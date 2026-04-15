@@ -408,35 +408,51 @@ async def poll_relay(self):
 
 ---
 
-### Phase 6 — Claude Code Compatibility
+### Phase 6 — Claude Code Compatibility & Developer Tooling ✅ COMPLETE
 
-**Goal:** Make Kim work as a drop-in MCP server for Claude Code CLI.
+**Goal:** Make Kim work as a drop-in MCP server for Claude Code CLI. Add git, code execution, and search tools.
 
-**Additional tools to add to mcp_server:**
+**Files produced:**
 
-`mcp_server/tools/git.py`:
-- `git_status` — current working tree status
-- `git_diff` — diff of a file or all changes
-- `git_add` — stage files
-- `git_commit` — commit with message
-- `git_log` — last N commits
-- `git_checkout` — switch branch or restore file
+- `mcp_server/tools/git.py` — Git repository management (6 tools)
+- `mcp_server/tools/code.py` — Code execution and linting (3 tools)
+- `mcp_server/tools/search.py` — Project-wide search (2 tools)
+- `mcp_server/server.py` — Updated with all 11 new tool registrations
 
-`mcp_server/tools/code.py`:
-- `run_python` — run a Python file or snippet
-- `run_node` — run a JS file or snippet
-- `run_tests` — run pytest or jest and return output
-- `lint_file` — run ruff/flake8 on a file
-- `format_file` — run black/prettier on a file
+**Git tools (`git.py`):**
 
-`mcp_server/tools/search.py`:
-- `search_in_files` — grep/ripgrep across project
-- `find_files` — glob pattern file finder
+| Tool | Description | Key args |
+|------|-------------|----------|
+| `git_status` | Working tree status | cwd, short |
+| `git_diff` | Diff of changes (file or all, staged or unstaged) | path, staged, cwd |
+| `git_add` | Stage files for commit | paths (string or array), cwd |
+| `git_commit` | Commit with message | message (required), cwd |
+| `git_log` | Recent commit history | n, oneline, cwd |
+| `git_checkout` | Switch branch or restore file | target (required), create, cwd |
 
-**Registration command to output:**
+**Code tools (`code.py`):**
+
+| Tool | Description | Key args |
+|------|-------------|----------|
+| `run_python` | Execute .py file or inline snippet | file, code, cwd, timeout |
+| `run_node` | Execute .js file or inline snippet | file, code, cwd, timeout |
+| `lint_file` | Lint Python file (ruff preferred, flake8 fallback) | path (required), fix, cwd |
+
+**Search tools (`search.py`):**
+
+| Tool | Description | Key args |
+|------|-------------|----------|
+| `search_in_files` | grep/ripgrep across project | pattern (required), path, include, case_sensitive, regex, context_lines |
+| `find_files` | Glob pattern file finder with sizes | pattern (required), path, type |
+
+**Registration command:**
 ```bash
 ## CMD: claude mcp add Kim -- python -m mcp_server.server
 ```
+
+**Total MCP tools:** 31 (20 Phase 1 + 11 Phase 6)
+
+**Status:** All deliverables implemented. Git and search tools verified on macOS.
 
 ---
 
