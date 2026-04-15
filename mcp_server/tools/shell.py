@@ -1,7 +1,25 @@
+"""
+Kim MCP Server — Shell Execution Tools
+
+Provides run_command and run_powershell tools with:
+  - Blocked-command filtering
+  - Cross-platform command translation via os_utils
+  - Platform-aware PowerShell / bash fallback
+"""
+
+from __future__ import annotations
+
 import asyncio
 import logging
 
 from mcp_server.config import BLOCKED_COMMANDS, SHELL_TIMEOUT, validate_path, PROJECT_ROOT
+from mcp_server.os_utils import (
+    CURRENT_OS,
+    IS_WINDOWS,
+    IS_MACOS,
+    IS_LINUX,
+    translate_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +47,12 @@ async def handle_run_command(args: dict) -> str:
     except PermissionError as e:
         return f"PERMISSION_ERROR: cwd {e}"
 
+    # ── Cross-platform translation ───────────────────────────────────────
+    original_cmd = cmd
+    cmd = translate_command(cmd)
+    if cmd != original_cmd:
+        logger.info(f"run_command translated: {original_cmd!r} → {cmd!r}")
+
     logger.info(f"run_command: {cmd!r} cwd={cwd}")
     try:
         proc = await asyncio.create_subprocess_shell(
@@ -55,6 +79,15 @@ async def handle_run_command(args: dict) -> str:
 
 
 async def handle_run_powershell(args: dict) -> str:
+    """
+    Run a PowerShell script block.
+
+    Cross-platform behaviour:
+      - Windows: Runs natively via powershell.exe
+      - macOS/Linux: Attempts to use pwsh (PowerShell Core) if installed.
+        If pwsh is not available, returns a clear error message suggesting
+        the LLM use run_command with bash/zsh instead.
+    """
     script = args["script"]
     timeout = int(args.get("timeout", SHELL_TIMEOUT))
 
@@ -63,14 +96,37 @@ async def handle_run_powershell(args: dict) -> str:
         logger.warning("run_powershell BLOCKED")
         return block_msg
 
-    logger.info(f"run_powershell: {script[:80]}...")
+    # ── Determine PowerShell executable ──────────────────────────────────
+    if IS_WINDOWS:
+        ps_exe = "powershell.exe"
+    else:
+        # macOS/Linux: try PowerShell Core (pwsh)
+        import shutil
+        ps_exe = shutil.which("pwsh")
+        if ps_exe is None:
+            os_name = "macOS" if IS_MACOS else "Linux"
+            return (
+                f"OS_LIMITATION: PowerShell is not available on this {os_name} system. "
+                f"PowerShell Core (pwsh) is not installed. "
+                f"Please use the 'run_command' tool with bash/zsh syntax instead. "
+                f"For example, replace 'Get-ChildItem' with 'ls -la', "
+                f"'Get-Content file.txt' with 'cat file.txt', etc."
+            )
+
+    logger.info(f"run_powershell [{ps_exe}]: {script[:80]}...")
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "powershell.exe",
+        ps_args = [
+            ps_exe,
             "-NonInteractive",
             "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-Command", script,
+        ]
+        # Only Windows powershell.exe needs -ExecutionPolicy
+        if IS_WINDOWS:
+            ps_args.extend(["-ExecutionPolicy", "Bypass"])
+        ps_args.extend(["-Command", script])
+
+        proc = await asyncio.create_subprocess_exec(
+            *ps_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(PROJECT_ROOT),

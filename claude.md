@@ -5,7 +5,14 @@
 
 ## What you are building
 
-**Kim** is a local AI agent platform for Windows. It connects any cloud LLM (Claude, GPT-4o, Gemini, DeepSeek) to full Windows OS control — screen vision, mouse/keyboard, file system, browser automation, and shell execution. It is the personal equivalent of Claude Code + Claude Computer Use, running locally, controlled by the user.
+**Kim** is a local AI agent platform for **Windows, macOS, and Linux**. It connects any cloud LLM (Claude, GPT-4o, Gemini, DeepSeek) to full OS control — screen vision, mouse/keyboard, file system, browser automation, and shell execution. It is the personal equivalent of Claude Code + Claude Computer Use, running locally, controlled by the user.
+
+> **Cross-Platform (Phase 6):** All MCP tools now auto-detect the host OS
+> via `mcp_server/os_utils.py`. Shell commands are translated between
+> platforms (e.g. `start notepad` → `open -a TextEdit` on Mac). Window
+> management uses `pygetwindow` (Windows), `osascript` (macOS), or
+> `wmctrl`/`xdotool` (Linux). Unsupported operations return structured
+> `OS_LIMITATION` messages so the LLM can adapt its approach.
 
 The user has an existing working prototype (Bridge V3) that:
 - Scrapes Gemini's DOM via a Chrome extension
@@ -43,13 +50,14 @@ Every piece of code you write MUST be in this format so the bridge can sync it a
 kim/
   mcp_server/
     server.py              ← Main MCP server (stdio transport)
+    os_utils.py            ← Cross-platform OS detection & command translation
     tools/
       files.py             ← read_file, write_file, list_dir, delete_file
-      shell.py             ← run_command, run_powershell
+      shell.py             ← run_command, run_powershell (cross-platform)
       screen.py            ← take_screenshot, get_screen_info
       mouse.py             ← click, double_click, right_click, drag, scroll
       keyboard.py          ← type_text, hotkey, key_press
-      windows.py           ← get_windows, focus_window, resize_window
+      windows.py           ← get_windows, focus_window, resize_window (cross-platform)
       browser.py           ← open_url, browser_click, fill_form, get_page_text
       git.py               ← git_status, git_diff, git_commit, git_log
       code.py              ← run_python, run_node, run_tests, lint_file
@@ -352,42 +360,51 @@ async def poll_relay(self):
 
 ---
 
-### Phase 5 — Tray App
+### Phase 5 — Tray App ✅ COMPLETE
 
 **Goal:** System tray icon that lets the user start/stop the agent, input tasks, view live logs, and switch providers — without opening a terminal.
 
-**Files to produce:**
+**Files produced:**
 - `tray/app.py`
 - `tray/ui.py`
 - `tray/settings.py`
 
-**pystray menu structure:**
-```
-[Kim icon]
-  ├── Open Control Panel
-  ├── Run Task...          (opens input dialog)
-  ├── ─────────────────
-  ├── Provider: Claude ▸   (submenu: Claude / GPT-4o / Gemini / DeepSeek)
-  ├── Agent: Running ▸     (submenu: Pause / Resume)
-  ├── ─────────────────
-  ├── Settings...
-  └── Quit
-```
+**Status:** All deliverables implemented and tested.
 
-**Control panel (tkinter) layout:**
-- Top: task input box + Run button (Enter submits)
-- Middle: scrolling log text widget, auto-scrolls, color-coded by level
-- Bottom: provider badge + relay status dot + screenshot thumbnail
-- Stop button visible only when agent is running
+---
 
-**Global hotkey:** Register Ctrl+Alt+J to open the task input dialog using `keyboard` library (`pip install keyboard`)
+### Phase 5.5 — Cross-Platform Architecture ✅ COMPLETE
 
-**Windows toast notification on task complete:**
-```python
-from win10toast import ToastNotifier
-toaster = ToastNotifier()
-toaster.show_toast("Kim", f"Task complete: {summary[:80]}", duration=5)
-```
+**Goal:** Make `mcp_server` tools seamlessly support macOS, Linux, and Windows.
+
+**Files produced:**
+- `mcp_server/os_utils.py` — OS detection, command translation dictionary, app-launch mapping
+- `mcp_server/tools/shell.py` — Updated with cross-platform command interception via `os_utils.translate_command()`
+- `mcp_server/tools/windows.py` — Platform-dispatching backends: `pygetwindow` (Windows), `osascript` (macOS), `wmctrl`/`xdotool` (Linux)
+- `requirements.txt` — Platform-conditional dependencies (`sys_platform` markers)
+
+**Cross-platform translation summary:**
+
+| Windows command | macOS equivalent | Linux equivalent |
+|----------------|-----------------|------------------|
+| `start notepad` | `open -a 'TextEdit'` | `gedit` |
+| `start calc` | `open -a 'Calculator'` | `gnome-calculator` |
+| `cls` | `clear` | `clear` |
+| `dir` | `ls -la` | `ls -la` |
+| `tasklist` | `ps aux` | `ps aux` |
+| `notepad.exe file.txt` | `open -a 'TextEdit' file.txt` | `gedit file.txt` |
+| PowerShell `-Command` | Uses `pwsh` if installed | Uses `pwsh` if installed |
+
+**Window management backends:**
+
+| Operation | Windows | macOS | Linux |
+|-----------|---------|-------|-------|
+| List windows | `pygetwindow` | `osascript` (AppleScript) | `wmctrl -l -G` |
+| Focus window | `pygetwindow` | `osascript` + `AXRaise` | `wmctrl -a` / `xdotool` |
+| Resize window | `pygetwindow` | `osascript` position/size | `wmctrl -e` / `xdotool` |
+| Fallback | — | Built-in (no install) | Clean `OS_LIMITATION` message |
+
+**Status:** All deliverables implemented and tested.
 
 ---
 
