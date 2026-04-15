@@ -1,0 +1,81 @@
+provider: browser         # browser | claude | openai | gemini | deepseek
+model:
+  claude: claude-opus-4-6
+  openai: gpt-4o
+  gemini: gemini-2.0-flash
+  deepseek: deepseek-chat
+project_root: "E:\\kim"
+allowed_paths:
+  - "E:\\kim"
+  - "E:\\Projects"
+max_iterations: 25
+screenshot_scale: 0.75
+preview_mode: false
+max_tokens: 4096
+memory_max_messages: 40
+memory_keep_screenshots: 4
+
+# ── OpenAI-compatible API settings ─────────────────────────────────────────
+# Set openai_base_url to use any OpenAI-compatible provider as the "openai"
+# provider.  Change openai_api_key_env to the env var that holds the key.
+#
+# Example — Cerebras (fast Llama inference, generous free tier):
+#   openai_base_url: "https://api.cerebras.ai/v1"
+#   openai_api_key_env: "CEREBRAS_API_KEY"
+#   model:
+#     openai: "llama-4-scout-17b-16e-instruct"
+#
+# Example — Groq:
+#   openai_base_url: "https://api.groq.com/openai/v1"
+#   openai_api_key_env: "GROQ_API_KEY"
+#   model:
+#     openai: "llama-3.3-70b-versatile"
+#
+openai_base_url: ""          # leave blank for official OpenAI
+openai_api_key_env: "OPENAI_API_KEY"
+
+# ── Browser provider ────────────────────────────────────────────────────────
+browser_provider:
+  cdp_url: "http://localhost:9222"   # Chrome remote debugging URL
+  max_history_messages: 6            # How many past turns to include in injected prompt
+  max_inject_chars: 12000            # Trim prompt if longer than this
+
+# ── Custom browser sites ────────────────────────────────────────────────────
+# Add any website with an AI chat UI here.  The browser provider will check
+# these BEFORE the built-in Claude/ChatGPT/Gemini entries, so they take
+# precedence.  Selectors can be a single string or a list (tried in order).
+#
+# Example — Perplexity:
+#   perplexity:
+#     url_pattern: "perplexity.ai"
+#     input_selector: "textarea[placeholder*='Ask']"
+#     send_button: "button[aria-label*='Submit']"
+#     stop_button: "button[aria-label*='Stop']"
+#     response_selector: ".prose"
+#
+custom_sites: {}
+  # my_site:
+  #   url_pattern: "example.com/chat"
+  #   input_selector: "textarea.chat-input"
+  #   send_button: "button.send-btn"
+  #   stop_button: "button.stop-btn"
+  #   response_selector: "div.response-text"
+
+# ── Shell ───────────────────────────────────────────────────────────────────
+shell:
+  timeout: 30
+  blocked_commands:
+    - "rm -rf /"
+    - "format c:"
+    - "del /S /Q C:\\"
+    - "rd /S /Q C:\\"
+
+# ── Relay ───────────────────────────────────────────────────────────────────
+relay:
+  url: ""                            # https://your-relay.railway.app
+  poll_interval: 2                   # seconds
+  pc_api_key: ""                     # set in .env as RELAY_PC_API_KEY
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+logging:
+  level: INFO
