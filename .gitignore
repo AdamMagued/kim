@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Secret Keys (CRITICAL)
 .env
 
@@ -23,3 +24,12 @@ Thumbs.db
 # Project config that might contain paths specific to your PC
 # (Only ignore this if you want to keep your PROJECT_ROOT path private)
 # config.yaml
+=======
+.env 
+__pycache__/ 
+*.pyc 
+.venv/ 
+venv/ 
+logs/ 
+data/*.sqlite 
+>>>>>>> 4a8c9c1 (Initial architecture: Core engine and Relay server)
