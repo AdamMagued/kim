@@ -38,6 +38,7 @@ import pystray
 from pystray import MenuItem as Item
 
 from orchestrator.agent import UIBridge, mcp_agent_context
+from tray.voice import VoiceEngine
 
 logger = logging.getLogger("kim.tray")
 
@@ -137,8 +138,14 @@ class KimApp:
         self._control_panel = None  # tray.ui.ControlPanel
         self._settings_win = None   # tray.settings.SettingsWindow
 
+        # Voice engine
+        self._voice = VoiceEngine(self._config)
+
         # pystray icon
         self._icon: Optional[pystray.Icon] = None
+
+        # pynput hotkey listener
+        self._hotkey_listener = None
 
         # Task submission queue (from hotkey / menu → tkinter thread)
         self._task_q: queue.Queue = queue.Queue()
@@ -159,11 +166,11 @@ class KimApp:
             self._cleanup()
 
     def _cleanup(self) -> None:
-        try:
-            import keyboard
-            keyboard.unhook_all()
-        except Exception:
-            pass
+        if self._hotkey_listener:
+            try:
+                self._hotkey_listener.stop()
+            except Exception:
+                pass
         if self._icon:
             try:
                 self._icon.stop()
@@ -222,13 +229,18 @@ class KimApp:
 
     def _register_hotkey(self) -> None:
         try:
-            import keyboard
-            keyboard.add_hotkey(
-                "ctrl+alt+j",
-                lambda: self._root.after(0, self._prompt_task),
-                suppress=False,
-            )
-            logger.info("Hotkey Ctrl+Alt+J registered")
+            from pynput import keyboard as pynput_keyboard
+
+            def _on_hotkey(*args, **kwargs):
+                # pynput may pass an 'injected' arg on some platforms — absorb it
+                self._root.after(0, self._prompt_task)
+
+            self._hotkey_listener = pynput_keyboard.GlobalHotKeys({
+                '<ctrl>+<alt>+j': _on_hotkey,
+            })
+            self._hotkey_listener.daemon = True
+            self._hotkey_listener.start()
+            logger.info("Hotkey Ctrl+Alt+J registered (pynput)")
         except Exception as e:
             logger.warning(f"Could not register hotkey: {e}")
 
@@ -306,6 +318,7 @@ class KimApp:
 
     def _do_quit(self) -> None:
         self._do_cancel()
+        self._voice.shutdown()
         self._root.quit()
 
     # ── task submission ───────────────────────────────────────────────────────
@@ -330,6 +343,7 @@ class KimApp:
                     self._config,
                     provider_name=self._active_provider,
                     ui_bridge=self._bridge,
+                    voice_engine=self._voice,
                 ) as agent:
                     result = await agent.run(task)
                 self._root.after(0, self._on_task_done, result, True)
@@ -349,6 +363,11 @@ class KimApp:
         title = "Kim — Task Complete" if success else "Kim — Task Failed"
         _toast(title, result)
         logger.info(f"Task finished (success={success}): {result[:120]}")
+
+        # Speak result summary
+        if self._voice.enabled:
+            prefix = "Task complete." if success else "Task failed."
+            self._voice.speak_fire_and_forget(f"{prefix} {result[:200]}")
 
         if self._control_panel and self._control_panel.winfo_exists():
             self._control_panel.on_task_done(result, success)

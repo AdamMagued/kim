@@ -487,6 +487,48 @@ retry_max_delay: 60.0    # Cap on delay between retries
 
 **Status:** All deliverables implemented. All 7 core build phases are COMPLETE.
 
+---
+
+### Phase 8 — Voice UI Integration ✅ COMPLETE
+
+**Goal:** Give Kim a realistic human voice using local open-source TTS so she speaks actions, thoughts, and summaries aloud.
+
+**Files produced / modified:**
+
+- `tray/voice.py` — NEW: `VoiceEngine` class with dual-backend TTS (kokoro local / HTTP API), `clean_for_speech()` text sanitiser, non-blocking playback via `ThreadPoolExecutor`
+- `orchestrator/agent.py` — Added `voice_engine` param to `KimAgent.__init__` and `mcp_agent_context()`. Added `_voice_speak()` helper. Voice speaks on `TASK_COMPLETE`, `NEED_HELP`, stuck detection, and tool calls
+- `tray/app.py` — Creates `VoiceEngine` at init, passes to agent, speaks on task done, shuts down on quit
+- `tray/ui.py` — Added 🔊 Voice Enabled checkbox toggle in control panel
+- `config.yaml` — Added `voice_enabled: true` master toggle + `voice:` config block
+- `mcp_server/config.py` — Parses `VOICE_ENABLED` flag
+- `requirements.txt` — Added `kokoro`, `sounddevice`, `soundfile`
+
+**Checklist:**
+- [x] `VoiceEngine` class with async `speak()` method
+- [x] Non-blocking playback (background thread via ThreadPoolExecutor)
+- [x] kokoro local TTS backend (default)
+- [x] HTTP API backend (OpenAI-compatible, for Maya-1 / AllTalk)
+- [x] Text sanitisation — strips Markdown `*`, `**`, `` ` ``, `#`, `[]`, `{}` before speaking
+- [x] `voice_enabled` config toggle in `config.yaml` and `config.py`
+- [x] Agent integration — speaks on TASK_COMPLETE, NEED_HELP, stuck, tool calls
+- [x] Tray app integration — speaks on task completion
+- [x] UI toggle — 🔊 Voice Enabled checkbox in control panel
+- [x] Graceful degradation — if kokoro/sounddevice not installed, logs warning and continues silently
+
+**Voice configuration (config.yaml):**
+```yaml
+voice_enabled: true
+voice:
+  backend: kokoro           # "kokoro" (local) or "http" (API server)
+  voice_id: af_heart        # kokoro voice name
+  speed: 1.0                # playback speed
+  # HTTP backend (optional):
+  # http_url: "http://localhost:8880/v1/audio/speech"
+  # http_model: "tts-1"
+  # http_voice: "nova"
+```
+
+**Status:** All deliverables implemented. All 8 build phases are COMPLETE.
 
 
 ## Key technical patterns
