@@ -1,7 +1,7 @@
 """
-Kim MCP Server — Phase 1
-Exposes OS control, file I/O, shell execution, screen capture, and input
-automation as MCP tools over stdio transport.
+Kim MCP Server — Phase 1 + Phase 6
+Exposes OS control, file I/O, shell execution, screen capture, input
+automation, git, code execution, and search as MCP tools over stdio transport.
 
 Usage (Claude Desktop):
     {
@@ -52,6 +52,23 @@ from mcp_server.tools.windows import (
     handle_get_windows,
     handle_open_url,
     handle_resize_window,
+)
+from mcp_server.tools.git import (
+    handle_git_status,
+    handle_git_diff,
+    handle_git_add,
+    handle_git_commit,
+    handle_git_log,
+    handle_git_checkout,
+)
+from mcp_server.tools.code import (
+    handle_run_python,
+    handle_run_node,
+    handle_lint_file,
+)
+from mcp_server.tools.search import (
+    handle_search_in_files,
+    handle_find_files,
 )
 
 # Logging goes to stderr — stdout is reserved for MCP protocol messages
@@ -312,6 +329,155 @@ _TOOLS: list[Tool] = [
             "required": ["url"],
         },
     ),
+    # ── Git operations ───────────────────────────────────────────────────────
+    Tool(
+        name="git_status",
+        description="Show the current git working tree status (staged, unstaged, untracked files).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "cwd": {"type": "string", "description": "Repository directory (defaults to PROJECT_ROOT)"},
+                "short": {"type": "boolean", "description": "Compact output format", "default": False},
+            },
+        },
+    ),
+    Tool(
+        name="git_diff",
+        description="Show git diff of working tree changes. Can diff a specific file or all changes.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Specific file to diff (optional, omit for all)"},
+                "staged": {"type": "boolean", "description": "Show staged changes (--cached)", "default": False},
+                "cwd": {"type": "string", "description": "Repository directory (defaults to PROJECT_ROOT)"},
+            },
+        },
+    ),
+    Tool(
+        name="git_add",
+        description="Stage files for the next commit. Use '.' to stage all changes.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "description": "File(s) to stage. String or array of strings. Use '.' for all.",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                    "default": ".",
+                },
+                "cwd": {"type": "string", "description": "Repository directory (defaults to PROJECT_ROOT)"},
+            },
+        },
+    ),
+    Tool(
+        name="git_commit",
+        description="Commit staged changes with a descriptive message.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "Commit message (required)"},
+                "cwd": {"type": "string", "description": "Repository directory (defaults to PROJECT_ROOT)"},
+            },
+            "required": ["message"],
+        },
+    ),
+    Tool(
+        name="git_log",
+        description="Show recent commit history.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "n": {"type": "integer", "description": "Number of commits to show", "default": 10},
+                "oneline": {"type": "boolean", "description": "Compact one-line format", "default": True},
+                "cwd": {"type": "string", "description": "Repository directory (defaults to PROJECT_ROOT)"},
+            },
+        },
+    ),
+    Tool(
+        name="git_checkout",
+        description="Switch to a branch, create a new branch, or restore a file to its last committed state.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Branch name or file path to checkout"},
+                "create": {"type": "boolean", "description": "Create new branch (-b flag)", "default": False},
+                "cwd": {"type": "string", "description": "Repository directory (defaults to PROJECT_ROOT)"},
+            },
+            "required": ["target"],
+        },
+    ),
+    # ── Code execution ───────────────────────────────────────────────────────
+    Tool(
+        name="run_python",
+        description="Execute a Python file or inline code snippet and return stdout/stderr.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "file": {"type": "string", "description": "Path to .py file to execute (relative or absolute)"},
+                "code": {"type": "string", "description": "Inline Python code snippet to execute"},
+                "cwd": {"type": "string", "description": "Working directory (defaults to PROJECT_ROOT)"},
+                "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 30},
+            },
+        },
+    ),
+    Tool(
+        name="run_node",
+        description="Execute a JavaScript file or inline code snippet via Node.js and return stdout/stderr.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "file": {"type": "string", "description": "Path to .js file to execute (relative or absolute)"},
+                "code": {"type": "string", "description": "Inline JavaScript code snippet to execute"},
+                "cwd": {"type": "string", "description": "Working directory (defaults to PROJECT_ROOT)"},
+                "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 30},
+            },
+        },
+    ),
+    Tool(
+        name="lint_file",
+        description="Lint a Python file using ruff (preferred) or flake8. Returns warnings and errors.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to Python file to lint"},
+                "fix": {"type": "boolean", "description": "Auto-fix issues (ruff only)", "default": False},
+                "cwd": {"type": "string", "description": "Working directory (defaults to PROJECT_ROOT)"},
+            },
+            "required": ["path"],
+        },
+    ),
+    # ── Search ───────────────────────────────────────────────────────────────
+    Tool(
+        name="search_in_files",
+        description="Search for a text pattern across all files in the project (like grep/ripgrep). Returns matching lines with file paths and line numbers.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Text or regex pattern to search for"},
+                "path": {"type": "string", "description": "Directory to search in (defaults to PROJECT_ROOT)"},
+                "include": {"type": "string", "description": "File glob filter (e.g. '*.py', '*.ts')"},
+                "case_sensitive": {"type": "boolean", "description": "Case-sensitive search", "default": True},
+                "regex": {"type": "boolean", "description": "Treat pattern as regex", "default": False},
+                "context_lines": {"type": "integer", "description": "Context lines around matches", "default": 0},
+            },
+            "required": ["pattern"],
+        },
+    ),
+    Tool(
+        name="find_files",
+        description="Find files matching a glob pattern in the project directory tree. Returns relative paths with file sizes.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern (e.g. '*.py', '**/*.ts', 'src/**/*.js')"},
+                "path": {"type": "string", "description": "Directory to search in (defaults to PROJECT_ROOT)"},
+                "type": {"type": "string", "enum": ["file", "dir", "all"], "description": "Filter by type", "default": "file"},
+            },
+            "required": ["pattern"],
+        },
+    ),
 ]
 
 # Build dispatch map
@@ -336,6 +502,20 @@ _DISPATCH = {
     "focus_window": handle_focus_window,
     "resize_window": handle_resize_window,
     "open_url": handle_open_url,
+    # Git
+    "git_status": handle_git_status,
+    "git_diff": handle_git_diff,
+    "git_add": handle_git_add,
+    "git_commit": handle_git_commit,
+    "git_log": handle_git_log,
+    "git_checkout": handle_git_checkout,
+    # Code
+    "run_python": handle_run_python,
+    "run_node": handle_run_node,
+    "lint_file": handle_lint_file,
+    # Search
+    "search_in_files": handle_search_in_files,
+    "find_files": handle_find_files,
 }
 
 
