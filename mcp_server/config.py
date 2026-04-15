@@ -5,11 +5,17 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
+# Ensure the project root is on sys.path so `mcp_server` is importable
+# regardless of how the process was launched.
+_PROJECT_DIR = Path(__file__).resolve().parent.parent
+if str(_PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_DIR))
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
+_CONFIG_PATH = _PROJECT_DIR / "config.yaml"
 
 
 def _load_yaml() -> dict:
@@ -21,12 +27,22 @@ def _load_yaml() -> dict:
 
 _cfg = _load_yaml()
 
-PROJECT_ROOT = Path(
-    os.environ.get("PROJECT_ROOT") or _cfg.get("project_root", str(Path.home()))
-).resolve()
+# Resolve project_root relative to config.yaml's directory — NOT cwd.
+# This makes project_root: "." work correctly regardless of launch dir.
+_raw_root = os.environ.get("PROJECT_ROOT") or _cfg.get("project_root", str(_PROJECT_DIR))
+_root_path = Path(_raw_root)
+if not _root_path.is_absolute():
+    _root_path = _PROJECT_DIR / _root_path
+PROJECT_ROOT = _root_path.resolve()
 
+# Resolve allowed_paths the same way
 _raw_allowed = _cfg.get("allowed_paths", [str(PROJECT_ROOT)])
-ALLOWED_PATHS = [Path(p).resolve() for p in _raw_allowed]
+ALLOWED_PATHS = []
+for p in _raw_allowed:
+    pp = Path(p)
+    if not pp.is_absolute():
+        pp = _PROJECT_DIR / pp
+    ALLOWED_PATHS.append(pp.resolve())
 if PROJECT_ROOT not in ALLOWED_PATHS:
     ALLOWED_PATHS.append(PROJECT_ROOT)
 
@@ -40,6 +56,7 @@ LOG_LEVEL: str = _cfg.get("logging", {}).get("level", "INFO")
 BROWSER_HEADLESS: bool = bool(
     _cfg.get("browser_provider", {}).get("browser_headless", False)
 )
+VOICE_ENABLED: bool = bool(_cfg.get("voice_enabled", False))
 
 
 def validate_path(path_str: str) -> Path:

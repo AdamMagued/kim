@@ -38,8 +38,16 @@ pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
 
 # ── Tray / UI ───────────────────────────────────────────────────────────────
 pystray>=0.19.5
-keyboard>=0.13.5
+pynput>=1.7.6
 
 # ── Testing ──────────────────────────────────────────────────────────────────
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+
+# ── Voice / TTS (optional — install for Kim's voice) ────────────────────────
+# kokoro: lightweight local TTS engine (default voice backend)
+# sounddevice: cross-platform audio playback
+# soundfile: audio file I/O (required by kokoro)
+kokoro>=0.9.0
+sounddevice>=0.5.0
+soundfile>=0.12.0

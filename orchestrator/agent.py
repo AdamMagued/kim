@@ -215,6 +215,7 @@ class KimAgent:
     """
     Vision-tool agent loop.  Receives a live MCP session and a configured
     provider.  Optionally wired to a UIBridge for live UI updates.
+    Optionally speaks via VoiceEngine when voice_enabled is True.
     """
 
     def __init__(
@@ -223,6 +224,7 @@ class KimAgent:
         session: ClientSession,
         provider: BaseProvider,
         ui_bridge: Optional[UIBridge] = None,
+        voice_engine=None,
     ):
         self.config = config
         self.session = session
@@ -236,6 +238,7 @@ class KimAgent:
         self._screenshot_hashes: list[str] = []
         self._tools: list[dict] = []
         self._ui_bridge: Optional[UIBridge] = ui_bridge
+        self._voice = voice_engine  # Optional VoiceEngine instance
         # Retry configuration for LLM API calls
         self._max_retries: int = int(config.get("max_retries", 5))
         self._retry_base_delay: float = float(config.get("retry_base_delay", 1.0))
@@ -261,6 +264,14 @@ class KimAgent:
 
     def _is_cancelled(self) -> bool:
         return bool(self._ui_bridge and self._ui_bridge.cancelled)
+
+    async def _voice_speak(self, text: str) -> None:
+        """Speak text via VoiceEngine if available and enabled."""
+        if self._voice and self._voice.enabled:
+            try:
+                await self._voice.speak(text)
+            except Exception as e:
+                logger.debug(f"Voice speak failed: {e}")
 
     # ------------------------------------------------------------------
     # Main loop
@@ -321,6 +332,7 @@ class KimAgent:
                 tool_name = response["tool"]
                 tool_args = response.get("args", {})
                 self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]})")
+                await self._voice_speak(f"Running {tool_name}")
 
                 # Preview mode — pause and ask for confirmation
                 if self._is_preview_mode() and self._ui_bridge:
@@ -349,6 +361,7 @@ class KimAgent:
                 # Stuck detection
                 if self._is_stuck(screenshot_b64) and iteration > 3:
                     self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
+                    await self._voice_speak("I appear to be stuck. The screen is not changing.")
                     return {
                         "success": False,
                         "summary": "STUCK: Screen not changing after repeated actions.",
@@ -372,11 +385,13 @@ class KimAgent:
                 if content.startswith("TASK_COMPLETE:"):
                     summary = content[len("TASK_COMPLETE:"):].strip()
                     self._log("INFO", f"TASK_COMPLETE: {summary}")
+                    await self._voice_speak(f"Task complete. {summary}")
                     return {"success": True, "summary": summary, "screenshot": last_screenshot_b64}
 
                 if content.startswith("NEED_HELP:"):
                     reason = content[len("NEED_HELP:"):].strip()
                     self._log("WARN", f"NEED_HELP: {reason}")
+                    await self._voice_speak(f"I need your help. {reason}")
                     return {"success": False, "summary": f"NEED_HELP: {reason}", "screenshot": last_screenshot_b64}
 
                 self._log("DEBUG", f"Text (continuing): {content[:120]}")
@@ -589,6 +604,7 @@ async def mcp_agent_context(
     config: dict,
     provider_name: Optional[str] = None,
     ui_bridge: Optional[UIBridge] = None,
+    voice_engine=None,
 ):
     """
     Yields a KimAgent ready to run tasks.
@@ -598,8 +614,26 @@ async def mcp_agent_context(
     """
     name = provider_name or config.get("provider", "claude")
     provider = create_provider(name, config)
+
+    # Auto-create VoiceEngine if voice_enabled and none provided
+    _voice = voice_engine
+    if _voice is None and config.get("voice_enabled", False):
+        try:
+            from tray.voice import VoiceEngine
+            _voice = VoiceEngine(config)
+        except ImportError:
+            logger.debug("tray.voice not available — voice disabled")
+
     async with mcp_session_context(config) as session:
-        yield KimAgent(config=config, session=session, provider=provider, ui_bridge=ui_bridge)
+        agent = KimAgent(
+            config=config, session=session, provider=provider,
+            ui_bridge=ui_bridge, voice_engine=_voice,
+        )
+        try:
+            yield agent
+        finally:
+            if _voice and voice_engine is None:
+                _voice.shutdown()
 
 
 # ---------------------------------------------------------------------------

@@ -4,10 +4,9 @@ model:
   openai: gpt-4o
   gemini: gemini-2.0-flash
   deepseek: deepseek-chat
-project_root: "E:\\kim"
+project_root: "."                 # "." = auto-detect from config.yaml location
 allowed_paths:
-  - "E:\\kim"
-  - "E:\\Projects"
+  - "."                            # paths the agent is allowed to access
 max_iterations: 25
 screenshot_scale: 0.75
 preview_mode: false
@@ -81,3 +80,15 @@ relay:
 # ── Logging ─────────────────────────────────────────────────────────────────
 logging:
   level: INFO
+
+# ── Voice ───────────────────────────────────────────────────────────────────
+voice_enabled: true                    # master toggle for Kim's voice
+voice:
+  enabled: true                        # duplicate for nested access
+  backend: kokoro                      # "kokoro" (local) or "http" (API server)
+  voice_id: af_heart                   # kokoro voice name (af_heart, af_bella, etc.)
+  speed: 1.0                           # playback speed multiplier
+  # HTTP backend settings (for Maya-1 / local OpenAI-compatible TTS):
+  # http_url: "http://localhost:8880/v1/audio/speech"
+  # http_model: "tts-1"
+  # http_voice: "nova"

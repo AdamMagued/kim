@@ -156,6 +156,25 @@ class ControlPanel(tk.Toplevel):
             bg=_BG, fg="#666", font=("Consolas", 8),
         ).pack(anchor=tk.W)
 
+        # Voice toggle
+        self._voice_var = tk.BooleanVar(
+            value=self._app._voice.enabled if hasattr(self._app, '_voice') else False
+        )
+        voice_cb = tk.Checkbutton(
+            right,
+            text="Voice Enabled  \U0001F50A",
+            variable=self._voice_var,
+            bg=_BG, fg=_FG, selectcolor="#2d2d2d",
+            activebackground=_BG, activeforeground=_FG,
+            command=self._on_voice_toggle,
+        )
+        voice_cb.pack(anchor=tk.W, pady=(6, 0))
+        tk.Label(
+            right,
+            text="Kim speaks actions and results aloud",
+            bg=_BG, fg="#666", font=("Consolas", 8),
+        ).pack(anchor=tk.W)
+
         # Confirm / Deny frame (hidden until confirmation needed)
         self._confirm_frame = tk.Frame(right, bg="#2d2d2d", relief=tk.FLAT, bd=1)
         self._confirm_label = tk.Label(
@@ -300,6 +319,12 @@ class ControlPanel(tk.Toplevel):
         logger.info(f"Preview mode {'ON' if enabled else 'OFF'}")
         if not enabled:
             self._hide_confirm()
+
+    def _on_voice_toggle(self) -> None:
+        enabled = self._voice_var.get()
+        if hasattr(self._app, '_voice'):
+            self._app._voice.set_enabled(enabled)
+        logger.info(f"Voice {'ON' if enabled else 'OFF'}")
 
     def _on_confirm(self) -> None:
         if self._confirm_pending:
