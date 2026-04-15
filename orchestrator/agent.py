@@ -9,6 +9,13 @@ The agent:
        take screenshot → call LLM → execute tool (or finish)
   5. Detects stuck state (3 identical screenshots in a row)
   6. Guards against runaway loops (max_iterations)
+  7. Optionally pauses before every tool call for user confirmation (preview mode)
+
+UIBridge
+────────
+KimAgent accepts an optional UIBridge that wires the async agent to a Tkinter
+UI without any hard dependency on tkinter.  When no bridge is attached the
+agent behaves identically to the CLI-only version.
 
 CLI usage:
     python -m orchestrator.agent --task "open Notepad and type Hello World"
@@ -18,6 +25,7 @@ CLI usage:
 
 Programmatic usage:
     async with mcp_agent_context(config) as agent:
+        agent.set_ui_bridge(bridge)
         result = await agent.run("open Chrome")
 """
 
@@ -29,7 +37,9 @@ import io
 import json
 import logging
 import os
+import queue
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -45,6 +55,117 @@ from orchestrator.providers.base import BaseProvider, create_provider
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# UIBridge — thread-safe channel between async agent and Tkinter UI
+# ---------------------------------------------------------------------------
+
+class UIBridge:
+    """
+    Connects the async KimAgent to a Tkinter UI (or any consumer) without
+    coupling the agent to any UI framework.
+
+    Thread safety
+    ─────────────
+    All public methods are safe to call from any thread.
+    `confirm_action()` is async and must be awaited from the agent coroutine.
+    """
+
+    def __init__(self) -> None:
+        # Log records → UI log window
+        self.log_queue: queue.Queue = queue.Queue()
+        # Latest screenshot (b64, no data: prefix) → UI thumbnail
+        self.screenshot_queue: queue.Queue = queue.Queue(maxsize=1)
+        # Confirmation requests: (tool_name, args, threading.Event, [bool])
+        self._confirm_queue: queue.Queue = queue.Queue()
+        # Cancellation flag — set by UI Stop button; checked by agent each iter
+        self.cancelled: bool = False
+        # Live toggle — UI checkbox sets this; agent reads it each iteration
+        self.preview_mode: bool = False
+
+    # ── Logging ────────────────────────────────────────────────────────────
+
+    def log(self, level: str, message: str) -> None:
+        """Put a (level, message) tuple for the UI to render."""
+        self.log_queue.put_nowait((level.upper(), message))
+
+    # ── Screenshot ─────────────────────────────────────────────────────────
+
+    def update_screenshot(self, b64: str) -> None:
+        """Replace the pending screenshot with the latest one (drop oldest)."""
+        try:
+            self.screenshot_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.screenshot_queue.put_nowait(b64)
+        except queue.Full:
+            pass
+
+    # ── Confirmation (preview mode) ────────────────────────────────────────
+
+    async def confirm_action(self, tool_name: str, args: dict) -> bool:
+        """
+        Pause execution and ask the UI for confirmation.
+        If cancelled, returns False immediately.
+        If the UI takes > 60 s (or no UI is attached), auto-allows.
+        """
+        if self.cancelled:
+            return False
+        event: threading.Event = threading.Event()
+        result: list[bool] = [True]
+        self._confirm_queue.put_nowait((tool_name, args, event, result))
+        # Wait without blocking the asyncio event loop
+        loop = asyncio.get_event_loop()
+        timed_out = not await loop.run_in_executor(None, lambda: event.wait(timeout=60.0))
+        if timed_out:
+            logger.warning("Confirmation timed out after 60 s — auto-allowing")
+        return result[0]
+
+    def resolve_confirm(
+        self, event: threading.Event, result: list[bool], confirmed: bool
+    ) -> None:
+        """Called by the UI when the user clicks Confirm or Deny."""
+        result[0] = confirmed
+        event.set()
+
+    # ── Cancel ─────────────────────────────────────────────────────────────
+
+    def cancel(self) -> None:
+        """Request agent stop.  Also unblocks any pending confirmation."""
+        self.cancelled = True
+        # Drain and deny any queued confirm requests
+        while True:
+            try:
+                _, _, event, result = self._confirm_queue.get_nowait()
+                result[0] = False
+                event.set()
+            except queue.Empty:
+                break
+
+    def reset(self) -> None:
+        """Call before submitting a new task."""
+        self.cancelled = False
+
+
+# ---------------------------------------------------------------------------
+# UIBridge logging handler — routes Python log records to the UI
+# ---------------------------------------------------------------------------
+
+class UIBridgeLogHandler(logging.Handler):
+    """Attach to any logger to mirror records into the UIBridge log queue."""
+
+    def __init__(self, bridge: UIBridge) -> None:
+        super().__init__()
+        self._bridge = bridge
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self._bridge.log(record.levelname, msg)
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -68,10 +189,6 @@ def load_config(path: Optional[str] = None) -> dict:
 
 @asynccontextmanager
 async def mcp_session_context(config: dict):
-    """
-    Async context manager that starts the Kim MCP server as a subprocess and
-    yields an initialized ClientSession.
-    """
     project_root = str(
         Path(
             os.environ.get("PROJECT_ROOT") or config.get("project_root", str(Path.cwd()))
@@ -95,8 +212,8 @@ async def mcp_session_context(config: dict):
 
 class KimAgent:
     """
-    One instance per task run.  Receives a live MCP session and a configured
-    provider; runs the vision-tool loop until completion or guard conditions.
+    Vision-tool agent loop.  Receives a live MCP session and a configured
+    provider.  Optionally wired to a UIBridge for live UI updates.
     """
 
     def __init__(
@@ -104,6 +221,7 @@ class KimAgent:
         config: dict,
         session: ClientSession,
         provider: BaseProvider,
+        ui_bridge: Optional[UIBridge] = None,
     ):
         self.config = config
         self.session = session
@@ -116,6 +234,32 @@ class KimAgent:
         )
         self._screenshot_hashes: list[str] = []
         self._tools: list[dict] = []
+        self._ui_bridge: Optional[UIBridge] = ui_bridge
+
+    def set_ui_bridge(self, bridge: Optional[UIBridge]) -> None:
+        self._ui_bridge = bridge
+
+    # ------------------------------------------------------------------
+    # Helpers that are UI-aware
+    # ------------------------------------------------------------------
+
+    def _log(self, level: str, message: str) -> None:
+        """Log to Python logger AND UIBridge (if attached)."""
+        getattr(logger, level.lower(), logger.info)(message)
+        if self._ui_bridge:
+            self._ui_bridge.log(level, message)
+
+    def _is_preview_mode(self) -> bool:
+        if self._ui_bridge is not None:
+            return self._ui_bridge.preview_mode
+        return bool(self.config.get("preview_mode", False))
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._ui_bridge and self._ui_bridge.cancelled)
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     async def run(self, task: str) -> dict:
         """
@@ -124,23 +268,20 @@ class KimAgent:
         Returns:
             {"success": bool, "summary": str, "screenshot": str (base64)}
         """
-        logger.info(f"=== Starting task: {task!r} ===")
+        self._log("INFO", f"=== Starting task: {task!r} ===")
         self.memory.clear()
         self._screenshot_hashes = []
 
-        # Refresh tool list from MCP server
         await self._refresh_tools()
         if not self._tools:
-            return {
-                "success": False,
-                "summary": "No MCP tools available",
-                "screenshot": "",
-            }
+            return {"success": False, "summary": "No MCP tools available", "screenshot": ""}
 
         system_prompt = self._build_system_prompt(task)
 
-        # Initial screenshot + task → first user message
         screenshot_b64 = await self._take_screenshot()
+        if self._ui_bridge:
+            self._ui_bridge.update_screenshot(screenshot_b64)
+
         self.memory.add_user(
             [
                 {"type": "text", "text": f"Task: {task}"},
@@ -152,9 +293,14 @@ class KimAgent:
         last_screenshot_b64 = screenshot_b64
 
         for iteration in range(1, self.max_iterations + 1):
-            logger.info(f"--- Iteration {iteration}/{self.max_iterations} ---")
+            # ── Cancellation check ───────────────────────────────────────
+            if self._is_cancelled():
+                self._log("WARN", "Task cancelled by user")
+                return {"success": False, "summary": "Cancelled by user", "screenshot": last_screenshot_b64}
 
-            # Call the LLM
+            self._log("INFO", f"--- Iteration {iteration}/{self.max_iterations} ---")
+
+            # ── LLM call ─────────────────────────────────────────────────
             try:
                 response = await self.provider.complete(
                     messages=self.memory.get_messages(),
@@ -162,42 +308,48 @@ class KimAgent:
                     system=system_prompt,
                 )
             except Exception as e:
-                logger.error(f"Provider error: {e}", exc_info=True)
-                return {
-                    "success": False,
-                    "summary": f"LLM error: {e}",
-                    "screenshot": last_screenshot_b64,
-                }
+                self._log("ERROR", f"Provider error: {e}")
+                return {"success": False, "summary": f"LLM error: {e}", "screenshot": last_screenshot_b64}
 
-            logger.debug(f"Provider response: {response}")
-
-            # ── Tool call ────────────────────────────────────────────────
+            # ── Tool call ─────────────────────────────────────────────────
             if response["type"] == "tool_call":
                 tool_name = response["tool"]
                 tool_args = response.get("args", {})
-                logger.info(f"Tool call: {tool_name}({json.dumps(tool_args)[:120]})")
+                self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]})")
 
-                # Record assistant decision
+                # Preview mode — pause and ask for confirmation
+                if self._is_preview_mode() and self._ui_bridge:
+                    self._log("INFO", f"[Preview] Waiting for confirmation: {tool_name}")
+                    confirmed = await self._ui_bridge.confirm_action(tool_name, tool_args)
+                    if not confirmed:
+                        self._log("WARN", f"Action denied by user: {tool_name}")
+                        self.memory.add_user(
+                            f"[User denied the action: {tool_name}]. "
+                            "Choose a different approach that does not require this action."
+                        )
+                        continue
+
                 self.memory.add_assistant(json.dumps(response))
 
                 # Execute via MCP
                 result_text = await self._execute_tool(tool_name, tool_args)
-                logger.info(f"Tool result ({len(result_text)} chars): {result_text[:200]}")
+                self._log("INFO", f"Result: {result_text[:200]}")
 
-                # Take fresh screenshot after action
+                # Fresh screenshot after action
                 screenshot_b64 = await self._take_screenshot()
                 last_screenshot_b64 = screenshot_b64
+                if self._ui_bridge:
+                    self._ui_bridge.update_screenshot(screenshot_b64)
 
                 # Stuck detection
                 if self._is_stuck(screenshot_b64) and iteration > 3:
-                    logger.warning("Stuck detected — 3 identical screenshots in a row")
+                    self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
                     return {
                         "success": False,
-                        "summary": "STUCK: Screen not changing after repeated actions. Stopping.",
+                        "summary": "STUCK: Screen not changing after repeated actions.",
                         "screenshot": screenshot_b64,
                     }
 
-                # Tool result + fresh screenshot → next user turn
                 self.memory.add_user(
                     [
                         {"type": "text", "text": f"[Tool result: {tool_name}]\n{result_text}"},
@@ -207,34 +359,26 @@ class KimAgent:
                 )
                 continue
 
-            # ── Text response ────────────────────────────────────────────
+            # ── Text response ─────────────────────────────────────────────
             if response["type"] == "text":
                 content = str(response.get("content", "")).strip()
                 self.memory.add_assistant(content)
 
                 if content.startswith("TASK_COMPLETE:"):
                     summary = content[len("TASK_COMPLETE:"):].strip()
-                    logger.info(f"Task complete: {summary}")
-                    return {
-                        "success": True,
-                        "summary": summary,
-                        "screenshot": last_screenshot_b64,
-                    }
+                    self._log("INFO", f"TASK_COMPLETE: {summary}")
+                    return {"success": True, "summary": summary, "screenshot": last_screenshot_b64}
 
                 if content.startswith("NEED_HELP:"):
                     reason = content[len("NEED_HELP:"):].strip()
-                    logger.warning(f"Agent needs help: {reason}")
-                    return {
-                        "success": False,
-                        "summary": f"NEED_HELP: {reason}",
-                        "screenshot": last_screenshot_b64,
-                    }
+                    self._log("WARN", f"NEED_HELP: {reason}")
+                    return {"success": False, "summary": f"NEED_HELP: {reason}", "screenshot": last_screenshot_b64}
 
-                # Plain text without a terminal signal — take a fresh screenshot
-                # and prompt the LLM to continue
-                logger.debug(f"Plain text response (continuing): {content[:120]}")
+                self._log("DEBUG", f"Text (continuing): {content[:120]}")
                 screenshot_b64 = await self._take_screenshot()
                 last_screenshot_b64 = screenshot_b64
+                if self._ui_bridge:
+                    self._ui_bridge.update_screenshot(screenshot_b64)
                 self.memory.add_user(
                     [
                         {"type": "text", "text": "Current screen. What is your next action?"},
@@ -244,11 +388,10 @@ class KimAgent:
                 )
                 continue
 
-        # Max iterations guard
-        logger.warning(f"Max iterations ({self.max_iterations}) reached")
+        self._log("WARN", f"Max iterations ({self.max_iterations}) reached")
         return {
             "success": False,
-            "summary": f"Reached maximum iterations ({self.max_iterations}) without completing the task.",
+            "summary": f"Reached maximum iterations ({self.max_iterations}) without completing.",
             "screenshot": last_screenshot_b64,
         }
 
@@ -257,7 +400,6 @@ class KimAgent:
     # ------------------------------------------------------------------
 
     async def _refresh_tools(self) -> None:
-        """Fetch the tool list from the MCP server and store in canonical format."""
         result = await self.session.list_tools()
         self._tools = [
             {
@@ -267,30 +409,20 @@ class KimAgent:
             }
             for t in result.tools
         ]
-        logger.info(f"Loaded {len(self._tools)} MCP tools: {[t['name'] for t in self._tools]}")
+        self._log("INFO", f"Loaded {len(self._tools)} MCP tools")
 
     async def _execute_tool(self, name: str, args: dict) -> str:
-        """Call a MCP tool and return its text output."""
         try:
             result = await self.session.call_tool(name=name, arguments=args)
-            parts = []
-            for content in result.content:
-                if hasattr(content, "text"):
-                    parts.append(content.text)
+            parts = [c.text for c in result.content if hasattr(c, "text")]
             return "\n".join(parts) if parts else "(no output)"
         except Exception as e:
             logger.error(f"MCP tool '{name}' failed: {e}", exc_info=True)
             return f"ERROR calling {name}: {e}"
 
     async def _take_screenshot(self) -> str:
-        """
-        Take a screenshot via MCP and return raw base64 (without data: URI prefix).
-        Falls back to direct mss capture if the MCP call fails.
-        """
         try:
-            raw = await self._execute_tool(
-                "take_screenshot", {"scale": self.screenshot_scale}
-            )
+            raw = await self._execute_tool("take_screenshot", {"scale": self.screenshot_scale})
             if raw.startswith("data:image/png;base64,"):
                 return raw[len("data:image/png;base64,"):]
             return raw
@@ -303,7 +435,6 @@ class KimAgent:
     # ------------------------------------------------------------------
 
     def _is_stuck(self, screenshot_b64: str) -> bool:
-        """Return True if the last 3 screenshots are all identical."""
         h = hashlib.md5(screenshot_b64[:4096].encode()).hexdigest()
         self._screenshot_hashes.append(h)
         if len(self._screenshot_hashes) > 3:
@@ -340,16 +471,15 @@ You MUST respond in EXACTLY one of these formats on every turn:
 
 ## Operational Guidelines
 - Always examine the screenshot before deciding what to do next.
-- After every click or keyboard action, wait for a new screenshot to verify the result.
+- After every click or keyboard action, verify the result in the next screenshot.
 - Prefer run_command for launching apps (e.g. `start notepad.exe`).
 - Use focus_window before typing into an application.
-- If an action fails, try an alternative approach before giving up.
 - Maximum {self.max_iterations} iterations are allowed.
 """
 
 
 # ---------------------------------------------------------------------------
-# Fallback direct screenshot (no MCP)
+# Fallback direct screenshot
 # ---------------------------------------------------------------------------
 
 def _direct_screenshot(scale: float = 0.75) -> str:
@@ -360,31 +490,32 @@ def _direct_screenshot(scale: float = 0.75) -> str:
         shot = sct.grab(sct.monitors[1])
         img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
     if scale != 1.0:
-        img = img.resize(
-            (int(img.width * scale), int(img.height * scale)), Image.LANCZOS
-        )
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
 
 # ---------------------------------------------------------------------------
-# Convenience context manager for external callers
+# Convenience context manager
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
-async def mcp_agent_context(config: dict, provider_name: Optional[str] = None):
+async def mcp_agent_context(
+    config: dict,
+    provider_name: Optional[str] = None,
+    ui_bridge: Optional[UIBridge] = None,
+):
     """
     Yields a KimAgent ready to run tasks.
 
-    Example:
-        async with mcp_agent_context(config) as agent:
+        async with mcp_agent_context(config, ui_bridge=bridge) as agent:
             result = await agent.run("open Notepad")
     """
     name = provider_name or config.get("provider", "claude")
     provider = create_provider(name, config)
     async with mcp_session_context(config) as session:
-        yield KimAgent(config=config, session=session, provider=provider)
+        yield KimAgent(config=config, session=session, provider=provider, ui_bridge=ui_bridge)
 
 
 # ---------------------------------------------------------------------------
@@ -404,11 +535,8 @@ async def _cli_main(args: argparse.Namespace) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    task = args.task
-    if not task:
-        task = input("Task: ").strip()
-
-    print(f"Running task: {task!r}  provider={config.get('provider', 'claude')}", file=sys.stderr)
+    task = args.task or input("Task: ").strip()
+    print(f"Running: {task!r}  provider={config.get('provider', 'claude')}", file=sys.stderr)
 
     async with mcp_agent_context(config) as agent:
         result = await agent.run(task)
@@ -418,23 +546,14 @@ async def _cli_main(args: argparse.Namespace) -> None:
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="python -m orchestrator.agent",
-        description="Kim — autonomous AI agent",
-    )
+    p = argparse.ArgumentParser(prog="python -m orchestrator.agent", description="Kim — autonomous AI agent")
     p.add_argument("--task", "-t", help="Task to execute")
-    p.add_argument(
-        "--provider", "-p",
-        choices=["claude", "openai", "gemini", "deepseek", "browser"],
-        help="Override provider from config.yaml",
-    )
+    p.add_argument("--provider", "-p", choices=["claude", "openai", "gemini", "deepseek", "browser"])
     p.add_argument("--config", "-c", help="Path to config.yaml")
-    p.add_argument("--max-iter", type=int, help="Override max_iterations")
-    p.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
+    p.add_argument("--max-iter", type=int)
+    p.add_argument("--verbose", "-v", action="store_true")
     return p
 
 
 if __name__ == "__main__":
-    parser = _build_arg_parser()
-    cli_args = parser.parse_args()
-    asyncio.run(_cli_main(cli_args))
+    asyncio.run(_cli_main(_build_arg_parser().parse_args()))
