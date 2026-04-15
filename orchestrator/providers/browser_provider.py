@@ -6,10 +6,30 @@ active AI chat tab (Claude, ChatGPT, or Gemini), injects the full context as a
 single text message, waits for generation to finish, scrapes the response, and
 parses it into the canonical {"type": "tool_call"|"text", ...} format.
 
-SETUP:
-    Launch Chrome with remote debugging BEFORE starting Kim:
+MODES:
+    1. Visible (browser_headless: false)  —  Default / first-time setup.
+       User manually launches Chrome with remote debugging and logs in.
+       Session cookies are saved to sessions/chrome_data/ for reuse.
 
-        chrome.exe --remote-debugging-port=9222 --user-data-dir="%TEMP%\kim-chrome"
+    2. Headless (browser_headless: true)  —  Background mode after first login.
+       Kim auto-launches Chromium invisibly via Playwright, reusing the
+       saved session directory.  No browser window appears on screen.
+
+       IMPORTANT: You must have logged in ONCE in visible mode first so
+       the session cookies exist in sessions/chrome_data/.
+
+SETUP (visible mode):
+    Launch Chrome with remote debugging and a persistent profile:
+
+    Windows:
+        chrome.exe --remote-debugging-port=9222 --user-data-dir="<project>/sessions/chrome_data"
+
+    macOS:
+        /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \\
+            --remote-debugging-port=9222 --user-data-dir="<project>/sessions/chrome_data"
+
+    Linux:
+        google-chrome --remote-debugging-port=9222 --user-data-dir="<project>/sessions/chrome_data"
 
     Then navigate to one of:
         https://claude.ai/new
@@ -20,7 +40,9 @@ SETUP:
 import asyncio
 import json
 import logging
+import os
 import re
+from pathlib import Path
 from typing import Optional
 
 from playwright.async_api import (
@@ -119,6 +141,16 @@ class BrowserProvider(BaseProvider):
     """
     Provider that drives a locally-open browser chat session.
     No API key required — the logged-in browser session handles auth.
+
+    Session persistence:
+        Chrome's user data directory defaults to <PROJECT_ROOT>/sessions/chrome_data.
+        This preserves cookies, localStorage, and login sessions across restarts.
+        Override via config.yaml → browser_provider.user_data_dir.
+
+    Headless mode (browser_headless: true):
+        Kim auto-launches Chromium via Playwright using the persistent session
+        directory.  No visible browser window.  Requires a prior visible login
+        so that session cookies exist in the data directory.
     """
 
     def __init__(self, config: dict):
@@ -127,6 +159,27 @@ class BrowserProvider(BaseProvider):
         self._cdp_url = cdp_url
         self._max_history_messages = int(bp_cfg.get("max_history_messages", 6))
         self._max_inject_chars = int(bp_cfg.get("max_inject_chars", 12000))
+        self._headless = bool(bp_cfg.get("browser_headless", False))
+
+        # Track Playwright-managed browser for auto-launch mode
+        self._managed_pw = None      # Playwright context manager
+        self._managed_browser = None  # Browser instance we launched ourselves
+
+        # ── Persistent session directory ────────────────────────────────
+        project_root = Path(
+            os.environ.get("PROJECT_ROOT")
+            or config.get("project_root", str(Path.cwd()))
+        ).resolve()
+        default_data_dir = str(project_root / "sessions" / "chrome_data")
+        self._user_data_dir = str(
+            Path(bp_cfg.get("user_data_dir", default_data_dir)).resolve()
+        )
+        # Ensure the directory exists
+        Path(self._user_data_dir).mkdir(parents=True, exist_ok=True)
+        logger.info(
+            f"BrowserProvider: session dir = {self._user_data_dir}  "
+            f"headless = {self._headless}"
+        )
 
         # Merge user-defined custom sites from config.yaml into the lookup table.
         # Each entry must have url_pattern + at least input/send/response selectors.
@@ -182,21 +235,115 @@ class BrowserProvider(BaseProvider):
             return {"type": "text", "content": f"BROWSER_ERROR: {e}"}
 
     # ------------------------------------------------------------------
-    # CDP connection
+    # CDP connection / headless auto-launch
     # ------------------------------------------------------------------
 
     async def _connect(self, pw: Playwright) -> Browser:
+        """
+        Two-tier connection strategy:
+          1. Try connecting to an externally-launched Chrome via CDP.
+          2. If that fails AND headless mode is enabled, auto-launch
+             Chromium via Playwright with the persistent session dir.
+        """
+        # ── Tier 1: Try CDP connection to user-launched Chrome ────────────
         try:
             browser = await pw.chromium.connect_over_cdp(self._cdp_url)
-            logger.info(f"Connected to Chrome at {self._cdp_url}")
+            logger.info(f"Connected to Chrome at {self._cdp_url} (external)")
             return browser
-        except Exception as e:
-            raise ConnectionError(
-                f"Cannot connect to Chrome at {self._cdp_url}.\n"
-                f"Launch Chrome with:\n"
-                f'  chrome.exe --remote-debugging-port=9222 --user-data-dir="%TEMP%\\kim-chrome"\n'
-                f"Original error: {e}"
-            ) from e
+        except Exception as cdp_error:
+            logger.debug(f"CDP connection failed: {cdp_error}")
+
+        # ── Tier 2: Auto-launch headless if enabled ──────────────────────
+        if self._headless:
+            logger.info("CDP unavailable — auto-launching headless Chromium")
+            return await self._auto_launch(pw)
+
+        # ── Neither worked: give the user actionable instructions ────────
+        import platform
+        sys_name = platform.system()
+        if sys_name == "Darwin":
+            launch_cmd = (
+                '/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome '
+                f'--remote-debugging-port=9222 --user-data-dir="{self._user_data_dir}"'
+            )
+        elif sys_name == "Linux":
+            launch_cmd = (
+                f'google-chrome --remote-debugging-port=9222 '
+                f'--user-data-dir="{self._user_data_dir}"'
+            )
+        else:
+            launch_cmd = (
+                f'chrome.exe --remote-debugging-port=9222 '
+                f'--user-data-dir="{self._user_data_dir}"'
+            )
+        raise ConnectionError(
+            f"Cannot connect to Chrome at {self._cdp_url}.\n"
+            f"\n"
+            f"Option A — Launch Chrome manually (for initial login):\n"
+            f"  {launch_cmd}\n"
+            f"\n"
+            f"Option B — Enable headless mode (after first login):\n"
+            f"  Set browser_headless: true in config.yaml\n"
+            f"\n"
+            f"Session data: {self._user_data_dir}"
+        )
+
+    async def _auto_launch(self, pw: Playwright) -> Browser:
+        """
+        Launch a Playwright-managed Chromium instance in headless mode,
+        reusing the persistent session directory for saved cookies.
+
+        This provides a completely invisible browser that preserves login
+        state from a previous visible session.
+        """
+        session_path = Path(self._user_data_dir)
+        if not any(session_path.iterdir()):
+            raise RuntimeError(
+                f"Headless mode requires a prior login session, but the session "
+                f"directory is empty: {self._user_data_dir}\n"
+                f"Run once with browser_headless: false, log into your AI chat, "
+                f"then switch to headless mode."
+            )
+
+        logger.info(
+            f"Launching headless Chromium with session dir: {self._user_data_dir}"
+        )
+
+        # launch_persistent_context gives us a BrowserContext directly;
+        # we use its .browser reference for consistency with CDP mode.
+        context = await pw.chromium.launch_persistent_context(
+            user_data_dir=self._user_data_dir,
+            headless=True,
+            # Chrome args that improve headless stability
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-popup-blocking",
+            ],
+            viewport={"width": 1280, "height": 900},
+            # Persist cookies/localStorage by using the user_data_dir
+            ignore_default_args=["--enable-automation"],
+        )
+
+        # Navigate to a known chat URL if no pages exist yet
+        if not context.pages:
+            page = await context.new_page()
+            await page.goto("https://claude.ai/new", wait_until="domcontentloaded")
+            await asyncio.sleep(2)  # Let the page settle
+            logger.info("Opened default chat page: claude.ai/new")
+
+        # The caller expects a Browser object for _find_chat_page.
+        # launch_persistent_context returns a BrowserContext, so we
+        # store it and adapt our page-finding to work with it.
+        self._managed_context = context
+        logger.info(
+            f"Headless Chromium ready — {len(context.pages)} page(s) loaded"
+        )
+
+        # Return the browser that owns this context (may be None for
+        # persistent contexts — we handle this in _find_chat_page)
+        return context.browser or context  # type: ignore[return-value]
 
     async def _list_pages(self, browser: Browser) -> list[str]:
         pages = []
@@ -205,11 +352,14 @@ class BrowserProvider(BaseProvider):
                 pages.append(page.url)
         return pages
 
-    async def _find_chat_page(self, browser: Browser) -> tuple[Optional[Page], Optional[str]]:
+    async def _find_chat_page(self, browser) -> tuple[Optional[Page], Optional[str]]:
         """
         Scan all open pages and return (page, site_key) for the first matching
         chat tab.  Custom sites (from config.yaml) are checked before the
         hardcoded built-in ones so they can override defaults.
+
+        Works with both CDP-connected Browser objects and Playwright-managed
+        BrowserContext objects (headless mode).
         """
         # Check custom sites first, then built-ins
         ordered = [
@@ -217,13 +367,23 @@ class BrowserProvider(BaseProvider):
         ] + [
             (k, v) for k, v in self._site_configs.items() if k in SITE_CONFIGS
         ]
-        for ctx in browser.contexts:
-            for page in ctx.pages:
-                url = page.url
-                for site_key, cfg in ordered:
-                    if cfg["url_pattern"] in url:
-                        logger.info(f"Found {site_key} tab: {url}")
-                        return page, site_key
+
+        # Collect all pages from either Browser or BrowserContext
+        all_pages = []
+        if hasattr(browser, 'contexts'):
+            # Standard Browser object (CDP mode)
+            for ctx in browser.contexts:
+                all_pages.extend(ctx.pages)
+        elif hasattr(browser, 'pages'):
+            # BrowserContext object (headless persistent mode)
+            all_pages.extend(browser.pages)
+
+        for page in all_pages:
+            url = page.url
+            for site_key, cfg in ordered:
+                if cfg["url_pattern"] in url:
+                    logger.info(f"Found {site_key} tab: {url}")
+                    return page, site_key
         return None, None
 
     # ------------------------------------------------------------------

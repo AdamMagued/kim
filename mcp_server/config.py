@@ -37,6 +37,9 @@ BLOCKED_COMMANDS: list[str] = _cfg.get("shell", {}).get("blocked_commands", [
 SHELL_TIMEOUT: int = int(_cfg.get("shell", {}).get("timeout", 30))
 PREVIEW_MODE: bool = bool(_cfg.get("preview_mode", False))
 LOG_LEVEL: str = _cfg.get("logging", {}).get("level", "INFO")
+BROWSER_HEADLESS: bool = bool(
+    _cfg.get("browser_provider", {}).get("browser_headless", False)
+)
 
 
 def validate_path(path_str: str) -> Path:

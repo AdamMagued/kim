@@ -39,6 +39,8 @@ browser_provider:
   cdp_url: "http://localhost:9222"   # Chrome remote debugging URL
   max_history_messages: 6            # How many past turns to include in injected prompt
   max_inject_chars: 12000            # Trim prompt if longer than this
+  browser_headless: false            # true = Kim auto-launches Chrome invisibly (must have logged in once first)
+                                     # false = user manually launches Chrome (visible) for initial login
 
 # ── Custom browser sites ────────────────────────────────────────────────────
 # Add any website with an AI chat UI here.  The browser provider will check

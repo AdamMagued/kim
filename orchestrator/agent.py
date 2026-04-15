@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import queue
+import random
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -235,6 +236,10 @@ class KimAgent:
         self._screenshot_hashes: list[str] = []
         self._tools: list[dict] = []
         self._ui_bridge: Optional[UIBridge] = ui_bridge
+        # Retry configuration for LLM API calls
+        self._max_retries: int = int(config.get("max_retries", 5))
+        self._retry_base_delay: float = float(config.get("retry_base_delay", 1.0))
+        self._retry_max_delay: float = float(config.get("retry_max_delay", 60.0))
 
     def set_ui_bridge(self, bridge: Optional[UIBridge]) -> None:
         self._ui_bridge = bridge
@@ -300,15 +305,15 @@ class KimAgent:
 
             self._log("INFO", f"--- Iteration {iteration}/{self.max_iterations} ---")
 
-            # ── LLM call ─────────────────────────────────────────────────
+            # ── LLM call with retry ──────────────────────────────────────
             try:
-                response = await self.provider.complete(
+                response = await self._call_with_retry(
                     messages=self.memory.get_messages(),
                     tools=self._tools,
                     system=system_prompt,
                 )
             except Exception as e:
-                self._log("ERROR", f"Provider error: {e}")
+                self._log("ERROR", f"Provider error (all retries exhausted): {e}")
                 return {"success": False, "summary": f"LLM error: {e}", "screenshot": last_screenshot_b64}
 
             # ── Tool call ─────────────────────────────────────────────────
@@ -435,11 +440,90 @@ class KimAgent:
     # ------------------------------------------------------------------
 
     def _is_stuck(self, screenshot_b64: str) -> bool:
-        h = hashlib.md5(screenshot_b64[:4096].encode()).hexdigest()
+        """Return True if the last 3 screenshots are identical (MD5 of full b64)."""
+        h = hashlib.md5(screenshot_b64.encode()).hexdigest()
         self._screenshot_hashes.append(h)
         if len(self._screenshot_hashes) > 3:
             self._screenshot_hashes.pop(0)
-        return len(self._screenshot_hashes) == 3 and len(set(self._screenshot_hashes)) == 1
+        if len(self._screenshot_hashes) == 3 and len(set(self._screenshot_hashes)) == 1:
+            self._log("DEBUG", f"Stuck check: 3 identical hashes ({h[:12]}...)")
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # LLM retry with exponential backoff
+    # ------------------------------------------------------------------
+
+    async def _call_with_retry(
+        self,
+        messages: list,
+        tools: list,
+        system: str,
+    ) -> dict:
+        """
+        Call the LLM provider with retry + exponential backoff for:
+          - HTTP 429 (Rate Limit)
+          - HTTP 5xx (Server errors)
+          - ConnectionError / TimeoutError
+
+        Non-retryable errors (auth, invalid request) are raised immediately.
+        """
+        last_error = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                return await self.provider.complete(
+                    messages=messages,
+                    tools=tools,
+                    system=system,
+                )
+            except Exception as e:
+                last_error = e
+                if not self._is_retryable(e):
+                    raise
+
+                delay = min(
+                    self._retry_base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1),
+                    self._retry_max_delay,
+                )
+                self._log(
+                    "WARN",
+                    f"LLM call failed (attempt {attempt}/{self._max_retries}): "
+                    f"{type(e).__name__}: {e} — retrying in {delay:.1f}s",
+                )
+                await asyncio.sleep(delay)
+
+        raise last_error  # type: ignore[misc]
+
+    @staticmethod
+    def _is_retryable(error: Exception) -> bool:
+        """Determine if an LLM error is worth retrying."""
+        error_str = str(error).lower()
+        error_type = type(error).__name__.lower()
+
+        # Rate limit errors (HTTP 429)
+        if "rate" in error_str and "limit" in error_str:
+            return True
+        if "429" in error_str:
+            return True
+        if "ratelimit" in error_type:
+            return True
+
+        # Server errors (HTTP 5xx)
+        for code in ("500", "502", "503", "529"):
+            if code in error_str:
+                return True
+        if "server" in error_str and "error" in error_str:
+            return True
+        if "overloaded" in error_str:
+            return True
+
+        # Network / timeout errors
+        if isinstance(error, (ConnectionError, TimeoutError, OSError)):
+            return True
+        if "timeout" in error_str or "connection" in error_str:
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # System prompt
