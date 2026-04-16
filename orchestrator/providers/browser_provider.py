@@ -6,6 +6,24 @@ active AI chat tab (Claude, ChatGPT, or Gemini), injects the full context as a
 single text message, waits for generation to finish, scrapes the response, and
 parses it into the canonical {"type": "tool_call"|"text", ...} format.
 
+Multimodal support:
+    Screenshots from the conversation history are decoded from base64, written
+    to a temporary ``temp_screenshot.png`` file, and uploaded via the site's
+    upload button + Playwright file chooser (or a hidden ``<input type="file">``)
+    BEFORE the text prompt is pasted.  The temp file is cleaned up in a
+    ``finally`` block after the message has been sent.
+
+Text injection:
+    Uses clipboard-paste (``navigator.clipboard.writeText`` + Cmd/Ctrl+V)
+    instead of the deprecated ``document.execCommand('insertText')``, which
+    truncates at newlines in contenteditable editors (ProseMirror, Gemini's
+    rich-textarea, etc.).
+
+Popup handling:
+    After uploading an image, a ``_dismiss_popups`` sweep clicks through any
+    one-time consent dialogs (Gemini "I agree" / "Got it" / "Continue") so
+    they don't block the Send button.
+
 MODES:
     1. Visible (browser_headless: false)  —  Default / first-time setup.
        User manually launches Chrome with remote debugging and logs in.
@@ -25,7 +43,7 @@ SETUP (visible mode):
         chrome.exe --remote-debugging-port=9222 --user-data-dir="<project>/sessions/chrome_data"
 
     macOS:
-        /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \\
+        /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\
             --remote-debugging-port=9222 --user-data-dir="<project>/sessions/chrome_data"
 
     Linux:
@@ -38,9 +56,11 @@ SETUP (visible mode):
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
+import platform
 import re
 from pathlib import Path
 from typing import Optional
@@ -80,6 +100,11 @@ SITE_CONFIGS: dict[str, dict] = {
             '[data-testid^="conversation-turn"]',
             '.font-claude-message',
         ],
+        "upload_button_selectors": [
+            'button[aria-label*="Attach"]',
+            'button[aria-label*="attach"]',
+            'button[aria-label*="Upload"]',
+        ],
     },
     "chatgpt": {
         "url_pattern": "chatgpt.com",
@@ -98,6 +123,10 @@ SITE_CONFIGS: dict[str, dict] = {
         "response_selectors": [
             "div.markdown",
             "article div.prose",
+        ],
+        "upload_button_selectors": [
+            'button[aria-label*="Attach"]',
+            'button[aria-label*="attach"]',
         ],
     },
     "gemini": {
@@ -118,6 +147,12 @@ SITE_CONFIGS: dict[str, dict] = {
             "model-response",
             ".response-content",
         ],
+        "upload_button_selectors": [
+            'button[aria-label*="Upload"]',
+            'button[aria-label*="upload"]',
+            'button[aria-label*="Add image"]',
+            'button[aria-label*="add image"]',
+        ],
     },
 }
 
@@ -130,11 +165,30 @@ def _to_list(value) -> list[str]:
     return [str(value)]
 
 
+# Modifier key: Cmd on Mac, Ctrl everywhere else
+_MOD_KEY = "Meta" if platform.system() == "Darwin" else "Control"
+
 CDP_URL = "http://localhost:9222"
 # Seconds to wait for a new response to appear after sending
 RESPONSE_WAIT_S = 90
 # Seconds to wait for generation to complete after response appears
 GENERATION_WAIT_S = 180
+# Minimum chars expected in editor after paste, for verification
+_VERIFY_MIN_CHARS = 20
+# Maximum retries for clipboard paste injection
+_INJECT_MAX_RETRIES = 3
+
+# Button labels that indicate a dismissible popup / consent dialog
+_POPUP_DISMISS_LABELS = [
+    "I agree",
+    "Got it",
+    "Continue",
+    "Accept",
+    "OK",
+    "Dismiss",
+    "Close",
+    "No thanks",
+]
 
 
 class BrowserProvider(BaseProvider):
@@ -174,12 +228,18 @@ class BrowserProvider(BaseProvider):
         self._user_data_dir = str(
             Path(bp_cfg.get("user_data_dir", default_data_dir)).resolve()
         )
+        self._project_root = project_root
         # Ensure the directory exists
         Path(self._user_data_dir).mkdir(parents=True, exist_ok=True)
         logger.info(
             f"BrowserProvider: session dir = {self._user_data_dir}  "
             f"headless = {self._headless}"
         )
+
+        # Stateful flag — tracks whether we've already sent the system
+        # prompt + tool list to the chat UI in this session.  Subsequent
+        # calls only send the latest delta message.
+        self._sent_system_prompt = False
 
         # Merge user-defined custom sites from config.yaml into the lookup table.
         # Each entry must have url_pattern + at least input/send/response selectors.
@@ -195,10 +255,15 @@ class BrowserProvider(BaseProvider):
                 "send_selectors":     _to_list(site_def.get("send_selectors")   or site_def.get("send_button", "")),
                 "stop_selectors":     _to_list(site_def.get("stop_selectors")   or site_def.get("stop_button", "")),
                 "response_selectors": _to_list(site_def.get("response_selectors") or site_def.get("response_selector", "")),
+                "upload_button_selectors": _to_list(site_def.get("upload_button_selectors") or site_def.get("upload_button", "")),
             }
             logger.info(f"Registered custom site: {site_key!r} → {site_def['url_pattern']!r}")
 
         logger.info(f"BrowserProvider: cdp_url={cdp_url}  sites={list(self._site_configs)}")
+
+    # ==================================================================
+    # Main entry point
+    # ==================================================================
 
     async def complete(
         self,
@@ -207,11 +272,20 @@ class BrowserProvider(BaseProvider):
         system: str,
     ) -> dict:
         """
-        Formats the full context as a single text block, injects it into the
-        active AI chat tab, waits for the response, and parses it.
+        Pure-clipboard approach — no temp files.
+
+        1. Build a text-only prompt (base64 blobs extracted, not embedded).
+        2. If a screenshot was extracted, inject it into the browser
+           clipboard as an image blob and paste it into the editor.
+        3. Dismiss any privacy/consent popups.
+        4. Paste the cleaned text prompt via clipboard.
+        5. Click Send and wait for the AI response.
         """
-        prompt = self._format_prompt(messages, tools, system)
-        logger.debug(f"Injecting {len(prompt)} chars into browser")
+        prompt, images_b64 = self._format_prompt(messages, tools, system)
+        logger.debug(
+            f"Prompt ready: {len(prompt)} chars, "
+            f"{len(images_b64)} image(s) extracted"
+        )
 
         try:
             async with async_playwright() as pw:
@@ -227,16 +301,31 @@ class BrowserProvider(BaseProvider):
                             f"Detected pages: {await self._list_pages(browser)}"
                         ),
                     }
-                cfg = SITE_CONFIGS[site]
+                cfg = self._site_configs[site]
+
+                # ── Step 1: Paste screenshot via clipboard (if any) ──────
+                if images_b64:
+                    await self._inject_image_clipboard(
+                        page, cfg, images_b64[-1]
+                    )
+
+                    # ── Step 2: Let the UI render the image ──────────────
+                    await page.wait_for_timeout(2000)
+
+                    # ── Step 3: Dismiss popups (Gemini "I agree", etc.) ──
+                    await self._dismiss_popups(page)
+
+                # ── Step 4: Paste cleaned text prompt ────────────────────
+                # ── Step 5: Click Send + wait for response ───────────────
                 raw_response = await self._send_and_wait(page, cfg, prompt)
                 return self._parse_response(raw_response)
         except Exception as e:
             logger.error(f"BrowserProvider.complete failed: {e}", exc_info=True)
             return {"type": "text", "content": f"BROWSER_ERROR: {e}"}
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # CDP connection / headless auto-launch
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     async def _connect(self, pw: Playwright) -> Browser:
         """
@@ -259,7 +348,6 @@ class BrowserProvider(BaseProvider):
             return await self._auto_launch(pw)
 
         # ── Neither worked: give the user actionable instructions ────────
-        import platform
         sys_name = platform.system()
         if sys_name == "Darwin":
             launch_cmd = (
@@ -386,39 +474,298 @@ class BrowserProvider(BaseProvider):
                     return page, site_key
         return None, None
 
-    # ------------------------------------------------------------------
-    # Injection + wait + scrape
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Popup dismissal
+    # ==================================================================
+
+    async def _dismiss_popups(self, page: Page) -> None:
+        """
+        Dismiss any one-time consent / privacy popups (e.g. Gemini's
+        "I agree" dialog, or promotional overlays like NotebookLM).
+
+        Strategy:
+          1. Press Escape a few times to clear any marketing modals or
+             overlays that don't have a predictable dismiss button.
+          2. Click through known consent buttons ("I agree", "Got it", …).
+          3. Sweep generic [role="dialog"] containers as a catch-all.
+
+        Uses a short timeout (1.5 s) per button so this never blocks
+        execution when no popup is present.
+        """
+        # ── Phase 0: Escape-key sweep for marketing overlays ─────────────
+        for i in range(3):
+            try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.3)
+            except Exception:
+                break
+        logger.debug("Escape-key sweep complete (3 presses)")
+        for label in _POPUP_DISMISS_LABELS:
+            try:
+                # Case-insensitive text match via XPath
+                btn = page.locator(
+                    f"xpath=//button[contains(translate(., "
+                    f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+                    f"'abcdefghijklmnopqrstuvwxyz'), "
+                    f"'{label.lower()}')]"
+                )
+                # Wait at most 1.5 s for the button to become visible
+                if await btn.count() > 0:
+                    first = btn.first
+                    try:
+                        await first.wait_for(state="visible", timeout=1500)
+                        await first.click()
+                        logger.info(f"Dismissed popup button: {label!r}")
+                        await asyncio.sleep(0.5)  # Let the dialog animate away
+                    except Exception:
+                        # Button exists but not visible/clickable — skip
+                        pass
+            except Exception as e:
+                logger.debug(f"Popup check for {label!r} failed: {e}")
+                continue
+
+        # Also try generic dialog dismiss patterns (role="dialog" + confirm)
+        try:
+            dialog_btns = page.locator(
+                '[role="dialog"] button, '
+                '[role="alertdialog"] button, '
+                '.modal button, '
+                '.dialog button'
+            )
+            count = await dialog_btns.count()
+            for i in range(count):
+                btn = dialog_btns.nth(i)
+                try:
+                    text = (await btn.inner_text()).strip().lower()
+                    if text in {"i agree", "got it", "continue", "accept", "ok", "dismiss"}:
+                        await btn.click()
+                        logger.info(f"Dismissed dialog button: {text!r}")
+                        await asyncio.sleep(0.5)
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug(f"Generic dialog dismiss sweep failed: {e}")
+
+    # ==================================================================
+    # Screenshot upload
+    # ==================================================================
+
+    async def _inject_image_clipboard(
+        self, page: Page, cfg: dict, image_b64: str
+    ) -> None:
+        """
+        Inject a base64 PNG screenshot into the editor via the clipboard.
+
+        Uses the Clipboard API to write an image blob, then pastes it
+        into the focused editor with Cmd/Ctrl+V.  No temp files needed.
+        """
+        # Build the full data URI for fetch()
+        if not image_b64.startswith("data:"):
+            data_uri = f"data:image/png;base64,{image_b64}"
+        else:
+            data_uri = image_b64
+
+        # Focus the editor first
+        input_sel = await self._find_selector(page, cfg["input_selectors"])
+        if not input_sel:
+            logger.warning("Cannot paste image — editor not found")
+            return
+
+        await page.click(input_sel)
+        await asyncio.sleep(0.2)
+
+        try:
+            await page.evaluate(
+                """async (dataUri) => {
+                    const res  = await fetch(dataUri);
+                    const blob = await res.blob();
+                    const item = new ClipboardItem({ [blob.type]: blob });
+                    await navigator.clipboard.write([item]);
+                }""",
+                data_uri,
+            )
+            await asyncio.sleep(0.2)
+            await page.keyboard.press(f"{_MOD_KEY}+v")
+            logger.info("Screenshot pasted into editor via clipboard")
+        except Exception as e:
+            logger.warning(f"Clipboard image injection failed: {e}")
+
+    # ==================================================================
+    # Text injection via clipboard paste
+    # ==================================================================
+
+    async def _inject_text(self, page: Page, selector: str, text: str) -> None:
+        """
+        Inject text into a contenteditable or textarea element using the
+        system clipboard.  This avoids the deprecated
+        ``execCommand('insertText')`` which truncates at the first newline
+        in rich-text editors.
+
+        Steps:
+          1. Focus and select-all in the editor to clear existing content.
+          2. Write the prompt to the clipboard via
+             ``navigator.clipboard.writeText()``.
+          3. Press Cmd+V (Mac) or Ctrl+V (other) to paste.
+          4. Verify the injection landed (retry up to ``_INJECT_MAX_RETRIES``
+             times).
+
+        Falls back to a synthetic ``ClipboardEvent('paste')`` dispatch, and
+        finally to ``page.keyboard.type()`` in chunks as a last resort.
+        """
+        for attempt in range(1, _INJECT_MAX_RETRIES + 1):
+            # Focus the editor element
+            await page.click(selector)
+            await asyncio.sleep(0.2)
+
+            # Select all existing content and delete it
+            await page.keyboard.press(f"{_MOD_KEY}+a")
+            await asyncio.sleep(0.1)
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(0.1)
+
+            # ── Primary: navigator.clipboard.writeText + Cmd/Ctrl+V ──────
+            try:
+                await page.evaluate(
+                    """async (text) => {
+                        await navigator.clipboard.writeText(text);
+                    }""",
+                    text,
+                )
+                await asyncio.sleep(0.1)
+                await page.keyboard.press(f"{_MOD_KEY}+v")
+                await asyncio.sleep(0.5)
+
+                if await self._verify_injection(page, selector):
+                    logger.info(
+                        f"Text injected via clipboard paste (attempt {attempt})"
+                    )
+                    return
+            except Exception as e:
+                logger.debug(
+                    f"navigator.clipboard.writeText failed ({e}), "
+                    "trying ClipboardEvent fallback"
+                )
+
+            # ── Fallback A: synthetic ClipboardEvent dispatch ────────────
+            await page.click(selector)
+            await page.keyboard.press(f"{_MOD_KEY}+a")
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(0.1)
+
+            await page.evaluate(
+                """([selector, text]) => {
+                    const el = document.querySelector(selector);
+                    if (!el) return;
+                    el.focus();
+                    const dt = new DataTransfer();
+                    dt.setData('text/plain', text);
+                    const event = new ClipboardEvent('paste', {
+                        clipboardData: dt,
+                        bubbles: true,
+                        cancelable: true,
+                    });
+                    el.dispatchEvent(event);
+                }""",
+                [selector, text],
+            )
+            await asyncio.sleep(0.5)
+
+            if await self._verify_injection(page, selector):
+                logger.info(
+                    f"Text injected via ClipboardEvent (attempt {attempt})"
+                )
+                return
+
+            # ── Fallback B: page.keyboard.type() in chunks ───────────────
+            logger.debug("ClipboardEvent fallback failed, using keyboard.type()")
+            await page.click(selector)
+            await page.keyboard.press(f"{_MOD_KEY}+a")
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(0.1)
+
+            chunk_size = 500
+            for i in range(0, len(text), chunk_size):
+                await page.keyboard.type(text[i:i + chunk_size], delay=0)
+                await asyncio.sleep(0.05)
+
+            if await self._verify_injection(page, selector):
+                logger.info(
+                    f"Text injected via keyboard.type() (attempt {attempt})"
+                )
+                return
+
+            logger.warning(
+                f"Injection verification failed "
+                f"(attempt {attempt}/{_INJECT_MAX_RETRIES}), retrying…"
+            )
+            await asyncio.sleep(0.3)
+
+        # All retries exhausted
+        logger.error(
+            f"Text injection verification failed after {_INJECT_MAX_RETRIES} "
+            "attempts. Proceeding — prompt may be incomplete."
+        )
+
+    async def _verify_injection(self, page: Page, selector: str) -> bool:
+        """
+        Check that the editor element contains a meaningful amount of text
+        after injection.  Returns True if the editor has at least
+        ``_VERIFY_MIN_CHARS`` characters.
+        """
+        try:
+            text_len = await page.evaluate(
+                """(selector) => {
+                    const el = document.querySelector(selector);
+                    if (!el) return 0;
+                    return (el.innerText || el.textContent || el.value || '').length;
+                }""",
+                selector,
+            )
+            logger.debug(f"Injection verify: editor has {text_len} chars")
+            return text_len >= _VERIFY_MIN_CHARS
+        except Exception as e:
+            logger.debug(f"Injection verify error: {e}")
+            return False
+
+    # ==================================================================
+    # Send + wait + scrape
+    # ==================================================================
 
     async def _send_and_wait(self, page: Page, cfg: dict, message: str) -> str:
+        """Inject the prompt, click Send, and wait for the full response."""
         # Count current responses before sending
         response_sel = cfg["response_selectors"][0]
         initial_count = await page.locator(response_sel).count()
         logger.debug(f"Response count before send: {initial_count}")
 
-        # Focus and clear the input box
+        # Locate the input box
         input_sel = await self._find_selector(page, cfg["input_selectors"])
         if not input_sel:
             raise RuntimeError("Could not locate chat input box")
 
+        # Inject prompt text via clipboard paste (with verification)
         await self._inject_text(page, input_sel, message)
-        await asyncio.sleep(0.3)  # Brief settle before clicking send
+        await asyncio.sleep(0.3)
 
-        # Click the send button
+        # Click the send button (prefer aria-label="Send message")
         send_sel = await self._find_selector(page, cfg["send_selectors"])
-        if not send_sel:
-            # Try pressing Enter as fallback
+        if send_sel:
+            await page.click(send_sel)
+        else:
             logger.warning("Send button not found; pressing Enter")
             await page.keyboard.press("Enter")
-        else:
-            await page.click(send_sel)
 
-        logger.info("Message sent, waiting for response...")
+        logger.info("Message sent, waiting for response…")
 
         # Wait for response count to increase (generation started)
-        started = await self._wait_for_new_response(page, response_sel, initial_count)
+        started = await self._wait_for_new_response(
+            page, response_sel, initial_count
+        )
         if not started:
-            raise TimeoutError(f"No new response appeared after {RESPONSE_WAIT_S}s")
+            raise TimeoutError(
+                f"No new response appeared after {RESPONSE_WAIT_S}s"
+            )
 
         # Wait for generation to finish (stop button disappears)
         await self._wait_for_generation_complete(page, cfg["stop_selectors"])
@@ -429,51 +776,29 @@ class BrowserProvider(BaseProvider):
         # Scrape the last response
         return await self._scrape_last_response(page, cfg["response_selectors"])
 
-    async def _find_selector(self, page: Page, selectors: list[str]) -> Optional[str]:
-        """Return the first selector from the list that matches at least one element."""
+    async def _find_selector(
+        self, page: Page, selectors: list[str]
+    ) -> Optional[str]:
+        """Return the first selector from the list that matches ≥1 element."""
         for sel in selectors:
             try:
-                count = await page.locator(sel).count()
-                if count > 0:
+                if await page.locator(sel).count() > 0:
                     return sel
             except Exception:
                 continue
         return None
 
-    async def _inject_text(self, page: Page, selector: str, text: str) -> None:
-        """
-        Clear the contenteditable/textarea element and insert the given text via
-        execCommand (works on ProseMirror, draft-js, and plain contenteditable).
-        Falls back to Playwright type() for plain <textarea> elements.
-        """
-        await page.evaluate(
-            """([selector, text]) => {
-                const el = document.querySelector(selector);
-                if (!el) return false;
-                el.focus();
-                // Select all existing content
-                const range = document.createRange();
-                range.selectNodeContents(el);
-                const sel = window.getSelection();
-                sel.removeAllRanges();
-                sel.addRange(range);
-                // Replace with new text using execCommand (triggers framework events)
-                document.execCommand('delete', false, null);
-                document.execCommand('insertText', false, text);
-                return true;
-            }""",
-            [selector, text],
-        )
-
     async def _wait_for_new_response(
         self, page: Page, response_sel: str, initial_count: int
     ) -> bool:
         """Poll until the response element count increases."""
-        deadline = asyncio.get_event_loop().time() + RESPONSE_WAIT_S
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = asyncio.get_running_loop().time() + RESPONSE_WAIT_S
+        while asyncio.get_running_loop().time() < deadline:
             count = await page.locator(response_sel).count()
             if count > initial_count:
-                logger.debug(f"Response element count: {initial_count} → {count}")
+                logger.debug(
+                    f"Response element count: {initial_count} → {count}"
+                )
                 return True
             await asyncio.sleep(0.5)
         return False
@@ -483,10 +808,10 @@ class BrowserProvider(BaseProvider):
     ) -> None:
         """
         Wait until all known stop-button selectors are invisible (generation
-        finished) or until GENERATION_WAIT_S seconds elapse.
+        finished) or until ``GENERATION_WAIT_S`` seconds elapse.
         """
-        deadline = asyncio.get_event_loop().time() + GENERATION_WAIT_S
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = asyncio.get_running_loop().time() + GENERATION_WAIT_S
+        while asyncio.get_running_loop().time() < deadline:
             any_stop_visible = False
             for sel in stop_selectors:
                 try:
@@ -499,9 +824,14 @@ class BrowserProvider(BaseProvider):
                 logger.debug("Generation complete (stop button gone)")
                 return
             await asyncio.sleep(0.75)
-        logger.warning(f"Generation did not complete after {GENERATION_WAIT_S}s — scraping anyway")
+        logger.warning(
+            f"Generation did not complete after {GENERATION_WAIT_S}s "
+            "— scraping anyway"
+        )
 
-    async def _scrape_last_response(self, page: Page, response_selectors: list[str]) -> str:
+    async def _scrape_last_response(
+        self, page: Page, response_selectors: list[str]
+    ) -> str:
         """Return inner text of the last response element."""
         for sel in response_selectors:
             try:
@@ -512,84 +842,158 @@ class BrowserProvider(BaseProvider):
                     return text.strip()
             except Exception:
                 continue
-        raise RuntimeError("Could not scrape response from any known selector")
+        raise RuntimeError(
+            "Could not scrape response from any known selector"
+        )
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Prompt formatting
-    # ------------------------------------------------------------------
+    # ==================================================================
+
+    # Prefix that marks the start of an inline data-URI image
+    _DATA_URI_PREFIX = "data:image/png;base64,"
+
+    def _strip_base64(self, text: str, images_out: list[str]) -> str:
+        """Find ``data:image/png;base64,…`` strings using plain string
+        operations (no regex — avoids catastrophic backtracking on
+        multi-MB retina screenshots).
+
+        For each match the raw base64 payload is appended to *images_out*
+        and the entire data-URI is replaced with ``[Screenshot attached]``.
+
+        Returns the cleaned text (guaranteed free of base64 blobs).
+        """
+        prefix = self._DATA_URI_PREFIX
+        while True:
+            start = text.find(prefix)
+            if start == -1:
+                break
+
+            # Find where the base64 payload ends: next whitespace,
+            # quote, angle bracket, or end-of-string.
+            payload_start = start + len(prefix)
+            end = payload_start
+            while end < len(text) and text[end] not in " \t\n\r\"'<>)],;":
+                end += 1
+
+            payload = text[payload_start:end]
+            if payload:  # only collect non-empty payloads
+                images_out.append(payload)
+
+            # Replace the entire data URI with a placeholder
+            text = text[:start] + "[Screenshot attached]" + text[end:]
+
+        return text
 
     def _format_prompt(
         self, messages: list[dict], tools: list[dict], system: str
-    ) -> str:
+    ) -> tuple[str, list[str]]:
         """
-        Compose the full context as a single text block.  Images are omitted
-        (text-only injection).  History is trimmed to the most recent
-        `max_history_messages` turns.
-        """
-        # Compact tool list
-        compact_tools = [
-            {"name": t["name"], "description": t.get("description", ""),
-             "args": list(t.get("parameters", {}).get("properties", {}).keys())}
-            for t in tools
-        ]
-        tools_json = json.dumps(compact_tools, indent=2)
+        Stateful prompt formatter for browser-based chat UIs.
 
-        # History — text only, last N messages
-        tail = messages[-self._max_history_messages:]
-        history_lines = []
-        for msg in tail:
-            role_label = "User" if msg["role"] == "user" else "Assistant"
-            content = msg["content"]
+        Because the web UI (Gemini, Claude, ChatGPT) retains its own
+        conversation history, we do **not** replay past messages.  Instead:
+
+        - **First call**: Send ``[SYSTEM]`` + ``[AVAILABLE TOOLS]`` +
+          ``[INSTRUCTIONS]`` + the latest user message.
+        - **Subsequent calls**: Send **only** the latest message (the
+          delta — typically a tool result or a follow-up instruction).
+
+        In both cases, any embedded ``data:image/png;base64,…`` blobs are
+        extracted for clipboard upload and replaced with
+        ``[Screenshot attached]``.
+
+        Returns:
+            ``(prompt_text, images_b64)``
+        """
+        images_b64: list[str] = []
+
+        # ── Extract the LAST message only (the delta) ────────────────────
+        last_text = ""
+        if messages:
+            last_msg = messages[-1]
+            content = last_msg["content"]
+
             if isinstance(content, list):
-                text_parts = [
-                    item["text"] for item in content
-                    if item.get("type") == "text" and item.get("text")
-                ]
-                text = "\n".join(text_parts)
+                text_parts: list[str] = []
+                for item in content:
+                    item_type = item.get("type", "")
+                    if item_type == "text" and item.get("text"):
+                        cleaned = self._strip_base64(
+                            item["text"], images_b64
+                        )
+                        text_parts.append(cleaned)
+                    elif item_type == "image" and item.get("data"):
+                        images_b64.append(item["data"])
+                        text_parts.append("[Screenshot attached]")
+                last_text = "\n".join(text_parts)
             else:
-                text = str(content)
-            if text.strip():
-                history_lines.append(f"{role_label}: {text.strip()}")
+                last_text = self._strip_base64(str(content), images_b64)
 
-        history_block = "\n\n".join(history_lines)
+        last_text = last_text.strip()
 
-        prompt = (
-            f"[SYSTEM]\n{system}\n\n"
-            f"[AVAILABLE TOOLS]\n{tools_json}\n\n"
-            f"[CONVERSATION HISTORY]\n{history_block}\n\n"
-            "[INSTRUCTIONS]\n"
-            "Respond with EXACTLY ONE of:\n"
-            '1. A JSON tool call on a single line: {"tool": "<name>", "args": {<args>}}\n'
-            "2. TASK_COMPLETE: <one-line summary>\n"
-            "3. NEED_HELP: <reason you cannot proceed>\n"
-            "Do NOT include markdown formatting around the JSON."
-        )
+        # ── First message: include system prompt + tools ─────────────────
+        if not self._sent_system_prompt:
+            compact_tools = [
+                {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "args": list(
+                        t.get("parameters", {}).get("properties", {}).keys()
+                    ),
+                }
+                for t in tools
+            ]
+            tools_json = json.dumps(compact_tools, indent=2)
+
+            prompt = (
+                f"[SYSTEM]\n{system}\n"
+                "You are running on macOS Tahoe. Use POSIX file paths "
+                "(e.g., /Users/adammaged/Desktop/) and Mac-specific "
+                "terminal commands (like 'open' instead of 'start').\n\n"
+                f"[AVAILABLE TOOLS]\n{tools_json}\n\n"
+                "[INSTRUCTIONS]\n"
+                "Respond with EXACTLY ONE of:\n"
+                '1. A JSON tool call on a single line: '
+                '{"tool": "<name>", "args": {<args>}}\n'
+                "2. TASK_COMPLETE: <one-line summary>\n"
+                "3. NEED_HELP: <reason you cannot proceed>\n"
+                "Do NOT include markdown formatting around the JSON.\n\n"
+                f"{last_text}"
+            )
+            self._sent_system_prompt = True
+        else:
+            # ── Subsequent calls: delta only ─────────────────────────────
+            prompt = last_text
 
         # Trim if too long
         if len(prompt) > self._max_inject_chars:
             trim_at = self._max_inject_chars - 200
-            prompt = prompt[:trim_at] + "\n...[context trimmed]\n" + prompt[-200:]
+            prompt = (
+                prompt[:trim_at]
+                + "\n…[context trimmed]\n"
+                + prompt[-200:]
+            )
 
-        return prompt
+        return prompt, images_b64
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Response parsing
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     def _parse_response(self, text: str) -> dict:
         """
         Parse the scraped DOM text into the canonical response format.
         Handles:
-            - TASK_COMPLETE: / NEED_HELP:  → {"type": "text", ...}
-            - ```json {...} ```             → {"type": "tool_call", ...}
-            - bare JSON {"tool": ...}       → {"type": "tool_call", ...}
+            - ``TASK_COMPLETE:`` / ``NEED_HELP:``  → ``{"type": "text", …}``
+            - fenced ``json`` code blocks           → ``{"type": "tool_call", …}``
+            - bare JSON ``{"tool": …}``             → ``{"type": "tool_call", …}``
         """
         text = text.strip()
 
         # Explicit completion/help signals
         for prefix in ("TASK_COMPLETE:", "NEED_HELP:"):
             if text.startswith(prefix) or f"\n{prefix}" in text:
-                # Extract the relevant line
                 for line in text.splitlines():
                     line = line.strip()
                     if line.startswith(prefix):

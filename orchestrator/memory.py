@@ -58,6 +58,16 @@ class ConversationMemory:
     def clear(self) -> None:
         self._messages.clear()
 
+    def load_from_messages(self, messages: list[dict]) -> None:
+        """
+        Bulk-load messages from a saved session (for --resume).
+
+        Each message should have at minimum ``{"role": ..., "content": ...}``.
+        Internal metadata keys (``_has_screenshot``) are preserved if present.
+        """
+        self._messages = list(messages)
+        self._enforce_limits()
+
     # ------------------------------------------------------------------
     # Public read API
     # ------------------------------------------------------------------
@@ -89,10 +99,15 @@ class ConversationMemory:
 
     def _apply_screenshot_policy(self) -> list[dict]:
         """
-        Return a deep-copied list where screenshots in all but the last
+        Return a list where screenshots in all but the last
         `keep_screenshots` user turns are replaced with a text note.
+
+        Optimised: only deep-copies messages that will actually be mutated
+        (the ones whose screenshots are being stripped).  Untouched messages
+        are shallow-referenced, avoiding expensive duplication of base64 data.
         """
-        messages = copy.deepcopy(self._messages)
+        # Shallow copy of the list — individual dicts are NOT copied unless needed
+        messages = list(self._messages)
 
         # Find indices of user messages that have screenshots
         screenshot_indices = [
@@ -103,6 +118,8 @@ class ConversationMemory:
         strip_indices = set(screenshot_indices[: max(0, len(screenshot_indices) - self.keep_screenshots)])
 
         for i in strip_indices:
+            # Deep-copy only the message we're about to mutate
+            messages[i] = copy.deepcopy(messages[i])
             messages[i]["content"] = _strip_images(messages[i]["content"])
             messages[i]["_has_screenshot"] = False
 

@@ -23,3 +23,4 @@ Thumbs.db
 # Project config that might contain paths specific to your PC
 # (Only ignore this if you want to keep your PROJECT_ROOT path private)
 # config.yaml
+pythonExperimentTool/
