@@ -18,7 +18,7 @@ async def handle_take_screenshot(args: dict) -> str:
             if monitor_index >= len(monitors):
                 monitor_index = 1
             screenshot = sct.grab(monitors[monitor_index])
-            img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+            img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
         if scale != 1.0:
             new_size = (int(img.width * scale), int(img.height * scale))
             img = img.resize(new_size, Image.LANCZOS)

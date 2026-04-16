@@ -38,7 +38,7 @@ import pystray
 from pystray import MenuItem as Item
 
 from orchestrator.agent import UIBridge, mcp_agent_context
-from tray.voice import VoiceEngine
+from tray.voice import VoiceEngine, VoiceStatus
 
 logger = logging.getLogger("kim.tray")
 
@@ -72,6 +72,12 @@ def _save_provider(provider: str) -> None:
     """Persist the active provider to config.yaml."""
     config = _load_config()
     config["provider"] = provider
+    with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+
+
+def _save_config(config: dict) -> None:
+    """Persist the full config dict to config.yaml."""
     with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
 
@@ -138,7 +144,7 @@ class KimApp:
         self._control_panel = None  # tray.ui.ControlPanel
         self._settings_win = None   # tray.settings.SettingsWindow
 
-        # Voice engine
+        # Voice engine (constructor is cheap — no model loading here)
         self._voice = VoiceEngine(self._config)
 
         # pystray icon
@@ -158,12 +164,29 @@ class KimApp:
         self._start_tray_icon()
         self._register_hotkey()
 
-        # Poll for cross-thread events every 100 ms
-        self._root.after(100, self._poll)
+        # Show control panel immediately (splash-first)
+        self._show_control_panel()
+
+        # Wire voice status → UI and kick off background warm-up
+        self._voice.set_status_callback(self._on_voice_status)
+        self._voice.warm_up()
+
+        # Poll for cross-thread events every 50 ms
+        self._root.after(50, self._poll)
         try:
             self._root.mainloop()
         finally:
             self._cleanup()
+
+    def _on_voice_status(self, status: VoiceStatus, message: str) -> None:
+        """Callback from VoiceEngine (may fire from any thread).
+        Schedules a UI update on the Tkinter thread."""
+        self._root.after(0, self._apply_voice_status, status, message)
+
+    def _apply_voice_status(self, status: VoiceStatus, message: str) -> None:
+        """Update the ControlPanel's voice status label (Tkinter thread)."""
+        if self._control_panel and self._control_panel.winfo_exists():
+            self._control_panel.set_voice_status(status, message)
 
     def _cleanup(self) -> None:
         if self._hotkey_listener:
@@ -228,19 +251,48 @@ class KimApp:
     # ── hotkey ────────────────────────────────────────────────────────────────
 
     def _register_hotkey(self) -> None:
+        """Register Ctrl+Alt+J using a plain Listener to avoid the macOS
+        GlobalHotKeys bug where ``_on_press()`` crashes with:
+            TypeError: GlobalHotKeys._on_press() missing 1 required
+            positional argument: 'injected'
+        A manual pressed-key set sidesteps the issue entirely.
+        """
         try:
             from pynput import keyboard as pynput_keyboard
 
-            def _on_hotkey(*args, **kwargs):
-                # pynput may pass an 'injected' arg on some platforms — absorb it
-                self._root.after(0, self._prompt_task)
+            _COMBO = {
+                pynput_keyboard.Key.ctrl_l, pynput_keyboard.Key.ctrl_r,
+                pynput_keyboard.Key.alt_l, pynput_keyboard.Key.alt_r,
+            }
+            _TARGET_CHAR = "j"
+            _pressed: set = set()
 
-            self._hotkey_listener = pynput_keyboard.GlobalHotKeys({
-                '<ctrl>+<alt>+j': _on_hotkey,
-            })
+            def _on_press(*args, **kwargs):
+                # First positional arg is the key; extra 'injected' bool is absorbed by *args
+                key = args[0] if args else kwargs.get("key")
+                if key is None:
+                    return
+                _pressed.add(key)
+                # Check: any ctrl + any alt + 'j'
+                has_ctrl = _pressed & {pynput_keyboard.Key.ctrl_l, pynput_keyboard.Key.ctrl_r}
+                has_alt  = _pressed & {pynput_keyboard.Key.alt_l, pynput_keyboard.Key.alt_r}
+                try:
+                    has_j = hasattr(key, "char") and key.char == _TARGET_CHAR
+                except AttributeError:
+                    has_j = False
+                if has_ctrl and has_alt and has_j:
+                    self._root.after(0, self._prompt_task)
+
+            def _on_release(*args, **kwargs):
+                key = args[0] if args else kwargs.get("key")
+                _pressed.discard(key)
+
+            self._hotkey_listener = pynput_keyboard.Listener(
+                on_press=_on_press, on_release=_on_release,
+            )
             self._hotkey_listener.daemon = True
             self._hotkey_listener.start()
-            logger.info("Hotkey Ctrl+Alt+J registered (pynput)")
+            logger.info("Hotkey Ctrl+Alt+J registered (pynput Listener)")
         except Exception as e:
             logger.warning(f"Could not register hotkey: {e}")
 
@@ -355,27 +407,52 @@ class KimApp:
 
         self._runner.submit(_run())
 
-    def _on_task_done(self, result: str, success: bool) -> None:
+    def _on_task_done(self, result, success: bool) -> None:
+        # Extract a clean summary for voice (before stringifying the full result)
+        if isinstance(result, dict):
+            voice_summary = result.get("summary", "")
+        else:
+            voice_summary = str(result)
+
+        # Stringify for display / logging
+        display = voice_summary if voice_summary else str(result)
         self._agent_running = False
         colour = _COLOUR_IDLE if success else _COLOUR_ERROR
         self._update_icon_colour(colour)
 
         title = "Kim — Task Complete" if success else "Kim — Task Failed"
-        _toast(title, result)
-        logger.info(f"Task finished (success={success}): {result[:120]}")
+        _toast(title, display)
+        logger.info(f"Task finished (success={success}): {display[:120]}")
 
-        # Speak result summary
-        if self._voice.enabled:
+        # Speak result summary (emotion tags like <sigh> are preserved for Maya-1)
+        if self._voice.enabled and voice_summary:
             prefix = "Task complete." if success else "Task failed."
-            self._voice.speak_fire_and_forget(f"{prefix} {result[:200]}")
+            self._voice.speak_fire_and_forget(f"{prefix} {voice_summary[:200]}")
 
         if self._control_panel and self._control_panel.winfo_exists():
-            self._control_panel.on_task_done(result, success)
+            self._control_panel.on_task_done(display, success)
 
     # ── cross-thread poll ─────────────────────────────────────────────────────
 
     def _poll(self) -> None:
-        """Called every 100 ms on the Tkinter thread to forward bridge events."""
+        """Called every 50 ms on the Tkinter thread to forward bridge events."""
+        # ── Screenshot blink: hide/show window (high priority) ────────────
+        while True:
+            try:
+                action, event = self._bridge._visibility_queue.get_nowait()
+                if action == "hide":
+                    self._root.withdraw()
+                    if self._control_panel and self._control_panel.winfo_exists():
+                        self._control_panel.withdraw()
+                    self._root.update_idletasks()
+                elif action == "show":
+                    self._root.deiconify()
+                    if self._control_panel and self._control_panel.winfo_exists():
+                        self._control_panel.deiconify()
+                event.set()
+            except queue.Empty:
+                break
+
         # Forward log messages to control panel
         if self._control_panel and self._control_panel.winfo_exists():
             while True:
@@ -384,13 +461,6 @@ class KimApp:
                     self._control_panel.append_log(level, msg)
                 except queue.Empty:
                     break
-
-            # Forward screenshots
-            try:
-                b64 = self._bridge.screenshot_queue.get_nowait()
-                self._control_panel.update_screenshot(b64)
-            except queue.Empty:
-                pass
 
             # Forward confirmation requests
             try:
@@ -405,10 +475,6 @@ class KimApp:
                     self._bridge.log_queue.get_nowait()
                 except queue.Empty:
                     break
-            try:
-                self._bridge.screenshot_queue.get_nowait()
-            except queue.Empty:
-                pass
             # Auto-confirm when panel is closed
             try:
                 tool_name, args, event, result = self._bridge._confirm_queue.get_nowait()
@@ -417,7 +483,7 @@ class KimApp:
             except queue.Empty:
                 pass
 
-        self._root.after(100, self._poll)
+        self._root.after(50, self._poll)
 
 
 # ── entry point ───────────────────────────────────────────────────────────────

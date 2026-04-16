@@ -1,0 +1,127 @@
+@import "tailwindcss";
+
+/* Enable class-based dark mode */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ── Theme tokens ─────────────────────────────────────────────────────────── */
+:root {
+  --bg: #fafafa;
+  --bg-sidebar: #f0f0f5;
+  --bg-card: #ebebf5;
+  --bg-input: #ffffff;
+  --accent: #4361ee;
+  --accent-hover: #3451d1;
+  --accent-muted: #e8ecff;
+  --text: #1a1a2e;
+  --text-muted: #666677;
+  --border: #e0e0e8;
+  --bubble-user-bg: #4361ee;
+  --bubble-user-text: #ffffff;
+  --bubble-ai-bg: #ebebf5;
+  --bubble-ai-text: #1a1a2e;
+  --scrollbar: #d0d0dc;
+  --scrollbar-hover: #b0b0c4;
+  color-scheme: light;
+}
+
+.dark {
+  --bg: #1a1a2e;
+  --bg-sidebar: #16213e;
+  --bg-card: #1e2a4a;
+  --bg-input: #16213e;
+  --accent: #4361ee;
+  --accent-hover: #3451d1;
+  --accent-muted: #1e2a4a;
+  --text: #e8e8f0;
+  --text-muted: #a0a0b8;
+  --border: #2a2a4e;
+  --bubble-user-bg: #4361ee;
+  --bubble-user-text: #ffffff;
+  --bubble-ai-bg: #1e2a4a;
+  --bubble-ai-text: #e8e8f0;
+  --scrollbar: #2a2a4e;
+  --scrollbar-hover: #3a3a6e;
+  color-scheme: dark;
+}
+
+/* ── Base reset ───────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  background-color: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Scrollbars ───────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-hover);
+}
+
+/* ── Utility: visually hidden ─────────────────────────────────────────────── */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* ── Prose (assistant message text) ──────────────────────────────────────── */
+.prose p { margin-bottom: 0.75rem; }
+.prose p:last-child { margin-bottom: 0; }
+.prose code {
+  font-family: "SF Mono", "Fira Code", Consolas, monospace;
+  font-size: 0.85em;
+  padding: 0.15em 0.35em;
+  border-radius: 4px;
+  background: var(--bg-card);
+}
+.prose pre {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  overflow-x: auto;
+  font-size: 0.85em;
+  margin: 0.5rem 0;
+}
+.prose pre code {
+  background: none;
+  padding: 0;
+}
+.prose ul, .prose ol {
+  padding-left: 1.5rem;
+  margin-bottom: 0.75rem;
+}
+.prose li { margin-bottom: 0.25rem; }
+.prose strong { font-weight: 600; }
+.prose em { font-style: italic; }

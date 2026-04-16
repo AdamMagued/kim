@@ -1,94 +1,50 @@
-provider: browser         # browser | claude | openai | gemini | deepseek
-model:
-  claude: claude-opus-4-6
-  openai: gpt-4o
-  gemini: gemini-2.0-flash
-  deepseek: deepseek-chat
-project_root: "."                 # "." = auto-detect from config.yaml location
 allowed_paths:
-  - "."                            # paths the agent is allowed to access
-max_iterations: 25
-screenshot_scale: 0.75
-preview_mode: false
-max_tokens: 4096
-memory_max_messages: 40
-memory_keep_screenshots: 4
-
-# ── OpenAI-compatible API settings ─────────────────────────────────────────
-# Set openai_base_url to use any OpenAI-compatible provider as the "openai"
-# provider.  Change openai_api_key_env to the env var that holds the key.
-#
-# Example — Cerebras (fast Llama inference, generous free tier):
-#   openai_base_url: "https://api.cerebras.ai/v1"
-#   openai_api_key_env: "CEREBRAS_API_KEY"
-#   model:
-#     openai: "llama-4-scout-17b-16e-instruct"
-#
-# Example — Groq:
-#   openai_base_url: "https://api.groq.com/openai/v1"
-#   openai_api_key_env: "GROQ_API_KEY"
-#   model:
-#     openai: "llama-3.3-70b-versatile"
-#
-openai_base_url: ""          # leave blank for official OpenAI
-openai_api_key_env: "OPENAI_API_KEY"
-
-# ── Browser provider ────────────────────────────────────────────────────────
+- .
 browser_provider:
-  cdp_url: "http://localhost:9222"   # Chrome remote debugging URL
-  max_history_messages: 6            # How many past turns to include in injected prompt
-  max_inject_chars: 12000            # Trim prompt if longer than this
-  browser_headless: false            # true = Kim auto-launches Chrome invisibly (must have logged in once first)
-                                     # false = user manually launches Chrome (visible) for initial login
-
-# ── Custom browser sites ────────────────────────────────────────────────────
-# Add any website with an AI chat UI here.  The browser provider will check
-# these BEFORE the built-in Claude/ChatGPT/Gemini entries, so they take
-# precedence.  Selectors can be a single string or a list (tried in order).
-#
-# Example — Perplexity:
-#   perplexity:
-#     url_pattern: "perplexity.ai"
-#     input_selector: "textarea[placeholder*='Ask']"
-#     send_button: "button[aria-label*='Submit']"
-#     stop_button: "button[aria-label*='Stop']"
-#     response_selector: ".prose"
-#
+  browser_headless: false
+  cdp_url: http://localhost:9222
+  max_history_messages: 6
+  max_inject_chars: 12000
 custom_sites: {}
-  # my_site:
-  #   url_pattern: "example.com/chat"
-  #   input_selector: "textarea.chat-input"
-  #   send_button: "button.send-btn"
-  #   stop_button: "button.stop-btn"
-  #   response_selector: "div.response-text"
-
-# ── Shell ───────────────────────────────────────────────────────────────────
-shell:
-  timeout: 30
-  blocked_commands:
-    - "rm -rf /"
-    - "format c:"
-    - "del /S /Q C:\\"
-    - "rd /S /Q C:\\"
-
-# ── Relay ───────────────────────────────────────────────────────────────────
-relay:
-  url: ""                            # https://your-relay.railway.app
-  poll_interval: 2                   # seconds
-  pc_api_key: ""                     # set in .env as RELAY_PC_API_KEY
-
-# ── Logging ─────────────────────────────────────────────────────────────────
 logging:
   level: INFO
-
-# ── Voice ───────────────────────────────────────────────────────────────────
-voice_enabled: true                    # master toggle for Kim's voice
+max_iterations: 25
+max_tokens: 4096
+memory_keep_screenshots: 4
+memory_max_messages: 40
+model:
+  claude: claude-opus-4-6
+  deepseek: deepseek-chat
+  gemini: gemini-2.0-flash
+  openai: gpt-4o
+openai_api_key_env: OPENAI_API_KEY
+openai_base_url: ''
+preview_mode: false
+project_root: .
+provider: browser
+relay:
+  pc_api_key: ''
+  poll_interval: 2
+  url: ''
+screenshot_scale: 0.75
+shell:
+  blocked_commands:
+  - rm -rf /
+  - 'format c:'
+  - del /S /Q C:\
+  - rd /S /Q C:\
+  timeout: 30
 voice:
-  enabled: true                        # duplicate for nested access
-  backend: kokoro                      # "kokoro" (local) or "http" (API server)
-  voice_id: af_heart                   # kokoro voice name (af_heart, af_bella, etc.)
-  speed: 1.0                           # playback speed multiplier
-  # HTTP backend settings (for Maya-1 / local OpenAI-compatible TTS):
-  # http_url: "http://localhost:8880/v1/audio/speech"
-  # http_model: "tts-1"
-  # http_voice: "nova"
+  enabled: true
+  engine: hume
+  human_quirks: false
+  hume:
+    description: A warm, clear, and friendly female voice.
+    voice_name: Alice Bennett
+  maya1:
+    max_new_tokens: 2048
+    model_id: maya-research/maya1
+    speaker_description: A young female with a warm, clear, and natural voice.
+    use_4bit: false
+  speed: 1.0
+  voice_id: af_heart
