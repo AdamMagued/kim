@@ -685,6 +685,589 @@ async fn write_voice_config(
 }
 
 // ---------------------------------------------------------------------------
+// Account — ~/.config/kim/account.json (platform-native config dir)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct KimAccount {
+    pub display_name: String,
+    pub github_username: Option<String>,
+    /// Personal Access Token stored locally, never sent anywhere except GitHub.
+    pub github_token: Option<String>,
+    pub github_avatar_url: Option<String>,
+    /// ID of the private backup Gist so restore can find it later.
+    pub gist_id: Option<String>,
+    pub created_at: String,
+}
+
+fn account_dir() -> PathBuf {
+    dirs::config_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("kim")
+}
+
+fn account_path() -> PathBuf {
+    account_dir().join("account.json")
+}
+
+#[tauri::command]
+async fn load_account() -> Result<Option<KimAccount>, String> {
+    let path = account_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let account: KimAccount = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    Ok(Some(account))
+}
+
+#[tauri::command]
+async fn save_account(account: KimAccount) -> Result<(), String> {
+    let dir = account_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let raw = serde_json::to_string_pretty(&account).map_err(|e| e.to_string())?;
+    fs::write(account_path(), raw).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GitHub PAT verification — get user identity from token
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GitHubUser {
+    pub login: String,
+    pub name: Option<String>,
+    pub avatar_url: String,
+}
+
+#[tauri::command]
+async fn verify_github_pat(token: String) -> Result<GitHubUser, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://api.github.com/user")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "Kim-Desktop/0.1")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub returned {}. Check that your token has 'read:user' scope.", resp.status()));
+    }
+
+    let user: GitHubUser = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(user)
+}
+
+// ---------------------------------------------------------------------------
+// Data export — ZIP | JSON | Markdown
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn export_data(
+    format: String,
+    output_path: String,
+    sessions_dir: Option<String>,
+) -> Result<String, String> {
+    let base = sessions_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(default_sessions_dir);
+
+    match format.as_str() {
+        "zip" => export_as_zip(&base, &PathBuf::from(&output_path)),
+        "json" => export_as_json(&base, &PathBuf::from(&output_path)),
+        "markdown" => export_as_markdown(&base, &PathBuf::from(&output_path)),
+        _ => Err(format!("Unknown format: {}. Use 'zip', 'json', or 'markdown'.", format)),
+    }
+}
+
+fn export_as_zip(sessions_base: &Path, out: &Path) -> Result<String, String> {
+    use std::io::Write;
+    use zip::write::FileOptions;
+
+    let file = std::fs::File::create(out).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts: FileOptions<'_, ()> = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let mut count = 0usize;
+    collect_jsonl_files(sessions_base, &mut |rel, data| {
+        zip.start_file(rel, opts).ok();
+        zip.write_all(data).ok();
+        count += 1;
+    });
+
+    // Include account.json if present.
+    let acct = account_path();
+    if acct.exists() {
+        if let Ok(data) = fs::read(&acct) {
+            zip.start_file("account.json", opts).ok();
+            let _ = zip.write_all(&data);
+        }
+    }
+
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(format!("Exported {} session files to {}", count, out.display()))
+}
+
+fn export_as_json(sessions_base: &Path, out: &Path) -> Result<String, String> {
+    let mut sessions: Vec<serde_json::Value> = Vec::new();
+
+    collect_jsonl_files(sessions_base, &mut |rel, data| {
+        let text = String::from_utf8_lossy(data);
+        let messages: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        sessions.push(serde_json::json!({ "session": rel, "messages": messages }));
+    });
+
+    let payload = serde_json::json!({
+        "version": 1,
+        "exported_at": chrono_now(),
+        "sessions": sessions,
+    });
+    let raw = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
+    fs::write(out, raw).map_err(|e| e.to_string())?;
+    Ok(format!("Exported {} sessions to {}", sessions.len(), out.display()))
+}
+
+fn export_as_markdown(sessions_base: &Path, out: &Path) -> Result<String, String> {
+    use std::fmt::Write as FmtWrite;
+    let mut md = String::new();
+    let _ = writeln!(md, "# Kim Session Export\n\nExported: {}\n", chrono_now());
+
+    let mut count = 0usize;
+    collect_jsonl_files(sessions_base, &mut |rel, data| {
+        let _ = writeln!(md, "---\n\n## {}\n", rel);
+        let text = String::from_utf8_lossy(data);
+        for line in text.lines() {
+            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
+                let role = msg["role"].as_str().unwrap_or("unknown");
+                let content = match msg["content"].as_str() {
+                    Some(s) => s.to_string(),
+                    None => msg["content"].to_string(),
+                };
+                let _ = writeln!(md, "**{}**: {}\n", role, content);
+            }
+        }
+        count += 1;
+    });
+
+    fs::write(out, &md).map_err(|e| e.to_string())?;
+    Ok(format!("Exported {} sessions as Markdown to {}", count, out.display()))
+}
+
+fn collect_jsonl_files<F>(base: &Path, cb: &mut F)
+where
+    F: FnMut(String, &[u8]),
+{
+    if !base.exists() {
+        return;
+    }
+    let Ok(date_dirs) = fs::read_dir(base) else { return };
+    for de in date_dirs.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()) {
+        let date = de.file_name().to_string_lossy().to_string();
+        let Ok(files) = fs::read_dir(de.path()) else { continue };
+        for fe in files.filter_map(|e| e.ok()) {
+            let name = fe.file_name().to_string_lossy().to_string();
+            if name.ends_with(".jsonl") {
+                if let Ok(data) = fs::read(fe.path()) {
+                    cb(format!("{}/{}", date, name), &data);
+                }
+            }
+        }
+    }
+}
+
+fn chrono_now() -> String {
+    // Simple ISO-8601-ish timestamp without pulling in chrono.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("unix:{}", secs)
+}
+
+// ---------------------------------------------------------------------------
+// Data import — restore from a Kim ZIP or JSON export
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn import_data(
+    file_path: String,
+    sessions_dir: Option<String>,
+) -> Result<String, String> {
+    let src = PathBuf::from(&file_path);
+    if !src.exists() {
+        return Err(format!("File not found: {}", file_path));
+    }
+
+    let base = sessions_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(default_sessions_dir);
+    fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "zip" => import_from_zip(&src, &base),
+        "json" => import_from_json(&src, &base),
+        _ => Err("Unsupported file type. Use a .zip or .json exported from Kim.".to_string()),
+    }
+}
+
+fn import_from_zip(src: &Path, base: &Path) -> Result<String, String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(src).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let mut count = 0usize;
+
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_string();
+
+        if name == "account.json" {
+            // Restore account if it doesn't exist yet (don't overwrite existing).
+            let acct_path = account_path();
+            if !acct_path.exists() {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).ok();
+                if let Some(parent) = acct_path.parent() {
+                    fs::create_dir_all(parent).ok();
+                }
+                fs::write(&acct_path, &buf).ok();
+            }
+            continue;
+        }
+
+        if !name.ends_with(".jsonl") {
+            continue;
+        }
+
+        let dest = base.join(&name);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        fs::write(&dest, &buf).map_err(|e| e.to_string())?;
+        count += 1;
+    }
+
+    Ok(format!("Imported {} session files.", count))
+}
+
+fn import_from_json(src: &Path, base: &Path) -> Result<String, String> {
+    let raw = fs::read_to_string(src).map_err(|e| e.to_string())?;
+    let payload: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+
+    let sessions = payload["sessions"].as_array().ok_or("Invalid export format: missing 'sessions' array.")?;
+    let mut count = 0usize;
+
+    for session in sessions {
+        let rel = session["session"].as_str().unwrap_or("unknown/session.jsonl");
+        let messages = session["messages"].as_array().cloned().unwrap_or_default();
+
+        let dest = base.join(rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+
+        let mut lines = String::new();
+        for msg in &messages {
+            if let Ok(line) = serde_json::to_string(msg) {
+                lines.push_str(&line);
+                lines.push('\n');
+            }
+        }
+        fs::write(&dest, &lines).map_err(|e| e.to_string())?;
+        count += 1;
+    }
+
+    Ok(format!("Imported {} sessions.", count))
+}
+
+// ---------------------------------------------------------------------------
+// GitHub Gist backup / restore
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn backup_to_gist(
+    token: String,
+    sessions_dir: Option<String>,
+    existing_gist_id: Option<String>,
+) -> Result<String, String> {
+    let base = sessions_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(default_sessions_dir);
+
+    // Build an index of all sessions (not the full content — Gist has 10MB limit).
+    let mut index: Vec<serde_json::Value> = Vec::new();
+    collect_jsonl_files(&base, &mut |rel, data| {
+        let line_count = data.iter().filter(|&&b| b == b'\n').count();
+        index.push(serde_json::json!({ "path": rel, "messages": line_count }));
+    });
+
+    let account_data = if account_path().exists() {
+        fs::read_to_string(account_path()).unwrap_or_default()
+    } else {
+        "{}".to_string()
+    };
+
+    let payload = serde_json::json!({
+        "version": 1,
+        "backed_up_at": chrono_now(),
+        "session_index": index,
+    });
+
+    let files = serde_json::json!({
+        "kim_backup.json": { "content": serde_json::to_string_pretty(&payload).unwrap_or_default() },
+        "kim_account.json": { "content": account_data },
+    });
+
+    let client = reqwest::Client::new();
+
+    let gist_url = match &existing_gist_id {
+        Some(id) => format!("https://api.github.com/gists/{}", id),
+        None => "https://api.github.com/gists".to_string(),
+    };
+
+    let body = serde_json::json!({
+        "description": "Kim Desktop backup (private)",
+        "public": false,
+        "files": files,
+    });
+
+    let req = if existing_gist_id.is_some() {
+        client.patch(&gist_url)
+    } else {
+        client.post(&gist_url)
+    };
+
+    let resp = req
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "Kim-Desktop/0.1")
+        .header("Accept", "application/vnd.github+json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        return Err(format!("GitHub returned {}: {}", status, err));
+    }
+
+    let gist: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let gist_id = gist["id"].as_str().unwrap_or("").to_string();
+    Ok(gist_id)
+}
+
+#[tauri::command]
+async fn restore_from_gist(
+    token: String,
+    gist_id: String,
+) -> Result<KimAccount, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("https://api.github.com/gists/{}", gist_id))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "Kim-Desktop/0.1")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub returned {}. Check the Gist ID.", resp.status()));
+    }
+
+    let gist: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    // Restore account from gist.
+    if let Some(acct_content) = gist["files"]["kim_account.json"]["content"].as_str() {
+        if let Ok(account) = serde_json::from_str::<KimAccount>(acct_content) {
+            // Write to local account file if not present.
+            if !account_path().exists() {
+                let dir = account_dir();
+                fs::create_dir_all(&dir).ok();
+                if let Ok(raw) = serde_json::to_string_pretty(&account) {
+                    fs::write(account_path(), raw).ok();
+                }
+            }
+            return Ok(account);
+        }
+    }
+
+    Err("Gist found but kim_account.json was empty or invalid.".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Claw (Code) projects — grouped by project directory + git branch
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClawSession {
+    pub session_id: String,
+    pub date: String,
+    pub message_count: usize,
+    pub summary: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClawBranch {
+    pub name: String,           // git branch name, or "main" / "unknown"
+    pub sessions: Vec<ClawSession>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClawProject {
+    pub path: String,           // decoded project path
+    pub name: String,           // last path component (display name)
+    pub current_branch: String, // current git branch in that dir
+    pub branches: Vec<ClawBranch>,
+}
+
+/// Claude Code stores sessions under ~/.claude/projects/<encoded-path>/.
+/// The encoded path uses `-` as a path separator (leading `/` becomes leading `-`).
+fn decode_claude_project_path(encoded: &str) -> String {
+    // The Claude Code CLI encodes paths by replacing '/' with '-' with a
+    // leading '-' for the root '/'. Reverse: replace the encoded form.
+    // e.g. "-Users-adam-Desktop-myproject" → "/Users/adam/Desktop/myproject"
+    if encoded.starts_with('-') {
+        format!("/{}", &encoded[1..].replace('-', "/"))
+    } else {
+        encoded.replace('-', "/")
+    }
+}
+
+fn read_git_branch(project_path: &Path) -> String {
+    let head = project_path.join(".git").join("HEAD");
+    if let Ok(content) = fs::read_to_string(&head) {
+        let s = content.trim();
+        if let Some(branch) = s.strip_prefix("ref: refs/heads/") {
+            return branch.to_string();
+        }
+        // Detached HEAD — return short commit hash.
+        if s.len() >= 8 {
+            return s[..8].to_string();
+        }
+    }
+    "main".to_string()
+}
+
+#[tauri::command]
+async fn list_claw_projects(claw_dir: Option<String>) -> Result<Vec<ClawProject>, String> {
+    // Priority: explicit claw_dir > ~/.claude/projects
+    let projects_root = match claw_dir {
+        Some(ref d) if !d.is_empty() => PathBuf::from(d),
+        _ => dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".claude")
+            .join("projects"),
+    };
+
+    if !projects_root.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut result: Vec<ClawProject> = Vec::new();
+
+    let mut entries: Vec<_> = fs::read_dir(&projects_root)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+    for entry in entries {
+        let encoded = entry.file_name().to_string_lossy().to_string();
+        let decoded_path = decode_claude_project_path(&encoded);
+        let project_path = PathBuf::from(&decoded_path);
+
+        let name = project_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| encoded.clone());
+
+        let current_branch = read_git_branch(&project_path);
+
+        // Read sessions from this project directory.
+        let sessions_dir = entry.path().join("sessions");
+        let sessions = if sessions_dir.exists() {
+            read_project_sessions(&sessions_dir)
+        } else {
+            // Fallback: sessions directly in the project dir (older format).
+            read_project_sessions(&entry.path())
+        };
+
+        if sessions.is_empty() {
+            continue;
+        }
+
+        // Group sessions under the current branch.
+        let branch = ClawBranch {
+            name: current_branch.clone(),
+            sessions,
+        };
+
+        result.push(ClawProject {
+            path: decoded_path,
+            name,
+            current_branch,
+            branches: vec![branch],
+        });
+    }
+
+    Ok(result)
+}
+
+fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
+    let mut sessions = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else { return sessions };
+
+    let mut files: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            s.ends_with(".jsonl") && !s.contains(".summary")
+        })
+        .collect();
+    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+    for fe in files.iter().take(50) {
+        let session_id = fe.path()
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let message_count = count_lines(&fe.path()).unwrap_or(0);
+        let summary_path = dir.join(format!("{}.summary.txt", session_id));
+        let summary = if summary_path.exists() {
+            fs::read_to_string(&summary_path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        sessions.push(ClawSession {
+            session_id,
+            date: String::new(),
+            message_count,
+            summary,
+        });
+    }
+    sessions
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -703,6 +1286,14 @@ pub fn run() {
             cancel_task,
             read_voice_config,
             write_voice_config,
+            load_account,
+            save_account,
+            verify_github_pat,
+            export_data,
+            import_data,
+            backup_to_gist,
+            restore_from_gist,
+            list_claw_projects,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

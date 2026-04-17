@@ -1,7 +1,130 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap');
 @import "tailwindcss";
 
 /* Enable class-based dark mode */
 @custom-variant dark (&:where(.dark, .dark *));
+
+/* ── Accent themes — applied via data-accent="..." on <html> ─────────────── */
+
+/* Ocean — deep blue */
+:root[data-accent="ocean"] {
+  --accent:           #2563eb;
+  --accent-hover:     #1d55d5;
+  --accent-active:    #1a48b8;
+  --accent-muted:     #eff4ff;
+  --accent-soft:      #dbeafe;
+  --accent-gradient:  linear-gradient(135deg, #2563eb 0%, #3b82f6 55%, #60a5fa 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #1d55d5 0%, #2f74e8 55%, #4d95ef 100%);
+  --ring:             rgba(37, 99, 235, 0.22);
+  --bubble-user-bg:   linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
+}
+.dark[data-accent="ocean"] {
+  --accent:           #60a5fa;
+  --accent-hover:     #7ab8fb;
+  --accent-active:    #4d95ef;
+  --accent-muted:     #132040;
+  --accent-soft:      #1a2f57;
+  --accent-gradient:  linear-gradient(135deg, #3b82f6 0%, #60a5fa 55%, #93c5fd 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #2f74e8 0%, #4d95ef 55%, #7ab8fb 100%);
+  --ring:             rgba(96, 165, 250, 0.30);
+  --bubble-user-bg:   linear-gradient(135deg, #3b82f6 0%, #60a5fa 100%);
+}
+
+/* Ember — warm amber/orange */
+:root[data-accent="ember"] {
+  --accent:           #ea6c0a;
+  --accent-hover:     #d45f07;
+  --accent-active:    #bc5205;
+  --accent-muted:     #fff7ed;
+  --accent-soft:      #fed7aa;
+  --accent-gradient:  linear-gradient(135deg, #f97316 0%, #ea6c0a 55%, #fb923c 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #ea6c0a 0%, #d45f07 55%, #f17a28 100%);
+  --ring:             rgba(234, 108, 10, 0.22);
+  --bubble-user-bg:   linear-gradient(135deg, #f97316 0%, #ea6c0a 100%);
+}
+.dark[data-accent="ember"] {
+  --accent:           #fb923c;
+  --accent-hover:     #fba55a;
+  --accent-active:    #f17a28;
+  --accent-muted:     #2c1a08;
+  --accent-soft:      #3d2310;
+  --accent-gradient:  linear-gradient(135deg, #f97316 0%, #fb923c 55%, #fdba74 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #ea6c0a 0%, #f17a28 55%, #fba55a 100%);
+  --ring:             rgba(251, 146, 60, 0.30);
+  --bubble-user-bg:   linear-gradient(135deg, #f97316 0%, #fb923c 100%);
+}
+
+/* Teal — cyan/teal */
+:root[data-accent="teal"] {
+  --accent:           #0891b2;
+  --accent-hover:     #0780a0;
+  --accent-active:    #066e8c;
+  --accent-muted:     #ecfeff;
+  --accent-soft:      #cffafe;
+  --accent-gradient:  linear-gradient(135deg, #06b6d4 0%, #0891b2 55%, #22d3ee 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #0780a0 0%, #066e8c 55%, #06b6d4 100%);
+  --ring:             rgba(8, 145, 178, 0.22);
+  --bubble-user-bg:   linear-gradient(135deg, #06b6d4 0%, #0891b2 100%);
+}
+.dark[data-accent="teal"] {
+  --accent:           #22d3ee;
+  --accent-hover:     #38dff2;
+  --accent-active:    #06b6d4;
+  --accent-muted:     #052630;
+  --accent-soft:      #083340;
+  --accent-gradient:  linear-gradient(135deg, #06b6d4 0%, #22d3ee 55%, #67e8f9 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #0891b2 0%, #06b6d4 55%, #38dff2 100%);
+  --ring:             rgba(34, 211, 238, 0.30);
+  --bubble-user-bg:   linear-gradient(135deg, #06b6d4 0%, #22d3ee 100%);
+}
+
+/* Jade — green */
+:root[data-accent="jade"] {
+  --accent:           #059669;
+  --accent-hover:     #047857;
+  --accent-active:    #036646;
+  --accent-muted:     #ecfdf5;
+  --accent-soft:      #d1fae5;
+  --accent-gradient:  linear-gradient(135deg, #10b981 0%, #059669 55%, #34d399 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #059669 0%, #047857 55%, #10b981 100%);
+  --ring:             rgba(5, 150, 105, 0.22);
+  --bubble-user-bg:   linear-gradient(135deg, #10b981 0%, #059669 100%);
+}
+.dark[data-accent="jade"] {
+  --accent:           #34d399;
+  --accent-hover:     #4adeac;
+  --accent-active:    #10b981;
+  --accent-muted:     #042614;
+  --accent-soft:      #063320;
+  --accent-gradient:  linear-gradient(135deg, #10b981 0%, #34d399 55%, #6ee7b7 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #059669 0%, #10b981 55%, #4adeac 100%);
+  --ring:             rgba(52, 211, 153, 0.30);
+  --bubble-user-bg:   linear-gradient(135deg, #10b981 0%, #34d399 100%);
+}
+
+/* Mono — white accents on dark, charcoal on light (Vercel/Raycast style) */
+:root[data-accent="mono"] {
+  --accent:           #18181b;
+  --accent-hover:     #09090b;
+  --accent-active:    #000000;
+  --accent-muted:     #f4f4f5;
+  --accent-soft:      #e4e4e7;
+  --accent-gradient:  linear-gradient(135deg, #27272a 0%, #18181b 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #18181b 0%, #09090b 100%);
+  --ring:             rgba(24, 24, 27, 0.20);
+  --bubble-user-bg:   linear-gradient(135deg, #27272a 0%, #18181b 100%);
+}
+.dark[data-accent="mono"] {
+  --accent:           #e4e4e7;
+  --accent-hover:     #f4f4f5;
+  --accent-active:    #d4d4d8;
+  --accent-muted:     #1c1c1f;
+  --accent-soft:      #242428;
+  --accent-gradient:  linear-gradient(135deg, #a1a1aa 0%, #e4e4e7 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #d4d4d8 0%, #f4f4f5 100%);
+  --ring:             rgba(228, 228, 231, 0.25);
+  --bubble-user-bg:   linear-gradient(135deg, #a1a1aa 0%, #e4e4e7 100%);
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
    KIM DESIGN SYSTEM
@@ -1425,6 +1548,132 @@ kbd {
   max-width: 94vw;
   max-height: 86vh;
 }
+
+/* Left-nav settings panel */
+.kim-modal--settings-panel {
+  width: 760px;
+  max-width: 96vw;
+  max-height: 88vh;
+  flex-direction: row;
+  padding: 0;
+  overflow: hidden;
+}
+
+.kim-settings-nav {
+  width: 200px;
+  flex-shrink: 0;
+  background: var(--bg-card);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 20px 10px;
+  overflow-y: auto;
+}
+.kim-settings-nav__header {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-subtle);
+  padding: 0 8px;
+  margin-bottom: 12px;
+}
+.kim-settings-nav__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.kim-settings-nav__item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  font-family: inherit;
+  text-align: left;
+  transition: background 0.1s, color 0.1s;
+}
+.kim-settings-nav__item:hover {
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+.kim-settings-nav__item--active {
+  background: var(--accent-muted);
+  color: var(--accent);
+  font-weight: 600;
+}
+.kim-settings-nav__item--active:hover {
+  background: var(--accent-soft);
+}
+.kim-settings-nav__item-icon {
+  color: inherit;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+.kim-settings-body {
+  flex: 1;
+  overflow-y: auto;
+  position: relative;
+  padding: 28px 28px 28px;
+}
+.kim-settings-body .kim-modal__close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+}
+
+.kim-settings-content__title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-strong);
+  letter-spacing: -0.02em;
+  margin-bottom: 24px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.kim-accent-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+
+.kim-inline-success {
+  font-size: 13px;
+  color: var(--success);
+  padding: 8px 12px;
+  background: var(--success-muted);
+  border-radius: 7px;
+}
+
+.kim-data-privacy-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-subtle);
+  line-height: 1.6;
+  padding: 12px 14px;
+  background: var(--bg-card);
+  border-radius: 8px;
+  border-left: 3px solid var(--accent);
+  margin-top: 4px;
+}
+.kim-data-privacy-note svg { flex-shrink: 0; margin-top: 1px; color: var(--accent); }
+
 .kim-modal--update {
   width: 500px;
   max-width: 92vw;
@@ -1754,4 +2003,339 @@ kbd {
   display: flex;
   gap: 10px;
   justify-content: flex-end;
+}
+
+/* ── Logo — orbit mark ────────────────────────────────────────────────────── */
+.kim-logo-mark {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+/* ── Tab bar (Chat / Code) ────────────────────────────────────────────────── */
+.kim-tab-bar {
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  background: var(--bg-card);
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+.kim-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 7px;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: transparent;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.kim-tab:hover { color: var(--text); background: var(--bg-card-hover); }
+.kim-tab--active {
+  background: var(--bg-elevated);
+  color: var(--text-strong);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+/* ── Account chip in sidebar footer ──────────────────────────────────────── */
+.kim-account-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  cursor: default;
+  text-align: left;
+  overflow: hidden;
+}
+.kim-account-chip__avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent-gradient);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+.kim-account-chip__avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.kim-account-chip__info { min-width: 0; flex: 1; }
+.kim-account-chip__name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kim-account-chip__sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Claw project tree ────────────────────────────────────────────────────── */
+.kim-project-item {
+  margin-bottom: 2px;
+}
+.kim-project-item__header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 7px 8px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-muted);
+  text-align: left;
+  transition: background 0.1s;
+}
+.kim-project-item__header:hover { background: var(--bg-card); }
+.kim-project-item__icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  background: var(--accent-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--accent);
+}
+.kim-project-item__name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kim-project-item__branch-pill {
+  font-size: 10px;
+  font-family: "JetBrains Mono", monospace;
+  color: var(--accent);
+  background: var(--accent-muted);
+  border-radius: 4px;
+  padding: 1px 5px;
+  flex-shrink: 0;
+}
+.kim-project-item__sessions { padding-left: 12px; margin-top: 1px; }
+
+/* ── Onboarding screen ────────────────────────────────────────────────────── */
+.kim-onboarding {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  padding: 24px;
+  -webkit-app-region: drag;
+}
+.kim-onboarding__card {
+  width: 460px;
+  max-width: 100%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 40px;
+  box-shadow: var(--shadow-xl);
+  -webkit-app-region: no-drag;
+  animation: kim-scale-in 0.25s ease;
+}
+.kim-onboarding__logo {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 28px;
+  color: var(--accent);
+}
+.kim-onboarding__title {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-strong);
+  letter-spacing: -0.03em;
+  text-align: center;
+  margin-bottom: 6px;
+}
+.kim-onboarding__subtitle {
+  font-size: 14px;
+  color: var(--text-muted);
+  text-align: center;
+  margin-bottom: 32px;
+  line-height: 1.5;
+}
+.kim-onboarding__step {
+  margin-bottom: 20px;
+}
+.kim-onboarding__step-label {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-subtle);
+  margin-bottom: 8px;
+}
+.kim-onboarding__divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 24px 0;
+  color: var(--text-subtle);
+  font-size: 12px;
+}
+.kim-onboarding__divider::before,
+.kim-onboarding__divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+.kim-onboarding__github {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 11px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: left;
+  margin-bottom: 8px;
+}
+.kim-onboarding__github:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-card-hover);
+}
+.kim-onboarding__skip {
+  display: block;
+  width: 100%;
+  padding: 4px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-subtle);
+  text-align: center;
+  transition: color 0.15s;
+}
+.kim-onboarding__skip:hover { color: var(--text-muted); }
+.kim-onboarding__error {
+  font-size: 12px;
+  color: var(--danger);
+  margin-top: 6px;
+  padding: 8px 12px;
+  background: var(--danger-muted);
+  border-radius: 7px;
+}
+.kim-onboarding__success {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--success);
+  margin-top: 6px;
+  padding: 8px 12px;
+  background: var(--success-muted);
+  border-radius: 7px;
+}
+
+/* ── Accent picker in settings ────────────────────────────────────────────── */
+.kim-accent-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.kim-accent-swatch {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 2.5px solid transparent;
+  cursor: pointer;
+  transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+  position: relative;
+  background: var(--swatch-color, var(--accent));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.kim-accent-swatch:hover { transform: scale(1.12); }
+.kim-accent-swatch--active {
+  border-color: var(--text-strong);
+  transform: scale(1.1);
+  box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--swatch-color, var(--accent));
+}
+
+/* ── Data portability section ─────────────────────────────────────────────── */
+.kim-data-method {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  background: var(--bg-card);
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.kim-data-method__icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--accent-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.kim-data-method__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.kim-data-method__body { flex: 1; min-width: 0; }
+.kim-data-method__desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  line-height: 1.5;
+}
+.kim-data-privacy-note {
+  font-size: 12px;
+  color: var(--text-subtle);
+  line-height: 1.6;
+  padding: 12px 14px;
+  background: var(--bg-card);
+  border-radius: 8px;
+  border-left: 3px solid var(--accent);
+  margin-top: 4px;
 }
