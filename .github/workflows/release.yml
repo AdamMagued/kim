@@ -1,42 +1,60 @@
 name: Release
 
+# Trigger modes:
+#   1. Push a version tag (v1.2.3)  →  create a real GitHub Release
+#   2. Manual "Run workflow" button →  build only, no release published
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — build binaries but do not publish a release'
+        required: false
+        default: 'true'
+        type: boolean
 
 jobs:
-  release:
+  build-and-release:
+    name: Build (${{ matrix.label }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
+          - label: macOS Apple Silicon
+            platform: macos-latest
             args: '--target aarch64-apple-darwin'
-            rust-target: 'aarch64-apple-darwin'
-          - platform: macos-latest
+            rust-target: aarch64-apple-darwin
+
+          - label: macOS Intel
+            platform: macos-latest
             args: '--target x86_64-apple-darwin'
-            rust-target: 'x86_64-apple-darwin'
-          - platform: ubuntu-22.04
+            rust-target: x86_64-apple-darwin
+
+          - label: Linux (x64)
+            platform: ubuntu-22.04
             args: ''
             rust-target: ''
-          - platform: windows-latest
+
+          - label: Windows (x64)
+            platform: windows-latest
             args: ''
             rust-target: ''
 
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      # ── Node.js ─────────────────────────────────────────────────────────────
+      - uses: actions/setup-node@v4
         with:
           node-version: lts/*
-          cache: 'npm'
+          cache: npm
           cache-dependency-path: desktop/package-lock.json
 
+      # ── Rust ────────────────────────────────────────────────────────────────
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -45,9 +63,10 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: './desktop/src-tauri -> target'
+          workspaces: ./desktop/src-tauri -> target
 
-      - name: Install Linux dependencies
+      # ── Linux system libs (WebKit2GTK + friends) ─────────────────────────
+      - name: Install Linux system deps
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
@@ -57,11 +76,24 @@ jobs:
             librsvg2-dev \
             patchelf
 
+      # ── Frontend deps ────────────────────────────────────────────────────
       - name: Install frontend dependencies
         working-directory: desktop
         run: npm ci
 
-      - name: Build and release
+      # ── Upload raw binaries on workflow_dispatch (dry run) ────────────────
+      - name: Build (dry run — upload artifact)
+        if: github.event_name == 'workflow_dispatch'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          args: ${{ matrix.args }}
+
+      # ── Full release on version tag ────────────────────────────────────────
+      - name: Build and publish release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -72,14 +104,24 @@ jobs:
           releaseBody: |
             ## Kim ${{ github.ref_name }}
 
-            ### Installation
-            Download the appropriate file for your platform:
-            - **macOS Apple Silicon**: `Kim_*_aarch64.dmg`
-            - **macOS Intel**: `Kim_*_x64.dmg`
-            - **Windows**: `Kim_*_x64-setup.exe`
-            - **Linux**: `kim_*_amd64.deb` or `kim_*_amd64.AppImage`
+            ### Download the right file for your OS
 
-            See the full changelog below.
+            | Platform | File |
+            |---|---|
+            | macOS (Apple Silicon M1/M2/M3) | `Kim_*_aarch64.dmg` |
+            | macOS (Intel) | `Kim_*_x64.dmg` |
+            | Windows 10/11 | `Kim_*_x64-setup.exe` |
+            | Linux (Debian/Ubuntu) | `kim_*_amd64.deb` |
+            | Linux (other) | `kim_*_amd64.AppImage` |
+
+            > **Note:** Binaries are unsigned. macOS users: right-click → Open
+            > the first time. Windows users: click "More info" → "Run anyway".
+
+            ### What is Kim?
+            Kim is a local AI agent that controls your computer —
+            browser, terminal, files, apps — using any LLM provider
+            (Claude, GPT-4o, Gemini) or free browser-based mode (no API key).
+
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
