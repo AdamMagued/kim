@@ -1,30 +1,36 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { SessionInfo, KimMessage, Settings } from '../types';
+import type { SessionInfo, KimMessage, Settings, KimAccount } from '../types';
 import { MessageBubble } from './MessageBubble';
 
-// Hard cap on live output lines to avoid unbounded memory growth on long
-// agent runs. Older lines are dropped from the top and a placeholder row
-// is inserted once so the user knows content was truncated.
 const MAX_LIVE_OUTPUT_LINES = 500;
 
-// Example prompts shown on the new-chat empty state.
-const EXAMPLE_PROMPTS: { icon: string; title: string; hint: string }[] = [
-  { icon: '📝', title: 'Summarize this PDF on my desktop', hint: 'Read and extract key insights' },
-  { icon: '🎨', title: 'Make a gradient hero section in React', hint: 'Write, save, and open the file' },
-  { icon: '🔍', title: 'Find all TODOs in my project', hint: 'Search across files and list them' },
-  { icon: '🚀', title: 'Deploy this folder to GitHub', hint: 'Stage, commit, and push' },
+const EXAMPLE_PROMPTS: { title: string; hint: string }[] = [
+  { title: 'Summarize the PDF on my desktop', hint: 'Read and extract key insights from a file' },
+  { title: 'Find all TODOs in my project', hint: 'Search across files and list them' },
+  { title: 'Take a screenshot and describe what you see', hint: 'Vision + analysis' },
+  { title: 'Stage, commit, and push my changes', hint: 'Git workflow end-to-end' },
 ];
+
+function getGreeting(name: string): string {
+  const hour = new Date().getHours();
+  if (hour < 5) return `Late night, ${name}`;
+  if (hour < 12) return `Good morning, ${name}`;
+  if (hour < 17) return `Good afternoon, ${name}`;
+  if (hour < 21) return `Good evening, ${name}`;
+  return `Evening, ${name}`;
+}
 
 interface Props {
   session: SessionInfo | null;
   newChatMode: boolean;
   settings: Settings;
   onTaskDone: () => void;
+  account: KimAccount;
 }
 
-export function ChatView({ session, newChatMode, settings, onTaskDone }: Props) {
+export function ChatView({ session, newChatMode, settings, onTaskDone, account }: Props) {
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [taskInput, setTaskInput] = useState('');
@@ -203,7 +209,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone }: Props) 
               <path d="M12 2l2.5 6.5L21 11l-6.5 2.5L12 20l-2.5-6.5L3 11l6.5-2.5L12 2z" />
             </svg>
           </div>
-          <div className="kim-empty-welcome__title">Welcome to Kim</div>
+          <div className="kim-empty-welcome__title">{getGreeting(account.display_name)}</div>
           <div className="kim-empty-welcome__subtitle">
             Pick a session from the sidebar or start a new chat
           </div>
@@ -228,7 +234,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone }: Props) 
                 <span className="kim-pulse-dot kim-pulse-dot--accent" />
                 Ready
               </div>
-              <div className="kim-new-chat-empty__title">What should Kim do?</div>
+              <div className="kim-new-chat-empty__title">{getGreeting(account.display_name)}</div>
               <div className="kim-new-chat-empty__subtitle">
                 Describe a task in plain English. Kim can see your screen, control
                 your mouse, run commands, browse the web, and write code.
@@ -241,7 +247,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone }: Props) 
                     className="kim-example-card"
                     onClick={() => pickExample(ex.title)}
                   >
-                    <div className="kim-example-card__icon">{ex.icon}</div>
                     <div className="kim-example-card__body">
                       <div className="kim-example-card__title">{ex.title}</div>
                       <div className="kim-example-card__hint">{ex.hint}</div>

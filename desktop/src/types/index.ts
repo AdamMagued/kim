@@ -53,10 +53,43 @@ export interface KimMessage {
   name?: string;
 }
 
+// ── Account ──────────────────────────────────────────────────────────────────
+
+export interface KimAccount {
+  display_name: string;
+  github_username?: string;
+  github_token?: string;
+  github_avatar_url?: string;
+  gist_id?: string;
+  created_at: string;
+}
+
+// ── Claw (Code) project types ────────────────────────────────────────────────
+
+export interface ClawSession {
+  session_id: string;
+  date: string;
+  message_count: number;
+  summary?: string;
+}
+
+export interface ClawBranch {
+  name: string;
+  sessions: ClawSession[];
+}
+
+export interface ClawProject {
+  path: string;
+  name: string;
+  current_branch: string;
+  branches: ClawBranch[];
+}
+
 // ── Settings ─────────────────────────────────────────────────────────────────
 
 export type Theme = 'dark' | 'light' | 'system';
 export type Provider = 'claude' | 'openai' | 'gemini' | 'deepseek' | 'browser';
+export type AccentTheme = 'indigo' | 'ocean' | 'ember' | 'teal' | 'jade' | 'mono';
 export type VoiceEngine = 'kokoro' | 'maya1' | 'http' | 'hume';
 
 export interface VoiceSettings {
@@ -71,15 +104,17 @@ export interface Settings {
   project_root: string;
   provider: Provider;
   theme: Theme;
+  accent: AccentTheme;
   voice: VoiceSettings;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  kim_sessions_dir: '',   // empty = use Rust default
+  kim_sessions_dir: '',
   claw_sessions_dir: '',
-  project_root: '',       // empty = use Rust default
+  project_root: '',
   provider: 'browser',
   theme: 'system',
+  accent: 'indigo',
   voice: {
     enabled: true,
     engine: 'kokoro',
