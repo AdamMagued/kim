@@ -391,16 +391,7 @@ kbd {
   flex-direction: column;
   background: var(--bg);
   color: var(--text);
-  /* Subtle ambient gradient underlay */
-  background-image:
-    radial-gradient(1200px 600px at 0% 0%, rgba(91, 108, 255, 0.04), transparent 55%),
-    radial-gradient(1000px 500px at 100% 100%, rgba(168, 85, 247, 0.03), transparent 55%);
-}
-.dark .kim-app {
-  background-image:
-    radial-gradient(1200px 600px at 0% 0%, rgba(124, 141, 255, 0.06), transparent 55%),
-    radial-gradient(1000px 500px at 100% 100%, rgba(192, 132, 252, 0.04), transparent 55%);
-}
+  }
 
 /* ── Header ───────────────────────────────────────────────────────────────── */
 .kim-header {
@@ -449,24 +440,13 @@ kbd {
   width: 28px;
   height: 28px;
   border-radius: 8px;
-  background: var(--accent-gradient);
+  background: var(--accent);
   display: flex;
   align-items: center;
   justify-content: center;
   color: #fff;
   flex-shrink: 0;
-  box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.25);
   position: relative;
-}
-.kim-logo::after {
-  content: "";
-  position: absolute;
-  inset: -1px;
-  border-radius: 9px;
-  background: var(--accent-gradient);
-  filter: blur(12px);
-  opacity: 0.35;
-  z-index: -1;
 }
 
 .kim-header__title {
@@ -554,12 +534,18 @@ kbd {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 .kim-sidebar {
+  width: 240px;
+  min-width: 240px;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  transition: width 0.24s cubic-bezier(0.32, 0.72, 0.32, 1), min-width 0.24s cubic-bezier(0.32, 0.72, 0.32, 1);
+  transition: width 0.22s ease, min-width 0.22s ease;
   overflow: hidden;
+}
+.kim-sidebar--collapsed {
+  width: 52px;
+  min-width: 52px;
 }
 
 .kim-sidebar__top {
@@ -598,24 +584,16 @@ kbd {
   height: 34px;
   border-radius: 9px;
   border: none;
-  background: var(--accent-gradient);
+  background: var(--accent);
   color: #fff;
   cursor: pointer;
   font-size: 13px;
   font-weight: 600;
   letter-spacing: -0.005em;
-  box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.18);
-  transition: transform 0.12s, box-shadow 0.12s, background 0.18s;
+  transition: background 0.15s, opacity 0.15s;
 }
-.kim-sidebar__new-chat:hover {
-  background: var(--accent-gradient-hover);
-  box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.25);
-  transform: translateY(-1px);
-}
-.kim-sidebar__new-chat:active {
-  transform: translateY(0);
-  box-shadow: var(--shadow-xs);
-}
+.kim-sidebar__new-chat:hover { background: var(--accent-hover); }
+.kim-sidebar__new-chat:active { opacity: 0.85; }
 
 .kim-sidebar__scroll {
   flex: 1;
@@ -690,7 +668,7 @@ kbd {
   bottom: 8px;
   width: 3px;
   border-radius: 2px;
-  background: var(--accent-gradient);
+  background: var(--accent);
 }
 
 .kim-session-item__title {
@@ -796,27 +774,17 @@ kbd {
   animation: kim-fade-in 0.4s ease;
 }
 .kim-empty-welcome__icon {
-  width: 72px;
-  height: 72px;
-  border-radius: 20px;
-  background: var(--accent-gradient);
-  color: #fff;
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
+  background: var(--accent-muted);
+  color: var(--accent);
   display: flex;
   align-items: center;
   justify-content: center;
-  position: relative;
-  box-shadow: var(--shadow-lg);
   margin-bottom: 8px;
 }
-.kim-empty-welcome__glow {
-  position: absolute;
-  inset: -8px;
-  background: var(--accent-gradient);
-  border-radius: 24px;
-  filter: blur(24px);
-  opacity: 0.35;
-  z-index: -1;
-}
+.kim-empty-welcome__glow { display: none; }
 .kim-empty-welcome__title {
   font-size: 22px;
   font-weight: 700;
@@ -865,15 +833,11 @@ kbd {
   margin-bottom: 16px;
 }
 .kim-new-chat-empty__title {
-  font-size: 30px;
+  font-size: 28px;
   font-weight: 700;
   color: var(--text-strong);
   letter-spacing: -0.03em;
   margin-bottom: 8px;
-  background: var(--accent-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
 }
 .kim-new-chat-empty__subtitle {
   font-size: 15px;
@@ -907,22 +871,10 @@ kbd {
   position: relative;
   overflow: hidden;
 }
-.kim-example-card::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: var(--accent-gradient);
-  opacity: 0;
-  transition: opacity 0.2s;
-  z-index: 0;
-}
-.kim-example-card > * { position: relative; z-index: 1; }
 .kim-example-card:hover {
-  transform: translateY(-2px);
   border-color: var(--accent);
-  box-shadow: var(--shadow-md);
+  background: var(--bg-card);
 }
-.kim-example-card:hover::before { opacity: 0.04; }
 .kim-example-card__icon {
   font-size: 22px;
   width: 38px;
@@ -971,12 +923,10 @@ kbd {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 14px;
-  border-radius: 10px;
-  background: var(--accent-muted);
-  color: var(--accent);
+  padding: 10px 4px;
+  color: var(--text-muted);
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 400;
   animation: kim-fade-in 0.25s ease;
 }
 .kim-working-indicator__dots {
@@ -1140,9 +1090,8 @@ kbd {
   font-family: inherit;
 }
 .kim-btn--send {
-  background: var(--accent-gradient);
+  background: var(--accent);
   color: #fff;
-  box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.18);
 }
 .kim-btn--send:hover:not(:disabled) {
   background: var(--accent-gradient-hover);
@@ -1302,20 +1251,18 @@ kbd {
   animation: kim-slide-up 0.25s ease;
 }
 .kim-bubble--user {
-  background: var(--bubble-user-bg);
-  color: var(--bubble-user-text);
+  background: var(--accent);
+  color: #fff;
   border-radius: 18px 18px 4px 18px;
   white-space: pre-wrap;
   max-width: 75%;
-  box-shadow: var(--shadow-sm);
 }
 .kim-bubble--assistant {
   background: var(--bubble-ai-bg);
   color: var(--bubble-ai-text);
   border: 1px solid var(--bubble-ai-border);
-  border-radius: 18px 18px 18px 4px;
-  max-width: 80%;
-  box-shadow: var(--shadow-xs);
+  border-radius: 4px 18px 18px 18px;
+  max-width: 82%;
 }
 .kim-bubble--assistant-group-top {
   border-radius: 18px 18px 4px 4px;
@@ -1936,7 +1883,7 @@ kbd {
   padding: 9px 20px;
   border-radius: 9px;
   border: none;
-  background: var(--accent-gradient);
+  background: var(--accent);
   color: #fff;
   cursor: pointer;
   font-size: 13px;
@@ -1946,14 +1893,10 @@ kbd {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.18);
-  transition: all 0.15s ease;
+  transition: background 0.15s, opacity 0.15s;
 }
-.kim-btn--primary:hover {
-  background: var(--accent-gradient-hover);
-  transform: translateY(-1px);
-  box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.25);
-}
+.kim-btn--primary:hover { background: var(--accent-hover); }
+.kim-btn--primary:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* Update modal specifics */
 .kim-update__hero {
@@ -2063,7 +2006,7 @@ kbd {
   width: 28px;
   height: 28px;
   border-radius: 50%;
-  background: var(--accent-gradient);
+  background: var(--accent);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2339,3 +2282,139 @@ kbd {
   border-left: 3px solid var(--accent);
   margin-top: 4px;
 }
+
+/* ── Code tab (Claw projects) ─────────────────────────────────────────────── */
+.kim-sidebar__tabs {
+  padding: 8px 10px 4px;
+}
+
+.kim-code-tab-header {
+  display: flex;
+  align-items: center;
+  padding: 6px 10px 4px;
+  gap: 6px;
+}
+.kim-code-tab-add-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s, color 0.12s;
+  flex-shrink: 0;
+}
+.kim-code-tab-add-btn:hover {
+  background: var(--bg-card);
+  color: var(--text);
+}
+
+.kim-add-project-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 8px;
+  flex-wrap: wrap;
+}
+.kim-add-project-error {
+  width: 100%;
+  font-size: 11px;
+  color: var(--danger);
+  padding: 0 2px;
+}
+
+.kim-input--sm {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  font-size: 12px;
+  padding: 0 10px;
+}
+
+.kim-link-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--accent);
+  font-family: inherit;
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.kim-link-btn:hover { color: var(--accent-hover); }
+
+/* Project tree row */
+.kim-project-item__header {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  width: 100%;
+  padding: 2px 8px 2px 4px;
+}
+.kim-project-item__toggle {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 4px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-muted);
+  text-align: left;
+  border-radius: 6px;
+  transition: background 0.1s, color 0.1s;
+  min-width: 0;
+}
+.kim-project-item__toggle:hover {
+  background: var(--bg-card);
+  color: var(--text);
+}
+.kim-project-item__remove {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: background 0.1s, color 0.1s, opacity 0.1s;
+}
+.kim-project-item:hover .kim-project-item__remove { opacity: 1; }
+.kim-project-item__remove:hover {
+  background: var(--danger-muted);
+  color: var(--danger);
+}
+.kim-project-item__sessions {
+  padding-left: 8px;
+  margin-top: 1px;
+}
+
+.kim-branch-label {
+  padding: 3px 8px 3px 20px;
+  font-size: 10.5px;
+  font-family: "JetBrains Mono", "SF Mono", monospace;
+  color: var(--text-subtle);
+  letter-spacing: 0.02em;
+}
+
+/* ── Sidebar pulse dot ────────────────────────────────────────────────────── */
+.kim-pulse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  display: inline-block;
+  flex-shrink: 0;
+}
+

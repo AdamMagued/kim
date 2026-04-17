@@ -62,6 +62,8 @@ export interface KimAccount {
   github_avatar_url?: string;
   gist_id?: string;
   created_at: string;
+  /** Explicit project roots shown in the Code tab — scans .claw/sessions/ inside each */
+  code_projects?: string[];
 }
 
 // ── Claw (Code) project types ────────────────────────────────────────────────

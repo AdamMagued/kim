@@ -62,7 +62,7 @@ export default function App() {
   const { setTheme } = useTheme(settings.theme);
   const { account, loading: accountLoading, setAccount } = useAccount();
 
-  const { kimSessions, clawSessions, loading, refresh } = useSessions(settings);
+  const { kimSessions, loading, refresh } = useSessions(settings);
 
   const [activeSession, setActiveSession] = useState<SessionInfo | null>(null);
   const [newChatMode, setNewChatMode] = useState(false);
@@ -201,7 +201,6 @@ export default function App() {
       <div className="kim-body">
         <Sidebar
           kimSessions={kimSessions}
-          clawSessions={clawSessions}
           activeSessionId={activeSession?.session_id ?? null}
           onSelectSession={handleSelectSession}
           onNewChat={handleNewChat}
@@ -210,9 +209,9 @@ export default function App() {
           onOpenSettings={() => setShowSettings(true)}
           loading={loading}
           account={account}
+          onAccountChange={setAccount}
           activeTab={activeTab}
           onTabChange={setActiveTab}
-          clawSessionsDir={settings.claw_sessions_dir}
         />
 
         <ChatView
