@@ -1,101 +1,84 @@
 import { useState } from 'react';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { toast } from './Toast';
 
 interface BrowserProvider {
   id: string;
   name: string;
-  url: string | null; // null = custom (user provides URL)
+  url: string | null;
   hint: string;
   warning?: string;
 }
 
 const BROWSER_PROVIDERS: BrowserProvider[] = [
+  { id: 'claude',   name: 'Claude',   url: 'https://claude.ai',          hint: 'Sign in with your Anthropic account' },
+  { id: 'chatgpt',  name: 'ChatGPT',  url: 'https://chatgpt.com',        hint: 'Sign in with your OpenAI account' },
+  { id: 'gemini',   name: 'Gemini',   url: 'https://gemini.google.com',  hint: 'Sign in with your Google account' },
+  { id: 'grok',     name: 'Grok',     url: 'https://grok.com',           hint: 'Sign in with your X (Twitter) account' },
   {
-    id: 'claude',
-    name: 'Claude',
-    url: 'https://claude.ai',
-    hint: 'Sign in with your Anthropic account',
-  },
-  {
-    id: 'chatgpt',
-    name: 'ChatGPT',
-    url: 'https://chatgpt.com',
-    hint: 'Sign in with your OpenAI account',
-  },
-  {
-    id: 'gemini',
-    name: 'Gemini',
-    url: 'https://gemini.google.com',
-    hint: 'Sign in with your Google account',
-  },
-  {
-    id: 'grok',
-    name: 'Grok',
-    url: 'https://grok.com',
-    hint: 'Sign in with your X (Twitter) account',
-  },
-  {
-    id: 'deepseek',
-    name: 'DeepSeek',
-    url: 'https://chat.deepseek.com',
-    hint: 'Sign in with your DeepSeek account',
+    id: 'deepseek', name: 'DeepSeek', url: 'https://chat.deepseek.com',  hint: 'Sign in with your DeepSeek account',
     warning: 'DeepSeek cannot see screenshots — screen control tasks will not work.',
   },
-  {
-    id: 'custom',
-    name: 'Custom',
-    url: null,
-    hint: 'Open any AI chat website inside Kim',
-  },
+  { id: 'custom',   name: 'Custom',   url: null,                         hint: 'Open any AI chat website inside Kim' },
 ];
 
-// ── Icons ─────────────────────────────────────────────────────────────────────
+// ── Real brand logos ──────────────────────────────────────────────────────────
 
 function ClaudeIcon() {
+  // Anthropic / Claude wordmark "A" shape
   return (
-    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
-      <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z" />
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-label="Claude">
+      <path d="M13.827 3.52h3.603L24 20.479h-3.603l-6.57-16.96zM8.322 3.52H4.719L.001 20.479h3.603l.85-2.487h5.865l.85 2.487h3.603L9.172 3.52zm-3.086 11.77 1.902-5.566 1.9 5.567H5.236z"/>
     </svg>
   );
 }
+
 function ChatGPTIcon() {
+  // OpenAI logo
   return (
-    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
-      <path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.985 5.985 0 0 0-3.998 2.9 6.046 6.046 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073zm-9.022 12.338a4.476 4.476 0 0 1-2.866-1.032l.141-.081 4.756-2.748a.78.78 0 0 0 .392-.681v-6.706l2.01 1.16a.07.07 0 0 1 .039.053v5.56a4.494 4.494 0 0 1-4.472 4.474z" />
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-label="ChatGPT">
+      <path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.985 5.985 0 0 0-3.998 2.9 6.046 6.046 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073zM13.26 22.43a4.476 4.476 0 0 1-2.866-1.032l.141-.081 4.756-2.748a.78.78 0 0 0 .392-.681v-6.706l2.01 1.16a.07.07 0 0 1 .039.053v5.56a4.494 4.494 0 0 1-4.472 4.474zm-9.722-4.107a4.476 4.476 0 0 1-.535-3.014l.142.085 4.756 2.747a.77.77 0 0 0 .783 0l5.812-3.354v2.318a.07.07 0 0 1-.028.061l-4.808 2.776a4.494 4.494 0 0 1-6.122-1.619zm-1.264-9.642A4.475 4.475 0 0 1 4.61 6.54v5.641a.78.78 0 0 0 .391.681l5.814 3.354-2.01 1.16a.07.07 0 0 1-.069.007L3.927 14.6a4.494 4.494 0 0 1-.653-5.919zm16.556 3.864l-5.813-3.354 2.01-1.16a.07.07 0 0 1 .07-.006l4.808 2.776a4.494 4.494 0 0 1-.691 8.108v-5.64a.77.77 0 0 0-.384-.724zm2.001-3.025-.141-.085-4.755-2.748a.77.77 0 0 0-.785 0L9.34 10.031V7.712a.07.07 0 0 1 .028-.061l4.808-2.775a4.493 4.493 0 0 1 6.676 4.653zm-12.57 4.135l-2.01-1.16a.07.07 0 0 1-.038-.053v-5.56a4.493 4.493 0 0 1 7.363-3.448l-.141.08-4.756 2.748a.78.78 0 0 0-.392.681zm1.092-2.354l2.587-1.495 2.587 1.494v2.99l-2.587 1.494-2.587-1.494z"/>
     </svg>
   );
 }
+
 function GeminiIcon() {
+  // Google Gemini logo (the four-pointed star)
   return (
-    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
-      <path d="M12 0C5.372 0 0 5.372 0 12s5.372 12 12 12 12-5.372 12-12S18.628 0 12 0zm0 2.4a9.6 9.6 0 1 1 0 19.2A9.6 9.6 0 0 1 12 2.4zm0 3.6L8.4 12 12 18l3.6-6L12 6z" />
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-label="Gemini">
+      <path d="M12 24A14.304 14.304 0 0 0 0 12 14.304 14.304 0 0 0 12 0a14.305 14.305 0 0 0 12 12 14.305 14.305 0 0 0-12 12" />
     </svg>
   );
 }
+
 function GrokIcon() {
+  // X (Twitter) logo
   return (
-    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-label="Grok">
       <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
     </svg>
   );
 }
+
 function DeepSeekIcon() {
+  // DeepSeek whale/fish shape approximation
   return (
-    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="12" cy="12" r="10" />
-      <path d="M8 12h8M12 8v8" />
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-label="DeepSeek">
+      <path d="M22.979 10.557c-.024-.053-.071-.092-.128-.103a6.87 6.87 0 0 0-.765-.088c-.459-.033-.918-.045-1.378-.037-.18-.44-.423-.85-.722-1.218 1.09-1.89 1.68-4.01 1.302-5.987-.033-.175-.195-.296-.373-.27C18.37 3.19 16.7 4.35 15.39 5.9a8.32 8.32 0 0 0-3.39-.72 8.32 8.32 0 0 0-3.39.72C7.3 4.35 5.63 3.19 3.086 2.854a.357.357 0 0 0-.373.27c-.379 1.977.212 4.097 1.302 5.987-.3.368-.542.777-.722 1.218-.46-.008-.919.004-1.378.037-.257.018-.513.05-.765.088a.203.203 0 0 0-.128.103.193.193 0 0 0-.003.162c.31.717.752 1.366 1.303 1.91a5.84 5.84 0 0 0 1.793 1.183 9.047 9.047 0 0 0 1.47 3.97C6.83 19.316 9.28 20.4 12 20.4s5.17-1.084 6.415-3.218a9.047 9.047 0 0 0 1.47-3.97 5.84 5.84 0 0 0 1.793-1.184 5.574 5.574 0 0 0 1.303-1.909.193.193 0 0 0-.002-.162zM12 6.14c.774 0 1.53.113 2.25.327-.692.965-1.226 2.04-1.567 3.183a.78.78 0 0 1-.683.54.78.78 0 0 1-.683-.54A10.35 10.35 0 0 0 9.75 6.467c.72-.214 1.476-.327 2.25-.327zm0 12.66c-2.254 0-4.274-.985-5.512-2.676a7.618 7.618 0 0 1-1.33-3.694C5.895 11.065 8.75 9.12 12 9.12s6.105 1.945 6.842 3.31a7.618 7.618 0 0 1-1.33 3.694C16.274 17.815 14.254 18.8 12 18.8z"/>
     </svg>
   );
 }
+
 function CustomIcon() {
   return (
-    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-label="Custom">
       <circle cx="12" cy="12" r="10" />
-      <path d="M12 8v4l3 3" />
+      <path d="M12 8v8M8 12h8" />
     </svg>
   );
 }
+
 function WarnTriangle() {
   return (
     <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -103,6 +86,7 @@ function WarnTriangle() {
     </svg>
   );
 }
+
 function ExternalIcon() {
   return (
     <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -120,6 +104,8 @@ const ICONS: Record<string, React.ReactNode> = {
   custom:   <CustomIcon />,
 };
 
+// ── Provider picker ───────────────────────────────────────────────────────────
+
 interface Props {
   selected: string;
   onSelect: (providerId: string) => void;
@@ -131,6 +117,25 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
 
   const selectedProvider = BROWSER_PROVIDERS.find(p => p.id === selected);
 
+  /** Extract a human-readable string from a Tauri event (which is not a plain string) */
+  function extractErrorMessage(e: unknown, providerName: string): string {
+    // Tauri events are objects: { event: string, payload: unknown, id: number }
+    if (e && typeof e === 'object') {
+      const payload = (e as Record<string, unknown>).payload;
+      if (typeof payload === 'string' && payload.length > 0) {
+        // Map technical errors to user-friendly messages
+        if (payload.includes('not allowed') || payload.includes('permission') || payload.includes('capability'))
+          return `Kim needs permission to open ${providerName}. Try restarting Kim.`;
+        if (payload.includes('network') || payload.includes('unreachable') || payload.includes('dns'))
+          return 'Could not connect — check your internet connection.';
+        return payload.length < 200 ? payload : 'Could not open window — check your internet connection.';
+      }
+    }
+    if (typeof e === 'string' && e.length > 0) return e;
+    // Generic fallback — the most common cause is network/CSP
+    return `Could not open ${providerName} inside Kim. Try opening it in your system browser instead.`;
+  }
+
   async function openInKim(provider: BrowserProvider) {
     const targetUrl = provider.url ?? customUrl.trim();
     if (!targetUrl || targetUrl === 'https://') {
@@ -139,8 +144,10 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
     }
 
     setOpeningId(provider.id);
+    const label = `browser-signin-${provider.id}`;
+
     try {
-      const label = `browser-signin-${provider.id}`;
+      // Focus existing window if it's already open
       const existing = await WebviewWindow.getByLabel(label);
       if (existing) {
         await existing.setFocus();
@@ -162,12 +169,18 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
         toast(`${provider.name} opened — sign in, then come back to Kim.`, 'info', 5000);
         setOpeningId(null);
       });
-      w.once('tauri://error', (e) => {
-        toast(`Failed to open ${provider.name}: ${String(e)}`, 'error');
+
+      w.once('tauri://error', (e: unknown) => {
+        const msg = extractErrorMessage(e, provider.name);
+        // Offer to open in system browser as fallback
+        toast(`${msg} Opening in your browser instead…`, 'warning', 6000);
+        openUrl(targetUrl).catch(() => {});
         setOpeningId(null);
       });
     } catch (err) {
-      toast(`Could not open browser window: ${String(err)}`, 'error');
+      // WebviewWindow constructor threw — open in system browser as fallback
+      toast(`Opening ${provider.name} in your system browser.`, 'info', 4000);
+      openUrl(targetUrl).catch(() => {});
       setOpeningId(null);
     }
   }
@@ -198,7 +211,6 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
                 <span>{p.warning}</span>
               </div>
             )}
-            {/* Custom URL input */}
             {selected === p.id && p.id === 'custom' && (
               <input
                 className="kim-browser-card__url-input"
@@ -225,7 +237,7 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
       <div className="kim-browser-picker__info">
         {selectedProvider?.id === 'custom'
           ? 'Enter any AI chat URL above, open it in Kim, sign in, then send your task as normal.'
-          : 'Sign into the AI provider above, then send your task from Kim as normal. Kim will relay your message through that browser session.'}
+          : 'Sign in to the AI provider above, then send your task from Kim as normal. Kim will relay your message through that browser session.'}
       </div>
     </div>
   );

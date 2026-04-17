@@ -1,7 +1,9 @@
 import { useEffect, useState, useRef, type ReactElement } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type { Settings, Provider, Theme, VoiceEngine, VoiceSettings, AccentTheme, KimAccount } from '../types';
 import { VOICES_BY_ENGINE } from '../types';
+import { toast } from './Toast';
 
 const PROVIDERS: { value: Provider; label: string }[] = [
   { value: 'browser', label: 'Browser (no API key)' },
@@ -27,7 +29,7 @@ const ACCENTS: { value: AccentTheme; label: string; light: string; dark: string 
   { value: 'mono',   label: 'Mono',   light: '#18181b', dark: '#e4e4e7' },
 ];
 
-type NavSection = 'appearance' | 'ai' | 'voice' | 'paths' | 'data' | 'account' | 'about';
+type NavSection = 'appearance' | 'ai' | 'voice' | 'paths' | 'data' | 'account' | 'mcp' | 'feedback' | 'about';
 
 interface NavItem {
   id: NavSection;
@@ -169,6 +171,28 @@ function RefreshIcon() {
     </svg>
   );
 }
+function PlugIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 22V12M5 12H2a10 10 0 0 0 20 0h-3M9 3v4M15 3v4"/>
+      <rect x="9" y="7" width="6" height="5" rx="1"/>
+    </svg>
+  );
+}
+function MessageSquareIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+    </svg>
+  );
+}
+function PickerIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h2a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>
+    </svg>
+  );
+}
 
 const THEMES: { value: Theme; label: string; icon: ReactElement }[] = [
   { value: 'light', label: 'Light', icon: <SunIcon /> },
@@ -183,6 +207,8 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'paths',      label: 'Paths',      icon: <FolderIcon /> },
   { id: 'data',       label: 'Data',       icon: <DatabaseIcon /> },
   { id: 'account',    label: 'Account',    icon: <UserIcon /> },
+  { id: 'mcp',        label: 'MCP',        icon: <PlugIcon /> },
+  { id: 'feedback',   label: 'Feedback',   icon: <MessageSquareIcon /> },
   { id: 'about',      label: 'About',      icon: <InfoIcon /> },
 ];
 
@@ -373,18 +399,41 @@ function PathsSection({ settings, onChange }: { settings: Settings; onChange: (s
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
     onChange({ ...settings, [key]: value });
   }
+
+  async function pickDir(key: keyof Settings) {
+    try {
+      const selected = await openDialog({ directory: true, multiple: false, title: 'Select Folder' });
+      if (selected && typeof selected === 'string') update(key, selected);
+    } catch {
+      // user cancelled or dialog unavailable — no-op
+    }
+  }
+
+  function PathField({ label, settingsKey, hint, placeholder }: { label: string; settingsKey: keyof Settings; hint: string; placeholder: string }) {
+    return (
+      <Field label={label} hint={hint}>
+        <div className="kim-path-row">
+          <input
+            type="text"
+            value={String(settings[settingsKey] ?? '')}
+            onChange={e => update(settingsKey, e.target.value as Settings[typeof settingsKey])}
+            placeholder={placeholder}
+            className="kim-input"
+          />
+          <button className="kim-btn kim-btn--secondary kim-path-pick-btn" title="Browse…" onClick={() => pickDir(settingsKey)}>
+            <PickerIcon />
+          </button>
+        </div>
+      </Field>
+    );
+  }
+
   return (
     <div className="kim-settings-content">
       <div className="kim-settings-content__title">Paths</div>
-      <Field label="Kim sessions directory" hint="Leave empty to use the default (~/Desktop/kim/kim_sessions or ~/.kim/sessions)">
-        <input type="text" value={settings.kim_sessions_dir} onChange={e => update('kim_sessions_dir', e.target.value)} placeholder="/path/to/kim_sessions" className="kim-input" />
-      </Field>
-      <Field label="Code sessions directory" hint="Path where Claude Code stores its JSONL session files">
-        <input type="text" value={settings.claw_sessions_dir} onChange={e => update('claw_sessions_dir', e.target.value)} placeholder="/path/to/claude/sessions" className="kim-input" />
-      </Field>
-      <Field label="Project root" hint="Root of your Kim installation (where orchestrator/ lives). Leave empty for auto-detect.">
-        <input type="text" value={settings.project_root} onChange={e => update('project_root', e.target.value)} placeholder="/path/to/kim" className="kim-input" />
-      </Field>
+      <PathField label="Kim sessions directory" settingsKey="kim_sessions_dir" hint="Leave empty to use the default (~/Desktop/kim/kim_sessions or ~/.kim/sessions)" placeholder="/path/to/kim_sessions" />
+      <PathField label="Code sessions directory" settingsKey="claw_sessions_dir" hint="Path where Claw stores its JSONL session files" placeholder="/path/to/claw/sessions" />
+      <PathField label="Project root" settingsKey="project_root" hint="Root of your Kim installation (where orchestrator/ lives). Leave empty for auto-detect." placeholder="/path/to/kim" />
     </div>
   );
 }
@@ -723,23 +772,303 @@ function AccountSection({ account, onAccountChange }: { account: KimAccount; onA
 }
 
 function AboutSection({ appVersion, onCheckUpdate }: { appVersion: string; onCheckUpdate: () => void }) {
+  const [updateStatus, setUpdateStatus] = useState<'idle' | 'checking' | 'latest' | 'available'>('idle');
+  const [releaseNotes, setReleaseNotes] = useState<string | null>(null);
+  const [loadingNotes, setLoadingNotes] = useState(false);
+
+  // Fetch release notes for the current version on mount
+  useEffect(() => {
+    setLoadingNotes(true);
+    fetch('https://api.github.com/repos/AdamMagued/kim/releases/latest', {
+      headers: { Accept: 'application/vnd.github+json' },
+    })
+      .then(r => r.ok ? r.json() : null)
+      .then((data: { body?: string; tag_name?: string } | null) => {
+        if (data?.body) setReleaseNotes(data.body);
+      })
+      .catch(() => {})
+      .finally(() => setLoadingNotes(false));
+  }, []);
+
+  async function handleCheckUpdate() {
+    setUpdateStatus('checking');
+    try {
+      const resp = await fetch('https://api.github.com/repos/AdamMagued/kim/releases/latest', {
+        headers: { Accept: 'application/vnd.github+json' },
+      });
+      if (!resp.ok) { setUpdateStatus('idle'); return; }
+      const data = await resp.json() as { tag_name: string };
+      const latest = data.tag_name.replace(/^v/, '');
+      const cur = appVersion.replace(/^v/, '');
+      const isNewer = latest.split('.').map(Number).some((n, i) => n > (Number(cur.split('.')[i] ?? 0)));
+      setUpdateStatus(isNewer ? 'available' : 'latest');
+      onCheckUpdate();
+    } catch {
+      setUpdateStatus('idle');
+    }
+  }
+
+  /** Render a subset of GitHub markdown: headers, bullets, bold, code */
+  function renderNotes(md: string): React.ReactNode {
+    return md.split('\n').map((line, i) => {
+      if (line.startsWith('### ')) return <h4 key={i} className="kim-release-notes__h3">{line.slice(4)}</h4>;
+      if (line.startsWith('## '))  return <h3 key={i} className="kim-release-notes__h2">{line.slice(3)}</h3>;
+      if (line.startsWith('- ') || line.startsWith('* ')) {
+        const text = line.slice(2).replace(/\*\*([^*]+)\*\*/g, '$1');
+        return <li key={i} className="kim-release-notes__li">{text}</li>;
+      }
+      if (line.trim() === '') return <br key={i} />;
+      return <p key={i} className="kim-release-notes__p">{line.replace(/\*\*([^*]+)\*\*/g, '$1')}</p>;
+    });
+  }
+
   return (
     <div className="kim-settings-content">
       <div className="kim-settings-content__title">About</div>
+
       <div className="kim-about">
         <div>
           <div className="kim-about__title">Kim Desktop</div>
           <div className="kim-about__version">v{appVersion}</div>
         </div>
-        <button onClick={onCheckUpdate} className="kim-btn kim-btn--secondary">
-          <RefreshIcon />
-          <span>Check for updates</span>
+        <button
+          onClick={handleCheckUpdate}
+          disabled={updateStatus === 'checking'}
+          className={`kim-btn kim-btn--secondary${updateStatus === 'available' ? ' kim-btn--has-update' : ''}`}
+        >
+          {updateStatus === 'checking' ? (
+            <span className="kim-spinner kim-spinner--sm" />
+          ) : (
+            <RefreshIcon />
+          )}
+          <span>
+            {updateStatus === 'checking' ? 'Checking…'
+              : updateStatus === 'latest'    ? 'You\'re up to date'
+              : updateStatus === 'available' ? 'Update available!'
+              : 'Check for updates'}
+          </span>
         </button>
       </div>
-      <div className="kim-field__hint" style={{ marginTop: 16, lineHeight: 1.6 }}>
+
+      <div className="kim-field__hint" style={{ marginTop: 12, lineHeight: 1.6 }}>
         Kim is a local AI agent that runs entirely on your machine. No telemetry, no cloud accounts required.
-        Your sessions are stored in <code>~/.config/kim/</code>.
+        Sessions are stored in <code>~/.config/kim/</code>.
       </div>
+
+      {/* Release notes */}
+      <div className="kim-settings-section__header" style={{ marginTop: 24, marginBottom: 8 }}>
+        <span className="kim-settings-section__title" style={{ fontSize: 13 }}>What's new</span>
+      </div>
+      {loadingNotes ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-muted)', fontSize: 13 }}>
+          <span className="kim-spinner kim-spinner--sm" /> Loading release notes…
+        </div>
+      ) : releaseNotes ? (
+        <div className="kim-release-notes">
+          {renderNotes(releaseNotes)}
+        </div>
+      ) : (
+        <div className="kim-field__hint">Could not load release notes. Check your internet connection.</div>
+      )}
+    </div>
+  );
+}
+
+// ── MCP section ───────────────────────────────────────────────────────────────
+
+const BUILT_IN_TOOLS = [
+  { name: 'take_screenshot',   desc: 'Capture the current screen' },
+  { name: 'read_file',         desc: 'Read a file from the filesystem' },
+  { name: 'write_file',        desc: 'Write or create a file' },
+  { name: 'run_command',       desc: 'Execute a shell command' },
+  { name: 'click',             desc: 'Click at screen coordinates' },
+  { name: 'type_text',         desc: 'Type text using the keyboard' },
+  { name: 'browser_navigate',  desc: 'Navigate a browser to a URL' },
+  { name: 'search_files',      desc: 'Search for files by name or content' },
+  { name: 'focus_window',      desc: 'Bring an application window to focus' },
+  { name: 'get_screen_text',   desc: 'Extract text visible on screen' },
+];
+
+function MCPSection() {
+  return (
+    <div className="kim-settings-content">
+      <div className="kim-settings-content__title">MCP Servers</div>
+
+      {/* What is MCP */}
+      <div className="kim-mcp-explainer">
+        <div className="kim-mcp-explainer__title">What are MCP servers?</div>
+        <div className="kim-mcp-explainer__body">
+          <p><strong>MCP (Model Context Protocol)</strong> is a standard that lets AI agents communicate with external tools and services. Think of each MCP server as a plugin that gives Kim new abilities.</p>
+          <p>For example, a <strong>Puppeteer MCP</strong> server lets Kim control a real browser programmatically. A <strong>database MCP</strong> server lets Kim query your data directly. A <strong>Slack MCP</strong> server lets Kim read and send messages.</p>
+          <p>Kim includes a built-in MCP server with {BUILT_IN_TOOLS.length} tools for screen control, file access, and terminal commands. Custom MCP servers extend this further.</p>
+        </div>
+      </div>
+
+      {/* Built-in tools */}
+      <div className="kim-settings-section__header" style={{ marginTop: 20, marginBottom: 10 }}>
+        <span className="kim-settings-section__title" style={{ fontSize: 13 }}>Built-in tools ({BUILT_IN_TOOLS.length})</span>
+      </div>
+      <div className="kim-mcp-tools-grid">
+        {BUILT_IN_TOOLS.map(t => (
+          <div key={t.name} className="kim-mcp-tool">
+            <code className="kim-mcp-tool__name">{t.name}</code>
+            <span className="kim-mcp-tool__desc">{t.desc}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Custom MCP servers */}
+      <div className="kim-settings-section__header" style={{ marginTop: 24, marginBottom: 10 }}>
+        <span className="kim-settings-section__title" style={{ fontSize: 13 }}>Adding custom MCP servers</span>
+      </div>
+      <div className="kim-mcp-explainer__body" style={{ marginBottom: 16 }}>
+        <p>Custom MCP servers are configured in <code>config.yaml</code> at the root of your Kim installation. Each server is a process that Kim connects to on startup.</p>
+      </div>
+      <div className="kim-mcp-code-block">
+        <pre>{`# config.yaml
+mcp_servers:
+  - name: puppeteer
+    command: npx
+    args: [-y, "@modelcontextprotocol/server-puppeteer"]
+
+  - name: my-custom-server
+    command: python
+    args: [my_mcp_server.py]
+    env:
+      MY_API_KEY: "your-key-here"`}</pre>
+      </div>
+      <div className="kim-field__hint" style={{ marginTop: 12 }}>
+        After editing <code>config.yaml</code>, restart Kim for the changes to take effect. Popular servers: <strong>Puppeteer</strong>, <strong>Filesystem</strong>, <strong>GitHub</strong>, <strong>Slack</strong> — browse more at <strong>21st.dev/mcp</strong>.
+      </div>
+
+      {/* Can browser/Claw use MCP? */}
+      <div className="kim-settings-section__header" style={{ marginTop: 24, marginBottom: 10 }}>
+        <span className="kim-settings-section__title" style={{ fontSize: 13 }}>Browser providers & MCP</span>
+      </div>
+      <div className="kim-mcp-explainer__body">
+        <p>Yes — all of Kim's built-in MCP tools work with every provider, including browser providers (Claude.ai, ChatGPT, Gemini, Grok). The browser is only used for the <em>language model</em> part; Kim still executes all tool calls locally via the MCP server.</p>
+        <p>Custom MCP servers (e.g. Puppeteer, 21st.dev) will also work once configured in <code>config.yaml</code> — they're available to all providers.</p>
+      </div>
+    </div>
+  );
+}
+
+// ── Feedback section ──────────────────────────────────────────────────────────
+
+const FEEDBACK_CATEGORIES = [
+  { id: 'bug',     label: '🐛 Bug',             desc: 'Something is broken or not working' },
+  { id: 'feature', label: '✨ Feature request',  desc: 'Something you\'d like Kim to do' },
+  { id: 'general', label: '💬 General feedback', desc: 'Anything on your mind' },
+  { id: 'praise',  label: '🙏 Praise',           desc: 'Tell us what you love' },
+  { id: 'other',   label: '📝 Other',            desc: 'Anything else' },
+];
+
+function FeedbackSection() {
+  const [category, setCategory] = useState('general');
+  const [message, setMessage] = useState('');
+  const [contact, setContact] = useState('');
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!message.trim()) return;
+    setSending(true);
+    try {
+      await invoke('send_feedback', {
+        payload: { category, message: message.trim(), contact: contact.trim() || null },
+      });
+      setSent(true);
+      setMessage('');
+      setContact('');
+      toast('Thanks for your feedback!', 'success');
+    } catch (err) {
+      toast(`Couldn't send feedback: ${String(err)}`, 'error');
+    } finally {
+      setSending(false);
+    }
+  }
+
+  if (sent) {
+    return (
+      <div className="kim-settings-content">
+        <div className="kim-settings-content__title">Feedback</div>
+        <div className="kim-feedback-sent">
+          <div className="kim-feedback-sent__icon">🙏</div>
+          <div className="kim-feedback-sent__title">Thank you!</div>
+          <div className="kim-feedback-sent__desc">Your feedback helps make Kim better for everyone.</div>
+          <button className="kim-btn kim-btn--secondary" onClick={() => setSent(false)} style={{ marginTop: 16 }}>
+            Send more feedback
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="kim-settings-content">
+      <div className="kim-settings-content__title">Feedback</div>
+      <div className="kim-field__hint" style={{ marginBottom: 20, lineHeight: 1.6 }}>
+        Tell us what's on your mind. Your message goes directly to the Kim team — we read every one.
+      </div>
+
+      <form onSubmit={handleSubmit}>
+        {/* Category */}
+        <div className="kim-field" style={{ marginBottom: 16 }}>
+          <label className="kim-field__label">What kind of feedback?</label>
+          <div className="kim-feedback-cats">
+            {FEEDBACK_CATEGORIES.map(c => (
+              <button
+                key={c.id}
+                type="button"
+                className={`kim-feedback-cat${category === c.id ? ' kim-feedback-cat--active' : ''}`}
+                onClick={() => setCategory(c.id)}
+              >
+                <span className="kim-feedback-cat__label">{c.label}</span>
+                <span className="kim-feedback-cat__desc">{c.desc}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Message */}
+        <div className="kim-field" style={{ marginBottom: 16 }}>
+          <label className="kim-field__label">Your message</label>
+          <textarea
+            className="kim-input kim-feedback-textarea"
+            value={message}
+            onChange={e => setMessage(e.target.value)}
+            placeholder={
+              category === 'bug'     ? 'Describe what happened and what you expected to happen…' :
+              category === 'feature' ? 'Describe the feature you\'d like and how you\'d use it…' :
+              category === 'praise'  ? 'What do you love about Kim?' :
+              'Tell us anything…'
+            }
+            rows={5}
+          />
+        </div>
+
+        {/* Optional contact */}
+        <div className="kim-field" style={{ marginBottom: 20 }}>
+          <label className="kim-field__label">Your email <span className="kim-field__optional">(optional — only if you want a reply)</span></label>
+          <input
+            type="email"
+            className="kim-input"
+            value={contact}
+            onChange={e => setContact(e.target.value)}
+            placeholder="you@example.com"
+          />
+        </div>
+
+        <button
+          type="submit"
+          className="kim-btn kim-btn--primary"
+          disabled={!message.trim() || sending}
+          style={{ width: '100%' }}
+        >
+          {sending ? 'Sending…' : 'Send feedback'}
+        </button>
+      </form>
     </div>
   );
 }
@@ -787,6 +1116,8 @@ export function SettingsPanel({ settings, onChange, onClose, appVersion, onCheck
           {activeSection === 'paths'      && <PathsSection settings={settings} onChange={onChange} />}
           {activeSection === 'data'       && <DataSection account={account} />}
           {activeSection === 'account'    && <AccountSection account={account} onAccountChange={onAccountChange} />}
+          {activeSection === 'mcp'        && <MCPSection />}
+          {activeSection === 'feedback'   && <FeedbackSection />}
           {activeSection === 'about'      && <AboutSection appVersion={appVersion} onCheckUpdate={onCheckUpdate} />}
         </div>
       </div>

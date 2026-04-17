@@ -98,18 +98,27 @@ class AnthropicProvider(BaseProvider):
     # ------------------------------------------------------------------
 
     def _parse_response(self, response) -> dict:
+        # Extract token usage if available
+        usage = {}
+        if hasattr(response, "usage") and response.usage:
+            usage = {
+                "input": getattr(response.usage, "input_tokens", 0),
+                "output": getattr(response.usage, "output_tokens", 0),
+            }
+
         for block in response.content:
             if block.type == "tool_use":
                 return {
                     "type": "tool_call",
                     "tool": block.name,
                     "args": dict(block.input),
+                    "usage": usage,
                 }
             if block.type == "text":
-                return {"type": "text", "content": block.text}
+                return {"type": "text", "content": block.text, "usage": usage}
 
         # Fallback: concatenate all text blocks
         text = " ".join(
             b.text for b in response.content if hasattr(b, "text") and b.text
         )
-        return {"type": "text", "content": text or ""}
+        return {"type": "text", "content": text or "", "usage": usage}

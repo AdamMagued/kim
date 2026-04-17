@@ -136,6 +136,14 @@ class OpenAIProvider(BaseProvider):
         choice = response.choices[0]
         msg = choice.message
 
+        # Extract token usage
+        usage = {}
+        if hasattr(response, "usage") and response.usage:
+            usage = {
+                "input": getattr(response.usage, "prompt_tokens", 0),
+                "output": getattr(response.usage, "completion_tokens", 0),
+            }
+
         if msg.tool_calls:
             tc = msg.tool_calls[0]
             try:
@@ -146,6 +154,7 @@ class OpenAIProvider(BaseProvider):
                 "type": "tool_call",
                 "tool": tc.function.name,
                 "args": args,
+                "usage": usage,
             }
 
-        return {"type": "text", "content": msg.content or ""}
+        return {"type": "text", "content": msg.content or "", "usage": usage}

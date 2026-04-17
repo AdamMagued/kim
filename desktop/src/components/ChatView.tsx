@@ -175,11 +175,27 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
 
 // ── Greeting ──────────────────────────────────────────────────────────────────
 
-const EXAMPLE_PROMPTS: { title: string; hint: string }[] = [
-  { title: 'Summarize the PDF on my desktop', hint: 'Read and extract key insights from a file' },
-  { title: 'Find all TODOs in my project', hint: 'Search across files and list them' },
-  { title: 'Stage, commit, and push my changes', hint: 'Git workflow end-to-end' },
-  { title: 'Search the web and write a report', hint: 'Browse + summarize' },
+const EXAMPLE_PROMPTS: { title: string; hint: string; icon: string }[] = [
+  { title: 'Summarize the PDF on my desktop', hint: 'Read and extract key insights', icon: '📄' },
+  { title: 'Find all TODOs in my project', hint: 'Search files and list them', icon: '🔍' },
+  { title: 'Stage, commit, and push my changes', hint: 'Full git workflow', icon: '⚡' },
+  { title: 'Search the web and write a report', hint: 'Browse + summarize', icon: '🌐' },
+];
+
+const KIM_CAPABILITIES = [
+  { icon: '🖥', label: 'See your screen', desc: 'Kim takes screenshots to understand what\'s happening' },
+  { icon: '🖱', label: 'Control your mouse', desc: 'Click buttons, drag files, navigate any app' },
+  { icon: '⌨️', label: 'Type & edit', desc: 'Write code, fill forms, compose emails' },
+  { icon: '📁', label: 'Manage files', desc: 'Read, write, move, search files on your computer' },
+  { icon: '🌐', label: 'Browse the web', desc: 'Search, visit websites, extract information' },
+  { icon: '⚡', label: 'Run commands', desc: 'Terminal commands, scripts, git operations' },
+];
+
+const KIM_SHORTCUTS = [
+  { keys: ['⌘', 'N'], label: 'New chat' },
+  { keys: ['⌘', 'B'], label: 'Toggle sidebar' },
+  { keys: ['⌘', ','], label: 'Settings' },
+  { keys: ['⇧', '↵'], label: 'New line in message' },
 ];
 
 function getGreeting(name: string): string {
@@ -219,6 +235,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   const [activity, setActivity] = useState<ActivityItem[]>([]);
   const [taskError, setTaskError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
+  const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
 
@@ -274,6 +291,30 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   // ── Append to activity feed ─────────────────────────────────────────────────
   function appendRaw(line: string) {
     const id = ++_activityCounter;
+
+    // Handle [STATS] token lines — update token counter, don't add to feed
+    const statsMatch = line.match(/\[STATS\]\s+input_tokens=(\d+)\s+output_tokens=(\d+)\s+total_tokens=(\d+)/);
+    if (statsMatch) {
+      setTokenStats({ input: parseInt(statsMatch[1]), output: parseInt(statsMatch[2]), total: parseInt(statsMatch[3]) });
+      return;
+    }
+
+    // Handle [DIFF] lines — annotate the previous file-write activity item
+    const diffMatch = line.match(/\[DIFF\]\s+path=(\S+)\s+\+(\d+)\s+-(\d+)/);
+    if (diffMatch) {
+      const [, _path, added, removed] = diffMatch;
+      setActivity(prev => {
+        if (prev.length === 0) return prev;
+        const last = prev[prev.length - 1];
+        if (last.kind === 'tool' && (last.text.includes('Editing') || last.text.includes('Writing') || last.text.includes('Creating'))) {
+          const annotated = { ...last, text: last.text + ` +${added} -${removed}` };
+          return [...prev.slice(0, -1), annotated];
+        }
+        return prev;
+      });
+      return;
+    }
+
     const item = parseLogLine(line, id);
     if (!item) return;
     setActivity(prev => {
@@ -348,6 +389,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     setIsRunning(true);
     setActivity([]);
     setTaskError(null);
+    setTokenStats(null);
     setTaskInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
@@ -387,15 +429,20 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
 
   // ── Activity feed render ─────────────────────────────────────────────────────
 
-  /** Converts `backtick` segments to <code> tags for display */
+  /** Renders activity text: backtick → <code>, +N → green, -N → red */
   function renderActivityText(text: string): React.ReactNode {
-    const parts = text.split(/(`[^`]+`)/g);
+    // Split on backtick segments AND +N/-N diff markers
+    const parts = text.split(/(`[^`]+`|\+\d+|-\d+)/g);
     if (parts.length === 1) return text;
-    return parts.map((p, i) =>
-      p.startsWith('`') && p.endsWith('`')
-        ? <code key={i}>{p.slice(1, -1)}</code>
-        : p
-    );
+    return parts.map((p, i) => {
+      if (p.startsWith('`') && p.endsWith('`'))
+        return <code key={i}>{p.slice(1, -1)}</code>;
+      if (/^\+\d+$/.test(p))
+        return <span key={i} className="kim-diff-added">{p}</span>;
+      if (/^-\d+$/.test(p))
+        return <span key={i} className="kim-diff-removed">{p}</span>;
+      return p;
+    });
   }
 
   function renderActivityFeed() {
@@ -511,8 +558,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
               </div>
               <div className="kim-new-chat-empty__title">{getGreeting(account.display_name)}</div>
               <div className="kim-new-chat-empty__subtitle">
-                Describe a task in plain English. Kim can see your screen, control
-                your mouse, run commands, browse the web, and write code.
+                Describe any task in plain English below — Kim will figure out how to do it.
               </div>
 
               {settings.provider === 'browser' && (
@@ -522,6 +568,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
                 />
               )}
 
+              {/* Example prompts */}
               <div className="kim-examples" style={{ marginTop: settings.provider === 'browser' ? 24 : 0 }}>
                 {EXAMPLE_PROMPTS.map((ex, i) => (
                   <button
@@ -529,6 +576,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
                     className="kim-example-card"
                     onClick={() => pickExample(ex.title)}
                   >
+                    <span className="kim-example-card__icon">{ex.icon}</span>
                     <div className="kim-example-card__body">
                       <div className="kim-example-card__title">{ex.title}</div>
                       <div className="kim-example-card__hint">{ex.hint}</div>
@@ -536,6 +584,35 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
                     <div className="kim-example-card__arrow">↗</div>
                   </button>
                 ))}
+              </div>
+
+              {/* What Kim can do */}
+              <div className="kim-capabilities">
+                <div className="kim-capabilities__label">What Kim can do</div>
+                <div className="kim-capabilities__grid">
+                  {KIM_CAPABILITIES.map((cap, i) => (
+                    <div key={i} className="kim-capability-item">
+                      <span className="kim-capability-item__icon">{cap.icon}</span>
+                      <div>
+                        <div className="kim-capability-item__label">{cap.label}</div>
+                        <div className="kim-capability-item__desc">{cap.desc}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Keyboard shortcuts */}
+              <div className="kim-shortcuts">
+                <div className="kim-shortcuts__label">Keyboard shortcuts</div>
+                <div className="kim-shortcuts__row">
+                  {KIM_SHORTCUTS.map((s, i) => (
+                    <span key={i} className="kim-shortcut">
+                      {s.keys.map((k, ki) => <kbd key={ki}>{k}</kbd>)}
+                      <span className="kim-shortcut__label">{s.label}</span>
+                    </span>
+                  ))}
+                </div>
               </div>
             </div>
           )}
@@ -566,6 +643,11 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
               <span className="kim-working-indicator__text">
                 {cancelling ? 'Stopping Kim…' : 'Kim is working…'}
               </span>
+              {!cancelling && tokenStats && (
+                <span className="kim-working-indicator__tokens" title={`Input: ${tokenStats.input.toLocaleString()} · Output: ${tokenStats.output.toLocaleString()}`}>
+                  {tokenStats.total.toLocaleString()} tokens
+                </span>
+              )}
               {!cancelling && elapsed > 0 && (
                 <span className="kim-working-indicator__timer">{formatElapsed(elapsed)}</span>
               )}

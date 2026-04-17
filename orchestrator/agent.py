@@ -300,6 +300,8 @@ class KimAgent:
         self._max_retries: int = int(config.get("max_retries", 5))
         self._retry_base_delay: float = float(config.get("retry_base_delay", 1.0))
         self._retry_max_delay: float = float(config.get("retry_max_delay", 60.0))
+        # Token usage tracking
+        self._total_tokens: dict = {"input": 0, "output": 0}
 
     def set_ui_bridge(self, bridge: Optional[UIBridge]) -> None:
         self._ui_bridge = bridge
@@ -399,6 +401,14 @@ class KimAgent:
             except Exception as e:
                 self._log("ERROR", f"Provider error (all retries exhausted): {e}")
                 return {"success": False, "summary": f"LLM error: {e}", "screenshot": last_screenshot_b64}
+
+            # ── Track token usage ────────────────────────────────────────
+            usage = response.get("usage", {})
+            if usage:
+                self._total_tokens["input"] += usage.get("input", 0)
+                self._total_tokens["output"] += usage.get("output", 0)
+                total = self._total_tokens["input"] + self._total_tokens["output"]
+                self._log("INFO", f"[STATS] input_tokens={usage.get('input', 0)} output_tokens={usage.get('output', 0)} total_tokens={total}")
 
             # ── Tool call ────────────────────────────────────────────────
             if response["type"] == "tool_call":
@@ -502,13 +512,47 @@ class KimAgent:
         self._log("INFO", f"Loaded {len(self._tools)} MCP tools")
 
     async def _execute_tool(self, name: str, args: dict) -> str:
+        import time as _time
+
+        # ── Pre-execution: capture file state for diff ───────────────────
+        _file_path: Optional[str] = None
+        _before_lines: int = 0
+        _write_ops = {"write_file", "create_file", "edit_file", "append_file"}
+        if name in _write_ops:
+            _file_path = args.get("path") or args.get("file_path")
+            if _file_path:
+                try:
+                    with open(_file_path, "r", encoding="utf-8", errors="ignore") as _f:
+                        _before_lines = sum(1 for _ in _f)
+                except (OSError, IOError):
+                    _before_lines = 0
+
+        t0 = _time.monotonic()
+
         try:
             result = await self.session.call_tool(name=name, arguments=args)
             parts = [c.text for c in result.content if hasattr(c, "text")]
-            return "\n".join(parts) if parts else "(no output)"
+            output = "\n".join(parts) if parts else "(no output)"
         except Exception as e:
             logger.error(f"MCP tool '{name}' failed: {e}", exc_info=True)
             return f"ERROR calling {name}: {e}"
+
+        duration_ms = int((_time.monotonic() - t0) * 1000)
+
+        # ── Post-execution: emit line diff for file writes ───────────────
+        if _file_path and name in _write_ops:
+            try:
+                with open(_file_path, "r", encoding="utf-8", errors="ignore") as _f:
+                    after_lines = sum(1 for _ in _f)
+                added = max(0, after_lines - _before_lines)
+                removed = max(0, _before_lines - after_lines)
+                import os as _os
+                basename = _os.path.basename(_file_path)
+                self._log("INFO", f"[DIFF] path={basename} +{added} -{removed} duration_ms={duration_ms}")
+            except (OSError, IOError):
+                pass
+
+        return output
 
     async def _take_screenshot(self) -> str:
         """Take a screenshot, blinking the Kim UI off and back on so it
