@@ -12,6 +12,7 @@ import { SettingsPanel } from './components/SettingsPanel';
 import { UpdateModal } from './components/UpdateModal';
 import { ThemeToggle } from './components/ThemeToggle';
 import { OnboardingFlow } from './components/OnboardingFlow';
+import { ToastProvider, toast } from './components/Toast';
 
 import type { SessionInfo, Settings, Theme, AccentTheme, KimAccount } from './types';
 import { DEFAULT_SETTINGS } from './types';
@@ -123,15 +124,16 @@ export default function App() {
   }, [refresh]);
 
   async function checkForUpdates() {
+    toast('Checking for updates…', 'info', 2000);
     try {
       const resp = await fetch(
         'https://api.github.com/repos/AdamMagued/kim/releases/latest',
         { headers: { Accept: 'application/vnd.github+json' } }
       );
       if (!resp.ok) {
-        if (resp.status === 404) { alert('No published release yet.'); return; }
-        if (resp.status === 403) { alert('Rate-limited by GitHub. Try again later.'); return; }
-        alert(`Update check failed (HTTP ${resp.status}).`);
+        if (resp.status === 404) { toast('No published release found yet.', 'info'); return; }
+        if (resp.status === 403) { toast('Rate-limited by GitHub — try again in a minute.', 'warning'); return; }
+        toast(`Update check failed (HTTP ${resp.status}).`, 'error');
         return;
       }
       const data = (await resp.json()) as GithubRelease;
@@ -140,10 +142,10 @@ export default function App() {
         setUpdateInfo(data);
         setShowUpdate(true);
       } else {
-        alert('You are on the latest version!');
+        toast(`You're on the latest version (v${appVersion}).`, 'success');
       }
     } catch {
-      alert('Could not check for updates. Make sure you are connected to the internet.');
+      toast('Could not reach GitHub. Check your internet connection.', 'error');
     }
   }
 
@@ -244,6 +246,8 @@ export default function App() {
           onDismiss={() => setShowUpdate(false)}
         />
       )}
+
+      <ToastProvider />
     </div>
   );
 }
