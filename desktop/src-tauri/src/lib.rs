@@ -698,6 +698,10 @@ pub struct KimAccount {
     /// ID of the private backup Gist so restore can find it later.
     pub gist_id: Option<String>,
     pub created_at: String,
+    /// Explicit project root paths the user has added to the Code tab.
+    /// Kim scans <path>/.claw/sessions/ for each — never ~/.claude/projects/.
+    #[serde(default)]
+    pub code_projects: Vec<String>,
 }
 
 fn account_dir() -> PathBuf {
@@ -1133,19 +1137,6 @@ pub struct ClawProject {
     pub branches: Vec<ClawBranch>,
 }
 
-/// Claude Code stores sessions under ~/.claude/projects/<encoded-path>/.
-/// The encoded path uses `-` as a path separator (leading `/` becomes leading `-`).
-fn decode_claude_project_path(encoded: &str) -> String {
-    // The Claude Code CLI encodes paths by replacing '/' with '-' with a
-    // leading '-' for the root '/'. Reverse: replace the encoded form.
-    // e.g. "-Users-adam-Desktop-myproject" → "/Users/adam/Desktop/myproject"
-    if encoded.starts_with('-') {
-        format!("/{}", &encoded[1..].replace('-', "/"))
-    } else {
-        encoded.replace('-', "/")
-    }
-}
-
 fn read_git_branch(project_path: &Path) -> String {
     let head = project_path.join(".git").join("HEAD");
     if let Ok(content) = fs::read_to_string(&head) {
@@ -1153,7 +1144,6 @@ fn read_git_branch(project_path: &Path) -> String {
         if let Some(branch) = s.strip_prefix("ref: refs/heads/") {
             return branch.to_string();
         }
-        // Detached HEAD — return short commit hash.
         if s.len() >= 8 {
             return s[..8].to_string();
         }
@@ -1161,70 +1151,98 @@ fn read_git_branch(project_path: &Path) -> String {
     "main".to_string()
 }
 
+/// List Claw sessions for explicitly-added project paths.
+/// Scans <project>/.claw/sessions/ — NEVER ~/.claude/projects/.
+/// Claw and Claude Code must never mix.
 #[tauri::command]
-async fn list_claw_projects(claw_dir: Option<String>) -> Result<Vec<ClawProject>, String> {
-    // Priority: explicit claw_dir > ~/.claude/projects
-    let projects_root = match claw_dir {
-        Some(ref d) if !d.is_empty() => PathBuf::from(d),
-        _ => dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".claude")
-            .join("projects"),
-    };
-
-    if !projects_root.exists() {
-        return Ok(vec![]);
-    }
-
+async fn list_claw_projects(project_paths: Vec<String>) -> Result<Vec<ClawProject>, String> {
     let mut result: Vec<ClawProject> = Vec::new();
 
-    let mut entries: Vec<_> = fs::read_dir(&projects_root)
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-    entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-
-    for entry in entries {
-        let encoded = entry.file_name().to_string_lossy().to_string();
-        let decoded_path = decode_claude_project_path(&encoded);
-        let project_path = PathBuf::from(&decoded_path);
+    for raw_path in project_paths {
+        let project_path = PathBuf::from(&raw_path);
+        if !project_path.exists() {
+            continue;
+        }
 
         let name = project_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| encoded.clone());
+            .unwrap_or_else(|| raw_path.clone());
 
         let current_branch = read_git_branch(&project_path);
 
-        // Read sessions from this project directory.
-        let sessions_dir = entry.path().join("sessions");
-        let sessions = if sessions_dir.exists() {
-            read_project_sessions(&sessions_dir)
+        // Claw stores sessions at <project>/.claw/sessions/ — this is the
+        // ONLY place we look. ~/.claude/projects is off-limits.
+        let claw_sessions_dir = project_path.join(".claw").join("sessions");
+        let sessions = if claw_sessions_dir.exists() {
+            read_project_sessions(&claw_sessions_dir)
         } else {
-            // Fallback: sessions directly in the project dir (older format).
-            read_project_sessions(&entry.path())
+            vec![]
         };
 
-        if sessions.is_empty() {
-            continue;
-        }
-
-        // Group sessions under the current branch.
-        let branch = ClawBranch {
-            name: current_branch.clone(),
-            sessions,
+        // Build branch list. For now we group all sessions under the current
+        // branch. Future: walk git log to bucket sessions by branch.
+        let branches = if sessions.is_empty() {
+            vec![]
+        } else {
+            vec![ClawBranch {
+                name: current_branch.clone(),
+                sessions,
+            }]
         };
 
         result.push(ClawProject {
-            path: decoded_path,
+            path: raw_path,
             name,
             current_branch,
-            branches: vec![branch],
+            branches,
         });
     }
 
     Ok(result)
+}
+
+/// Add a project root path to the account's code_projects list.
+#[tauri::command]
+async fn add_code_project(path: String) -> Result<Vec<String>, String> {
+    let account_path = account_path();
+    let mut account: KimAccount = if account_path.exists() {
+        let raw = fs::read_to_string(&account_path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?
+    } else {
+        return Err("No account found".to_string());
+    };
+
+    let canonical = PathBuf::from(&path)
+        .canonicalize()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or(path);
+
+    if !account.code_projects.contains(&canonical) {
+        account.code_projects.push(canonical);
+    }
+
+    let json = serde_json::to_string_pretty(&account).map_err(|e| e.to_string())?;
+    fs::write(&account_path, json).map_err(|e| e.to_string())?;
+    Ok(account.code_projects)
+}
+
+/// Remove a project root path from the account's code_projects list.
+#[tauri::command]
+async fn remove_code_project(path: String) -> Result<Vec<String>, String> {
+    let account_path = account_path();
+    let mut account: KimAccount = if account_path.exists() {
+        let raw = fs::read_to_string(&account_path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?
+    } else {
+        return Err("No account found".to_string());
+    };
+
+    account.code_projects.retain(|p| p != &path);
+
+    let json = serde_json::to_string_pretty(&account).map_err(|e| e.to_string())?;
+    fs::write(&account_path, json).map_err(|e| e.to_string())?;
+    Ok(account.code_projects)
 }
 
 fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
@@ -1294,6 +1312,8 @@ pub fn run() {
             backup_to_gist,
             restore_from_gist,
             list_claw_projects,
+            add_code_project,
+            remove_code_project,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
