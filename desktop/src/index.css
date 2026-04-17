@@ -761,7 +761,7 @@ kbd {
   min-height: 0;
 }
 
-/* Empty welcome (no session selected) */
+/* Empty welcome (no session selected) — redesigned to match chat interface mockup */
 .kim-empty-welcome {
   flex: 1;
   display: flex;
@@ -2921,4 +2921,477 @@ kbd {
 .kim-feedback-sent__icon { font-size: 40px; margin-bottom: 12px; }
 .kim-feedback-sent__title { font-size: 18px; font-weight: 600; color: var(--text-strong); }
 .kim-feedback-sent__desc { font-size: 13px; color: var(--text-muted); margin-top: 6px; line-height: 1.5; }
+
+/* ════════════════════════════════════════════════════════════════════════════
+   ONBOARDING — full-screen immersive (kim-ob__*)
+   ════════════════════════════════════════════════════════════════════════════ */
+
+.kim-ob {
+  position: fixed;
+  inset: 0;
+  background: #080808;
+  overflow: hidden;
+  z-index: 3000;
+  -webkit-app-region: drag;
+}
+
+/* Full-bleed WebGL canvas */
+.kim-ob__canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Dark radial vignette so content reads over the chrome shader */
+.kim-ob__scrim {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    ellipse 68% 58% at 50% 50%,
+    rgba(4,4,4,.58) 0%,
+    rgba(4,4,4,.2) 55%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+/* Content container — centres the inner card */
+.kim-ob__screen {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  -webkit-app-region: no-drag;
+}
+
+/* Entrance / exit animations */
+.kim-ob__screen--in {
+  animation: kim-ob-in 0.55s cubic-bezier(.22,1,.36,1) forwards;
+}
+.kim-ob__screen--out {
+  animation: kim-ob-out 0.38s ease forwards;
+  pointer-events: none !important;
+}
+
+@keyframes kim-ob-in {
+  from { opacity: 0; transform: scale(.97) translateY(10px); }
+  to   { opacity: 1; transform: scale(1)   translateY(0); }
+}
+@keyframes kim-ob-out {
+  from { opacity: 1; transform: scale(1)    translateY(0); }
+  to   { opacity: 0; transform: scale(1.04) translateY(-8px); }
+}
+
+.kim-ob__inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  pointer-events: all;
+  gap: 0;
+  width: min(520px, 92vw);
+}
+
+/* ── Asterisk logo mark ── */
+.kim-ob__logo-mark {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,.22);
+  background: rgba(255,255,255,.06);
+  backdrop-filter: blur(14px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 26px;
+  animation: kim-ob-rise .9s cubic-bezier(.22,1,.36,1) .15s both;
+}
+.kim-ob__logo-mark svg { width: 28px; height: 28px; }
+
+/* ── Wordmark ── */
+.kim-ob__wordmark {
+  font-family: 'Syne', ui-sans-serif, sans-serif;
+  font-size: clamp(60px, 10vw, 100px);
+  font-weight: 600;
+  letter-spacing: -.03em;
+  line-height: 1;
+  background: linear-gradient(170deg, #ffffff 15%, #c8cdd6 55%, #eceef2 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  /* Extra bottom padding so Syne descenders don't clip */
+  padding-bottom: 0.12em;
+  overflow: visible;
+  margin-bottom: 16px;
+  animation: kim-ob-rise .9s cubic-bezier(.22,1,.36,1) .3s both;
+}
+
+/* ── Tagline / prompt ── */
+.kim-ob__tagline {
+  font-size: clamp(14px, 1.8vw, 17px);
+  font-weight: 400;
+  color: rgba(255,255,255,.6);
+  letter-spacing: .01em;
+  margin-bottom: 32px;
+  animation: kim-ob-rise .9s cubic-bezier(.22,1,.36,1) .48s both;
+}
+
+/* ── Input shell ── */
+.kim-ob__input-shell {
+  width: 100%;
+  animation: kim-ob-rise .9s cubic-bezier(.22,1,.36,1) .64s both;
+}
+.kim-ob__input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255,255,255,.08);
+  border: 1px solid rgba(255,255,255,.15);
+  border-radius: 999px;
+  padding: 9px 9px 9px 22px;
+  backdrop-filter: blur(20px);
+  transition: border-color .2s, background .2s;
+}
+.kim-ob__input-row:focus-within {
+  border-color: rgba(255,255,255,.32);
+  background: rgba(255,255,255,.11);
+}
+.kim-ob__input {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: #fff;
+  font: 400 15px/1.4 ui-sans-serif, -apple-system, 'Helvetica Neue', Arial, sans-serif;
+  letter-spacing: .01em;
+}
+.kim-ob__input::placeholder { color: rgba(255,255,255,.32); }
+
+/* ── Send / submit button ── */
+.kim-ob__send-btn {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255,255,255,.9);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0.35;
+  transition: opacity .15s, transform .15s, background .15s;
+}
+.kim-ob__send-btn--ready { opacity: 1; }
+.kim-ob__send-btn--ready:hover { background: #fff; transform: scale(1.06); }
+.kim-ob__send-btn:disabled { cursor: default; }
+
+/* Wide variant for GitHub "Get started" */
+.kim-ob__send-btn--wide {
+  width: auto;
+  border-radius: 10px;
+  padding: 0 20px;
+  height: 42px;
+  font: 600 14px/1 ui-sans-serif, -apple-system, sans-serif;
+  color: #0c0c0c;
+  opacity: 0.5;
+}
+.kim-ob__send-btn--wide.kim-ob__send-btn--ready { opacity: 1; }
+
+/* ── Footer line ── */
+.kim-ob__footer {
+  margin-top: 18px;
+  font-size: 11px;
+  color: rgba(255,255,255,.2);
+  letter-spacing: .04em;
+  animation: kim-ob-rise .7s ease .9s both;
+}
+
+/* ── GitHub step ── */
+.kim-ob__github-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 20px;
+  font-weight: 600;
+  color: rgba(255,255,255,.9);
+  margin-bottom: 14px;
+  animation: kim-ob-rise .7s cubic-bezier(.22,1,.36,1) .1s both;
+}
+.kim-ob__github-desc {
+  font-size: 13px;
+  color: rgba(255,255,255,.5);
+  line-height: 1.6;
+  margin-bottom: 22px;
+  max-width: 420px;
+  animation: kim-ob-rise .7s cubic-bezier(.22,1,.36,1) .22s both;
+}
+.kim-ob__github-desc strong { color: rgba(255,255,255,.75); }
+.kim-ob__github-desc code {
+  font-size: 11px;
+  background: rgba(255,255,255,.1);
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+
+.kim-ob__token-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  animation: kim-ob-rise .7s cubic-bezier(.22,1,.36,1) .34s both;
+  margin-bottom: 12px;
+}
+.kim-ob__token-input {
+  flex: 1;
+  background: rgba(255,255,255,.07);
+  border: 1px solid rgba(255,255,255,.14);
+  border-radius: 10px;
+  padding: 10px 16px;
+  color: #fff;
+  font: 400 14px/1 ui-monospace, Menlo, monospace;
+  letter-spacing: .04em;
+  outline: none;
+  transition: border-color .2s;
+}
+.kim-ob__token-input:focus {
+  border-color: rgba(255,255,255,.3);
+}
+.kim-ob__token-input::placeholder { color: rgba(255,255,255,.3); }
+
+.kim-ob__verify-btn {
+  padding: 10px 18px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,.18);
+  background: rgba(255,255,255,.08);
+  color: rgba(255,255,255,.8);
+  font: 500 13px/1 ui-sans-serif, -apple-system, sans-serif;
+  cursor: pointer;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: background .15s, border-color .15s;
+  flex-shrink: 0;
+}
+.kim-ob__verify-btn:hover:not(:disabled) {
+  background: rgba(255,255,255,.12);
+  border-color: rgba(255,255,255,.28);
+}
+.kim-ob__verify-btn:disabled { opacity: .5; cursor: default; }
+.kim-ob__verify-btn--done {
+  border-color: rgba(100,220,120,.5);
+  background: rgba(100,220,120,.08);
+  color: rgba(150,240,160,.9);
+}
+
+.kim-ob__token-error {
+  font-size: 12px;
+  color: rgba(255,120,100,.9);
+  background: rgba(255,80,60,.1);
+  border: 1px solid rgba(255,80,60,.18);
+  border-radius: 8px;
+  padding: 8px 12px;
+  text-align: left;
+  width: 100%;
+  margin-bottom: 8px;
+}
+.kim-ob__token-success {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: rgba(150,240,160,.9);
+  margin-bottom: 8px;
+}
+
+.kim-ob__github-actions {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  margin-top: 8px;
+  animation: kim-ob-rise .7s cubic-bezier(.22,1,.36,1) .46s both;
+}
+.kim-ob__skip-btn {
+  flex: 1;
+  padding: 11px 16px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,.12);
+  background: transparent;
+  color: rgba(255,255,255,.5);
+  font: 500 13px/1 ui-sans-serif, -apple-system, sans-serif;
+  cursor: pointer;
+  transition: color .15s, border-color .15s;
+}
+.kim-ob__skip-btn:hover:not(:disabled) {
+  color: rgba(255,255,255,.75);
+  border-color: rgba(255,255,255,.2);
+}
+.kim-ob__skip-btn:disabled { opacity: .5; cursor: default; }
+
+@keyframes kim-ob-rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   GREETING — Syne font, overflow-safe descenders
+   ════════════════════════════════════════════════════════════════════════════ */
+
+.kim-greeting {
+  font-family: 'Syne', ui-sans-serif, -apple-system, sans-serif !important;
+  font-weight: 600 !important;
+  letter-spacing: -.025em !important;
+  line-height: 1.15 !important;
+  /* Key fix: give room for descenders ('g', 'y', 'p' in late night, etc.) */
+  padding-bottom: 0.15em !important;
+  overflow: visible !important;
+  /* Ensure the parent clip doesn't eat the descenders */
+  display: block !important;
+}
+
+/* Override the empty welcome title specifically */
+.kim-empty-welcome__title.kim-greeting,
+.kim-empty-welcome__greeting.kim-greeting {
+  font-size: 26px;
+}
+.kim-new-chat-empty__title.kim-greeting {
+  font-size: 28px;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   BLOBBY LOADERS — 3, 6, 12, 15, 20
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* Shared: tiny 28×28 display inside the working indicator */
+.kim-blob-loader {
+  width: 28px;
+  height: 28px;
+  display: block;
+  overflow: visible;
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+/* ── Loader 3 — pulsing blob ── */
+@keyframes kim-l03 {
+  0%,100% { transform: scale(0.82); }
+  50%     { transform: scale(1.08); }
+}
+.kim-blob-l3 path {
+  transform-origin: 50px 50px;
+  animation: kim-l03 1.4s ease-in-out infinite;
+}
+
+/* ── Loader 6 — splitting cell ── */
+@keyframes kim-l06a {
+  0%,100% { transform: translateX(-16px) scale(1, 1); }
+  50%     { transform: translateX(0)     scale(0.8, 1.1); }
+}
+@keyframes kim-l06b {
+  0%,100% { transform: translateX(16px)  scale(1, 1); }
+  50%     { transform: translateX(0)     scale(0.8, 1.1); }
+}
+.kim-blob-l6__a {
+  transform-origin: 50px 50px;
+  animation: kim-l06a 1.6s ease-in-out infinite;
+}
+.kim-blob-l6__b {
+  transform-origin: 50px 50px;
+  animation: kim-l06b 1.6s ease-in-out infinite;
+}
+/* Slightly larger for session loading context */
+.kim-messages__loading .kim-blob-loader {
+  width: 40px;
+  height: 40px;
+}
+
+/* ── Loader 12 — pill squeeze ── */
+@keyframes kim-l12 {
+  0%,100% { transform: scaleX(1)   scaleY(1); }
+  25%     { transform: scaleX(.5)  scaleY(1.5); }
+  50%     { transform: scaleX(1)   scaleY(1); }
+  75%     { transform: scaleX(1.5) scaleY(.5); }
+}
+.kim-blob-l12__pill {
+  transform-origin: 50px 50px;
+  animation: kim-l12 1.8s ease-in-out infinite;
+}
+
+/* ── Loader 15 — chasing dots (goo) ── */
+@keyframes kim-l15a {
+  0%   { transform: translateX(-24px); }
+  50%  { transform: translateX(24px); }
+  100% { transform: translateX(-24px); }
+}
+@keyframes kim-l15b {
+  0%   { transform: translateX(-24px); }
+  50%  { transform: translateX(24px); }
+  100% { transform: translateX(-24px); }
+}
+.kim-blob-l15__d1 {
+  transform-origin: 50px 50px;
+  animation: kim-l15a 1.8s ease-in-out infinite;
+}
+.kim-blob-l15__d2 {
+  transform-origin: 50px 50px;
+  animation: kim-l15b 1.8s ease-in-out infinite -0.9s;
+}
+
+/* ── Loader 20 — mitosis ── */
+@keyframes kim-l20a {
+  0%,100% { transform: translateX(0)    scale(1); }
+  50%     { transform: translateX(-14px) scale(.85); }
+}
+@keyframes kim-l20b {
+  0%,100% { transform: translateX(0)   scale(1); }
+  50%     { transform: translateX(14px) scale(.85); }
+}
+.kim-blob-l20__a {
+  transform-origin: 50px 50px;
+  animation: kim-l20a 1.6s ease-in-out infinite;
+}
+.kim-blob-l20__b {
+  transform-origin: 50px 50px;
+  animation: kim-l20b 1.6s ease-in-out infinite;
+}
+
+/* Working indicator: use the blob loader instead of dots */
+.kim-working-indicator {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  margin: 8px 0;
+}
+/* Hide old three-dot indicator if still present */
+.kim-working-indicator__dots { display: none !important; }
+
+/* Reduced motion: pause all blob animations */
+@media (prefers-reduced-motion: reduce) {
+  .kim-blob-l3 path,
+  .kim-blob-l6__a, .kim-blob-l6__b,
+  .kim-blob-l12__pill,
+  .kim-blob-l15__d1, .kim-blob-l15__d2,
+  .kim-blob-l20__a, .kim-blob-l20__b {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+  }
+  .kim-ob__wordmark, .kim-ob__tagline, .kim-ob__input-shell,
+  .kim-ob__footer, .kim-ob__logo-mark, .kim-ob__screen--in,
+  .kim-ob__github-title, .kim-ob__github-desc, .kim-ob__token-row,
+  .kim-ob__github-actions {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}
 
