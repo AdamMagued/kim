@@ -207,6 +207,56 @@ function getGreeting(name: string): string {
   return `Evening, ${name}`;
 }
 
+// ── Blobby Loaders (3, 6, 12, 15, 20) ────────────────────────────────────────
+
+/** Renders one of the 5 organic blob loading animations. Size is ~24×24px. */
+function BlobLoader({ which }: { which: 3 | 6 | 12 | 15 | 20 }) {
+  // Colors inherit from parent via currentColor
+  if (which === 3) {
+    return (
+      <svg viewBox="0 0 100 100" className="kim-blob-loader kim-blob-l3" aria-hidden="true">
+        <path d="M50,12 C74,12 92,30 88,54 C84,78 64,90 44,86 C20,82 8,60 14,38 C20,20 34,12 50,12 Z" fill="currentColor" />
+      </svg>
+    );
+  }
+  if (which === 6) {
+    return (
+      <svg viewBox="0 0 100 100" className="kim-blob-loader kim-blob-l6" aria-hidden="true">
+        <g style={{ filter: 'url(#kim-goo)' }}>
+          <circle className="kim-blob-l6__a" cx="50" cy="50" r="18" fill="currentColor" />
+          <circle className="kim-blob-l6__b" cx="50" cy="50" r="18" fill="currentColor" />
+        </g>
+      </svg>
+    );
+  }
+  if (which === 12) {
+    return (
+      <svg viewBox="0 0 100 100" className="kim-blob-loader kim-blob-l12" aria-hidden="true">
+        <rect className="kim-blob-l12__pill" x="20" y="35" width="60" height="30" rx="15" fill="currentColor" />
+      </svg>
+    );
+  }
+  if (which === 15) {
+    return (
+      <svg viewBox="0 0 100 100" className="kim-blob-loader kim-blob-l15" aria-hidden="true">
+        <g style={{ filter: 'url(#kim-goo)' }}>
+          <circle className="kim-blob-l15__d1" cx="50" cy="50" r="13" fill="currentColor" />
+          <circle className="kim-blob-l15__d2" cx="50" cy="50" r="13" fill="currentColor" />
+        </g>
+      </svg>
+    );
+  }
+  // 20 — mitosis
+  return (
+    <svg viewBox="0 0 100 100" className="kim-blob-loader kim-blob-l20" aria-hidden="true">
+      <g style={{ filter: 'url(#kim-goo)' }}>
+        <circle className="kim-blob-l20__a" cx="50" cy="50" r="18" fill="currentColor" />
+        <circle className="kim-blob-l20__b" cx="50" cy="50" r="18" fill="currentColor" />
+      </g>
+    </svg>
+  );
+}
+
 function formatElapsed(s: number): string {
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
@@ -525,13 +575,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     return (
       <div className="kim-chat">
         <div className="kim-empty-welcome">
-          <div className="kim-empty-welcome__icon">
-            <div className="kim-empty-welcome__glow" />
-            <svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 2l2.5 6.5L21 11l-6.5 2.5L12 20l-2.5-6.5L3 11l6.5-2.5L12 2z" />
-            </svg>
+          <div className="kim-empty-welcome__greeting kim-greeting">
+            {getGreeting(account.display_name)}
           </div>
-          <div className="kim-empty-welcome__title">{getGreeting(account.display_name)}</div>
           <div className="kim-empty-welcome__subtitle">
             Pick a session from the sidebar or start a new chat
           </div>
@@ -556,7 +602,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
                 <span className="kim-pulse-dot kim-pulse-dot--accent" />
                 Ready
               </div>
-              <div className="kim-new-chat-empty__title">{getGreeting(account.display_name)}</div>
+              <div className="kim-new-chat-empty__title kim-greeting">{getGreeting(account.display_name)}</div>
               <div className="kim-new-chat-empty__subtitle">
                 Describe any task in plain English below — Kim will figure out how to do it.
               </div>
@@ -634,12 +680,20 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
           {/* Activity feed */}
           {renderActivityFeed()}
 
-          {/* Working indicator with timer */}
+          {/* Working indicator with blobby loader */}
           {isRunning && (
             <div className="kim-working-indicator">
-              <div className="kim-working-indicator__dots">
-                <span /><span /><span />
-              </div>
+              {/* Goo filter used by loaders 6, 15, 20 */}
+              <svg width="0" height="0" style={{ position: 'absolute' }}>
+                <defs>
+                  <filter id="kim-goo">
+                    <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur" />
+                    <feColorMatrix in="blur" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 20 -9" result="goo" />
+                    <feComposite in="SourceGraphic" in2="goo" operator="atop" />
+                  </filter>
+                </defs>
+              </svg>
+              <BlobLoader which={cancelling ? 3 : 15} />
               <span className="kim-working-indicator__text">
                 {cancelling ? 'Stopping Kim…' : 'Kim is working…'}
               </span>
@@ -697,7 +751,16 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       <div className="kim-messages">
         {loadingMessages ? (
           <div className="kim-messages__loading">
-            <div className="kim-spinner" />
+            <svg width="0" height="0" style={{ position: 'absolute' }}>
+              <defs>
+                <filter id="kim-goo">
+                  <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur" />
+                  <feColorMatrix in="blur" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 20 -9" result="goo" />
+                  <feComposite in="SourceGraphic" in2="goo" operator="atop" />
+                </filter>
+              </defs>
+            </svg>
+            <BlobLoader which={6} />
             <span>Loading conversation…</span>
           </div>
         ) : messages.length === 0 ? (
