@@ -2418,3 +2418,160 @@ kbd {
   flex-shrink: 0;
 }
 
+/* ── Toast notifications ─────────────────────────────────────────────────── */
+.kim-toast-container {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.kim-toast {
+  pointer-events: all;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-md);
+  font-size: 13px;
+  color: var(--text);
+  max-width: 360px;
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.kim-toast--visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+.kim-toast__icon { flex-shrink: 0; }
+.kim-toast--success .kim-toast__icon { color: var(--success); }
+.kim-toast--error   .kim-toast__icon { color: var(--danger); }
+.kim-toast--warning .kim-toast__icon { color: var(--warning); }
+.kim-toast--info    .kim-toast__icon { color: var(--accent); }
+.kim-toast__text { flex: 1; line-height: 1.4; }
+.kim-toast__close {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.1s;
+}
+.kim-toast__close:hover { background: var(--bg-card); }
+
+/* ── Browser provider picker ─────────────────────────────────────────────── */
+.kim-browser-picker {
+  margin-bottom: 4px;
+}
+.kim-browser-picker__label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-subtle);
+  margin-bottom: 10px;
+}
+.kim-browser-picker__grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.kim-browser-card {
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  cursor: pointer;
+  background: var(--bg-elevated);
+  transition: border-color 0.15s, background 0.15s;
+}
+.kim-browser-card:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-card);
+}
+.kim-browser-card--active {
+  border-color: var(--accent);
+  background: var(--accent-muted);
+}
+.kim-browser-card__top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+.kim-browser-card__icon {
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.kim-browser-card--active .kim-browser-card__icon { color: var(--accent); }
+.kim-browser-card__name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  flex: 1;
+}
+.kim-browser-card__check { color: var(--accent); margin-left: auto; }
+.kim-browser-card__hint {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.kim-browser-card__warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.2);
+  font-size: 11.5px;
+  color: var(--warning);
+  line-height: 1.4;
+}
+.kim-browser-card__warning svg { flex-shrink: 0; margin-top: 1px; }
+.kim-browser-card__open-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  width: 100%;
+  justify-content: center;
+  transition: background 0.12s, opacity 0.12s;
+}
+.kim-browser-card__open-btn:hover { background: var(--accent-hover); }
+.kim-browser-card__open-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.kim-browser-picker__info {
+  font-size: 12px;
+  color: var(--text-subtle);
+  line-height: 1.5;
+  padding: 10px 12px;
+  background: var(--bg-card);
+  border-radius: 8px;
+  border-left: 3px solid var(--border-strong);
+}
+

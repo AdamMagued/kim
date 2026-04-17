@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { SessionInfo, KimMessage, Settings, KimAccount } from '../types';
 import { MessageBubble } from './MessageBubble';
+import { BrowserProviderPicker } from './BrowserProviderPicker';
 
 const MAX_LIVE_OUTPUT_LINES = 500;
 
@@ -38,6 +39,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   const [cancelling, setCancelling] = useState(false);
   const [liveOutput, setLiveOutput] = useState<string[]>([]);
   const [taskError, setTaskError] = useState<string | null>(null);
+  // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
+  const [browserProvider, setBrowserProvider] = useState('claude');
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -166,9 +169,14 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
     try {
+      // When browser mode is active, pass the specific browser provider so
+      // the orchestrator knows which site to relay through.
+      const resolvedProvider = settings.provider === 'browser'
+        ? `browser:${browserProvider}`
+        : (settings.provider || null);
       await invoke('send_task', {
         task,
-        provider: settings.provider || null,
+        provider: resolvedProvider,
         projectRoot: settings.project_root || null,
       });
     } catch (err) {
@@ -240,7 +248,14 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
                 your mouse, run commands, browse the web, and write code.
               </div>
 
-              <div className="kim-examples">
+              {settings.provider === 'browser' && (
+                <BrowserProviderPicker
+                  selected={browserProvider}
+                  onSelect={setBrowserProvider}
+                />
+              )}
+
+              <div className="kim-examples" style={{ marginTop: settings.provider === 'browser' ? 24 : 0 }}>
                 {EXAMPLE_PROMPTS.map((ex, i) => (
                   <button
                     key={i}
