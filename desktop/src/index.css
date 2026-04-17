@@ -942,40 +942,82 @@ kbd {
 }
 .kim-working-indicator__dots span:nth-child(2) { animation-delay: 0.15s; }
 .kim-working-indicator__dots span:nth-child(3) { animation-delay: 0.3s; }
+.kim-working-indicator__timer {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--text-subtle);
+  letter-spacing: 0.02em;
+}
 
-/* Live output (streaming logs) */
-.kim-live-output {
+/* Activity feed — replaces raw log output */
+.kim-activity-feed {
   max-width: 720px;
   margin: 16px auto 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.kim-activity-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  animation: kim-fade-in 0.18s ease;
+}
+.kim-activity-item--tool {
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 12px 16px;
-  max-height: 420px;
-  overflow-y: auto;
-  box-shadow: var(--shadow-xs);
-}
-.kim-live-output__line {
-  font-family: "JetBrains Mono", "SF Mono", monospace;
-  font-size: 12px;
   color: var(--text);
-  padding: 2px 0;
-  word-break: break-word;
-  line-height: 1.55;
-  animation: kim-fade-in 0.2s ease;
 }
-.kim-live-output__line--err { color: var(--danger); }
-.kim-live-output__line--cancelled {
+.kim-activity-item--status {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.kim-activity-item--info {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.kim-activity-item--error {
+  background: var(--danger-muted);
+  color: var(--danger-hover);
+  border-radius: 8px;
+  padding: 7px 12px;
+}
+.kim-activity-item--success {
+  color: var(--success, #16a34a);
+  font-weight: 500;
+}
+.kim-activity-item--cancelled {
   color: var(--warning);
-  font-weight: 600;
-  padding: 6px 0;
+  font-weight: 500;
 }
-.kim-live-output__line--truncated {
-  color: var(--text-subtle);
-  font-style: italic;
-  padding: 4px 0 6px;
-  border-bottom: 1px dashed var(--border);
-  margin-bottom: 4px;
+.kim-activity-item__icon {
+  flex-shrink: 0;
+  font-size: 14px;
+  line-height: 1;
+  width: 20px;
+  text-align: center;
+}
+.kim-activity-item__text {
+  flex: 1;
+  word-break: break-word;
+}
+.kim-activity-item__text code,
+.kim-activity-item__text strong {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  background: var(--bg-inset);
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: var(--text-strong);
+}
+/* Render backtick-wrapped text as inline code */
+.kim-activity-item__text {
+  /* rendered via dangerouslySetInnerHTML or via parseMarkdown below;
+     styles above cover the code tag if we inject it */
 }
 
 /* Task error banner */
@@ -2545,6 +2587,23 @@ kbd {
   line-height: 1.4;
 }
 .kim-browser-card__warning svg { flex-shrink: 0; margin-top: 1px; }
+.kim-browser-card__url-input {
+  margin-top: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-inset);
+  color: var(--text);
+  font-size: 12.5px;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  outline: none;
+  transition: border-color 0.15s;
+  box-sizing: border-box;
+}
+.kim-browser-card__url-input:focus {
+  border-color: var(--accent);
+}
 .kim-browser-card__open-btn {
   display: flex;
   align-items: center;

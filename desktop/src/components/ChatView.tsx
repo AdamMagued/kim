@@ -5,13 +5,181 @@ import type { SessionInfo, KimMessage, Settings, KimAccount } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { BrowserProviderPicker } from './BrowserProviderPicker';
 
-const MAX_LIVE_OUTPUT_LINES = 500;
+const MAX_ACTIVITY_ITEMS = 300;
+
+// ── Activity feed ─────────────────────────────────────────────────────────────
+
+interface ActivityItem {
+  id: number;
+  kind: 'tool' | 'info' | 'error' | 'success' | 'cancelled' | 'status';
+  icon: string;
+  text: string;
+}
+
+let _activityCounter = 0;
+
+/** Lines that contain these strings are silently dropped */
+const HIDDEN_PATTERNS = [
+  'take_screenshot',
+  'screenshot',
+  'capture_screen',
+  'TASK_COMPLETE',
+  'NEED_HELP',
+  // noisy internal logs
+  'INFO] kimdir',
+  'DEBUG] kimdir',
+];
+
+/** Friendly names + icons for known tool calls */
+const TOOL_MAP: Record<string, { icon: string; label: (args: Record<string, unknown>) => string }> = {
+  read_file:          { icon: '📄', label: a => `Reading \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
+  write_file:         { icon: '✏️', label: a => `Writing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
+  create_file:        { icon: '📝', label: a => `Creating \`${basename(String(a.path ?? ''))}\`` },
+  edit_file:          { icon: '✏️', label: a => `Editing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
+  delete_file:        { icon: '🗑', label: a => `Deleting \`${basename(String(a.path ?? ''))}\`` },
+  list_directory:     { icon: '📁', label: a => `Listing \`${basename(String(a.path ?? a.directory ?? ''))}\`` },
+  search_files:       { icon: '🔍', label: a => `Searching for \`${String(a.pattern ?? a.query ?? '')}\`` },
+  grep:               { icon: '🔍', label: a => `Searching code for \`${String(a.pattern ?? '')}\`` },
+  run_command:        { icon: '⚡', label: a => `Running \`${shorten(String(a.command ?? a.cmd ?? ''), 60)}\`` },
+  execute_command:    { icon: '⚡', label: a => `Running \`${shorten(String(a.command ?? ''), 60)}\`` },
+  bash:               { icon: '⚡', label: a => `Running \`${shorten(String(a.command ?? ''), 60)}\`` },
+  browser_navigate:   { icon: '🌐', label: a => `Opening ${String(a.url ?? 'a web page')}` },
+  web_search:         { icon: '🔍', label: a => `Searching the web for "${String(a.query ?? '')}"\`` },
+  type_text:          { icon: '⌨️',  label: _a => 'Typing text' },
+  click:              { icon: '🖱', label: _a => 'Clicking' },
+  scroll:             { icon: '↕',  label: _a => 'Scrolling' },
+  move_mouse:         { icon: '🖱', label: _a => 'Moving mouse' },
+  press_key:          { icon: '⌨️',  label: a => `Pressing key \`${String(a.key ?? '')}\`` },
+  open_application:   { icon: '🚀', label: a => `Opening ${String(a.app_name ?? a.application ?? '')}` },
+  close_application:  { icon: '✕',  label: a => `Closing ${String(a.app_name ?? '')}` },
+  read_clipboard:     { icon: '📋', label: _a => 'Reading clipboard' },
+  write_clipboard:    { icon: '📋', label: _a => 'Writing to clipboard' },
+  get_screen_text:    { icon: '👁', label: _a => 'Reading screen text' },
+  ask_user:           { icon: '💬', label: a => `Asking: "${String(a.question ?? '')}"` },
+};
+
+function basename(p: string): string {
+  if (!p) return '';
+  return p.split(/[/\\]/).pop() ?? p;
+}
+
+function shorten(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+
+/** Map technical error text to something a non-technical user can understand */
+function friendlyError(raw: string): string {
+  const r = raw.toLowerCase();
+  if (r.includes('api key') || r.includes('unauthorized') || r.includes('401'))
+    return 'Your API key isn\'t working. Open Settings → AI to check your credentials.';
+  if (r.includes('rate limit') || r.includes('429') || r.includes('too many requests'))
+    return 'Kim is being rate-limited by the AI provider. Wait a moment and try again.';
+  if (r.includes('quota') || r.includes('billing') || r.includes('insufficient_quota'))
+    return 'You\'ve hit your API usage limit. Check your billing on the provider\'s website.';
+  if (r.includes('network') || r.includes('connection refused') || r.includes('econnrefused') || r.includes('fetch'))
+    return 'Can\'t reach the AI provider. Check your internet connection and try again.';
+  if (r.includes('timeout') || r.includes('timed out'))
+    return 'The request took too long and timed out. Try a simpler task or check your connection.';
+  if (r.includes('model') && (r.includes('not found') || r.includes('invalid')))
+    return 'The selected AI model isn\'t available. Open Settings → AI to pick a different one.';
+  if (r.includes('context') && r.includes('length'))
+    return 'The conversation is too long for the AI to handle. Try starting a new chat.';
+  if (r.includes('permission') || r.includes('access denied'))
+    return 'Kim doesn\'t have permission to access that file or folder.';
+  // Strip noise from log lines and return a condensed version
+  const cleaned = raw
+    .replace(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},?\d*\s*/g, '')
+    .replace(/\[(ERROR|WARN|INFO|DEBUG|TOOL|CRITICAL)\]\s*/g, '')
+    .replace(/orchestrator\.\w+:\s*/g, '')
+    .trim();
+  return cleaned.length > 0 && cleaned.length < 200 ? cleaned : 'Something went wrong. Check your settings and try again.';
+}
+
+function parseLogLine(raw: string, id: number): ActivityItem | null {
+  // Hide screenshot and other noisy lines
+  for (const pat of HIDDEN_PATTERNS) {
+    if (raw.toLowerCase().includes(pat.toLowerCase())) return null;
+  }
+
+  // Hide truncated meta-lines
+  if (raw.startsWith('[truncated')) return null;
+
+  // ⏹ Cancelled
+  if (raw.startsWith('⏹')) {
+    return { id, kind: 'cancelled', icon: '⏹', text: 'Task stopped' };
+  }
+
+  // SUCCESS from stdout
+  if (raw.includes('[SUCCESS]')) {
+    const text = raw.replace(/.*\[SUCCESS\]\s*/, '').trim();
+    return { id, kind: 'success', icon: '✓', text: text || 'Task completed successfully' };
+  }
+
+  // [err] prefix = came from stderr
+  const isErr = raw.startsWith('[err]');
+  const line = isErr ? raw.slice(5).trim() : raw;
+
+  // Strip timestamp prefix: "2024-01-01 12:00:00,123 "
+  const stripped = line.replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.,]?\d*\s+/, '');
+
+  // [TOOL] lines
+  const toolMatch = stripped.match(/\[TOOL\]\s+[\w.]+:\s+(\w+)\((.{0,200})\)/);
+  if (toolMatch) {
+    const toolName = toolMatch[1];
+    const argsRaw = toolMatch[2] ?? '{}';
+    // Try to parse JSON args (may be truncated)
+    let args: Record<string, unknown> = {};
+    try { args = JSON.parse(argsRaw); } catch {
+      // Try to extract first key-value pair at minimum
+      const m = argsRaw.match(/"(\w+)":\s*"([^"]+)"/);
+      if (m) args = { [m[1]]: m[2] };
+    }
+
+    const def = TOOL_MAP[toolName];
+    if (def) {
+      return { id, kind: 'tool', icon: def.icon, text: def.label(args) };
+    }
+    // Unknown tool — show generic
+    return { id, kind: 'tool', icon: '🔧', text: `Using tool: \`${toolName}\`` };
+  }
+
+  // [ERROR] / [CRITICAL] lines
+  if (stripped.match(/\[(ERROR|CRITICAL)\]/)) {
+    const msg = stripped.replace(/\[(ERROR|CRITICAL)\]\s+[\w.]*:\s*/, '').trim();
+    return { id, kind: 'error', icon: '⚠', text: friendlyError(msg) };
+  }
+
+  // [FAILED] from stdout
+  if (raw.includes('[FAILED]') || raw.includes('[ERROR]')) {
+    const msg = raw.replace(/.*\[(FAILED|ERROR)\]\s*/, '').trim();
+    return { id, kind: 'error', icon: '⚠', text: friendlyError(msg) };
+  }
+
+  // Generic [err] stderr lines that aren't tool calls
+  if (isErr) {
+    // Filter out pure INFO/DEBUG log noise that isn't user-facing
+    if (stripped.match(/\[(INFO|DEBUG)\]/)) {
+      const msg = stripped.replace(/\[(INFO|DEBUG)\]\s+[\w.]*:\s*/, '').trim();
+      // Only show if it looks like a meaningful status update
+      if (msg.length < 5 || msg.match(/^(Starting|Listening|Initialized|Loaded|Connected)/i)) return null;
+      return { id, kind: 'status', icon: '·', text: msg.length > 120 ? msg.slice(0, 120) + '…' : msg };
+    }
+    // Non-classified stderr
+    const msg = stripped.replace(/\[[\w]+\]\s+[\w.]*:\s*/, '').trim();
+    if (!msg) return null;
+    return { id, kind: 'status', icon: '·', text: msg.length > 120 ? msg.slice(0, 120) + '…' : msg };
+  }
+
+  return null;
+}
+
+// ── Greeting ──────────────────────────────────────────────────────────────────
 
 const EXAMPLE_PROMPTS: { title: string; hint: string }[] = [
   { title: 'Summarize the PDF on my desktop', hint: 'Read and extract key insights from a file' },
   { title: 'Find all TODOs in my project', hint: 'Search across files and list them' },
-  { title: 'Take a screenshot and describe what you see', hint: 'Vision + analysis' },
   { title: 'Stage, commit, and push my changes', hint: 'Git workflow end-to-end' },
+  { title: 'Search the web and write a report', hint: 'Browse + summarize' },
 ];
 
 function getGreeting(name: string): string {
@@ -23,6 +191,15 @@ function getGreeting(name: string): string {
   return `Evening, ${name}`;
 }
 
+function formatElapsed(s: number): string {
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${m}m ${sec}s`;
+}
+
+// ── Props ─────────────────────────────────────────────────────────────────────
+
 interface Props {
   session: SessionInfo | null;
   newChatMode: boolean;
@@ -31,28 +208,40 @@ interface Props {
   account: KimAccount;
 }
 
+// ── Component ─────────────────────────────────────────────────────────────────
+
 export function ChatView({ session, newChatMode, settings, onTaskDone, account }: Props) {
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [taskInput, setTaskInput] = useState('');
   const [isRunning, setIsRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
-  const [liveOutput, setLiveOutput] = useState<string[]>([]);
+  const [activity, setActivity] = useState<ActivityItem[]>([]);
   const [taskError, setTaskError] = useState<string | null>(null);
+  const [elapsed, setElapsed] = useState(0);
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
+
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const startTimeRef = useRef<number | null>(null);
 
-  // Keep a stable ref to the onTaskDone callback so the event-listener
-  // effect never re-subscribes. Previously the effect depended on
-  // onTaskDone and duplicated listeners whenever the parent re-rendered.
+  // Keep a stable ref to the onTaskDone callback
   const onTaskDoneRef = useRef(onTaskDone);
-  useEffect(() => {
-    onTaskDoneRef.current = onTaskDone;
-  }, [onTaskDone]);
+  useEffect(() => { onTaskDoneRef.current = onTaskDone; }, [onTaskDone]);
 
-  // Load messages when a session is selected
+  // ── Timer ───────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!isRunning) return;
+    startTimeRef.current = Date.now();
+    setElapsed(0);
+    const id = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - (startTimeRef.current ?? Date.now())) / 1000));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isRunning]);
+
+  // ── Load messages ───────────────────────────────────────────────────────────
   useEffect(() => {
     if (!session) {
       setMessages([]);
@@ -69,12 +258,12 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       .finally(() => setLoadingMessages(false));
   }, [session, settings.kim_sessions_dir, settings.claw_sessions_dir]);
 
-  // Scroll to bottom when messages change
+  // ── Scroll to bottom ────────────────────────────────────────────────────────
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, liveOutput]);
+  }, [messages, activity]);
 
-  // Focus the textarea when we enter new-chat mode.
+  // ── Focus on new chat ───────────────────────────────────────────────────────
   useEffect(() => {
     if (newChatMode) {
       const t = setTimeout(() => textareaRef.current?.focus(), 50);
@@ -82,23 +271,19 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     }
   }, [newChatMode]);
 
-  // Append a line to liveOutput, capping at MAX_LIVE_OUTPUT_LINES to avoid
-  // unbounded memory growth on long-running tasks.
-  function appendLive(line: string) {
-    setLiveOutput(prev => {
-      const next = [...prev, line];
-      if (next.length > MAX_LIVE_OUTPUT_LINES) {
-        const dropped = next.length - MAX_LIVE_OUTPUT_LINES;
-        return [
-          `[truncated ${dropped} earlier line${dropped === 1 ? '' : 's'}]`,
-          ...next.slice(dropped + 1),
-        ];
-      }
+  // ── Append to activity feed ─────────────────────────────────────────────────
+  function appendRaw(line: string) {
+    const id = ++_activityCounter;
+    const item = parseLogLine(line, id);
+    if (!item) return;
+    setActivity(prev => {
+      const next = [...prev, item];
+      if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
       return next;
     });
   }
 
-  // Listen for agent events — subscribe once.
+  // ── Agent event listeners ───────────────────────────────────────────────────
   useEffect(() => {
     let unlistenOutput: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
@@ -106,15 +291,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     let unlistenCancelled: (() => void) | undefined;
 
     listen<string>('kim-agent-output', event => {
-      appendLive(event.payload);
+      appendRaw(event.payload);
     }).then(fn => { unlistenOutput = fn; });
 
     listen<string>('kim-agent-error', event => {
-      appendLive(`[err] ${event.payload}`);
+      appendRaw(`[err] ${event.payload}`);
     }).then(fn => { unlistenError = fn; });
 
-    // Track cancel via ref so the done-listener can read it without
-    // restarting the subscription.
     let cancelFlag = false;
 
     listen<boolean>('kim-agent-done', event => {
@@ -123,14 +306,14 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       if (event.payload) {
         onTaskDoneRef.current();
       } else if (!cancelFlag) {
-        setTaskError('Agent exited with an error. Check logs.');
+        setTaskError('agent-error');
       }
       cancelFlag = false;
     }).then(fn => { unlistenDone = fn; });
 
     listen<boolean>('kim-agent-cancelled', () => {
       cancelFlag = true;
-      appendLive('⏹ Task cancelled');
+      appendRaw('⏹ Task cancelled');
       setIsRunning(false);
       setCancelling(false);
     }).then(fn => { unlistenCancelled = fn; });
@@ -141,9 +324,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       unlistenDone?.();
       unlistenCancelled?.();
     };
-    // Subscribe-once semantics: intentionally no deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── Actions ─────────────────────────────────────────────────────────────────
 
   async function handleCancel() {
     if (!isRunning || cancelling) return;
@@ -152,7 +336,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       await invoke('cancel_task');
     } catch (err) {
       setCancelling(false);
-      setTaskError(`Cancel failed: ${String(err)}`);
+      setTaskError(friendlyError(String(err)));
     }
   }
 
@@ -162,15 +346,12 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     if (!task || isRunning) return;
 
     setIsRunning(true);
-    setLiveOutput([]);
+    setActivity([]);
     setTaskError(null);
     setTaskInput('');
-    // Reset textarea height
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
     try {
-      // When browser mode is active, pass the specific browser provider so
-      // the orchestrator knows which site to relay through.
       const resolvedProvider = settings.provider === 'browser'
         ? `browser:${browserProvider}`
         : (settings.provider || null);
@@ -181,11 +362,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       });
     } catch (err) {
       setIsRunning(false);
-      setTaskError(String(err));
+      setTaskError(friendlyError(String(err)));
     }
   }
 
-  // Auto-resize textarea
   function handleTextareaInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
     setTaskInput(e.target.value);
     const el = e.target;
@@ -195,7 +375,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
 
   function pickExample(p: string) {
     setTaskInput(p);
-    // Auto-resize after state update
     setTimeout(() => {
       if (textareaRef.current) {
         textareaRef.current.style.height = 'auto';
@@ -206,7 +385,95 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     }, 0);
   }
 
-  // ── Empty welcome state (no session, no newChat) ───────────────────────────
+  // ── Activity feed render ─────────────────────────────────────────────────────
+
+  /** Converts `backtick` segments to <code> tags for display */
+  function renderActivityText(text: string): React.ReactNode {
+    const parts = text.split(/(`[^`]+`)/g);
+    if (parts.length === 1) return text;
+    return parts.map((p, i) =>
+      p.startsWith('`') && p.endsWith('`')
+        ? <code key={i}>{p.slice(1, -1)}</code>
+        : p
+    );
+  }
+
+  function renderActivityFeed() {
+    if (activity.length === 0) return null;
+    return (
+      <div className="kim-activity-feed">
+        {activity.map(item => (
+          <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
+            <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
+            <span className="kim-activity-item__text">{renderActivityText(item.text)}</span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  // ── Composer ─────────────────────────────────────────────────────────────────
+
+  function renderComposer() {
+    return (
+      <form className="kim-composer" onSubmit={handleSubmit}>
+        <div className={'kim-composer__box' + (isRunning ? ' kim-composer__box--running' : '')}>
+          <textarea
+            ref={textareaRef}
+            value={taskInput}
+            onChange={handleTextareaInput}
+            placeholder={isRunning ? 'Kim is working — press Stop to cancel' : 'Message Kim…'}
+            rows={1}
+            disabled={isRunning}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                void handleSubmit(e as unknown as React.FormEvent);
+              }
+            }}
+            className="kim-composer__textarea"
+          />
+
+          <div className="kim-composer__actions">
+            {isRunning ? (
+              <button
+                type="button"
+                onClick={handleCancel}
+                disabled={cancelling}
+                title={cancelling ? 'Stopping…' : 'Stop task'}
+                className={'kim-btn kim-btn--stop' + (cancelling ? ' kim-btn--stop-pending' : '')}
+                aria-label="Stop task"
+              >
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
+                  <rect x="6" y="6" width="12" height="12" rx="2" />
+                </svg>
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!taskInput.trim()}
+                className="kim-btn kim-btn--send"
+                aria-label="Send"
+              >
+                <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M5 12h14M13 5l7 7-7 7" />
+                </svg>
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="kim-composer__hint">
+          <span><kbd>↵</kbd> to send</span>
+          <span className="kim-composer__hint-sep">·</span>
+          <span><kbd>⇧</kbd>+<kbd>↵</kbd> for new line</span>
+          <span className="kim-composer__hint-sep">·</span>
+          <span>via <strong>{settings.provider}</strong></span>
+        </div>
+      </form>
+    );
+  }
+
+  // ── Empty welcome state ──────────────────────────────────────────────────────
   if (!newChatMode && !session) {
     return (
       <div className="kim-chat">
@@ -229,9 +496,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     );
   }
 
-  // ── New chat mode ──────────────────────────────────────────────────────────
+  // ── New chat mode ─────────────────────────────────────────────────────────────
   if (newChatMode) {
-    const hasStarted = isRunning || liveOutput.length > 0 || taskError;
+    const hasStarted = isRunning || activity.length > 0 || taskError;
 
     return (
       <div className="kim-chat">
@@ -273,119 +540,54 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
             </div>
           )}
 
-          {taskError && (
+          {/* Task error banner */}
+          {taskError && taskError !== 'agent-error' && (
             <div className="kim-task-error" role="alert">
               <span className="kim-task-error__icon">⚠</span>
               <span>{taskError}</span>
             </div>
           )}
-
-          {liveOutput.length > 0 && (
-            <div className="kim-live-output">
-              {liveOutput.map((line, i) => {
-                const isErr = line.startsWith('[err]');
-                const isCancelled = line.startsWith('⏹');
-                const isTruncated = line.startsWith('[truncated');
-                return (
-                  <div
-                    key={i}
-                    className={
-                      'kim-live-output__line' +
-                      (isErr ? ' kim-live-output__line--err' : '') +
-                      (isCancelled ? ' kim-live-output__line--cancelled' : '') +
-                      (isTruncated ? ' kim-live-output__line--truncated' : '')
-                    }
-                  >
-                    {line}
-                  </div>
-                );
-              })}
+          {taskError === 'agent-error' && (
+            <div className="kim-task-error" role="alert">
+              <span className="kim-task-error__icon">⚠</span>
+              <span>Kim ran into a problem and had to stop. Check the activity above for clues, or try rephrasing your task.</span>
             </div>
           )}
 
+          {/* Activity feed */}
+          {renderActivityFeed()}
+
+          {/* Working indicator with timer */}
           {isRunning && (
             <div className="kim-working-indicator">
               <div className="kim-working-indicator__dots">
                 <span /><span /><span />
               </div>
               <span className="kim-working-indicator__text">
-                {cancelling ? 'Stopping Kim…' : 'Kim is thinking…'}
+                {cancelling ? 'Stopping Kim…' : 'Kim is working…'}
               </span>
+              {!cancelling && elapsed > 0 && (
+                <span className="kim-working-indicator__timer">{formatElapsed(elapsed)}</span>
+              )}
             </div>
           )}
 
           <div ref={bottomRef} />
         </div>
 
-        {/* Composer */}
-        <form className="kim-composer" onSubmit={handleSubmit}>
-          <div className={'kim-composer__box' + (isRunning ? ' kim-composer__box--running' : '')}>
-            <textarea
-              ref={textareaRef}
-              value={taskInput}
-              onChange={handleTextareaInput}
-              placeholder={isRunning ? 'Kim is working — press Stop to cancel' : 'Message Kim…'}
-              rows={1}
-              disabled={isRunning}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  void handleSubmit(e as unknown as React.FormEvent);
-                }
-              }}
-              className="kim-composer__textarea"
-            />
-
-            <div className="kim-composer__actions">
-              {isRunning ? (
-                <button
-                  type="button"
-                  onClick={handleCancel}
-                  disabled={cancelling}
-                  title={cancelling ? 'Stopping…' : 'Stop task'}
-                  className={'kim-btn kim-btn--stop' + (cancelling ? ' kim-btn--stop-pending' : '')}
-                  aria-label="Stop task"
-                >
-                  <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
-                    <rect x="6" y="6" width="12" height="12" rx="2" />
-                  </svg>
-                </button>
-              ) : (
-                <button
-                  type="submit"
-                  disabled={!taskInput.trim()}
-                  className="kim-btn kim-btn--send"
-                  aria-label="Send"
-                >
-                  <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M5 12h14M13 5l7 7-7 7" />
-                  </svg>
-                </button>
-              )}
-            </div>
-          </div>
-          <div className="kim-composer__hint">
-            <span><kbd>↵</kbd> to send</span>
-            <span className="kim-composer__hint-sep">·</span>
-            <span><kbd>⇧</kbd>+<kbd>↵</kbd> for new line</span>
-            <span className="kim-composer__hint-sep">·</span>
-            <span>provider: <strong>{settings.provider}</strong></span>
-          </div>
-        </form>
+        {renderComposer()}
       </div>
     );
   }
 
-  // ── Existing session view ──────────────────────────────────────────────────
+  // ── Existing session view ─────────────────────────────────────────────────────
   return (
     <div className="kim-chat">
       {/* Session header */}
       <div className="kim-session-header">
         <div className="kim-session-header__main">
           <div className="kim-session-header__row">
-            <span
-              className={`kim-session-badge kim-session-badge--${session!.session_type}`}
-            >
+            <span className={`kim-session-badge kim-session-badge--${session!.session_type}`}>
               {session!.session_type === 'kim' ? 'Kim' : 'Claw Code'}
             </span>
             <span className="kim-session-header__id">{session!.session_id}</span>
