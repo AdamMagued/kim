@@ -1286,6 +1286,95 @@ fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
 }
 
 // ---------------------------------------------------------------------------
+// Feedback — POST to a private Discord webhook (URL never exposed to frontend)
+// ---------------------------------------------------------------------------
+
+/// The Discord webhook URL is embedded at compile time from the
+/// KIM_DISCORD_WEBHOOK environment variable.  Set it before `cargo build`:
+///   export KIM_DISCORD_WEBHOOK="https://discord.com/api/webhooks/..."
+/// Leave unset (or empty) to silently no-op — the user sees a success message
+/// so they're not confused, but nothing is transmitted.
+const DISCORD_WEBHOOK_URL: &str = match option_env!("KIM_DISCORD_WEBHOOK") {
+    Some(url) => url,
+    None => "",
+};
+
+#[derive(serde::Deserialize)]
+pub struct FeedbackPayload {
+    pub category: String,    // "bug" | "feature" | "general" | "praise" | "other"
+    pub message: String,
+    pub contact: Option<String>, // optional email the user chose to share
+}
+
+#[tauri::command]
+async fn send_feedback(payload: FeedbackPayload) -> Result<(), String> {
+    if DISCORD_WEBHOOK_URL.is_empty() {
+        // Webhook not configured — silently succeed so UX is clean.
+        return Ok(());
+    }
+
+    let category_label = match payload.category.as_str() {
+        "bug"     => "🐛 Bug Report",
+        "feature" => "✨ Feature Request",
+        "praise"  => "🙏 Praise",
+        "general" => "💬 General Feedback",
+        _         => "📝 Feedback",
+    };
+
+    let contact_field = payload.contact
+        .filter(|s| !s.trim().is_empty())
+        .map(|email| serde_json::json!({
+            "name": "Contact",
+            "value": email,
+            "inline": true,
+        }));
+
+    let mut fields = vec![
+        serde_json::json!({
+            "name": "Category",
+            "value": category_label,
+            "inline": true,
+        }),
+        serde_json::json!({
+            "name": "Message",
+            "value": &payload.message,
+            "inline": false,
+        }),
+    ];
+    if let Some(cf) = contact_field {
+        fields.push(cf);
+    }
+
+    let color = match payload.category.as_str() {
+        "bug"     => 0xef4444u32, // red
+        "feature" => 0x6366f1,    // indigo
+        "praise"  => 0x22c55e,    // green
+        _         => 0x64748b,    // slate
+    };
+
+    let body = serde_json::json!({
+        "embeds": [{
+            "title": format!("{} — Kim Desktop", category_label),
+            "color": color,
+            "fields": fields,
+            "footer": { "text": format!("Kim Desktop — {}", chrono_now()) },
+        }]
+    });
+
+    let client = reqwest::Client::new();
+    client
+        .post(DISCORD_WEBHOOK_URL)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("Webhook error: {}", e))?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1295,6 +1384,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(task_state)
         .invoke_handler(tauri::generate_handler![
             list_sessions,
@@ -1314,6 +1404,7 @@ pub fn run() {
             list_claw_projects,
             add_code_project,
             remove_code_project,
+            send_feedback,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
