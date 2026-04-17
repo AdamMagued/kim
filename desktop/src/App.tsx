@@ -36,13 +36,28 @@ interface GithubRelease {
   html_url: string;
 }
 
+// Compare "1.10.2" vs "1.9.5" correctly by numeric parts, not string order.
+function compareSemver(a: string, b: string): number {
+  const pa = a.split('.').map(n => parseInt(n, 10) || 0);
+  const pb = b.split('.').map(n => parseInt(n, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const x = pa[i] ?? 0;
+    const y = pb[i] ?? 0;
+    if (x > y) return 1;
+    if (x < y) return -1;
+  }
+  return 0;
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
   const [settings, setSettings] = useState<Settings>(loadSettings);
 
-  // Theme — driven by settings.theme
-  const { theme, setTheme } = useTheme(settings.theme);
+  // Theme — useTheme applies `.dark` to document.documentElement; no need
+  // to duplicate the class on our root div.
+  const { setTheme } = useTheme(settings.theme);
 
   // Sessions
   const { kimSessions, clawSessions, loading, refresh } = useSessions(settings);
@@ -69,6 +84,32 @@ export default function App() {
   useEffect(() => {
     setTheme(settings.theme);
   }, [settings.theme, setTheme]);
+
+  // ── Keyboard shortcuts ─────────────────────────────────────────────────────
+  //   Cmd/Ctrl + N  → New chat
+  //   Cmd/Ctrl + ,  → Settings
+  //   Cmd/Ctrl + B  → Toggle sidebar
+  //   Esc           → Close any open modal
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === 'n') {
+        e.preventDefault();
+        handleNewChat();
+      } else if (mod && e.key === ',') {
+        e.preventDefault();
+        setShowSettings(true);
+      } else if (mod && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        setSidebarCollapsed(v => !v);
+      } else if (e.key === 'Escape') {
+        if (showSettings) setShowSettings(false);
+        else if (showUpdate) setShowUpdate(false);
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showSettings, showUpdate]);
 
   // Persist settings
   function handleSettingsChange(next: Settings) {
@@ -108,10 +149,21 @@ export default function App() {
         'https://api.github.com/repos/AdamMagued/kim/releases/latest',
         { headers: { Accept: 'application/vnd.github+json' } }
       );
-      if (!resp.ok) return;
+      if (!resp.ok) {
+        if (resp.status === 404) {
+          alert('No published release yet.');
+          return;
+        }
+        if (resp.status === 403) {
+          alert('Rate-limited by GitHub. Try again later.');
+          return;
+        }
+        alert(`Update check failed (HTTP ${resp.status}).`);
+        return;
+      }
       const data = (await resp.json()) as GithubRelease;
       const latest = data.tag_name.replace(/^v/, '');
-      if (latest !== appVersion) {
+      if (compareSemver(latest, appVersion) > 0) {
         setUpdateInfo(data);
         setShowUpdate(true);
       } else {
@@ -122,76 +174,43 @@ export default function App() {
     }
   }
 
-  // Resolved theme for the outer class
-  const darkClass = (theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)) ? 'dark' : '';
-
   return (
-    <div
-      className={darkClass}
-      style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--bg)', color: 'var(--text)' }}
-    >
+    <div className="kim-app">
       {/* ── Header ──────────────────────────────────────────────────────────── */}
-      <header
-        style={{
-          height: '48px',
-          minHeight: '48px',
-          display: 'flex',
-          alignItems: 'center',
-          padding: '0 16px',
-          borderBottom: '1px solid var(--border)',
-          background: 'var(--bg-sidebar)',
-          gap: '12px',
-          flexShrink: 0,
-        }}
-      >
+      <header className="kim-header">
+        {/* macOS traffic-lights spacer (titleBarStyle=Overlay + hiddenTitle) */}
+        <div className="kim-header__traffic-lights-spacer" />
+
         {/* Logo + name */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <div
-            style={{
-              width: '26px',
-              height: '26px',
-              borderRadius: '7px',
-              background: 'var(--accent)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              fontSize: '14px',
-              color: '#fff',
-              fontWeight: 700,
-              flexShrink: 0,
-            }}
-          >
-            K
+        <div className="kim-header__brand">
+          <div className="kim-logo" aria-hidden>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M5 4v16M5 12h6l8-8M11 12l8 8" />
+            </svg>
           </div>
-          <span style={{ fontWeight: 700, fontSize: '15px', letterSpacing: '-0.01em' }}>
-            Kim
-          </span>
+          <span className="kim-header__title">Kim</span>
+          <span className="kim-header__version">v{appVersion}</span>
         </div>
 
         {/* Active session breadcrumb */}
         {activeSession && !newChatMode && (
-          <>
-            <span style={{ color: 'var(--border)', fontSize: '16px' }}>/</span>
+          <div className="kim-header__breadcrumb">
+            <span className="kim-header__slash">/</span>
             <span
-              style={{
-                fontSize: '13px',
-                color: 'var(--text-muted)',
-                fontFamily: 'monospace',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-                maxWidth: '200px',
-              }}
+              className={`kim-header__session-badge kim-header__session-badge--${activeSession.session_type}`}
             >
-              {activeSession.session_id}
+              {activeSession.session_type === 'kim' ? 'Kim' : 'Claw'}
             </span>
-          </>
+            <span className="kim-header__session-id">{activeSession.session_id}</span>
+          </div>
         )}
         {newChatMode && (
-          <>
-            <span style={{ color: 'var(--border)', fontSize: '16px' }}>/</span>
-            <span style={{ fontSize: '13px', color: 'var(--text-muted)' }}>New chat</span>
-          </>
+          <div className="kim-header__breadcrumb">
+            <span className="kim-header__slash">/</span>
+            <span className="kim-header__new-chat-label">
+              <span className="kim-pulse-dot" /> New chat
+            </span>
+          </div>
         )}
 
         <div style={{ flex: 1 }} />
@@ -201,7 +220,7 @@ export default function App() {
       </header>
 
       {/* ── Body ────────────────────────────────────────────────────────────── */}
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+      <div className="kim-body">
         <Sidebar
           kimSessions={kimSessions}
           clawSessions={clawSessions}

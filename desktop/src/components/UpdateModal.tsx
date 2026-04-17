@@ -15,90 +15,39 @@ export function UpdateModal({
 }: Props) {
   return (
     <div
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0,0,0,0.5)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: 1000,
+      className="kim-modal-backdrop"
+      onClick={e => {
+        if (e.target === e.currentTarget) onDismiss();
       }}
-      onClick={e => { if (e.target === e.currentTarget) onDismiss(); }}
     >
-      <div
-        style={{
-          background: 'var(--bg)',
-          border: '1px solid var(--border)',
-          borderRadius: '16px',
-          padding: '28px 32px',
-          width: '480px',
-          maxWidth: '90vw',
-          boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
-        }}
-      >
-        {/* Header */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '20px' }}>
-          <div
-            style={{
-              width: '40px',
-              height: '40px',
-              borderRadius: '10px',
-              background: 'var(--accent)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              fontSize: '20px',
-              flexShrink: 0,
-            }}
-          >
-            🚀
+      <div className="kim-modal kim-modal--update" role="dialog" aria-labelledby="update-title">
+        <div className="kim-update__hero">
+          <div className="kim-update__icon" aria-hidden>
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 3v12M6 9l6-6 6 6" />
+              <path d="M5 21h14" />
+            </svg>
           </div>
-          <div>
-            <div style={{ fontWeight: 700, fontSize: '16px', color: 'var(--text)' }}>
+          <div style={{ minWidth: 0 }}>
+            <div id="update-title" className="kim-update__title">
               Update available
             </div>
-            <div style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
-              {currentVersion} → {latestVersion}
+            <div className="kim-update__version">
+              <span>v{currentVersion}</span>
+              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.6 }}>
+                <path d="M5 3l5 5-5 5" />
+              </svg>
+              <span style={{ fontWeight: 600, color: 'var(--accent)' }}>v{latestVersion}</span>
             </div>
           </div>
         </div>
 
-        {/* Release notes */}
         {releaseNotes && (
-          <div
-            style={{
-              background: 'var(--bg-card)',
-              border: '1px solid var(--border)',
-              borderRadius: '10px',
-              padding: '14px 16px',
-              marginBottom: '20px',
-              maxHeight: '220px',
-              overflowY: 'auto',
-              fontSize: '13px',
-              color: 'var(--text)',
-              lineHeight: 1.6,
-              whiteSpace: 'pre-wrap',
-            }}
-          >
-            {releaseNotes}
-          </div>
+          <div className="kim-update__notes">{releaseNotes}</div>
         )}
 
-        {/* Actions */}
-        <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
-          <button
-            onClick={onDismiss}
-            style={{
-              padding: '9px 20px',
-              borderRadius: '8px',
-              border: '1px solid var(--border)',
-              background: 'transparent',
-              color: 'var(--text-muted)',
-              cursor: 'pointer',
-              fontSize: '14px',
-            }}
-          >
+        <div className="kim-update__actions">
+          <button onClick={onDismiss} className="kim-btn kim-btn--secondary">
             Later
           </button>
           <a
@@ -106,22 +55,12 @@ export function UpdateModal({
             target="_blank"
             rel="noopener noreferrer"
             onClick={onDismiss}
-            style={{
-              padding: '9px 20px',
-              borderRadius: '8px',
-              border: 'none',
-              background: 'var(--accent)',
-              color: '#fff',
-              cursor: 'pointer',
-              fontSize: '14px',
-              fontWeight: 600,
-              textDecoration: 'none',
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '6px',
-            }}
+            className="kim-btn kim-btn--primary"
           >
-            Download
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M8 2v9M4 7l4 4 4-4M3 14h10" />
+            </svg>
+            <span>Download</span>
           </a>
         </div>
       </div>

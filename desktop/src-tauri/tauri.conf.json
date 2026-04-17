@@ -13,16 +13,18 @@
     "windows": [
       {
         "title": "Kim",
-        "width": 1200,
-        "height": 800,
-        "minWidth": 800,
+        "width": 1280,
+        "height": 840,
+        "minWidth": 900,
         "minHeight": 600,
         "resizable": true,
-        "decorations": true
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src 'self' https://api.github.com ipc: http://ipc.localhost; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'; frame-ancestors 'none'; object-src 'none'"
     }
   },
   "bundle": {

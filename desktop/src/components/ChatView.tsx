@@ -4,6 +4,19 @@ import { listen } from '@tauri-apps/api/event';
 import type { SessionInfo, KimMessage, Settings } from '../types';
 import { MessageBubble } from './MessageBubble';
 
+// Hard cap on live output lines to avoid unbounded memory growth on long
+// agent runs. Older lines are dropped from the top and a placeholder row
+// is inserted once so the user knows content was truncated.
+const MAX_LIVE_OUTPUT_LINES = 500;
+
+// Example prompts shown on the new-chat empty state.
+const EXAMPLE_PROMPTS: { icon: string; title: string; hint: string }[] = [
+  { icon: '📝', title: 'Summarize this PDF on my desktop', hint: 'Read and extract key insights' },
+  { icon: '🎨', title: 'Make a gradient hero section in React', hint: 'Write, save, and open the file' },
+  { icon: '🔍', title: 'Find all TODOs in my project', hint: 'Search across files and list them' },
+  { icon: '🚀', title: 'Deploy this folder to GitHub', hint: 'Stage, commit, and push' },
+];
+
 interface Props {
   session: SessionInfo | null;
   newChatMode: boolean;
@@ -16,10 +29,19 @@ export function ChatView({ session, newChatMode, settings, onTaskDone }: Props) 
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [taskInput, setTaskInput] = useState('');
   const [isRunning, setIsRunning] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [liveOutput, setLiveOutput] = useState<string[]>([]);
   const [taskError, setTaskError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Keep a stable ref to the onTaskDone callback so the event-listener
+  // effect never re-subscribes. Previously the effect depended on
+  // onTaskDone and duplicated listeners whenever the parent re-rendered.
+  const onTaskDoneRef = useRef(onTaskDone);
+  useEffect(() => {
+    onTaskDoneRef.current = onTaskDone;
+  }, [onTaskDone]);
 
   // Load messages when a session is selected
   useEffect(() => {
@@ -43,35 +65,87 @@ export function ChatView({ session, newChatMode, settings, onTaskDone }: Props) 
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, liveOutput]);
 
-  // Listen for agent events
+  // Focus the textarea when we enter new-chat mode.
+  useEffect(() => {
+    if (newChatMode) {
+      const t = setTimeout(() => textareaRef.current?.focus(), 50);
+      return () => clearTimeout(t);
+    }
+  }, [newChatMode]);
+
+  // Append a line to liveOutput, capping at MAX_LIVE_OUTPUT_LINES to avoid
+  // unbounded memory growth on long-running tasks.
+  function appendLive(line: string) {
+    setLiveOutput(prev => {
+      const next = [...prev, line];
+      if (next.length > MAX_LIVE_OUTPUT_LINES) {
+        const dropped = next.length - MAX_LIVE_OUTPUT_LINES;
+        return [
+          `[truncated ${dropped} earlier line${dropped === 1 ? '' : 's'}]`,
+          ...next.slice(dropped + 1),
+        ];
+      }
+      return next;
+    });
+  }
+
+  // Listen for agent events — subscribe once.
   useEffect(() => {
     let unlistenOutput: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
     let unlistenDone: (() => void) | undefined;
+    let unlistenCancelled: (() => void) | undefined;
 
     listen<string>('kim-agent-output', event => {
-      setLiveOutput(prev => [...prev, event.payload]);
+      appendLive(event.payload);
     }).then(fn => { unlistenOutput = fn; });
 
     listen<string>('kim-agent-error', event => {
-      setLiveOutput(prev => [...prev, `[err] ${event.payload}`]);
+      appendLive(`[err] ${event.payload}`);
     }).then(fn => { unlistenError = fn; });
+
+    // Track cancel via ref so the done-listener can read it without
+    // restarting the subscription.
+    let cancelFlag = false;
 
     listen<boolean>('kim-agent-done', event => {
       setIsRunning(false);
+      setCancelling(false);
       if (event.payload) {
-        onTaskDone();
-      } else {
+        onTaskDoneRef.current();
+      } else if (!cancelFlag) {
         setTaskError('Agent exited with an error. Check logs.');
       }
+      cancelFlag = false;
     }).then(fn => { unlistenDone = fn; });
+
+    listen<boolean>('kim-agent-cancelled', () => {
+      cancelFlag = true;
+      appendLive('⏹ Task cancelled');
+      setIsRunning(false);
+      setCancelling(false);
+    }).then(fn => { unlistenCancelled = fn; });
 
     return () => {
       unlistenOutput?.();
       unlistenError?.();
       unlistenDone?.();
+      unlistenCancelled?.();
     };
-  }, [onTaskDone]);
+    // Subscribe-once semantics: intentionally no deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function handleCancel() {
+    if (!isRunning || cancelling) return;
+    setCancelling(true);
+    try {
+      await invoke('cancel_task');
+    } catch (err) {
+      setCancelling(false);
+      setTaskError(`Cancel failed: ${String(err)}`);
+    }
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -81,6 +155,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone }: Props) 
     setIsRunning(true);
     setLiveOutput([]);
     setTaskError(null);
+    setTaskInput('');
+    // Reset textarea height
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
     try {
       await invoke('send_task', {
@@ -102,241 +179,210 @@ export function ChatView({ session, newChatMode, settings, onTaskDone }: Props) 
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
   }
 
-  // ── Empty / new chat state ─────────────────────────────────────────────────
-  if (newChatMode || (!session && !newChatMode)) {
+  function pickExample(p: string) {
+    setTaskInput(p);
+    // Auto-resize after state update
+    setTimeout(() => {
+      if (textareaRef.current) {
+        textareaRef.current.style.height = 'auto';
+        textareaRef.current.style.height =
+          Math.min(textareaRef.current.scrollHeight, 200) + 'px';
+        textareaRef.current.focus();
+      }
+    }, 0);
+  }
+
+  // ── Empty welcome state (no session, no newChat) ───────────────────────────
+  if (!newChatMode && !session) {
     return (
-      <div
-        style={{
-          flex: 1,
-          display: 'flex',
-          flexDirection: 'column',
-          background: 'var(--bg)',
-          overflow: 'hidden',
-        }}
-      >
-        {/* Welcome / empty */}
-        {!newChatMode && (
-          <div
-            style={{
-              flex: 1,
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              justifyContent: 'center',
-              color: 'var(--text-muted)',
-              gap: '12px',
-            }}
-          >
-            <div style={{ fontSize: '48px' }}>🤖</div>
-            <div style={{ fontSize: '20px', fontWeight: 600, color: 'var(--text)' }}>
-              Kim
-            </div>
-            <div style={{ fontSize: '14px' }}>
-              Select a session or start a new chat
-            </div>
+      <div className="kim-chat">
+        <div className="kim-empty-welcome">
+          <div className="kim-empty-welcome__icon">
+            <div className="kim-empty-welcome__glow" />
+            <svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 2l2.5 6.5L21 11l-6.5 2.5L12 20l-2.5-6.5L3 11l6.5-2.5L12 2z" />
+            </svg>
           </div>
-        )}
-
-        {/* New chat mode */}
-        {newChatMode && (
-          <>
-            {/* Live output area */}
-            <div style={{ flex: 1, overflowY: 'auto', padding: '16px' }}>
-              {liveOutput.length === 0 && !isRunning && !taskError && (
-                <div
-                  style={{
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    height: '100%',
-                    color: 'var(--text-muted)',
-                    gap: '8px',
-                  }}
-                >
-                  <div style={{ fontSize: '32px' }}>✨</div>
-                  <div style={{ fontSize: '16px', fontWeight: 600, color: 'var(--text)' }}>
-                    New chat
-                  </div>
-                  <div style={{ fontSize: '13px' }}>Type a task below to get started</div>
-                </div>
-              )}
-
-              {taskError && (
-                <div
-                  style={{
-                    background: '#fee2e2',
-                    border: '1px solid #fca5a5',
-                    borderRadius: '8px',
-                    padding: '12px 16px',
-                    color: '#991b1b',
-                    fontSize: '13px',
-                    marginBottom: '12px',
-                  }}
-                >
-                  {taskError}
-                </div>
-              )}
-
-              {liveOutput.map((line, i) => (
-                <div
-                  key={i}
-                  style={{
-                    fontFamily: 'monospace',
-                    fontSize: '12px',
-                    color: line.startsWith('[err]') ? '#ef4444' : 'var(--text)',
-                    padding: '2px 0',
-                    wordBreak: 'break-all',
-                  }}
-                >
-                  {line}
-                </div>
-              ))}
-
-              {isRunning && (
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '8px',
-                    padding: '8px 0',
-                    color: 'var(--accent)',
-                    fontSize: '13px',
-                  }}
-                >
-                  <span className="animate-pulse">●</span>
-                  <span>Kim is working…</span>
-                </div>
-              )}
-
-              <div ref={bottomRef} />
-            </div>
-
-            {/* Input */}
-            <div
-              style={{
-                borderTop: '1px solid var(--border)',
-                padding: '16px',
-                background: 'var(--bg)',
-              }}
-            >
-              <form onSubmit={handleSubmit} style={{ display: 'flex', gap: '10px', alignItems: 'flex-end' }}>
-                <textarea
-                  ref={textareaRef}
-                  value={taskInput}
-                  onChange={handleTextareaInput}
-                  placeholder="Describe a task for Kim…"
-                  rows={1}
-                  disabled={isRunning}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault();
-                      void handleSubmit(e as unknown as React.FormEvent);
-                    }
-                  }}
-                  style={{
-                    flex: 1,
-                    resize: 'none',
-                    padding: '10px 14px',
-                    borderRadius: '12px',
-                    border: '1px solid var(--border)',
-                    background: 'var(--bg-input)',
-                    color: 'var(--text)',
-                    fontSize: '14px',
-                    outline: 'none',
-                    fontFamily: 'inherit',
-                    lineHeight: 1.5,
-                    overflowY: 'hidden',
-                    minHeight: '42px',
-                    maxHeight: '200px',
-                    opacity: isRunning ? 0.6 : 1,
-                  }}
-                />
-                <button
-                  type="submit"
-                  disabled={!taskInput.trim() || isRunning}
-                  style={{
-                    width: '42px',
-                    height: '42px',
-                    borderRadius: '12px',
-                    border: 'none',
-                    background: taskInput.trim() && !isRunning ? 'var(--accent)' : 'var(--bg-card)',
-                    color: taskInput.trim() && !isRunning ? '#fff' : 'var(--text-muted)',
-                    cursor: taskInput.trim() && !isRunning ? 'pointer' : 'not-allowed',
-                    fontSize: '18px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    flexShrink: 0,
-                    transition: 'all 0.15s ease',
-                  }}
-                >
-                  {isRunning ? '⏹' : '↑'}
-                </button>
-              </form>
-              <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '6px', paddingLeft: '2px' }}>
-                Enter to send · Shift+Enter for new line
-              </div>
-            </div>
-          </>
-        )}
+          <div className="kim-empty-welcome__title">Welcome to Kim</div>
+          <div className="kim-empty-welcome__subtitle">
+            Pick a session from the sidebar or start a new chat
+          </div>
+          <div className="kim-empty-welcome__kbd-hint">
+            Press <kbd>⌘</kbd> <kbd>N</kbd> for a new chat
+          </div>
+        </div>
       </div>
     );
   }
 
-  // ── Session view ───────────────────────────────────────────────────────────
-  return (
-    <div
-      style={{
-        flex: 1,
-        display: 'flex',
-        flexDirection: 'column',
-        background: 'var(--bg)',
-        overflow: 'hidden',
-      }}
-    >
-      {/* Session header */}
-      <div
-        style={{
-          padding: '12px 20px',
-          borderBottom: '1px solid var(--border)',
-          display: 'flex',
-          alignItems: 'center',
-          gap: '12px',
-          flexShrink: 0,
-        }}
-      >
-        <div>
-          <div style={{ fontWeight: 600, fontSize: '14px', color: 'var(--text)' }}>
-            {session!.session_id}
-          </div>
-          <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-            {session!.date} · {session!.message_count} messages ·{' '}
-            <span
-              style={{
-                background: session!.session_type === 'kim' ? 'var(--accent-muted)' : '#f3e8ff',
-                color: session!.session_type === 'kim' ? 'var(--accent)' : '#7c3aed',
-                padding: '1px 7px',
-                borderRadius: '8px',
-                fontSize: '11px',
-                fontWeight: 500,
+  // ── New chat mode ──────────────────────────────────────────────────────────
+  if (newChatMode) {
+    const hasStarted = isRunning || liveOutput.length > 0 || taskError;
+
+    return (
+      <div className="kim-chat">
+        <div className="kim-chat__output">
+          {!hasStarted && (
+            <div className="kim-new-chat-empty">
+              <div className="kim-new-chat-empty__badge">
+                <span className="kim-pulse-dot kim-pulse-dot--accent" />
+                Ready
+              </div>
+              <div className="kim-new-chat-empty__title">What should Kim do?</div>
+              <div className="kim-new-chat-empty__subtitle">
+                Describe a task in plain English. Kim can see your screen, control
+                your mouse, run commands, browse the web, and write code.
+              </div>
+
+              <div className="kim-examples">
+                {EXAMPLE_PROMPTS.map((ex, i) => (
+                  <button
+                    key={i}
+                    className="kim-example-card"
+                    onClick={() => pickExample(ex.title)}
+                  >
+                    <div className="kim-example-card__icon">{ex.icon}</div>
+                    <div className="kim-example-card__body">
+                      <div className="kim-example-card__title">{ex.title}</div>
+                      <div className="kim-example-card__hint">{ex.hint}</div>
+                    </div>
+                    <div className="kim-example-card__arrow">↗</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {taskError && (
+            <div className="kim-task-error" role="alert">
+              <span className="kim-task-error__icon">⚠</span>
+              <span>{taskError}</span>
+            </div>
+          )}
+
+          {liveOutput.length > 0 && (
+            <div className="kim-live-output">
+              {liveOutput.map((line, i) => {
+                const isErr = line.startsWith('[err]');
+                const isCancelled = line.startsWith('⏹');
+                const isTruncated = line.startsWith('[truncated');
+                return (
+                  <div
+                    key={i}
+                    className={
+                      'kim-live-output__line' +
+                      (isErr ? ' kim-live-output__line--err' : '') +
+                      (isCancelled ? ' kim-live-output__line--cancelled' : '') +
+                      (isTruncated ? ' kim-live-output__line--truncated' : '')
+                    }
+                  >
+                    {line}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {isRunning && (
+            <div className="kim-working-indicator">
+              <div className="kim-working-indicator__dots">
+                <span /><span /><span />
+              </div>
+              <span className="kim-working-indicator__text">
+                {cancelling ? 'Stopping Kim…' : 'Kim is thinking…'}
+              </span>
+            </div>
+          )}
+
+          <div ref={bottomRef} />
+        </div>
+
+        {/* Composer */}
+        <form className="kim-composer" onSubmit={handleSubmit}>
+          <div className={'kim-composer__box' + (isRunning ? ' kim-composer__box--running' : '')}>
+            <textarea
+              ref={textareaRef}
+              value={taskInput}
+              onChange={handleTextareaInput}
+              placeholder={isRunning ? 'Kim is working — press Stop to cancel' : 'Message Kim…'}
+              rows={1}
+              disabled={isRunning}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  void handleSubmit(e as unknown as React.FormEvent);
+                }
               }}
+              className="kim-composer__textarea"
+            />
+
+            <div className="kim-composer__actions">
+              {isRunning ? (
+                <button
+                  type="button"
+                  onClick={handleCancel}
+                  disabled={cancelling}
+                  title={cancelling ? 'Stopping…' : 'Stop task'}
+                  className={'kim-btn kim-btn--stop' + (cancelling ? ' kim-btn--stop-pending' : '')}
+                  aria-label="Stop task"
+                >
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
+                    <rect x="6" y="6" width="12" height="12" rx="2" />
+                  </svg>
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={!taskInput.trim()}
+                  className="kim-btn kim-btn--send"
+                  aria-label="Send"
+                >
+                  <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M5 12h14M13 5l7 7-7 7" />
+                  </svg>
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="kim-composer__hint">
+            <span><kbd>↵</kbd> to send</span>
+            <span className="kim-composer__hint-sep">·</span>
+            <span><kbd>⇧</kbd>+<kbd>↵</kbd> for new line</span>
+            <span className="kim-composer__hint-sep">·</span>
+            <span>provider: <strong>{settings.provider}</strong></span>
+          </div>
+        </form>
+      </div>
+    );
+  }
+
+  // ── Existing session view ──────────────────────────────────────────────────
+  return (
+    <div className="kim-chat">
+      {/* Session header */}
+      <div className="kim-session-header">
+        <div className="kim-session-header__main">
+          <div className="kim-session-header__row">
+            <span
+              className={`kim-session-badge kim-session-badge--${session!.session_type}`}
             >
               {session!.session_type === 'kim' ? 'Kim' : 'Claw Code'}
             </span>
+            <span className="kim-session-header__id">{session!.session_id}</span>
+          </div>
+          <div className="kim-session-header__meta">
+            <span>{session!.date}</span>
+            <span className="kim-session-header__dot">·</span>
+            <span>{session!.message_count} message{session!.message_count !== 1 ? 's' : ''}</span>
+            {session!.has_summary && (
+              <>
+                <span className="kim-session-header__dot">·</span>
+                <span className="kim-session-header__summary-tag">summarized</span>
+              </>
+            )}
           </div>
           {session!.summary && (
-            <div
-              style={{
-                fontSize: '12px',
-                color: 'var(--text-muted)',
-                marginTop: '4px',
-                maxWidth: '600px',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-              }}
-            >
+            <div className="kim-session-header__summary">
               {session!.summary}
             </div>
           )}
@@ -344,32 +390,16 @@ export function ChatView({ session, newChatMode, settings, onTaskDone }: Props) 
       </div>
 
       {/* Messages */}
-      <div style={{ flex: 1, overflowY: 'auto', paddingTop: '12px', paddingBottom: '16px' }}>
+      <div className="kim-messages">
         {loadingMessages ? (
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              height: '100%',
-              color: 'var(--text-muted)',
-              fontSize: '13px',
-            }}
-          >
-            Loading…
+          <div className="kim-messages__loading">
+            <div className="kim-spinner" />
+            <span>Loading conversation…</span>
           </div>
         ) : messages.length === 0 ? (
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              height: '100%',
-              color: 'var(--text-muted)',
-              fontSize: '13px',
-            }}
-          >
-            No messages in this session
+          <div className="kim-messages__empty">
+            <div className="kim-messages__empty-icon">💬</div>
+            <div className="kim-messages__empty-text">No messages in this session</div>
           </div>
         ) : (
           <>

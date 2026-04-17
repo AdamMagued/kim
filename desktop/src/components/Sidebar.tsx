@@ -30,47 +30,10 @@ function SessionItem({
     <button
       onClick={onClick}
       title={session.summary ?? session.session_id}
-      style={{
-        width: '100%',
-        padding: '10px 12px',
-        borderRadius: '8px',
-        border: 'none',
-        background: active ? 'var(--accent-muted)' : 'transparent',
-        cursor: 'pointer',
-        textAlign: 'left',
-        transition: 'background 0.1s',
-      }}
-      onMouseEnter={e => {
-        if (!active) (e.currentTarget as HTMLButtonElement).style.background = 'var(--bg-card)';
-      }}
-      onMouseLeave={e => {
-        if (!active) (e.currentTarget as HTMLButtonElement).style.background = 'transparent';
-      }}
+      className={`kim-session-item${active ? ' kim-session-item--active' : ''}`}
     >
-      <div
-        style={{
-          fontSize: '13px',
-          fontWeight: 500,
-          color: active ? 'var(--accent)' : 'var(--text)',
-          marginBottom: '2px',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        {session.session_id}
-      </div>
-      <div
-        style={{
-          fontSize: '11px',
-          color: 'var(--text-muted)',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        {preview}
-      </div>
+      <div className="kim-session-item__title">{session.session_id}</div>
+      <div className="kim-session-item__preview">{preview}</div>
     </button>
   );
 }
@@ -87,46 +50,19 @@ function SectionHeader({
   onToggle: () => void;
 }) {
   return (
-    <button
-      onClick={onToggle}
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: '6px',
-        width: '100%',
-        padding: '6px 8px',
-        borderRadius: '6px',
-        border: 'none',
-        background: 'transparent',
-        cursor: 'pointer',
-        color: 'var(--text-muted)',
-        textAlign: 'left',
-      }}
-    >
-      <span
-        style={{
-          fontSize: '10px',
-          transition: 'transform 0.15s',
-          transform: expanded ? 'rotate(90deg)' : 'none',
-          display: 'inline-block',
-        }}
+    <button onClick={onToggle} className="kim-section-header">
+      <svg
+        className={`kim-section-header__chevron${expanded ? ' kim-section-header__chevron--open' : ''}`}
+        viewBox="0 0 16 16"
+        width="10"
+        height="10"
+        fill="currentColor"
+        aria-hidden
       >
-        ▶
-      </span>
-      <span style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', flex: 1 }}>
-        {label}
-      </span>
-      <span
-        style={{
-          fontSize: '10px',
-          background: 'var(--bg-card)',
-          borderRadius: '10px',
-          padding: '1px 7px',
-          color: 'var(--text-muted)',
-        }}
-      >
-        {count}
-      </span>
+        <path d="M6 4l4 4-4 4V4z" />
+      </svg>
+      <span className="kim-section-header__label">{label}</span>
+      <span className="kim-section-header__count">{count}</span>
     </button>
   );
 }
@@ -145,72 +81,34 @@ export function Sidebar({
   const [kimExpanded, setKimExpanded] = useState(true);
   const [clawExpanded, setClawExpanded] = useState(true);
 
-  const WIDTH = 280;
-
   return (
-    <div
-      style={{
-        width: collapsed ? '48px' : `${WIDTH}px`,
-        minWidth: collapsed ? '48px' : `${WIDTH}px`,
-        background: 'var(--bg-sidebar)',
-        borderRight: '1px solid var(--border)',
-        display: 'flex',
-        flexDirection: 'column',
-        transition: 'width 0.2s ease, min-width 0.2s ease',
-        overflow: 'hidden',
-      }}
-    >
+    <aside className={`kim-sidebar${collapsed ? ' kim-sidebar--collapsed' : ''}`}>
       {/* Top bar */}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          padding: '12px 8px',
-          gap: '8px',
-          borderBottom: '1px solid var(--border)',
-        }}
-      >
+      <div className="kim-sidebar__top">
         <button
           onClick={onToggle}
-          title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          style={{
-            width: '32px',
-            height: '32px',
-            borderRadius: '8px',
-            border: 'none',
-            background: 'transparent',
-            cursor: 'pointer',
-            color: 'var(--text-muted)',
-            fontSize: '16px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            flexShrink: 0,
-          }}
+          title={collapsed ? 'Expand sidebar (⌘B)' : 'Collapse sidebar (⌘B)'}
+          className="kim-sidebar__toggle"
+          aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         >
-          {collapsed ? '»' : '«'}
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            {collapsed ? (
+              <path d="M6 3l5 5-5 5" />
+            ) : (
+              <path d="M10 3l-5 5 5 5" />
+            )}
+          </svg>
         </button>
 
         {!collapsed && (
           <button
             onClick={onNewChat}
-            style={{
-              flex: 1,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              gap: '6px',
-              padding: '7px 12px',
-              borderRadius: '8px',
-              border: '1px solid var(--border)',
-              background: 'var(--accent)',
-              color: '#fff',
-              cursor: 'pointer',
-              fontSize: '13px',
-              fontWeight: 600,
-            }}
+            className="kim-sidebar__new-chat"
+            title="New chat (⌘N)"
           >
-            <span>+</span>
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+              <path d="M8 3v10M3 8h10" />
+            </svg>
             <span>New chat</span>
           </button>
         )}
@@ -218,22 +116,17 @@ export function Sidebar({
 
       {/* Session lists */}
       {!collapsed && (
-        <div style={{ flex: 1, overflowY: 'auto', padding: '8px' }}>
+        <div className="kim-sidebar__scroll">
           {loading ? (
-            <div
-              style={{
-                padding: '20px',
-                textAlign: 'center',
-                color: 'var(--text-muted)',
-                fontSize: '13px',
-              }}
-            >
-              Loading sessions…
+            <div className="kim-sidebar__loading">
+              <div className="kim-skeleton" style={{ height: 32 }} />
+              <div className="kim-skeleton" style={{ height: 32 }} />
+              <div className="kim-skeleton" style={{ height: 32 }} />
             </div>
           ) : (
             <>
               {/* Kim sessions */}
-              <div style={{ marginBottom: '4px' }}>
+              <div style={{ marginBottom: 4 }}>
                 <SectionHeader
                   label="Kim"
                   count={kimSessions.length}
@@ -241,17 +134,9 @@ export function Sidebar({
                   onToggle={() => setKimExpanded(v => !v)}
                 />
                 {kimExpanded && (
-                  <div style={{ marginTop: '2px', paddingLeft: '4px' }}>
+                  <div style={{ marginTop: 2 }}>
                     {kimSessions.length === 0 ? (
-                      <div
-                        style={{
-                          padding: '8px 12px',
-                          fontSize: '12px',
-                          color: 'var(--text-muted)',
-                        }}
-                      >
-                        No sessions yet
-                      </div>
+                      <div className="kim-empty-section">No sessions yet</div>
                     ) : (
                       kimSessions.map(s => (
                         <SessionItem
@@ -275,15 +160,9 @@ export function Sidebar({
                   onToggle={() => setClawExpanded(v => !v)}
                 />
                 {clawExpanded && (
-                  <div style={{ marginTop: '2px', paddingLeft: '4px' }}>
+                  <div style={{ marginTop: 2 }}>
                     {clawSessions.length === 0 ? (
-                      <div
-                        style={{
-                          padding: '8px 12px',
-                          fontSize: '12px',
-                          color: 'var(--text-muted)',
-                        }}
-                      >
+                      <div className="kim-empty-section">
                         No sessions — configure path in Settings
                       </div>
                     ) : (
@@ -305,39 +184,20 @@ export function Sidebar({
       )}
 
       {/* Bottom: settings */}
-      <div
-        style={{
-          padding: '8px',
-          borderTop: '1px solid var(--border)',
-          display: 'flex',
-          justifyContent: collapsed ? 'center' : 'flex-start',
-        }}
-      >
+      <div className="kim-sidebar__bottom">
         <button
           onClick={onOpenSettings}
-          title="Settings"
-          style={{
-            width: collapsed ? '32px' : '100%',
-            height: '34px',
-            borderRadius: '8px',
-            border: 'none',
-            background: 'transparent',
-            cursor: 'pointer',
-            color: 'var(--text-muted)',
-            fontSize: '15px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: collapsed ? 'center' : 'flex-start',
-            gap: '8px',
-            padding: collapsed ? '0' : '0 8px',
-          }}
+          title="Settings (⌘,)"
+          className="kim-sidebar__settings-btn"
+          aria-label="Settings"
         >
-          <span>⚙️</span>
-          {!collapsed && (
-            <span style={{ fontSize: '13px' }}>Settings</span>
-          )}
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9c.2.6.8 1 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
+          </svg>
+          {!collapsed && <span>Settings</span>}
         </button>
       </div>
-    </div>
+    </aside>
   );
 }

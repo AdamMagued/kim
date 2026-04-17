@@ -1,3 +1,4 @@
+import type { ReactElement } from 'react';
 import type { Theme } from '../types';
 
 interface Props {
@@ -5,45 +6,50 @@ interface Props {
   onChange: (theme: Theme) => void;
 }
 
-const OPTIONS: { value: Theme; label: string; icon: string }[] = [
-  { value: 'light', label: 'Light', icon: '☀️' },
-  { value: 'system', label: 'System', icon: '💻' },
-  { value: 'dark', label: 'Dark', icon: '🌙' },
+function SunIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+    </svg>
+  );
+}
+function SystemIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="12" rx="2" />
+      <path d="M8 20h8M12 16v4" />
+    </svg>
+  );
+}
+function MoonIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+    </svg>
+  );
+}
+
+const OPTIONS: { value: Theme; label: string; icon: ReactElement }[] = [
+  { value: 'light', label: 'Light', icon: <SunIcon /> },
+  { value: 'system', label: 'Auto', icon: <SystemIcon /> },
+  { value: 'dark', label: 'Dark', icon: <MoonIcon /> },
 ];
 
 export function ThemeToggle({ theme, onChange }: Props) {
   return (
-    <div
-      style={{
-        display: 'flex',
-        gap: '2px',
-        background: 'var(--bg-card)',
-        border: '1px solid var(--border)',
-        borderRadius: '8px',
-        padding: '2px',
-      }}
-    >
+    <div className="kim-theme-toggle" role="group" aria-label="Theme">
       {OPTIONS.map(opt => (
         <button
           key={opt.value}
           title={opt.label}
           onClick={() => onChange(opt.value)}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '4px',
-            padding: '4px 10px',
-            borderRadius: '6px',
-            border: 'none',
-            cursor: 'pointer',
-            fontSize: '12px',
-            fontWeight: theme === opt.value ? 600 : 400,
-            background: theme === opt.value ? 'var(--accent)' : 'transparent',
-            color: theme === opt.value ? '#fff' : 'var(--text-muted)',
-            transition: 'all 0.15s ease',
-          }}
+          className={`kim-theme-toggle__btn${
+            theme === opt.value ? ' kim-theme-toggle__btn--active' : ''
+          }`}
+          aria-pressed={theme === opt.value}
         >
-          <span>{opt.icon}</span>
+          {opt.icon}
           <span>{opt.label}</span>
         </button>
       ))}
