@@ -5,7 +5,7 @@ import { toast } from './Toast';
 interface BrowserProvider {
   id: string;
   name: string;
-  url: string;
+  url: string | null; // null = custom (user provides URL)
   hint: string;
   warning?: string;
 }
@@ -30,13 +30,27 @@ const BROWSER_PROVIDERS: BrowserProvider[] = [
     hint: 'Sign in with your Google account',
   },
   {
+    id: 'grok',
+    name: 'Grok',
+    url: 'https://grok.com',
+    hint: 'Sign in with your X (Twitter) account',
+  },
+  {
     id: 'deepseek',
     name: 'DeepSeek',
     url: 'https://chat.deepseek.com',
     hint: 'Sign in with your DeepSeek account',
     warning: 'DeepSeek cannot see screenshots — screen control tasks will not work.',
   },
+  {
+    id: 'custom',
+    name: 'Custom',
+    url: null,
+    hint: 'Open any AI chat website inside Kim',
+  },
 ];
+
+// ── Icons ─────────────────────────────────────────────────────────────────────
 
 function ClaudeIcon() {
   return (
@@ -59,11 +73,26 @@ function GeminiIcon() {
     </svg>
   );
 }
+function GrokIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+      <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+    </svg>
+  );
+}
 function DeepSeekIcon() {
   return (
     <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="12" cy="12" r="10" />
       <path d="M8 12h8M12 8v8" />
+    </svg>
+  );
+}
+function CustomIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 8v4l3 3" />
     </svg>
   );
 }
@@ -86,7 +115,9 @@ const ICONS: Record<string, React.ReactNode> = {
   claude:   <ClaudeIcon />,
   chatgpt:  <ChatGPTIcon />,
   gemini:   <GeminiIcon />,
+  grok:     <GrokIcon />,
   deepseek: <DeepSeekIcon />,
+  custom:   <CustomIcon />,
 };
 
 interface Props {
@@ -96,20 +127,29 @@ interface Props {
 
 export function BrowserProviderPicker({ selected, onSelect }: Props) {
   const [openingId, setOpeningId] = useState<string | null>(null);
+  const [customUrl, setCustomUrl] = useState('https://');
+
+  const selectedProvider = BROWSER_PROVIDERS.find(p => p.id === selected);
 
   async function openInKim(provider: BrowserProvider) {
+    const targetUrl = provider.url ?? customUrl.trim();
+    if (!targetUrl || targetUrl === 'https://') {
+      toast('Please enter a URL for your custom AI provider.', 'warning');
+      return;
+    }
+
     setOpeningId(provider.id);
     try {
-      // Check if window already exists and focus it
-      const existing = await WebviewWindow.getByLabel(`browser-signin-${provider.id}`);
+      const label = `browser-signin-${provider.id}`;
+      const existing = await WebviewWindow.getByLabel(label);
       if (existing) {
         await existing.setFocus();
         setOpeningId(null);
         return;
       }
 
-      const w = new WebviewWindow(`browser-signin-${provider.id}`, {
-        url: provider.url,
+      const w = new WebviewWindow(label, {
+        url: targetUrl,
         title: `Sign in to ${provider.name}`,
         width: 1100,
         height: 760,
@@ -158,6 +198,17 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
                 <span>{p.warning}</span>
               </div>
             )}
+            {/* Custom URL input */}
+            {selected === p.id && p.id === 'custom' && (
+              <input
+                className="kim-browser-card__url-input"
+                type="url"
+                placeholder="https://your-ai-provider.com"
+                value={customUrl}
+                onChange={e => setCustomUrl(e.target.value)}
+                onClick={e => e.stopPropagation()}
+              />
+            )}
             {selected === p.id && (
               <button
                 className="kim-browser-card__open-btn"
@@ -172,8 +223,9 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
         ))}
       </div>
       <div className="kim-browser-picker__info">
-        Sign into the AI provider above, then send your task from Kim as normal.
-        Kim will relay your message through that browser session.
+        {selectedProvider?.id === 'custom'
+          ? 'Enter any AI chat URL above, open it in Kim, sign in, then send your task as normal.'
+          : 'Sign into the AI provider above, then send your task from Kim as normal. Kim will relay your message through that browser session.'}
       </div>
     </div>
   );

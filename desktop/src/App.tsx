@@ -77,9 +77,35 @@ export default function App() {
 
   useEffect(() => {
     invoke<string>('get_app_version')
-      .then(v => setAppVersion(v))
+      .then(v => {
+        setAppVersion(v);
+        // Silently check for updates on startup — show a banner if one exists
+        silentUpdateCheck(v);
+      })
       .catch(() => {});
   }, []);
+
+  async function silentUpdateCheck(currentVersion: string) {
+    try {
+      const resp = await fetch(
+        'https://api.github.com/repos/AdamMagued/kim/releases/latest',
+        { headers: { Accept: 'application/vnd.github+json' } }
+      );
+      if (!resp.ok) return; // fail silently on startup
+      const data = (await resp.json()) as GithubRelease;
+      const latest = data.tag_name.replace(/^v/, '');
+      if (compareSemver(latest, currentVersion) > 0) {
+        setUpdateInfo(data);
+        // Delay slightly so the app has time to finish loading
+        setTimeout(() => {
+          toast(`Kim ${latest} is available — you're on ${currentVersion}. Click to update.`, 'info', 8000);
+          setShowUpdate(true);
+        }, 2000);
+      }
+    } catch {
+      // Network unavailable on startup — that's fine, ignore silently
+    }
+  }
 
   useEffect(() => { setTheme(settings.theme); }, [settings.theme, setTheme]);
   useEffect(() => { applyAccent(settings.accent ?? 'indigo'); }, [settings.accent]);
