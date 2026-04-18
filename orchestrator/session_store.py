@@ -134,7 +134,7 @@ class SessionStore:
             return _read_jsonl(candidate)
 
         if warn_if_missing:
-            logger.warning(f"Session not found: {session_id}")
+            logger.info(f"Session not found: {session_id}")
         return []
 
     @staticmethod
