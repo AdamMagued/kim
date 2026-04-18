@@ -279,6 +279,8 @@ interface Props {
 export function ChatView({ session, newChatMode, settings, onTaskDone, account }: Props) {
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
+  const [newestMsgIdx, setNewestMsgIdx] = useState<number | null>(null);
+  const prevMsgCountRef = useRef(0);
   const [taskInput, setTaskInput] = useState('');
   const [isRunning, setIsRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -320,7 +322,19 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       kimDir: settings.kim_sessions_dir || null,
       clawDir: settings.claw_sessions_dir || null,
     })
-      .then(setMessages)
+      .then(msgs => {
+        const prev = prevMsgCountRef.current;
+        const lastAssistantIdx = msgs.reduceRight((found, m, i) =>
+          found === -1 && m.role === 'assistant' ? i : found, -1);
+        // Only animate if this is a refresh after task done (new messages appeared)
+        if (prev > 0 && msgs.length > prev && lastAssistantIdx >= prev) {
+          setNewestMsgIdx(lastAssistantIdx);
+        } else {
+          setNewestMsgIdx(null);
+        }
+        prevMsgCountRef.current = msgs.length;
+        setMessages(msgs);
+      })
       .catch(err => console.error('Failed to load messages:', err))
       .finally(() => setLoadingMessages(false));
   }, [session, settings.kim_sessions_dir, settings.claw_sessions_dir]);
@@ -771,7 +785,12 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
         ) : (
           <>
             {messages.map((msg, i) => (
-              <MessageBubble key={i} message={msg} />
+              <MessageBubble
+                key={i}
+                message={msg}
+                animate={i === newestMsgIdx}
+                typingAnimation={settings.typing_animation ?? 'none'}
+              />
             ))}
           </>
         )}

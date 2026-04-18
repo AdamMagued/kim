@@ -1,9 +1,10 @@
 import { useEffect, useState, useRef, type ReactElement } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import type { Settings, Provider, Theme, VoiceEngine, VoiceSettings, AccentTheme, KimAccount } from '../types';
+import type { Settings, Provider, Theme, VoiceEngine, VoiceSettings, AccentTheme, KimAccount, TypingAnimation } from '../types';
 import { VOICES_BY_ENGINE } from '../types';
 import { toast } from './Toast';
+import { useChromaShader } from '../hooks/useChromaShader';
 
 const PROVIDERS: { value: Provider; label: string }[] = [
   { value: 'browser', label: 'Browser (no API key)' },
@@ -27,6 +28,13 @@ const ACCENTS: { value: AccentTheme; label: string; light: string; dark: string 
   { value: 'teal',   label: 'Teal',   light: '#0891b2', dark: '#22d3ee' },
   { value: 'jade',   label: 'Jade',   light: '#059669', dark: '#34d399' },
   { value: 'mono',   label: 'Mono',   light: '#18181b', dark: '#e4e4e7' },
+];
+
+const TYPING_ANIMATIONS: { value: string; label: string; desc: string; icon: string }[] = [
+  { value: 'none',       label: 'Instant',    desc: 'No animation',                    icon: '⚡' },
+  { value: 'typewriter', label: 'Typewriter',  desc: 'Characters appear one by one',   icon: '⌨️' },
+  { value: 'word-fade',  label: 'Word fade',   desc: 'Words drift up and fade in',     icon: '✦' },
+  { value: 'char-blur',  label: 'Char blur',   desc: 'Letters crystallise from blur',  icon: '◎' },
 ];
 
 type NavSection = 'appearance' | 'ai' | 'voice' | 'paths' | 'data' | 'account' | 'mcp' | 'feedback' | 'about';
@@ -287,6 +295,22 @@ function AppearanceSection({ settings, onChange }: { settings: Settings; onChang
           ))}
         </div>
         <div className="kim-accent-label">{ACCENTS.find(a => a.value === settings.accent)?.label}</div>
+      </Field>
+
+      <Field label="Message animation" hint="How AI responses appear when Kim finishes a task. Applies to the newest message only.">
+        <div className="kim-typing-anim-picker">
+          {TYPING_ANIMATIONS.map(ta => (
+            <button
+              key={ta.value}
+              onClick={() => update('typing_animation', ta.value as TypingAnimation)}
+              className={`kim-typing-anim-opt${(settings.typing_animation ?? 'none') === ta.value ? ' kim-typing-anim-opt--active' : ''}`}
+            >
+              <span className="kim-typing-anim-opt__icon">{ta.icon}</span>
+              <span className="kim-typing-anim-opt__label">{ta.label}</span>
+              <span className="kim-typing-anim-opt__desc">{ta.desc}</span>
+            </button>
+          ))}
+        </div>
       </Field>
     </div>
   );
@@ -1077,16 +1101,32 @@ function FeedbackSection() {
 
 export function SettingsPanel({ settings, onChange, onClose, appVersion, onCheckUpdate, account, onAccountChange }: Props) {
   const [activeSection, setActiveSection] = useState<NavSection>('appearance');
+  const canvasRef  = useRef<HTMLCanvasElement>(null);
+  const backdropRef = useRef<HTMLDivElement>(null);
+  useChromaShader(canvasRef, backdropRef);
 
   return (
     <div
-      className="kim-modal-backdrop"
+      ref={backdropRef}
+      className="kim-settings-backdrop"
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <div className="kim-modal kim-modal--settings-panel" role="dialog" aria-labelledby="settings-title">
+      {/* Live chrome shader behind the panel */}
+      <canvas ref={canvasRef} className="kim-settings-canvas" />
+
+      {/* Glass panel */}
+      <div className="kim-settings-panel" role="dialog" aria-labelledby="settings-title">
+
         {/* Left nav */}
         <nav className="kim-settings-nav">
-          <div className="kim-settings-nav__header" id="settings-title">Settings</div>
+          <div className="kim-settings-nav__brand" id="settings-title">
+            <svg viewBox="0 0 28 28" fill="none" style={{ width: 18, height: 18, flexShrink: 0 }}>
+              <line x1="14" y1="3" x2="14" y2="25" stroke="rgba(255,255,255,.7)" strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="3.8" y1="8.5" x2="24.2" y2="19.5" stroke="rgba(255,255,255,.7)" strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="3.8" y1="19.5" x2="24.2" y2="8.5" stroke="rgba(255,255,255,.7)" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+            <span>Settings</span>
+          </div>
           <ul className="kim-settings-nav__list">
             {NAV_ITEMS.map(item => (
               <li key={item.id}>
@@ -1104,8 +1144,8 @@ export function SettingsPanel({ settings, onChange, onClose, appVersion, onCheck
 
         {/* Right content */}
         <div className="kim-settings-body">
-          <button onClick={onClose} className="kim-modal__close" aria-label="Close settings">
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <button onClick={onClose} className="kim-settings-close" aria-label="Close settings">
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
               <path d="M4 4l8 8M12 4l-8 8" />
             </svg>
           </button>

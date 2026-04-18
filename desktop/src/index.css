@@ -3395,3 +3395,380 @@ kbd {
   }
 }
 
+/* ════════════════════════════════════════════════════════════════════════════
+   SETTINGS PANEL — chrome shader backdrop + glass panel
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* Full-screen backdrop — hosts the WebGL canvas + centers the panel */
+.kim-settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(6, 6, 6, 0.88);
+  backdrop-filter: blur(2px);
+  -webkit-app-region: no-drag;
+}
+
+/* The live chrome canvas fills the backdrop */
+.kim-settings-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* Glass settings panel — floats over the shader */
+.kim-settings-panel {
+  position: relative;
+  z-index: 1;
+  width: min(860px, 96vw);
+  height: min(620px, 92vh);
+  border-radius: 16px;
+  overflow: hidden;
+  display: flex;
+  background: rgba(10, 10, 10, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow:
+    0 48px 120px rgba(0, 0, 0, 0.9),
+    0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  backdrop-filter: blur(28px);
+  animation: kim-settings-in 0.38s cubic-bezier(.22, 1, .36, 1);
+}
+
+@keyframes kim-settings-in {
+  from { opacity: 0; transform: scale(.97) translateY(12px); }
+  to   { opacity: 1; transform: scale(1)   translateY(0); }
+}
+
+/* ── Left nav — dark chrome sidebar ── */
+.kim-settings-nav {
+  width: 188px;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.03);
+  border-right: 1px solid rgba(255, 255, 255, 0.07);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: 12px;
+}
+
+.kim-settings-nav__brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 20px 16px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  margin-bottom: 8px;
+  font-family: 'Syne', ui-sans-serif, sans-serif;
+  font-weight: 600;
+  font-size: 14px;
+  color: rgba(255, 255, 255, 0.88);
+  letter-spacing: -0.01em;
+}
+
+.kim-settings-nav__list {
+  list-style: none;
+  padding: 0 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.kim-settings-nav__item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s, color 0.12s;
+}
+.kim-settings-nav__item:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.75);
+}
+.kim-settings-nav__item--active {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.95);
+}
+.kim-settings-nav__item-icon {
+  opacity: 0.7;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.kim-settings-nav__item--active .kim-settings-nav__item-icon { opacity: 1; }
+
+/* ── Right content area ── */
+.kim-settings-body {
+  flex: 1;
+  position: relative;
+  overflow-y: auto;
+  padding: 28px 32px 32px;
+  /* custom scrollbar */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,.12) transparent;
+}
+.kim-settings-body::-webkit-scrollbar { width: 5px; }
+.kim-settings-body::-webkit-scrollbar-track { background: transparent; }
+.kim-settings-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 3px; }
+
+/* Close button */
+.kim-settings-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  z-index: 2;
+}
+.kim-settings-close:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.9);
+}
+
+/* ── Override section/field chrome for dark settings panel ── */
+.kim-settings-body .kim-settings-content__title {
+  font-family: 'Syne', ui-sans-serif, sans-serif;
+  font-size: 18px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.92);
+  letter-spacing: -0.02em;
+  margin-bottom: 24px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+.kim-settings-body .kim-field__label {
+  color: rgba(255, 255, 255, 0.65);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+.kim-settings-body .kim-field__hint {
+  color: rgba(255, 255, 255, 0.35);
+}
+.kim-settings-body .kim-select,
+.kim-settings-body .kim-input {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.88);
+}
+.kim-settings-body .kim-select:focus,
+.kim-settings-body .kim-input:focus {
+  border-color: rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.09);
+}
+.kim-settings-body .kim-select option {
+  background: #141414;
+  color: #e8e5df;
+}
+.kim-settings-body .kim-toggle-row__label { color: rgba(255,255,255,.8); }
+.kim-settings-body .kim-toggle-row__hint  { color: rgba(255,255,255,.38); }
+.kim-settings-body .kim-settings-section__title { color: rgba(255,255,255,.55); }
+.kim-settings-body .kim-settings-content { color: rgba(255,255,255,.75); }
+
+/* Theme chooser overrides for dark */
+.kim-settings-body .kim-theme-chooser__opt {
+  background: rgba(255,255,255,.05);
+  border-color: rgba(255,255,255,.1);
+  color: rgba(255,255,255,.55);
+}
+.kim-settings-body .kim-theme-chooser__opt:hover {
+  background: rgba(255,255,255,.09);
+  color: rgba(255,255,255,.85);
+}
+.kim-settings-body .kim-theme-chooser__opt--active {
+  background: rgba(255,255,255,.14);
+  border-color: rgba(255,255,255,.25);
+  color: rgba(255,255,255,.95);
+}
+
+/* Accent swatches remain coloured — just larger on dark bg */
+.kim-settings-body .kim-accent-picker { gap: 10px; }
+.kim-settings-body .kim-accent-swatch { width: 30px; height: 30px; border-radius: 50%; }
+.kim-settings-body .kim-accent-label { color: rgba(255,255,255,.45); }
+
+/* Data / path fields */
+.kim-settings-body .kim-path-row input {
+  background: rgba(255,255,255,.06);
+  border-color: rgba(255,255,255,.12);
+  color: rgba(255,255,255,.85);
+}
+.kim-settings-body .kim-path-pick-btn {
+  background: rgba(255,255,255,.08);
+  border-color: rgba(255,255,255,.12);
+  color: rgba(255,255,255,.6);
+}
+.kim-settings-body .kim-path-pick-btn:hover {
+  background: rgba(255,255,255,.13);
+  color: rgba(255,255,255,.9);
+}
+
+/* Feedback form overrides */
+.kim-settings-body .kim-feedback-cat {
+  background: rgba(255,255,255,.05);
+  border-color: rgba(255,255,255,.1);
+}
+.kim-settings-body .kim-feedback-cat:hover {
+  background: rgba(255,255,255,.09);
+  border-color: rgba(255,255,255,.2);
+}
+.kim-settings-body .kim-feedback-cat__label { color: rgba(255,255,255,.8); }
+.kim-settings-body .kim-feedback-cat__desc  { color: rgba(255,255,255,.4); }
+
+/* MCP section overrides */
+.kim-settings-body .kim-mcp-tool {
+  background: rgba(255,255,255,.05);
+  border-color: rgba(255,255,255,.08);
+  color: rgba(255,255,255,.7);
+}
+.kim-settings-body .kim-mcp-code-block {
+  background: rgba(255,255,255,.06);
+  border-color: rgba(255,255,255,.1);
+  color: rgba(255,255,255,.75);
+}
+
+/* About section release notes */
+.kim-settings-body .kim-release-notes {
+  background: rgba(255,255,255,.05);
+  border-color: rgba(255,255,255,.1);
+  color: rgba(255,255,255,.7);
+}
+.kim-settings-body .kim-release-notes__h2 { color: rgba(255,255,255,.9); }
+.kim-settings-body .kim-release-notes__h3 { color: rgba(255,255,255,.7); }
+
+/* ── Typing animation picker ── */
+.kim-typing-anim-picker {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  margin-top: 2px;
+}
+.kim-typing-anim-opt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  transition: background 0.13s, border-color 0.13s;
+}
+.kim-typing-anim-opt:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+.kim-typing-anim-opt--active {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+.kim-typing-anim-opt__icon {
+  font-size: 18px;
+  margin-bottom: 2px;
+  display: block;
+}
+.kim-typing-anim-opt__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.85);
+}
+.kim-typing-anim-opt--active .kim-typing-anim-opt__label { color: #fff; }
+.kim-typing-anim-opt__desc {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.38);
+  line-height: 1.4;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   TYPING ANIMATIONS — 1 (typewriter), 2 (word-fade), 4 (char-blur)
+   ════════════════════════════════════════════════════════════════════════════ */
+
+.kim-anim-root { display: inline; }
+
+/* Blinking caret for typewriter */
+.kim-anim-caret {
+  display: inline-block;
+  width: 8px;
+  height: 1em;
+  vertical-align: -0.1em;
+  background: currentColor;
+  opacity: 0.7;
+  margin-left: 1px;
+  border-radius: 1px;
+  animation: kim-caret-blink 0.9s steps(1) infinite;
+}
+@keyframes kim-caret-blink { 50% { opacity: 0; } }
+
+/* Word-fade: flex wrapper + individual word transitions */
+.kim-anim-word-wrap {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0;
+}
+.kim-anim-word {
+  opacity: 0;
+  filter: blur(4px);
+  transform: translateY(5px);
+  transition: opacity 0.28s ease, filter 0.28s ease, transform 0.28s ease;
+  white-space: pre-wrap;
+}
+.kim-anim-word--show {
+  opacity: 1;
+  filter: none;
+  transform: none;
+}
+
+/* Char-blur: individual character transitions */
+.kim-anim-char {
+  display: inline-block;
+  opacity: 0;
+  filter: blur(6px);
+  transition: opacity 0.2s ease, filter 0.2s ease;
+}
+.kim-anim-char--show {
+  opacity: 1;
+  filter: none;
+}
+
+/* Respect reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .kim-anim-word, .kim-anim-char {
+    transition: none !important;
+    opacity: 1 !important;
+    filter: none !important;
+    transform: none !important;
+  }
+  .kim-anim-caret { animation: none !important; }
+}
+
