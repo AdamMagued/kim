@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kim Bridge</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 300px;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      color: #1a1a1a;
+      background: #f8f9fa;
+    }
+
+    /* ── Header ── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 14px 10px;
+      background: #1e1e2e;
+      color: #cdd6f4;
+    }
+    .header-title { font-size: 15px; font-weight: 600; flex: 1; }
+    .relay-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: #6c7086;
+      flex-shrink: 0;
+      title: "Relay disconnected";
+    }
+    .relay-dot.connected   { background: #a6e3a1; }
+    .relay-dot.disconnected { background: #f38ba8; }
+
+    /* ── Site badge ── */
+    .site-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px 6px;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    .site-badge {
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      background: #e2e8f0;
+      color: #475569;
+    }
+    .site-badge.claude   { background: #fde8d8; color: #c2410c; }
+    .site-badge.chatgpt  { background: #d1fae5; color: #065f46; }
+    .site-badge.gemini   { background: #dbeafe; color: #1d4ed8; }
+    .site-badge.deepseek { background: #ede9fe; color: #6d28d9; }
+    .site-badge.unknown  { background: #e5e7eb; color: #6b7280; }
+
+    .loop-status {
+      font-size: 11px;
+      color: #6b7280;
+      margin-left: auto;
+    }
+    .loop-status.active { color: #16a34a; font-weight: 600; }
+
+    /* ── Controls ── */
+    .section { padding: 10px 14px; border-bottom: 1px solid #e5e7eb; }
+    .section-label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #9ca3af;
+      margin-bottom: 6px;
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .row:last-child { margin-bottom: 0; }
+
+    label { flex: 1; color: #374151; }
+
+    /* Toggle switch */
+    .toggle-wrap { display: flex; align-items: center; gap: 6px; }
+    .toggle {
+      position: relative;
+      display: inline-block;
+      width: 34px; height: 18px;
+    }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; inset: 0;
+      background: #d1d5db; border-radius: 18px;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .slider::before {
+      content: "";
+      position: absolute;
+      width: 14px; height: 14px;
+      left: 2px; bottom: 2px;
+      background: white; border-radius: 50%;
+      transition: transform 0.2s;
+    }
+    .toggle input:checked + .slider { background: #16a34a; }
+    .toggle input:checked + .slider::before { transform: translateX(16px); }
+
+    /* Retries input */
+    .retries-input {
+      width: 44px;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 13px;
+      text-align: center;
+    }
+
+    /* ── Settings ── */
+    .settings-toggle {
+      width: 100%;
+      padding: 6px 14px;
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: #6b7280;
+      font-size: 12px;
+      text-align: left;
+      display: flex;
+      justify-content: space-between;
+    }
+    .settings-toggle:hover { color: #374151; }
+
+    #settings-panel { display: none; padding: 8px 14px 10px; border-bottom: 1px solid #e5e7eb; }
+    #settings-panel.open { display: block; }
+
+    .setting-row { margin-bottom: 8px; }
+    .setting-row label { display: block; color: #6b7280; font-size: 11px; margin-bottom: 2px; }
+    .setting-row input {
+      width: 100%;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      padding: 4px 7px;
+      font-size: 12px;
+      font-family: monospace;
+    }
+
+    .btn-save {
+      display: block; width: 100%;
+      padding: 5px; margin-top: 6px;
+      background: #1e1e2e; color: #cdd6f4;
+      border: none; border-radius: 4px;
+      cursor: pointer; font-size: 12px;
+    }
+    .btn-save:hover { background: #313244; }
+
+    /* ── Footer ── */
+    .footer {
+      padding: 7px 14px;
+      font-size: 11px;
+      color: #9ca3af;
+      text-align: center;
+    }
+    .relay-label { font-size: 11px; }
+    .relay-label span { font-weight: 600; }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-title">Kim Bridge</div>
+    <div class="relay-label" id="relay-label" style="color:#6c7086;font-size:11px;">relay: —</div>
+    <div class="relay-dot" id="relay-dot" title="Relay status"></div>
+  </div>
+
+  <!-- Site + loop status -->
+  <div class="site-row">
+    <span class="site-badge unknown" id="site-badge">No AI tab</span>
+    <span class="loop-status" id="loop-status">loop off</span>
+  </div>
+
+  <!-- Auto-loop controls -->
+  <div class="section">
+    <div class="section-label">Auto-Loop</div>
+    <div class="row">
+      <label for="loop-toggle">Enable auto-loop</label>
+      <label class="toggle">
+        <input type="checkbox" id="loop-toggle" />
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="row">
+      <label for="retries-input">Max retries</label>
+      <input type="number" id="retries-input" class="retries-input" min="1" max="10" value="3" />
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <button class="settings-toggle" id="settings-btn">
+    <span>Settings</span><span id="settings-arrow">▸</span>
+  </button>
+  <div id="settings-panel">
+    <div class="setting-row">
+      <label>Kim bridge URL (local HTTP adapter)</label>
+      <input type="text" id="bridge-url-input" placeholder="http://localhost:3000" />
+    </div>
+    <div class="setting-row">
+      <label>Relay server URL (optional)</label>
+      <input type="text" id="relay-url-input" placeholder="https://your-relay.railway.app" />
+    </div>
+    <button class="btn-save" id="save-btn">Save settings</button>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    Drop files onto the chat to sync them to Kim
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

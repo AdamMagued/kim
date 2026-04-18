@@ -1,0 +1,53 @@
+# ── Core ─────────────────────────────────────────────────────────────────────
+mcp>=1.0.0
+anthropic>=0.40.0
+openai>=1.50.0
+google-generativeai>=0.8.0
+python-dotenv>=1.0.0
+PyYAML>=6.0.1
+httpx>=0.27.0
+aiofiles>=23.0.0
+aiosqlite>=0.20.0
+
+# ── Screen / Input Automation ────────────────────────────────────────────────
+pyautogui>=0.9.54
+mss>=9.0.1
+Pillow>=10.0.0
+playwright>=1.40.0
+
+# ── Relay Server ─────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# ── Window Management (platform-conditional) ────────────────────────────────
+# pygetwindow: Windows only — used for window listing, focus, and resize.
+#   On macOS, osascript (built-in) is used instead. No extra dependency.
+#   On Linux, install wmctrl and/or xdotool system packages instead.
+pygetwindow>=0.0.9; sys_platform == "win32"
+
+# ── Windows-only dependencies ───────────────────────────────────────────────
+pywin32>=308; sys_platform == "win32"
+win10toast>=0.9; sys_platform == "win32"
+
+# ── macOS-only dependencies ─────────────────────────────────────────────────
+# pyobjc-core and pyobjc-framework-Quartz are optional — they improve
+# screenshot quality and enable some advanced window queries on macOS.
+# osascript (used for window management) is built-in and needs no pip dep.
+pyobjc-core>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+
+# ── Tray / UI ───────────────────────────────────────────────────────────────
+pystray>=0.19.5
+pynput>=1.7.6
+
+# ── Testing ──────────────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+
+# ── Voice / TTS (optional — install for Kim's voice) ────────────────────────
+# kokoro: lightweight local TTS engine (default voice backend)
+# sounddevice: cross-platform audio playback
+# soundfile: audio file I/O (required by kokoro)
+kokoro>=0.9.0
+sounddevice>=0.5.0
+soundfile>=0.12.0
