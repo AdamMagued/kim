@@ -1,0 +1,26 @@
+# Secret Keys (CRITICAL)
+.env
+
+# Python specific
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+
+# Project Specific
+logs/
+sessions/
+data/*.sqlite
+temp/
+screenshots/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Project config that might contain paths specific to your PC
+# (Only ignore this if you want to keep your PROJECT_ROOT path private)
+# config.yaml
+pythonExperimentTool/

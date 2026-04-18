@@ -1,0 +1,50 @@
+allowed_paths:
+- .
+browser_provider:
+  browser_headless: false
+  cdp_url: http://localhost:9222
+  max_history_messages: 6
+  max_inject_chars: 12000
+custom_sites: {}
+logging:
+  level: INFO
+max_iterations: 25
+max_tokens: 4096
+memory_keep_screenshots: 4
+memory_max_messages: 40
+model:
+  claude: claude-opus-4-6
+  deepseek: deepseek-chat
+  gemini: gemini-2.0-flash
+  openai: gpt-4o
+openai_api_key_env: OPENAI_API_KEY
+openai_base_url: ''
+preview_mode: false
+project_root: .
+provider: browser
+relay:
+  pc_api_key: ''
+  poll_interval: 2
+  url: ''
+screenshot_scale: 0.75
+shell:
+  blocked_commands:
+  - rm -rf /
+  - 'format c:'
+  - del /S /Q C:\
+  - rd /S /Q C:\
+  timeout: 30
+voice:
+  enabled: true
+  engine: hume
+  human_quirks: false
+  hume:
+    description: A warm, clear, and friendly female voice.
+    voice_name: Alice Bennett
+  maya1:
+    max_new_tokens: 2048
+    model_id: maya-research/maya1
+    speaker_description: A young female with a warm, clear, and natural voice.
+    use_4bit: false
+  speed: 1.0
+  voice_id: af_heart
