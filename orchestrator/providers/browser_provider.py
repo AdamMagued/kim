@@ -56,7 +56,6 @@ SETUP (visible mode):
 """
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -156,6 +155,7 @@ SITE_CONFIGS: dict[str, dict] = {
     },
 }
 
+
 def _to_list(value) -> list[str]:
     """Normalise a selector value from config: string → [string], list → list."""
     if not value:
@@ -208,6 +208,7 @@ class BrowserProvider(BaseProvider):
     """
 
     def __init__(self, config: dict):
+        self._config = config
         bp_cfg = config.get("browser_provider", {})
         cdp_url = bp_cfg.get("cdp_url", CDP_URL)
         self._cdp_url = cdp_url
@@ -252,21 +253,34 @@ class BrowserProvider(BaseProvider):
         # Each entry must have url_pattern + at least input/send/response selectors.
         # Selectors can be a string or a list; strings are wrapped in a list.
         self._site_configs = dict(SITE_CONFIGS)  # copy so class-level dict is untouched
-        for site_key, site_def in (config.get("custom_sites") or {}).items():
+        for site_key, site_def in (self._config.get("custom_sites") or {}).items():
             if not site_def.get("url_pattern"):
                 logger.warning(f"custom_sites.{site_key}: missing url_pattern, skipping")
                 continue
             self._site_configs[site_key] = {
                 "url_pattern": site_def["url_pattern"],
-                "input_selectors":    _to_list(site_def.get("input_selectors") or site_def.get("input_selector", "")),
-                "send_selectors":     _to_list(site_def.get("send_selectors")   or site_def.get("send_button", "")),
-                "stop_selectors":     _to_list(site_def.get("stop_selectors")   or site_def.get("stop_button", "")),
-                "response_selectors": _to_list(site_def.get("response_selectors") or site_def.get("response_selector", "")),
-                "upload_button_selectors": _to_list(site_def.get("upload_button_selectors") or site_def.get("upload_button", "")),
+                "input_selectors": _to_list(
+                    site_def.get("input_selectors") or site_def.get("input_selector", "")
+                ),
+                "send_selectors": _to_list(
+                    site_def.get("send_selectors") or site_def.get("send_button", "")
+                ),
+                "stop_selectors": _to_list(
+                    site_def.get("stop_selectors") or site_def.get("stop_button", "")
+                ),
+                "response_selectors": _to_list(
+                    site_def.get("response_selectors") or site_def.get("response_selector", "")
+                ),
+                "upload_button_selectors": _to_list(
+                    site_def.get("upload_button_selectors")
+                    or site_def.get("upload_button", "")
+                ),
             }
             logger.info(f"Registered custom site: {site_key!r} → {site_def['url_pattern']!r}")
 
-        logger.info(f"BrowserProvider: cdp_url={cdp_url}  sites={list(self._site_configs)}")
+        logger.info(
+            f"BrowserProvider: cdp_url={self._cdp_url}  sites={list(self._site_configs)}"
+        )
 
     # ==================================================================
     # Main entry point
@@ -960,7 +974,8 @@ class BrowserProvider(BaseProvider):
             ]
             tools_json = json.dumps(compact_tools, indent=2)
 
-            import platform as _platform, os as _os
+            import platform as _platform
+            import os as _os
             _sys = _platform.system()
             _home = _os.path.expanduser("~")
             if _sys == "Darwin":

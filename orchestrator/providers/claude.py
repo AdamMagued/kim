@@ -6,7 +6,6 @@ responses.  Transforms canonical messages and tools to Anthropic API format
 and back.
 """
 
-import json
 import logging
 import os
 
