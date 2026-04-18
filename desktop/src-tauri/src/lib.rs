@@ -414,14 +414,10 @@ async fn send_task(
 
     let _ = app_handle.emit("kim-agent-done", status.success());
 
-    if status.success() {
-        Ok("Task completed".to_string())
-    } else {
-        // SIGTERM on Unix yields status.success()==false but a clean cancellation —
-        // the frontend distinguishes via the `kim-agent-cancelled` event emitted
-        // by cancel_task, so we just surface the raw status here.
-        Err(format!("Agent exited with status: {}", status))
-    }
+    // Always return Ok — the frontend learns about failure via the kim-agent-done
+    // event (payload = false). Returning Err here causes a second error path in the
+    // JS catch block, leading to duplicate error messages and UI state conflicts.
+    Ok(if status.success() { "Task completed".to_string() } else { "Task ended".to_string() })
 }
 
 // ---------------------------------------------------------------------------
