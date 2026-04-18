@@ -791,6 +791,34 @@ function AccountSection({ account, onAccountChange }: { account: KimAccount; onA
           )}
         </div>
       )}
+
+      {/* Danger zone: reset onboarding */}
+      <div className="kim-settings-section__header" style={{ marginTop: 28, marginBottom: 8 }}>
+        <span className="kim-settings-section__title" style={{ fontSize: 13 }}>Danger zone</span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', background: 'var(--surface-raised)', borderRadius: 8, border: '1px solid var(--border)' }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>Reset onboarding</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+            Forget your account and re-run the welcome flow on next launch.
+          </div>
+        </div>
+        <button
+          className="kim-btn kim-btn--secondary"
+          style={{ fontSize: 12 }}
+          onClick={async () => {
+            if (!confirm('Reset Kim to first-run?\n\nYour display name and GitHub link will be cleared.')) return;
+            try {
+              await invoke('clear_account');
+              window.location.reload();
+            } catch (e) {
+              alert('Could not reset: ' + String(e));
+            }
+          }}
+        >
+          Reset…
+        </button>
+      </div>
     </div>
   );
 }

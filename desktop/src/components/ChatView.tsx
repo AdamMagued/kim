@@ -4,6 +4,20 @@ import { listen } from '@tauri-apps/api/event';
 import type { SessionInfo, KimMessage, Settings, KimAccount } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { BrowserProviderPicker } from './BrowserProviderPicker';
+import { useChromaShader } from '../hooks/useChromaShader';
+
+/** Subtle chrome WebGL backdrop, matching the onboarding shader. */
+function ChatChromaBackdrop() {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  useChromaShader(canvasRef, containerRef);
+  return (
+    <div ref={containerRef} className="kim-chat__backdrop" aria-hidden="true">
+      <canvas ref={canvasRef} className="kim-chat__backdrop-canvas" />
+      <div className="kim-chat__backdrop-scrim" />
+    </div>
+  );
+}
 
 const MAX_ACTIVITY_ITEMS = 300;
 
@@ -588,6 +602,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   if (!newChatMode && !session) {
     return (
       <div className="kim-chat">
+        <ChatChromaBackdrop />
         <div className="kim-empty-welcome">
           <div className="kim-empty-welcome__greeting kim-greeting">
             {getGreeting(account.display_name)}
@@ -609,6 +624,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
 
     return (
       <div className="kim-chat">
+        <ChatChromaBackdrop />
         <div className="kim-chat__output">
           {!hasStarted && (
             <div className="kim-new-chat-empty">
@@ -733,6 +749,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   // ── Existing session view ─────────────────────────────────────────────────────
   return (
     <div className="kim-chat">
+      <ChatChromaBackdrop />
       {/* Session header */}
       <div className="kim-session-header">
         <div className="kim-session-header__main">
