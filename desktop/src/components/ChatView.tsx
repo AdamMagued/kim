@@ -441,6 +441,12 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   // Set to true when the kim-agent-done event fires; prevents the invoke()
   // rejection from double-reporting errors.
   const doneHandledRef = useRef(false);
+  // Set to true in handleCancel() BEFORE the cancel invoke so the kim-agent-done
+  // listener skips the error banner when the task was intentionally stopped.
+  // Must be a ref (not a closure-local let) because kim-agent-done always fires
+  // ~100ms BEFORE kim-agent-cancelled (Rust emits done inside child.wait(), then
+  // the cancel poller emits cancelled), so a closure variable would still be false.
+  const cancelFlagRef = useRef(false);
 
   // ── Deduplication (per-session, not module-global) ───────────────────────
   // Python writes many lines to both stdout AND stderr, causing duplicates.
@@ -616,15 +622,15 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       appendRaw(`[err] ${event.payload}`);
     }).then(fn => { unlistenError = fn; });
 
-    let cancelFlag = false;
-
     listen<boolean>('kim-agent-done', event => {
+      const wasCancelled = cancelFlagRef.current;
       doneHandledRef.current = true;
+      cancelFlagRef.current = false; // reset for next task
       setIsRunning(false);
       setCancelling(false);
       // Always refresh sessions — failed runs still create session files.
       onTaskDoneRef.current();
-      if (!event.payload && !cancelFlag) {
+      if (!event.payload && !wasCancelled) {
         setTaskError('agent-error');
         if (currentTaskRef.current) {
           setLastFailedTask(currentTaskRef.current);
@@ -633,11 +639,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
         setLastFailedTask(null);
       }
       currentTaskRef.current = null;
-      cancelFlag = false;
     }).then(fn => { unlistenDone = fn; });
 
     listen<boolean>('kim-agent-cancelled', () => {
-      cancelFlag = true;
+      cancelFlagRef.current = true; // safety: also set here in case done fires later
       appendRaw('⏹ Task cancelled');
       setIsRunning(false);
       setCancelling(false);
@@ -719,10 +724,15 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   async function handleCancel() {
     if (!isRunning || cancelling) return;
     setCancelling(true);
+    // Set the cancel flag BEFORE sending the signal. kim-agent-done fires
+    // ~100ms before kim-agent-cancelled (Rust emits done in child.wait()),
+    // so the flag must be true when done arrives or the error banner appears.
+    cancelFlagRef.current = true;
     try {
       await invoke('cancel_task');
     } catch (err) {
       setCancelling(false);
+      cancelFlagRef.current = false;
       setTaskError(friendlyError(String(err)));
     }
   }
