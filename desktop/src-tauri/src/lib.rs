@@ -30,9 +30,24 @@ struct WebviewBridgeConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+struct BridgeAttachment {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default = "default_attachment_mime")]
+    mime_type: String,
+    data_base64: String,
+}
+
+fn default_attachment_mime() -> String {
+    "application/octet-stream".to_string()
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct BridgeCompleteRequest {
     site: Option<String>,
     prompt: String,
+    #[serde(default)]
+    attachments: Vec<BridgeAttachment>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -60,6 +75,7 @@ static WEBVIEW_BRIDGE_REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SessionInfo {
     pub session_id: String,
+    pub title: String,
     pub date: String,
     pub message_count: usize,
     pub has_summary: bool,
@@ -221,9 +237,11 @@ fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<Session
             };
 
             let message_count = count_lines(&session_file).unwrap_or(0);
+            let title = infer_session_title(&session_file, summary.as_ref(), &session_id);
 
             sessions.push(SessionInfo {
                 session_id,
+                title,
                 date: date_str.clone(),
                 message_count,
                 has_summary,
@@ -267,6 +285,87 @@ fn parse_jsonl(path: &Path) -> Result<Vec<KimMessage>, String> {
     }
 
     Ok(messages)
+}
+
+fn normalize_title_text(raw: &str) -> Option<String> {
+    let mut text = raw.replace('\n', " ");
+    text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut cleaned = text.trim().to_string();
+
+    for prefix in ["Task:", "task:", "TASK:"] {
+        if cleaned.starts_with(prefix) {
+            cleaned = cleaned[prefix.len()..].trim().to_string();
+            break;
+        }
+    }
+
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let max_chars = 56usize;
+    let char_count = cleaned.chars().count();
+    if char_count > max_chars {
+        let mut shortened: String = cleaned.chars().take(max_chars - 1).collect();
+        shortened = shortened.trim_end().to_string();
+        return Some(format!("{}…", shortened));
+    }
+
+    Some(cleaned)
+}
+
+fn extract_title_from_content(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => normalize_title_text(s),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if item_type == "text" {
+                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                        if let Some(title) = normalize_title_text(text) {
+                            return Some(title);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn infer_session_title(session_file: &Path, summary: Option<&String>, session_id: &str) -> String {
+    if let Ok(file) = fs::File::open(session_file) {
+        let reader = BufReader::new(file);
+        for line in reader.lines().flatten().take(80) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let role = value.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            if role == "user" {
+                if let Some(content) = value.get("content") {
+                    if let Some(title) = extract_title_from_content(content) {
+                        return title;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(s) = summary {
+        if let Some(title) = normalize_title_text(s) {
+            return title;
+        }
+    }
+
+    let short_id: String = session_id.chars().take(8).collect();
+    format!("Session {}", short_id)
 }
 
 fn header_value(request: &Request, name: &str) -> Option<String> {
@@ -381,16 +480,23 @@ fn open_browser_signin_window_impl(
     Ok("Opened in Kim browser window".to_string())
 }
 
-fn build_bridge_complete_script(site: &str, prompt: &str, req_id: &str) -> Result<String, String> {
+fn build_bridge_complete_script(
+    site: &str,
+    prompt: &str,
+    req_id: &str,
+    attachments: &[BridgeAttachment],
+) -> Result<String, String> {
     let site_json = serde_json::to_string(site).map_err(|e| e.to_string())?;
     let prompt_json = serde_json::to_string(prompt).map_err(|e| e.to_string())?;
     let req_json = serde_json::to_string(req_id).map_err(|e| e.to_string())?;
+    let attachments_json = serde_json::to_string(attachments).map_err(|e| e.to_string())?;
 
     let mut script = r#"
 (async () => {
   const __kimSite = __KIM_SITE__;
   const __kimPrompt = __KIM_PROMPT__;
   const __kimReqId = __KIM_REQID__;
+    const __kimAttachments = __KIM_ATTACHMENTS__;
   const __KIM_CHUNK_PREFIX = "__KIMBRIDGE_CHUNK__";
   const __KIM_DONE_PREFIX = "__KIMBRIDGE_DONE__";
 
@@ -400,30 +506,40 @@ fn build_bridge_complete_script(site: &str, prompt: &str, req_id: &str) -> Resul
             send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']", "button[aria-label*='send']"],
       stop_selectors: ["button[aria-label*='Stop']", "button[aria-label*='stop']"],
       response_selectors: ["[data-testid^='conversation-turn']", ".font-claude-message"],
+            upload_button_selectors: ["button[aria-label*='Attach']", "button[aria-label*='Upload']"],
+            file_input_selectors: ["input[type='file']"],
     },
     chatgpt: {
       input_selectors: ["div#prompt-textarea", "div[contenteditable='true']"],
       send_selectors: ["button[data-testid='send-button']", "button[aria-label*='Send']"],
       stop_selectors: ["button[data-testid='stop-button']", "button[aria-label*='Stop']"],
       response_selectors: ["div.markdown", "article div.prose"],
+            upload_button_selectors: ["button[aria-label*='Attach']", "button[data-testid*='upload']"],
+            file_input_selectors: ["input[type='file']"],
     },
     gemini: {
       input_selectors: ["rich-textarea div[contenteditable]", "div[contenteditable='true']"],
       send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']"],
       stop_selectors: ["button[aria-label*='Stop']", "button[aria-label*='stop']"],
       response_selectors: ["model-response", ".response-content"],
+            upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Add image']"],
+            file_input_selectors: ["input[type='file']"],
     },
     deepseek: {
       input_selectors: ["textarea#chat-input", "textarea"],
       send_selectors: ["button[aria-label*='Send']", "button[type='submit']", "div[role='button']"],
       stop_selectors: ["button[aria-label*='Stop']", "div[role='button'][class*='stop']"],
       response_selectors: ["div.ds-markdown"],
+            upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']", "div[role='button']"],
+            file_input_selectors: ["input[type='file']"],
     },
     grok: {
       input_selectors: ["textarea", "div[contenteditable='true']"],
       send_selectors: ["button[aria-label*='Send']", "button[type='submit']"],
       stop_selectors: ["button[aria-label*='Stop']"],
       response_selectors: ["article", "div.markdown", "[data-testid*='message']"],
+            upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']"],
+            file_input_selectors: ["input[type='file']"],
     },
   };
 
@@ -455,6 +571,130 @@ fn build_bridge_complete_script(site: &str, prompt: &str, req_id: &str) -> Resul
     return null;
   };
 
+    const inferExtension = (mime) => {
+        const m = String(mime || '').toLowerCase();
+        const extMap = {
+            'image/png': 'png',
+            'image/jpeg': 'jpg',
+            'image/jpg': 'jpg',
+            'image/webp': 'webp',
+            'image/gif': 'gif',
+            'image/svg+xml': 'svg',
+            'application/pdf': 'pdf',
+            'text/plain': 'txt',
+            'text/markdown': 'md',
+            'application/json': 'json',
+            'application/zip': 'zip',
+        };
+        if (extMap[m]) return extMap[m];
+        if (m.includes('/')) {
+            const tail = m.split('/')[1].split('+')[0];
+            if (tail) return tail;
+        }
+        return 'bin';
+    };
+
+    const decodeBase64 = (b64) => {
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
+    };
+
+    const makeFileFromAttachment = (att, idx) => {
+        const mime = String(att?.mime_type || 'application/octet-stream');
+        const dataB64 = String(att?.data_base64 || '');
+        if (!dataB64) return null;
+        const bytes = decodeBase64(dataB64);
+        const blob = new Blob([bytes], { type: mime });
+        const fallbackName = `attachment_${idx + 1}.${inferExtension(mime)}`;
+        const name = String(att?.name || fallbackName).trim() || fallbackName;
+        return new File([blob], name, { type: mime });
+    };
+
+    const injectAttachments = async (cfg, inputEl) => {
+        const source = Array.isArray(__kimAttachments) ? __kimAttachments : [];
+        if (!source.length) return 0;
+
+        const files = [];
+        for (let i = 0; i < source.length; i++) {
+            try {
+                const file = makeFileFromAttachment(source[i], i);
+                if (file) files.push(file);
+            } catch (_) {}
+        }
+        if (!files.length) return 0;
+
+        const findFileInput = () => {
+            for (const sel of cfg.file_input_selectors || []) {
+                try {
+                    const el = document.querySelector(sel);
+                    if (el && el instanceof HTMLInputElement && el.type === 'file') {
+                        return el;
+                    }
+                } catch (_) {}
+            }
+            return null;
+        };
+
+        let fileInput = findFileInput();
+        if (!fileInput) {
+            const uploadSel = findSelector(cfg.upload_button_selectors);
+            if (uploadSel) {
+                try {
+                    const uploadBtn = document.querySelector(uploadSel);
+                    uploadBtn?.click();
+                    await sleep(280);
+                    fileInput = findFileInput();
+                } catch (_) {}
+            }
+        }
+
+        if (fileInput) {
+            const dt = new DataTransfer();
+            for (const file of files) {
+                dt.items.add(file);
+            }
+
+            try {
+                fileInput.files = dt.files;
+            } catch (_) {
+                try {
+                    Object.defineProperty(fileInput, 'files', {
+                        value: dt.files,
+                        configurable: true,
+                    });
+                } catch (_) {}
+            }
+
+            fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+            fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+            await sleep(700);
+            return files.length;
+        }
+
+        // Fallback: image clipboard paste when no file input is exposed.
+        const imageFile = files.find(f => String(f.type || '').startsWith('image/'));
+        if (imageFile && inputEl) {
+            try {
+                inputEl.focus();
+                const item = new ClipboardItem({ [imageFile.type]: imageFile });
+                await navigator.clipboard.write([item]);
+                const isMac = navigator.platform.toLowerCase().includes('mac');
+                const combo = isMac ? { metaKey: true, ctrlKey: false } : { metaKey: false, ctrlKey: true };
+                inputEl.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'v', code: 'KeyV', bubbles: true, ...combo,
+                }));
+                await sleep(450);
+                return 1;
+            } catch (_) {}
+        }
+
+        return 0;
+    };
+
   try {
     const siteKey = SITE_CONFIGS[__kimSite] ? __kimSite : 'claude';
     const cfg = SITE_CONFIGS[siteKey];
@@ -469,6 +709,11 @@ fn build_bridge_complete_script(site: &str, prompt: &str, req_id: &str) -> Resul
 
     const inputEl = document.querySelector(inputSel);
     inputEl.focus();
+
+        const uploadedCount = await injectAttachments(cfg, inputEl);
+        if (uploadedCount > 0) {
+            await sleep(450);
+        }
 
     if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
       const proto = Object.getPrototypeOf(inputEl);
@@ -585,7 +830,7 @@ fn build_bridge_complete_script(site: &str, prompt: &str, req_id: &str) -> Resul
       throw new Error('Could not read model response from page');
     }
 
-    await emitPayload({ ok: true, response: text, site: siteKey });
+    await emitPayload({ ok: true, response: text, site: siteKey, attachments_uploaded: uploadedCount || 0 });
   } catch (err) {
     const message = (err && err.message) ? err.message : String(err);
     await emitPayload({ ok: false, error: message, site: __kimSite || 'unknown' });
@@ -596,6 +841,7 @@ fn build_bridge_complete_script(site: &str, prompt: &str, req_id: &str) -> Resul
     script = script.replace("__KIM_SITE__", &site_json);
     script = script.replace("__KIM_PROMPT__", &prompt_json);
     script = script.replace("__KIM_REQID__", &req_json);
+    script = script.replace("__KIM_ATTACHMENTS__", &attachments_json);
     Ok(script)
 }
 
@@ -803,7 +1049,12 @@ fn handle_webview_bridge_request(
                 WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
             );
 
-            let script = match build_bridge_complete_script(&site, &parsed.prompt, &req_id) {
+            let script = match build_bridge_complete_script(
+                &site,
+                &parsed.prompt,
+                &req_id,
+                &parsed.attachments,
+            ) {
                 Ok(s) => s,
                 Err(e) => {
                     respond_json(

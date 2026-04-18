@@ -84,16 +84,17 @@ function XIcon() {
 function SessionItem({ session, active, onClick }: {
   session: SessionInfo; active: boolean; onClick: () => void;
 }) {
+  const chatTitle = session.title?.trim() || session.session_id;
   const preview = session.summary
     ? session.summary.slice(0, 60) + (session.summary.length > 60 ? '…' : '')
     : `${session.message_count} message${session.message_count !== 1 ? 's' : ''}`;
   return (
     <button
       onClick={onClick}
-      title={session.summary ?? session.session_id}
+      title={session.summary ?? chatTitle}
       className={`kim-session-item${active ? ' kim-session-item--active' : ''}`}
     >
-      <div className="kim-session-item__title">{session.session_id.slice(0, 18)}</div>
+      <div className="kim-session-item__title">{chatTitle}</div>
       <div className="kim-session-item__preview">{preview}</div>
     </button>
   );
