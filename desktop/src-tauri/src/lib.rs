@@ -353,7 +353,7 @@ fn open_browser_signin_window_impl(
         .map(|name| format!("Kim Browser - {}", name))
         .unwrap_or_else(|| "Kim Browser".to_string());
 
-    tauri::WebviewWindowBuilder::new(
+    let window = tauri::WebviewWindowBuilder::new(
         app_handle,
         label,
         tauri::WebviewUrl::External(parsed),
@@ -365,8 +365,17 @@ fn open_browser_signin_window_impl(
     .build()
     .map_err(|e| format!("Failed to open Kim browser window: {}", e))?;
 
-    if let Some(window) = app_handle.get_webview_window(label) {
-        let _ = window.set_focus();
+    let window_for_close = window.clone();
+    let _ = window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            // Keep the webview session alive for background/headless execution.
+            api.prevent_close();
+            let _ = window_for_close.hide();
+        }
+    });
+
+    if let Some(existing) = app_handle.get_webview_window(label) {
+        let _ = existing.set_focus();
     }
 
     Ok("Opened in Kim browser window".to_string())
@@ -388,7 +397,7 @@ fn build_bridge_complete_script(site: &str, prompt: &str, req_id: &str) -> Resul
   const SITE_CONFIGS = {
     claude: {
       input_selectors: ["div[contenteditable='true'].ProseMirror", "div[contenteditable='true']"],
-      send_selectors: ["button[aria-label*='Send']", "button[aria-label*='send']"],
+            send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']", "button[aria-label*='send']"],
       stop_selectors: ["button[aria-label*='Stop']", "button[aria-label*='stop']"],
       response_selectors: ["[data-testid^='conversation-turn']", ".font-claude-message"],
     },
@@ -423,7 +432,8 @@ fn build_bridge_complete_script(site: &str, prompt: &str, req_id: &str) -> Resul
   const emitPayload = async (payload) => {
     try {
       const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
-      const chunkSize = 1200;
+            // Keep chunks small; title values can be truncated on some engines.
+            const chunkSize = 180;
       const total = Math.max(1, Math.ceil(encoded.length / chunkSize));
       for (let i = 0; i < total; i++) {
         const chunk = encoded.slice(i * chunkSize, (i + 1) * chunkSize);
@@ -469,23 +479,50 @@ fn build_bridge_complete_script(site: &str, prompt: &str, req_id: &str) -> Resul
       inputEl.dispatchEvent(new Event('input', { bubbles: true }));
       inputEl.dispatchEvent(new Event('change', { bubbles: true }));
     } else {
-      inputEl.innerHTML = '';
-      const lines = __kimPrompt.split('\n');
-      for (const line of lines) {
-        const div = document.createElement('div');
-        div.textContent = line;
-        inputEl.appendChild(div);
-      }
+            let inserted = false;
+            try {
+                document.execCommand('selectAll', false);
+                inserted = document.execCommand('insertText', false, __kimPrompt);
+            } catch (_) {}
+
+            const currentText = (inputEl.innerText || inputEl.textContent || '').trim();
+            if (!inserted || currentText.length < Math.min(8, __kimPrompt.length)) {
+                inputEl.innerHTML = '';
+                const lines = __kimPrompt.split('\n');
+                for (const line of lines) {
+                    const div = document.createElement('div');
+                    div.textContent = line;
+                    inputEl.appendChild(div);
+                }
+            }
+            try {
+                inputEl.dispatchEvent(new InputEvent('input', {
+                    data: __kimPrompt,
+                    inputType: 'insertText',
+                    bubbles: true,
+                    cancelable: true,
+                }));
+            } catch (_) {}
       inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+            inputEl.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
     await sleep(300);
+
+        // Give reactive UIs a moment to enable the send button.
+        for (let i = 0; i < 20; i++) {
+            const sel = findSelector(cfg.send_selectors);
+            if (!sel) break;
+            const btn = document.querySelector(sel);
+            if (btn && !btn.disabled) break;
+            await sleep(120);
+        }
 
     let sent = false;
     const sendSel = findSelector(cfg.send_selectors);
     if (sendSel) {
       const sendEl = document.querySelector(sendSel);
-      if (sendEl) {
+            if (sendEl && !sendEl.disabled) {
         sendEl.click();
         sent = true;
       }
@@ -494,6 +531,12 @@ fn build_bridge_complete_script(site: &str, prompt: &str, req_id: &str) -> Resul
       inputEl.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
       }));
+            inputEl.dispatchEvent(new KeyboardEvent('keypress', {
+                key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+            }));
+            inputEl.dispatchEvent(new KeyboardEvent('keyup', {
+                key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+            }));
     }
 
     const responseDeadline = Date.now() + 90000;
