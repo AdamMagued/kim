@@ -1414,14 +1414,20 @@ async fn open_browser_signin_window(
 /// Uses the same user-data dir as Python's BrowserProvider: `<project>/sessions/chrome_data`.
 /// If port 9222 is already open, does not spawn (avoids a new Chrome window each task).
 /// Probes common install locations on each platform.
-/// Returns Ok(()) if a candidate launched; Err if none were found.
-fn launch_chrome_for_cdp(project_root: &Path) -> Result<(), String> {
+///
+/// Returns `Ok(true)` if Chrome was freshly spawned (caller should wait ~2 s for the debug
+/// port to open), `Ok(false)` if it was already running, or `Err` if not found.
+///
+/// NOTE: this function must only be called from a blocking context (e.g. inside
+/// `tokio::task::spawn_blocking`) because `TcpStream::connect` and `fs` calls are
+/// synchronous.  Do NOT call it directly from an async Tokio task.
+fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
     use std::net::TcpStream;
     use std::process::Command as StdCommand;
 
     let port_open = TcpStream::connect("127.0.0.1:9222").is_ok();
     if port_open {
-        return Ok(());
+        return Ok(false); // already running, no wait needed
     }
 
     let user_data_dir = project_root.join("sessions").join("chrome_data");
@@ -1458,9 +1464,9 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<(), String> {
             ])
             .spawn();
         if result.is_ok() {
-            // Give Chrome 2 seconds to open the debug port before the agent connects.
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            return Ok(());
+            // Caller is responsible for the post-launch wait so it can use
+            // tokio::time::sleep instead of std::thread::sleep.
+            return Ok(true); // freshly spawned — caller must wait for port
         }
     }
     Err("Chrome/Chromium not found. Install Google Chrome to use the browser provider.".to_string())
@@ -1525,11 +1531,28 @@ async fn send_task(
     // For browser provider: ensure Chrome is running with the CDP debug port
     // before the Python agent tries to connect. This is a best-effort launch;
     // if Chrome is already running on :9222 this is a no-op.
+    //
+    // launch_chrome_for_cdp() uses blocking I/O (TcpStream::connect, fs::create_dir_all,
+    // std::process::Command::spawn).  We run it on the blocking thread pool so we don't
+    // stall the Tokio executor, then do the post-launch wait with tokio::time::sleep.
     if provider_arg == "browser" || provider_arg.starts_with("browser:") {
         if bridge_cfg.is_none() {
-            if let Err(e) = launch_chrome_for_cdp(&root) {
-                // Non-fatal: the Python agent will surface a NEED_HELP if it can't connect.
-                eprintln!("[Kim] Chrome launch skipped: {}", e);
+            let root_for_chrome = root.clone();
+            match tokio::task::spawn_blocking(move || launch_chrome_for_cdp(&root_for_chrome)).await {
+                Ok(Ok(true)) => {
+                    // Chrome was freshly spawned — give it 2 s to open the debug port.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Ok(Ok(false)) => {
+                    // Chrome was already running — no wait needed.
+                }
+                Ok(Err(e)) => {
+                    // Non-fatal: the Python agent will surface a NEED_HELP if it can't connect.
+                    eprintln!("[Kim] Chrome launch skipped: {}", e);
+                }
+                Err(e) => {
+                    eprintln!("[Kim] Chrome launch task panicked: {}", e);
+                }
             }
         } else {
             eprintln!("[Kim] Browser provider using in-app bridge (no Chrome CDP launch)");

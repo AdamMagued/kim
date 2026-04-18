@@ -214,7 +214,7 @@ export default function App() {
             <span className={`kim-header__session-badge kim-header__session-badge--${activeSession.session_type}`}>
               {activeSession.session_type === 'kim' ? 'Kim' : 'Code'}
             </span>
-            <span className="kim-header__session-id">{activeSession.session_id}</span>
+            <span className="kim-header__session-id">{activeSession.title?.trim() || activeSession.session_id}</span>
           </div>
         )}
         {newChatMode && (
