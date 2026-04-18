@@ -93,6 +93,7 @@ export type Theme = 'dark' | 'light' | 'system';
 export type Provider = 'claude' | 'openai' | 'gemini' | 'deepseek' | 'browser';
 export type AccentTheme = 'indigo' | 'ocean' | 'ember' | 'teal' | 'jade' | 'mono';
 export type VoiceEngine = 'kokoro' | 'maya1' | 'http' | 'hume';
+export type TypingAnimation = 'none' | 'typewriter' | 'word-fade' | 'char-blur';
 
 export interface VoiceSettings {
   enabled: boolean;
@@ -108,6 +109,7 @@ export interface Settings {
   theme: Theme;
   accent: AccentTheme;
   voice: VoiceSettings;
+  typing_animation: TypingAnimation;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -122,6 +124,7 @@ export const DEFAULT_SETTINGS: Settings = {
     engine: 'kokoro',
     voice_id: 'af_heart',
   },
+  typing_animation: 'none',
 };
 
 // Voice catalog per engine — used by SettingsPanel to populate the voice dropdown.
