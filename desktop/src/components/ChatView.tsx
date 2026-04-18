@@ -94,12 +94,31 @@ const HIDDEN_REGEX: RegExp[] = [
 ];
 
 function isNoiseLine(raw: string): boolean {
-  const lower = raw.toLowerCase();
+  // Strip the [err] prefix that appendRaw prepends before pattern-matching,
+  // otherwise regex anchors like /^\s*\|/ never fire.
+  const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
+  const lower = line.toLowerCase();
   for (const sub of HIDDEN_SUBSTRINGS) {
     if (lower.includes(sub.toLowerCase())) return true;
   }
   for (const re of HIDDEN_REGEX) {
-    if (re.test(raw)) return true;
+    if (re.test(line)) return true;
+  }
+  return false;
+}
+
+// ── Deduplication: Python writes many lines to both stdout AND stderr, causing
+//    every line to appear twice.  We drop exact duplicates seen within 800 ms.
+const _recentRaw = new Map<string, number>();
+function isDuplicate(raw: string): boolean {
+  const now = Date.now();
+  const last = _recentRaw.get(raw);
+  if (last !== undefined && now - last < 800) return true;
+  _recentRaw.set(raw, now);
+  // Prune stale entries to avoid memory growth
+  if (_recentRaw.size > 200) {
+    const cutoff = now - 1600;
+    for (const [k, v] of _recentRaw) if (v < cutoff) _recentRaw.delete(k);
   }
   return false;
 }
@@ -446,6 +465,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
 
   // ── Append to activity feed ─────────────────────────────────────────────────
   function appendRaw(line: string) {
+    if (isDuplicate(line)) return;   // drop stdout/stderr duplicates
     const id = ++_activityCounter;
 
     // Handle [STATS] token lines — update token counter, don't add to feed
