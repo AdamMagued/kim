@@ -422,7 +422,12 @@ class KimAgent:
                 self._total_tokens["input"] += usage.get("input", 0)
                 self._total_tokens["output"] += usage.get("output", 0)
                 total = self._total_tokens["input"] + self._total_tokens["output"]
-                self._log("INFO", f"[STATS] input_tokens={usage.get('input', 0)} output_tokens={usage.get('output', 0)} total_tokens={total}")
+                self._log(
+                    "INFO",
+                    f"[STATS] input_tokens={usage.get('input', 0)}"
+                    f" output_tokens={usage.get('output', 0)}"
+                    f" total_tokens={total}",
+                )
 
             # ── Tool call ────────────────────────────────────────────────
             if response["type"] == "tool_call":
@@ -724,7 +729,13 @@ You MUST respond in EXACTLY one of these formats on every turn:
 - Maximum {self.max_iterations} iterations are allowed.
 """
         if self.config.get("voice", {}).get("human_quirks", False):
-            prompt += "\n## Voice Directives\nYou are speaking aloud. You MUST use conversational fillers (like 'Hmm...', 'Let's see...', 'Umm', 'Alright'). Speak casually, use short punchy sentences, and sound like a human peer thinking out loud. Avoid sounding like a formal AI assistant.\n"
+            prompt += (
+                "\n## Voice Directives\n"
+                "You are speaking aloud. You MUST use conversational fillers "
+                "(like 'Hmm...', 'Let\'s see...', 'Umm', 'Alright'). "
+                "Speak casually, use short punchy sentences, and sound like a "
+                "human peer thinking out loud. Avoid sounding like a formal AI assistant.\n"
+            )
 
         # Inject KIM.md project instructions
         instruction_files = discover_instruction_files()

@@ -17,7 +17,6 @@ Return value:
 """
 
 import logging
-import os
 from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)

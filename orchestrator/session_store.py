@@ -9,10 +9,10 @@ Usage:
     store = SessionStore()
     store.append_message({"role": "user", "content": "..."})
     store.save_summary("User asked Kim to open Chrome and navigate to...")
-    
+
     # Resume:
     messages = SessionStore.load_session("abc123")
-    
+
     # Recent context:
     summaries = SessionStore.recent_summaries(count=3)
 """
@@ -22,7 +22,6 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import os
 from datetime import date
 from pathlib import Path
 from typing import Optional
