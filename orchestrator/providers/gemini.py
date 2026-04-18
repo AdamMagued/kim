@@ -136,10 +136,21 @@ class GeminiProvider(BaseProvider):
     # ------------------------------------------------------------------
 
     def _parse_response(self, response) -> dict:
+        # Extract token usage first — available on all response types
+        usage: dict = {}
+        try:
+            um = response.usage_metadata
+            usage = {
+                "input": getattr(um, "prompt_token_count", 0) or 0,
+                "output": getattr(um, "candidates_token_count", 0) or 0,
+            }
+        except Exception:
+            pass
+
         try:
             candidate = response.candidates[0]
         except (AttributeError, IndexError):
-            return {"type": "text", "content": ""}
+            return {"type": "text", "content": "", "usage": usage}
 
         for part in candidate.content.parts:
             if hasattr(part, "function_call") and part.function_call.name:
@@ -147,12 +158,13 @@ class GeminiProvider(BaseProvider):
                     "type": "tool_call",
                     "tool": part.function_call.name,
                     "args": dict(part.function_call.args),
+                    "usage": usage,
                 }
             if hasattr(part, "text") and part.text:
-                return {"type": "text", "content": part.text}
+                return {"type": "text", "content": part.text, "usage": usage}
 
         # Fallback to response.text accessor
         try:
-            return {"type": "text", "content": response.text}
+            return {"type": "text", "content": response.text, "usage": usage}
         except Exception:
-            return {"type": "text", "content": ""}
+            return {"type": "text", "content": "", "usage": usage}

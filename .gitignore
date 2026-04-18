@@ -1,24 +1,49 @@
 # Secret Keys (CRITICAL)
 .env
+.env.*
+!.env.example
 
 # Python specific
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
+dist/
+build/
 venv/
 env/
 .venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 
 # Project Specific
 logs/
 sessions/
+kim_sessions/
 data/*.sqlite
 temp/
 screenshots/
+# Chrome CDP user-data directory created at runtime by the browser provider
+chrome_data/
+# Playwright browser cache
+.playwright/
+
+# Node / Frontend
+node_modules/
+desktop/node_modules/
+desktop/dist/
+
+# Rust / Tauri
+target/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+*.orig
 
 # OS specific
 .DS_Store
 Thumbs.db
+desktop/.DS_Store
 
 # Project config that might contain paths specific to your PC
 # (Only ignore this if you want to keep your PROJECT_ROOT path private)
