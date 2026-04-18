@@ -830,9 +830,11 @@ async def mcp_agent_context(
                 logger.debug("tray.voice not available — voice disabled")
 
     async with mcp_session_context(config) as session:
+        store = SessionStore(session_id=resume_session_id) if resume_session_id else SessionStore()
         agent = KimAgent(
             config=config, session=session, provider=provider,
             ui_bridge=ui_bridge, voice_engine=_voice,
+            session_store=store,
             resume_session_id=resume_session_id,
         )
         try:

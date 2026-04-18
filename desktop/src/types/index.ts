@@ -107,6 +107,7 @@ export interface Settings {
   claw_sessions_dir: string;
   project_root: string;
   provider: Provider;
+  allow_message_queue: boolean;
   theme: Theme;
   accent: AccentTheme;
   voice: VoiceSettings;
@@ -118,6 +119,7 @@ export const DEFAULT_SETTINGS: Settings = {
   claw_sessions_dir: '',
   project_root: '',
   provider: 'browser',
+  allow_message_queue: false,
   theme: 'system',
   accent: 'indigo',
   voice: {

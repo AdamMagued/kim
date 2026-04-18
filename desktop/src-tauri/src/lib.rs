@@ -827,15 +827,20 @@ fn build_bridge_complete_script(
 
     await sleep(300);
 
+        const getSendButton = () => {
+            return findElement(cfg.send_selectors, { visible: true, enabled: true })
+                || findElement(cfg.send_selectors, { visible: false, enabled: true });
+        };
+
         // Give reactive UIs a moment to enable the send button.
         for (let i = 0; i < 20; i++) {
-                        const btn = findElement(cfg.send_selectors, { visible: true, enabled: true });
+                        const btn = getSendButton();
                         if (btn) break;
             await sleep(120);
         }
 
     let sent = false;
-        const sendEl = findElement(cfg.send_selectors, { visible: true, enabled: true });
+        const sendEl = getSendButton();
         if (sendEl) {
             sendEl.click();
             sent = true;
@@ -851,6 +856,15 @@ fn build_bridge_complete_script(
                 key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
             }));
     }
+        if (!sent) {
+            try {
+                const form = inputEl.closest('form');
+                if (form) {
+                    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                    sent = true;
+                }
+            } catch (_) {}
+        }
 
     const responseDeadline = Date.now() + 90000;
     if (responseSel) {
@@ -1162,6 +1176,41 @@ fn handle_webview_bridge_request(
                 }
             }
 
+            let hidden_retry_needed = match &completion {
+                Ok(payload) => {
+                    if payload.ok {
+                        false
+                    } else {
+                        let err = payload.error.clone().unwrap_or_default().to_lowercase();
+                        err.contains("could not find input selector")
+                            || err.contains("could not read model response")
+                            || err.contains("timed out")
+                    }
+                }
+                Err(err) => {
+                    let e = err.to_lowercase();
+                    e.contains("could not find input selector")
+                        || e.contains("could not read model response")
+                        || e.contains("timed out")
+                }
+            };
+
+            if hidden_retry_needed {
+                let was_hidden = window.is_visible().map(|v| !v).unwrap_or(false);
+                if was_hidden {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    std::thread::sleep(Duration::from_millis(380));
+                    completion = run_bridge_completion_once(
+                        &window,
+                        &site,
+                        &parsed.prompt,
+                        &parsed.attachments,
+                    );
+                    let _ = window.hide();
+                }
+            }
+
             match completion {
                 Ok(payload) => {
                     if payload.ok {
@@ -1391,6 +1440,7 @@ async fn send_task(
     task: String,
     provider: Option<String>,
     project_root: Option<String>,
+    resume_session_id: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TaskState>,
 ) -> Result<String, String> {
@@ -1454,6 +1504,15 @@ async fn send_task(
             eprintln!("[Kim] Browser provider using in-app bridge (no Chrome CDP launch)");
         }
     }
+
+    if let Some(resume_id) = resume_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        cmd.arg("--resume").arg(resume_id);
+    }
+
     cmd.arg("--provider").arg(&provider_arg);
 
     let mut child = cmd

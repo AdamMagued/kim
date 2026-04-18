@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { SessionInfo, KimMessage, Settings, KimAccount } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { BrowserProviderPicker } from './BrowserProviderPicker';
 import { useChromaShader } from '../hooks/useChromaShader';
+import { toast } from './Toast';
 
 /** Subtle chrome WebGL backdrop, matching the onboarding shader. */
 function ChatChromaBackdrop() {
@@ -301,6 +302,37 @@ const KIM_SHORTCUTS = [
   { keys: ['⇧', '↵'], label: 'New line in message' },
 ];
 
+const PROVIDER_LABELS: Record<string, string> = {
+  claude: 'Claude',
+  openai: 'OpenAI',
+  gemini: 'Gemini',
+  deepseek: 'DeepSeek',
+  browser: 'Browser',
+  'browser:claude': 'Browser Claude',
+  'browser:chatgpt': 'Browser ChatGPT',
+  'browser:gemini': 'Browser Gemini',
+  'browser:grok': 'Browser Grok',
+  'browser:deepseek': 'Browser DeepSeek',
+  'browser:custom': 'Browser Custom',
+};
+
+interface PendingTask {
+  id: number;
+  text: string;
+  provider: string;
+}
+
+function makeConversationId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function providerLabel(provider: string): string {
+  return PROVIDER_LABELS[provider] ?? provider;
+}
+
 function getGreeting(name: string): string {
   const hour = new Date().getHours();
   if (hour < 5) return `Late night, ${name}`;
@@ -391,12 +423,20 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   const [taskError, setTaskError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
+  const [queuedTasks, setQueuedTasks] = useState<PendingTask[]>([]);
+  const [interruptTask, setInterruptTask] = useState<PendingTask | null>(null);
+  const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
+  const [autoFollowOutput, setAutoFollowOutput] = useState(true);
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
+  const [conversationId] = useState(() => makeConversationId());
 
   const bottomRef = useRef<HTMLDivElement>(null);
+  const outputRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const startTimeRef = useRef<number | null>(null);
+  const currentTaskRef = useRef<PendingTask | null>(null);
+  const previousProviderRef = useRef(settings.provider);
   // Set to true when the kim-agent-done event fires; prevents the invoke()
   // rejection from double-reporting errors.
   const doneHandledRef = useRef(false);
@@ -463,10 +503,30 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       .finally(() => setLoadingMessages(false));
   }, [session, settings.kim_sessions_dir, settings.claw_sessions_dir]);
 
-  // ── Scroll to bottom ────────────────────────────────────────────────────────
+  // ── Scroll behavior ─────────────────────────────────────────────────────────
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, activity]);
+    const scroller = outputRef.current;
+    if (!newChatMode || !scroller) return;
+
+    const onScroll = () => {
+      const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+      setAutoFollowOutput(distanceFromBottom < 80);
+    };
+
+    onScroll();
+    scroller.addEventListener('scroll', onScroll, { passive: true });
+    return () => scroller.removeEventListener('scroll', onScroll);
+  }, [newChatMode]);
+
+  useEffect(() => {
+    if (!newChatMode) {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+      return;
+    }
+    if (autoFollowOutput) {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages, activity, newChatMode, autoFollowOutput]);
 
   // ── Reset state when entering a new chat ─────────────────────────────────────
   // This ensures that if an error or activity is present from a previous run,
@@ -489,6 +549,19 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       return () => clearTimeout(t);
     }
   }, [newChatMode]);
+
+  useEffect(() => {
+    const prev = previousProviderRef.current;
+    if (prev !== settings.provider && (activity.length > 0 || isRunning)) {
+      toast(
+        `Provider changed from ${providerLabel(prev)} to ${providerLabel(settings.provider)}. ` +
+          'Kim will continue this chat with shared memory on your next message.',
+        'info',
+        7000,
+      );
+    }
+    previousProviderRef.current = settings.provider;
+  }, [settings.provider, activity.length, isRunning]);
 
   // ── Append to activity feed ─────────────────────────────────────────────────
   function appendRaw(line: string) {
@@ -552,7 +625,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       onTaskDoneRef.current();
       if (!event.payload && !cancelFlag) {
         setTaskError('agent-error');
+        if (currentTaskRef.current) {
+          setLastFailedTask(currentTaskRef.current);
+        }
+      } else if (event.payload) {
+        setLastFailedTask(null);
       }
+      currentTaskRef.current = null;
       cancelFlag = false;
     }).then(fn => { unlistenDone = fn; });
 
@@ -561,6 +640,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       appendRaw('⏹ Task cancelled');
       setIsRunning(false);
       setCancelling(false);
+      currentTaskRef.current = null;
     }).then(fn => { unlistenCancelled = fn; });
 
     return () => {
@@ -573,6 +653,67 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   }, []);
 
   // ── Actions ─────────────────────────────────────────────────────────────────
+
+  const queueEnabled = Boolean(settings.allow_message_queue);
+
+  const resolveProvider = useCallback((): string => {
+    if (settings.provider === 'browser') return `browser:${browserProvider}`;
+    return settings.provider || 'browser';
+  }, [settings.provider, browserProvider]);
+
+  const makePendingTask = useCallback((text: string, providerOverride?: string): PendingTask => {
+    return {
+      id: Date.now() + Math.floor(Math.random() * 1000),
+      text,
+      provider: providerOverride ?? resolveProvider(),
+    };
+  }, [resolveProvider]);
+
+  const runPendingTask = useCallback(async (pending: PendingTask) => {
+    doneHandledRef.current = false;
+    currentTaskRef.current = pending;
+    setIsRunning(true);
+    setActivity([]);
+    setTaskError(null);
+    setTokenStats(null);
+    setCancelling(false);
+    setAutoFollowOutput(true);
+
+    try {
+      await invoke('send_task', {
+        task: pending.text,
+        provider: pending.provider,
+        projectRoot: settings.project_root || null,
+        resumeSessionId: conversationId,
+      });
+    } catch (err) {
+      // kim-agent-done fires BEFORE invoke() rejects on process failure.
+      // If the event already handled everything, skip the duplicate rejection.
+      if (!doneHandledRef.current) {
+        setIsRunning(false);
+        setTaskError(friendlyError(String(err)));
+        setLastFailedTask(pending);
+        onTaskDoneRef.current(); // refresh sidebar even on invoke-level failures
+      }
+    }
+  }, [conversationId, settings.project_root]);
+
+  useEffect(() => {
+    if (isRunning) return;
+
+    if (interruptTask) {
+      const next = interruptTask;
+      setInterruptTask(null);
+      void runPendingTask(next);
+      return;
+    }
+
+    if (queuedTasks.length > 0) {
+      const [next, ...rest] = queuedTasks;
+      setQueuedTasks(rest);
+      void runPendingTask(next);
+    }
+  }, [isRunning, interruptTask, queuedTasks, runPendingTask]);
 
   async function handleCancel() {
     if (!isRunning || cancelling) return;
@@ -588,35 +729,66 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const task = taskInput.trim();
-    if (!task || isRunning) return;
+    if (!task) return;
 
-    doneHandledRef.current = false;
-    setIsRunning(true);
-    setActivity([]);
-    setTaskError(null);
-    setTokenStats(null);
+    const pending = makePendingTask(task);
+
     setTaskInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
-    try {
-      // Pass the browser sub-provider so the Python agent loads the correct
-      // site config (e.g. 'browser:chatgpt' → chatgpt.com selectors).
-      const resolvedProvider = settings.provider === 'browser'
-        ? `browser:${browserProvider}`
-        : (settings.provider || null);
-      await invoke('send_task', {
-        task,
-        provider: resolvedProvider,
-        projectRoot: settings.project_root || null,
-      });
-    } catch (err) {
-      // kim-agent-done fires BEFORE invoke() rejects on process failure.
-      // If the event already handled everything, skip the duplicate rejection.
-      if (!doneHandledRef.current) {
-        setIsRunning(false);
-        setTaskError(friendlyError(String(err)));
-        onTaskDoneRef.current(); // refresh sidebar even on invoke-level failures
+    if (isRunning) {
+      if (queueEnabled) {
+        const nextCount = queuedTasks.length + 1;
+        setQueuedTasks(prev => [...prev, pending]);
+        toast(`Queued message #${nextCount}. Kim will run it automatically next.`, 'info', 3000);
+      } else {
+        setQueuedTasks([]);
+        setInterruptTask(pending);
+        toast('Interrupting current task and replacing it with your latest message.', 'warning', 4500);
+        if (!cancelling) {
+          await handleCancel();
+        }
       }
+      return;
+    }
+
+    await runPendingTask(pending);
+  }
+
+  async function handleRetryLast() {
+    if (!lastFailedTask) return;
+    const retryTask = makePendingTask(lastFailedTask.text, lastFailedTask.provider);
+    setTaskError(null);
+
+    if (isRunning) {
+      if (queueEnabled) {
+        setQueuedTasks(prev => [...prev, retryTask]);
+        toast('Retry queued. It will run after the current task.', 'info', 3000);
+      } else {
+        setQueuedTasks([]);
+        setInterruptTask(retryTask);
+        toast('Retry will run after current task is interrupted.', 'warning', 4000);
+        if (!cancelling) {
+          await handleCancel();
+        }
+      }
+      return;
+    }
+
+    await runPendingTask(retryTask);
+  }
+
+  function handleBrowserProviderSelect(nextProvider: string) {
+    if (nextProvider === browserProvider) return;
+    const previous = browserProvider;
+    setBrowserProvider(nextProvider);
+    if (activity.length > 0 || isRunning || queuedTasks.length > 0 || interruptTask) {
+      toast(
+        `Switched from ${providerLabel(`browser:${previous}`)} to ${providerLabel(`browser:${nextProvider}`)}. ` +
+          'Next message keeps this chat memory and uses the new provider.',
+        'info',
+        7500,
+      );
     }
   }
 
@@ -675,6 +847,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   // ── Composer ─────────────────────────────────────────────────────────────────
 
   function renderComposer() {
+    const resolvedLabel = providerLabel(resolveProvider());
+
     return (
       <form className="kim-composer" onSubmit={handleSubmit}>
         <div className={'kim-composer__box' + (isRunning ? ' kim-composer__box--running' : '')}>
@@ -682,9 +856,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
             ref={textareaRef}
             value={taskInput}
             onChange={handleTextareaInput}
-            placeholder={isRunning ? 'Kim is working — press Stop to cancel' : 'Message Kim…'}
+            placeholder={isRunning
+              ? (queueEnabled ? 'Kim is working — type now, Send adds to queue' : 'Kim is working — Send interrupts current task')
+              : 'Message Kim…'}
             rows={1}
-            disabled={isRunning}
             onKeyDown={e => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
@@ -695,7 +870,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
           />
 
           <div className="kim-composer__actions">
-            {isRunning ? (
+            {isRunning && (
               <button
                 type="button"
                 onClick={handleCancel}
@@ -708,26 +883,39 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
                   <rect x="6" y="6" width="12" height="12" rx="2" />
                 </svg>
               </button>
-            ) : (
-              <button
-                type="submit"
-                disabled={!taskInput.trim()}
-                className="kim-btn kim-btn--send"
-                aria-label="Send"
-              >
-                <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M5 12h14M13 5l7 7-7 7" />
-                </svg>
-              </button>
             )}
+            <button
+              type="submit"
+              disabled={!taskInput.trim()}
+              className="kim-btn kim-btn--send"
+              aria-label="Send"
+            >
+              <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M5 12h14M13 5l7 7-7 7" />
+              </svg>
+            </button>
           </div>
         </div>
         <div className="kim-composer__hint">
-          <span><kbd>↵</kbd> to send</span>
+          <span>
+            {isRunning
+              ? (queueEnabled ? 'Send queues this message' : 'Send interrupts current task')
+              : <><kbd>↵</kbd> to send</>}
+          </span>
           <span className="kim-composer__hint-sep">·</span>
           <span><kbd>⇧</kbd>+<kbd>↵</kbd> for new line</span>
           <span className="kim-composer__hint-sep">·</span>
-          <span>via <strong>{settings.provider}</strong></span>
+          <span>via <strong>{resolvedLabel}</strong></span>
+          {(queuedTasks.length > 0 || interruptTask) && (
+            <>
+              <span className="kim-composer__hint-sep">·</span>
+              <span>
+                {interruptTask
+                  ? '1 interrupt pending'
+                  : `${queuedTasks.length} queued`}
+              </span>
+            </>
+          )}
         </div>
       </form>
     );
@@ -760,7 +948,16 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     return (
       <div className="kim-chat">
         <ChatChromaBackdrop />
-        <div className="kim-chat__output">
+        <div className="kim-chat__output" ref={outputRef}>
+          {hasStarted && settings.provider === 'browser' && (
+            <div className={'kim-provider-switch-wrap' + (hasStarted ? ' kim-provider-switch-wrap--active' : '')}>
+              <BrowserProviderPicker
+                selected={browserProvider}
+                onSelect={handleBrowserProviderSelect}
+              />
+            </div>
+          )}
+
           {!hasStarted && (
             <div className="kim-new-chat-empty">
               <div className="kim-new-chat-empty__badge">
@@ -775,7 +972,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
               {settings.provider === 'browser' && (
                 <BrowserProviderPicker
                   selected={browserProvider}
-                  onSelect={setBrowserProvider}
+                  onSelect={handleBrowserProviderSelect}
                 />
               )}
 
@@ -831,12 +1028,30 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
             <div className="kim-task-error" role="alert">
               <span className="kim-task-error__icon">⚠</span>
               <span>{taskError}</span>
+              {lastFailedTask && (
+                <button type="button" className="kim-task-error__retry" onClick={() => void handleRetryLast()}>
+                  Retry
+                </button>
+              )}
             </div>
           )}
           {taskError === 'agent-error' && (
             <div className="kim-task-error" role="alert">
               <span className="kim-task-error__icon">⚠</span>
               <span>Kim ran into a problem and had to stop. Check the activity above for clues, or try rephrasing your task.</span>
+              {lastFailedTask && (
+                <button type="button" className="kim-task-error__retry" onClick={() => void handleRetryLast()}>
+                  Retry
+                </button>
+              )}
+            </div>
+          )}
+
+          {(queuedTasks.length > 0 || interruptTask) && (
+            <div className="kim-queue-indicator" role="status" aria-live="polite">
+              {interruptTask
+                ? 'Interrupt pending. Current task will be replaced when cancellation completes.'
+                : `${queuedTasks.length} queued message${queuedTasks.length === 1 ? '' : 's'} waiting.`}
             </div>
           )}
 
@@ -868,6 +1083,21 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
               {!cancelling && elapsed > 0 && (
                 <span className="kim-working-indicator__timer">{formatElapsed(elapsed)}</span>
               )}
+            </div>
+          )}
+
+          {!autoFollowOutput && (activity.length > 0 || isRunning) && (
+            <div className="kim-jump-latest-wrap">
+              <button
+                type="button"
+                className="kim-jump-latest-btn"
+                onClick={() => {
+                  setAutoFollowOutput(true);
+                  bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+                }}
+              >
+                Jump to latest
+              </button>
             </div>
           )}
 
