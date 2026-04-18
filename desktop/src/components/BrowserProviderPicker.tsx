@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { toast } from './Toast';
 
@@ -117,70 +116,26 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
 
   const selectedProvider = BROWSER_PROVIDERS.find(p => p.id === selected);
 
-  /** Extract a human-readable string from a Tauri event (which is not a plain string) */
-  function extractErrorMessage(e: unknown, providerName: string): string {
-    // Tauri events are objects: { event: string, payload: unknown, id: number }
-    if (e && typeof e === 'object') {
-      const payload = (e as Record<string, unknown>).payload;
-      if (typeof payload === 'string' && payload.length > 0) {
-        // Map technical errors to user-friendly messages
-        if (payload.includes('not allowed') || payload.includes('permission') || payload.includes('capability'))
-          return `Kim needs permission to open ${providerName}. Try restarting Kim.`;
-        if (payload.includes('network') || payload.includes('unreachable') || payload.includes('dns'))
-          return 'Could not connect — check your internet connection.';
-        return payload.length < 200 ? payload : 'Could not open window — check your internet connection.';
-      }
-    }
-    if (typeof e === 'string' && e.length > 0) return e;
-    // Generic fallback — the most common cause is network/CSP
-    return `Could not open ${providerName} inside Kim. Try opening it in your system browser instead.`;
-  }
 
   async function openInKim(provider: BrowserProvider) {
     const targetUrl = provider.url ?? customUrl.trim();
+
     if (!targetUrl || targetUrl === 'https://') {
       toast('Please enter a URL for your custom AI provider.', 'warning');
       return;
     }
 
     setOpeningId(provider.id);
-    const label = `browser-signin-${provider.id}`;
-
     try {
-      // Focus existing window if it's already open
-      const existing = await WebviewWindow.getByLabel(label);
-      if (existing) {
-        await existing.setFocus();
-        setOpeningId(null);
-        return;
-      }
-
-      const w = new WebviewWindow(label, {
-        url: targetUrl,
-        title: `Sign in to ${provider.name}`,
-        width: 1100,
-        height: 760,
-        center: true,
-        resizable: true,
-        decorations: true,
-      });
-
-      w.once('tauri://created', () => {
-        toast(`${provider.name} opened — sign in, then come back to Kim.`, 'info', 5000);
-        setOpeningId(null);
-      });
-
-      w.once('tauri://error', (e: unknown) => {
-        const msg = extractErrorMessage(e, provider.name);
-        // Offer to open in system browser as fallback
-        toast(`${msg} Opening in your browser instead…`, 'warning', 6000);
-        openUrl(targetUrl).catch(() => {});
-        setOpeningId(null);
-      });
+      // Open the provider URL in the system browser (Chrome with CDP).
+      // The browser provider's CDP connection will pick up the signed-in
+      // session automatically — no Tauri webview needed.
+      await openUrl(targetUrl);
+      toast(`${provider.name} opened in your browser — sign in, then send your task from Kim.`, 'info', 6000);
     } catch (err) {
-      // WebviewWindow constructor threw — open in system browser as fallback
-      toast(`Opening ${provider.name} in your system browser.`, 'info', 4000);
-      openUrl(targetUrl).catch(() => {});
+      const msg = typeof err === 'string' ? err : `Could not open ${provider.name}.`;
+      toast(msg, 'error', 5000);
+    } finally {
       setOpeningId(null);
     }
   }
