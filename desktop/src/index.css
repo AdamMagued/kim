@@ -782,22 +782,22 @@ kbd {
   width: 100%;
   height: 100%;
   display: block;
-  opacity: 0.10;
+  opacity: 0.035;
   mix-blend-mode: screen;
-  filter: saturate(0.92) contrast(1.05);
-  animation: kim-chat-backdrop-fade 1.2s ease both;
+  filter: saturate(0.85) contrast(1.08);
+  animation: kim-chat-backdrop-fade 1.4s ease both;
 }
 :root[data-theme="light"] .kim-chat__backdrop-canvas {
-  opacity: 0.08;
+  opacity: 0.025;
   mix-blend-mode: multiply;
 }
 .kim-chat__backdrop-scrim {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(120% 80% at 50% 0%, transparent 0%, var(--bg) 75%),
+    radial-gradient(130% 90% at 50% 0%, transparent 0%, var(--bg) 65%),
     linear-gradient(180deg, transparent 0%, var(--bg) 100%);
-  opacity: 0.55;
+  opacity: 0.72;
 }
 @keyframes kim-chat-backdrop-fade {
   from { opacity: 0; }

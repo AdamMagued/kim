@@ -31,8 +31,8 @@ const ACCENTS: { value: AccentTheme; label: string; light: string; dark: string 
 ];
 
 const TYPING_ANIMATIONS: { value: string; label: string; desc: string; icon: string }[] = [
-  { value: 'none',       label: 'Instant',    desc: 'No animation',                    icon: '⚡' },
-  { value: 'typewriter', label: 'Typewriter',  desc: 'Characters appear one by one',   icon: '⌨️' },
+  { value: 'none',       label: 'Instant',    desc: 'No animation',                    icon: '—' },
+  { value: 'typewriter', label: 'Typewriter',  desc: 'Characters appear one by one',   icon: '|' },
   { value: 'word-fade',  label: 'Word fade',   desc: 'Words drift up and fade in',     icon: '✦' },
   { value: 'char-blur',  label: 'Char blur',   desc: 'Letters crystallise from blur',  icon: '◎' },
 ];
@@ -1008,11 +1008,11 @@ mcp_servers:
 // ── Feedback section ──────────────────────────────────────────────────────────
 
 const FEEDBACK_CATEGORIES = [
-  { id: 'bug',     label: '🐛 Bug',             desc: 'Something is broken or not working' },
-  { id: 'feature', label: '✨ Feature request',  desc: 'Something you\'d like Kim to do' },
-  { id: 'general', label: '💬 General feedback', desc: 'Anything on your mind' },
-  { id: 'praise',  label: '🙏 Praise',           desc: 'Tell us what you love' },
-  { id: 'other',   label: '📝 Other',            desc: 'Anything else' },
+  { id: 'bug',     label: 'Bug',             desc: 'Something is broken or not working' },
+  { id: 'feature', label: 'Feature request', desc: 'Something you\'d like Kim to do' },
+  { id: 'general', label: 'General feedback', desc: 'Anything on your mind' },
+  { id: 'praise',  label: 'Praise',          desc: 'Tell us what you love' },
+  { id: 'other',   label: 'Other',           desc: 'Anything else' },
 ];
 
 function FeedbackSection() {
@@ -1046,7 +1046,7 @@ function FeedbackSection() {
       <div className="kim-settings-content">
         <div className="kim-settings-content__title">Feedback</div>
         <div className="kim-feedback-sent">
-          <div className="kim-feedback-sent__icon">🙏</div>
+          <div className="kim-feedback-sent__icon">✓</div>
           <div className="kim-feedback-sent__title">Thank you!</div>
           <div className="kim-feedback-sent__desc">Your feedback helps make Kim better for everyone.</div>
           <button className="kim-btn kim-btn--secondary" onClick={() => setSent(false)} style={{ marginTop: 16 }}>
