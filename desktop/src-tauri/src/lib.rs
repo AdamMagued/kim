@@ -360,6 +360,13 @@ async fn send_task(
         .arg("--task")
         .arg(&task)
         .current_dir(&root)
+        // Tell the orchestrator and MCP server exactly where the kim repo lives.
+        // Without this, mcp_session_context falls back to Path.cwd() which may
+        // differ from the repo root when running inside the Tauri bundle.
+        .env("PROJECT_ROOT", root.to_str().unwrap_or(""))
+        // Ensure `import mcp_server.server` resolves from the repo root even when
+        // the Python cwd is something unexpected.
+        .env("PYTHONPATH", root.to_str().unwrap_or(""))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
