@@ -255,7 +255,13 @@ async def mcp_session_context(config: dict):
     )
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
+            try:
+                await asyncio.wait_for(session.initialize(), timeout=30.0)
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    "MCP server did not respond within 30 seconds. "
+                    "Ensure the mcp_server package is installed and importable."
+                )
             logger.info("MCP session initialized")
             yield session
 
@@ -359,9 +365,17 @@ class KimAgent:
         self._log("INFO", f"=== Starting task: {task!r} ===")
         self._screenshot_hashes = []
 
+        # Let the provider reset any per-session state (e.g. BrowserProvider
+        # clears _sent_system_prompt so the new task gets its system prompt).
+        if hasattr(self.provider, "reset_session"):
+            self.provider.reset_session()
+
         # Resume from saved session or start fresh
         if self._resume_session_id:
-            saved = SessionStore.load_session(self._resume_session_id)
+            saved = SessionStore.load_session(
+                self._resume_session_id,
+                base_dir=self._session_store.base_dir,
+            )
             if saved:
                 self._log("INFO", f"Resuming session {self._resume_session_id} ({len(saved)} messages)")
                 self.memory.load_from_messages(saved)
@@ -654,9 +668,11 @@ class KimAgent:
         if "ratelimit" in error_type:
             return True
 
-        # Server errors (HTTP 5xx)
+        # Server errors (HTTP 5xx) — match only standalone status codes,
+        # not substrings like '500' inside file names or other numbers.
+        import re as _re_retry
         for code in ("500", "502", "503", "529"):
-            if code in error_str:
+            if _re_retry.search(r'(?<![\d])' + code + r'(?![\d])', error_str):
                 return True
         if "server" in error_str and "error" in error_str:
             return True

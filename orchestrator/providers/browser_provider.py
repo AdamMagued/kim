@@ -241,6 +241,13 @@ class BrowserProvider(BaseProvider):
         # calls only send the latest delta message.
         self._sent_system_prompt = False
 
+    def reset_session(self) -> None:
+        """Call before each new task to force system prompt re-injection.
+        Without this, reusing the same BrowserProvider instance for multiple
+        tasks skips the system prompt on the second task and beyond.
+        """
+        self._sent_system_prompt = False
+
         # Merge user-defined custom sites from config.yaml into the lookup table.
         # Each entry must have url_pattern + at least input/send/response selectors.
         # Selectors can be a string or a list; strings are wrapped in a list.
@@ -321,7 +328,7 @@ class BrowserProvider(BaseProvider):
                 return self._parse_response(raw_response)
         except Exception as e:
             logger.error(f"BrowserProvider.complete failed: {e}", exc_info=True)
-            return {"type": "text", "content": f"BROWSER_ERROR: {e}"}
+            return {"type": "text", "content": f"NEED_HELP: Browser connection failed — {e}"}
 
     # ==================================================================
     # CDP connection / headless auto-launch
@@ -429,14 +436,21 @@ class BrowserProvider(BaseProvider):
             f"Headless Chromium ready — {len(context.pages)} page(s) loaded"
         )
 
-        # Return the browser that owns this context (may be None for
-        # persistent contexts — we handle this in _find_chat_page)
-        return context.browser or context  # type: ignore[return-value]
+        # launch_persistent_context gives us a BrowserContext with .browser == None.
+        # Return the context directly; _list_pages and _find_chat_page handle both types.
+        return context  # type: ignore[return-value]
 
-    async def _list_pages(self, browser: Browser) -> list[str]:
-        pages = []
-        for ctx in browser.contexts:
-            for page in ctx.pages:
+    async def _list_pages(self, browser) -> list[str]:
+        """Return URLs of all open pages. Handles both Browser and BrowserContext."""
+        pages: list[str] = []
+        if hasattr(browser, 'contexts'):
+            # Standard Browser (CDP mode)
+            for ctx in browser.contexts:
+                for page in ctx.pages:
+                    pages.append(page.url)
+        elif hasattr(browser, 'pages'):
+            # BrowserContext (persistent/headless launch)
+            for page in browser.pages:
                 pages.append(page.url)
         return pages
 
@@ -946,11 +960,19 @@ class BrowserProvider(BaseProvider):
             ]
             tools_json = json.dumps(compact_tools, indent=2)
 
+            import platform as _platform, os as _os
+            _sys = _platform.system()
+            _home = _os.path.expanduser("~")
+            if _sys == "Darwin":
+                _os_hint = f"You are running on macOS. Home is {_home}. Use 'open' to launch apps and POSIX paths."
+            elif _sys == "Linux":
+                _os_hint = f"You are running on Linux. Home is {_home}. Use 'xdg-open' to launch apps and POSIX paths."
+            else:
+                _os_hint = f"You are running on Windows. Home is {_home}. Use 'start' to launch apps and Windows paths."
+
             prompt = (
                 f"[SYSTEM]\n{system}\n"
-                "You are running on macOS Tahoe. Use POSIX file paths "
-                "(e.g., /Users/adammaged/Desktop/) and Mac-specific "
-                "terminal commands (like 'open' instead of 'start').\n\n"
+                f"{_os_hint}\n\n"
                 f"[AVAILABLE TOOLS]\n{tools_json}\n\n"
                 "[INSTRUCTIONS]\n"
                 "Respond with EXACTLY ONE of:\n"

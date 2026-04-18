@@ -82,6 +82,10 @@ class OpenAIProvider(BaseProvider):
             response = await self._client.chat.completions.create(**kwargs)
         except openai.RateLimitError:
             raise
+        except openai.AuthenticationError:
+            raise  # 401 — bad key; non-retryable
+        except openai.PermissionDeniedError:
+            raise  # 403 — non-retryable
         except openai.APIError as e:
             logger.error(f"OpenAI API error: {e}")
             return {"type": "text", "content": f"API_ERROR: {e}"}

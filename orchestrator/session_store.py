@@ -79,8 +79,6 @@ class SessionStore:
 
         with open(self.session_file, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-            f.flush()
-            os.fsync(f.fileno())
 
         self._message_count += 1
 

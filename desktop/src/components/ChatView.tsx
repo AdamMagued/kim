@@ -58,6 +58,8 @@ const HIDDEN_SUBSTRINGS = [
   // Python venv / site-packages paths
   'site-packages', 'venv/lib/python', 'venv/bin/python',
   '/opt/homebrew/', '/usr/local/lib/python',
+  // Node.js / npm deprecation warnings that leak into stderr
+  '--trace-deprecation', 'DeprecationWarning', 'ExperimentalWarning',
   // Error while finding module
   'Error while finding module specification',
   // asyncio runner internals
@@ -107,47 +109,54 @@ function isNoiseLine(raw: string): boolean {
   return false;
 }
 
-// ── Deduplication: Python writes many lines to both stdout AND stderr, causing
-//    every line to appear twice.  We drop exact duplicates seen within 800 ms.
-const _recentRaw = new Map<string, number>();
-function isDuplicate(raw: string): boolean {
-  const now = Date.now();
-  const last = _recentRaw.get(raw);
-  if (last !== undefined && now - last < 800) return true;
-  _recentRaw.set(raw, now);
-  // Prune stale entries to avoid memory growth
-  if (_recentRaw.size > 200) {
-    const cutoff = now - 1600;
-    for (const [k, v] of _recentRaw) if (v < cutoff) _recentRaw.delete(k);
-  }
-  return false;
-}
+// NOTE: _recentRaw has been moved inside the ChatView component as a useRef
+// to avoid cross-session pollution. See the `recentRawRef` ref below.
 
 /** Friendly names + icons for known tool calls */
 const TOOL_MAP: Record<string, { icon: string; label: (args: Record<string, unknown>) => string }> = {
+  // File operations (actual MCP tool names)
   read_file:          { icon: '›', label: a => `Reading \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
   write_file:         { icon: '›', label: a => `Writing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
   create_file:        { icon: '›', label: a => `Creating \`${basename(String(a.path ?? ''))}\`` },
   edit_file:          { icon: '›', label: a => `Editing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
+  append_file:        { icon: '›', label: a => `Appending to \`${basename(String(a.path ?? ''))}\`` },
   delete_file:        { icon: '›', label: a => `Deleting \`${basename(String(a.path ?? ''))}\`` },
+  list_dir:           { icon: '›', label: a => `Listing \`${basename(String(a.path ?? a.directory ?? ''))}\`` },
+  // Keep legacy alias in case older server versions use it
   list_directory:     { icon: '›', label: a => `Listing \`${basename(String(a.path ?? a.directory ?? ''))}\`` },
+  find_files:         { icon: '›', label: a => `Searching for \`${String(a.pattern ?? a.query ?? '')}\`` },
   search_files:       { icon: '›', label: a => `Searching for \`${String(a.pattern ?? a.query ?? '')}\`` },
+  search_in_files:    { icon: '›', label: a => `Searching code for \`${String(a.pattern ?? '')}\`` },
   grep:               { icon: '›', label: a => `Searching code for \`${String(a.pattern ?? '')}\`` },
+  // Shell
   run_command:        { icon: '›', label: a => `Running \`${shorten(String(a.command ?? a.cmd ?? ''), 60)}\`` },
-  execute_command:    { icon: '›', label: a => `Running \`${shorten(String(a.command ?? ''), 60)}\`` },
-  bash:               { icon: '›', label: a => `Running \`${shorten(String(a.command ?? ''), 60)}\`` },
-  browser_navigate:   { icon: '›', label: a => `Opening ${String(a.url ?? 'a web page')}` },
-  web_search:         { icon: '›', label: a => `Searching the web for "${String(a.query ?? '')}"\`` },
+  run_terminal:       { icon: '›', label: a => `Running \`${shorten(String(a.command ?? ''), 60)}\`` },
+  // Mouse / keyboard (actual MCP tool names)
   type_text:          { icon: '›', label: _a => 'Typing text' },
   click:              { icon: '›', label: _a => 'Clicking' },
+  double_click:       { icon: '›', label: _a => 'Double-clicking' },
+  right_click:        { icon: '›', label: _a => 'Right-clicking' },
   scroll:             { icon: '›', label: _a => 'Scrolling' },
   move_mouse:         { icon: '›', label: _a => 'Moving mouse' },
-  press_key:          { icon: '›', label: a => `Pressing key \`${String(a.key ?? '')}\`` },
+  press_key:          { icon: '›', label: a => `Pressing \`${String(a.key ?? '')}\`` },
+  hotkey:             { icon: '›', label: a => `Pressing \`${String(a.keys ?? a.key ?? '')}\`` },
+  drag:               { icon: '›', label: _a => 'Dragging' },
+  // Apps
   open_application:   { icon: '›', label: a => `Opening ${String(a.app_name ?? a.application ?? '')}` },
   close_application:  { icon: '›', label: a => `Closing ${String(a.app_name ?? '')}` },
+  // Clipboard
   read_clipboard:     { icon: '›', label: _a => 'Reading clipboard' },
   write_clipboard:    { icon: '›', label: _a => 'Writing to clipboard' },
+  // Screen reading
   get_screen_text:    { icon: '›', label: _a => 'Reading screen text' },
+  // Web
+  web_search:         { icon: '›', label: a => `Searching the web for "${String(a.query ?? '')}"` },
+  open_url:           { icon: '›', label: a => `Opening ${String(a.url ?? 'a web page')}` },
+  // Git
+  git_status:         { icon: '›', label: _a => 'Checking git status' },
+  git_commit:         { icon: '›', label: a => `Git commit: "${shorten(String(a.message ?? ''), 50)}"` },
+  git_diff:           { icon: '›', label: _a => 'Viewing git diff' },
+  // User interaction
   ask_user:           { icon: '›', label: a => `Asking: "${String(a.question ?? '')}"` },
 };
 
@@ -217,8 +226,8 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
   // Strip timestamp prefix: "2024-01-01 12:00:00,123 "
   const stripped = line.replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.,]?\d*\s+/, '');
 
-  // [TOOL] lines
-  const toolMatch = stripped.match(/\[TOOL\]\s+[\w.]+:\s+(\w+)\((.{0,200})\)/);
+  // [TOOL] lines — 'module:' prefix is optional in newer agent log format
+  const toolMatch = stripped.match(/\[TOOL\]\s+(?:[\w.]+:\s+)?(\w+)\((.{0,200})\)/);
   if (toolMatch) {
     const toolName = toolMatch[1];
     const argsRaw = toolMatch[2] ?? '{}';
@@ -391,6 +400,24 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   // Set to true when the kim-agent-done event fires; prevents the invoke()
   // rejection from double-reporting errors.
   const doneHandledRef = useRef(false);
+
+  // ── Deduplication (per-session, not module-global) ───────────────────────
+  // Python writes many lines to both stdout AND stderr, causing duplicates.
+  // We track exact duplicates seen within 800 ms and drop them.
+  const recentRawRef = useRef<Map<string, number>>(new Map());
+  const isDuplicate = (raw: string): boolean => {
+    const map = recentRawRef.current;
+    const now = Date.now();
+    const last = map.get(raw);
+    if (last !== undefined && now - last < 800) return true;
+    map.set(raw, now);
+    // Prune stale entries to prevent unbounded memory growth
+    if (map.size > 200) {
+      const cutoff = now - 1600;
+      for (const [k, v] of map) if (v < cutoff) map.delete(k);
+    }
+    return false;
+  };
 
   // Keep a stable ref to the onTaskDone callback
   const onTaskDoneRef = useRef(onTaskDone);
@@ -572,10 +599,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
     try {
-      // The orchestrator CLI only accepts the bare 'browser' token —
-      // the sub-provider (chatgpt / deepseek / etc.) is not a valid CLI argument.
+      // Pass the browser sub-provider so the Python agent loads the correct
+      // site config (e.g. 'browser:chatgpt' → chatgpt.com selectors).
       const resolvedProvider = settings.provider === 'browser'
-        ? 'browser'
+        ? `browser:${browserProvider}`
         : (settings.provider || null);
       await invoke('send_task', {
         task,

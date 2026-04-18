@@ -84,6 +84,7 @@ fn default_project_root() -> PathBuf {
         if user.exists() {
             return user;
         }
+        // Return the default location even if not yet created
         return user;
     }
     PathBuf::from(".")
@@ -318,6 +319,52 @@ async fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Chrome auto-launch for browser provider CDP
+// ---------------------------------------------------------------------------
+
+/// Try to start Chrome/Chromium with remote debugging enabled on port 9222.
+/// Probes common install locations on each platform.
+/// Returns Ok(()) if a candidate launched; Err if none were found.
+fn launch_chrome_for_cdp() -> Result<(), String> {
+    use std::process::Command as StdCommand;
+
+    #[cfg(target_os = "macos")]
+    let candidates: &[&str] = &[
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+    ];
+    #[cfg(target_os = "linux")]
+    let candidates: &[&str] = &[
+        "google-chrome", "google-chrome-stable", "chromium-browser", "chromium",
+    ];
+    #[cfg(target_os = "windows")]
+    let candidates: &[&str] = &[
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ];
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let candidates: &[&str] = &[];
+
+    for chrome in candidates {
+        let result = StdCommand::new(chrome)
+            .args([
+                "--remote-debugging-port=9222",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-popup-blocking",
+            ])
+            .spawn();
+        if result.is_ok() {
+            // Give Chrome 2 seconds to open the debug port before the agent connects.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            return Ok(());
+        }
+    }
+    Err("Chrome/Chromium not found. Install Google Chrome to use the browser provider.".to_string())
+}
+
 #[tauri::command]
 async fn send_task(
     task: String,
@@ -376,6 +423,16 @@ async fn send_task(
     let provider_arg = provider
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "browser".to_string());
+
+    // For browser provider: ensure Chrome is running with the CDP debug port
+    // before the Python agent tries to connect. This is a best-effort launch;
+    // if Chrome is already running on :9222 this is a no-op.
+    if provider_arg == "browser" || provider_arg.starts_with("browser:") {
+        if let Err(e) = launch_chrome_for_cdp() {
+            // Non-fatal: the Python agent will surface a NEED_HELP if it can't connect.
+            eprintln!("[Kim] Chrome launch skipped: {}", e);
+        }
+    }
     cmd.arg("--provider").arg(&provider_arg);
 
     let mut child = cmd
@@ -570,10 +627,10 @@ fn extract_voice_scalar<'a>(yaml: &'a str, key: &str) -> Option<&'a str> {
             continue;
         }
         if in_voice {
-            // Only look at direct children (2-space indent, no further nesting).
-            let trimmed = line.trim_start();
+            // Accept direct children indented with 1–4 spaces or a tab.
+            let trimmed = line.trim_start_matches(|c: char| c == ' ' || c == '\t');
             let indent = line.len() - trimmed.len();
-            if indent == 2 {
+            if indent >= 1 && indent <= 4 {
                 if let Some(rest) = trimmed.strip_prefix(&format!("{}:", key)) {
                     let v = rest.trim().trim_matches(|c| c == '"' || c == '\'');
                     return Some(v);
@@ -899,13 +956,38 @@ where
 }
 
 fn chrono_now() -> String {
-    // Simple ISO-8601-ish timestamp without pulling in chrono.
+    // Build a readable UTC timestamp without the chrono crate.
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!("unix:{}", secs)
+
+    // Convert Unix seconds to (year, month, day, h, m, s) UTC.
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    // Days since Unix epoch (1970-01-01)
+    let mut days = secs / 86400;
+    // Gregorian calendar algorithm (Julian Day Number method)
+    let mut year = 1970u64;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let days_in_year = if leap { 366 } else { 365 };
+        if days < days_in_year { break; }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days: [u64; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1u64;
+    for &md in &month_days {
+        if days < md { break; }
+        days -= md;
+        month += 1;
+    }
+    let day = days + 1;
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month, day, h, m, s)
 }
 
 // ---------------------------------------------------------------------------
@@ -965,8 +1047,21 @@ fn import_from_zip(src: &Path, base: &Path) -> Result<String, String> {
         }
 
         let dest = base.join(&name);
+
+        // Guard against path traversal attacks (e.g. "../../etc/passwd" in the ZIP).
+        // Canonicalize the destination's parent (which always exists after create_dir_all)
+        // and verify the final path stays inside `base`.
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if let (Ok(canon_dest_parent), Ok(canon_base)) = (parent.canonicalize(), base.canonicalize()) {
+                let full = canon_dest_parent.join(dest.file_name().unwrap_or_default());
+                if !full.starts_with(&canon_base) {
+                    // Silently skip the offending entry.
+                    continue;
+                }
+            }
+        } else {
+            fs::create_dir_all(base).map_err(|e| e.to_string())?;
         }
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;

@@ -24,7 +24,7 @@ class AnthropicProvider(BaseProvider):
             raise EnvironmentError("ANTHROPIC_API_KEY is not set")
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
         models = config.get("model", {})
-        self._model = models.get("claude", "claude-opus-4-6")
+        self._model = models.get("claude", "claude-opus-4-5")
         self._max_tokens = int(config.get("max_tokens", 4096))
         logger.info(f"AnthropicProvider: model={self._model}")
 
@@ -47,6 +47,10 @@ class AnthropicProvider(BaseProvider):
             )
         except anthropic.RateLimitError:
             raise
+        except anthropic.AuthenticationError:
+            raise  # 401 — bad key; non-retryable
+        except anthropic.PermissionDeniedError:
+            raise  # 403 — non-retryable
         except anthropic.APIError as e:
             logger.error(f"Anthropic API error: {e}")
             return {"type": "text", "content": f"API_ERROR: {e}"}
