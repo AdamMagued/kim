@@ -131,7 +131,7 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
         url: targetUrl,
         providerName: provider.name,
       });
-      toast(`${provider.name} opened inside Kim. Browser tasks still run through the Chrome provider session.`, 'info', 7000);
+      toast(`${provider.name} opened inside Kim. Browser mode runs through this in-app window.`, 'info', 7000);
     } catch (err) {
       const msg = typeof err === 'string' ? err : `Could not open ${provider.name}.`;
       toast(msg, 'error', 5000);
@@ -191,8 +191,8 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
       </div>
       <div className="kim-browser-picker__info">
         {selectedProvider?.id === 'custom'
-          ? 'Enter any AI chat URL and open it inside Kim. Browser-provider task execution still uses the Chrome CDP session.'
-          : 'Use this in-app sign-in window for convenience. Browser-provider task execution still uses the Chrome CDP session.'}
+          ? 'Enter any AI chat URL and open it inside Kim. Browser mode will use this window for prompt/response execution.'
+          : 'Use this in-app sign-in window for browser mode. Kim executes prompt/response directly in this window.'}
       </div>
     </div>
   );
