@@ -561,7 +561,7 @@ fn build_bridge_complete_script(
       input_selectors: ["rich-textarea div[contenteditable]", "div[contenteditable='true']"],
       send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']"],
       stop_selectors: ["button[aria-label*='Stop']", "button[aria-label*='stop']"],
-      response_selectors: ["model-response", ".response-content"],
+            response_selectors: ["model-response", "message-content", ".response-content", "div.markdown", "article"],
             upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Add image']"],
             file_input_selectors: ["input[type='file']"],
     },
@@ -769,12 +769,37 @@ fn build_bridge_complete_script(
         return 0;
     };
 
+    const extractLatestResponseText = (cfg) => {
+        let best = '';
+        for (const sel of cfg.response_selectors || []) {
+            let nodes = [];
+            try {
+                nodes = Array.from(document.querySelectorAll(sel));
+            } catch (_) {
+                continue;
+            }
+            for (let i = nodes.length - 1; i >= 0; i--) {
+                const node = nodes[i];
+                const candidate = (node.innerText || node.textContent || '').trim();
+                if (!candidate) continue;
+                if (candidate.length >= 12) {
+                    return candidate;
+                }
+                if (candidate.length > best.length) {
+                    best = candidate;
+                }
+            }
+        }
+        return best.trim();
+    };
+
   try {
     const siteKey = SITE_CONFIGS[__kimSite] ? __kimSite : 'claude';
     const cfg = SITE_CONFIGS[siteKey];
 
     const responseSel = cfg.response_selectors[0] || null;
     const initialCount = responseSel ? document.querySelectorAll(responseSel).length : 0;
+    const initialResponseText = extractLatestResponseText(cfg);
 
         const inputEl = findElement(cfg.input_selectors, { visible: true, enabled: false })
             || findElement(cfg.input_selectors, { visible: false, enabled: false });
@@ -867,12 +892,18 @@ fn build_bridge_complete_script(
         }
 
     const responseDeadline = Date.now() + 90000;
-    if (responseSel) {
-      while (Date.now() < responseDeadline) {
-        const count = document.querySelectorAll(responseSel).length;
-        if (count > initialCount) break;
-        await sleep(450);
-      }
+        while (Date.now() < responseDeadline) {
+            let countIncreased = false;
+            if (responseSel) {
+                try {
+                    const count = document.querySelectorAll(responseSel).length;
+                    countIncreased = count > initialCount;
+                } catch (_) {}
+            }
+            const latest = extractLatestResponseText(cfg);
+            const hasNewText = !!latest && latest !== initialResponseText;
+            if (countIncreased || hasNewText) break;
+            await sleep(450);
     }
 
     const doneDeadline = Date.now() + 180000;
@@ -893,19 +924,19 @@ fn build_bridge_complete_script(
 
     await sleep(1200);
 
-    let text = '';
-    for (const sel of cfg.response_selectors || []) {
-      try {
-        const nodes = document.querySelectorAll(sel);
-        if (nodes.length) {
-          const last = nodes[nodes.length - 1];
-          const candidate = (last.innerText || last.textContent || '').trim();
-          if (candidate) {
-            text = candidate;
-            break;
-          }
-        }
-      } catch (_) {}
+        let text = '';
+        const readDeadline = Date.now() + 30000;
+        while (Date.now() < readDeadline) {
+            const candidate = extractLatestResponseText(cfg);
+            if (candidate && candidate !== initialResponseText) {
+                text = candidate;
+                break;
+            }
+            if (candidate && !initialResponseText) {
+                text = candidate;
+                break;
+            }
+            await sleep(650);
     }
 
     if (!text) {

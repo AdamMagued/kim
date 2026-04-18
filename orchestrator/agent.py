@@ -372,15 +372,24 @@ class KimAgent:
 
         # Resume from saved session or start fresh
         if self._resume_session_id:
-            saved = SessionStore.load_session(
+            exists = SessionStore.session_exists(
                 self._resume_session_id,
                 base_dir=self._session_store.base_dir,
             )
-            if saved:
-                self._log("INFO", f"Resuming session {self._resume_session_id} ({len(saved)} messages)")
-                self.memory.load_from_messages(saved)
+            if exists:
+                saved = SessionStore.load_session(
+                    self._resume_session_id,
+                    base_dir=self._session_store.base_dir,
+                    warn_if_missing=False,
+                )
+                if saved:
+                    self._log("INFO", f"Resuming session {self._resume_session_id} ({len(saved)} messages)")
+                    self.memory.load_from_messages(saved)
+                else:
+                    self._log("WARN", f"Session {self._resume_session_id} exists but had no readable messages")
+                    self.memory.clear()
             else:
-                self._log("WARN", f"Session {self._resume_session_id} not found — starting fresh")
+                self._log("INFO", f"Starting new session {self._resume_session_id}")
                 self.memory.clear()
         else:
             self.memory.clear()

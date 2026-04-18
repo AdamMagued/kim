@@ -91,9 +91,36 @@ class SessionStore:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def find_session_file(
+        session_id: str,
+        base_dir: Optional[Path] = None,
+    ) -> Optional[Path]:
+        """Return the JSONL path for a session ID if it exists."""
+        base = Path(base_dir) if base_dir else _DEFAULT_BASE_DIR
+        if not base.exists():
+            return None
+
+        for date_dir in sorted(base.iterdir(), reverse=True):
+            if not date_dir.is_dir():
+                continue
+            candidate = date_dir / f"{session_id}.jsonl"
+            if candidate.exists():
+                return candidate
+        return None
+
+    @staticmethod
+    def session_exists(
+        session_id: str,
+        base_dir: Optional[Path] = None,
+    ) -> bool:
+        """Return True if a session JSONL file exists for this ID."""
+        return SessionStore.find_session_file(session_id, base_dir=base_dir) is not None
+
+    @staticmethod
     def load_session(
         session_id: str,
         base_dir: Optional[Path] = None,
+        warn_if_missing: bool = True,
     ) -> list[dict]:
         """
         Load all messages from a session JSONL file.
@@ -102,19 +129,12 @@ class SessionStore:
         Returns the messages in order, ready to be loaded into
         ConversationMemory.
         """
-        base = Path(base_dir) if base_dir else _DEFAULT_BASE_DIR
-        if not base.exists():
-            return []
+        candidate = SessionStore.find_session_file(session_id, base_dir=base_dir)
+        if candidate:
+            return _read_jsonl(candidate)
 
-        # Search across all date directories
-        for date_dir in sorted(base.iterdir(), reverse=True):
-            if not date_dir.is_dir():
-                continue
-            candidate = date_dir / f"{session_id}.jsonl"
-            if candidate.exists():
-                return _read_jsonl(candidate)
-
-        logger.warning(f"Session not found: {session_id}")
+        if warn_if_missing:
+            logger.warning(f"Session not found: {session_id}")
         return []
 
     @staticmethod

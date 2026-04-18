@@ -225,7 +225,7 @@ _VERIFY_MIN_CHARS = 20
 # Maximum retries for clipboard paste injection
 _INJECT_MAX_RETRIES = 3
 # Timeout for in-app webview bridge completion calls
-_BRIDGE_TIMEOUT_S = 240
+_BRIDGE_TIMEOUT_S = 720
 
 # Button labels that indicate a dismissible popup / consent dialog
 _POPUP_DISMISS_LABELS = [
@@ -476,11 +476,19 @@ class BrowserProvider(BaseProvider):
                     headers=headers,
                     json=payload,
                 )
-        except Exception as e:
-            logger.error(f"In-app bridge request failed: {e}", exc_info=True)
+        except httpx.ReadTimeout as e:
+            logger.error("In-app bridge request timed out", exc_info=True)
+            detail = str(e).strip() or "Bridge request timed out while waiting for provider response"
             return {
                 "type": "text",
-                "content": f"NEED_HELP: In-app browser bridge request failed — {e}",
+                "content": f"NEED_HELP: In-app browser bridge timeout — {detail}",
+            }
+        except Exception as e:
+            logger.error(f"In-app bridge request failed: {e}", exc_info=True)
+            detail = str(e).strip() or e.__class__.__name__
+            return {
+                "type": "text",
+                "content": f"NEED_HELP: In-app browser bridge request failed — {detail}",
             }
 
         try:
