@@ -677,6 +677,11 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
 
   const runPendingTask = useCallback(async (pending: PendingTask) => {
     doneHandledRef.current = false;
+    // Reset cancel flag at the start of every run. The kim-agent-cancelled
+    // listener sets it to true AFTER kim-agent-done has already reset it,
+    // leaving a stale true that would suppress the error banner for the
+    // next task if it failed for a real (non-cancel) reason.
+    cancelFlagRef.current = false;
     currentTaskRef.current = pending;
     setIsRunning(true);
     setActivity([]);
