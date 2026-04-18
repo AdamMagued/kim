@@ -64,6 +64,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from playwright.async_api import (
     Browser,
     Page,
@@ -223,6 +224,8 @@ GENERATION_WAIT_S = 180
 _VERIFY_MIN_CHARS = 20
 # Maximum retries for clipboard paste injection
 _INJECT_MAX_RETRIES = 3
+# Timeout for in-app webview bridge completion calls
+_BRIDGE_TIMEOUT_S = 240
 
 # Button labels that indicate a dismissible popup / consent dialog
 _POPUP_DISMISS_LABELS = [
@@ -263,6 +266,9 @@ class BrowserProvider(BaseProvider):
         self._headless = bool(bp_cfg.get("browser_headless", False))
         # When set (e.g. from desktop `browser:chatgpt`), pick that site's tab first.
         self._preferred_site = (bp_cfg.get("preferred_site") or "").strip().lower() or None
+        self._bridge_url = os.environ.get("KIM_WEBVIEW_BRIDGE_URL", "").strip().rstrip("/")
+        self._bridge_token = os.environ.get("KIM_WEBVIEW_BRIDGE_TOKEN", "").strip()
+        self._use_webview_bridge = bool(self._bridge_url and self._bridge_token)
 
         # Track Playwright-managed browser for auto-launch mode
         self._managed_pw = None      # Playwright context manager
@@ -282,7 +288,8 @@ class BrowserProvider(BaseProvider):
         Path(self._user_data_dir).mkdir(parents=True, exist_ok=True)
         logger.info(
             f"BrowserProvider: session dir = {self._user_data_dir}  "
-            f"headless = {self._headless}  preferred_site = {self._preferred_site!r}"
+            f"headless = {self._headless}  preferred_site = {self._preferred_site!r} "
+            f"in_app_bridge = {self._use_webview_bridge}"
         )
 
         # Stateful flag — tracks whether we've already sent the system
@@ -361,6 +368,9 @@ class BrowserProvider(BaseProvider):
             f"{len(images_b64)} image(s) extracted"
         )
 
+        if self._use_webview_bridge:
+            return await self._complete_via_webview_bridge(prompt, images_b64)
+
         try:
             async with async_playwright() as pw:
                 browser = await self._connect(pw)
@@ -396,6 +406,95 @@ class BrowserProvider(BaseProvider):
         except Exception as e:
             logger.error(f"BrowserProvider.complete failed: {e}", exc_info=True)
             return {"type": "text", "content": f"NEED_HELP: Browser connection failed — {e}"}
+
+    async def _complete_via_webview_bridge(
+        self,
+        prompt: str,
+        images_b64: list[str],
+    ) -> dict:
+        """Run completion through Kim desktop's in-app webview bridge.
+
+        This mode is used when the agent is launched from the desktop app,
+        where Rust starts a localhost bridge and passes auth env vars.
+        """
+        if not self._bridge_url or not self._bridge_token:
+            return {
+                "type": "text",
+                "content": "NEED_HELP: In-app browser bridge is not configured.",
+            }
+
+        site = self._preferred_site or "claude"
+        known_sites = getattr(self, "_site_configs", SITE_CONFIGS)
+        if site not in known_sites:
+            site = "claude"
+
+        if images_b64:
+            prompt = (
+                f"{prompt}\n\n"
+                f"[Kim note: {len(images_b64)} screenshot(s) were present in context. "
+                "In-app bridge currently sends text-only to the page.]"
+            )
+
+        headers = {"X-Kim-Token": self._bridge_token}
+        payload = {
+            "site": site,
+            "prompt": prompt,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_S) as client:
+                resp = await client.post(
+                    f"{self._bridge_url}/v1/complete",
+                    headers=headers,
+                    json=payload,
+                )
+        except Exception as e:
+            logger.error(f"In-app bridge request failed: {e}", exc_info=True)
+            return {
+                "type": "text",
+                "content": f"NEED_HELP: In-app browser bridge request failed — {e}",
+            }
+
+        try:
+            data = resp.json()
+        except ValueError:
+            body_preview = resp.text[:300]
+            return {
+                "type": "text",
+                "content": (
+                    "NEED_HELP: In-app browser bridge returned invalid JSON "
+                    f"(status {resp.status_code}): {body_preview}"
+                ),
+            }
+
+        if resp.status_code == 409:
+            msg = data.get("error") or (
+                "Kim opened the in-app browser window. Sign in and resend your task."
+            )
+            return {"type": "text", "content": f"NEED_HELP: {msg}"}
+
+        if resp.status_code >= 400:
+            msg = data.get("error") or f"HTTP {resp.status_code}"
+            return {
+                "type": "text",
+                "content": f"NEED_HELP: In-app browser bridge error — {msg}",
+            }
+
+        if not data.get("ok", False):
+            msg = data.get("error") or "Unknown in-app bridge failure"
+            return {
+                "type": "text",
+                "content": f"NEED_HELP: In-app browser execution failed — {msg}",
+            }
+
+        raw_response = str(data.get("response", "")).strip()
+        if not raw_response:
+            return {
+                "type": "text",
+                "content": "NEED_HELP: In-app browser bridge returned an empty response.",
+            }
+
+        return self._parse_response(raw_response)
 
     # ==================================================================
     # CDP connection / headless auto-launch
