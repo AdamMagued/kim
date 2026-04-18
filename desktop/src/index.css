@@ -391,7 +391,12 @@ kbd {
   flex-direction: column;
   background: var(--bg);
   color: var(--text);
-  }
+  animation: kim-app-enter 0.55s cubic-bezier(.22,.9,.3,1) both;
+}
+@keyframes kim-app-enter {
+  from { opacity: 0; transform: scale(0.985); filter: blur(4px); }
+  to   { opacity: 1; transform: scale(1);     filter: blur(0);   }
+}
 
 /* ── Header ───────────────────────────────────────────────────────────────── */
 .kim-header {
@@ -759,7 +764,48 @@ kbd {
   background: var(--bg);
   overflow: hidden;
   min-height: 0;
+  position: relative;
+  isolation: isolate;
 }
+
+/* ── Chrome shader backdrop inside the chat pane ───────────────────────── */
+.kim-chat__backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.kim-chat__backdrop-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  opacity: 0.10;
+  mix-blend-mode: screen;
+  filter: saturate(0.92) contrast(1.05);
+  animation: kim-chat-backdrop-fade 1.2s ease both;
+}
+:root[data-theme="light"] .kim-chat__backdrop-canvas {
+  opacity: 0.08;
+  mix-blend-mode: multiply;
+}
+.kim-chat__backdrop-scrim {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(120% 80% at 50% 0%, transparent 0%, var(--bg) 75%),
+    linear-gradient(180deg, transparent 0%, var(--bg) 100%);
+  opacity: 0.55;
+}
+@keyframes kim-chat-backdrop-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Keep chat content above the backdrop */
+.kim-chat > *:not(.kim-chat__backdrop) { position: relative; z-index: 1; }
 
 /* Empty welcome (no session selected) — redesigned to match chat interface mockup */
 .kim-empty-welcome {
@@ -3247,12 +3293,23 @@ kbd {
   font-family: 'Syne', ui-sans-serif, -apple-system, sans-serif !important;
   font-weight: 600 !important;
   letter-spacing: -.025em !important;
-  line-height: 1.15 !important;
-  /* Key fix: give room for descenders ('g', 'y', 'p' in late night, etc.) */
-  padding-bottom: 0.15em !important;
+  line-height: 1.35 !important;
+  /* Key fix: give generous room for descenders ('g','y','p' in "night","day", etc.) */
+  padding-bottom: 0.35em !important;
+  padding-top: 0.05em !important;
   overflow: visible !important;
   /* Ensure the parent clip doesn't eat the descenders */
   display: block !important;
+  /* Reserve extra space below the baseline so no glyph ink is ever cropped */
+  box-sizing: content-box !important;
+}
+
+/* Any ancestor of a greeting must not clip its descenders */
+.kim-empty-welcome,
+.kim-new-chat-empty,
+.kim-empty-welcome__greeting,
+.kim-new-chat-empty__title {
+  overflow: visible !important;
 }
 
 /* Override the empty welcome title specifically */

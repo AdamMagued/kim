@@ -735,6 +735,15 @@ async fn save_account(account: KimAccount) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn clear_account() -> Result<(), String> {
+    let path = account_path();
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // GitHub PAT verification — get user identity from token
 // ---------------------------------------------------------------------------
@@ -1396,6 +1405,7 @@ pub fn run() {
             write_voice_config,
             load_account,
             save_account,
+            clear_account,
             verify_github_pat,
             export_data,
             import_data,

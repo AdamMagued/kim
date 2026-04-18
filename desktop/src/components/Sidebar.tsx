@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type { SessionInfo, KimAccount, ClawProject } from '../types';
 
 interface Props {
@@ -173,10 +174,7 @@ function AddProjectForm({ onAdd }: { onAdd: (path: string) => Promise<void> }) {
   const [adding, setAdding] = useState(false);
   const [err, setErr] = useState('');
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    const p = path.trim();
-    if (!p) return;
+  async function commit(p: string) {
     setAdding(true);
     setErr('');
     try {
@@ -186,6 +184,28 @@ function AddProjectForm({ onAdd }: { onAdd: (path: string) => Promise<void> }) {
       setErr(String(e));
     } finally {
       setAdding(false);
+    }
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    const p = path.trim();
+    if (!p) return;
+    await commit(p);
+  }
+
+  async function handlePickFolder() {
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: 'Select project folder',
+      });
+      if (typeof selected === 'string' && selected) {
+        await commit(selected);
+      }
+    } catch (e) {
+      setErr(String(e));
     }
   }
 
@@ -199,6 +219,16 @@ function AddProjectForm({ onAdd }: { onAdd: (path: string) => Promise<void> }) {
         onChange={e => { setPath(e.target.value); setErr(''); }}
         autoFocus
       />
+      <button
+        type="button"
+        onClick={handlePickFolder}
+        disabled={adding}
+        className="kim-btn kim-btn--ghost"
+        style={{ padding: '5px 10px', fontSize: 12 }}
+        title="Browse for folder…"
+      >
+        Browse…
+      </button>
       <button type="submit" disabled={!path.trim() || adding} className="kim-btn kim-btn--primary" style={{ padding: '5px 10px', fontSize: 12 }}>
         {adding ? '…' : 'Add'}
       </button>
