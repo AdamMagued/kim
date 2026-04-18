@@ -7,6 +7,11 @@ Usage:
     queue = TaskQueue(config)
     queue.set_agent_runner(async_fn)  # async fn(task_id, task) -> dict
     await queue.run()                 # blocks; runs both consumers
+
+NOTE (dormant): This module is not yet wired into the Tauri send_task flow.
+It was designed for a future relay-server architecture (e.g., controlling Kim
+from a phone or remote device). The code is functional but unused by the
+desktop app. Do not delete — it will be integrated when the relay feature is built.
 """
 
 import asyncio
