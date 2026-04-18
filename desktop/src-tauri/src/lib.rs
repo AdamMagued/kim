@@ -1207,6 +1207,20 @@ fn handle_webview_bridge_request(
                 return;
             };
 
+            // If the user previously closed the browser window (which hides it rather
+            // than destroying it so the login session stays alive), show it briefly
+            // before injecting JS.  WKWebView reports offsetParent=null for every
+            // element while a window is hidden, which causes our isVisible() helper
+            // to reject all input/send selectors.  Showing upfront avoids an
+            // unnecessary failure → hidden_retry_needed cycle on every call.
+            let was_hidden = window.is_visible().map(|v| !v).unwrap_or(false);
+            if was_hidden {
+                let _ = window.show();
+                let _ = window.set_focus();
+                // Give the window and its compositor layer time to become active.
+                std::thread::sleep(Duration::from_millis(400));
+            }
+
             let mut completion = run_bridge_completion_once(
                 &window,
                 &site,
@@ -1214,7 +1228,9 @@ fn handle_webview_bridge_request(
                 &parsed.attachments,
             );
 
-            let needs_retry = match &completion {
+            // If the input selector still wasn't found (page may have navigated away
+            // from the chat view), reload the provider's root URL and try once more.
+            let needs_nav_retry = match &completion {
                 Ok(payload) => {
                     let err = payload.error.clone().unwrap_or_default().to_lowercase();
                     !payload.ok && err.contains("could not find input selector")
@@ -1222,11 +1238,11 @@ fn handle_webview_bridge_request(
                 Err(err) => err.to_lowercase().contains("could not find input selector"),
             };
 
-            if needs_retry {
+            if needs_nav_retry {
                 let nav_url = default_site_url(&site);
                 if let Ok(js_url) = serde_json::to_string(nav_url) {
                     let _ = window.eval(&format!("window.location.href = {};", js_url));
-                    std::thread::sleep(Duration::from_millis(1800));
+                    std::thread::sleep(Duration::from_millis(2000));
                     completion = run_bridge_completion_once(
                         &window,
                         &site,
@@ -1236,41 +1252,9 @@ fn handle_webview_bridge_request(
                 }
             }
 
-            let hidden_retry_needed = match &completion {
-                Ok(payload) => {
-                    if payload.ok {
-                        false
-                    } else {
-                        let err = payload.error.clone().unwrap_or_default().to_lowercase();
-                        // NOTE: do NOT include "timed out" here — a timeout already
-                        // consumed the full 220s window; retrying immediately would push
-                        // the total past httpx's 240s deadline and produce an empty
-                        // ReadTimeout error message on the Python side.
-                        err.contains("could not find input selector")
-                            || err.contains("could not read model response")
-                    }
-                }
-                Err(err) => {
-                    let e = err.to_lowercase();
-                    e.contains("could not find input selector")
-                        || e.contains("could not read model response")
-                }
-            };
-
-            if hidden_retry_needed {
-                let was_hidden = window.is_visible().map(|v| !v).unwrap_or(false);
-                if was_hidden {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                    std::thread::sleep(Duration::from_millis(380));
-                    completion = run_bridge_completion_once(
-                        &window,
-                        &site,
-                        &parsed.prompt,
-                        &parsed.attachments,
-                    );
-                    let _ = window.hide();
-                }
+            // Hide again if we showed the window just for this request.
+            if was_hidden {
+                let _ = window.hide();
             }
 
             match completion {
