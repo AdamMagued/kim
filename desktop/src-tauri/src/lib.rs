@@ -161,6 +161,46 @@ fn default_sessions_dir() -> PathBuf {
     PathBuf::from("kim_sessions")
 }
 
+fn command_exists(cmd: &str) -> bool {
+    std::process::Command::new(cmd)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn find_python_interpreter(project_root: &Path) -> Result<String, String> {
+    let candidates = [
+        project_root.join("venv").join("bin").join("python"),
+        project_root.join(".venv").join("bin").join("python"),
+        project_root.join("venv").join("Scripts").join("python.exe"),
+        project_root.join(".venv").join("Scripts").join("python.exe"),
+    ];
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    let cmd_candidates = ["py", "python", "python3"];
+    #[cfg(not(target_os = "windows"))]
+    let cmd_candidates = ["python3", "python"];
+
+    for cmd in cmd_candidates {
+        if command_exists(cmd) {
+            return Ok(cmd.to_string());
+        }
+    }
+
+    Err(
+        "No Python interpreter found. Install Python 3 or create a project venv (venv/.venv)."
+            .to_string(),
+    )
+}
+
 /// Validate that a user-supplied `session_id` is a safe file-stem:
 /// no path separators, no `..`, printable ASCII-ish. Prevents a caller
 /// from escaping the per-date directory via `../../etc/passwd` etc.
@@ -571,6 +611,40 @@ fn build_bridge_complete_script(
     return null;
   };
 
+    const isVisible = (el) => {
+        if (!el) return false;
+        const style = getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') === 0) {
+            return false;
+        }
+        if (el.offsetParent !== null) return true;
+        return style.position === 'fixed';
+    };
+
+    const isEnabled = (el) => {
+        if (!el) return false;
+        if ('disabled' in el && el.disabled) return false;
+        if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return false;
+        return true;
+    };
+
+    const findElement = (selectors, opts = { visible: false, enabled: false }) => {
+        for (const sel of selectors || []) {
+            let nodes = [];
+            try {
+                nodes = Array.from(document.querySelectorAll(sel));
+            } catch (_) {
+                continue;
+            }
+            for (const el of nodes) {
+                if (opts.visible && !isVisible(el)) continue;
+                if (opts.enabled && !isEnabled(el)) continue;
+                return el;
+            }
+        }
+        return null;
+    };
+
     const inferExtension = (mime) => {
         const m = String(mime || '').toLowerCase();
         const extMap = {
@@ -702,12 +776,11 @@ fn build_bridge_complete_script(
     const responseSel = cfg.response_selectors[0] || null;
     const initialCount = responseSel ? document.querySelectorAll(responseSel).length : 0;
 
-    const inputSel = findSelector(cfg.input_selectors);
-    if (!inputSel) {
+        const inputEl = findElement(cfg.input_selectors, { visible: true, enabled: false })
+            || findElement(cfg.input_selectors, { visible: false, enabled: false });
+        if (!inputEl) {
       throw new Error(`Could not find input selector for ${siteKey}`);
     }
-
-    const inputEl = document.querySelector(inputSel);
     inputEl.focus();
 
         const uploadedCount = await injectAttachments(cfg, inputEl);
@@ -756,21 +829,16 @@ fn build_bridge_complete_script(
 
         // Give reactive UIs a moment to enable the send button.
         for (let i = 0; i < 20; i++) {
-            const sel = findSelector(cfg.send_selectors);
-            if (!sel) break;
-            const btn = document.querySelector(sel);
-            if (btn && !btn.disabled) break;
+                        const btn = findElement(cfg.send_selectors, { visible: true, enabled: true });
+                        if (btn) break;
             await sleep(120);
         }
 
     let sent = false;
-    const sendSel = findSelector(cfg.send_selectors);
-    if (sendSel) {
-      const sendEl = document.querySelector(sendSel);
-            if (sendEl && !sendEl.disabled) {
-        sendEl.click();
-        sent = true;
-      }
+        const sendEl = findElement(cfg.send_selectors, { visible: true, enabled: true });
+        if (sendEl) {
+            sendEl.click();
+            sent = true;
     }
     if (!sent) {
       inputEl.dispatchEvent(new KeyboardEvent('keydown', {
@@ -908,6 +976,28 @@ fn collect_bridge_payload_from_title(
     Err("Timed out waiting for in-app browser completion response.".to_string())
 }
 
+fn run_bridge_completion_once(
+    window: &tauri::WebviewWindow,
+    site: &str,
+    prompt: &str,
+    attachments: &[BridgeAttachment],
+) -> Result<BridgeCompleteResponse, String> {
+    let req_id = format!(
+        "r-{}-{}",
+        std::process::id(),
+        WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+
+    let script = build_bridge_complete_script(site, prompt, &req_id, attachments)
+        .map_err(|e| format!("Script build failed: {}", e))?;
+
+    window
+        .eval(&script)
+        .map_err(|e| format!("Failed to evaluate in-app script: {}", e))?;
+
+    collect_bridge_payload_from_title(window, &req_id, Duration::from_secs(220))
+}
+
 fn handle_webview_bridge_request(
     mut request: Request,
     app_handle: tauri::AppHandle,
@@ -1043,39 +1133,36 @@ fn handle_webview_bridge_request(
                 return;
             };
 
-            let req_id = format!(
-                "r-{}-{}",
-                std::process::id(),
-                WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
-            );
-
-            let script = match build_bridge_complete_script(
+            let mut completion = run_bridge_completion_once(
+                &window,
                 &site,
                 &parsed.prompt,
-                &req_id,
                 &parsed.attachments,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    respond_json(
-                        request,
-                        500,
-                        serde_json::json!({"ok": false, "error": format!("Script build failed: {}", e)}),
-                    );
-                    return;
+            );
+
+            let needs_retry = match &completion {
+                Ok(payload) => {
+                    let err = payload.error.clone().unwrap_or_default().to_lowercase();
+                    !payload.ok && err.contains("could not find input selector")
                 }
+                Err(err) => err.to_lowercase().contains("could not find input selector"),
             };
 
-            if let Err(e) = window.eval(&script) {
-                respond_json(
-                    request,
-                    500,
-                    serde_json::json!({"ok": false, "error": format!("Failed to evaluate in-app script: {}", e)}),
-                );
-                return;
+            if needs_retry {
+                let nav_url = default_site_url(&site);
+                if let Ok(js_url) = serde_json::to_string(nav_url) {
+                    let _ = window.eval(&format!("window.location.href = {};", js_url));
+                    std::thread::sleep(Duration::from_millis(1800));
+                    completion = run_bridge_completion_once(
+                        &window,
+                        &site,
+                        &parsed.prompt,
+                        &parsed.attachments,
+                    );
+                }
             }
 
-            match collect_bridge_payload_from_title(&window, &req_id, Duration::from_secs(220)) {
+            match completion {
                 Ok(payload) => {
                     if payload.ok {
                         respond_json(
@@ -1323,18 +1410,7 @@ async fn send_task(
         .map(PathBuf::from)
         .unwrap_or_else(default_project_root);
 
-    // Prefer venv python
-    let python = {
-        let unix = root.join("venv").join("bin").join("python");
-        let win = root.join("venv").join("Scripts").join("python.exe");
-        if unix.exists() {
-            unix.to_string_lossy().to_string()
-        } else if win.exists() {
-            win.to_string_lossy().to_string()
-        } else {
-            "python".to_string()
-        }
-    };
+    let python = find_python_interpreter(&root)?;
 
     let mut cmd = Command::new(&python);
     cmd.args(["-m", "orchestrator.agent"])
