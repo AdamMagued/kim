@@ -150,7 +150,7 @@ fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<Session
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .collect();
-    date_dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    date_dirs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
     for date_entry in date_dirs {
         let date_dir = date_entry.path();
@@ -165,7 +165,7 @@ fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<Session
                 s.ends_with(".jsonl") && !s.contains(".summary")
             })
             .collect();
-        jsonl_files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        jsonl_files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
         for file_entry in jsonl_files {
             let session_file = file_entry.path();
@@ -287,7 +287,7 @@ async fn load_session_messages(
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_dir())
             .collect();
-        date_dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        date_dirs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
         for date_entry in date_dirs {
             let date_dir = date_entry.path();
@@ -543,8 +543,7 @@ fn send_signal(pid: u32, force: bool) -> std::io::Result<()> {
         .args([sig, &pid.to_string()])
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("kill {} {} failed with {}", sig, pid, status),
         ));
     }
@@ -628,9 +627,9 @@ fn extract_voice_scalar<'a>(yaml: &'a str, key: &str) -> Option<&'a str> {
         }
         if in_voice {
             // Accept direct children indented with 1–4 spaces or a tab.
-            let trimmed = line.trim_start_matches(|c: char| c == ' ' || c == '\t');
+            let trimmed = line.trim_start_matches([' ', '\t']);
             let indent = line.len() - trimmed.len();
-            if indent >= 1 && indent <= 4 {
+            if (1..=4).contains(&indent) {
                 if let Some(rest) = trimmed.strip_prefix(&format!("{}:", key)) {
                     let v = rest.trim().trim_matches(|c| c == '"' || c == '\'');
                     return Some(v);
@@ -972,13 +971,13 @@ fn chrono_now() -> String {
     // Gregorian calendar algorithm (Julian Day Number method)
     let mut year = 1970u64;
     loop {
-        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
         let days_in_year = if leap { 366 } else { 365 };
         if days < days_in_year { break; }
         days -= days_in_year;
         year += 1;
     }
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
     let month_days: [u64; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut month = 1u64;
     for &md in &month_days {
@@ -1364,7 +1363,7 @@ fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
             s.ends_with(".jsonl") && !s.contains(".summary")
         })
         .collect();
-    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
     for fe in files.iter().take(50) {
         let session_id = fe.path()
