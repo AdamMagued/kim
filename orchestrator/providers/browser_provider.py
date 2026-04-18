@@ -362,14 +362,14 @@ class BrowserProvider(BaseProvider):
         4. Paste the cleaned text prompt via clipboard.
         5. Click Send and wait for the AI response.
         """
-        prompt, images_b64 = self._format_prompt(messages, tools, system)
+        prompt, attachments = self._format_prompt(messages, tools, system)
         logger.debug(
             f"Prompt ready: {len(prompt)} chars, "
-            f"{len(images_b64)} image(s) extracted"
+            f"{len(attachments)} attachment(s) extracted"
         )
 
         if self._use_webview_bridge:
-            return await self._complete_via_webview_bridge(prompt, images_b64)
+            return await self._complete_via_webview_bridge(prompt, attachments)
 
         try:
             async with async_playwright() as pw:
@@ -387,10 +387,15 @@ class BrowserProvider(BaseProvider):
                     }
                 cfg = self._site_configs[site]
 
+                image_attachments = [
+                    a for a in attachments
+                    if str(a.get("mime_type", "")).startswith("image/") and a.get("data_base64")
+                ]
+
                 # ── Step 1: Paste screenshot via clipboard (if any) ──────
-                if images_b64:
+                if image_attachments:
                     await self._inject_image_clipboard(
-                        page, cfg, images_b64[-1]
+                        page, cfg, str(image_attachments[-1]["data_base64"])
                     )
 
                     # ── Step 2: Let the UI render the image ──────────────
@@ -410,7 +415,7 @@ class BrowserProvider(BaseProvider):
     async def _complete_via_webview_bridge(
         self,
         prompt: str,
-        images_b64: list[str],
+        attachments: list[dict],
     ) -> dict:
         """Run completion through Kim desktop's in-app webview bridge.
 
@@ -428,17 +433,40 @@ class BrowserProvider(BaseProvider):
         if site not in known_sites:
             site = "claude"
 
-        if images_b64:
+        bridge_attachments: list[dict] = []
+        max_attachments = 8
+        max_attachment_bytes = 10 * 1024 * 1024
+        for i, attachment in enumerate(attachments[:max_attachments], start=1):
+            data_b64 = str(attachment.get("data_base64", "")).strip()
+            mime_type = str(attachment.get("mime_type", "application/octet-stream")).strip()
+            if not data_b64:
+                continue
+            approx_size = (len(data_b64) * 3) // 4
+            if approx_size > max_attachment_bytes:
+                logger.warning(
+                    f"Skipping oversized bridge attachment #{i} ({approx_size} bytes, {mime_type})"
+                )
+                continue
+            bridge_attachments.append(
+                {
+                    "name": str(attachment.get("name", f"attachment_{i}")),
+                    "mime_type": mime_type,
+                    "data_base64": data_b64,
+                }
+            )
+
+        if len(attachments) > max_attachments:
             prompt = (
                 f"{prompt}\n\n"
-                f"[Kim note: {len(images_b64)} screenshot(s) were present in context. "
-                "In-app bridge currently sends text-only to the page.]"
+                f"[Kim note: {len(attachments) - max_attachments} additional attachment(s) "
+                "were omitted due to attachment limit.]"
             )
 
         headers = {"X-Kim-Token": self._bridge_token}
         payload = {
             "site": site,
             "prompt": prompt,
+            "attachments": bridge_attachments,
         }
 
         try:
@@ -1078,44 +1106,108 @@ class BrowserProvider(BaseProvider):
     # Prompt formatting
     # ==================================================================
 
-    # Prefix that marks the start of an inline data-URI image
-    _DATA_URI_PREFIX = "data:image/png;base64,"
+    _DATA_URI_PREFIX = "data:"
+    _DATA_URI_BASE64_MARKER = ";base64,"
 
-    def _strip_base64(self, text: str, images_out: list[str]) -> str:
-        """Find ``data:image/png;base64,…`` strings using plain string
-        operations (no regex — avoids catastrophic backtracking on
-        multi-MB retina screenshots).
+    @staticmethod
+    def _ext_for_mime(mime_type: str) -> str:
+        mime_type = (mime_type or "").lower().strip()
+        ext_map = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/jpg": "jpg",
+            "image/webp": "webp",
+            "image/gif": "gif",
+            "image/svg+xml": "svg",
+            "application/pdf": "pdf",
+            "text/plain": "txt",
+            "text/markdown": "md",
+            "application/json": "json",
+            "application/zip": "zip",
+            "application/octet-stream": "bin",
+        }
+        if mime_type in ext_map:
+            return ext_map[mime_type]
+        if "/" in mime_type:
+            tail = mime_type.split("/")[-1].split("+")[0].strip()
+            if tail:
+                return tail
+        return "bin"
 
-        For each match the raw base64 payload is appended to *images_out*
-        and the entire data-URI is replaced with ``[Screenshot attached]``.
+    def _append_attachment(
+        self,
+        attachments_out: list[dict],
+        mime_type: str,
+        data_b64: str,
+        name: Optional[str] = None,
+    ) -> None:
+        if not data_b64:
+            return
+        clean_mime = mime_type.strip().lower() if mime_type else "application/octet-stream"
+        if "/" not in clean_mime:
+            clean_mime = "application/octet-stream"
+        idx = len(attachments_out) + 1
+        ext = self._ext_for_mime(clean_mime)
+        default_name = (
+            f"screenshot_{idx}.{ext}"
+            if clean_mime.startswith("image/")
+            else f"attachment_{idx}.{ext}"
+        )
+        attachments_out.append(
+            {
+                "name": (name or default_name).strip() or default_name,
+                "mime_type": clean_mime,
+                "data_base64": data_b64,
+            }
+        )
 
-        Returns the cleaned text (guaranteed free of base64 blobs).
+    def _strip_data_uris(self, text: str, attachments_out: list[dict]) -> str:
+        """Extract inline ``data:<mime>;base64,...`` URIs into attachments.
+
+        Uses string scanning (not regex) to avoid catastrophic backtracking on
+        very large base64 payloads.
         """
+        out_parts: list[str] = []
+        i = 0
         prefix = self._DATA_URI_PREFIX
+        marker = self._DATA_URI_BASE64_MARKER
+
         while True:
-            start = text.find(prefix)
+            start = text.find(prefix, i)
             if start == -1:
+                out_parts.append(text[i:])
                 break
 
-            # Find where the base64 payload ends: next whitespace,
-            # quote, angle bracket, or end-of-string.
-            payload_start = start + len(prefix)
+            marker_pos = text.find(marker, start)
+            if marker_pos == -1:
+                out_parts.append(text[i:])
+                break
+
+            mime_type = text[start + len(prefix):marker_pos].strip().lower()
+            payload_start = marker_pos + len(marker)
             end = payload_start
             while end < len(text) and text[end] not in " \t\n\r\"'<>)],;":
                 end += 1
 
             payload = text[payload_start:end]
-            if payload:  # only collect non-empty payloads
-                images_out.append(payload)
+            if payload and "/" in mime_type:
+                out_parts.append(text[i:start])
+                self._append_attachment(attachments_out, mime_type, payload)
+                if mime_type.startswith("image/"):
+                    out_parts.append("[Screenshot attached]")
+                else:
+                    out_parts.append(f"[Attachment: {mime_type}]")
+                i = end
+            else:
+                # Not a valid data URI payload; advance safely.
+                out_parts.append(text[i:start + len(prefix)])
+                i = start + len(prefix)
 
-            # Replace the entire data URI with a placeholder
-            text = text[:start] + "[Screenshot attached]" + text[end:]
-
-        return text
+        return "".join(out_parts)
 
     def _format_prompt(
         self, messages: list[dict], tools: list[dict], system: str
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[str, list[dict]]:
         """
         Stateful prompt formatter for browser-based chat UIs.
 
@@ -1127,14 +1219,13 @@ class BrowserProvider(BaseProvider):
         - **Subsequent calls**: Send **only** the latest message (the
           delta — typically a tool result or a follow-up instruction).
 
-        In both cases, any embedded ``data:image/png;base64,…`` blobs are
-        extracted for clipboard upload and replaced with
-        ``[Screenshot attached]``.
+        In both cases, any embedded ``data:<mime>;base64,…`` blobs are
+        extracted into attachment records and replaced with placeholders.
 
         Returns:
-            ``(prompt_text, images_b64)``
+            ``(prompt_text, attachments)``
         """
-        images_b64: list[str] = []
+        attachments: list[dict] = []
 
         # ── Extract the LAST message only (the delta) ────────────────────
         last_text = ""
@@ -1147,16 +1238,38 @@ class BrowserProvider(BaseProvider):
                 for item in content:
                     item_type = item.get("type", "")
                     if item_type == "text" and item.get("text"):
-                        cleaned = self._strip_base64(
-                            item["text"], images_b64
+                        cleaned = self._strip_data_uris(
+                            item["text"], attachments
                         )
                         text_parts.append(cleaned)
                     elif item_type == "image" and item.get("data"):
-                        images_b64.append(item["data"])
+                        self._append_attachment(
+                            attachments,
+                            str(item.get("media_type") or "image/png"),
+                            str(item["data"]),
+                            str(item.get("name") or "").strip() or None,
+                        )
                         text_parts.append("[Screenshot attached]")
+                    elif item_type in {"file", "document", "attachment"} and item.get("data"):
+                        file_name = str(item.get("name") or item.get("filename") or "").strip() or None
+                        mime_type = str(
+                            item.get("media_type")
+                            or item.get("mime_type")
+                            or "application/octet-stream"
+                        )
+                        self._append_attachment(
+                            attachments,
+                            mime_type,
+                            str(item.get("data") or ""),
+                            file_name,
+                        )
+                        if file_name:
+                            text_parts.append(f"[Attachment: {file_name}]")
+                        else:
+                            text_parts.append("[Attachment attached]")
                 last_text = "\n".join(text_parts)
             else:
-                last_text = self._strip_base64(str(content), images_b64)
+                last_text = self._strip_data_uris(str(content), attachments)
 
         last_text = last_text.strip()
 
@@ -1212,7 +1325,7 @@ class BrowserProvider(BaseProvider):
                 + prompt[-200:]
             )
 
-        return prompt, images_b64
+        return prompt, attachments
 
     # ==================================================================
     # Response parsing

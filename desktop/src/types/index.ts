@@ -2,6 +2,7 @@
 
 export interface SessionInfo {
   session_id: string;
+  title?: string;
   date: string;
   message_count: number;
   has_summary: boolean;

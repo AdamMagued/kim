@@ -3293,15 +3293,13 @@ kbd {
   font-family: 'Syne', ui-sans-serif, -apple-system, sans-serif !important;
   font-weight: 600 !important;
   letter-spacing: -.025em !important;
-  line-height: 1.35 !important;
-  /* Key fix: give generous room for descenders ('g','y','p' in "night","day", etc.) */
-  padding-bottom: 0.35em !important;
-  padding-top: 0.05em !important;
+  line-height: 1.22 !important;
+  /* Preserve descenders in Syne without requiring extra parent layout hacks. */
+  padding-top: 0.03em !important;
+  padding-bottom: 0.22em !important;
   overflow: visible !important;
-  /* Ensure the parent clip doesn't eat the descenders */
-  display: block !important;
-  /* Reserve extra space below the baseline so no glyph ink is ever cropped */
-  box-sizing: content-box !important;
+  display: inline-block !important;
+  text-rendering: geometricPrecision;
 }
 
 /* Any ancestor of a greeting must not clip its descenders */
@@ -3316,9 +3314,11 @@ kbd {
 .kim-empty-welcome__title.kim-greeting,
 .kim-empty-welcome__greeting.kim-greeting {
   font-size: 26px;
+  min-height: calc(1em + 0.22em);
 }
 .kim-new-chat-empty__title.kim-greeting {
   font-size: 28px;
+  min-height: calc(1em + 0.22em);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
