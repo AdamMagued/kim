@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -537,7 +536,6 @@ fn build_bridge_complete_script(
   const __kimPrompt = __KIM_PROMPT__;
   const __kimReqId = __KIM_REQID__;
     const __kimAttachments = __KIM_ATTACHMENTS__;
-  const __KIM_CHUNK_PREFIX = "__KIMBRIDGE_CHUNK__";
   const __KIM_DONE_PREFIX = "__KIMBRIDGE_DONE__";
 
   const SITE_CONFIGS = {
@@ -588,18 +586,16 @@ fn build_bridge_complete_script(
   const emitPayload = async (payload) => {
     try {
       const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
-            // Keep chunks small; title values can be truncated on some engines.
-            const chunkSize = 180;
-      const total = Math.max(1, Math.ceil(encoded.length / chunkSize));
-      for (let i = 0; i < total; i++) {
-        const chunk = encoded.slice(i * chunkSize, (i + 1) * chunkSize);
-        document.title = `${__KIM_CHUNK_PREFIX}:${__kimReqId}:${i}:${total}:${chunk}`;
-        await sleep(20);
-      }
-      document.title = `${__KIM_DONE_PREFIX}:${__kimReqId}`;
+      // Store full payload in a JS global so Rust can pull it via eval
+      // after seeing the DONE signal — avoids the timing race of chunk-by-chunk
+      // title updates (JS 20 ms emit vs Rust 40 ms poll).
+      window.__kimBridgeData = encoded;
+      window.__kimBridgeErr = null;
     } catch (err) {
-      document.title = `${__KIM_DONE_PREFIX}:${__kimReqId}`;
+      window.__kimBridgeData = null;
+      window.__kimBridgeErr = String(err);
     }
+    document.title = `${__KIM_DONE_PREFIX}:${__kimReqId}`;
   };
 
   const findSelector = (selectors) => {
@@ -958,67 +954,100 @@ fn build_bridge_complete_script(
     Ok(script)
 }
 
+/// Pull-based bridge payload collector.
+///
+/// Protocol:
+///   1. JS stores `window.__kimBridgeData = <base64>` then sets
+///      `document.title = "__KIMBRIDGE_DONE__:{req_id}"`.
+///   2. Rust polls the title until it sees the DONE signal.
+///   3. Rust calls `window.eval(...)` to copy the JS global into
+///      `document.title`, then reads it back.  This avoids the timing
+///      race where JS emitted 20 ms-spaced title chunks that Rust's
+///      40 ms poller would miss.
 fn collect_bridge_payload_from_title(
     window: &tauri::WebviewWindow,
     req_id: &str,
     timeout: Duration,
 ) -> Result<BridgeCompleteResponse, String> {
-    let chunk_prefix = format!("__KIMBRIDGE_CHUNK__:{}:", req_id);
     let done_prefix = format!("__KIMBRIDGE_DONE__:{}", req_id);
+    let null_marker = "__KIMBRIDGE_NULL__";
     let started = Instant::now();
 
-    let mut chunks: HashMap<usize, String> = HashMap::new();
-    let mut total_chunks: Option<usize> = None;
-    let mut saw_done = false;
+    // ── Phase 1: wait for JS to signal completion via document.title ──────────
+    loop {
+        if started.elapsed() >= timeout {
+            return Err("Timed out waiting for in-app browser completion response.".to_string());
+        }
 
-    while started.elapsed() < timeout {
         let title = window
             .title()
             .map_err(|e| format!("Failed reading in-app browser title: {}", e))?;
 
-        if title.starts_with(&chunk_prefix) {
-            let parts: Vec<&str> = title.splitn(5, ':').collect();
-            if parts.len() == 5 {
-                let idx = parts[2].parse::<usize>().ok();
-                let total = parts[3].parse::<usize>().ok();
-                if let (Some(i), Some(t)) = (idx, total) {
-                    total_chunks = Some(t);
-                    chunks.entry(i).or_insert_with(|| parts[4].to_string());
-                }
-            }
-        } else if title.starts_with(&done_prefix) {
-            saw_done = true;
-        }
-
-        if saw_done {
-            if let Some(total) = total_chunks {
-                if chunks.len() >= total {
-                    let mut encoded = String::new();
-                    for i in 0..total {
-                        if let Some(chunk) = chunks.get(&i) {
-                            encoded.push_str(chunk);
-                        } else {
-                            return Err("Bridge payload missing one or more chunks.".to_string());
-                        }
-                    }
-
-                    let decoded = base64::engine::general_purpose::STANDARD
-                        .decode(encoded)
-                        .map_err(|e| format!("Failed to decode bridge payload: {}", e))?;
-                    let decoded_str = String::from_utf8(decoded)
-                        .map_err(|e| format!("Bridge payload was not valid UTF-8: {}", e))?;
-
-                    let payload: BridgeCompleteResponse = serde_json::from_str(&decoded_str)
-                        .map_err(|e| format!("Failed to parse bridge payload JSON: {}", e))?;
-                    return Ok(payload);
-                }
-            }
+        if title.starts_with(&done_prefix) {
+            break;
         }
 
         std::thread::sleep(Duration::from_millis(40));
     }
 
-    Err("Timed out waiting for in-app browser completion response.".to_string())
+    // ── Phase 2: pull payload out of the JS global via eval → title round-trip ─
+    // Ask JS to copy window.__kimBridgeData into document.title so we can
+    // read it synchronously from Rust.
+    let eval_js = format!(
+        "document.title = (typeof window.__kimBridgeData === 'string' && window.__kimBridgeData.length > 0) \
+         ? window.__kimBridgeData : '{}';",
+        null_marker
+    );
+    window
+        .eval(&eval_js)
+        .map_err(|e| format!("Failed to eval bridge data pull: {}", e))?;
+
+    // Poll until the webview processes the eval and the title changes away
+    // from the DONE prefix (the eval overwrites it).
+    let pull_deadline = Instant::now() + Duration::from_millis(800);
+    let encoded = loop {
+        std::thread::sleep(Duration::from_millis(20));
+
+        let title = window
+            .title()
+            .map_err(|e| format!("Failed reading bridge data from title: {}", e))?;
+
+        if !title.starts_with(&done_prefix) {
+            break title;
+        }
+
+        if Instant::now() >= pull_deadline {
+            return Err("Timed out pulling bridge payload from JS global.".to_string());
+        }
+    };
+
+    if encoded == null_marker {
+        // JS reported no data — try to read the error string
+        let err_js = format!(
+            "document.title = window.__kimBridgeErr || '{}';",
+            null_marker
+        );
+        let _ = window.eval(&err_js);
+        std::thread::sleep(Duration::from_millis(60));
+        let err_title = window.title().unwrap_or_default();
+        let reason = if err_title == null_marker || err_title.is_empty() {
+            "no payload data".to_string()
+        } else {
+            err_title
+        };
+        return Err(format!("Bridge payload not available: {}", reason));
+    }
+
+    // ── Phase 3: decode and parse ─────────────────────────────────────────────
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&encoded)
+        .map_err(|e| format!("Failed to decode bridge payload: {}", e))?;
+    let decoded_str = String::from_utf8(decoded)
+        .map_err(|e| format!("Bridge payload was not valid UTF-8: {}", e))?;
+    let payload: BridgeCompleteResponse = serde_json::from_str(&decoded_str)
+        .map_err(|e| format!("Failed to parse bridge payload JSON: {}", e))?;
+
+    Ok(payload)
 }
 
 fn run_bridge_completion_once(
@@ -1213,16 +1242,18 @@ fn handle_webview_bridge_request(
                         false
                     } else {
                         let err = payload.error.clone().unwrap_or_default().to_lowercase();
+                        // NOTE: do NOT include "timed out" here — a timeout already
+                        // consumed the full 220s window; retrying immediately would push
+                        // the total past httpx's 240s deadline and produce an empty
+                        // ReadTimeout error message on the Python side.
                         err.contains("could not find input selector")
                             || err.contains("could not read model response")
-                            || err.contains("timed out")
                     }
                 }
                 Err(err) => {
                     let e = err.to_lowercase();
                     e.contains("could not find input selector")
                         || e.contains("could not read model response")
-                        || e.contains("timed out")
                 }
             };
 
