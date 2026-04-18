@@ -32,36 +32,77 @@ interface ActivityItem {
 
 let _activityCounter = 0;
 
-/** Lines that contain these strings are silently dropped */
-const HIDDEN_PATTERNS = [
-  'take_screenshot',
-  'screenshot',
-  'capture_screen',
-  'TASK_COMPLETE',
-  'NEED_HELP',
-  // noisy internal logs
-  'INFO] kimdir',
-  'DEBUG] kimdir',
-  // argparse/CLI usage noise — should never reach the user
-  'usage: python',
-  'usage: python -m',
-  'python -m orchestrator',
-  'optional arguments:',
-  'positional arguments:',
-  '--task TASK',
-  '--provider {',
-  '--max-iter',
-  '--resume SESSION_ID',
-  'argument --provider',
-  'invalid choice:',
-  'choose from',
-  '[--task',
-  '[--provider',
-  '[--config',
-  '[--max-iter',
-  '[--resume',
-  '[-h]',
+// ── Aggressive log suppression ───────────────────────────────────────────────
+// Nothing that matches these rules should ever reach the activity feed.
+
+/** Substring patterns that silently drop a line (case-insensitive match). */
+const HIDDEN_SUBSTRINGS = [
+  // screenshot / internal commands
+  'take_screenshot', 'screenshot', 'capture_screen',
+  'TASK_COMPLETE', 'NEED_HELP',
+  // kimdir noise
+  'INFO] kimdir', 'DEBUG] kimdir',
+  // argparse / CLI usage block
+  'usage: python', 'python -m orchestrator', 'optional arguments:',
+  '--task TASK', '--provider {', '--max-iter', '--resume SESSION_ID',
+  'argument --provider', 'invalid choice:', 'choose from',
+  '[--task', '[--provider', '[--config', '[--max-iter', '[--resume', '[-h]',
+  // BrowserProvider internal debug
+  'BrowserProvider:', 'cdp_url=', "sites=['", 'headless =',
+  // VoiceEngine
+  'VoiceEngine initialized:', 'fallback chain:',
+  // MCP / asyncio internals
+  'mcp_server', 'mcp.shared', 'McpError', 'stdio_client',
+  'asyncio.run(', 'ExceptionGroup:', 'TaskGroup',
+  'mcp/client', 'mcp/shared',
+  // Python venv / site-packages paths
+  'site-packages', 'venv/lib/python', 'venv/bin/python',
+  '/opt/homebrew/', '/usr/local/lib/python',
+  // Error while finding module
+  'Error while finding module specification',
+  // asyncio runner internals
+  'return runner.run', 'return self._loop.run_until_complete',
+  'runner.run(main)', 'loop.run_until_complete',
+  // common traceback boilerplate
+  '_run_module_as_main', '_run_code', '_cli_main',
+  'mcp_agent_context', 'mcp_session_context', 'mcp_server_context',
+  'session.initialize', 'send_request', '__aexit__',
+  'return await anext', 'anext(self.gen)',
+  'BaseExceptionGroup', 'raise BaseExceptionGroup',
+  'unhandled errors in a TaskGroup',
+  'return future.result()',
+  'File "<frozen runpy>"',
 ];
+
+/** Regex patterns that silently drop a line. */
+const HIDDEN_REGEX: RegExp[] = [
+  /^\s*\|/,                        // exception group framing lines: "  |  ..."
+  /^\s*\+[-+]+/,                   // exception group border: "+-+---..."
+  /^\s*\^\^\^\^/,                  // Python error pointer: "    ^^^^^"
+  /^\s*File\s+"[^"]+",\s+line\s+\d+/,  // traceback file lines
+  /^\s*Traceback \(most recent call last\)/,
+  /^\s*raise\s+\w/,
+  /^\s*async with\s/,
+  /^\s*await\s+(?:self|session|anext|runner)\./,
+  /^\s*return\s+(?:await|self|runner|future)\./,
+  /^\s*[A-Za-z_]+Error:/,          // any XxxError: line
+  /^\s*[A-Za-z_.]+\.[A-Za-z_.]+Error:/, // module.XxxError:
+  /python@\d+\.\d+/,               // Python version paths
+  /\/Users\/\w+\/.*\/python[\d.]+\//,  // Python lib paths
+  /\^+$/,                          // lines that are only carets
+  /^[-+\s]*\d+\s+sub-exception/,  // "1 sub-exception"
+];
+
+function isNoiseLine(raw: string): boolean {
+  const lower = raw.toLowerCase();
+  for (const sub of HIDDEN_SUBSTRINGS) {
+    if (lower.includes(sub.toLowerCase())) return true;
+  }
+  for (const re of HIDDEN_REGEX) {
+    if (re.test(raw)) return true;
+  }
+  return false;
+}
 
 /** Friendly names + icons for known tool calls */
 const TOOL_MAP: Record<string, { icon: string; label: (args: Record<string, unknown>) => string }> = {
@@ -131,12 +172,12 @@ function friendlyError(raw: string): string {
 }
 
 function parseLogLine(raw: string, id: number): ActivityItem | null {
-  // Hide screenshot and other noisy lines
-  for (const pat of HIDDEN_PATTERNS) {
-    if (raw.toLowerCase().includes(pat.toLowerCase())) return null;
-  }
+  if (!raw.trim()) return null;
 
-  // Hide truncated meta-lines
+  // Aggressive noise suppression first — catches tracebacks, internal debug, etc.
+  if (isNoiseLine(raw)) return null;
+
+  // Truncated meta-lines
   if (raw.startsWith('[truncated')) return null;
 
   // ⏹ Cancelled
@@ -192,17 +233,16 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
 
   // Generic [err] stderr lines that aren't tool calls
   if (isErr) {
-    // Filter out pure INFO/DEBUG log noise that isn't user-facing
-    if (stripped.match(/\[(INFO|DEBUG)\]/)) {
-      const msg = stripped.replace(/\[(INFO|DEBUG)\]\s+[\w.]*:\s*/, '').trim();
-      // Only show if it looks like a meaningful status update
-      if (msg.length < 5 || msg.match(/^(Starting|Listening|Initialized|Loaded|Connected)/i)) return null;
-      return { id, kind: 'status', icon: '·', text: msg.length > 120 ? msg.slice(0, 120) + '…' : msg };
-    }
-    // Non-classified stderr
+    // Filter out INFO/DEBUG noise entirely
+    if (stripped.match(/\[(INFO|DEBUG)\]/)) return null;
+    // Non-classified stderr — only surface very short, clearly user-facing messages.
+    // Long lines are almost always stack trace noise or internal logging.
     const msg = stripped.replace(/\[[\w]+\]\s+[\w.]*:\s*/, '').trim();
-    if (!msg) return null;
-    return { id, kind: 'status', icon: '·', text: msg.length > 120 ? msg.slice(0, 120) + '…' : msg };
+    if (!msg || msg.length > 80) return null;
+    // Drop lines that look like code / paths / stack frames
+    if (/[/\\].+\.py/.test(msg)) return null;
+    if (/^\s*at\s/.test(msg)) return null;
+    return { id, kind: 'status', icon: '·', text: msg };
   }
 
   return null;
@@ -329,6 +369,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const startTimeRef = useRef<number | null>(null);
+  // Set to true when the kim-agent-done event fires; prevents the invoke()
+  // rejection from double-reporting errors.
+  const doneHandledRef = useRef(false);
 
   // Keep a stable ref to the onTaskDone callback
   const onTaskDoneRef = useRef(onTaskDone);
@@ -455,11 +498,12 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     let cancelFlag = false;
 
     listen<boolean>('kim-agent-done', event => {
+      doneHandledRef.current = true;
       setIsRunning(false);
       setCancelling(false);
-      if (event.payload) {
-        onTaskDoneRef.current();
-      } else if (!cancelFlag) {
+      // Always refresh sessions — failed runs still create session files.
+      onTaskDoneRef.current();
+      if (!event.payload && !cancelFlag) {
         setTaskError('agent-error');
       }
       cancelFlag = false;
@@ -499,6 +543,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     const task = taskInput.trim();
     if (!task || isRunning) return;
 
+    doneHandledRef.current = false;
     setIsRunning(true);
     setActivity([]);
     setTaskError(null);
@@ -518,8 +563,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
         projectRoot: settings.project_root || null,
       });
     } catch (err) {
-      setIsRunning(false);
-      setTaskError(friendlyError(String(err)));
+      // kim-agent-done fires BEFORE invoke() rejects on process failure.
+      // If the event already handled everything, skip the duplicate rejection.
+      if (!doneHandledRef.current) {
+        setIsRunning(false);
+        setTaskError(friendlyError(String(err)));
+        onTaskDoneRef.current(); // refresh sidebar even on invoke-level failures
+      }
     }
   }
 

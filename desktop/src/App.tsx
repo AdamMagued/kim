@@ -67,6 +67,9 @@ export default function App() {
 
   const [activeSession, setActiveSession] = useState<SessionInfo | null>(null);
   const [newChatMode, setNewChatMode] = useState(false);
+  // Incremented every time the user presses New Chat — used as ChatView's key
+  // so the component fully remounts (clearing all transient state) each time.
+  const [chatSerial, setChatSerial] = useState(0);
   const [activeTab, setActiveTab] = useState<'chat' | 'code'>('chat');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -142,6 +145,7 @@ export default function App() {
   function handleNewChat() {
     setActiveSession(null);
     setNewChatMode(true);
+    setChatSerial(s => s + 1);   // force ChatView remount → clean slate
   }
 
   const handleTaskDone = useCallback(() => {
@@ -243,6 +247,7 @@ export default function App() {
         />
 
         <ChatView
+          key={activeSession ? activeSession.session_id : `new-${chatSerial}`}
           session={activeSession}
           newChatMode={newChatMode}
           settings={settings}
