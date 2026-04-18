@@ -320,6 +320,7 @@ function AISection({ settings, onChange }: { settings: Settings; onChange: (s: S
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
     onChange({ ...settings, [key]: value });
   }
+
   return (
     <div className="kim-settings-content">
       <div className="kim-settings-content__title">AI</div>
@@ -334,6 +335,21 @@ function AISection({ settings, onChange }: { settings: Settings; onChange: (s: S
           ))}
         </select>
       </Field>
+
+      <div className="kim-toggle-row">
+        <div>
+          <div className="kim-toggle-row__label">Queue messages while Kim is working</div>
+          <div className="kim-toggle-row__hint">
+            Off (default): sending interrupts and replaces the current task. On: sends are queued (unlimited) and run automatically in order.
+          </div>
+        </div>
+        <button
+          role="switch"
+          aria-checked={settings.allow_message_queue}
+          onClick={() => update('allow_message_queue', !settings.allow_message_queue)}
+          className={`kim-switch${settings.allow_message_queue ? ' kim-switch--on' : ''}`}
+        />
+      </div>
     </div>
   );
 }

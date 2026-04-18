@@ -860,6 +860,17 @@ kbd {
   min-height: 0;
 }
 
+.kim-provider-switch-wrap {
+  max-width: 720px;
+  margin: 0 auto 18px;
+}
+
+.kim-provider-switch-wrap--active {
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
 .kim-new-chat-empty {
   max-width: 720px;
   margin: 40px auto 0;
@@ -1081,6 +1092,23 @@ kbd {
   gap: 10px;
   animation: kim-scale-in 0.2s ease;
 }
+.kim-task-error__retry {
+  margin-left: auto;
+  border: 1px solid rgba(220, 38, 38, 0.35);
+  background: rgba(255, 255, 255, 0.6);
+  color: var(--danger-hover);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.dark .kim-task-error__retry {
+  background: rgba(25, 25, 30, 0.45);
+}
+.kim-task-error__retry:hover {
+  border-color: var(--danger);
+}
 .dark .kim-task-error { color: var(--danger-hover); }
 .kim-task-error__icon {
   width: 22px;
@@ -1094,6 +1122,40 @@ kbd {
   font-size: 13px;
   font-weight: 700;
   flex-shrink: 0;
+}
+
+.kim-queue-indicator {
+  max-width: 720px;
+  margin: 10px auto 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.kim-jump-latest-wrap {
+  max-width: 720px;
+  margin: 12px auto 0;
+  display: flex;
+  justify-content: center;
+}
+
+.kim-jump-latest-btn {
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.kim-jump-latest-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 /* ── Composer ─────────────────────────────────────────────────────────────── */
