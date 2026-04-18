@@ -1,10 +1,14 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -18,6 +22,36 @@ pub struct RunningTask {
 }
 
 pub type TaskState = Arc<Mutex<RunningTask>>;
+
+#[derive(Clone, Debug)]
+struct WebviewBridgeConfig {
+    base_url: String,
+    token: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BridgeCompleteRequest {
+    site: Option<String>,
+    prompt: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BridgeOpenRequest {
+    url: String,
+    provider_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BridgeCompleteResponse {
+    ok: bool,
+    response: Option<String>,
+    error: Option<String>,
+    site: Option<String>,
+}
+
+static WEBVIEW_BRIDGE_CFG: OnceLock<WebviewBridgeConfig> = OnceLock::new();
+static WEBVIEW_BRIDGE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static WEBVIEW_BRIDGE_REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -235,6 +269,589 @@ fn parse_jsonl(path: &Path) -> Result<Vec<KimMessage>, String> {
     Ok(messages)
 }
 
+fn header_value(request: &Request, name: &str) -> Option<String> {
+    request
+        .headers()
+        .iter()
+    .find(|h| h.field.to_string().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+fn json_response(status: u16, body: serde_json::Value) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut resp = Response::from_string(body.to_string()).with_status_code(StatusCode(status));
+    if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
+        resp.add_header(h);
+    }
+    if let Ok(h) = Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]) {
+        resp.add_header(h);
+    }
+    if let Ok(h) = Header::from_bytes(
+        &b"Access-Control-Allow-Headers"[..],
+        &b"Content-Type, X-Kim-Token"[..],
+    ) {
+        resp.add_header(h);
+    }
+    if let Ok(h) = Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]) {
+        resp.add_header(h);
+    }
+    resp
+}
+
+fn respond_json(request: Request, status: u16, body: serde_json::Value) {
+    let _ = request.respond(json_response(status, body));
+}
+
+fn normalize_site(site: &str) -> String {
+    match site.trim().to_lowercase().as_str() {
+        "claude" | "claude.ai" => "claude".to_string(),
+        "chatgpt" | "openai" | "gpt" => "chatgpt".to_string(),
+        "gemini" | "google" => "gemini".to_string(),
+        "deepseek" => "deepseek".to_string(),
+        "grok" => "grok".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "claude".to_string(),
+    }
+}
+
+fn default_site_url(site: &str) -> &'static str {
+    match normalize_site(site).as_str() {
+        "chatgpt" => "https://chatgpt.com",
+        "gemini" => "https://gemini.google.com",
+        "deepseek" => "https://chat.deepseek.com",
+        "grok" => "https://grok.com",
+        _ => "https://claude.ai/new",
+    }
+}
+
+fn open_browser_signin_window_impl(
+    url: &str,
+    provider_name: Option<String>,
+    app_handle: &tauri::AppHandle,
+) -> Result<String, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("URL cannot be empty.".to_string());
+    }
+
+    let parsed = tauri::Url::parse(trimmed)
+        .map_err(|e| format!("Invalid URL: {}", e))?;
+    match parsed.scheme() {
+        "https" | "http" => {}
+        _ => return Err("Only http:// or https:// URLs are allowed.".to_string()),
+    }
+
+    let label = "kim-browser-signin";
+    if let Some(existing) = app_handle.get_webview_window(label) {
+        let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
+        let _ = existing.eval(&format!("window.location.href = {};", js_url));
+        let _ = existing.show();
+        let _ = existing.set_focus();
+        return Ok("Opened in existing Kim browser window".to_string());
+    }
+
+    let title = provider_name
+        .map(|name| format!("Kim Browser - {}", name))
+        .unwrap_or_else(|| "Kim Browser".to_string());
+
+    tauri::WebviewWindowBuilder::new(
+        app_handle,
+        label,
+        tauri::WebviewUrl::External(parsed),
+    )
+    .title(title)
+    .inner_size(1280.0, 860.0)
+    .resizable(true)
+    .visible(true)
+    .build()
+    .map_err(|e| format!("Failed to open Kim browser window: {}", e))?;
+
+    if let Some(window) = app_handle.get_webview_window(label) {
+        let _ = window.set_focus();
+    }
+
+    Ok("Opened in Kim browser window".to_string())
+}
+
+fn build_bridge_complete_script(site: &str, prompt: &str, req_id: &str) -> Result<String, String> {
+    let site_json = serde_json::to_string(site).map_err(|e| e.to_string())?;
+    let prompt_json = serde_json::to_string(prompt).map_err(|e| e.to_string())?;
+    let req_json = serde_json::to_string(req_id).map_err(|e| e.to_string())?;
+
+    let mut script = r#"
+(async () => {
+  const __kimSite = __KIM_SITE__;
+  const __kimPrompt = __KIM_PROMPT__;
+  const __kimReqId = __KIM_REQID__;
+  const __KIM_CHUNK_PREFIX = "__KIMBRIDGE_CHUNK__";
+  const __KIM_DONE_PREFIX = "__KIMBRIDGE_DONE__";
+
+  const SITE_CONFIGS = {
+    claude: {
+      input_selectors: ["div[contenteditable='true'].ProseMirror", "div[contenteditable='true']"],
+      send_selectors: ["button[aria-label*='Send']", "button[aria-label*='send']"],
+      stop_selectors: ["button[aria-label*='Stop']", "button[aria-label*='stop']"],
+      response_selectors: ["[data-testid^='conversation-turn']", ".font-claude-message"],
+    },
+    chatgpt: {
+      input_selectors: ["div#prompt-textarea", "div[contenteditable='true']"],
+      send_selectors: ["button[data-testid='send-button']", "button[aria-label*='Send']"],
+      stop_selectors: ["button[data-testid='stop-button']", "button[aria-label*='Stop']"],
+      response_selectors: ["div.markdown", "article div.prose"],
+    },
+    gemini: {
+      input_selectors: ["rich-textarea div[contenteditable]", "div[contenteditable='true']"],
+      send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']"],
+      stop_selectors: ["button[aria-label*='Stop']", "button[aria-label*='stop']"],
+      response_selectors: ["model-response", ".response-content"],
+    },
+    deepseek: {
+      input_selectors: ["textarea#chat-input", "textarea"],
+      send_selectors: ["button[aria-label*='Send']", "button[type='submit']", "div[role='button']"],
+      stop_selectors: ["button[aria-label*='Stop']", "div[role='button'][class*='stop']"],
+      response_selectors: ["div.ds-markdown"],
+    },
+    grok: {
+      input_selectors: ["textarea", "div[contenteditable='true']"],
+      send_selectors: ["button[aria-label*='Send']", "button[type='submit']"],
+      stop_selectors: ["button[aria-label*='Stop']"],
+      response_selectors: ["article", "div.markdown", "[data-testid*='message']"],
+    },
+  };
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  const emitPayload = async (payload) => {
+    try {
+      const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+      const chunkSize = 1200;
+      const total = Math.max(1, Math.ceil(encoded.length / chunkSize));
+      for (let i = 0; i < total; i++) {
+        const chunk = encoded.slice(i * chunkSize, (i + 1) * chunkSize);
+        document.title = `${__KIM_CHUNK_PREFIX}:${__kimReqId}:${i}:${total}:${chunk}`;
+        await sleep(20);
+      }
+      document.title = `${__KIM_DONE_PREFIX}:${__kimReqId}`;
+    } catch (err) {
+      document.title = `${__KIM_DONE_PREFIX}:${__kimReqId}`;
+    }
+  };
+
+  const findSelector = (selectors) => {
+    for (const sel of selectors || []) {
+      try {
+        if (document.querySelector(sel)) return sel;
+      } catch (_) {}
+    }
+    return null;
+  };
+
+  try {
+    const siteKey = SITE_CONFIGS[__kimSite] ? __kimSite : 'claude';
+    const cfg = SITE_CONFIGS[siteKey];
+
+    const responseSel = cfg.response_selectors[0] || null;
+    const initialCount = responseSel ? document.querySelectorAll(responseSel).length : 0;
+
+    const inputSel = findSelector(cfg.input_selectors);
+    if (!inputSel) {
+      throw new Error(`Could not find input selector for ${siteKey}`);
+    }
+
+    const inputEl = document.querySelector(inputSel);
+    inputEl.focus();
+
+    if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
+      const proto = Object.getPrototypeOf(inputEl);
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) setter.call(inputEl, ''); else inputEl.value = '';
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      if (setter) setter.call(inputEl, __kimPrompt); else inputEl.value = __kimPrompt;
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+    } else {
+      inputEl.innerHTML = '';
+      const lines = __kimPrompt.split('\n');
+      for (const line of lines) {
+        const div = document.createElement('div');
+        div.textContent = line;
+        inputEl.appendChild(div);
+      }
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    await sleep(300);
+
+    let sent = false;
+    const sendSel = findSelector(cfg.send_selectors);
+    if (sendSel) {
+      const sendEl = document.querySelector(sendSel);
+      if (sendEl) {
+        sendEl.click();
+        sent = true;
+      }
+    }
+    if (!sent) {
+      inputEl.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+      }));
+    }
+
+    const responseDeadline = Date.now() + 90000;
+    if (responseSel) {
+      while (Date.now() < responseDeadline) {
+        const count = document.querySelectorAll(responseSel).length;
+        if (count > initialCount) break;
+        await sleep(450);
+      }
+    }
+
+    const doneDeadline = Date.now() + 180000;
+    while (Date.now() < doneDeadline) {
+      let stopVisible = false;
+      for (const sel of cfg.stop_selectors || []) {
+        try {
+          const el = document.querySelector(sel);
+          if (el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none')) {
+            stopVisible = true;
+            break;
+          }
+        } catch (_) {}
+      }
+      if (!stopVisible) break;
+      await sleep(700);
+    }
+
+    await sleep(1200);
+
+    let text = '';
+    for (const sel of cfg.response_selectors || []) {
+      try {
+        const nodes = document.querySelectorAll(sel);
+        if (nodes.length) {
+          const last = nodes[nodes.length - 1];
+          const candidate = (last.innerText || last.textContent || '').trim();
+          if (candidate) {
+            text = candidate;
+            break;
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (!text) {
+      throw new Error('Could not read model response from page');
+    }
+
+    await emitPayload({ ok: true, response: text, site: siteKey });
+  } catch (err) {
+    const message = (err && err.message) ? err.message : String(err);
+    await emitPayload({ ok: false, error: message, site: __kimSite || 'unknown' });
+  }
+})();
+"#.to_string();
+
+    script = script.replace("__KIM_SITE__", &site_json);
+    script = script.replace("__KIM_PROMPT__", &prompt_json);
+    script = script.replace("__KIM_REQID__", &req_json);
+    Ok(script)
+}
+
+fn collect_bridge_payload_from_title(
+    window: &tauri::WebviewWindow,
+    req_id: &str,
+    timeout: Duration,
+) -> Result<BridgeCompleteResponse, String> {
+    let chunk_prefix = format!("__KIMBRIDGE_CHUNK__:{}:", req_id);
+    let done_prefix = format!("__KIMBRIDGE_DONE__:{}", req_id);
+    let started = Instant::now();
+
+    let mut chunks: HashMap<usize, String> = HashMap::new();
+    let mut total_chunks: Option<usize> = None;
+    let mut saw_done = false;
+
+    while started.elapsed() < timeout {
+        let title = window
+            .title()
+            .map_err(|e| format!("Failed reading in-app browser title: {}", e))?;
+
+        if title.starts_with(&chunk_prefix) {
+            let parts: Vec<&str> = title.splitn(5, ':').collect();
+            if parts.len() == 5 {
+                let idx = parts[2].parse::<usize>().ok();
+                let total = parts[3].parse::<usize>().ok();
+                if let (Some(i), Some(t)) = (idx, total) {
+                    total_chunks = Some(t);
+                    chunks.entry(i).or_insert_with(|| parts[4].to_string());
+                }
+            }
+        } else if title.starts_with(&done_prefix) {
+            saw_done = true;
+        }
+
+        if saw_done {
+            if let Some(total) = total_chunks {
+                if chunks.len() >= total {
+                    let mut encoded = String::new();
+                    for i in 0..total {
+                        if let Some(chunk) = chunks.get(&i) {
+                            encoded.push_str(chunk);
+                        } else {
+                            return Err("Bridge payload missing one or more chunks.".to_string());
+                        }
+                    }
+
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .map_err(|e| format!("Failed to decode bridge payload: {}", e))?;
+                    let decoded_str = String::from_utf8(decoded)
+                        .map_err(|e| format!("Bridge payload was not valid UTF-8: {}", e))?;
+
+                    let payload: BridgeCompleteResponse = serde_json::from_str(&decoded_str)
+                        .map_err(|e| format!("Failed to parse bridge payload JSON: {}", e))?;
+                    return Ok(payload);
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    Err("Timed out waiting for in-app browser completion response.".to_string())
+}
+
+fn handle_webview_bridge_request(
+    mut request: Request,
+    app_handle: tauri::AppHandle,
+    token: String,
+) {
+    let method = request.method().clone();
+    let path = request
+        .url()
+        .split('?')
+        .next()
+        .unwrap_or("/")
+        .to_string();
+
+    if method == Method::Options {
+        respond_json(request, 204, serde_json::json!({"ok": true}));
+        return;
+    }
+
+    if !(method == Method::Get && path == "/v1/health") {
+        let auth = header_value(&request, "X-Kim-Token");
+        if auth.as_deref() != Some(token.as_str()) {
+            respond_json(
+                request,
+                401,
+                serde_json::json!({"ok": false, "error": "Unauthorized bridge token."}),
+            );
+            return;
+        }
+    }
+
+    match (method, path.as_str()) {
+        (Method::Get, "/v1/health") => {
+            respond_json(request, 200, serde_json::json!({"ok": true}));
+        }
+        (Method::Post, "/v1/open") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
+                );
+                return;
+            }
+
+            let parsed: BridgeOpenRequest = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
+                    );
+                    return;
+                }
+            };
+
+            match open_browser_signin_window_impl(&parsed.url, parsed.provider_name, &app_handle) {
+                Ok(msg) => respond_json(request, 200, serde_json::json!({"ok": true, "message": msg})),
+                Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": e})),
+            }
+        }
+        (Method::Post, "/v1/complete") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
+                );
+                return;
+            }
+
+            let parsed: BridgeCompleteRequest = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
+                    );
+                    return;
+                }
+            };
+
+            if parsed.prompt.trim().is_empty() {
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": "Prompt cannot be empty."}),
+                );
+                return;
+            }
+
+            let site = normalize_site(parsed.site.as_deref().unwrap_or("claude"));
+            let bridge_lock = WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(()));
+            let _guard = match bridge_lock.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    respond_json(
+                        request,
+                        500,
+                        serde_json::json!({"ok": false, "error": "Bridge lock poisoned."}),
+                    );
+                    return;
+                }
+            };
+
+            let window = if let Some(w) = app_handle.get_webview_window("kim-browser-signin") {
+                w
+            } else {
+                let open_result = open_browser_signin_window_impl(
+                    default_site_url(&site),
+                    Some(site.clone()),
+                    &app_handle,
+                );
+                if let Err(e) = open_result {
+                    respond_json(
+                        request,
+                        500,
+                        serde_json::json!({"ok": false, "error": format!("Could not open in-app browser window: {}", e)}),
+                    );
+                    return;
+                }
+                respond_json(
+                    request,
+                    409,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "In-app browser window opened. Sign in to the provider, then resend your task.",
+                    }),
+                );
+                return;
+            };
+
+            let req_id = format!(
+                "r-{}-{}",
+                std::process::id(),
+                WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
+
+            let script = match build_bridge_complete_script(&site, &parsed.prompt, &req_id) {
+                Ok(s) => s,
+                Err(e) => {
+                    respond_json(
+                        request,
+                        500,
+                        serde_json::json!({"ok": false, "error": format!("Script build failed: {}", e)}),
+                    );
+                    return;
+                }
+            };
+
+            if let Err(e) = window.eval(&script) {
+                respond_json(
+                    request,
+                    500,
+                    serde_json::json!({"ok": false, "error": format!("Failed to evaluate in-app script: {}", e)}),
+                );
+                return;
+            }
+
+            match collect_bridge_payload_from_title(&window, &req_id, Duration::from_secs(220)) {
+                Ok(payload) => {
+                    if payload.ok {
+                        respond_json(
+                            request,
+                            200,
+                            serde_json::to_value(payload).unwrap_or_else(|_| serde_json::json!({"ok": false, "error": "Serialization error"})),
+                        );
+                    } else {
+                        respond_json(
+                            request,
+                            502,
+                            serde_json::to_value(payload).unwrap_or_else(|_| serde_json::json!({"ok": false, "error": "Serialization error"})),
+                        );
+                    }
+                }
+                Err(e) => respond_json(request, 504, serde_json::json!({"ok": false, "error": e, "site": site})),
+            }
+        }
+        _ => {
+            respond_json(
+                request,
+                404,
+                serde_json::json!({"ok": false, "error": format!("Unknown bridge route: {}", path)}),
+            );
+        }
+    }
+}
+
+fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Result<(), String> {
+    if WEBVIEW_BRIDGE_CFG.get().is_some() {
+        return Ok(());
+    }
+
+    let mut selected: Option<(Server, u16)> = None;
+    for port in 18991u16..19011u16 {
+        if let Ok(server) = Server::http(("127.0.0.1", port)) {
+            selected = Some((server, port));
+            break;
+        }
+    }
+
+    let (server, port) = selected
+        .ok_or_else(|| "Could not bind local in-app bridge port (18991-19010).".to_string())?;
+
+    let token = format!(
+        "kim-{}-{}",
+        std::process::id(),
+        WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    let _ = WEBVIEW_BRIDGE_CFG.set(WebviewBridgeConfig {
+        base_url: base_url.clone(),
+        token: token.clone(),
+    });
+
+    std::thread::spawn(move || {
+        eprintln!("[Kim] In-app browser bridge listening at {}", base_url);
+        for request in server.incoming_requests() {
+            let app = app_handle.clone();
+            let tok = token.clone();
+            std::thread::spawn(move || {
+                handle_webview_bridge_request(request, app, tok);
+            });
+        }
+    });
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
@@ -325,48 +942,7 @@ async fn open_browser_signin_window(
     provider_name: Option<String>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return Err("URL cannot be empty.".to_string());
-    }
-
-    let parsed = tauri::Url::parse(trimmed)
-        .map_err(|e| format!("Invalid URL: {}", e))?;
-    match parsed.scheme() {
-        "https" | "http" => {}
-        _ => return Err("Only http:// or https:// URLs are allowed.".to_string()),
-    }
-
-    let label = "kim-browser-signin";
-    if let Some(existing) = app_handle.get_webview_window(label) {
-        let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
-        let _ = existing.eval(&format!("window.location.href = {};", js_url));
-        let _ = existing.show();
-        let _ = existing.set_focus();
-        return Ok("Opened in existing Kim browser window".to_string());
-    }
-
-    let title = provider_name
-        .map(|name| format!("Kim Browser Sign-In - {}", name))
-        .unwrap_or_else(|| "Kim Browser Sign-In".to_string());
-
-    tauri::WebviewWindowBuilder::new(
-        &app_handle,
-        label,
-        tauri::WebviewUrl::External(parsed),
-    )
-    .title(title)
-    .inner_size(1280.0, 860.0)
-    .resizable(true)
-    .visible(true)
-    .build()
-    .map_err(|e| format!("Failed to open Kim browser window: {}", e))?;
-
-    if let Some(window) = app_handle.get_webview_window(label) {
-        let _ = window.set_focus();
-    }
-
-    Ok("Opened in Kim browser window".to_string())
+    open_browser_signin_window_impl(&url, provider_name, &app_handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +1057,13 @@ async fn send_task(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();
+    if let Some(cfg) = &bridge_cfg {
+        cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
+            .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
+            .env("KIM_WEBVIEW_WINDOW_LABEL", "kim-browser-signin");
+    }
+
     // Default to the browser provider (no API key required) when the caller
     // omits one or passes an empty string. Never silently fall through to a
     // paid API key provider.
@@ -492,9 +1075,13 @@ async fn send_task(
     // before the Python agent tries to connect. This is a best-effort launch;
     // if Chrome is already running on :9222 this is a no-op.
     if provider_arg == "browser" || provider_arg.starts_with("browser:") {
-        if let Err(e) = launch_chrome_for_cdp(&root) {
-            // Non-fatal: the Python agent will surface a NEED_HELP if it can't connect.
-            eprintln!("[Kim] Chrome launch skipped: {}", e);
+        if bridge_cfg.is_none() {
+            if let Err(e) = launch_chrome_for_cdp(&root) {
+                // Non-fatal: the Python agent will surface a NEED_HELP if it can't connect.
+                eprintln!("[Kim] Chrome launch skipped: {}", e);
+            }
+        } else {
+            eprintln!("[Kim] Browser provider using in-app bridge (no Chrome CDP launch)");
         }
     }
     cmd.arg("--provider").arg(&provider_arg);
@@ -1555,6 +2142,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            if let Err(e) = start_webview_bridge_server(app.handle().clone()) {
+                eprintln!("[Kim] Failed to start in-app browser bridge: {}", e);
+            }
+            Ok(())
+        })
         .manage(task_state)
         .invoke_handler(tauri::generate_handler![
             list_sessions,
