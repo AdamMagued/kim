@@ -643,15 +643,16 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
 
   /** Renders activity text: backtick → <code>, +N → green, -N → red */
   function renderActivityText(text: string): React.ReactNode {
-    // Split on backtick segments AND +N/-N diff markers
-    const parts = text.split(/(`[^`]+`|\+\d+|-\d+)/g);
+    // Highlight diff tokens only when they are standalone words (e.g. " +12 "),
+    // not embedded math like "2+2".
+    const parts = text.split(/(`[^`]+`|(?:^|\s)(?:[+-]\d+)(?=$|\s))/g);
     if (parts.length === 1) return text;
     return parts.map((p, i) => {
       if (p.startsWith('`') && p.endsWith('`'))
         return <code key={i}>{p.slice(1, -1)}</code>;
-      if (/^\+\d+$/.test(p))
+      if (/^\s*\+\d+\s*$/.test(p))
         return <span key={i} className="kim-diff-added">{p}</span>;
-      if (/^-\d+$/.test(p))
+      if (/^\s*-\d+\s*$/.test(p))
         return <span key={i} className="kim-diff-removed">{p}</span>;
       return p;
     });
