@@ -42,34 +42,53 @@ const HIDDEN_PATTERNS = [
   // noisy internal logs
   'INFO] kimdir',
   'DEBUG] kimdir',
+  // argparse/CLI usage noise — should never reach the user
+  'usage: python',
+  'usage: python -m',
+  'python -m orchestrator',
+  'optional arguments:',
+  'positional arguments:',
+  '--task TASK',
+  '--provider {',
+  '--max-iter',
+  '--resume SESSION_ID',
+  'argument --provider',
+  'invalid choice:',
+  'choose from',
+  '[--task',
+  '[--provider',
+  '[--config',
+  '[--max-iter',
+  '[--resume',
+  '[-h]',
 ];
 
 /** Friendly names + icons for known tool calls */
 const TOOL_MAP: Record<string, { icon: string; label: (args: Record<string, unknown>) => string }> = {
-  read_file:          { icon: '📄', label: a => `Reading \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
-  write_file:         { icon: '✏️', label: a => `Writing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
-  create_file:        { icon: '📝', label: a => `Creating \`${basename(String(a.path ?? ''))}\`` },
-  edit_file:          { icon: '✏️', label: a => `Editing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
-  delete_file:        { icon: '🗑', label: a => `Deleting \`${basename(String(a.path ?? ''))}\`` },
-  list_directory:     { icon: '📁', label: a => `Listing \`${basename(String(a.path ?? a.directory ?? ''))}\`` },
-  search_files:       { icon: '🔍', label: a => `Searching for \`${String(a.pattern ?? a.query ?? '')}\`` },
-  grep:               { icon: '🔍', label: a => `Searching code for \`${String(a.pattern ?? '')}\`` },
-  run_command:        { icon: '⚡', label: a => `Running \`${shorten(String(a.command ?? a.cmd ?? ''), 60)}\`` },
-  execute_command:    { icon: '⚡', label: a => `Running \`${shorten(String(a.command ?? ''), 60)}\`` },
-  bash:               { icon: '⚡', label: a => `Running \`${shorten(String(a.command ?? ''), 60)}\`` },
-  browser_navigate:   { icon: '🌐', label: a => `Opening ${String(a.url ?? 'a web page')}` },
-  web_search:         { icon: '🔍', label: a => `Searching the web for "${String(a.query ?? '')}"\`` },
-  type_text:          { icon: '⌨️',  label: _a => 'Typing text' },
-  click:              { icon: '🖱', label: _a => 'Clicking' },
-  scroll:             { icon: '↕',  label: _a => 'Scrolling' },
-  move_mouse:         { icon: '🖱', label: _a => 'Moving mouse' },
-  press_key:          { icon: '⌨️',  label: a => `Pressing key \`${String(a.key ?? '')}\`` },
-  open_application:   { icon: '🚀', label: a => `Opening ${String(a.app_name ?? a.application ?? '')}` },
-  close_application:  { icon: '✕',  label: a => `Closing ${String(a.app_name ?? '')}` },
-  read_clipboard:     { icon: '📋', label: _a => 'Reading clipboard' },
-  write_clipboard:    { icon: '📋', label: _a => 'Writing to clipboard' },
-  get_screen_text:    { icon: '👁', label: _a => 'Reading screen text' },
-  ask_user:           { icon: '💬', label: a => `Asking: "${String(a.question ?? '')}"` },
+  read_file:          { icon: '›', label: a => `Reading \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
+  write_file:         { icon: '›', label: a => `Writing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
+  create_file:        { icon: '›', label: a => `Creating \`${basename(String(a.path ?? ''))}\`` },
+  edit_file:          { icon: '›', label: a => `Editing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
+  delete_file:        { icon: '›', label: a => `Deleting \`${basename(String(a.path ?? ''))}\`` },
+  list_directory:     { icon: '›', label: a => `Listing \`${basename(String(a.path ?? a.directory ?? ''))}\`` },
+  search_files:       { icon: '›', label: a => `Searching for \`${String(a.pattern ?? a.query ?? '')}\`` },
+  grep:               { icon: '›', label: a => `Searching code for \`${String(a.pattern ?? '')}\`` },
+  run_command:        { icon: '›', label: a => `Running \`${shorten(String(a.command ?? a.cmd ?? ''), 60)}\`` },
+  execute_command:    { icon: '›', label: a => `Running \`${shorten(String(a.command ?? ''), 60)}\`` },
+  bash:               { icon: '›', label: a => `Running \`${shorten(String(a.command ?? ''), 60)}\`` },
+  browser_navigate:   { icon: '›', label: a => `Opening ${String(a.url ?? 'a web page')}` },
+  web_search:         { icon: '›', label: a => `Searching the web for "${String(a.query ?? '')}"\`` },
+  type_text:          { icon: '›', label: _a => 'Typing text' },
+  click:              { icon: '›', label: _a => 'Clicking' },
+  scroll:             { icon: '›', label: _a => 'Scrolling' },
+  move_mouse:         { icon: '›', label: _a => 'Moving mouse' },
+  press_key:          { icon: '›', label: a => `Pressing key \`${String(a.key ?? '')}\`` },
+  open_application:   { icon: '›', label: a => `Opening ${String(a.app_name ?? a.application ?? '')}` },
+  close_application:  { icon: '›', label: a => `Closing ${String(a.app_name ?? '')}` },
+  read_clipboard:     { icon: '›', label: _a => 'Reading clipboard' },
+  write_clipboard:    { icon: '›', label: _a => 'Writing to clipboard' },
+  get_screen_text:    { icon: '›', label: _a => 'Reading screen text' },
+  ask_user:           { icon: '›', label: a => `Asking: "${String(a.question ?? '')}"` },
 };
 
 function basename(p: string): string {
@@ -100,6 +119,8 @@ function friendlyError(raw: string): string {
     return 'The conversation is too long for the AI to handle. Try starting a new chat.';
   if (r.includes('permission') || r.includes('access denied'))
     return 'Kim doesn\'t have permission to access that file or folder.';
+  if (r.includes('invalid choice') || r.includes('argument --provider') || r.includes('exit status: 2'))
+    return 'The selected provider isn\'t configured correctly. Open Settings → AI to choose a provider.';
   // Strip noise from log lines and return a condensed version
   const cleaned = raw
     .replace(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},?\d*\s*/g, '')
@@ -154,7 +175,7 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
       return { id, kind: 'tool', icon: def.icon, text: def.label(args) };
     }
     // Unknown tool — show generic
-    return { id, kind: 'tool', icon: '🔧', text: `Using tool: \`${toolName}\`` };
+    return { id, kind: 'tool', icon: '›', text: `Using tool: \`${toolName}\`` };
   }
 
   // [ERROR] / [CRITICAL] lines
@@ -189,20 +210,20 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
 
 // ── Greeting ──────────────────────────────────────────────────────────────────
 
-const EXAMPLE_PROMPTS: { title: string; hint: string; icon: string }[] = [
-  { title: 'Summarize the PDF on my desktop', hint: 'Read and extract key insights', icon: '📄' },
-  { title: 'Find all TODOs in my project', hint: 'Search files and list them', icon: '🔍' },
-  { title: 'Stage, commit, and push my changes', hint: 'Full git workflow', icon: '⚡' },
-  { title: 'Search the web and write a report', hint: 'Browse + summarize', icon: '🌐' },
+const EXAMPLE_PROMPTS: { title: string; hint: string }[] = [
+  { title: 'Summarize the PDF on my desktop', hint: 'Read and extract key insights' },
+  { title: 'Find all TODOs in my project', hint: 'Search files and list them' },
+  { title: 'Stage, commit, and push my changes', hint: 'Full git workflow' },
+  { title: 'Search the web and write a report', hint: 'Browse and summarize' },
 ];
 
 const KIM_CAPABILITIES = [
-  { icon: '🖥', label: 'See your screen', desc: 'Kim takes screenshots to understand what\'s happening' },
-  { icon: '🖱', label: 'Control your mouse', desc: 'Click buttons, drag files, navigate any app' },
-  { icon: '⌨️', label: 'Type & edit', desc: 'Write code, fill forms, compose emails' },
-  { icon: '📁', label: 'Manage files', desc: 'Read, write, move, search files on your computer' },
-  { icon: '🌐', label: 'Browse the web', desc: 'Search, visit websites, extract information' },
-  { icon: '⚡', label: 'Run commands', desc: 'Terminal commands, scripts, git operations' },
+  { label: 'See your screen', desc: 'Kim takes screenshots to understand what\'s happening' },
+  { label: 'Control your mouse', desc: 'Click buttons, drag files, navigate any app' },
+  { label: 'Type and edit', desc: 'Write code, fill forms, compose emails' },
+  { label: 'Manage files', desc: 'Read, write, move, search files on your computer' },
+  { label: 'Browse the web', desc: 'Search, visit websites, extract information' },
+  { label: 'Run commands', desc: 'Terminal commands, scripts, git operations' },
 ];
 
 const KIM_SHORTCUTS = [
@@ -358,6 +379,20 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, activity]);
 
+  // ── Reset state when entering a new chat ─────────────────────────────────────
+  // This ensures that if an error or activity is present from a previous run,
+  // entering new-chat mode always shows a clean slate.
+  useEffect(() => {
+    if (newChatMode) {
+      setActivity([]);
+      setTaskError(null);
+      setTokenStats(null);
+      setElapsed(0);
+      // Note: do NOT set isRunning=false here — if a task is actually still
+      // running we should show that state. But if not running, we want clean UI.
+    }
+  }, [newChatMode]);
+
   // ── Focus on new chat ───────────────────────────────────────────────────────
   useEffect(() => {
     if (newChatMode) {
@@ -472,8 +507,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
     try {
+      // The orchestrator CLI only accepts the bare 'browser' token —
+      // the sub-provider (chatgpt / deepseek / etc.) is not a valid CLI argument.
       const resolvedProvider = settings.provider === 'browser'
-        ? `browser:${browserProvider}`
+        ? 'browser'
         : (settings.provider || null);
       await invoke('send_task', {
         task,
@@ -652,7 +689,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
                     className="kim-example-card"
                     onClick={() => pickExample(ex.title)}
                   >
-                    <span className="kim-example-card__icon">{ex.icon}</span>
                     <div className="kim-example-card__body">
                       <div className="kim-example-card__title">{ex.title}</div>
                       <div className="kim-example-card__hint">{ex.hint}</div>
@@ -668,7 +704,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
                 <div className="kim-capabilities__grid">
                   {KIM_CAPABILITIES.map((cap, i) => (
                     <div key={i} className="kim-capability-item">
-                      <span className="kim-capability-item__icon">{cap.icon}</span>
                       <div>
                         <div className="kim-capability-item__label">{cap.label}</div>
                         <div className="kim-capability-item__desc">{cap.desc}</div>
@@ -796,7 +831,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
           </div>
         ) : messages.length === 0 ? (
           <div className="kim-messages__empty">
-            <div className="kim-messages__empty-icon">💬</div>
             <div className="kim-messages__empty-text">No messages in this session</div>
           </div>
         ) : (

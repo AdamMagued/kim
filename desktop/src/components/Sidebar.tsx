@@ -169,72 +169,28 @@ function ClawProjectTree({ project, onRemove }: {
 
 // ── Add project form ───────────────────────────────────────────────────────────
 
-function AddProjectForm({ onAdd }: { onAdd: (path: string) => Promise<void> }) {
-  const [path, setPath] = useState('');
-  const [adding, setAdding] = useState(false);
-  const [err, setErr] = useState('');
-
-  async function commit(p: string) {
-    setAdding(true);
-    setErr('');
-    try {
-      await onAdd(p);
-      setPath('');
-    } catch (e) {
-      setErr(String(e));
-    } finally {
-      setAdding(false);
-    }
-  }
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    const p = path.trim();
-    if (!p) return;
-    await commit(p);
-  }
-
-  async function handlePickFolder() {
-    try {
-      const selected = await openDialog({
-        directory: true,
-        multiple: false,
-        title: 'Select project folder',
-      });
-      if (typeof selected === 'string' && selected) {
-        await commit(selected);
+/** Opens the native folder picker and immediately adds the selected path. */
+async function pickAndAddProject(onAdd: (path: string) => Promise<void>, setErr: (e: string) => void, setAdding: (b: boolean) => void) {
+  try {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: 'Select project folder',
+    });
+    if (typeof selected === 'string' && selected) {
+      setAdding(true);
+      setErr('');
+      try {
+        await onAdd(selected);
+      } catch (e) {
+        setErr(String(e));
+      } finally {
+        setAdding(false);
       }
-    } catch (e) {
-      setErr(String(e));
     }
+  } catch (e) {
+    setErr(String(e));
   }
-
-  return (
-    <form className="kim-add-project-form" onSubmit={handleSubmit}>
-      <input
-        type="text"
-        className="kim-input kim-input--sm"
-        placeholder="/path/to/your/project"
-        value={path}
-        onChange={e => { setPath(e.target.value); setErr(''); }}
-        autoFocus
-      />
-      <button
-        type="button"
-        onClick={handlePickFolder}
-        disabled={adding}
-        className="kim-btn kim-btn--ghost"
-        style={{ padding: '5px 10px', fontSize: 12 }}
-        title="Browse for folder…"
-      >
-        Browse…
-      </button>
-      <button type="submit" disabled={!path.trim() || adding} className="kim-btn kim-btn--primary" style={{ padding: '5px 10px', fontSize: 12 }}>
-        {adding ? '…' : 'Add'}
-      </button>
-      {err && <div className="kim-add-project-error">{err}</div>}
-    </form>
-  );
 }
 
 // ── Main Sidebar ───────────────────────────────────────────────────────────────
@@ -248,7 +204,8 @@ export function Sidebar({
   const [kimExpanded, setKimExpanded] = useState(true);
   const [clawProjects, setClawProjects] = useState<ClawProject[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(false);
-  const [showAddForm, setShowAddForm] = useState(false);
+  const [projectsAdding, setProjectsAdding] = useState(false);
+  const [projectsErr, setProjectsErr] = useState('');
 
   const projectPaths = account.code_projects ?? [];
 
@@ -271,7 +228,10 @@ export function Sidebar({
   async function handleAddProject(path: string) {
     const newPaths = await invoke<string[]>('add_code_project', { path });
     await onAccountChange({ ...account, code_projects: newPaths });
-    setShowAddForm(false);
+  }
+
+  function handlePickProject() {
+    pickAndAddProject(handleAddProject, setProjectsErr, setProjectsAdding);
   }
 
   async function handleRemoveProject(path: string) {
@@ -366,22 +326,23 @@ export function Sidebar({
                 <span className="kim-section-header__label" style={{ flex: 1 }}>Projects</span>
                 <button
                   className="kim-code-tab-add-btn"
-                  onClick={() => setShowAddForm(v => !v)}
-                  title="Add project"
+                  onClick={handlePickProject}
+                  disabled={projectsAdding}
+                  title="Add project folder"
                 >
-                  <PlusIcon />
+                  {projectsAdding ? '…' : <PlusIcon />}
                 </button>
               </div>
 
-              {showAddForm && (
-                <AddProjectForm onAdd={handleAddProject} />
+              {projectsErr && (
+                <div className="kim-add-project-error" style={{ padding: '0 8px 6px' }}>{projectsErr}</div>
               )}
 
-              {projectPaths.length === 0 && !showAddForm ? (
+              {projectPaths.length === 0 ? (
                 <div className="kim-empty-section" style={{ marginTop: 8 }}>
                   <div style={{ marginBottom: 8 }}>No projects added yet.</div>
-                  <button className="kim-link-btn" onClick={() => setShowAddForm(true)}>
-                    Add your first project
+                  <button className="kim-link-btn" onClick={handlePickProject} disabled={projectsAdding}>
+                    {projectsAdding ? 'Selecting…' : 'Choose a project folder'}
                   </button>
                 </div>
               ) : projectsLoading ? (
