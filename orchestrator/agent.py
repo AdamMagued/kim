@@ -872,10 +872,24 @@ async def _cli_main(args: argparse.Namespace) -> None:
     print(f"\n[{status}] {result['summary']}")
 
 
+def _cli_provider_type(value: str) -> str:
+    """Allow `browser:claude` / `browser:chatgpt` (desktop) as well as plain provider names."""
+    s = (value or "").strip().lower()
+    base = {"claude", "openai", "gemini", "deepseek", "browser"}
+    if s in base:
+        return s
+    if s.startswith("browser:") and len(s) > len("browser:"):
+        return s
+    raise argparse.ArgumentTypeError(
+        f"unknown provider {value!r}; use claude, openai, gemini, deepseek, browser, "
+        "or browser:<site> (e.g. browser:chatgpt)"
+    )
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m orchestrator.agent", description="Kim — autonomous AI agent")
     p.add_argument("--task", "-t", help="Task to execute")
-    p.add_argument("--provider", "-p", choices=["claude", "openai", "gemini", "deepseek", "browser"])
+    p.add_argument("--provider", "-p", type=_cli_provider_type, metavar="NAME")
     p.add_argument("--config", "-c", help="Path to config.yaml")
     p.add_argument("--max-iter", type=int)
     p.add_argument("--resume", "-r", metavar="SESSION_ID",

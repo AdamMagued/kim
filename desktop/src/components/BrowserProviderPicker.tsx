@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { openUrl } from '@tauri-apps/plugin-opener';
+import { invoke } from '@tauri-apps/api/core';
 import { toast } from './Toast';
 
 interface BrowserProvider {
@@ -127,11 +127,11 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
 
     setOpeningId(provider.id);
     try {
-      // Open the provider URL in the system browser (Chrome with CDP).
-      // The browser provider's CDP connection will pick up the signed-in
-      // session automatically — no Tauri webview needed.
-      await openUrl(targetUrl);
-      toast(`${provider.name} opened in your browser — sign in, then send your task from Kim.`, 'info', 6000);
+      await invoke<string>('open_browser_signin_window', {
+        url: targetUrl,
+        providerName: provider.name,
+      });
+      toast(`${provider.name} opened inside Kim. Browser tasks still run through the Chrome provider session.`, 'info', 7000);
     } catch (err) {
       const msg = typeof err === 'string' ? err : `Could not open ${provider.name}.`;
       toast(msg, 'error', 5000);
@@ -191,8 +191,8 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
       </div>
       <div className="kim-browser-picker__info">
         {selectedProvider?.id === 'custom'
-          ? 'Enter any AI chat URL above, open it in Kim, sign in, then send your task as normal.'
-          : 'Sign in to the AI provider above, then send your task from Kim as normal. Kim will relay your message through that browser session.'}
+          ? 'Enter any AI chat URL and open it inside Kim. Browser-provider task execution still uses the Chrome CDP session.'
+          : 'Use this in-app sign-in window for convenience. Browser-provider task execution still uses the Chrome CDP session.'}
       </div>
     </div>
   );

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -319,15 +319,77 @@ async fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+#[tauri::command]
+async fn open_browser_signin_window(
+    url: String,
+    provider_name: Option<String>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("URL cannot be empty.".to_string());
+    }
+
+    let parsed = tauri::Url::parse(trimmed)
+        .map_err(|e| format!("Invalid URL: {}", e))?;
+    match parsed.scheme() {
+        "https" | "http" => {}
+        _ => return Err("Only http:// or https:// URLs are allowed.".to_string()),
+    }
+
+    let label = "kim-browser-signin";
+    if let Some(existing) = app_handle.get_webview_window(label) {
+        let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
+        let _ = existing.eval(&format!("window.location.href = {};", js_url));
+        let _ = existing.show();
+        let _ = existing.set_focus();
+        return Ok("Opened in existing Kim browser window".to_string());
+    }
+
+    let title = provider_name
+        .map(|name| format!("Kim Browser Sign-In - {}", name))
+        .unwrap_or_else(|| "Kim Browser Sign-In".to_string());
+
+    tauri::WebviewWindowBuilder::new(
+        &app_handle,
+        label,
+        tauri::WebviewUrl::External(parsed),
+    )
+    .title(title)
+    .inner_size(1280.0, 860.0)
+    .resizable(true)
+    .visible(true)
+    .build()
+    .map_err(|e| format!("Failed to open Kim browser window: {}", e))?;
+
+    if let Some(window) = app_handle.get_webview_window(label) {
+        let _ = window.set_focus();
+    }
+
+    Ok("Opened in Kim browser window".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Chrome auto-launch for browser provider CDP
 // ---------------------------------------------------------------------------
 
 /// Try to start Chrome/Chromium with remote debugging enabled on port 9222.
+/// Uses the same user-data dir as Python's BrowserProvider: `<project>/sessions/chrome_data`.
+/// If port 9222 is already open, does not spawn (avoids a new Chrome window each task).
 /// Probes common install locations on each platform.
 /// Returns Ok(()) if a candidate launched; Err if none were found.
-fn launch_chrome_for_cdp() -> Result<(), String> {
+fn launch_chrome_for_cdp(project_root: &Path) -> Result<(), String> {
+    use std::net::TcpStream;
     use std::process::Command as StdCommand;
+
+    let port_open = TcpStream::connect("127.0.0.1:9222").is_ok();
+    if port_open {
+        return Ok(());
+    }
+
+    let user_data_dir = project_root.join("sessions").join("chrome_data");
+    let _ = fs::create_dir_all(&user_data_dir);
+    let user_data_str = user_data_dir.to_string_lossy().into_owned();
 
     #[cfg(target_os = "macos")]
     let candidates: &[&str] = &[
@@ -348,8 +410,10 @@ fn launch_chrome_for_cdp() -> Result<(), String> {
     let candidates: &[&str] = &[];
 
     for chrome in candidates {
+        let user_data_arg = format!("--user-data-dir={}", user_data_str);
         let result = StdCommand::new(chrome)
             .args([
+                user_data_arg.as_str(),
                 "--remote-debugging-port=9222",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -428,7 +492,7 @@ async fn send_task(
     // before the Python agent tries to connect. This is a best-effort launch;
     // if Chrome is already running on :9222 this is a no-op.
     if provider_arg == "browser" || provider_arg.starts_with("browser:") {
-        if let Err(e) = launch_chrome_for_cdp() {
+        if let Err(e) = launch_chrome_for_cdp(&root) {
             // Non-fatal: the Python agent will surface a NEED_HELP if it can't connect.
             eprintln!("[Kim] Chrome launch skipped: {}", e);
         }
@@ -1496,6 +1560,7 @@ pub fn run() {
             list_sessions,
             load_session_messages,
             get_app_version,
+            open_browser_signin_window,
             send_task,
             cancel_task,
             read_voice_config,

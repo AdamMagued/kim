@@ -47,8 +47,20 @@ def create_provider(name: str, config: dict) -> BaseProvider:
     """
     Factory — returns a provider instance for the given name.
     Names: "claude", "openai", "gemini", "deepseek", "browser"
+    Also: "browser:claude", "browser:chatgpt", … (sets browser_provider.preferred_site).
     """
     name = name.lower().strip()
+    if name.startswith("browser:"):
+        sub = name.split(":", 1)[1].strip().lower()
+        merged = dict(config)
+        bp = dict(config.get("browser_provider") or {})
+        if sub:
+            bp["preferred_site"] = sub
+        merged["browser_provider"] = bp
+        merged["provider"] = "browser"
+        from orchestrator.providers.browser_provider import BrowserProvider
+
+        return BrowserProvider(merged)
     if name == "claude":
         from orchestrator.providers.claude import AnthropicProvider
         return AnthropicProvider(config)

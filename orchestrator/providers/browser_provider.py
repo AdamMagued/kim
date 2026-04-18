@@ -153,6 +153,52 @@ SITE_CONFIGS: dict[str, dict] = {
             'button[aria-label*="add image"]',
         ],
     },
+    "deepseek": {
+        "url_pattern": "chat.deepseek.com",
+        "input_selectors": [
+            "textarea#chat-input",
+            "textarea",
+        ],
+        # DeepSeek send controls vary; Enter fallback in _send_and_wait handles misses.
+        "send_selectors": [
+            'button[aria-label*="Send"]',
+            'button[type="submit"]',
+        ],
+        "stop_selectors": [
+            'button[aria-label*="Stop"]',
+            'div[role="button"][class*="stop"]',
+        ],
+        "response_selectors": [
+            "div.ds-markdown",
+        ],
+        "upload_button_selectors": [
+            'button[aria-label*="Upload"]',
+            'button[aria-label*="Attach"]',
+        ],
+    },
+    "grok": {
+        "url_pattern": "grok.com",
+        "input_selectors": [
+            "textarea",
+            'div[contenteditable="true"]',
+        ],
+        "send_selectors": [
+            'button[aria-label*="Send"]',
+            'button[type="submit"]',
+        ],
+        "stop_selectors": [
+            'button[aria-label*="Stop"]',
+        ],
+        "response_selectors": [
+            "article",
+            "div.markdown",
+            '[data-testid*="message"]',
+        ],
+        "upload_button_selectors": [
+            'button[aria-label*="Upload"]',
+            'button[aria-label*="Attach"]',
+        ],
+    },
 }
 
 
@@ -215,6 +261,8 @@ class BrowserProvider(BaseProvider):
         self._max_history_messages = int(bp_cfg.get("max_history_messages", 6))
         self._max_inject_chars = int(bp_cfg.get("max_inject_chars", 12000))
         self._headless = bool(bp_cfg.get("browser_headless", False))
+        # When set (e.g. from desktop `browser:chatgpt`), pick that site's tab first.
+        self._preferred_site = (bp_cfg.get("preferred_site") or "").strip().lower() or None
 
         # Track Playwright-managed browser for auto-launch mode
         self._managed_pw = None      # Playwright context manager
@@ -234,13 +282,16 @@ class BrowserProvider(BaseProvider):
         Path(self._user_data_dir).mkdir(parents=True, exist_ok=True)
         logger.info(
             f"BrowserProvider: session dir = {self._user_data_dir}  "
-            f"headless = {self._headless}"
+            f"headless = {self._headless}  preferred_site = {self._preferred_site!r}"
         )
 
         # Stateful flag — tracks whether we've already sent the system
         # prompt + tool list to the chat UI in this session.  Subsequent
         # calls only send the latest delta message.
         self._sent_system_prompt = False
+        # Sticky tab preference to keep the loop anchored to one chat tab.
+        self._last_chat_page_url: Optional[str] = None
+        self._last_chat_site: Optional[str] = None
 
     def reset_session(self) -> None:
         """Call before each new task to force system prompt re-injection.
@@ -248,6 +299,8 @@ class BrowserProvider(BaseProvider):
         tasks skips the system prompt on the second task and beyond.
         """
         self._sent_system_prompt = False
+        self._last_chat_page_url = None
+        self._last_chat_site = None
 
         # Merge user-defined custom sites from config.yaml into the lookup table.
         # Each entry must have url_pattern + at least input/send/response selectors.
@@ -494,13 +547,61 @@ class BrowserProvider(BaseProvider):
             # BrowserContext object (headless persistent mode)
             all_pages.extend(browser.pages)
 
+        # Prefer desktop / CLI sub-provider (browser:chatgpt → chatgpt tab first).
+        if self._preferred_site:
+            ordered = [(k, v) for k, v in ordered if k == self._preferred_site] + [
+                (k, v) for k, v in ordered if k != self._preferred_site
+            ]
+
+        matches: list[tuple[Page, str]] = []
         for page in all_pages:
             url = page.url
             for site_key, cfg in ordered:
                 if cfg["url_pattern"] in url:
-                    logger.info(f"Found {site_key} tab: {url}")
+                    matches.append((page, site_key))
+                    break
+
+        if not matches:
+            return None, None
+
+        # Prefer the previously used tab if still available. This prevents
+        # hopping between multiple same-site tabs across iterations.
+        if self._last_chat_page_url and self._last_chat_site:
+            for page, site_key in matches:
+                if site_key == self._last_chat_site and page.url == self._last_chat_page_url:
+                    logger.info(f"Reusing previous {site_key} tab: {page.url}")
                     return page, site_key
-        return None, None
+
+        # Next prefer the currently focused tab among matches.
+        focused_matches: list[tuple[Page, str]] = []
+        for page, site_key in matches:
+            try:
+                has_focus = await page.evaluate("() => document.hasFocus()")
+                if has_focus:
+                    focused_matches.append((page, site_key))
+            except Exception:
+                continue
+
+        if focused_matches:
+            page, site_key = focused_matches[0]
+            self._last_chat_page_url = page.url
+            self._last_chat_site = site_key
+            logger.info(f"Using focused {site_key} tab: {page.url}")
+            return page, site_key
+
+        if self._preferred_site:
+            for page, site_key in matches:
+                if site_key == self._preferred_site:
+                    self._last_chat_page_url = page.url
+                    self._last_chat_site = site_key
+                    logger.info(f"Found preferred {site_key} tab: {page.url}")
+                    return page, site_key
+
+        page, site_key = matches[0]
+        self._last_chat_page_url = page.url
+        self._last_chat_site = site_key
+        logger.info(f"Found {site_key} tab: {page.url}")
+        return page, site_key
 
     # ==================================================================
     # Popup dismissal
