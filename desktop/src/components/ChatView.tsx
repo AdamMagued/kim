@@ -75,6 +75,7 @@ const HIDDEN_SUBSTRINGS = [
   'unhandled errors in a TaskGroup',
   'return future.result()',
   'File "<frozen runpy>"',
+  'getattr(logger, level.lower(), logger.info)(message)',
 ];
 
 /** Regex patterns that silently drop a line. */
