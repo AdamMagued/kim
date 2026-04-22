@@ -40,7 +40,6 @@ let _activityCounter = 0;
 const HIDDEN_SUBSTRINGS = [
   // screenshot / internal commands
   'take_screenshot', 'screenshot', 'capture_screen',
-  'TASK_COMPLETE', 'NEED_HELP',
   // kimdir noise
   'INFO] kimdir', 'DEBUG] kimdir',
   // argparse / CLI usage block
@@ -227,6 +226,29 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
 
   // Strip timestamp prefix: "2024-01-01 12:00:00,123 "
   const stripped = line.replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.,]?\d*\s+/, '');
+
+  // Explicit completion/help signals from the agent loop
+  const taskCompleteMatch = stripped.match(/(?:^|\b)TASK_COMPLETE:\s*(.+)$/i);
+  if (taskCompleteMatch) {
+    const summary = taskCompleteMatch[1].trim();
+    return {
+      id,
+      kind: 'success',
+      icon: '✓',
+      text: summary || 'Task completed',
+    };
+  }
+
+  const needHelpMatch = stripped.match(/(?:^|\b)NEED_HELP:\s*(.+)$/i);
+  if (needHelpMatch) {
+    const reason = needHelpMatch[1].trim();
+    return {
+      id,
+      kind: 'error',
+      icon: '⚠',
+      text: reason || 'Kim needs your help to continue.',
+    };
+  }
 
   // [TOOL] lines — 'module:' prefix is optional in newer agent log format
   const toolMatch = stripped.match(/\[TOOL\]\s+(?:[\w.]+:\s+)?(\w+)\((.{0,200})\)/);
@@ -416,6 +438,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [newestMsgIdx, setNewestMsgIdx] = useState<number | null>(null);
+  const [messageReloadNonce, setMessageReloadNonce] = useState(0);
   const prevMsgCountRef = useRef(0);
   const [taskInput, setTaskInput] = useState('');
   const [isRunning, setIsRunning] = useState(false);
@@ -431,6 +454,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
   const [conversationId] = useState(() => makeConversationId());
+  const activeResumeSessionId = session?.session_id ?? conversationId;
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const outputRef = useRef<HTMLDivElement>(null);
@@ -508,7 +532,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       })
       .catch(err => console.error('Failed to load messages:', err))
       .finally(() => setLoadingMessages(false));
-  }, [session, settings.kim_sessions_dir, settings.claw_sessions_dir]);
+  }, [session, settings.kim_sessions_dir, settings.claw_sessions_dir, messageReloadNonce]);
 
   // ── Scroll behavior ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -628,6 +652,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       cancelFlagRef.current = false; // reset for next task
       setIsRunning(false);
       setCancelling(false);
+      // Existing session view is now interactive, so reload message history
+      // after every run completion to reflect newly appended turns.
+      setMessageReloadNonce(v => v + 1);
       // Always refresh sessions — failed runs still create session files.
       onTaskDoneRef.current();
       if (!event.payload && !wasCancelled) {
@@ -695,7 +722,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
         task: pending.text,
         provider: pending.provider,
         projectRoot: settings.project_root || null,
-        resumeSessionId: conversationId,
+        resumeSessionId: activeResumeSessionId,
       });
     } catch (err) {
       // kim-agent-done fires BEFORE invoke() rejects on process failure.
@@ -707,7 +734,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
         onTaskDoneRef.current(); // refresh sidebar even on invoke-level failures
       }
     }
-  }, [conversationId, settings.project_root]);
+  }, [activeResumeSessionId, settings.project_root]);
 
   useEffect(() => {
     if (isRunning) return;
@@ -1191,6 +1218,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
         )}
         <div ref={bottomRef} />
       </div>
+
+      {renderComposer()}
     </div>
   );
 }

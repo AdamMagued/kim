@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -63,9 +64,18 @@ struct BridgeCompleteResponse {
     site: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BridgeCallbackRequest {
+    req_id: String,
+    payload: BridgeCompleteResponse,
+}
+
 static WEBVIEW_BRIDGE_CFG: OnceLock<WebviewBridgeConfig> = OnceLock::new();
 static WEBVIEW_BRIDGE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WEBVIEW_BRIDGE_REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
+static WEBVIEW_BRIDGE_RESULTS: OnceLock<StdMutex<HashMap<String, BridgeCompleteResponse>>> = OnceLock::new();
+const BRIDGE_COLLECTOR_MODE: &str = "title_pulse_v3";
+const BRIDGE_COMPLETION_TIMEOUT_S: u64 = 160;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -439,6 +449,29 @@ fn respond_json(request: Request, status: u16, body: serde_json::Value) {
     let _ = request.respond(json_response(status, body));
 }
 
+fn agent_debug_log(hypothesis_id: &str, message: &str, data: serde_json::Value) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = serde_json::json!({
+        "sessionId": "16b33e",
+        "hypothesisId": hypothesis_id,
+        "location": "desktop/src-tauri/src/lib.rs",
+        "message": message,
+        "data": data,
+        "timestamp": ts,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/adammaged/Desktop/Personal/kim/.cursor/debug-16b33e.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
 fn normalize_site(site: &str) -> String {
     match site.trim().to_lowercase().as_str() {
         "claude" | "claude.ai" => "claude".to_string(),
@@ -524,25 +557,35 @@ fn build_bridge_complete_script(
     prompt: &str,
     req_id: &str,
     attachments: &[BridgeAttachment],
+    callback_url: &str,
+    callback_token: &str,
 ) -> Result<String, String> {
     let site_json = serde_json::to_string(site).map_err(|e| e.to_string())?;
     let prompt_json = serde_json::to_string(prompt).map_err(|e| e.to_string())?;
     let req_json = serde_json::to_string(req_id).map_err(|e| e.to_string())?;
     let attachments_json = serde_json::to_string(attachments).map_err(|e| e.to_string())?;
+    let callback_url_json = serde_json::to_string(callback_url).map_err(|e| e.to_string())?;
+    let callback_token_json = serde_json::to_string(callback_token).map_err(|e| e.to_string())?;
 
-    let mut script = r#"
-(async () => {
+        let mut script = r#"
+(() => {
+    setTimeout(async () => {
+    try {
   const __kimSite = __KIM_SITE__;
   const __kimPrompt = __KIM_PROMPT__;
   const __kimReqId = __KIM_REQID__;
     const __kimAttachments = __KIM_ATTACHMENTS__;
+    const __kimCallbackUrl = __KIM_CALLBACK_URL__;
+    const __kimCallbackToken = __KIM_CALLBACK_TOKEN__;
   const __KIM_DONE_PREFIX = "__KIMBRIDGE_DONE__";
+    let __kimFinished = false;
+    let __kimWatchdog = null;
 
   const SITE_CONFIGS = {
     claude: {
       input_selectors: ["div[contenteditable='true'].ProseMirror", "div[contenteditable='true']"],
             send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']", "button[aria-label*='send']"],
-      stop_selectors: ["button[aria-label*='Stop']", "button[aria-label*='stop']"],
+    stop_selectors: ["button[aria-label*='Stop']"],
       response_selectors: ["[data-testid^='conversation-turn']", ".font-claude-message"],
             upload_button_selectors: ["button[aria-label*='Attach']", "button[aria-label*='Upload']"],
             file_input_selectors: ["input[type='file']"],
@@ -556,10 +599,10 @@ fn build_bridge_complete_script(
             file_input_selectors: ["input[type='file']"],
     },
     gemini: {
-      input_selectors: ["rich-textarea div[contenteditable]", "div[contenteditable='true']"],
-      send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']"],
-      stop_selectors: ["button[aria-label*='Stop']", "button[aria-label*='stop']"],
-            response_selectors: ["model-response", "message-content", ".response-content", "div.markdown", "article"],
+        input_selectors: ["rich-textarea div[contenteditable]", "rich-textarea [contenteditable='true']", "div[contenteditable='true']"],
+        send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']", "button[data-testid*='send']", "button[mattooltip*='Send']"],
+            stop_selectors: ["button[aria-label*='Stop']", "button[aria-label*='Stop generating']", "button[data-testid*='stop']"],
+            response_selectors: ["model-response", "model-response message-content", "model-response .response-content", "message-content", "div.response-content", "div.markdown"],
             upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Add image']"],
             file_input_selectors: ["input[type='file']"],
     },
@@ -582,21 +625,99 @@ fn build_bridge_complete_script(
   };
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const RESPONSE_WAIT_MS = 70000;
+    const STOP_APPEAR_WAIT_MS = 8000;
+    const GENERATION_DONE_WAIT_MS = 80000;
+    const READ_WAIT_MS = 25000;
+    const HARD_SCRIPT_DEADLINE_MS = 110000;
+    const hardDeadlineAt = Date.now() + HARD_SCRIPT_DEADLINE_MS;
+
+    const ensureWithinDeadline = (stage) => {
+        if (Date.now() > hardDeadlineAt) {
+            throw new Error(`Hard timeout at ${stage} after ${HARD_SCRIPT_DEADLINE_MS}ms`);
+        }
+    };
+
+  // #region agent log
+  const __kimDbg = (hypothesisId, message, data) => {
+    fetch('http://127.0.0.1:7243/ingest/52674002-420c-4794-b88a-e97e502fc8b6',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'16b33e'},body:JSON.stringify({sessionId:'16b33e',runId:__kimReqId,hypothesisId,location:'desktop/src-tauri/src/lib.rs:build_bridge_complete_script',message,data,timestamp:Date.now()})}).catch(()=>{});
+  };
+  // #endregion
 
   const emitPayload = async (payload) => {
+        if (__kimFinished) return;
+        __kimFinished = true;
+        if (__kimWatchdog) {
+            clearTimeout(__kimWatchdog);
+            __kimWatchdog = null;
+        }
+    // #region agent log
+    __kimDbg('H3', 'emitPayload called', { ok: !!payload?.ok, hasError: !!payload?.error, site: payload?.site || __kimSite || 'unknown' });
+    // #endregion
     try {
       const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
-      // Store full payload in a JS global so Rust can pull it via eval
-      // after seeing the DONE signal — avoids the timing race of chunk-by-chunk
-      // title updates (JS 20 ms emit vs Rust 40 ms poll).
-      window.__kimBridgeData = encoded;
-      window.__kimBridgeErr = null;
+            // Store payload in a per-request map so retries/cancellations cannot
+            // leak stale data from a previous req_id.
+            if (typeof window.__kimBridgeStore !== 'object' || window.__kimBridgeStore === null) {
+                window.__kimBridgeStore = {};
+            }
+            window.__kimBridgeStore[__kimReqId] = {
+                data: encoded,
+                err: null,
+                ts: Date.now(),
+            };
     } catch (err) {
-      window.__kimBridgeData = null;
-      window.__kimBridgeErr = String(err);
+            if (typeof window.__kimBridgeStore !== 'object' || window.__kimBridgeStore === null) {
+                window.__kimBridgeStore = {};
+            }
+            window.__kimBridgeStore[__kimReqId] = {
+                data: null,
+                err: String(err),
+                ts: Date.now(),
+            };
     }
-    document.title = `${__KIM_DONE_PREFIX}:${__kimReqId}`;
+
+    const doneBase = `${__KIM_DONE_PREFIX}:${__kimReqId}`;
+    let pulseCount = 0;
+    const pulseDone = () => {
+        if (!window.__kimPulsePaused) {
+            try { document.title = `${doneBase}:${Date.now()}`; } catch (_) {}
+        }
+        pulseCount += 1;
+        if (pulseCount < 600) setTimeout(pulseDone, 100);
+    };
+    pulseDone();
+
+    // Fire-and-forget callback; never block done signaling on network.
+    Promise.resolve().then(async () => {
+        try {
+            await fetch(__kimCallbackUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Kim-Token': __kimCallbackToken,
+                },
+                body: JSON.stringify({
+                    req_id: __kimReqId,
+                    payload,
+                }),
+            });
+            __kimDbg('H2', 'callback posted', { reqId: __kimReqId, url: __kimCallbackUrl });
+        } catch (err) {
+            __kimDbg('H3', 'callback post failed', { reqId: __kimReqId, error: String(err) });
+        }
+    });
   };
+
+    const __KIM_WATCHDOG_MS = 120000;
+    __kimWatchdog = setTimeout(() => {
+        if (__kimFinished) return;
+        emitPayload({
+            ok: false,
+            error: `Bridge script watchdog timeout after ${__KIM_WATCHDOG_MS}ms`,
+            site: __kimSite || 'unknown',
+        });
+    }, __KIM_WATCHDOG_MS);
 
   const findSelector = (selectors) => {
     for (const sel of selectors || []) {
@@ -765,8 +886,123 @@ fn build_bridge_complete_script(
         return 0;
     };
 
-    const extractLatestResponseText = (cfg) => {
-        let best = '';
+    const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+
+    const selectorCounts = (selectors) => {
+        const out = {};
+        for (const sel of selectors || []) {
+            try {
+                out[sel] = document.querySelectorAll(sel).length;
+            } catch (_) {
+                out[sel] = -1;
+            }
+        }
+        return out;
+    };
+
+    const isLikelyUserNode = (node) => {
+        if (!node) return false;
+        try {
+            if (node.closest(
+                'user-query, [data-message-author-role="user"], [data-role="user"], [data-author="user"], '
+                + '.user-message, .from-user, .query-content, .prompt-bubble, [data-testid*="user-message"]'
+            )) {
+                return true;
+            }
+        } catch (_) {}
+        try {
+            const author = String(
+                node.getAttribute?.('data-message-author-role')
+                || node.getAttribute?.('data-role')
+                || node.getAttribute?.('data-author')
+                || ''
+            ).toLowerCase();
+            if (author === 'user') return true;
+        } catch (_) {}
+        try {
+            const cls = String(node.className || '').toLowerCase();
+            if (cls.includes('user') && !cls.includes('assistant')) return true;
+        } catch (_) {}
+        return false;
+    };
+
+    const readInputText = (inputEl) => {
+        if (!inputEl) return '';
+        if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
+            return normalizeText(inputEl.value || '');
+        }
+        return normalizeText(inputEl.innerText || inputEl.textContent || '');
+    };
+
+    const injectPromptText = async (inputEl, promptText) => {
+        const target = String(promptText || '');
+        if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
+            const proto = Object.getPrototypeOf(inputEl);
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            if (setter) setter.call(inputEl, ''); else inputEl.value = '';
+            inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+            if (setter) setter.call(inputEl, target); else inputEl.value = target;
+            inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+            inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+            return readInputText(inputEl).length;
+        }
+
+        let inserted = false;
+        try {
+            inputEl.focus();
+            document.execCommand('selectAll', false);
+            inserted = document.execCommand('insertText', false, target);
+        } catch (_) {}
+
+        const currentText = readInputText(inputEl);
+        if (!inserted || currentText.length < Math.min(8, target.length)) {
+            inputEl.innerHTML = '';
+            const lines = target.split('\n');
+            for (const line of lines) {
+                const div = document.createElement('div');
+                div.textContent = line;
+                inputEl.appendChild(div);
+            }
+        }
+
+        // Gemini rich-textarea can keep source-of-truth in an inner textarea.
+        try {
+            const rich = inputEl.closest('rich-textarea');
+            const mirror = rich ? rich.querySelector('textarea, input') : null;
+            if (mirror && (mirror instanceof HTMLTextAreaElement || mirror instanceof HTMLInputElement)) {
+                const proto = Object.getPrototypeOf(mirror);
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                if (setter) setter.call(mirror, target); else mirror.value = target;
+                mirror.dispatchEvent(new Event('input', { bubbles: true }));
+                mirror.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        } catch (_) {}
+
+        try {
+            inputEl.dispatchEvent(new InputEvent('beforeinput', {
+                data: target,
+                inputType: 'insertText',
+                bubbles: true,
+                cancelable: true,
+            }));
+        } catch (_) {}
+        try {
+            inputEl.dispatchEvent(new InputEvent('input', {
+                data: target,
+                inputType: 'insertText',
+                bubbles: true,
+                cancelable: true,
+            }));
+        } catch (_) {}
+        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+        inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+        await sleep(120);
+        return readInputText(inputEl).length;
+    };
+
+    const gatherResponseCandidates = (cfg, siteKey) => {
+        const candidates = [];
+        const seenNodes = new Set();
         for (const sel of cfg.response_selectors || []) {
             let nodes = [];
             try {
@@ -774,33 +1010,210 @@ fn build_bridge_complete_script(
             } catch (_) {
                 continue;
             }
-            for (let i = nodes.length - 1; i >= 0; i--) {
-                const node = nodes[i];
-                const candidate = (node.innerText || node.textContent || '').trim();
-                if (!candidate) continue;
-                if (candidate.length >= 12) {
-                    return candidate;
+            for (const node of nodes) {
+                if (!node || seenNodes.has(node)) continue;
+                seenNodes.add(node);
+                if (!isVisible(node)) continue;
+                if (isLikelyUserNode(node)) continue;
+
+                // Gemini is especially noisy: only trust model-response subtree.
+                if (siteKey === 'gemini') {
+                    const isModelResponse = (
+                        (node.matches && node.matches('model-response'))
+                        || (node.closest && node.closest('model-response'))
+                    );
+                    if (!isModelResponse) continue;
                 }
-                if (candidate.length > best.length) {
-                    best = candidate;
-                }
+
+                const text = normalizeText(node.innerText || node.textContent || '');
+                if (!text || text.length < 3) continue;
+
+                candidates.push({
+                    node,
+                    selector: sel,
+                    text,
+                    key: `${sel}::${text.length}::${text.slice(0, 200)}::${text.slice(-200)}`,
+                });
             }
         }
-        return best.trim();
+
+        candidates.sort((a, b) => {
+            if (a.node === b.node) return 0;
+            const pos = a.node.compareDocumentPosition(b.node);
+            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+            if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+            return 0;
+        });
+
+        return candidates;
+    };
+
+    const getGeminiLatestResponseText = () => {
+        const modelResponses = Array.from(document.querySelectorAll('model-response')).filter(node => {
+            return !!node && isVisible(node) && !isLikelyUserNode(node);
+        });
+
+        let bestText = '';
+        let bestModelNode = null;
+        let bestModelIndex = -1;
+
+        const chooseBest = (text, modelNode, modelIndex) => {
+            if (!text) return;
+            if (modelIndex > bestModelIndex) {
+                bestText = text;
+                bestModelNode = modelNode;
+                bestModelIndex = modelIndex;
+                return;
+            }
+            if (modelIndex === bestModelIndex && text.length > bestText.length) {
+                bestText = text;
+                bestModelNode = modelNode;
+                bestModelIndex = modelIndex;
+            }
+        };
+
+        for (const sel of [
+            'model-response',
+            'model-response message-content',
+            'model-response .response-content',
+            'message-content',
+            'div.response-content',
+        ]) {
+            let nodes = [];
+            try {
+                nodes = Array.from(document.querySelectorAll(sel));
+            } catch (_) {
+                continue;
+            }
+            for (const node of nodes) {
+                if (!node || !isVisible(node) || isLikelyUserNode(node)) continue;
+
+                const modelNode = (node.matches && node.matches('model-response'))
+                    ? node
+                    : (node.closest ? node.closest('model-response') : null);
+                if (!modelNode || !isVisible(modelNode) || isLikelyUserNode(modelNode)) continue;
+
+                const modelIndex = modelResponses.indexOf(modelNode);
+                if (modelIndex < 0) continue;
+
+                const text = normalizeText(node.innerText || node.textContent || '');
+                chooseBest(text, modelNode, modelIndex);
+            }
+        }
+
+        if (!bestText && modelResponses.length > 0) {
+            const lastIndex = modelResponses.length - 1;
+            const lastNode = modelResponses[lastIndex];
+            bestText = normalizeText(lastNode.innerText || lastNode.textContent || '');
+            bestModelNode = lastNode;
+            bestModelIndex = lastIndex;
+        }
+
+        return {
+            text: bestText,
+            modelNode: bestModelNode,
+            modelIndex: bestModelIndex,
+        };
+    };
+
+    const captureResponseState = (cfg, siteKey) => {
+        if (siteKey === 'gemini') {
+            const snapshot = getGeminiLatestResponseText();
+            const latestText = snapshot?.text || '';
+            const latestNodeIndex = Number.isInteger(snapshot?.modelIndex) ? snapshot.modelIndex : -1;
+            return {
+                count: latestNodeIndex >= 0 ? latestNodeIndex + 1 : (latestText ? 1 : 0),
+                keys: latestNodeIndex >= 0 ? ['gemini-node-index::' + latestNodeIndex] : [],
+                latestText,
+                latestNodeIndex,
+            };
+        }
+        const candidates = gatherResponseCandidates(cfg, siteKey);
+        return {
+            count: candidates.length,
+            keys: candidates.map(c => c.key),
+            latestText: candidates.length > 0 ? candidates[candidates.length - 1].text : '',
+        };
+    };
+
+    const hasNewResponseSince = (baselineState, currentState) => {
+        // A valid current Gemini node index means we have a response node now.
+        // Treat it as new if baseline had no valid node, or if the index advanced.
+        if (
+            Number.isInteger(currentState?.latestNodeIndex) &&
+            currentState.latestNodeIndex >= 0 &&
+            (
+                !Number.isInteger(baselineState?.latestNodeIndex) ||
+                baselineState.latestNodeIndex < 0 ||
+                currentState.latestNodeIndex > baselineState.latestNodeIndex
+            )
+        ) return true;
+
+        if ((currentState?.count || 0) > (baselineState?.count || 0)) return true;
+        const baselineKeys = new Set((baselineState?.keys || []));
+        if ((currentState?.keys || []).some(k => !baselineKeys.has(k))) return true;
+        const baselineText = normalizeText(baselineState?.latestText || '');
+        const currentText = normalizeText(currentState?.latestText || '');
+        return !!currentText && currentText !== baselineText;
+    };
+
+    const extractLatestResponseText = (cfg, siteKey) => {
+        return captureResponseState(cfg, siteKey).latestText;
+    };
+
+    const hasStopSemantics = (el) => {
+        const label = String(
+            (el && el.getAttribute && el.getAttribute('aria-label'))
+            || (el && el.textContent)
+            || ''
+        ).toLowerCase().trim();
+        if (!label) return false;
+        return /(^|\b)stop(\b|$)/i.test(label) || label.includes('stop generating');
+    };
+
+    const isAnyStopVisible = (cfg) => {
+        for (const sel of cfg.stop_selectors || []) {
+            try {
+                const nodes = Array.from(document.querySelectorAll(sel));
+                for (const el of nodes) {
+                    if (el && isVisible(el) && hasStopSemantics(el)) {
+                        return true;
+                    }
+                }
+            } catch (_) {}
+        }
+        return false;
     };
 
   try {
     const siteKey = SITE_CONFIGS[__kimSite] ? __kimSite : 'claude';
     const cfg = SITE_CONFIGS[siteKey];
+        const selectorDiag = {
+            input: selectorCounts(cfg.input_selectors),
+            send: selectorCounts(cfg.send_selectors),
+            stop: selectorCounts(cfg.stop_selectors),
+            response: selectorCounts(cfg.response_selectors),
+        };
+        const selectorDiagText = JSON.stringify(selectorDiag);
 
-    const responseSel = cfg.response_selectors[0] || null;
-    const initialCount = responseSel ? document.querySelectorAll(responseSel).length : 0;
-    const initialResponseText = extractLatestResponseText(cfg);
+        __kimDbg('H2', 'selector diagnostics', {
+            siteKey,
+            ...selectorDiag,
+        });
 
-        const inputEl = findElement(cfg.input_selectors, { visible: true, enabled: false })
-            || findElement(cfg.input_selectors, { visible: false, enabled: false });
+        const baselineState = captureResponseState(cfg, siteKey);
+        const initialResponseText = baselineState.latestText;
+    // #region agent log
+        __kimDbg('H2', 'bridge run start', {
+            siteKey,
+            baselineCount: baselineState.count,
+            initialResponseTextLen: (initialResponseText || '').length,
+        });
+    // #endregion
+
+                const inputEl = findElement(cfg.input_selectors, { visible: true, enabled: false });
         if (!inputEl) {
-      throw new Error(`Could not find input selector for ${siteKey}`);
+            throw new Error(`Could not find input selector for ${siteKey}. selectorDiag=${selectorDiagText}`);
     }
     inputEl.focus();
 
@@ -809,126 +1222,130 @@ fn build_bridge_complete_script(
             await sleep(450);
         }
 
-    if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
-      const proto = Object.getPrototypeOf(inputEl);
-      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-      if (setter) setter.call(inputEl, ''); else inputEl.value = '';
-      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-      if (setter) setter.call(inputEl, __kimPrompt); else inputEl.value = __kimPrompt;
-      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-      inputEl.dispatchEvent(new Event('change', { bubbles: true }));
-    } else {
-            let inserted = false;
-            try {
-                document.execCommand('selectAll', false);
-                inserted = document.execCommand('insertText', false, __kimPrompt);
-            } catch (_) {}
-
-            const currentText = (inputEl.innerText || inputEl.textContent || '').trim();
-            if (!inserted || currentText.length < Math.min(8, __kimPrompt.length)) {
-                inputEl.innerHTML = '';
-                const lines = __kimPrompt.split('\n');
-                for (const line of lines) {
-                    const div = document.createElement('div');
-                    div.textContent = line;
-                    inputEl.appendChild(div);
-                }
-            }
-            try {
-                inputEl.dispatchEvent(new InputEvent('input', {
-                    data: __kimPrompt,
-                    inputType: 'insertText',
-                    bubbles: true,
-                    cancelable: true,
-                }));
-            } catch (_) {}
-      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-            inputEl.dispatchEvent(new Event('change', { bubbles: true }));
-    }
+        const injectedLen = await injectPromptText(inputEl, __kimPrompt);
+        if (injectedLen < Math.min(8, normalizeText(__kimPrompt).length)) {
+            throw new Error('Prompt text was not accepted by the chat input.');
+        }
 
     await sleep(300);
 
         const getSendButton = () => {
-            return findElement(cfg.send_selectors, { visible: true, enabled: true })
-                || findElement(cfg.send_selectors, { visible: false, enabled: true });
+                        return findElement(cfg.send_selectors, { visible: true, enabled: true });
         };
 
         // Give reactive UIs a moment to enable the send button.
-        for (let i = 0; i < 20; i++) {
+                for (let i = 0; i < 10; i++) {
+                    ensureWithinDeadline('wait_send_button');
                         const btn = getSendButton();
                         if (btn) break;
-            await sleep(120);
+                await sleep(120);
         }
 
+        const stateBeforeSend = captureResponseState(cfg, siteKey);
     let sent = false;
+                let usedButton = false;
         const sendEl = getSendButton();
         if (sendEl) {
             sendEl.click();
             sent = true;
+                        usedButton = true;
     }
     if (!sent) {
-      inputEl.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-      }));
+            inputEl.focus();
+            inputEl.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+            }));
             inputEl.dispatchEvent(new KeyboardEvent('keypress', {
                 key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
             }));
             inputEl.dispatchEvent(new KeyboardEvent('keyup', {
                 key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
             }));
+            sent = true;
+            await sleep(350);
+            const postEnterState = captureResponseState(cfg, siteKey);
+            const stillReadyToSend = !!getSendButton();
+            if (!hasNewResponseSince(stateBeforeSend, postEnterState) && stillReadyToSend) {
+                sent = false;
+            }
     }
         if (!sent) {
             try {
                 const form = inputEl.closest('form');
                 if (form) {
-                    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                                        if (typeof form.requestSubmit === 'function') {
+                                                form.requestSubmit();
+                                        } else {
+                                                form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                                        }
                     sent = true;
                 }
             } catch (_) {}
         }
+                if (!sent) {
+                    throw new Error(`Could not submit prompt to provider UI. selectorDiag=${selectorDiagText}`);
+                }
+        // #region agent log
+                __kimDbg('H1', 'send stage finished', { sent, usedButton, hasForm: !!(inputEl && inputEl.closest && inputEl.closest('form')), inputTextLen: readInputText(inputEl).length });
+        // #endregion
 
-    const responseDeadline = Date.now() + 90000;
+        const responseDeadline = Date.now() + RESPONSE_WAIT_MS;
+                let brokeOnResponseSignal = false;
         while (Date.now() < responseDeadline) {
-            let countIncreased = false;
-            if (responseSel) {
-                try {
-                    const count = document.querySelectorAll(responseSel).length;
-                    countIncreased = count > initialCount;
-                } catch (_) {}
+                ensureWithinDeadline('wait_response_start');
+                        const currentState = captureResponseState(cfg, siteKey);
+                        const hasNewText = hasNewResponseSince(baselineState, currentState);
+                if (hasNewText) {
+                brokeOnResponseSignal = true;
+                break;
             }
-            const latest = extractLatestResponseText(cfg);
-            const hasNewText = !!latest && latest !== initialResponseText;
-            if (countIncreased || hasNewText) break;
             await sleep(450);
     }
+        if (!brokeOnResponseSignal) {
+            // Some providers update an existing node in-place without changing
+            // the overall response count. Continue into fallback scraping.
+            __kimDbg('H2', 'response signal timeout; continuing with fallback scrape', {
+                baselineCount: baselineState.count,
+                latestLen: (extractLatestResponseText(cfg, siteKey) || '').length,
+            });
+        }
+    // #region agent log
+        __kimDbg('H2', 'response wait finished', {
+            brokeOnResponseSignal,
+            latestLen: (extractLatestResponseText(cfg, siteKey) || '').length,
+        });
+    // #endregion
 
-    const doneDeadline = Date.now() + 180000;
-    while (Date.now() < doneDeadline) {
-      let stopVisible = false;
-      for (const sel of cfg.stop_selectors || []) {
-        try {
-          const el = document.querySelector(sel);
-          if (el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none')) {
-            stopVisible = true;
-            break;
-          }
-        } catch (_) {}
-      }
-      if (!stopVisible) break;
-      await sleep(700);
+        let sawStop = isAnyStopVisible(cfg);
+        const stopAppearDeadline = Date.now() + STOP_APPEAR_WAIT_MS;
+        while (!sawStop && Date.now() < stopAppearDeadline) {
+            ensureWithinDeadline('wait_stop_appear');
+            await sleep(250);
+            sawStop = isAnyStopVisible(cfg);
+        }
+
+        if (sawStop) {
+            const doneDeadline = Date.now() + GENERATION_DONE_WAIT_MS;
+            while (Date.now() < doneDeadline) {
+                ensureWithinDeadline('wait_generation_done');
+                if (!isAnyStopVisible(cfg)) break;
+                await sleep(700);
+            }
     }
 
     await sleep(1200);
 
         let text = '';
-        const readDeadline = Date.now() + 30000;
+        const readDeadline = Date.now() + READ_WAIT_MS;
         while (Date.now() < readDeadline) {
-            const candidate = extractLatestResponseText(cfg);
-            if (candidate && candidate !== initialResponseText) {
-                text = candidate;
-                break;
-            }
-            if (candidate && !initialResponseText) {
+                        ensureWithinDeadline('read_response_text');
+                        const currentState = captureResponseState(cfg, siteKey);
+                        const candidate = currentState.latestText;
+                                                const changed = candidate && (
+                                                        hasNewResponseSince(baselineState, currentState)
+                                                        || normalizeText(candidate) !== normalizeText(initialResponseText)
+                                                );
+                                                if (changed) {
                 text = candidate;
                 break;
             }
@@ -936,14 +1353,33 @@ fn build_bridge_complete_script(
     }
 
     if (!text) {
-      throw new Error('Could not read model response from page');
+            const fallback = extractLatestResponseText(cfg, siteKey);
+            if (fallback && normalizeText(fallback) !== normalizeText(initialResponseText)) {
+                text = fallback;
+            }
+        }
+
+        if (!text) {
+      // #region agent log
+            __kimDbg('H2', 'read failed empty text', { responseSelectors: cfg.response_selectors || [], initialResponseTextLen: (initialResponseText || '').length, finalCandidateLen: (extractLatestResponseText(cfg, siteKey) || '').length, sent });
+      // #endregion
+            throw new Error(`Could not read model response from page. selectorDiag=${selectorDiagText}`);
     }
 
     await emitPayload({ ok: true, response: text, site: siteKey, attachments_uploaded: uploadedCount || 0 });
   } catch (err) {
     const message = (err && err.message) ? err.message : String(err);
+    // #region agent log
+    __kimDbg('H3', 'bridge script catch', { message });
+    // #endregion
     await emitPayload({ ok: false, error: message, site: __kimSite || 'unknown' });
   }
+    } catch (fatalErr) {
+        try {
+            document.title = '__KIMBRIDGE_FATAL__:' + String((fatalErr && fatalErr.message) ? fatalErr.message : fatalErr);
+        } catch (_) {}
+    }
+    }, 0);
 })();
 "#.to_string();
 
@@ -951,103 +1387,152 @@ fn build_bridge_complete_script(
     script = script.replace("__KIM_PROMPT__", &prompt_json);
     script = script.replace("__KIM_REQID__", &req_json);
     script = script.replace("__KIM_ATTACHMENTS__", &attachments_json);
+    script = script.replace("__KIM_CALLBACK_URL__", &callback_url_json);
+    script = script.replace("__KIM_CALLBACK_TOKEN__", &callback_token_json);
     Ok(script)
 }
 
 /// Pull-based bridge payload collector.
 ///
 /// Protocol:
-///   1. JS stores `window.__kimBridgeData = <base64>` then sets
-///      `document.title = "__KIMBRIDGE_DONE__:{req_id}"`.
-///   2. Rust polls the title until it sees the DONE signal.
-///   3. Rust calls `window.eval(...)` to copy the JS global into
-///      `document.title`, then reads it back.  This avoids the timing
-///      race where JS emitted 20 ms-spaced title chunks that Rust's
-///      40 ms poller would miss.
+///   1. JS posts `{req_id, payload}` to `/v1/callback`.
+///   2. Rust callback handler stores payload in `WEBVIEW_BRIDGE_RESULTS`.
+///   3. Collector polls the map until payload appears or timeout elapses.
 fn collect_bridge_payload_from_title(
     window: &tauri::WebviewWindow,
     req_id: &str,
     timeout: Duration,
 ) -> Result<BridgeCompleteResponse, String> {
-    let done_prefix = format!("__KIMBRIDGE_DONE__:{}", req_id);
-    let null_marker = "__KIMBRIDGE_NULL__";
     let started = Instant::now();
+    let result_store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let done_prefix = format!("__KIMBRIDGE_DONE__:{}", req_id);
+    let fatal_prefix = "__KIMBRIDGE_FATAL__:";
+    let null_marker = "__KIMBRIDGE_NULL__";
+    let req_id_json = serde_json::to_string(req_id)
+        .map_err(|e| format!("Failed to encode req_id for JS: {}", e))?;
+    let mut saw_done_pulse = false;
+    let mut eval_pull_attempts: u64 = 0;
+    let mut last_eval_pull_at = Instant::now() - Duration::from_secs(3);
 
-    // ── Phase 1: wait for JS to signal completion via document.title ──────────
     loop {
-        if started.elapsed() >= timeout {
-            return Err("Timed out waiting for in-app browser completion response.".to_string());
+        match result_store.lock() {
+            Ok(mut guard) => {
+                if let Some(payload) = guard.remove(req_id) {
+                    return Ok(payload);
+                }
+            }
+            Err(_) => {
+                return Err("Bridge results lock poisoned.".to_string());
+            }
         }
 
-        let title = window
-            .title()
-            .map_err(|e| format!("Failed reading in-app browser title: {}", e))?;
+        if let Ok(title) = window.title() {
+            if let Some(msg) = title.strip_prefix(fatal_prefix) {
+                let fatal_message = msg.trim();
+                agent_debug_log(
+                    "H3",
+                    "collect saw fatal title",
+                    serde_json::json!({ "reqId": req_id, "title": title }),
+                );
+                return Err(format!("Bridge script fatal error: {}", fatal_message));
+            }
+        }
 
-        if title.starts_with(&done_prefix) {
-            break;
+        // Primary path: poll JS store via eval every 2 seconds.
+        if last_eval_pull_at.elapsed() >= Duration::from_secs(2) {
+            last_eval_pull_at = Instant::now();
+            eval_pull_attempts += 1;
+            match pull_payload_from_js_store(window, &req_id_json, null_marker) {
+                Ok(Some(payload)) => return Ok(payload),
+                Ok(None) => {}
+                Err(e) => {
+                    agent_debug_log(
+                        "H3",
+                        "collect eval pull failed",
+                        serde_json::json!({ "reqId": req_id, "error": e }),
+                    );
+                }
+            }
+        }
+
+        // Secondary path: observe done pulse for diagnostics/confirmation.
+        if !saw_done_pulse {
+            if let Ok(title) = window.title() {
+                if title.starts_with(&done_prefix) {
+                    saw_done_pulse = true;
+                    agent_debug_log(
+                        "H2",
+                        "collect saw done pulse",
+                        serde_json::json!({ "reqId": req_id, "title": title }),
+                    );
+                }
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            agent_debug_log(
+                "H3",
+                "collect timeout waiting callback payload",
+                serde_json::json!({
+                    "reqId": req_id,
+                    "sawDonePulse": saw_done_pulse,
+                    "evalPullAttempts": eval_pull_attempts,
+                }),
+            );
+            return Err("Timed out waiting for in-app browser completion response.".to_string());
         }
 
         std::thread::sleep(Duration::from_millis(40));
     }
+}
 
-    // ── Phase 2: pull payload out of the JS global via eval → title round-trip ─
-    // Ask JS to copy window.__kimBridgeData into document.title so we can
-    // read it synchronously from Rust.
-    let eval_js = format!(
-        "document.title = (typeof window.__kimBridgeData === 'string' && window.__kimBridgeData.length > 0) \
-         ? window.__kimBridgeData : '{}';",
-        null_marker
+fn pull_payload_from_js_store(
+    window: &tauri::WebviewWindow,
+    req_id_json: &str,
+    null_marker: &str,
+) -> Result<Option<BridgeCompleteResponse>, String> {
+    let write_js = format!(
+        r#"(() => {{
+            window.__kimPulsePaused = true;
+            const entry = (window.__kimBridgeStore || {{}})[{req_id_json}];
+            const val = (entry && typeof entry.data === 'string' && entry.data.length > 0)
+                ? entry.data : '{null_marker}';
+            document.title = val;
+        }})()"#,
+        req_id_json = req_id_json,
+        null_marker = null_marker,
     );
     window
-        .eval(&eval_js)
-        .map_err(|e| format!("Failed to eval bridge data pull: {}", e))?;
+        .eval(&write_js)
+        .map_err(|e| e.to_string())?;
+    std::thread::sleep(Duration::from_millis(150));
 
-    // Poll until the webview processes the eval and the title changes away
-    // from the DONE prefix (the eval overwrites it).
-    let pull_deadline = Instant::now() + Duration::from_millis(800);
-    let encoded = loop {
-        std::thread::sleep(Duration::from_millis(20));
+    let encoded = window.title().map_err(|e| e.to_string())?;
 
-        let title = window
-            .title()
-            .map_err(|e| format!("Failed reading bridge data from title: {}", e))?;
+    // Resume pulseDone regardless of outcome.
+    let _ = window.eval("(() => { window.__kimPulsePaused = false; })()");
 
-        if !title.starts_with(&done_prefix) {
-            break title;
-        }
-
-        if Instant::now() >= pull_deadline {
-            return Err("Timed out pulling bridge payload from JS global.".to_string());
-        }
-    };
-
-    if encoded == null_marker {
-        // JS reported no data — try to read the error string
-        let err_js = format!(
-            "document.title = window.__kimBridgeErr || '{}';",
-            null_marker
-        );
-        let _ = window.eval(&err_js);
-        std::thread::sleep(Duration::from_millis(60));
-        let err_title = window.title().unwrap_or_default();
-        let reason = if err_title == null_marker || err_title.is_empty() {
-            "no payload data".to_string()
-        } else {
-            err_title
-        };
-        return Err(format!("Bridge payload not available: {}", reason));
+    // A real base64 payload should not contain spaces; if we read a page title,
+    // treat it as not-ready and let the caller retry.
+    if encoded == null_marker || encoded.trim().is_empty() || encoded.contains(' ') {
+        return Ok(None);
     }
 
-    // ── Phase 3: decode and parse ─────────────────────────────────────────────
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(&encoded)
-        .map_err(|e| format!("Failed to decode bridge payload: {}", e))?;
+        .map_err(|e| format!("base64 decode failed: {}", e))?;
     let decoded_str = String::from_utf8(decoded)
-        .map_err(|e| format!("Bridge payload was not valid UTF-8: {}", e))?;
+        .map_err(|e| format!("utf8 decode failed: {}", e))?;
     let payload: BridgeCompleteResponse = serde_json::from_str(&decoded_str)
-        .map_err(|e| format!("Failed to parse bridge payload JSON: {}", e))?;
+        .map_err(|e| format!("json parse failed: {}", e))?;
 
-    Ok(payload)
+    let clear_js = format!(
+        "try {{ delete (window.__kimBridgeStore || {{}})[{req_id_json}]; }} catch(_) {{}}",
+        req_id_json = req_id_json,
+    );
+    let _ = window.eval(&clear_js);
+
+    Ok(Some(payload))
 }
 
 fn run_bridge_completion_once(
@@ -1055,21 +1540,103 @@ fn run_bridge_completion_once(
     site: &str,
     prompt: &str,
     attachments: &[BridgeAttachment],
+    callback_url: &str,
+    callback_token: &str,
 ) -> Result<BridgeCompleteResponse, String> {
     let req_id = format!(
         "r-{}-{}",
         std::process::id(),
         WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
+    agent_debug_log(
+        "H1",
+        "run_bridge_completion_once start",
+        serde_json::json!({
+            "reqId": req_id,
+            "site": site,
+            "promptLen": prompt.len(),
+            "attachments": attachments.len(),
+            "collectorMode": BRIDGE_COLLECTOR_MODE,
+            "collectorTimeoutS": BRIDGE_COMPLETION_TIMEOUT_S,
+        }),
+    );
 
-    let script = build_bridge_complete_script(site, prompt, &req_id, attachments)
+    if let Ok(mut guard) = WEBVIEW_BRIDGE_RESULTS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        guard.remove(&req_id);
+    }
+
+    let script = build_bridge_complete_script(
+        site,
+        prompt,
+        &req_id,
+        attachments,
+        callback_url,
+        callback_token,
+    )
         .map_err(|e| format!("Script build failed: {}", e))?;
 
-    window
-        .eval(&script)
-        .map_err(|e| format!("Failed to evaluate in-app script: {}", e))?;
+    agent_debug_log(
+        "H1",
+        "bridge eval begin",
+        serde_json::json!({ "reqId": req_id, "scriptLen": script.len() }),
+    );
 
-    collect_bridge_payload_from_title(window, &req_id, Duration::from_secs(220))
+    if let Err(e) = window.eval(&script) {
+        agent_debug_log(
+            "H3",
+            "bridge eval failed",
+            serde_json::json!({ "reqId": req_id, "error": e.to_string() }),
+        );
+        return Err(format!("Failed to evaluate in-app script: {}", e));
+    }
+
+    agent_debug_log(
+        "H1",
+        "bridge eval returned",
+        serde_json::json!({ "reqId": req_id }),
+    );
+
+    agent_debug_log(
+        "H1",
+        "bridge collect begin",
+        serde_json::json!({
+            "reqId": req_id,
+            "timeoutS": BRIDGE_COMPLETION_TIMEOUT_S,
+            "mode": BRIDGE_COLLECTOR_MODE,
+        }),
+    );
+
+    let result = collect_bridge_payload_from_title(
+        window,
+        &req_id,
+        Duration::from_secs(BRIDGE_COMPLETION_TIMEOUT_S),
+    );
+    agent_debug_log(
+        "H1",
+        "bridge collect returned",
+        serde_json::json!({ "reqId": req_id, "ok": result.is_ok() }),
+    );
+    match &result {
+        Ok(payload) => agent_debug_log(
+            "H2",
+            "bridge completion collected payload",
+            serde_json::json!({
+                "reqId": req_id,
+                "ok": payload.ok,
+                "hasResponse": payload.response.as_ref().map(|s| !s.is_empty()).unwrap_or(false),
+                "error": payload.error,
+            }),
+        ),
+        Err(e) => agent_debug_log(
+            "H3",
+            "bridge completion collect failed",
+            serde_json::json!({ "reqId": req_id, "error": e }),
+        ),
+    }
+    result
 }
 
 fn handle_webview_bridge_request(
@@ -1134,6 +1701,57 @@ fn handle_webview_bridge_request(
                 Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": e})),
             }
         }
+        (Method::Post, "/v1/callback") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
+                );
+                return;
+            }
+
+            let parsed: BridgeCallbackRequest = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
+                    );
+                    return;
+                }
+            };
+
+            agent_debug_log(
+                "H2",
+                "callback received",
+                serde_json::json!({
+                    "reqId": parsed.req_id,
+                    "ok": parsed.payload.ok,
+                    "hasResponse": parsed.payload.response.as_ref().map(|s| !s.is_empty()).unwrap_or(false),
+                    "error": parsed.payload.error,
+                }),
+            );
+
+            let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
+            match store.lock() {
+                Ok(mut guard) => {
+                    guard.insert(parsed.req_id.clone(), parsed.payload);
+                }
+                Err(_) => {
+                    respond_json(
+                        request,
+                        500,
+                        serde_json::json!({"ok": false, "error": "Bridge results lock poisoned."}),
+                    );
+                    return;
+                }
+            }
+
+            respond_json(request, 200, serde_json::json!({"ok": true}));
+        }
         (Method::Post, "/v1/complete") => {
             let mut body = String::new();
             if let Err(e) = request.as_reader().read_to_string(&mut body) {
@@ -1168,9 +1786,20 @@ fn handle_webview_bridge_request(
 
             let site = normalize_site(parsed.site.as_deref().unwrap_or("claude"));
             let bridge_lock = WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(()));
-            let _guard = match bridge_lock.lock() {
+            let _guard = match bridge_lock.try_lock() {
                 Ok(g) => g,
-                Err(_) => {
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    respond_json(
+                        request,
+                        429,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": "In-app browser bridge is busy with another request. Retry in a moment.",
+                        }),
+                    );
+                    return;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
                     respond_json(
                         request,
                         500,
@@ -1221,11 +1850,18 @@ fn handle_webview_bridge_request(
                 std::thread::sleep(Duration::from_millis(400));
             }
 
+            let callback_url = WEBVIEW_BRIDGE_CFG
+                .get()
+                .map(|cfg| format!("{}/v1/callback", cfg.base_url))
+                .unwrap_or_else(|| "http://127.0.0.1:18991/v1/callback".to_string());
+
             let mut completion = run_bridge_completion_once(
                 &window,
                 &site,
                 &parsed.prompt,
                 &parsed.attachments,
+                &callback_url,
+                token.as_str(),
             );
 
             // If the input selector still wasn't found (page may have navigated away
@@ -1248,6 +1884,8 @@ fn handle_webview_bridge_request(
                         &site,
                         &parsed.prompt,
                         &parsed.attachments,
+                        &callback_url,
+                        token.as_str(),
                     );
                 }
             }
@@ -1315,7 +1953,12 @@ fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Result<(), Strin
     });
 
     std::thread::spawn(move || {
-        eprintln!("[Kim] In-app browser bridge listening at {}", base_url);
+        eprintln!(
+            "[Kim] In-app browser bridge listening at {} (mode={}, timeout={}s)",
+            base_url,
+            BRIDGE_COLLECTOR_MODE,
+            BRIDGE_COMPLETION_TIMEOUT_S,
+        );
         for request in server.incoming_requests() {
             let app = app_handle.clone();
             let tok = token.clone();

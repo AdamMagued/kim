@@ -423,7 +423,10 @@ class KimAgent:
                 )
             except Exception as e:
                 self._log("ERROR", f"Provider error (all retries exhausted): {e}")
-                return {"success": False, "summary": f"LLM error: {e}", "screenshot": last_screenshot_b64}
+                need_help = f"NEED_HELP: LLM provider call failed after retries: {e}"
+                self.memory.add_assistant(need_help)
+                self._session_store.append_message({"role": "assistant", "content": need_help})
+                return {"success": False, "summary": need_help, "screenshot": last_screenshot_b64}
 
             # ── Track token usage ────────────────────────────────────────
             usage = response.get("usage", {})
