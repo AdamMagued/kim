@@ -625,11 +625,11 @@ fn build_bridge_complete_script(
   };
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-    const RESPONSE_WAIT_MS = 70000;
-    const STOP_APPEAR_WAIT_MS = 8000;
-    const GENERATION_DONE_WAIT_MS = 80000;
-    const READ_WAIT_MS = 25000;
-    const HARD_SCRIPT_DEADLINE_MS = 110000;
+    const RESPONSE_WAIT_MS = 45000;
+    const STOP_APPEAR_WAIT_MS = 5000;
+    const GENERATION_DONE_WAIT_MS = 60000;
+    const READ_WAIT_MS = 10000;
+    const HARD_SCRIPT_DEADLINE_MS = 90000;
     const hardDeadlineAt = Date.now() + HARD_SCRIPT_DEADLINE_MS;
 
     const ensureWithinDeadline = (stage) => {
@@ -709,7 +709,7 @@ fn build_bridge_complete_script(
     });
   };
 
-    const __KIM_WATCHDOG_MS = 120000;
+    const __KIM_WATCHDOG_MS = 95000;
     __kimWatchdog = setTimeout(() => {
         if (__kimFinished) return;
         emitPayload({
@@ -1219,7 +1219,7 @@ fn build_bridge_complete_script(
 
         const uploadedCount = await injectAttachments(cfg, inputEl);
         if (uploadedCount > 0) {
-            await sleep(450);
+            await sleep(200);
         }
 
         const injectedLen = await injectPromptText(inputEl, __kimPrompt);
@@ -1227,7 +1227,7 @@ fn build_bridge_complete_script(
             throw new Error('Prompt text was not accepted by the chat input.');
         }
 
-    await sleep(300);
+    await sleep(80);
 
         const getSendButton = () => {
                         return findElement(cfg.send_selectors, { visible: true, enabled: true });
@@ -1333,7 +1333,7 @@ fn build_bridge_complete_script(
             }
     }
 
-    await sleep(1200);
+    await sleep(400);
 
         let text = '';
         const readDeadline = Date.now() + READ_WAIT_MS;
@@ -1439,7 +1439,7 @@ fn collect_bridge_payload_from_title(
         }
 
         // Primary path: poll JS store via eval every 2 seconds.
-        if last_eval_pull_at.elapsed() >= Duration::from_secs(2) {
+        if last_eval_pull_at.elapsed() >= Duration::from_millis(500) {
             last_eval_pull_at = Instant::now();
             eval_pull_attempts += 1;
             match pull_payload_from_js_store(window, &req_id_json, null_marker) {
@@ -1482,7 +1482,7 @@ fn collect_bridge_payload_from_title(
             return Err("Timed out waiting for in-app browser completion response.".to_string());
         }
 
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -1505,7 +1505,7 @@ fn pull_payload_from_js_store(
     window
         .eval(&write_js)
         .map_err(|e| e.to_string())?;
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(Duration::from_millis(60));
 
     let encoded = window.title().map_err(|e| e.to_string())?;
 
@@ -1559,7 +1559,7 @@ fn run_bridge_completion_once(
             "collectorMode": BRIDGE_COLLECTOR_MODE,
             "collectorTimeoutS": BRIDGE_COMPLETION_TIMEOUT_S,
         }),
-    );
+    ); 
 
     if let Ok(mut guard) = WEBVIEW_BRIDGE_RESULTS
         .get_or_init(|| StdMutex::new(HashMap::new()))
@@ -1847,7 +1847,7 @@ fn handle_webview_bridge_request(
                 let _ = window.show();
                 let _ = window.set_focus();
                 // Give the window and its compositor layer time to become active.
-                std::thread::sleep(Duration::from_millis(400));
+                std::thread::sleep(Duration::from_millis(150));
             }
 
             let callback_url = WEBVIEW_BRIDGE_CFG
