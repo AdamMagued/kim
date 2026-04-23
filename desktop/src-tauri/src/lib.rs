@@ -681,7 +681,18 @@ fn build_bridge_complete_script(
     let pulseCount = 0;
     const pulseDone = () => {
         if (!window.__kimPulsePaused) {
-            try { document.title = `${doneBase}:${Date.now()}`; } catch (_) {}
+            try {
+                // Embed the base64 payload (if ready) directly in the title pulse.
+                // This lets Rust read the result without a separate eval round-trip,
+                // eliminating the async eval-to-title race condition.
+                const store = window.__kimBridgeStore || {};
+                const entry = store[__kimReqId];
+                const data = (entry && typeof entry.data === 'string' && entry.data.length > 0)
+                    ? entry.data : '';
+                document.title = data
+                    ? `${doneBase}:${Date.now()}:${data}`
+                    : `${doneBase}:${Date.now()}`;
+            } catch (_) {}
         }
         pulseCount += 1;
         if (pulseCount < 600) setTimeout(pulseDone, 100);
@@ -1455,16 +1466,37 @@ fn collect_bridge_payload_from_title(
             }
         }
 
-        // Secondary path: observe done pulse for diagnostics/confirmation.
-        if !saw_done_pulse {
-            if let Ok(title) = window.title() {
-                if title.starts_with(&done_prefix) {
+        // Fast path: pulseDone now embeds the base64 payload in the title as
+        // "__KIMBRIDGE_DONE__:<reqId>:<ts>:<base64>".  Try to extract it on
+        // every loop tick (every 20ms) without any eval round-trip.
+        if let Ok(title) = window.title() {
+            if title.starts_with(&done_prefix) {
+                if !saw_done_pulse {
                     saw_done_pulse = true;
                     agent_debug_log(
                         "H2",
                         "collect saw done pulse",
-                        serde_json::json!({ "reqId": req_id, "title": title }),
+                        serde_json::json!({ "reqId": req_id, "title": &title }),
                     );
+                }
+                // Title format with payload: "__KIMBRIDGE_DONE__:reqId:ts:BASE64"
+                let parts: Vec<&str> = title.splitn(4, ':').collect();
+                if parts.len() == 4 {
+                    let encoded = parts[3];
+                    if !encoded.is_empty() && !encoded.contains(' ') {
+                        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                            if let Ok(s) = String::from_utf8(decoded) {
+                                if let Ok(payload) = serde_json::from_str::<BridgeCompleteResponse>(&s) {
+                                    agent_debug_log(
+                                        "H2",
+                                        "collect extracted payload from title pulse",
+                                        serde_json::json!({ "reqId": req_id }),
+                                    );
+                                    return Ok(payload);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1491,6 +1523,37 @@ fn pull_payload_from_js_store(
     req_id_json: &str,
     null_marker: &str,
 ) -> Result<Option<BridgeCompleteResponse>, String> {
+    // Primary path: the pulseDone function embeds the base64 payload directly
+    // in the title as "__KIMBRIDGE_DONE__:reqId:ts:BASE64".  Read it without
+    // any eval so there is no async write-then-read race condition.
+    if let Ok(current_title) = window.title() {
+        // Title format when payload is embedded: "__KIMBRIDGE_DONE__:<reqId>:<ts>:<base64>"
+        // Split on ':' with a limit of 4 parts so the base64 (which may contain '+')
+        // is kept intact in the last field.
+        let parts: Vec<&str> = current_title.splitn(4, ':').collect();
+        if parts.len() == 4 {
+            let encoded = parts[3];
+            if !encoded.is_empty() && !encoded.contains(' ') {
+                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                    if let Ok(decoded_str) = String::from_utf8(decoded) {
+                        if let Ok(payload) = serde_json::from_str::<BridgeCompleteResponse>(&decoded_str) {
+                            // Clean up the store entry.
+                            let clear_js = format!(
+                                "try {{ delete (window.__kimBridgeStore || {{}})[{req_id_json}]; }} catch(_) {{}}",
+                                req_id_json = req_id_json,
+                            );
+                            let _ = window.eval(clear_js);
+                            return Ok(Some(payload));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback path: use an eval to write the payload to the title, then read
+    // it back after a generous delay.  This handles the case where the title
+    // pulse hasn't fired yet after emitPayload.
     let write_js = format!(
         r#"(() => {{
             window.__kimPulsePaused = true;
@@ -1503,17 +1566,17 @@ fn pull_payload_from_js_store(
         null_marker = null_marker,
     );
     window
-        .eval(&write_js)
+        .eval(write_js)
         .map_err(|e| e.to_string())?;
-    std::thread::sleep(Duration::from_millis(60));
+    // 250ms — enough for WKWebView to execute the JS and propagate the
+    // document.title change back to the OS window title layer.
+    std::thread::sleep(Duration::from_millis(250));
 
     let encoded = window.title().map_err(|e| e.to_string())?;
 
     // Resume pulseDone regardless of outcome.
     let _ = window.eval("(() => { window.__kimPulsePaused = false; })()");
 
-    // A real base64 payload should not contain spaces; if we read a page title,
-    // treat it as not-ready and let the caller retry.
     if encoded == null_marker || encoded.trim().is_empty() || encoded.contains(' ') {
         return Ok(None);
     }
@@ -1530,7 +1593,7 @@ fn pull_payload_from_js_store(
         "try {{ delete (window.__kimBridgeStore || {{}})[{req_id_json}]; }} catch(_) {{}}",
         req_id_json = req_id_json,
     );
-    let _ = window.eval(&clear_js);
+    let _ = window.eval(clear_js);
 
     Ok(Some(payload))
 }
