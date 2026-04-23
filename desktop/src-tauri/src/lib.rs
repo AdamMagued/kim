@@ -386,7 +386,7 @@ fn extract_title_from_content(content: &serde_json::Value) -> Option<String> {
 fn infer_session_title(session_file: &Path, summary: Option<&String>, session_id: &str) -> String {
     if let Ok(file) = fs::File::open(session_file) {
         let reader = BufReader::new(file);
-        for line in reader.lines().flatten().take(80) {
+        for line in reader.lines().map_while(Result::ok).take(80) {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -514,7 +514,7 @@ fn open_browser_signin_window_impl(
     let label = "kim-browser-signin";
     if let Some(existing) = app_handle.get_webview_window(label) {
         let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
-        let _ = existing.eval(&format!("window.location.href = {};", js_url));
+        let _ = existing.eval(format!("window.location.href = {};", js_url));
         let _ = existing.show();
         let _ = existing.set_focus();
         return Ok("Opened in existing Kim browser window".to_string());
@@ -537,7 +537,7 @@ fn open_browser_signin_window_impl(
     .map_err(|e| format!("Failed to open Kim browser window: {}", e))?;
 
     let window_for_close = window.clone();
-    let _ = window.on_window_event(move |event| {
+    window.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             // Keep the webview session alive for background/headless execution.
             api.prevent_close();
@@ -1877,7 +1877,7 @@ fn handle_webview_bridge_request(
             if needs_nav_retry {
                 let nav_url = default_site_url(&site);
                 if let Ok(js_url) = serde_json::to_string(nav_url) {
-                    let _ = window.eval(&format!("window.location.href = {};", js_url));
+                    let _ = window.eval(format!("window.location.href = {};", js_url));
                     std::thread::sleep(Duration::from_millis(2000));
                     completion = run_bridge_completion_once(
                         &window,
