@@ -1176,20 +1176,23 @@ kbd {
 }
 .kim-composer__bloop {
   flex-shrink: 0;
-  width: 48px;
+  width: 32px;
   height: 50px;
   display: flex;
   align-items: center;
   justify-content: center;
   pointer-events: none;
   user-select: none;
-  position: relative;
+  overflow: visible;
 }
-.kim-composer__bloop .bloop-char {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  margin: -44px 0 0 -46px;
+.kim-composer__bloop-inner {
+  width: 92px;
+  height: 88px;
+  transform: scale(0.32);
+  transform-origin: center center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 .kim-composer__box {
   max-width: 820px;
