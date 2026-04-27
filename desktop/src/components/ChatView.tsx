@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { SessionInfo, KimMessage, Settings, KimAccount } from '../types';
-import { MessageBubble } from './MessageBubble';
+import { MessageBubble, AnimatedText } from './MessageBubble';
+import { SignalCard } from './ToolCallCard';
 import { BrowserProviderPicker } from './BrowserProviderPicker';
 import { useChromaShader } from '../hooks/useChromaShader';
 import { toast } from './Toast';
@@ -42,6 +43,8 @@ const HIDDEN_SUBSTRINGS = [
   'take_screenshot', 'screenshot', 'capture_screen',
   // kimdir noise
   'INFO] kimdir', 'DEBUG] kimdir',
+  // CLI noise
+  'Running: ',
   // argparse / CLI usage block
   'usage: python', 'python -m orchestrator', 'optional arguments:',
   '--task TASK', '--provider {', '--max-iter', '--resume SESSION_ID',
@@ -171,7 +174,7 @@ function shorten(s: string, max: number): string {
 }
 
 /** Map technical error text to something a non-technical user can understand */
-function friendlyError(raw: string): string {
+export function friendlyError(raw: string): string {
   const r = raw.toLowerCase();
   if (r.includes('api key') || r.includes('unauthorized') || r.includes('401'))
     return 'Your API key isn\'t working. Open Settings → AI to check your credentials.';
@@ -246,7 +249,7 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
       id,
       kind: 'error',
       icon: '⚠',
-      text: reason || 'Kim needs your help to continue.',
+      text: friendlyError(reason || 'Kim needs your help to continue.'),
     };
   }
 
@@ -361,8 +364,8 @@ function getGreeting(name: string): string {
   if (hour < 5) return `Late night, ${name}`;
   if (hour < 12) return `Good morning, ${name}`;
   if (hour < 17) return `Good afternoon, ${name}`;
-  if (hour < 21) return `Good evening, ${name}`;
-  return `Evening, ${name}`;
+  if (hour < 21) return `Good evening, ${name} (test)`;
+  return `Evening, ${name} (test)`;
 }
 
 // ── Blobby Loaders (3, 6, 12, 15, 20) ────────────────────────────────────────
@@ -430,14 +433,17 @@ interface Props {
   settings: Settings;
   onTaskDone: () => void;
   account: KimAccount;
+  activeTab: 'chat' | 'code';
+  activeProjectPath?: string | null;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function ChatView({ session, newChatMode, settings, onTaskDone, account }: Props) {
+export function ChatView({ session, newChatMode, settings, onTaskDone, account, activeTab, activeProjectPath }: Props) {
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [newestMsgIdx, setNewestMsgIdx] = useState<number | null>(null);
+  const [localProvider, setLocalProvider] = useState<string | null>(null);
   const [messageReloadNonce, setMessageReloadNonce] = useState(0);
   const prevMsgCountRef = useRef(0);
   const [taskInput, setTaskInput] = useState('');
@@ -456,11 +462,18 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   const [conversationId] = useState(() => makeConversationId());
   const activeResumeSessionId = session?.session_id ?? conversationId;
 
+  // Live conversation history for new-chat mode — persists across task runs
+  // and doesn't get wiped by the disk-based message reload.
+  const [liveHistory, setLiveHistory] = useState<{role: 'user' | 'assistant'; content: string}[]>([]);
+
   const bottomRef = useRef<HTMLDivElement>(null);
   const outputRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const startTimeRef = useRef<number | null>(null);
   const currentTaskRef = useRef<PendingTask | null>(null);
+  // Tracks the most recently submitted task — never cleared, so retry always works
+  // even when the task "succeeded" with a NEED_HELP (e.g., 409 sign-in required).
+  const lastRunTaskRef = useRef<PendingTask | null>(null);
   const previousProviderRef = useRef(settings.provider);
   // Set to true when the kim-agent-done event fires; prevents the invoke()
   // rejection from double-reporting errors.
@@ -471,6 +484,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   // ~100ms BEFORE kim-agent-cancelled (Rust emits done inside child.wait(), then
   // the cancel poller emits cancelled), so a closure variable would still be false.
   const cancelFlagRef = useRef(false);
+  const needHelpFlagRef = useRef(false);
 
   // ── Deduplication (per-session, not module-global) ───────────────────────
   // Python writes many lines to both stdout AND stderr, causing duplicates.
@@ -512,6 +526,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       return;
     }
     setLoadingMessages(true);
+    setLiveHistory([]);
     invoke<KimMessage[]>('load_session_messages', {
       sessionId: session.session_id,
       kimDir: settings.kim_sessions_dir || null,
@@ -550,7 +565,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   }, [newChatMode]);
 
   useEffect(() => {
+    // If we're starting a brand new chat and there's no activity yet,
+    // don't scroll to the bottom (otherwise it skips the greeting/examples).
+    if (newChatMode && activity.length === 0) {
+      return;
+    }
     if (!newChatMode) {
+      // For existing sessions, or when newChatMode starts generating activity
       bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
       return;
     }
@@ -623,12 +644,39 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     }
 
     const item = parseLogLine(line, id);
-    if (!item) return;
+    if (!item) {
+      if (line.includes('[UI] SCREENSHOT_FLASH')) {
+        invoke('show_screenshot_flash').catch(() => {});
+        invoke('hide_main_window').catch(() => {});
+      } else if (line.includes('[UI] HIDE')) {
+        invoke('hide_main_window').catch(() => {});
+      } else if (line.includes('[UI] SHOW')) {
+        invoke('show_main_window').catch(() => {});
+      }
+      return;
+    }
+
+    const needHelpMatch = line.match(/(?:^|\b)NEED_HELP:\s*(.+)$/i);
+    if (needHelpMatch) {
+      needHelpFlagRef.current = true;
+      setTaskError(needHelpMatch[1].trim() || 'Kim needs your help to continue.');
+      if (lastRunTaskRef.current) {
+        setLastFailedTask(lastRunTaskRef.current);
+      }
+      return; // Skip adding to activity feed to avoid duplicate error messages
+    }
+
     setActivity(prev => {
+      if (item.kind === 'success') return prev; // Skip adding to activity feed to avoid duplicating the assistant bubble
       const next = [...prev, item];
       if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
       return next;
     });
+
+    // Capture success results as assistant bubbles in liveHistory
+    if (item.kind === 'success') {
+      setLiveHistory(prev => [...prev, { role: 'assistant', content: item.text }]);
+    }
   }
 
   // ── Agent event listeners ───────────────────────────────────────────────────
@@ -648,8 +696,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
 
     listen<boolean>('kim-agent-done', event => {
       const wasCancelled = cancelFlagRef.current;
+      const hadNeedHelp = needHelpFlagRef.current;
       doneHandledRef.current = true;
       cancelFlagRef.current = false; // reset for next task
+      needHelpFlagRef.current = false; // reset
       setIsRunning(false);
       setCancelling(false);
       // Existing session view is now interactive, so reload message history
@@ -658,11 +708,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       // Always refresh sessions — failed runs still create session files.
       onTaskDoneRef.current();
       if (!event.payload && !wasCancelled) {
-        setTaskError('agent-error');
-        if (currentTaskRef.current) {
-          setLastFailedTask(currentTaskRef.current);
+        if (!hadNeedHelp) {
+          setTaskError('agent-error');
         }
-      } else if (event.payload) {
+        if (lastRunTaskRef.current) {
+          setLastFailedTask(lastRunTaskRef.current);
+        }
+      } else if (event.payload && !hadNeedHelp) {
         setLastFailedTask(null);
       }
       currentTaskRef.current = null;
@@ -690,9 +742,12 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   const queueEnabled = Boolean(settings.allow_message_queue);
 
   const resolveProvider = useCallback((): string => {
-    if (settings.provider === 'browser') return `browser:${browserProvider}`;
-    return settings.provider || 'browser';
-  }, [settings.provider, browserProvider]);
+    const p = localProvider ?? settings.provider;
+    // If localProvider is already "browser:claude" etc., pass it through
+    if (p.startsWith('browser:')) return p;
+    if (p === 'browser') return `browser:${browserProvider}`;
+    return p || 'browser';
+  }, [localProvider, settings.provider, browserProvider]);
 
   const makePendingTask = useCallback((text: string, providerOverride?: string): PendingTask => {
     return {
@@ -709,7 +764,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     // leaving a stale true that would suppress the error banner for the
     // next task if it failed for a real (non-cancel) reason.
     cancelFlagRef.current = false;
+    needHelpFlagRef.current = false;
     currentTaskRef.current = pending;
+    lastRunTaskRef.current = pending;
     setIsRunning(true);
     setActivity([]);
     setTaskError(null);
@@ -717,11 +774,14 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     setCancelling(false);
     setAutoFollowOutput(true);
 
+    // Add user message to live history for chat bubble display
+    setLiveHistory(prev => [...prev, { role: 'user', content: pending.text }]);
+
     try {
       await invoke('send_task', {
         task: pending.text,
         provider: pending.provider,
-        projectRoot: settings.project_root || null,
+        projectRoot: (activeTab === 'code' && activeProjectPath) ? activeProjectPath : (settings.project_root || null),
         resumeSessionId: activeResumeSessionId,
       });
     } catch (err) {
@@ -734,7 +794,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
         onTaskDoneRef.current(); // refresh sidebar even on invoke-level failures
       }
     }
-  }, [activeResumeSessionId, settings.project_root]);
+  }, [activeResumeSessionId, settings.project_root, activeTab, activeProjectPath]);
 
   useEffect(() => {
     if (isRunning) return;
@@ -799,8 +859,28 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   }
 
   async function handleRetryLast() {
-    if (!lastFailedTask) return;
-    const retryTask = makePendingTask(lastFailedTask.text, lastFailedTask.provider);
+    let taskToRetry = lastFailedTask ?? lastRunTaskRef.current;
+    
+    // If not in current lifecycle, find the last user message from the loaded history
+    if (!taskToRetry && messages.length > 0) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+          const msg = messages[i];
+          let text = typeof msg.content === 'string'
+            ? msg.content
+            : msg.content.filter(b => b.type === 'text').map(b => (b as any).text).join('\n');
+            
+          if (text.startsWith('Task: ')) {
+            text = text.substring(6).trim();
+          }
+          taskToRetry = { id: 0, text, provider: resolveProvider() };
+          break;
+        }
+      }
+    }
+    
+    if (!taskToRetry) return;
+    const retryTask = makePendingTask(taskToRetry.text, resolveProvider());
     setTaskError(null);
 
     if (isRunning) {
@@ -825,6 +905,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     if (nextProvider === browserProvider) return;
     const previous = browserProvider;
     setBrowserProvider(nextProvider);
+    setLocalProvider(`browser:${nextProvider}`);
+
     if (activity.length > 0 || isRunning || queuedTasks.length > 0 || interruptTask) {
       toast(
         `Switched from ${providerLabel(`browser:${previous}`)} to ${providerLabel(`browser:${nextProvider}`)}. ` +
@@ -876,13 +958,17 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   function renderActivityFeed() {
     if (activity.length === 0) return null;
     return (
-      <div className="kim-activity-feed">
-        {activity.map(item => (
-          <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
-            <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
-            <span className="kim-activity-item__text">{renderActivityText(item.text)}</span>
+      <div className="kim-msg-row kim-msg-row--assistant kim-msg-row--live">
+        <div className="kim-bubble kim-bubble--assistant kim-bubble--live">
+          <div className="kim-activity-feed">
+            {activity.map(item => (
+              <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
+                <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
+                <span className="kim-activity-item__text">{renderActivityText(item.text)}</span>
+              </div>
+            ))}
           </div>
-        ))}
+        </div>
       </div>
     );
   }
@@ -890,8 +976,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
   // ── Composer ─────────────────────────────────────────────────────────────────
 
   function renderComposer() {
-    const resolvedLabel = providerLabel(resolveProvider());
-
     return (
       <form className="kim-composer" onSubmit={handleSubmit}>
         <div className={'kim-composer__box' + (isRunning ? ' kim-composer__box--running' : '')}>
@@ -948,7 +1032,85 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
           <span className="kim-composer__hint-sep">·</span>
           <span><kbd>⇧</kbd>+<kbd>↵</kbd> for new line</span>
           <span className="kim-composer__hint-sep">·</span>
-          <span>via <strong>{resolvedLabel}</strong></span>
+          <span className="kim-composer__provider-pill">
+            <select 
+              value={resolveProvider()} 
+              onChange={async (e) => {
+                const val = e.target.value;
+                if (val.startsWith('browser:')) {
+                  // Browser sub-provider: set both localProvider and browserProvider
+                  setLocalProvider(val);
+                  const sub = val.split(':')[1];
+                  setBrowserProvider(sub);
+                  // Navigate the existing browser window (if open) to the new provider
+                  const urlMap: Record<string, string> = {
+                    claude: 'https://claude.ai',
+                    chatgpt: 'https://chatgpt.com',
+                    gemini: 'https://gemini.google.com',
+                    grok: 'https://grok.com',
+                    deepseek: 'https://chat.deepseek.com',
+                  };
+                  const newUrl = urlMap[sub];
+                  if (newUrl) {
+                    try {
+                      await invoke<boolean>('navigate_browser_window_if_open', { url: newUrl });
+                    } catch (_) {}
+                  }
+                } else {
+                  setLocalProvider(val);
+                }
+              }}
+              className="kim-composer__provider-select"
+            >
+              <optgroup label="Browser (free — uses your sign-in)">
+                <option value="browser:claude">Browser: Claude</option>
+                <option value="browser:chatgpt">Browser: ChatGPT</option>
+                <option value="browser:gemini">Browser: Gemini</option>
+                <option value="browser:grok">Browser: Grok</option>
+                <option value="browser:deepseek">Browser: DeepSeek</option>
+              </optgroup>
+              <optgroup label="API (requires API key)">
+                <option value="claude">Claude API</option>
+                <option value="openai">OpenAI API</option>
+                <option value="gemini">Gemini API</option>
+                <option value="deepseek">DeepSeek API</option>
+              </optgroup>
+            </select>
+            <svg className="kim-composer__provider-chevron" viewBox="0 0 10 10" width="8" height="8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M2 4l3 3 3-3" />
+            </svg>
+          </span>
+          {resolveProvider().startsWith('browser:') && resolveProvider().split(':')[1] !== 'custom' && (
+            <>
+              <span className="kim-composer__hint-sep">·</span>
+              <button
+                type="button"
+                className="kim-composer__signin-btn"
+                onClick={async () => {
+                  const p = resolveProvider().split(':')[1];
+                  const providerName = p.charAt(0).toUpperCase() + p.slice(1);
+                  let url = '';
+                  if (p === 'claude') url = 'https://claude.ai';
+                  else if (p === 'chatgpt') url = 'https://chatgpt.com';
+                  else if (p === 'gemini') url = 'https://gemini.google.com';
+                  else if (p === 'grok') url = 'https://grok.com';
+                  else if (p === 'deepseek') url = 'https://chat.deepseek.com';
+                  
+                  if (url) {
+                    try {
+                      await invoke<string>('open_browser_signin_window', { url, providerName });
+                      await invoke('show_browser_window').catch(() => {});
+                      toast(`${providerName} opened! Close the window when you're done signing in.`, 'info', 7000);
+                    } catch (err) {
+                      toast(typeof err === 'string' ? err : `Could not open ${providerName}.`, 'error', 5000);
+                    }
+                  }
+                }}
+              >
+                Sign into {resolveProvider().split(':')[1].charAt(0).toUpperCase() + resolveProvider().split(':')[1].slice(1)}
+              </button>
+            </>
+          )}
           {(queuedTasks.length > 0 || interruptTask) && (
             <>
               <span className="kim-composer__hint-sep">·</span>
@@ -970,8 +1132,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
       <div className="kim-chat">
         <ChatChromaBackdrop />
         <div className="kim-empty-welcome">
-          <div className="kim-empty-welcome__greeting kim-greeting">
-            {getGreeting(account.display_name)}
+          <div className="kim-greeting__text">
+            {activeTab === 'code' ? 'Start a new Code session' : getGreeting(account.display_name.split(' ')[0])}
           </div>
           <div className="kim-empty-welcome__subtitle">
             Pick a session from the sidebar or start a new chat
@@ -984,22 +1146,15 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
     );
   }
 
+  const hasStarted = isRunning || activity.length > 0 || !!taskError;
+
   // ── New chat mode ─────────────────────────────────────────────────────────────
   if (newChatMode) {
-    const hasStarted = isRunning || activity.length > 0 || taskError;
-
     return (
       <div className="kim-chat">
         <ChatChromaBackdrop />
         <div className="kim-chat__output" ref={outputRef}>
-          {hasStarted && settings.provider === 'browser' && (
-            <div className={'kim-provider-switch-wrap' + (hasStarted ? ' kim-provider-switch-wrap--active' : '')}>
-              <BrowserProviderPicker
-                selected={browserProvider}
-                onSelect={handleBrowserProviderSelect}
-              />
-            </div>
-          )}
+
 
           {!hasStarted && (
             <div className="kim-new-chat-empty">
@@ -1007,12 +1162,16 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
                 <span className="kim-pulse-dot kim-pulse-dot--accent" />
                 Ready
               </div>
-              <div className="kim-new-chat-empty__title kim-greeting">{getGreeting(account.display_name)}</div>
+              <div className="kim-new-chat-empty__title kim-greeting">
+                {activeTab === 'code' ? 'Start a new Code session' : getGreeting(account.display_name)}
+              </div>
               <div className="kim-new-chat-empty__subtitle">
-                Describe any task in plain English below — Kim will figure out how to do it.
+                {activeTab === 'code'
+                  ? 'Select a codebase from the sidebar, or just ask Kim to analyze a specific path.'
+                  : 'Describe any task in plain English below — Kim will figure out how to do it.'}
               </div>
 
-              {settings.provider === 'browser' && (
+              {(localProvider?.startsWith('browser') || (!localProvider && settings.provider === 'browser')) && (
                 <BrowserProviderPicker
                   selected={browserProvider}
                   onSelect={handleBrowserProviderSelect}
@@ -1020,7 +1179,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
               )}
 
               {/* Example prompts */}
-              <div className="kim-examples" style={{ marginTop: settings.provider === 'browser' ? 24 : 0 }}>
+              <div className="kim-examples" style={{ marginTop: (localProvider?.startsWith('browser') || (!localProvider && settings.provider === 'browser')) ? 24 : 0 }}>
                 {EXAMPLE_PROMPTS.map((ex, i) => (
                   <button
                     key={i}
@@ -1054,6 +1213,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
               {/* Keyboard shortcuts */}
               <div className="kim-shortcuts">
                 <div className="kim-shortcuts__label">Keyboard shortcuts</div>
+
                 <div className="kim-shortcuts__row">
                   {KIM_SHORTCUTS.map((s, i) => (
                     <span key={i} className="kim-shortcut">
@@ -1066,27 +1226,45 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
             </div>
           )}
 
-          {/* Task error banner */}
+          {/* Live conversation history */}
+          {liveHistory.map((msg, i) => {
+            // Show activity feed right after the last user message (current task)
+            const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
+            return (
+              <div key={`live-${i}`}>
+                <div className={`kim-msg-row kim-msg-row--${msg.role}`}>
+                  <div className={`kim-bubble kim-bubble--${msg.role}`}>{msg.content}</div>
+                </div>
+                {showActivityAfter && renderActivityFeed()}
+              </div>
+            );
+          })}
+
+          {/* Error / retry — inside an assistant-aligned row */}
           {taskError && taskError !== 'agent-error' && (
-            <div className="kim-task-error" role="alert">
-              <span className="kim-task-error__icon">⚠</span>
-              <span>{taskError}</span>
-              {lastFailedTask && (
-                <button type="button" className="kim-task-error__retry" onClick={() => void handleRetryLast()}>
-                  Retry
-                </button>
-              )}
+            <div className="kim-msg-row kim-msg-row--assistant">
+              <div className="kim-task-error" role="alert">
+                <span className="kim-task-error__icon">⚠</span>
+                <span>{taskError}</span>
+                {lastRunTaskRef.current && (
+                  <button type="button" className="kim-task-error__retry" onClick={() => void handleRetryLast()}>
+                    Retry
+                  </button>
+                )}
+              </div>
             </div>
           )}
           {taskError === 'agent-error' && (
-            <div className="kim-task-error" role="alert">
-              <span className="kim-task-error__icon">⚠</span>
-              <span>Kim ran into a problem and had to stop. Check the activity above for clues, or try rephrasing your task.</span>
-              {lastFailedTask && (
-                <button type="button" className="kim-task-error__retry" onClick={() => void handleRetryLast()}>
-                  Retry
-                </button>
-              )}
+            <div className="kim-msg-row kim-msg-row--assistant">
+              <div className="kim-task-error" role="alert">
+                <span className="kim-task-error__icon">⚠</span>
+                <span>Kim ran into a problem and had to stop. Check the activity above for clues, or try rephrasing your task.</span>
+                {lastRunTaskRef.current && (
+                  <button type="button" className="kim-task-error__retry" onClick={() => void handleRetryLast()}>
+                    Retry
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
@@ -1097,9 +1275,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
                 : `${queuedTasks.length} queued message${queuedTasks.length === 1 ? '' : 's'} waiting.`}
             </div>
           )}
-
-          {/* Activity feed */}
-          {renderActivityFeed()}
 
           {/* Working indicator with blobby loader */}
           {isRunning && (
@@ -1178,7 +1353,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
           </div>
           {session!.summary && (
             <div className="kim-session-header__summary">
-              {session!.summary}
+              {(() => {
+                const match = session!.summary!.match(/^Task:.*?(?:\.\s*Result:\s*|\nResult:\s*)([\s\S]*)$/i);
+                return match ? match[1].trim() : session!.summary;
+              })()}
             </div>
           )}
         </div>
@@ -1212,8 +1390,61 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account }
                 message={msg}
                 animate={i === newestMsgIdx}
                 typingAnimation={settings.typing_animation ?? 'none'}
+                onRetry={handleRetryLast}
               />
             ))}
+
+            {/* Newly added messages in this session */}
+            {liveHistory.map((msg, i) => {
+              if (msg.role === 'system') return null;
+              if (msg.role === 'assistant' && typeof msg.content === 'string' && msg.content.startsWith('NEED_HELP:')) return null;
+              return (
+                <div key={`live-${i}`} className={`kim-msg-row kim-msg-row--${msg.role}`}>
+                  <div className={`kim-bubble kim-bubble--${msg.role}`}>
+                    {msg.role === 'assistant' ? <AnimatedText text={msg.content} animation={settings.typing_animation ?? 'none'} active={i === liveHistory.length - 1} /> : msg.content}
+                  </div>
+                </div>
+              );
+            })}
+            
+            {/* Activity feed and errors */}
+            {renderActivityFeed()}
+
+            {/* Working indicator with blobby loader */}
+            {isRunning && (
+              <div className="kim-working-indicator">
+                {/* Goo filter used by loaders 6, 15, 20 */}
+                <svg width="0" height="0" style={{ position: 'absolute' }}>
+                  <defs>
+                    <filter id="kim-goo">
+                      <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur" />
+                      <feColorMatrix in="blur" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 20 -9" result="goo" />
+                      <feComposite in="SourceGraphic" in2="goo" operator="atop" />
+                    </filter>
+                  </defs>
+                </svg>
+                <BlobLoader which={cancelling ? 3 : 15} />
+                <span className="kim-working-indicator__text">
+                  {cancelling ? 'Stopping Kim…' : 'Kim is working…'}
+                </span>
+                {!cancelling && tokenStats && (
+                  <span className="kim-working-indicator__tokens" title={`Input: ${tokenStats.input.toLocaleString()} · Output: ${tokenStats.output.toLocaleString()}`}>
+                    {tokenStats.total.toLocaleString()} tokens
+                  </span>
+                )}
+                {!cancelling && elapsed > 0 && (
+                  <span className="kim-working-indicator__timer">{formatElapsed(elapsed)}</span>
+                )}
+              </div>
+            )}
+
+            {taskError && (
+              <div className="kim-msg-row kim-msg-row--assistant">
+                <div style={{ maxWidth: '78%', minWidth: 0 }}>
+                  <SignalCard kind="error" text={taskError} onAction={handleRetryLast} actionLabel="Resend Task" />
+                </div>
+              </div>
+            )}
           </>
         )}
         <div ref={bottomRef} />

@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Window Recording Aura</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+
+  @property --angle {
+    syntax: '<angle>';
+    initial-value: 0deg;
+    inherits: false;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --aura-1: #b054ff;
+    --aura-2: #7c3aed;
+    --aura-3: #f0abfc;
+    --aura-dim: rgba(0,0,0,0);
+    --font: 'Inter', system-ui, sans-serif;
+  }
+
+  html, body { height: 100%; }
+
+  body {
+    background: transparent; /* transparent so desktop shows through */
+    font-family: var(--font);
+    overflow: hidden;
+    animation: fadeInOut 10s ease forwards;
+  }
+
+  @keyframes fadeInOut {
+    0%   { opacity: 0; }
+    10%  { opacity: 1; }
+    72%  { opacity: 1; }
+    100% { opacity: 0; }
+  }
+
+  /* ─── WINDOW WRAPPER ─── */
+  .window-wrapper {
+    position: fixed;
+    inset: 0;
+    z-index: 1;
+  }
+
+  /* ─── GLOW LAYERS ─── */
+  /* Original uses inset:-Xpx to extend past viewport + a dark window-content
+     panel to hide the center. Since we need the center transparent, we add a
+     CSS mask (content-box XOR border-box) instead of the panel.
+     padding = |inset| + 4px (original window-content inset) so the ring width
+     is identical to the original design. All other values unchanged. */
+
+  .glow-diffuse {
+    position: absolute;
+    inset: -30px;
+    border-radius: 40px;
+    padding: 34px;
+    background: conic-gradient(
+      from var(--angle),
+      var(--aura-dim) 0%,
+      var(--aura-1) 12%,
+      var(--aura-2) 20%,
+      var(--aura-3) 28%,
+      var(--aura-dim) 40%,
+      var(--aura-dim) 60%,
+      var(--aura-1) 72%,
+      var(--aura-2) 80%,
+      var(--aura-3) 88%,
+      var(--aura-dim) 100%
+    );
+    filter: blur(34px);
+    animation: rotateConic var(--aura-speed, 6s) linear infinite;
+    opacity: 0.55;
+    pointer-events: none;
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+            mask-composite: exclude;
+  }
+
+  .glow-mid {
+    position: absolute;
+    inset: -12px;
+    border-radius: 24px;
+    padding: 16px;
+    background: conic-gradient(
+      from var(--angle),
+      var(--aura-dim) 0%,
+      var(--aura-1) 15%,
+      var(--aura-2) 22%,
+      var(--aura-dim) 35%,
+      var(--aura-dim) 65%,
+      var(--aura-1) 80%,
+      var(--aura-2) 87%,
+      var(--aura-dim) 100%
+    );
+    filter: blur(12px);
+    animation: rotateConic var(--aura-speed, 6s) linear infinite;
+    opacity: 0.75;
+    pointer-events: none;
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+            mask-composite: exclude;
+  }
+
+  .glow-sharp {
+    position: absolute;
+    inset: 0;
+    border-radius: 14px;
+    padding: 4px;
+    background: conic-gradient(
+      from var(--angle),
+      transparent 0%,
+      rgba(176, 84, 255, 0.9) 14%,
+      rgba(124, 58, 237, 1)   20%,
+      rgba(240, 171, 252, 0.9) 26%,
+      transparent 38%,
+      transparent 62%,
+      rgba(176, 84, 255, 0.9) 76%,
+      rgba(124, 58, 237, 1)   82%,
+      rgba(240, 171, 252, 0.9) 88%,
+      transparent 100%
+    );
+    filter: blur(2.5px);
+    animation: rotateConic var(--aura-speed, 6s) linear infinite;
+    opacity: 0.95;
+    pointer-events: none;
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+            mask-composite: exclude;
+  }
+
+  @keyframes rotateConic {
+    to { --angle: 360deg; }
+  }
+
+  /* ─── WINDOW CONTENT ─── */
+  /* Background transparent — desktop shows through center */
+  .window-content {
+    position: absolute;
+    inset: 4px;
+    z-index: 2;
+    background: transparent;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+
+  /* ─── CORNER ACCENTS ─── */
+  .corner-accent {
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    z-index: 3;
+    pointer-events: none;
+  }
+  .corner-accent::before,
+  .corner-accent::after {
+    content: '';
+    position: absolute;
+    background: var(--aura-1);
+    border-radius: 1px;
+    animation: cornerGlow 3s ease-in-out infinite;
+  }
+  .corner-accent::before { width: 100%; height: 2px; top: 0; left: 0; }
+  .corner-accent::after  { width: 2px; height: 100%; top: 0; left: 0; }
+  .corner-accent.tl { top: 0; left: 0; }
+  .corner-accent.tr { top: 0; right: 0; transform: scaleX(-1); }
+  .corner-accent.bl { bottom: 0; left: 0; transform: scaleY(-1); }
+  .corner-accent.br { bottom: 0; right: 0; transform: scale(-1); }
+  .corner-accent.tl::before, .corner-accent.tl::after { animation-delay: 0s; }
+  .corner-accent.tr::before, .corner-accent.tr::after { animation-delay: 0.75s; }
+  .corner-accent.br::before, .corner-accent.br::after { animation-delay: 1.5s; }
+  .corner-accent.bl::before, .corner-accent.bl::after { animation-delay: 2.25s; }
+  @keyframes cornerGlow {
+    0%, 100% { opacity: 0.4; filter: brightness(1); }
+    25%       { opacity: 1;   filter: brightness(1.8); }
+    50%       { opacity: 0.6; filter: brightness(1.2); }
+  }
+
+  /* ─── REC BADGE ─── */
+  .rec-badge {
+    position: absolute;
+    top: 8px;
+    right: 14px;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    background: rgba(10, 8, 20, 0.85);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(176,84,255,0.3);
+    border-radius: 999px;
+    padding: 4px 12px 4px 9px;
+  }
+  .rec-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #b054ff;
+    box-shadow: 0 0 8px 2px rgba(176, 84, 255, 0.55);
+    animation: recPulse 1.4s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+  @keyframes recPulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.35; }
+  }
+  .rec-text {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    color: rgba(255,255,255,0.7);
+  }
+  .rec-timer {
+    font-family: 'Monaco', 'Menlo', monospace;
+    font-size: 10px;
+    color: rgba(255,255,255,0.45);
+    min-width: 32px;
+  }
+</style>
+</head>
+<body>
+
+<div class="window-wrapper" id="wrapper">
+
+  <div class="glow-diffuse" id="glowDiffuse"></div>
+  <div class="glow-mid"     id="glowMid"></div>
+  <div class="glow-sharp"   id="glowSharp"></div>
+
+  <div class="corner-accent tl"></div>
+  <div class="corner-accent tr"></div>
+  <div class="corner-accent bl"></div>
+  <div class="corner-accent br"></div>
+
+  <div class="window-content">
+    <div class="rec-badge">
+      <div class="rec-dot" id="recDot"></div>
+      <span class="rec-text">REC</span>
+      <span class="rec-timer" id="timer">0:00</span>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  const PRESETS = {
+    violet: { a1: '#b054ff', a2: '#7c3aed', a3: '#f0abfc', rec: 'rgba(176,84,255,0.55)' },
+    red:    { a1: '#ff3b5c', a2: '#ff6b35', a3: '#ff1a8c', rec: 'rgba(255,59,92,0.55)' },
+    cyan:   { a1: '#00e5ff', a2: '#00bcd4', a3: '#40c4ff', rec: 'rgba(0,229,255,0.55)' },
+    amber:  { a1: '#ffb300', a2: '#ff6d00', a3: '#ffd740', rec: 'rgba(255,179,0,0.55)' },
+  };
+
+  const dim = 'rgba(0,0,0,0)';
+
+  function applyColor(p) {
+    const c = PRESETS[p];
+    const root = document.documentElement;
+    root.style.setProperty('--aura-1', c.a1);
+    root.style.setProperty('--aura-2', c.a2);
+    root.style.setProperty('--aura-3', c.a3);
+    const dot = document.getElementById('recDot');
+    dot.style.background = c.a1;
+    dot.style.boxShadow = `0 0 8px 2px ${c.rec}`;
+    document.querySelector('.rec-badge').style.borderColor = c.rec;
+    document.getElementById('glowDiffuse').style.background = `conic-gradient(from var(--angle), ${dim} 0%, ${c.a1} 12%, ${c.a2} 20%, ${c.a3} 28%, ${dim} 40%, ${dim} 60%, ${c.a1} 72%, ${c.a2} 80%, ${c.a3} 88%, ${dim} 100%)`;
+    document.getElementById('glowMid').style.background = `conic-gradient(from var(--angle), ${dim} 0%, ${c.a1} 15%, ${c.a2} 22%, ${dim} 35%, ${dim} 65%, ${c.a1} 80%, ${c.a2} 87%, ${dim} 100%)`;
+    document.getElementById('glowSharp').style.background = `conic-gradient(from var(--angle), transparent 0%, ${c.a1}e6 14%, ${c.a2} 20%, ${c.a3}e6 26%, transparent 38%, transparent 62%, ${c.a1}e6 76%, ${c.a2} 82%, ${c.a3}e6 88%, transparent 100%)`;
+  }
+
+  function applySpeed(s) {
+    const dur = (4 / s).toFixed(2) + 's';
+    ['glowDiffuse', 'glowMid', 'glowSharp'].forEach(id => {
+      document.getElementById(id).style.animationDuration = dur;
+    });
+  }
+
+  function applyIntensity(v) {
+    document.getElementById('glowDiffuse').style.opacity = Math.min(v * 0.65, 1).toFixed(2);
+    document.getElementById('glowMid').style.opacity     = Math.min(v * 0.85, 1).toFixed(2);
+    document.getElementById('glowSharp').style.opacity   = Math.min(v * 1.1,  1).toFixed(2);
+  }
+
+  // medium intensity (0.65), lowest speed (0.3)
+  applyColor('violet');
+  applySpeed(0.3);
+  applyIntensity(0.65);
+
+  // Timer
+  let startTime = Date.now();
+  setInterval(() => {
+    const s = Math.floor((Date.now() - startTime) / 1000);
+    document.getElementById('timer').textContent = `${Math.floor(s/60)}:${(s%60).toString().padStart(2,'0')}`;
+  }, 1000);
+</script>
+</body>
+</html>

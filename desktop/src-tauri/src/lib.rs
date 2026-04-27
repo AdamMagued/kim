@@ -3,11 +3,11 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Manager, State};
+use tauri::{Emitter, Listener, Manager, State};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use tokio::sync::Mutex;
 
@@ -48,6 +48,8 @@ struct BridgeCompleteRequest {
     prompt: String,
     #[serde(default)]
     attachments: Vec<BridgeAttachment>,
+    #[serde(default)]
+    completion_hash: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -70,12 +72,38 @@ struct BridgeCallbackRequest {
     payload: BridgeCompleteResponse,
 }
 
+/// IPC event payload sent from the persistent JS bridge via Tauri emit.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BridgeIpcEvent {
+    event: String,     // "sent" | "done" | "error"
+    req_id: String,
+    #[serde(default)]
+    response: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    site: Option<String>,
+}
+
+static IPC_LISTENER_REGISTERED: OnceLock<()> = OnceLock::new();
+
 static WEBVIEW_BRIDGE_CFG: OnceLock<WebviewBridgeConfig> = OnceLock::new();
 static WEBVIEW_BRIDGE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WEBVIEW_BRIDGE_REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 static WEBVIEW_BRIDGE_RESULTS: OnceLock<StdMutex<HashMap<String, BridgeCompleteResponse>>> = OnceLock::new();
-const BRIDGE_COLLECTOR_MODE: &str = "title_pulse_v3";
-const BRIDGE_COMPLETION_TIMEOUT_S: u64 = 160;
+/// Condvar notified whenever a result is inserted into WEBVIEW_BRIDGE_RESULTS.
+/// Collectors wait on this instead of polling every 150ms.
+static WEBVIEW_BRIDGE_NOTIFY: OnceLock<(StdMutex<()>, Condvar)> = OnceLock::new();
+/// Tracks whether the browser window was hidden before a specific /v1/send request, so /v1/result knows to hide it after.
+static WEBVIEW_WAS_HIDDEN: OnceLock<StdMutex<std::collections::HashSet<String>>> = OnceLock::new();
+const BRIDGE_COMPLETION_TIMEOUT_S: u64 = 720;
+/// PID of the currently-running agent subprocess, accessible from both the
+/// sync bridge thread (/v1/task, /v1/cancel) and the async Tauri commands.
+static BRIDGE_TASK_PID: OnceLock<StdMutex<Option<u32>>> = OnceLock::new();
+/// Session ID of the currently-running agent task (set by /v1/task or send_task).
+static BRIDGE_TASK_SESSION: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
+/// The site selected via /v1/provider, to be passed to the next agent spawn.
+static KIM_PREFERRED_SITE: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -494,6 +522,694 @@ fn default_site_url(site: &str) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Persistent JS bridge — injected ONCE via initialization_script.
+//
+// This replaces the previous approach of re-evaluating a ~30KB JS script on
+// every single request.  The bridge is injected at page load time and persists
+// across SPA navigations.  It re-injects automatically on full page loads.
+//
+// Communication:
+//   JS  →  Rust:  window.__TAURI_INTERNALS__.invoke() / emit()
+//   Rust → JS:    window.__kimBridge.send(prompt, reqId, site, attachments)
+//
+// The bridge emits three event types via Tauri IPC:
+//   "sent"  — prompt was injected and Enter pressed (~150ms)
+//   "done"  — generation complete, full response text attached
+//   "error" — something went wrong
+// ---------------------------------------------------------------------------
+
+const PERSISTENT_BRIDGE_JS: &str = r#"
+(() => {
+  // Guard: only install once per page load.
+  if (window.__kimBridge && window.__kimBridge._v >= 8) return;
+
+  const SITE_CONFIGS = {
+    claude: {
+      input_selectors: ["div[contenteditable='true'].ProseMirror", "div[contenteditable='true']"],
+      send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']", "button[aria-label*='send']"],
+      stop_selectors: ["button[aria-label*='Stop']"],
+      response_selectors: ["[data-testid^='conversation-turn']", ".font-claude-message"],
+      upload_button_selectors: ["button[aria-label*='Attach']", "button[aria-label*='Upload']"],
+      file_input_selectors: ["input[type='file']"],
+    },
+    chatgpt: {
+      input_selectors: ["div#prompt-textarea", "div[contenteditable='true']"],
+      send_selectors: ["button[data-testid='send-button']", "button[aria-label*='Send']"],
+      stop_selectors: ["button[data-testid='stop-button']", "button[aria-label*='Stop']"],
+      response_selectors: ["div.markdown", "article div.prose"],
+      upload_button_selectors: ["button[aria-label*='Attach']", "button[data-testid*='upload']"],
+      file_input_selectors: ["input[type='file']"],
+    },
+    gemini: {
+      input_selectors: ["rich-textarea div[contenteditable]", "rich-textarea [contenteditable='true']", "div[contenteditable='true']"],
+      send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']", "button[data-testid*='send']", "button[mattooltip*='Send']", "button[aria-label*='Submit prompt']", "button[aria-label*='Submit']"],
+      stop_selectors: ["button[aria-label*='Stop']", "button[aria-label*='Stop generating']", "button[data-testid*='stop']"],
+      response_selectors: ["model-response", "model-response message-content", "model-response .response-content", "message-content", "div.response-content", "div.markdown"],
+      upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Add image']"],
+      file_input_selectors: ["input[type='file']"],
+    },
+    deepseek: {
+      input_selectors: ["textarea#chat-input", "textarea"],
+      send_selectors: ["button[aria-label*='Send']", "button[type='submit']", "div[role='button']"],
+      stop_selectors: ["button[aria-label*='Stop']", "div[role='button'][class*='stop']"],
+      response_selectors: ["div.ds-markdown"],
+      upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']", "div[role='button']"],
+      file_input_selectors: ["input[type='file']"],
+    },
+    grok: {
+      input_selectors: ["textarea", "div[contenteditable='true']"],
+      send_selectors: ["button[aria-label*='Send']", "button[type='submit']"],
+      stop_selectors: ["button[aria-label*='Stop']"],
+      response_selectors: ["article", "div.markdown", "[data-testid*='message']"],
+      upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']"],
+      file_input_selectors: ["input[type='file']"],
+    },
+  };
+
+  // ── Helpers ──────────────────────────────────────────────────────────
+  const normalizeText = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+
+  const isVisible = (el) => {
+    if (!el) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') === 0) return false;
+    if (el.offsetParent !== null) return true;
+    return style.position === 'fixed';
+  };
+
+  const isEnabled = (el) => {
+    if (!el) return false;
+    if ('disabled' in el && el.disabled) return false;
+    if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return false;
+    return true;
+  };
+
+  const findElement = (selectors, opts = {}) => {
+    for (const sel of selectors || []) {
+      let nodes = [];
+      try { nodes = Array.from(document.querySelectorAll(sel)); } catch (_) { continue; }
+      for (const el of nodes) {
+        if (opts.visible && !isVisible(el)) continue;
+        if (opts.enabled && !isEnabled(el)) continue;
+        return el;
+      }
+    }
+    return null;
+  };
+
+  // Shadow-DOM-aware input finder for Gemini's rich-textarea component.
+  // document.querySelectorAll cannot pierce shadow roots, so we check both
+  // the light DOM children and the shadow root of each rich-textarea host.
+  const findGeminiInput = () => {
+    for (const host of Array.from(document.querySelectorAll('rich-textarea'))) {
+      if (!isVisible(host)) continue;
+      let inner = host.querySelector('[contenteditable]');
+      if (inner && isVisible(inner)) return inner;
+      if (host.shadowRoot) {
+        inner = host.shadowRoot.querySelector('[contenteditable]');
+        if (inner) return inner;
+      }
+    }
+    // Broad fallback: any visible contenteditable on the page
+    for (const el of Array.from(document.querySelectorAll('[contenteditable]'))) {
+      if (isVisible(el)) return el;
+    }
+    return null;
+  };
+
+  const dismissPopups = async () => {
+    const labels = ['i agree', 'agree', 'got it', 'continue', 'accept', 'ok', 'dismiss', 'close', 'no thanks'];
+    for (const btn of document.querySelectorAll('button')) {
+      if (!isVisible(btn)) continue;
+      const text = normalizeText(btn.textContent).toLowerCase();
+      if (labels.includes(text)) {
+        try { btn.click(); await new Promise(r => setTimeout(r, 200)); } catch (_) {}
+      }
+    }
+  };
+
+  const hasStopSemantics = (el) => {
+    const label = String((el && el.getAttribute && el.getAttribute('aria-label')) || (el && el.textContent) || '').toLowerCase().trim();
+    if (!label) return false;
+    return /(^|\b)stop(\b|$)/i.test(label) || label.includes('stop generating');
+  };
+
+  const isAnyStopVisible = (cfg) => {
+    for (const sel of cfg.stop_selectors || []) {
+      try {
+        const nodes = Array.from(document.querySelectorAll(sel));
+        for (const el of nodes) {
+          if (el && isVisible(el) && hasStopSemantics(el)) return true;
+        }
+      } catch (_) {}
+    }
+    return false;
+  };
+
+  const isLikelyUserNode = (node) => {
+    if (!node) return false;
+    try {
+      if (node.closest(
+        'user-query, [data-message-author-role="user"], [data-role="user"], [data-author="user"], '
+        + '.user-message, .from-user, .query-content, .prompt-bubble, [data-testid*="user-message"]'
+      )) return true;
+    } catch (_) {}
+    try {
+      const author = String(node.getAttribute?.('data-message-author-role') || node.getAttribute?.('data-role') || node.getAttribute?.('data-author') || '').toLowerCase();
+      if (author === 'user') return true;
+    } catch (_) {}
+    return false;
+  };
+
+  const readInputText = (inputEl) => {
+    if (!inputEl) return '';
+    if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
+      return normalizeText(inputEl.value || '');
+    }
+    return normalizeText(inputEl.innerText || inputEl.textContent || '');
+  };
+
+  // ── IPC emit (Tauri native) ──────────────────────────────────────────
+  const ipcEmit = (payload) => {
+    try {
+      if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
+        window.__TAURI_INTERNALS__.invoke('plugin:event|emit', {
+          event: 'kim-bridge-ipc',
+          payload: payload,
+        });
+        return true;
+      }
+    } catch (_) {}
+
+    try {
+      // Direct WebKit IPC fallback for external domains where __TAURI_INTERNALS__ is not injected
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) {
+        window.webkit.messageHandlers.ipc.postMessage({
+          cmd: "plugin:event|emit",
+          callback: 0,
+          error: 0,
+          payload: {
+            event: "kim-bridge-ipc",
+            payload: payload
+          }
+        });
+        return true;
+      }
+    } catch (e) {
+      console.warn('[KimBridge] WebKit IPC emit failed:', e);
+    }
+
+    return false;
+  };
+
+  // ── Response extraction ──────────────────────────────────────────────
+  const getLatestResponseText = (cfg, siteKey) => {
+    if (siteKey === 'gemini') {
+        const modelResponses = Array.from(document.querySelectorAll('model-response')).filter(node => {
+            return !!node && isVisible(node) && !isLikelyUserNode(node);
+        });
+
+        let bestText = '';
+        let bestModelNode = null;
+        let bestModelIndex = -1;
+
+        const chooseBest = (text, modelNode, modelIndex) => {
+            if (!text) return;
+            if (modelIndex > bestModelIndex) {
+                bestText = text;
+                bestModelNode = modelNode;
+                bestModelIndex = modelIndex;
+                return;
+            }
+            if (modelIndex === bestModelIndex && text.length > bestText.length) {
+                bestText = text;
+                bestModelNode = modelNode;
+                bestModelIndex = modelIndex;
+            }
+        };
+
+        for (const sel of [
+            'model-response',
+            'model-response message-content',
+            'model-response .response-content',
+            'message-content',
+            'div.response-content',
+        ]) {
+            let nodes = [];
+            try {
+                nodes = Array.from(document.querySelectorAll(sel));
+            } catch (_) {
+                continue;
+            }
+            for (const node of nodes) {
+                if (!node || !isVisible(node) || isLikelyUserNode(node)) continue;
+
+                const modelNode = (node.matches && node.matches('model-response'))
+                    ? node
+                    : (node.closest ? node.closest('model-response') : null);
+                if (!modelNode || !isVisible(modelNode) || isLikelyUserNode(modelNode)) continue;
+
+                const modelIndex = modelResponses.indexOf(modelNode);
+                if (modelIndex < 0) continue;
+
+                const text = normalizeText(node.innerText || node.textContent || '');
+                chooseBest(text, modelNode, modelIndex);
+            }
+        }
+
+        if (!bestText && modelResponses.length > 0) {
+            const lastIndex = modelResponses.length - 1;
+            const lastNode = modelResponses[lastIndex];
+            bestText = normalizeText(lastNode.innerText || lastNode.textContent || '');
+        }
+
+        return bestText;
+    }
+
+    // Generic: find last visible non-user response node
+    let bestText = '';
+    for (const sel of cfg.response_selectors || []) {
+      try {
+        const nodes = Array.from(document.querySelectorAll(sel));
+        for (const node of nodes) {
+          if (!node || !isVisible(node) || isLikelyUserNode(node)) continue;
+          const text = normalizeText(node.innerText || node.textContent || '');
+          if (text.length > bestText.length) bestText = text;
+        }
+      } catch (_) {}
+    }
+    return bestText;
+  };
+
+  const countResponseNodes = (cfg, siteKey) => {
+    if (siteKey === 'gemini') {
+      return Array.from(document.querySelectorAll('model-response')).filter(n => !!n && isVisible(n) && !isLikelyUserNode(n)).length;
+    }
+    let count = 0;
+    const seen = new Set();
+    for (const sel of cfg.response_selectors || []) {
+      try {
+        const nodes = Array.from(document.querySelectorAll(sel));
+        for (const n of nodes) {
+          if (!n || seen.has(n) || !isVisible(n) || isLikelyUserNode(n)) continue;
+          seen.add(n);
+          count++;
+        }
+      } catch (_) {}
+    }
+    return count;
+  };
+
+  // ── Prompt injection ─────────────────────────────────────────────────
+  const injectPromptText = async (inputEl, promptText) => {
+    const target = String(promptText || '');
+    if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
+      const proto = Object.getPrototypeOf(inputEl);
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) setter.call(inputEl, ''); else inputEl.value = '';
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      if (setter) setter.call(inputEl, target); else inputEl.value = target;
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+      return readInputText(inputEl).length;
+    }
+    let inserted = false;
+    try {
+      inputEl.focus();
+      document.execCommand('selectAll', false);
+      inserted = document.execCommand('insertText', false, target);
+    } catch (_) {}
+    const currentText = readInputText(inputEl);
+    if (!inserted || currentText.length < Math.min(8, target.length)) {
+      inputEl.textContent = '';
+      const lines = target.split('\n');
+      for (const line of lines) {
+        const div = document.createElement('div');
+        div.textContent = line;
+        inputEl.appendChild(div);
+      }
+    }
+    // Gemini rich-textarea mirror sync
+    try {
+      const rich = inputEl.closest('rich-textarea');
+      if (rich) {
+        const mirror = rich.querySelector('textarea, input') || (rich.shadowRoot && rich.shadowRoot.querySelector('textarea, input'));
+        if (mirror && (mirror instanceof HTMLTextAreaElement || mirror instanceof HTMLInputElement)) {
+          const proto = Object.getPrototypeOf(mirror);
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(mirror, target); else mirror.value = target;
+          mirror.dispatchEvent(new Event('input', { bubbles: true }));
+          mirror.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+    } catch (_) {}
+    try {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', target);
+      inputEl.dispatchEvent(new ClipboardEvent('paste', {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: dt,
+      }));
+    } catch (_) {}
+    try {
+      inputEl.dispatchEvent(new InputEvent('input', { data: target, inputType: 'insertText', bubbles: true, cancelable: true }));
+    } catch (_) {}
+    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+    inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+    return Math.max(readInputText(inputEl).length, target.length);
+  };
+
+  // ── Attachment injection ──────────────────────────────────────────────
+  const decodeBase64 = (b64) => {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  };
+
+  const inferExtension = (mime) => {
+    const m = String(mime || '').toLowerCase();
+    const map = { 'image/png':'png', 'image/jpeg':'jpg', 'image/webp':'webp', 'image/gif':'gif', 'application/pdf':'pdf', 'text/plain':'txt' };
+    return map[m] || (m.includes('/') ? m.split('/')[1].split('+')[0] : 'bin');
+  };
+
+  const injectAttachments = async (cfg, inputEl, attachments) => {
+    if (!attachments || !attachments.length) return 0;
+    const files = [];
+    for (let i = 0; i < attachments.length; i++) {
+      try {
+        const att = attachments[i];
+        const mime = String(att?.mime_type || 'application/octet-stream');
+        const b64 = String(att?.data_base64 || '');
+        if (!b64) continue;
+        const bytes = decodeBase64(b64);
+        const blob = new Blob([bytes], { type: mime });
+        const name = String(att?.name || `attachment_${i+1}.${inferExtension(mime)}`).trim();
+        files.push(new File([blob], name, { type: mime }));
+      } catch (_) {}
+    }
+    if (!files.length) return 0;
+
+    // Find file input
+    let fileInput = null;
+    for (const sel of cfg.file_input_selectors || []) {
+      try {
+        const el = document.querySelector(sel);
+        if (el && el instanceof HTMLInputElement && el.type === 'file') { fileInput = el; break; }
+      } catch (_) {}
+    }
+    if (!fileInput) {
+      for (const sel of cfg.upload_button_selectors || []) {
+        try {
+          const btn = document.querySelector(sel);
+          if (btn) { btn.click(); await new Promise(r => setTimeout(r, 280)); }
+          for (const fsel of cfg.file_input_selectors || []) {
+            const fi = document.querySelector(fsel);
+            if (fi && fi instanceof HTMLInputElement && fi.type === 'file') { fileInput = fi; break; }
+          }
+          if (fileInput) break;
+        } catch (_) {}
+      }
+    }
+    if (fileInput) {
+      const dt = new DataTransfer();
+      for (const f of files) dt.items.add(f);
+      try { fileInput.files = dt.files; } catch (_) {
+        try { Object.defineProperty(fileInput, 'files', { value: dt.files, configurable: true }); } catch (_) {}
+      }
+      fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise(r => setTimeout(r, 700));
+      return files.length;
+    }
+
+    // Fallback: image clipboard paste via ClipboardEvent('paste').
+    // Synthetic KeyboardEvent('keydown', {key:'v'}) does NOT trigger the
+    // browser's native paste handler — only a real ClipboardEvent with
+    // clipboardData will be picked up by ProseMirror / React editors.
+    const imageFile = files.find(f => String(f.type || '').startsWith('image/'));
+    if (imageFile && inputEl) {
+      try {
+        inputEl.focus();
+        await new Promise(r => setTimeout(r, 300));
+
+        // Build a DataTransfer with the image file
+        const dt = new DataTransfer();
+        dt.items.add(imageFile);
+
+        // Dispatch a real ClipboardEvent('paste') — this is what editors listen for
+        const pasteEvent = new ClipboardEvent('paste', {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: dt,
+        });
+        inputEl.dispatchEvent(pasteEvent);
+        console.log('[KimBridge] Dispatched ClipboardEvent paste with image:', imageFile.name, imageFile.type);
+
+        // Give the UI time to process the pasted image (thumbnail render, upload)
+        let waited = 0;
+        while (waited < 5000) {
+          await new Promise(r => setTimeout(r, 200));
+          waited += 200;
+          if (document.querySelector('img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view')) {
+            break;
+          }
+        }
+        
+        // Dismiss any consent popups (like Gemini's "I agree" dialog for first-time uploads)
+        await dismissPopups();
+        
+        return 1;
+      } catch (e) {
+        console.warn('[KimBridge] ClipboardEvent paste fallback failed:', e);
+      }
+    }
+    return 0;
+  };
+
+  // ── Main send function ───────────────────────────────────────────────
+  const send = async (prompt, reqId, site, attachments, callbackUrl, completionHash) => {
+    const siteKey = SITE_CONFIGS[site] ? site : 'claude';
+    const cfg = SITE_CONFIGS[siteKey];
+    const HARD_TIMEOUT = 120000;
+    const hardDeadlineAt = Date.now() + HARD_TIMEOUT;
+
+    const reportResult = (payload) => {
+      // 1. Try Tauri/WebKit IPC
+      if (!ipcEmit(payload)) {
+        // 2. Fallback: Image Ping to the Rust bridge orchestrator (CSP-safe)
+        if (callbackUrl) {
+          try {
+            const pingUrl = callbackUrl.replace('/callback', '/ping');
+            const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+            const img = new Image();
+            img.src = `${pingUrl}?req_id=${encodeURIComponent(reqId)}&data=${encodeURIComponent(encoded)}`;
+          } catch (e) {
+            console.warn('[KimBridge] ping fallback failed:', e);
+          }
+        }
+      }
+      
+      // 3. Fallback: Legacy store (for title polling)
+      if (payload.event !== 'sent') {
+        try {
+          const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+          if (typeof window.__kimBridgeStore !== 'object' || window.__kimBridgeStore === null) window.__kimBridgeStore = {};
+          window.__kimBridgeStore[reqId] = { ready: true, data: encoded, err: null, ts: Date.now() };
+        } catch (_) {}
+      }
+    };
+
+    // Mark this as the current in-flight request. Any earlier send() call
+    // still running will detect that it's been superseded and bail out
+    // before clobbering shared state (input box, _lastHash, response polling).
+    window.__kimBridge._currentReqId = reqId;
+    const isSuperseded = () => window.__kimBridge._currentReqId !== reqId;
+
+    try {
+      // 1. Find input (use shadow-DOM-aware finder for Gemini)
+      const inputEl = (siteKey === 'gemini' ? findGeminiInput() : null) || findElement(cfg.input_selectors, { visible: true });
+      if (!inputEl) {
+        throw new Error(`Could not find input selector for ${siteKey}`);
+      }
+      inputEl.focus();
+
+      const uploadedCount = await injectAttachments(cfg, inputEl, attachments);
+
+      // 3. Inject text — verify with rAF loop instead of hardcoded sleep
+      const injectedLen = await injectPromptText(inputEl, prompt);
+      if (injectedLen < Math.min(8, normalizeText(prompt).length)) {
+        throw new Error('Prompt text was not accepted by the chat input.');
+      }
+
+      // Allow UI framework to sync state before sending
+      await new Promise(r => setTimeout(r, 150));
+
+      // 4a. Wait for the PREVIOUS request's completion hash to appear in the
+      //     DOM before pressing Enter.  This ensures we never interrupt an
+      //     in-progress generation.  The hash is provider-agnostic — it lives
+      //     in the response text itself, so it works regardless of UI changes.
+      {
+        const prevHash = window.__kimBridge._lastHash;
+        if (prevHash) {
+          const PRE_SEND_TIMEOUT = 120000; // up to 120s for long responses
+          const preDeadline = Date.now() + PRE_SEND_TIMEOUT;
+          let noStopCount = 0;
+          while (Date.now() < preDeadline) {
+            if (isSuperseded()) { console.log('[KimBridge] send superseded during pre-send wait, bailing'); return; }
+            const pageText = getLatestResponseText(cfg, siteKey) || '';
+            if (pageText.includes(prevHash)) break;
+
+            if (!isAnyStopVisible(cfg)) {
+              noStopCount++;
+              // If stop button is missing for ~1.5 seconds, assume done
+              if (noStopCount >= 5) {
+                console.log('[KimBridge] prevHash not found, but stop button is gone. Proceeding.');
+                break;
+              }
+            } else {
+              noStopCount = 0;
+            }
+            await new Promise(r => setTimeout(r, 300));
+          }
+          // Short settle delay removed for latency
+        }
+      }
+
+      // 4b. Record THIS request's hash so the NEXT request can wait for it
+      if (completionHash) {
+        window.__kimBridge._lastHash = completionHash;
+      }
+
+      // 4c. Submit via Enter key
+      inputEl.focus();
+      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+
+      // 4d. Click the send button — only click when it is actually enabled.
+      //     Using enabled:false would match a disabled button (e.g. while an
+      //     uploaded image is still processing) and silently do nothing.
+      //     15 attempts × 500 ms = up to 7.5 s, enough for image uploads.
+      let sendClicked = false;
+      if (siteKey === 'gemini') {
+        for (let attempt = 0; attempt < 15; attempt++) {
+          const sendBtn = findElement(cfg.send_selectors, { visible: true, enabled: true });
+          if (sendBtn) {
+            try { sendBtn.click(); sendClicked = true; console.log('[KimBridge] Send button clicked on attempt', attempt + 1); break; } catch (_) {}
+          }
+          await new Promise(r => setTimeout(r, 500));
+        }
+        if (!sendClicked) {
+          console.warn('[KimBridge] Could not find/click enabled send button after 15 attempts, Enter may have worked');
+          const disabledBtn = findElement(cfg.send_selectors, { visible: true });
+          if (disabledBtn) {
+            console.warn('[KimBridge] Attempting to click disabled send button as last resort...');
+            try { disabledBtn.click(); } catch (_) {}
+          }
+        }
+      }
+
+      // 5. Emit "sent" immediately via IPC only — NOT via the legacy store,
+      //    because the store is used by Rust's title-pull fallback which can't
+      //    distinguish 'sent' from 'done' (BridgeCompleteResponse has no event
+      //    field).  Writing 'sent' to the store would cause the collector to
+      //    return response=null before the LLM has finished.
+      ipcEmit({ ok: true, event: 'sent', req_id: reqId, site: siteKey });
+
+      // 6. Poll DOM for the completion hash
+      //    The LLM was instructed to append the hash at the very end of its
+      //    response.  When we see it in the page text, the response is complete
+      //    and we know exactly which text belongs to this request.
+      const POLL_MS = 500;
+      let responseText = '';
+
+      let noPostStopCount = 0;
+      while (Date.now() < hardDeadlineAt) {
+        await new Promise(r => setTimeout(r, POLL_MS));
+        if (isSuperseded()) { console.log('[KimBridge] send superseded during response wait, bailing'); return; }
+
+        const latestText = getLatestResponseText(cfg, siteKey) || '';
+        if (completionHash && latestText.includes(completionHash)) {
+          responseText = latestText.replace(completionHash, '').trim();
+          break;
+        }
+
+        if (latestText && latestText.length > 0 && !isAnyStopVisible(cfg)) {
+          noPostStopCount++;
+          if (noPostStopCount >= 5) {
+            console.log('[KimBridge] completionHash not found, but stop button is gone. Falling back to latest text.');
+            responseText = latestText;
+            break;
+          }
+        } else {
+          noPostStopCount = 0;
+        }
+      }
+
+      if (!responseText) {
+        // Last-ditch: try to grab whatever text is on the page
+        const lastTry = getLatestResponseText(cfg, siteKey) || '';
+        if (completionHash && lastTry.includes(completionHash)) {
+          responseText = lastTry.replace(completionHash, '').trim();
+        } else if (lastTry.length > 0) {
+          responseText = lastTry;
+        } else {
+          throw new Error(`Timed out waiting for completion hash in response (${HARD_TIMEOUT}ms)`);
+        }
+      }
+
+      // 7. Emit "done" with full response
+      reportResult({ ok: true, event: 'done', req_id: reqId, response: responseText, site: siteKey, attachments_uploaded: uploadedCount || 0 });
+
+    } catch (err) {
+      const message = (err && err.message) ? err.message : String(err);
+      reportResult({ ok: false, event: 'error', req_id: reqId, error: message, site: site || 'unknown' });
+    }
+  };
+
+  // ── Detect which site we're on ────────────────────────────────────────
+  const detectSite = () => {
+    const href = window.location.href.toLowerCase();
+    if (href.includes('gemini.google.com')) return 'gemini';
+    if (href.includes('claude.ai')) return 'claude';
+    if (href.includes('chatgpt.com')) return 'chatgpt';
+    if (href.includes('chat.deepseek.com')) return 'deepseek';
+    if (href.includes('grok.com')) return 'grok';
+    return null;
+  };
+
+  // ── Check if page is ready (input element exists) ─────────────────────
+  const checkReady = () => {
+    const site = detectSite();
+    if (!site) return false;
+    const cfg = SITE_CONFIGS[site];
+    if (!cfg) return false;
+    return !!findElement(cfg.input_selectors, { visible: true });
+  };
+
+  // ── Public API ─────────────────────────────────────────────────────────
+  window.__kimBridge = {
+    _v: 8,
+    _lastHash: null, // Tracks the completion hash of the most recent request
+    _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
+    send,
+    detectSite,
+    checkReady,
+    SITE_CONFIGS,
+    // Legacy compat
+    getLatestResponseText: (site) => {
+      const siteKey = SITE_CONFIGS[site] ? site : 'claude';
+      return getLatestResponseText(SITE_CONFIGS[siteKey], siteKey);
+    },
+  };
+
+  console.log('[KimBridge] Persistent bridge v2 installed for', detectSite() || 'unknown site');
+})();
+"#;
+
 fn open_browser_signin_window_impl(
     url: &str,
     provider_name: Option<String>,
@@ -515,9 +1231,9 @@ fn open_browser_signin_window_impl(
     if let Some(existing) = app_handle.get_webview_window(label) {
         let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
         let _ = existing.eval(format!("window.location.href = {};", js_url));
-        let _ = existing.show();
-        let _ = existing.set_focus();
-        return Ok("Opened in existing Kim browser window".to_string());
+        // Don't show/focus — keep it hidden if the user previously closed it.
+        // The user can explicitly show it via show_browser_window.
+        return Ok("Navigated existing Kim browser window".to_string());
     }
 
     let title = provider_name
@@ -532,17 +1248,48 @@ fn open_browser_signin_window_impl(
     .title(title)
     .inner_size(1280.0, 860.0)
     .resizable(true)
-    .visible(true)
+    .visible(true) // Open visible + centered so the sign-in page is reachable.
+    .initialization_script(PERSISTENT_BRIDGE_JS)
     .build()
     .map_err(|e| format!("Failed to open Kim browser window: {}", e))?;
 
     let window_for_close = window.clone();
+    let app_for_close = app_handle.clone();
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             // Keep the webview session alive for background/headless execution.
+            // Hide the window instead of closing it so the DOM keeps rendering.
             api.prevent_close();
-            let _ = window_for_close.hide();
+            hide_browser_window_offscreen(&window_for_close);
+
+            // Refocus the main app window so the user isn't left staring at nothing.
+            if let Some(main_win) = app_for_close.get_webview_window("main") {
+                let _ = main_win.show();
+                let _ = main_win.set_focus();
+            }
+            // Notify the frontend that the browser window was dismissed.
+            let _ = app_for_close.emit("kim-browser-hidden", true);
         }
+    });
+
+    // Listen for IPC events from the persistent JS bridge only once per app instance.
+    IPC_LISTENER_REGISTERED.get_or_init(|| {
+        let app_for_listener = app_handle.clone();
+        app_for_listener.listen("kim-bridge-ipc", move |event| {
+            let payload_str = event.payload();
+            match serde_json::from_str::<BridgeIpcEvent>(payload_str) {
+                Ok(ipc_event) => {
+                    handle_bridge_ipc_event(ipc_event);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[Kim] Failed to parse bridge IPC event: {} — payload: {}",
+                        e,
+                        &payload_str[..payload_str.len().min(200)]
+                    );
+                }
+            }
+        });
     });
 
     if let Some(existing) = app_handle.get_webview_window(label) {
@@ -552,6 +1299,100 @@ fn open_browser_signin_window_impl(
     Ok("Opened in Kim browser window".to_string())
 }
 
+#[tauri::command]
+async fn add_custom_provider_capability(url: String, app_handle: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    use tauri::ipc::CapabilityBuilder;
+
+    let parsed = tauri::Url::parse(&url).map_err(|e| e.to_string())?;
+    let origin = parsed.origin().ascii_serialization();
+    let capability_url = format!("{}/*", origin);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let cap_id = format!("kim-custom-bridge-{}", nanos);
+    
+    let cap = CapabilityBuilder::new(cap_id)
+        .remote(capability_url)
+        .window("kim-browser-signin")
+        .permission("core:default")
+        .permission("core:event:allow-emit");
+
+    app_handle.add_capability(cap).map_err(|e| format!("Failed to add runtime capability: {}", e))?;
+    Ok(())
+}
+
+/// Handle an IPC event from the persistent JS bridge.
+/// Inserts results into the shared store and wakes up any waiting collector.
+fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent) {
+    agent_debug_log(
+        "H1",
+        "bridge IPC event received",
+        serde_json::json!({
+            "event": ipc_event.event,
+            "reqId": ipc_event.req_id,
+            "hasResponse": ipc_event.response.is_some(),
+            "hasError": ipc_event.error.is_some(),
+        }),
+    );
+
+    match ipc_event.event.as_str() {
+        "sent" => {
+            // Prompt was injected and Enter pressed. Store a "sent" marker
+            // so the /v1/send endpoint can return immediately.
+            let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
+            if let Ok(mut guard) = store.lock() {
+                let sent_key = format!("{}_sent", ipc_event.req_id);
+                guard.insert(sent_key, BridgeCompleteResponse {
+                    ok: true,
+                    response: None,
+                    error: None,
+                    site: ipc_event.site,
+                });
+            }
+            // Wake up anyone waiting for the "sent" signal.
+            notify_bridge_result();
+        }
+        "done" => {
+            let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
+            if let Ok(mut guard) = store.lock() {
+                guard.insert(ipc_event.req_id.clone(), BridgeCompleteResponse {
+                    ok: true,
+                    response: ipc_event.response,
+                    error: None,
+                    site: ipc_event.site,
+                });
+            }
+            notify_bridge_result();
+        }
+        "error" => {
+            let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
+            if let Ok(mut guard) = store.lock() {
+                guard.insert(ipc_event.req_id.clone(), BridgeCompleteResponse {
+                    ok: false,
+                    response: None,
+                    error: ipc_event.error,
+                    site: ipc_event.site,
+                });
+            }
+            notify_bridge_result();
+        }
+        other => {
+            eprintln!("[Kim] Unknown bridge IPC event type: {}", other);
+        }
+    }
+}
+
+/// Wake up any thread waiting on WEBVIEW_BRIDGE_NOTIFY.
+fn notify_bridge_result() {
+    let (_, condvar) = WEBVIEW_BRIDGE_NOTIFY.get_or_init(|| {
+        (StdMutex::new(()), Condvar::new())
+    });
+    condvar.notify_all();
+}
+
 fn build_bridge_complete_script(
     site: &str,
     prompt: &str,
@@ -559,6 +1400,7 @@ fn build_bridge_complete_script(
     attachments: &[BridgeAttachment],
     callback_url: &str,
     callback_token: &str,
+    completion_hash: Option<&str>,
 ) -> Result<String, String> {
     let site_json = serde_json::to_string(site).map_err(|e| e.to_string())?;
     let prompt_json = serde_json::to_string(prompt).map_err(|e| e.to_string())?;
@@ -566,6 +1408,7 @@ fn build_bridge_complete_script(
     let attachments_json = serde_json::to_string(attachments).map_err(|e| e.to_string())?;
     let callback_url_json = serde_json::to_string(callback_url).map_err(|e| e.to_string())?;
     let callback_token_json = serde_json::to_string(callback_token).map_err(|e| e.to_string())?;
+    let hash_json = serde_json::to_string(&completion_hash).unwrap_or_else(|_| "null".to_string());
 
         let mut script = r#"
 (() => {
@@ -577,7 +1420,7 @@ fn build_bridge_complete_script(
     const __kimAttachments = __KIM_ATTACHMENTS__;
     const __kimCallbackUrl = __KIM_CALLBACK_URL__;
     const __kimCallbackToken = __KIM_CALLBACK_TOKEN__;
-  const __KIM_DONE_PREFIX = "__KIMBRIDGE_DONE__";
+  const __kimCompletionHash = __KIM_COMPLETION_HASH__;
     let __kimFinished = false;
     let __kimWatchdog = null;
 
@@ -638,11 +1481,10 @@ fn build_bridge_complete_script(
         }
     };
 
-  // #region agent log
-  const __kimDbg = (hypothesisId, message, data) => {
-    fetch('http://127.0.0.1:7243/ingest/52674002-420c-4794-b88a-e97e502fc8b6',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'16b33e'},body:JSON.stringify({sessionId:'16b33e',runId:__kimReqId,hypothesisId,location:'desktop/src-tauri/src/lib.rs:build_bridge_complete_script',message,data,timestamp:Date.now()})}).catch(()=>{});
-  };
-  // #endregion
+  // No-op: previously fetched to localhost:7243 which CSP blocks on every provider page,
+  // serializing the script on dozens of blocked network calls.  Silent no-op is safe
+  // because Rust already logs bridge lifecycle via agent_debug_log.
+  const __kimDbg = () => {};
 
   const emitPayload = async (payload) => {
         if (__kimFinished) return;
@@ -677,47 +1519,9 @@ fn build_bridge_complete_script(
             };
     }
 
-    const doneBase = `${__KIM_DONE_PREFIX}:${__kimReqId}`;
-    let pulseCount = 0;
-    const pulseDone = () => {
-        if (!window.__kimPulsePaused) {
-            try {
-                // Embed the base64 payload (if ready) directly in the title pulse.
-                // This lets Rust read the result without a separate eval round-trip,
-                // eliminating the async eval-to-title race condition.
-                const store = window.__kimBridgeStore || {};
-                const entry = store[__kimReqId];
-                const data = (entry && typeof entry.data === 'string' && entry.data.length > 0)
-                    ? entry.data : '';
-                document.title = data
-                    ? `${doneBase}:${Date.now()}:${data}`
-                    : `${doneBase}:${Date.now()}`;
-            } catch (_) {}
-        }
-        pulseCount += 1;
-        if (pulseCount < 600) setTimeout(pulseDone, 100);
-    };
-    pulseDone();
-
-    // Fire-and-forget callback; never block done signaling on network.
-    Promise.resolve().then(async () => {
-        try {
-            await fetch(__kimCallbackUrl, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Kim-Token': __kimCallbackToken,
-                },
-                body: JSON.stringify({
-                    req_id: __kimReqId,
-                    payload,
-                }),
-            });
-            __kimDbg('H2', 'callback posted', { reqId: __kimReqId, url: __kimCallbackUrl });
-        } catch (err) {
-            __kimDbg('H3', 'callback post failed', { reqId: __kimReqId, error: String(err) });
-        }
-    });
+    // Payload delivery: JS just stores the result in window.__kimBridgeStore[reqId].
+    // Rust reads it via a tight eval+title roundtrip (see pull_payload_from_js_store).
+    // No title pulsing, no Angular race, no CSP-blocked HTTP callback.
   };
 
     const __KIM_WATCHDOG_MS = 95000;
@@ -771,6 +1575,33 @@ fn build_bridge_complete_script(
             }
         }
         return null;
+    };
+
+    const findGeminiInput = () => {
+        for (const host of Array.from(document.querySelectorAll('rich-textarea'))) {
+            if (!isVisible(host)) continue;
+            let inner = host.querySelector('[contenteditable]');
+            if (inner && isVisible(inner)) return inner;
+            if (host.shadowRoot) {
+                inner = host.shadowRoot.querySelector('[contenteditable]');
+                if (inner) return inner;
+            }
+        }
+        for (const el of Array.from(document.querySelectorAll('[contenteditable]'))) {
+            if (isVisible(el)) return el;
+        }
+        return null;
+    };
+
+    const dismissPopups = async () => {
+        const labels = ['i agree', 'agree', 'got it', 'continue', 'accept', 'ok', 'dismiss', 'close', 'no thanks'];
+        for (const btn of document.querySelectorAll('button')) {
+            if (!isVisible(btn)) continue;
+            const text = normalizeText(btn.textContent).toLowerCase();
+            if (labels.includes(text)) {
+                try { btn.click(); await sleep(200); } catch (_) {}
+            }
+        }
     };
 
     const inferExtension = (mime) => {
@@ -877,21 +1708,46 @@ fn build_bridge_complete_script(
             return files.length;
         }
 
-        // Fallback: image clipboard paste when no file input is exposed.
+        // Fallback: image clipboard paste via ClipboardEvent('paste').
+        // Synthetic KeyboardEvent('keydown', {key:'v'}) does NOT trigger the
+        // browser's native paste handler — only a real ClipboardEvent with
+        // clipboardData will be picked up by ProseMirror / React editors.
         const imageFile = files.find(f => String(f.type || '').startsWith('image/'));
         if (imageFile && inputEl) {
             try {
                 inputEl.focus();
-                const item = new ClipboardItem({ [imageFile.type]: imageFile });
-                await navigator.clipboard.write([item]);
-                const isMac = navigator.platform.toLowerCase().includes('mac');
-                const combo = isMac ? { metaKey: true, ctrlKey: false } : { metaKey: false, ctrlKey: true };
-                inputEl.dispatchEvent(new KeyboardEvent('keydown', {
-                    key: 'v', code: 'KeyV', bubbles: true, ...combo,
-                }));
-                await sleep(450);
+                await sleep(300);
+
+                // Build a DataTransfer with the image file
+                const dt2 = new DataTransfer();
+                dt2.items.add(imageFile);
+
+                // Dispatch a real ClipboardEvent('paste') — this is what editors listen for
+                const pasteEvent = new ClipboardEvent('paste', {
+                    bubbles: true,
+                    cancelable: true,
+                    clipboardData: dt2,
+                });
+                inputEl.dispatchEvent(pasteEvent);
+                __kimDbg('H1', 'Dispatched ClipboardEvent paste with image', { name: imageFile.name, type: imageFile.type });
+
+                // Give the UI time to process the pasted image (thumbnail render, upload)
+                let waited = 0;
+                while (waited < 5000) {
+                    await sleep(200);
+                    waited += 200;
+                    if (document.querySelector('img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view')) {
+                        break;
+                    }
+                }
+                
+                // Dismiss any consent popups (like Gemini's "I agree" dialog)
+                await dismissPopups();
+                
                 return 1;
-            } catch (_) {}
+            } catch (e) {
+                __kimDbg('H1', 'ClipboardEvent paste fallback failed', { error: String(e) });
+            }
         }
 
         return 0;
@@ -967,7 +1823,7 @@ fn build_bridge_complete_script(
 
         const currentText = readInputText(inputEl);
         if (!inserted || currentText.length < Math.min(8, target.length)) {
-            inputEl.innerHTML = '';
+            inputEl.textContent = '';
             const lines = target.split('\n');
             for (const line of lines) {
                 const div = document.createElement('div');
@@ -976,16 +1832,21 @@ fn build_bridge_complete_script(
             }
         }
 
-        // Gemini rich-textarea can keep source-of-truth in an inner textarea.
+        // Gemini rich-textarea keeps its source-of-truth in a shadow-DOM textarea.
+        // querySelector on the host element cannot reach shadow DOM; check shadowRoot too.
         try {
             const rich = inputEl.closest('rich-textarea');
-            const mirror = rich ? rich.querySelector('textarea, input') : null;
-            if (mirror && (mirror instanceof HTMLTextAreaElement || mirror instanceof HTMLInputElement)) {
-                const proto = Object.getPrototypeOf(mirror);
-                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-                if (setter) setter.call(mirror, target); else mirror.value = target;
-                mirror.dispatchEvent(new Event('input', { bubbles: true }));
-                mirror.dispatchEvent(new Event('change', { bubbles: true }));
+            if (rich) {
+                const mirror = rich.querySelector('textarea, input')
+                    || (rich.shadowRoot && rich.shadowRoot.querySelector('textarea, input'));
+                if (mirror && (mirror instanceof HTMLTextAreaElement || mirror instanceof HTMLInputElement)) {
+                    const proto = Object.getPrototypeOf(mirror);
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) setter.call(mirror, target); else mirror.value = target;
+                    mirror.dispatchEvent(new Event('input', { bubbles: true }));
+                    mirror.dispatchEvent(new Event('change', { bubbles: true }));
+                    mirror.dispatchEvent(new Event('input', { bubbles: true }));
+                }
             }
         } catch (_) {}
 
@@ -1222,16 +2083,13 @@ fn build_bridge_complete_script(
         });
     // #endregion
 
-                const inputEl = findElement(cfg.input_selectors, { visible: true, enabled: false });
+                const inputEl = (siteKey === 'gemini' ? findGeminiInput() : null) || findElement(cfg.input_selectors, { visible: true, enabled: false });
         if (!inputEl) {
             throw new Error(`Could not find input selector for ${siteKey}. selectorDiag=${selectorDiagText}`);
     }
     inputEl.focus();
 
         const uploadedCount = await injectAttachments(cfg, inputEl);
-        if (uploadedCount > 0) {
-            await sleep(200);
-        }
 
         const injectedLen = await injectPromptText(inputEl, __kimPrompt);
         if (injectedLen < Math.min(8, normalizeText(__kimPrompt).length)) {
@@ -1240,64 +2098,66 @@ fn build_bridge_complete_script(
 
     await sleep(80);
 
-        const getSendButton = () => {
-                        return findElement(cfg.send_selectors, { visible: true, enabled: true });
-        };
+        // Wait for the PREVIOUS request's completion hash before pressing
+        // Enter.  This is the most reliable guard — the hash is embedded in
+        // the response text itself and is provider-agnostic.
+        {
+            const prevHash = (window.__kimBridge && window.__kimBridge._lastHash) || null;
+            if (prevHash) {
+                const PRE_SEND_TIMEOUT = 120000;
+                const preDeadline = Date.now() + PRE_SEND_TIMEOUT;
+                while (Date.now() < preDeadline) {
+                    const pageText = extractLatestResponseText(cfg, siteKey) || '';
+                    if (pageText.includes(prevHash)) break;
+                    await sleep(300);
+                }
+                // Short settle delay removed for latency
+            }
+        }
 
-        // Give reactive UIs a moment to enable the send button.
-                for (let i = 0; i < 10; i++) {
-                    ensureWithinDeadline('wait_send_button');
-                        const btn = getSendButton();
-                        if (btn) break;
-                await sleep(120);
+        // Record THIS request's hash so the NEXT request can wait for it
+        if (__kimCompletionHash && window.__kimBridge) {
+            window.__kimBridge._lastHash = __kimCompletionHash;
         }
 
         const stateBeforeSend = captureResponseState(cfg, siteKey);
-    let sent = false;
-                let usedButton = false;
-        const sendEl = getSendButton();
-        if (sendEl) {
-            sendEl.click();
-            sent = true;
-                        usedButton = true;
-    }
-    if (!sent) {
-            inputEl.focus();
-            inputEl.dispatchEvent(new KeyboardEvent('keydown', {
-                key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-            }));
-            inputEl.dispatchEvent(new KeyboardEvent('keypress', {
-                key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-            }));
-            inputEl.dispatchEvent(new KeyboardEvent('keyup', {
-                key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-            }));
-            sent = true;
-            await sleep(350);
-            const postEnterState = captureResponseState(cfg, siteKey);
-            const stillReadyToSend = !!getSendButton();
-            if (!hasNewResponseSince(stateBeforeSend, postEnterState) && stillReadyToSend) {
-                sent = false;
-            }
-    }
-        if (!sent) {
+
+        // Always submit via Enter key — never click the send button.
+        inputEl.focus();
+        inputEl.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+        }));
+        inputEl.dispatchEvent(new KeyboardEvent('keypress', {
+            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+        }));
+        inputEl.dispatchEvent(new KeyboardEvent('keyup', {
+            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+        }));
+        let sent = true;
+        await sleep(400);
+        const postEnterState = captureResponseState(cfg, siteKey);
+        if (!hasNewResponseSince(stateBeforeSend, postEnterState)) {
+            // Enter did not produce a response — try form submission as fallback.
             try {
                 const form = inputEl.closest('form');
                 if (form) {
-                                        if (typeof form.requestSubmit === 'function') {
-                                                form.requestSubmit();
-                                        } else {
-                                                form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-                                        }
-                    sent = true;
+                    if (typeof form.requestSubmit === 'function') {
+                        form.requestSubmit();
+                    } else {
+                        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                    }
+                } else {
+                    sent = false;
                 }
-            } catch (_) {}
+            } catch (_) {
+                sent = false;
+            }
         }
-                if (!sent) {
-                    throw new Error(`Could not submit prompt to provider UI. selectorDiag=${selectorDiagText}`);
-                }
+        if (!sent) {
+            throw new Error(`Could not submit prompt to provider UI. selectorDiag=${selectorDiagText}`);
+        }
         // #region agent log
-                __kimDbg('H1', 'send stage finished', { sent, usedButton, hasForm: !!(inputEl && inputEl.closest && inputEl.closest('form')), inputTextLen: readInputText(inputEl).length });
+        __kimDbg('H1', 'send stage finished', { sent, hasForm: !!(inputEl && inputEl.closest && inputEl.closest('form')), inputTextLen: readInputText(inputEl).length });
         // #endregion
 
         const responseDeadline = Date.now() + RESPONSE_WAIT_MS;
@@ -1331,18 +2191,22 @@ fn build_bridge_complete_script(
         const stopAppearDeadline = Date.now() + STOP_APPEAR_WAIT_MS;
         while (!sawStop && Date.now() < stopAppearDeadline) {
             ensureWithinDeadline('wait_stop_appear');
+            const currentState = captureResponseState(cfg, siteKey);
+            if ((currentState.latestText || '').includes(__kimCompletionHash || '__KIMBRIDGE_DONE__')) break;
             await sleep(250);
             sawStop = isAnyStopVisible(cfg);
         }
 
-        if (sawStop) {
+        if (sawStop || (captureResponseState(cfg, siteKey).latestText || '').includes(__kimCompletionHash || '__KIMBRIDGE_DONE__')) {
             const doneDeadline = Date.now() + GENERATION_DONE_WAIT_MS;
             while (Date.now() < doneDeadline) {
                 ensureWithinDeadline('wait_generation_done');
+                const currentState = captureResponseState(cfg, siteKey);
+                if ((currentState.latestText || '').includes(__kimCompletionHash || '__KIMBRIDGE_DONE__')) break;
                 if (!isAnyStopVisible(cfg)) break;
                 await sleep(700);
             }
-    }
+        }
 
     await sleep(400);
 
@@ -1400,194 +2264,153 @@ fn build_bridge_complete_script(
     script = script.replace("__KIM_ATTACHMENTS__", &attachments_json);
     script = script.replace("__KIM_CALLBACK_URL__", &callback_url_json);
     script = script.replace("__KIM_CALLBACK_TOKEN__", &callback_token_json);
+    script = script.replace("__KIM_COMPLETION_HASH__", &hash_json);
     Ok(script)
 }
 
-/// Pull-based bridge payload collector.
+/// Condvar-based bridge payload collector.
 ///
-/// Protocol:
-///   1. JS posts `{req_id, payload}` to `/v1/callback`.
-///   2. Rust callback handler stores payload in `WEBVIEW_BRIDGE_RESULTS`.
-///   3. Collector polls the map until payload appears or timeout elapses.
-fn collect_bridge_payload_from_title(
+/// Primary path: waits on WEBVIEW_BRIDGE_NOTIFY condvar which is notified
+/// instantly when the JS bridge sends an IPC event.  No polling, no title
+/// hacks.  Falls back to legacy title-polling if IPC hasn't delivered after
+/// a few seconds (for backward compat with old JS scripts).
+fn collect_bridge_payload(
     window: &tauri::WebviewWindow,
     req_id: &str,
     timeout: Duration,
 ) -> Result<BridgeCompleteResponse, String> {
     let started = Instant::now();
     let result_store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
-    let done_prefix = format!("__KIMBRIDGE_DONE__:{}", req_id);
-    let fatal_prefix = "__KIMBRIDGE_FATAL__:";
-    let null_marker = "__KIMBRIDGE_NULL__";
+    let (lock, condvar) = WEBVIEW_BRIDGE_NOTIFY.get_or_init(|| {
+        (StdMutex::new(()), Condvar::new())
+    });
+
+    // For legacy fallback: if IPC isn't delivering, fall back to title polling
     let req_id_json = serde_json::to_string(req_id)
         .map_err(|e| format!("Failed to encode req_id for JS: {}", e))?;
-    let mut saw_done_pulse = false;
-    let mut eval_pull_attempts: u64 = 0;
-    let mut last_eval_pull_at = Instant::now() - Duration::from_secs(3);
+    let mut ipc_wait_loops: u64 = 0;
 
     loop {
+        // Check if result is already in the store (from IPC or HTTP callback).
         match result_store.lock() {
             Ok(mut guard) => {
                 if let Some(payload) = guard.remove(req_id) {
+                    agent_debug_log(
+                        "H1",
+                        "collect: result found via IPC",
+                        serde_json::json!({ "reqId": req_id, "loops": ipc_wait_loops }),
+                    );
                     return Ok(payload);
                 }
             }
-            Err(_) => {
-                return Err("Bridge results lock poisoned.".to_string());
-            }
+            Err(_) => return Err("Bridge results lock poisoned.".to_string()),
         }
 
+        // Check for a fatal title
         if let Ok(title) = window.title() {
-            if let Some(msg) = title.strip_prefix(fatal_prefix) {
-                let fatal_message = msg.trim();
-                agent_debug_log(
-                    "H3",
-                    "collect saw fatal title",
-                    serde_json::json!({ "reqId": req_id, "title": title }),
-                );
-                return Err(format!("Bridge script fatal error: {}", fatal_message));
-            }
-        }
-
-        // Primary path: poll JS store via eval every 2 seconds.
-        if last_eval_pull_at.elapsed() >= Duration::from_millis(500) {
-            last_eval_pull_at = Instant::now();
-            eval_pull_attempts += 1;
-            match pull_payload_from_js_store(window, &req_id_json, null_marker) {
-                Ok(Some(payload)) => return Ok(payload),
-                Ok(None) => {}
-                Err(e) => {
-                    agent_debug_log(
-                        "H3",
-                        "collect eval pull failed",
-                        serde_json::json!({ "reqId": req_id, "error": e }),
-                    );
-                }
-            }
-        }
-
-        // Fast path: pulseDone now embeds the base64 payload in the title as
-        // "__KIMBRIDGE_DONE__:<reqId>:<ts>:<base64>".  Try to extract it on
-        // every loop tick (every 20ms) without any eval round-trip.
-        if let Ok(title) = window.title() {
-            if title.starts_with(&done_prefix) {
-                if !saw_done_pulse {
-                    saw_done_pulse = true;
-                    agent_debug_log(
-                        "H2",
-                        "collect saw done pulse",
-                        serde_json::json!({ "reqId": req_id, "title": &title }),
-                    );
-                }
-                // Title format with payload: "__KIMBRIDGE_DONE__:reqId:ts:BASE64"
-                let parts: Vec<&str> = title.splitn(4, ':').collect();
-                if parts.len() == 4 {
-                    let encoded = parts[3];
-                    if !encoded.is_empty() && !encoded.contains(' ') {
-                        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) {
-                            if let Ok(s) = String::from_utf8(decoded) {
-                                if let Ok(payload) = serde_json::from_str::<BridgeCompleteResponse>(&s) {
-                                    agent_debug_log(
-                                        "H2",
-                                        "collect extracted payload from title pulse",
-                                        serde_json::json!({ "reqId": req_id }),
-                                    );
-                                    return Ok(payload);
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Some(msg) = title.strip_prefix("__KIMBRIDGE_FATAL__:") {
+                return Err(format!("Bridge script fatal error: {}", msg.trim()));
             }
         }
 
         if started.elapsed() >= timeout {
             agent_debug_log(
                 "H3",
-                "collect timeout waiting callback payload",
+                "collect timeout waiting payload",
                 serde_json::json!({
                     "reqId": req_id,
-                    "sawDonePulse": saw_done_pulse,
-                    "evalPullAttempts": eval_pull_attempts,
+                    "ipcWaitLoops": ipc_wait_loops,
                 }),
             );
             return Err("Timed out waiting for in-app browser completion response.".to_string());
         }
 
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
+        ipc_wait_loops += 1;
 
-fn pull_payload_from_js_store(
-    window: &tauri::WebviewWindow,
-    req_id_json: &str,
-    null_marker: &str,
-) -> Result<Option<BridgeCompleteResponse>, String> {
-    // Primary path: the pulseDone function embeds the base64 payload directly
-    // in the title as "__KIMBRIDGE_DONE__:reqId:ts:BASE64".  Read it without
-    // any eval so there is no async write-then-read race condition.
-    if let Ok(current_title) = window.title() {
-        // Title format when payload is embedded: "__KIMBRIDGE_DONE__:<reqId>:<ts>:<base64>"
-        // Split on ':' with a limit of 4 parts so the base64 (which may contain '+')
-        // is kept intact in the last field.
-        let parts: Vec<&str> = current_title.splitn(4, ':').collect();
-        if parts.len() == 4 {
-            let encoded = parts[3];
-            if !encoded.is_empty() && !encoded.contains(' ') {
-                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) {
-                    if let Ok(decoded_str) = String::from_utf8(decoded) {
-                        if let Ok(payload) = serde_json::from_str::<BridgeCompleteResponse>(&decoded_str) {
-                            // Clean up the store entry.
-                            let clear_js = format!(
-                                "try {{ delete (window.__kimBridgeStore || {{}})[{req_id_json}]; }} catch(_) {{}}",
-                                req_id_json = req_id_json,
-                            );
-                            let _ = window.eval(clear_js);
-                            return Ok(Some(payload));
-                        }
-                    }
-                }
+        // Wait briefly before the next title-pull attempt.
+        // Since IPC doesn't work on external pages, the title-pull on each
+        // iteration is our real collection mechanism (~500ms cadence).
+        let wait_duration = Duration::from_millis(500);
+        if let Ok(guard) = lock.lock() {
+            let _ = condvar.wait_timeout(guard, wait_duration);
+        }
+
+        // Always try legacy title-pull on every iteration.
+        // Tauri IPC (emit) does NOT work on external pages — __TAURI_INTERNALS__
+        // is not injected even with remote IPC capabilities. The JS bridge stores
+        // results in window.__kimBridgeStore which we poll via title-pull.
+        match pull_payload_from_js_store_legacy(window, &req_id_json) {
+            Ok(Some(payload)) => {
+                agent_debug_log(
+                    "H2",
+                    "collect: result found via title-pull",
+                    serde_json::json!({ "reqId": req_id, "loops": ipc_wait_loops }),
+                );
+                return Ok(payload);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                agent_debug_log(
+                    "H3",
+                    "collect title-pull failed",
+                    serde_json::json!({ "reqId": req_id, "error": e }),
+                );
             }
         }
     }
+}
 
-    // Fallback path: use an eval to write the payload to the title, then read
-    // it back after a generous delay.  This handles the case where the title
-    // pulse hasn't fired yet after emitPayload.
+/// Legacy title-polling fallback — only used when IPC isn't available.
+/// Kept for backward compatibility with pages that don't have IPC access.
+fn pull_payload_from_js_store_legacy(
+    window: &tauri::WebviewWindow,
+    req_id_json: &str,
+) -> Result<Option<BridgeCompleteResponse>, String> {
+    const NULL_MARKER: &str = "__KIMBRIDGE_NONE__";
+
     let write_js = format!(
         r#"(() => {{
-            window.__kimPulsePaused = true;
-            const entry = (window.__kimBridgeStore || {{}})[{req_id_json}];
-            const val = (entry && typeof entry.data === 'string' && entry.data.length > 0)
-                ? entry.data : '{null_marker}';
-            document.title = val;
+            try {{
+                const store = window.__kimBridgeStore || {{}};
+                const entry = store[{req_id_json}];
+                const data = (entry && typeof entry.data === 'string' && entry.data.length > 0)
+                    ? entry.data : '{null_marker}';
+                document.title = data;
+            }} catch (_) {{
+                document.title = '{null_marker}';
+            }}
         }})()"#,
         req_id_json = req_id_json,
-        null_marker = null_marker,
+        null_marker = NULL_MARKER,
     );
-    window
-        .eval(write_js)
-        .map_err(|e| e.to_string())?;
-    // 250ms — enough for WKWebView to execute the JS and propagate the
-    // document.title change back to the OS window title layer.
-    std::thread::sleep(Duration::from_millis(250));
+    window.eval(write_js).map_err(|e| e.to_string())?;
 
-    let encoded = window.title().map_err(|e| e.to_string())?;
+    std::thread::sleep(Duration::from_millis(80));
 
-    // Resume pulseDone regardless of outcome.
-    let _ = window.eval("(() => { window.__kimPulsePaused = false; })()");
+    let title = window.title().map_err(|e| e.to_string())?;
 
-    if encoded == null_marker || encoded.trim().is_empty() || encoded.contains(' ') {
+    agent_debug_log(
+        "H2",
+        "title pull read title",
+        serde_json::json!({ "reqId": req_id_json, "title": title }),
+    );
+
+    if title == NULL_MARKER || title.trim().is_empty() || title.contains(' ') {
         return Ok(None);
     }
 
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&encoded)
-        .map_err(|e| format!("base64 decode failed: {}", e))?;
-    let decoded_str = String::from_utf8(decoded)
-        .map_err(|e| format!("utf8 decode failed: {}", e))?;
-    let payload: BridgeCompleteResponse = serde_json::from_str(&decoded_str)
-        .map_err(|e| format!("json parse failed: {}", e))?;
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(&title) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let decoded_str = match String::from_utf8(decoded) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let payload: BridgeCompleteResponse = match serde_json::from_str(&decoded_str) {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
 
     let clear_js = format!(
         "try {{ delete (window.__kimBridgeStore || {{}})[{req_id_json}]; }} catch(_) {{}}",
@@ -1598,6 +2421,12 @@ fn pull_payload_from_js_store(
     Ok(Some(payload))
 }
 
+/// Run a completion using the persistent bridge (preferred) or the legacy
+/// full-script approach (fallback).
+///
+/// The persistent bridge is already loaded via initialization_script:
+///   window.__kimBridge.send(prompt, reqId, site, attachments)
+/// This is a ~100 byte eval call vs the previous ~30KB script injection.
 fn run_bridge_completion_once(
     window: &tauri::WebviewWindow,
     site: &str,
@@ -1605,6 +2434,7 @@ fn run_bridge_completion_once(
     attachments: &[BridgeAttachment],
     callback_url: &str,
     callback_token: &str,
+    completion_hash: Option<&str>,
 ) -> Result<BridgeCompleteResponse, String> {
     let req_id = format!(
         "r-{}-{}",
@@ -1619,11 +2449,12 @@ fn run_bridge_completion_once(
             "site": site,
             "promptLen": prompt.len(),
             "attachments": attachments.len(),
-            "collectorMode": BRIDGE_COLLECTOR_MODE,
+            "collectorMode": "sentinel_v1",
             "collectorTimeoutS": BRIDGE_COMPLETION_TIMEOUT_S,
         }),
-    ); 
+    );
 
+    // Clear any stale result for this req_id.
     if let Ok(mut guard) = WEBVIEW_BRIDGE_RESULTS
         .get_or_init(|| StdMutex::new(HashMap::new()))
         .lock()
@@ -1631,23 +2462,36 @@ fn run_bridge_completion_once(
         guard.remove(&req_id);
     }
 
-    let script = build_bridge_complete_script(
-        site,
-        prompt,
-        &req_id,
-        attachments,
-        callback_url,
-        callback_token,
-    )
-        .map_err(|e| format!("Script build failed: {}", e))?;
+    // Try the persistent bridge first (tiny eval call).
+    let prompt_json = serde_json::to_string(prompt).map_err(|e| e.to_string())?;
+    let req_id_json = serde_json::to_string(&req_id).map_err(|e| e.to_string())?;
+    let site_json = serde_json::to_string(site).map_err(|e| e.to_string())?;
+    let attachments_json = serde_json::to_string(attachments).map_err(|e| e.to_string())?;
+    let hash_json = serde_json::to_string(&completion_hash).unwrap_or_else(|_| "null".to_string());
+
+    let bridge_call = format!(
+        r#"(() => {{
+            if (window.__kimBridge && window.__kimBridge._v >= 2) {{
+                window.__kimBridge.send({prompt}, {req_id}, {site}, {attachments}, null, {hash});
+            }} else {{
+                // Persistent bridge not installed — signal to fall back
+                document.title = '__KIMBRIDGE_NO_PERSISTENT__';
+            }}
+        }})()"#,
+        prompt = prompt_json,
+        req_id = req_id_json,
+        site = site_json,
+        attachments = attachments_json,
+        hash = hash_json,
+    );
 
     agent_debug_log(
         "H1",
-        "bridge eval begin",
-        serde_json::json!({ "reqId": req_id, "scriptLen": script.len() }),
+        "bridge eval begin (persistent)",
+        serde_json::json!({ "reqId": req_id, "scriptLen": bridge_call.len() }),
     );
 
-    if let Err(e) = window.eval(&script) {
+    if let Err(e) = window.eval(&bridge_call) {
         agent_debug_log(
             "H3",
             "bridge eval failed",
@@ -1656,11 +2500,34 @@ fn run_bridge_completion_once(
         return Err(format!("Failed to evaluate in-app script: {}", e));
     }
 
-    agent_debug_log(
-        "H1",
-        "bridge eval returned",
-        serde_json::json!({ "reqId": req_id }),
-    );
+    // Check if persistent bridge wasn't available (title marker)
+    std::thread::sleep(Duration::from_millis(100));
+    let title_check = window.title().unwrap_or_default();
+    if title_check == "__KIMBRIDGE_NO_PERSISTENT__" {
+        // Restore title and fall back to the legacy full-script approach.
+        let _ = window.eval("document.title = '';");
+        agent_debug_log(
+            "H2",
+            "persistent bridge not available, falling back to legacy script",
+            serde_json::json!({ "reqId": req_id }),
+        );
+
+        // Clear old req_id and generate a new one for the legacy path
+        if let Ok(mut guard) = WEBVIEW_BRIDGE_RESULTS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            guard.remove(&req_id);
+        }
+
+        let script = build_bridge_complete_script(
+            site, prompt, &req_id, attachments, callback_url, callback_token, completion_hash,
+        ).map_err(|e| format!("Script build failed: {}", e))?;
+
+        if let Err(e) = window.eval(&script) {
+            return Err(format!("Failed to evaluate legacy script: {}", e));
+        }
+    }
 
     agent_debug_log(
         "H1",
@@ -1668,15 +2535,16 @@ fn run_bridge_completion_once(
         serde_json::json!({
             "reqId": req_id,
             "timeoutS": BRIDGE_COMPLETION_TIMEOUT_S,
-            "mode": BRIDGE_COLLECTOR_MODE,
+            "mode": "sentinel_v1",
         }),
     );
 
-    let result = collect_bridge_payload_from_title(
+    let result = collect_bridge_payload(
         window,
         &req_id,
         Duration::from_secs(BRIDGE_COMPLETION_TIMEOUT_S),
     );
+
     agent_debug_log(
         "H1",
         "bridge collect returned",
@@ -1720,7 +2588,7 @@ fn handle_webview_bridge_request(
         return;
     }
 
-    if !(method == Method::Get && path == "/v1/health") {
+    if !(method == Method::Get && (path == "/v1/health" || path == "/v1/status")) {
         let auth = header_value(&request, "X-Kim-Token");
         if auth.as_deref() != Some(token.as_str()) {
             respond_json(
@@ -1732,8 +2600,28 @@ fn handle_webview_bridge_request(
         }
     }
 
+    // Handle /v1/result/{reqId} before the match, since it has a dynamic path
+    // and we can't use it in a match arm without consuming `method`.
+    if method == Method::Get && path.starts_with("/v1/result/") {
+        handle_bridge_result_request(request, &path, &token, app_handle.clone());
+        return;
+    }
+
     match (method, path.as_str()) {
         (Method::Get, "/v1/health") => {
+            respond_json(request, 200, serde_json::json!({"ok": true}));
+        }
+        (Method::Post, "/v1/hide") => {
+            if let Some(win) = app_handle.get_webview_window("main") {
+                let _ = win.hide();
+            }
+            respond_json(request, 200, serde_json::json!({"ok": true}));
+        }
+        (Method::Post, "/v1/show") => {
+            if let Some(win) = app_handle.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
             respond_json(request, 200, serde_json::json!({"ok": true}));
         }
         (Method::Post, "/v1/open") => {
@@ -1812,7 +2700,61 @@ fn handle_webview_bridge_request(
                     return;
                 }
             }
+            // Wake up any Condvar-waiting collector.
+            notify_bridge_result();
 
+            respond_json(request, 200, serde_json::json!({"ok": true}));
+        }
+        (Method::Get, path) if path.starts_with("/v1/ping") => {
+            let full_uri = request.url().to_string();
+            let url = tauri::Url::parse(&format!("http://localhost{}", full_uri)).unwrap();
+            let mut req_id = String::new();
+            let mut payload_str = String::new();
+            for (key, value) in url.query_pairs() {
+                if key == "req_id" { 
+                    req_id = value.into_owned(); 
+                } else if key == "data" { 
+                    payload_str = value.into_owned(); 
+                }
+            }
+            
+            agent_debug_log(
+                "H2",
+                "ping received",
+                serde_json::json!({
+                    "reqId": req_id,
+                    "payloadStrLen": payload_str.len(),
+                }),
+            );
+            
+            if !req_id.is_empty() && !payload_str.is_empty() {
+                match base64::engine::general_purpose::STANDARD.decode(&payload_str) {
+                    Ok(decoded) => {
+                        match String::from_utf8(decoded) {
+                            Ok(json_str) => {
+                                match serde_json::from_str::<BridgeCompleteResponse>(&json_str) {
+                                    Ok(payload) => {
+                                        let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
+                                        if let Ok(mut guard) = store.lock() {
+                                            guard.insert(req_id, payload);
+                                        }
+                                        notify_bridge_result();
+                                    }
+                                    Err(e) => {
+                                        agent_debug_log("H2", "ping json parse failed", serde_json::json!({ "error": e.to_string(), "json_str": json_str }));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                agent_debug_log("H2", "ping utf8 parse failed", serde_json::json!({ "error": e.to_string() }));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        agent_debug_log("H2", "ping base64 parse failed", serde_json::json!({ "error": e.to_string(), "payload_str": payload_str }));
+                    }
+                }
+            }
             respond_json(request, 200, serde_json::json!({"ok": true}));
         }
         (Method::Post, "/v1/complete") => {
@@ -1888,6 +2830,7 @@ fn handle_webview_bridge_request(
                     );
                     return;
                 }
+                show_browser_window_impl(&app_handle);
                 respond_json(
                     request,
                     409,
@@ -1899,24 +2842,20 @@ fn handle_webview_bridge_request(
                 return;
             };
 
-            // If the user previously closed the browser window (which hides it rather
-            // than destroying it so the login session stays alive), show it briefly
-            // before injecting JS.  WKWebView reports offsetParent=null for every
-            // element while a window is hidden, which causes our isVisible() helper
-            // to reject all input/send selectors.  Showing upfront avoids an
-            // unnecessary failure → hidden_retry_needed cycle on every call.
-            let was_hidden = window.is_visible().map(|v| !v).unwrap_or(false);
-            if was_hidden {
-                let _ = window.show();
-                let _ = window.set_focus();
-                // Give the window and its compositor layer time to become active.
-                std::thread::sleep(Duration::from_millis(150));
-            }
+            // Window is managed permanently off-screen by show/hide_browser_window.
+            // No need to manually reposition it here.
 
             let callback_url = WEBVIEW_BRIDGE_CFG
                 .get()
                 .map(|cfg| format!("{}/v1/callback", cfg.base_url))
                 .unwrap_or_else(|| "http://127.0.0.1:18991/v1/callback".to_string());
+
+            let was_hidden = window.is_visible().map(|v| !v).unwrap_or(false);
+            if was_hidden {
+                let _ = window.show();
+                let _ = window.set_focus();
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
 
             let mut completion = run_bridge_completion_once(
                 &window,
@@ -1925,6 +2864,7 @@ fn handle_webview_bridge_request(
                 &parsed.attachments,
                 &callback_url,
                 token.as_str(),
+                parsed.completion_hash.as_deref(),
             );
 
             // If the input selector still wasn't found (page may have navigated away
@@ -1949,13 +2889,13 @@ fn handle_webview_bridge_request(
                         &parsed.attachments,
                         &callback_url,
                         token.as_str(),
+                        parsed.completion_hash.as_deref(),
                     );
                 }
             }
 
-            // Hide again if we showed the window just for this request.
             if was_hidden {
-                let _ = window.hide();
+                hide_browser_window_offscreen(&window);
             }
 
             match completion {
@@ -1977,6 +2917,583 @@ fn handle_webview_bridge_request(
                 Err(e) => respond_json(request, 504, serde_json::json!({"ok": false, "error": e, "site": site})),
             }
         }
+        // ── Split send/receive: /v1/send ────────────────────────────────
+        // Injects the prompt and returns immediately with a req_id.
+        // Python can then long-poll /v1/result/{reqId} for the actual response.
+        (Method::Post, "/v1/send") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
+                );
+                return;
+            }
+
+            let parsed: BridgeCompleteRequest = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
+                    );
+                    return;
+                }
+            };
+
+            if parsed.prompt.trim().is_empty() {
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": "Prompt cannot be empty."}),
+                );
+                return;
+            }
+
+            let site = normalize_site(parsed.site.as_deref().unwrap_or("claude"));
+
+            let window = if let Some(w) = app_handle.get_webview_window("kim-browser-signin") {
+                w
+            } else {
+                let open_result = open_browser_signin_window_impl(
+                    default_site_url(&site),
+                    Some(site.clone()),
+                    &app_handle,
+                );
+                if let Err(e) = open_result {
+                    respond_json(
+                        request,
+                        500,
+                        serde_json::json!({"ok": false, "error": format!("Could not open browser: {}", e)}),
+                    );
+                    return;
+                }
+                show_browser_window_impl(&app_handle);
+                respond_json(
+                    request,
+                    409,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "In-app browser window opened. Sign in to the provider, then resend your task.",
+                    }),
+                );
+                return;
+            };
+
+            // Generate req_id
+            let req_id = format!(
+                "r-{}-{}",
+                std::process::id(),
+                WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
+
+            // Clear old req_id and sentinel marker
+            if let Ok(mut guard) = WEBVIEW_BRIDGE_RESULTS
+                .get_or_init(|| StdMutex::new(HashMap::new()))
+                .lock()
+            {
+                guard.remove(&req_id);
+                guard.remove(&format!("{}_sent", req_id));
+            }
+
+            let attachments = &parsed.attachments;
+            let prompt_json = serde_json::to_string(&parsed.prompt).unwrap_or_else(|_| "\"\"".to_string());
+            let req_id_json = serde_json::to_string(&req_id).unwrap_or_else(|_| "\"\"".to_string());
+            let site_json = serde_json::to_string(&site).unwrap_or_else(|_| "\"\"".to_string());
+            let attachments_json = serde_json::to_string(&attachments).unwrap_or_else(|_| "\"[]\"".to_string());
+            let hash_json = serde_json::to_string(&parsed.completion_hash).unwrap_or_else(|_| "null".to_string());
+
+            let bridge_call = format!(
+                r#"(() => {{
+                    if (window.__kimBridge && window.__kimBridge._v >= 2) {{
+                        window.__kimBridge.send({prompt}, {req_id}, {site}, {attachments}, null, {hash});
+                    }} else {{
+                        document.title = '__KIMBRIDGE_NO_PERSISTENT__';
+                    }}
+                }})()"#,
+                prompt = prompt_json,
+                req_id = req_id_json,
+                site = site_json,
+                attachments = attachments_json,
+                hash = hash_json,
+            );
+
+            let was_hidden = window.is_visible().map(|v| !v).unwrap_or(false);
+            if was_hidden {
+                let _ = window.show();
+                let _ = window.set_focus();
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
+                    guard.insert(req_id.clone());
+                }
+            }
+
+            agent_debug_log("H1", "send via persistent bridge", serde_json::json!({
+                "reqId": req_id,
+                "site": site,
+                "promptLen": parsed.prompt.len(),
+            }));
+
+            // Acquire lock to prevent overlapping window manipulations
+            let _guard = WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(())).try_lock();
+
+            if let Err(e) = window.eval(&bridge_call) {
+                respond_json(
+                    request,
+                    500,
+                    serde_json::json!({"ok": false, "error": format!("Eval failed: {}", e)}),
+                );
+                return;
+            }
+
+            // Fallback for NO_PERSISTENT
+            std::thread::sleep(Duration::from_millis(100));
+            let title_check = window.title().unwrap_or_default();
+            if title_check == "__KIMBRIDGE_NO_PERSISTENT__" {
+                let _ = window.eval("document.title = '';");
+                respond_json(
+                    request,
+                    500,
+                    serde_json::json!({"ok": false, "error": "Persistent bridge not installed. Ensure page is loaded."}),
+                );
+                return;
+            }
+
+            // Wait briefly for the "sent" confirmation from the persistent bridge
+            let mut sent_confirmed = false;
+            let start = Instant::now();
+            let timeout = Duration::from_secs(5);
+            
+            let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
+            let (notify_lock, condvar) = WEBVIEW_BRIDGE_NOTIFY.get_or_init(|| {
+                (StdMutex::new(()), Condvar::new())
+            });
+
+            if let Ok(mut guard) = notify_lock.lock() {
+                while start.elapsed() < timeout {
+                    let mut found = false;
+                    if let Ok(store_guard) = store.lock() {
+                        if store_guard.contains_key(&format!("{}_sent", req_id)) {
+                            found = true;
+                        }
+                    }
+                    if found {
+                        sent_confirmed = true;
+                        break;
+                    }
+                    let result = condvar.wait_timeout(guard, Duration::from_millis(100));
+                    if let Ok((new_guard, _)) = result {
+                        guard = new_guard;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            respond_json(
+                request,
+                200,
+                serde_json::json!({
+                    "ok": true,
+                    "req_id": req_id,
+                    "sent_confirmed": sent_confirmed,
+                    "site": site,
+                }),
+            );
+        }
+        // ---------------------------------------------------------------
+        // kimctl routes
+        // ---------------------------------------------------------------
+        (Method::Get, "/v1/status") => {
+            let has_running_task = {
+                let store = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None));
+                if let Ok(guard) = store.lock() {
+                    guard.map(|pid| process_exists(pid)).unwrap_or(false)
+                } else {
+                    false
+                }
+            };
+            let active_session_id = {
+                let store = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None));
+                if let Ok(guard) = store.lock() {
+                    guard.clone()
+                } else {
+                    None
+                }
+            };
+            let browser_visible = app_handle
+                .get_webview_window("kim-browser-signin")
+                .map(|w| w.is_visible().unwrap_or(false))
+                .unwrap_or(false);
+            respond_json(request, 200, serde_json::json!({
+                "ok": true,
+                "has_running_task": has_running_task,
+                "active_session_id": active_session_id,
+                "browser_visible": browser_visible,
+            }));
+        }
+        (Method::Post, "/v1/task") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                return;
+            }
+
+            #[derive(Deserialize)]
+            struct TaskRequest {
+                task: String,
+                #[serde(default)]
+                session_id: Option<String>,
+                #[serde(default)]
+                provider: Option<String>,
+            }
+
+            let parsed: TaskRequest = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    return;
+                }
+            };
+
+            if parsed.task.trim().is_empty() {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": "Task cannot be empty."}));
+                return;
+            }
+
+            // Reject if a task is already running
+            {
+                let store = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None));
+                if let Ok(guard) = store.lock() {
+                    if let Some(pid) = *guard {
+                        if process_exists(pid) {
+                            respond_json(request, 409, serde_json::json!({
+                                "ok": false,
+                                "error": "A task is already running. Cancel it first.",
+                            }));
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let kim_root = default_project_root();
+            let python = match find_python_interpreter(&kim_root) {
+                Ok(p) => p,
+                Err(e) => {
+                    respond_json(request, 500, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
+
+            let session_id = parsed.session_id
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let counter = WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    format!("{:04x}{:04x}", (ts & 0xFFFF) as u16, (counter & 0xFFFF) as u16)
+                });
+            let session_dir = kim_root.join("kim_sessions");
+            let provider = parsed.provider
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "browser".to_string());
+
+            let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();
+
+            let mut cmd = std::process::Command::new(&python);
+            cmd.args(["-m", "orchestrator.agent"])
+                .arg("--task")
+                .arg(&parsed.task)
+                .arg("--session-dir")
+                .arg(session_dir.to_string_lossy().to_string())
+                .arg("--resume")
+                .arg(&session_id)
+                .arg("--provider")
+                .arg(&provider)
+                .current_dir(&kim_root)
+                .env("PROJECT_ROOT", kim_root.to_str().unwrap_or(""))
+                .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit());
+
+            if let Ok(guard) = KIM_PREFERRED_SITE.get_or_init(|| StdMutex::new(None)).lock() {
+                if let Some(site) = &*guard {
+                    cmd.env("KIM_PREFERRED_SITE", site);
+                }
+            }
+
+            if let Some(cfg) = &bridge_cfg {
+                cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
+                    .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
+                    .env("KIM_WEBVIEW_WINDOW_LABEL", "kim-browser-signin");
+            }
+
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let child_pid = child.id();
+                    // Store PID
+                    if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
+                        *guard = Some(child_pid);
+                    }
+                    // Store session ID
+                    if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
+                        *guard = Some(session_id.clone());
+                    }
+
+                    // Emit event so the desktop UI knows a task started
+                    let _ = app_handle.emit("kim-agent-started", serde_json::json!({
+                        "session_id": session_id,
+                        "source": "kimctl",
+                    }));
+
+                    // Background thread: read stdout to capture SCREENSHOT_FLASH and emit to UI
+                    let reader_handle = if let Some(stdout) = child.stdout.take() {
+                        let reader = std::io::BufReader::new(stdout);
+                        use std::io::BufRead;
+                        let app_handle_out = app_handle.clone();
+                        Some(std::thread::spawn(move || {
+                            for line in reader.lines() {
+                                if let Ok(l) = line {
+                                    let _ = app_handle_out.emit("kim-agent-output", l);
+                                }
+                            }
+                        }))
+                    } else {
+                        None
+                    };
+
+                    // Background thread: wait for child to exit, then clear PID
+                    let app_for_wait = app_handle.clone();
+                    std::thread::spawn(move || {
+                        let mut child = child;
+                        let _ = child.wait();
+                        if let Some(handle) = reader_handle {
+                            let _ = handle.join();
+                        }
+                        if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
+                            *guard = None;
+                        }
+                        if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
+                            *guard = None;
+                        }
+                        let _ = app_for_wait.emit("kim-agent-done", true);
+                    });
+
+                    respond_json(request, 200, serde_json::json!({
+                        "ok": true,
+                        "session_id": session_id,
+                        "sessions_dir": session_dir.to_string_lossy(),
+                    }));
+                }
+                Err(e) => {
+                    respond_json(request, 500, serde_json::json!({
+                        "ok": false,
+                        "error": format!("Failed to start agent: {}", e),
+                    }));
+                }
+            }
+        }
+        (Method::Post, "/v1/cancel") => {
+            let pid = {
+                let store = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None));
+                if let Ok(guard) = store.lock() {
+                    *guard
+                } else {
+                    None
+                }
+            };
+
+            match pid {
+                Some(pid) if process_exists(pid) => {
+                    match send_signal(pid, false) {
+                        Ok(()) => {
+                            // Background cleanup: wait 2s then force-kill if alive
+                            std::thread::spawn(move || {
+                                for _ in 0..20 {
+                                    std::thread::sleep(Duration::from_millis(100));
+                                    if !process_exists(pid) {
+                                        break;
+                                    }
+                                }
+                                if process_exists(pid) {
+                                    let _ = send_signal(pid, true);
+                                }
+                                if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
+                                    *guard = None;
+                                }
+                                if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
+                                    *guard = None;
+                                }
+                            });
+                            respond_json(request, 200, serde_json::json!({"ok": true, "message": "Cancelling task."}));
+                        }
+                        Err(e) => {
+                            respond_json(request, 500, serde_json::json!({
+                                "ok": false,
+                                "error": format!("Failed to send stop signal: {}", e),
+                            }));
+                        }
+                    }
+                }
+                _ => {
+                    respond_json(request, 200, serde_json::json!({
+                        "ok": true,
+                        "message": "No task is currently running.",
+                    }));
+                }
+            }
+        }
+        (Method::Post, "/v1/browser/show") => {
+            if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
+                let _ = win.show();
+                let _ = win.set_focus();
+                respond_json(request, 200, serde_json::json!({"ok": true}));
+            } else {
+                respond_json(request, 200, serde_json::json!({"ok": false, "message": "No browser window exists yet."}));
+            }
+        }
+        (Method::Post, "/v1/browser/hide") => {
+            if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
+                hide_browser_window_offscreen(&win);
+            }
+            respond_json(request, 200, serde_json::json!({"ok": true}));
+        }
+        (Method::Post, "/v1/browser/click") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                return;
+            }
+
+            #[derive(Deserialize)]
+            struct ClickRequest {
+                selector: String,
+            }
+
+            let parsed: ClickRequest = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    return;
+                }
+            };
+
+            if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
+                let selector_json = serde_json::to_string(&parsed.selector).unwrap_or_else(|_| "\"\"".to_string());
+                let js = format!(
+                    "(() => {{ const el = document.querySelector({}); if (el) {{ el.click(); return true; }} return false; }})()",
+                    selector_json
+                );
+                match win.eval(&js) {
+                    Ok(()) => {
+                        respond_json(request, 200, serde_json::json!({"ok": true, "clicked": true}));
+                    }
+                    Err(e) => {
+                        respond_json(request, 500, serde_json::json!({
+                            "ok": false,
+                            "error": format!("eval failed: {}", e),
+                        }));
+                    }
+                }
+            } else {
+                respond_json(request, 200, serde_json::json!({"ok": false, "clicked": false, "error": "No browser window."}));
+            }
+        }
+        (Method::Post, "/v1/browser/new-chat") => {
+            // Reset bridge state and start a fresh conversation in the active
+            // chat UI. Uses provider-specific selectors with sensible fallbacks.
+            if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
+                let js = r#"(() => {
+                    try {
+                        if (window.__kimBridge) {
+                            window.__kimBridge._lastHash = null;
+                            window.__kimBridge._currentReqId = null;
+                        }
+                        if (typeof window.__kimBridgeStore === 'object' && window.__kimBridgeStore) {
+                            window.__kimBridgeStore = {};
+                        }
+                    } catch (_) {}
+
+                    const candidates = [
+                        'button[aria-label*="New chat" i]',
+                        'a[aria-label*="New chat" i]',
+                        '[data-testid*="new-chat" i]',
+                        'button[aria-label*="New conversation" i]',
+                        'a[href$="/app"]',
+                    ];
+                    for (const sel of candidates) {
+                        try {
+                            const el = document.querySelector(sel);
+                            if (el) { el.click(); return true; }
+                        } catch (_) {}
+                    }
+                    // Fallback for Gemini: navigate to /app which always opens fresh
+                    if (location.hostname.includes('gemini.google.com')) {
+                        location.href = 'https://gemini.google.com/app';
+                        return true;
+                    }
+                    return false;
+                })()"#;
+                match win.eval(js) {
+                    Ok(()) => respond_json(request, 200, serde_json::json!({"ok": true})),
+                    Err(e) => respond_json(request, 500, serde_json::json!({
+                        "ok": false,
+                        "error": format!("eval failed: {}", e),
+                    })),
+                }
+            } else {
+                respond_json(request, 200, serde_json::json!({"ok": false, "error": "No browser window."}));
+            }
+        }
+        (Method::Post, "/v1/provider") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                return;
+            }
+
+            #[derive(Deserialize)]
+            struct ProviderRequest {
+                site: String,
+            }
+
+            let parsed: ProviderRequest = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    return;
+                }
+            };
+
+            let site = normalize_site(&parsed.site);
+            if let Ok(mut guard) = KIM_PREFERRED_SITE.get_or_init(|| StdMutex::new(None)).lock() {
+                *guard = Some(site.clone());
+            }
+            let url = default_site_url(&site);
+
+            if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
+                if let Ok(js_url) = serde_json::to_string(url) {
+                    let _ = win.eval(&format!("window.location.href = {};", js_url));
+                }
+                respond_json(request, 200, serde_json::json!({"ok": true, "site": site}));
+            } else {
+                // Open the browser window with this provider
+                match open_browser_signin_window_impl(url, Some(site.clone()), &app_handle) {
+                    Ok(_) => {
+                        show_browser_window_impl(&app_handle);
+                        respond_json(request, 200, serde_json::json!({"ok": true, "site": site, "opened": true}));
+                    }
+                    Err(e) => {
+                        respond_json(request, 500, serde_json::json!({"ok": false, "error": format!("{}", e)}));
+                    }
+                }
+            }
+        }
         _ => {
             respond_json(
                 request,
@@ -1984,6 +3501,265 @@ fn handle_webview_bridge_request(
                 serde_json::json!({"ok": false, "error": format!("Unknown bridge route: {}", path)}),
             );
         }
+    }
+}
+
+
+
+fn handle_bridge_result_request(
+    request: Request,
+    path: &str,
+    _token: &str,
+    app_handle: tauri::AppHandle,
+) {
+    let req_id = path.trim_start_matches("/v1/result/").to_string();
+    if req_id.is_empty() {
+        respond_json(request, 400, serde_json::json!({"ok": false, "error": "Missing req_id"}));
+        return;
+    }
+
+    let window = if let Some(w) = app_handle.get_webview_window("kim-browser-signin") {
+        w
+    } else {
+        respond_json(request, 500, serde_json::json!({"ok": false, "error": "Browser window closed."}));
+        return;
+    };
+
+    agent_debug_log("H1", "result collector start (persistent bridge)", serde_json::json!({
+        "reqId": req_id,
+    }));
+
+    let result = collect_bridge_payload(
+        &window,
+        &req_id,
+        Duration::from_secs(BRIDGE_COMPLETION_TIMEOUT_S),
+    );
+
+    let mut should_hide = false;
+    if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
+        should_hide = guard.remove(&req_id);
+    }
+    if should_hide {
+        hide_browser_window_offscreen(&window);
+    }
+
+    match result {
+        Ok(payload) => {
+            if payload.ok {
+                respond_json(request, 200, serde_json::json!({
+                    "ok": true,
+                    "response": payload.response,
+                    "site": payload.site.unwrap_or_else(|| "unknown".to_string()),
+                    "req_id": req_id,
+                }));
+            } else {
+                respond_json(request, 500, serde_json::json!({
+                    "ok": false,
+                    "error": payload.error.unwrap_or_else(|| "Unknown bridge error".to_string()),
+                    "req_id": req_id,
+                }));
+            }
+        }
+        Err(e) => {
+            respond_json(request, 504, serde_json::json!({
+                "ok": false,
+                "error": e,
+                "req_id": req_id,
+            }));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Claw file-bridge command watcher (Tasks 4/5/7 of the browser-parity work)
+// ---------------------------------------------------------------------------
+
+const CLAW_BRIDGE_DIR: &str = "/tmp/claw_bridge";
+
+/// Spawn a background thread that:
+///  - Polls `/tmp/claw_bridge/browser_cmd.json` every 500 ms and dispatches
+///    show/hide/switch_site actions to the Kim webview window.
+///  - Writes `/tmp/claw_bridge/bridge_status.json` every 5 s so Claw's
+///    `/browser status` command can report the current bridge state.
+fn start_bridge_file_watcher(app_handle: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let bridge_dir = std::path::Path::new(CLAW_BRIDGE_DIR);
+        let cmd_path = bridge_dir.join("browser_cmd.json");
+        let status_path = bridge_dir.join("bridge_status.json");
+
+        let mut last_cmd_mtime: Option<std::time::SystemTime> = None;
+        let mut last_status_write = std::time::Instant::now();
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            // ── Handle browser_cmd.json ─────────────────────────────────────
+            if let Ok(meta) = fs::metadata(&cmd_path) {
+                if let Ok(modified) = meta.modified() {
+                    let is_new = last_cmd_mtime.map_or(true, |prev| modified > prev);
+                    if is_new {
+                        last_cmd_mtime = Some(modified);
+                        if let Ok(text) = fs::read_to_string(&cmd_path) {
+                            let _ = fs::remove_file(&cmd_path); // consume once
+                            if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&text) {
+                                let action = cmd.get("action")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let app = app_handle.clone();
+                                match action.as_str() {
+                                    "show_window" => {
+                                        show_browser_window_impl(&app);
+                                    }
+                                    "hide_window" => {
+                                        if let Some(win) = app.get_webview_window("kim-browser-signin") {
+                                            hide_browser_window_offscreen(&win);
+                                        }
+                                    }
+                                    "switch_site" => {
+                                        let site = cmd.get("site")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("claude");
+                                        let url = site_to_url(site);
+                                        let provider = Some(format!("{} (via /model)", capitalize(site)));
+                                        let _ = open_browser_signin_window_impl(&url, provider, &app);
+                                    }
+                                    "screenshot_flash" => {
+                                        show_screenshot_flash_impl(&app);
+                                    }
+                                    _ => {
+                                        eprintln!("[Kim] Unknown browser cmd action: {action}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Write bridge_status.json every 5 s ─────────────────────────
+            if last_status_write.elapsed() >= std::time::Duration::from_secs(5) {
+                last_status_write = std::time::Instant::now();
+                let (window_open, current_url) = if let Some(win) =
+                    app_handle.get_webview_window("kim-browser-signin")
+                {
+                    let url = win.url().map(|u| u.to_string()).unwrap_or_default();
+                    (true, url)
+                } else {
+                    (false, String::new())
+                };
+                let current_site = url_to_site(&current_url);
+                let signed_in = !current_url.is_empty()
+                    && !current_url.contains("login")
+                    && !current_url.contains("signin")
+                    && !current_url.contains("sign-in")
+                    && !current_url.contains("auth");
+                let status = serde_json::json!({
+                    "window_open": window_open,
+                    "current_site": current_site,
+                    "current_url": current_url,
+                    "bridge_version": 8,
+                    "signed_in": signed_in,
+                });
+                let _ = fs::create_dir_all(bridge_dir);
+                if let Ok(text) = serde_json::to_string_pretty(&status) {
+                    let _ = fs::write(&status_path, text);
+                }
+            }
+        }
+    });
+}
+
+fn show_screenshot_flash_impl(app_handle: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(existing) = app_handle.get_webview_window("screenshot-flash") {
+        let _ = existing.close();
+    }
+    // Use monitor logical size instead of fullscreen(true) to avoid the
+    // macOS Spaces slide-in transition and the opaque backing-layer that
+    // fullscreen mode forces (which produces the black fill).
+    let (log_w, log_h, log_x, log_y) = app_handle
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| {
+            let sf = m.scale_factor();
+            let sz = m.size();
+            let pos = m.position();
+            (
+                sz.width as f64 / sf,
+                sz.height as f64 / sf,
+                pos.x as f64 / sf,
+                pos.y as f64 / sf,
+            )
+        })
+        .unwrap_or((1920.0, 1080.0, 0.0, 0.0));
+
+    match tauri::WebviewWindowBuilder::new(
+        app_handle,
+        "screenshot-flash",
+        tauri::WebviewUrl::App("screenshot-flash.html".into()),
+    )
+    .title("")
+    .inner_size(log_w, log_h)
+    .position(log_x, log_y)
+    .transparent(true)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .visible_on_all_workspaces(true)
+    .resizable(false)
+    .build()
+    {
+        Ok(win) => {
+            let win: tauri::WebviewWindow = win;
+            let _ = win.set_ignore_cursor_events(true);
+            let win_for_close = win.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(3300));
+                let _ = win_for_close.close();
+            });
+        }
+        Err(e) => eprintln!("[Kim] screenshot flash window error: {e}"),
+    }
+}
+
+#[tauri::command]
+async fn show_screenshot_flash(app_handle: tauri::AppHandle) {
+    show_screenshot_flash_impl(&app_handle);
+}
+
+fn site_to_url(site: &str) -> String {
+    match site {
+        "chatgpt" => "https://chatgpt.com/".to_string(),
+        "gemini" => "https://gemini.google.com/app".to_string(),
+        "deepseek" => "https://chat.deepseek.com/".to_string(),
+        "grok" => "https://grok.x.com/".to_string(),
+        _ => "https://claude.ai/new".to_string(),
+    }
+}
+
+fn url_to_site(url: &str) -> &'static str {
+    if url.contains("chatgpt.com") || url.contains("chat.openai.com") {
+        "chatgpt"
+    } else if url.contains("gemini.google.com") {
+        "gemini"
+    } else if url.contains("deepseek.com") {
+        "deepseek"
+    } else if url.contains("grok.x.com") || url.contains("x.com/i/grok") {
+        "grok"
+    } else if url.contains("claude.ai") {
+        "claude"
+    } else {
+        "unknown"
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
     }
 }
 
@@ -2015,11 +3791,16 @@ fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Result<(), Strin
         token: token.clone(),
     });
 
+    // Write token to kim_sessions/.bridge_token for kimctl
+    let sessions_dir = default_project_root().join("kim_sessions");
+    let _ = std::fs::create_dir_all(&sessions_dir);
+    let _ = std::fs::write(sessions_dir.join(".bridge_token"), format!("{}\n{}", base_url, token));
+
     std::thread::spawn(move || {
         eprintln!(
             "[Kim] In-app browser bridge listening at {} (mode={}, timeout={}s)",
             base_url,
-            BRIDGE_COLLECTOR_MODE,
+            "sentinel_v1",
             BRIDGE_COMPLETION_TIMEOUT_S,
         );
         for request in server.incoming_requests() {
@@ -2056,6 +3837,67 @@ async fn list_sessions(
     }
 
     Ok(sessions)
+}
+
+#[tauri::command]
+async fn delete_sessions(
+    session_ids: Vec<String>,
+    kim_dir: Option<String>,
+    claw_dir: Option<String>,
+) -> Result<(), String> {
+    for session_id in session_ids {
+        validate_session_id(&session_id)?;
+        
+        let mut deleted = false;
+        
+        let dirs_to_search: Vec<PathBuf> = {
+            let mut v = vec![kim_dir
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(default_sessions_dir)];
+            if let Some(claw_path) = &claw_dir {
+                v.push(PathBuf::from(claw_path));
+            }
+            v
+        };
+        
+        // Sessions are stored as <base>/<date_dir>/<session_id>.jsonl
+        // We need to search all date subdirectories
+        for base in &dirs_to_search {
+            if !base.exists() {
+                continue;
+            }
+            // Search date subdirectories (e.g., 2026-04-23/)
+            if let Ok(entries) = std::fs::read_dir(base) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let date_dir = entry.path();
+                    if !date_dir.is_dir() {
+                        continue;
+                    }
+                    // Look for <session_id>.jsonl
+                    let jsonl_path = date_dir.join(format!("{}.jsonl", session_id));
+                    if jsonl_path.exists() {
+                        if let Err(e) = std::fs::remove_file(&jsonl_path) {
+                            eprintln!("Failed to delete session file {}: {}", session_id, e);
+                        } else {
+                            deleted = true;
+                            // Also delete companion summary file if it exists
+                            let summary_path = date_dir.join(format!("{}.summary.txt", session_id));
+                            if summary_path.exists() {
+                                let _ = std::fs::remove_file(&summary_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if !deleted {
+            eprintln!("Session {} not found for deletion.", session_id);
+        }
+    }
+    
+    Ok(())
 }
 
 #[tauri::command]
@@ -2125,6 +3967,107 @@ async fn open_browser_signin_window(
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
     open_browser_signin_window_impl(&url, provider_name, &app_handle)
+}
+
+/// Hide the Kim browser window without triggering WKWebView's background-tab
+/// JavaScript suspension on macOS. Raw `win.hide()` causes WKWebView to throttle
+/// or pause `setTimeout`/`requestAnimationFrame` and synthetic DOM events, which
+/// breaks the bridge JS mid-poll on multi-turn conversations.
+///
+/// Instead we strip decorations, shrink to 0x0, and move off-screen. The window
+/// remains technically "visible" so JS keeps running at full speed, but is
+/// invisible to the user. `show_browser_window_impl` restores it.
+fn hide_browser_window_offscreen(win: &tauri::WebviewWindow) {
+    let _ = win.set_decorations(false);
+    let _ = win.set_size(tauri::PhysicalSize::new(0, 0));
+    let _ = win.set_position(tauri::PhysicalPosition::new(-10000, -10000));
+}
+
+fn show_browser_window_impl(app_handle: &tauri::AppHandle) {
+    let label = "kim-browser-signin";
+    if let Some(win) = app_handle.get_webview_window(label) {
+        let _ = win.set_decorations(true);
+        if let Some(monitor) = win.current_monitor().unwrap_or(None) {
+            let monitor_size = monitor.size();
+            let width = 1280;
+            let height = 860;
+            let x = (monitor_size.width as i32 - width) / 2;
+            let y = (monitor_size.height as i32 - height) / 2;
+            let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+            let _ = win.set_size(tauri::PhysicalSize::new(width as u32, height as u32));
+        } else {
+            // Fallback if no monitor found
+            let _ = win.set_position(tauri::PhysicalPosition::new(100, 100));
+            let _ = win.set_size(tauri::PhysicalSize::new(1280, 860));
+        }
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+#[tauri::command]
+async fn show_browser_window(app_handle: tauri::AppHandle) -> Result<(), String> {
+    if app_handle.get_webview_window("kim-browser-signin").is_some() {
+        show_browser_window_impl(&app_handle);
+        Ok(())
+    } else {
+        Err("No Kim browser window is open yet. Open a browser provider first.".to_string())
+
+    }
+}
+
+#[tauri::command]
+async fn hide_main_window(app_handle: tauri::AppHandle) -> Result<(), String> {
+    // Hide only the "main" window so the screenshot-flash overlay stays visible.
+    // app_handle.hide() would hide every window including the flash overlay.
+    if let Some(win) = app_handle.get_webview_window("main") {
+        let _ = win.hide();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn show_main_window(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let _ = app_handle.show();
+    if let Some(win) = app_handle.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn hide_browser_window(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let label = "kim-browser-signin";
+    if let Some(win) = app_handle.get_webview_window(label) {
+        hide_browser_window_offscreen(&win);
+
+        // Refocus the main app window.
+        if let Some(main_win) = app_handle.get_webview_window("main") {
+            let _ = main_win.show();
+            let _ = main_win.set_focus();
+        }
+        let _ = app_handle.emit("kim-browser-hidden", true);
+        Ok(())
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
+async fn navigate_browser_window_if_open(url: String, app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("URL cannot be empty.".to_string());
+    }
+
+    if let Some(existing) = app_handle.get_webview_window("kim-browser-signin") {
+        let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
+        let _ = existing.eval(&format!("window.location.href = {};", js_url));
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2214,24 +4157,43 @@ async fn send_task(
         }
     }
 
-    let root = project_root
-        .map(PathBuf::from)
-        .unwrap_or_else(default_project_root);
+    // The Kim repo root (where orchestrator/, mcp_server/, and venv/ live).
+    // This is ALWAYS used for finding the Python interpreter, setting PYTHONPATH,
+    // and as the working directory so `python -m orchestrator.agent` resolves.
+    let kim_root = default_project_root();
 
-    let python = find_python_interpreter(&root)?;
+    // The target project the user wants Kim/Claw to work on.  For the normal
+    // Chat tab this is typically the Kim repo itself.  For the Code tab it is
+    // the user's external code project.  MCP tools use PROJECT_ROOT to know
+    // which directory to operate in (file reads/writes, git, search, etc.).
+    let is_claw = project_root.is_some();
+    let target_root = project_root
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| kim_root.clone());
+
+    let python = find_python_interpreter(&kim_root)?;
+
+    let session_dir = if is_claw {
+        target_root.join(".claw").join("sessions")
+    } else {
+        kim_root.join("kim_sessions")
+    };
 
     let mut cmd = Command::new(&python);
     cmd.args(["-m", "orchestrator.agent"])
         .arg("--task")
         .arg(&task)
-        .current_dir(&root)
-        // Tell the orchestrator and MCP server exactly where the kim repo lives.
-        // Without this, mcp_session_context falls back to Path.cwd() which may
-        // differ from the repo root when running inside the Tauri bundle.
-        .env("PROJECT_ROOT", root.to_str().unwrap_or(""))
-        // Ensure `import mcp_server.server` resolves from the repo root even when
-        // the Python cwd is something unexpected.
-        .env("PYTHONPATH", root.to_str().unwrap_or(""))
+        .arg("--session-dir")
+        .arg(session_dir.to_string_lossy().to_string())
+        .current_dir(&kim_root)
+        // Tell the MCP server which directory to operate on (file tools, git, etc.).
+        // For the Code tab this is the user's external project; for Chat it is
+        // the Kim repo itself.
+        .env("PROJECT_ROOT", target_root.to_str().unwrap_or(""))
+        // Ensure `import orchestrator` and `import mcp_server` always resolve
+        // from the Kim repo, regardless of the target project.
+        .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -2258,7 +4220,7 @@ async fn send_task(
     // stall the Tokio executor, then do the post-launch wait with tokio::time::sleep.
     if provider_arg == "browser" || provider_arg.starts_with("browser:") {
         if bridge_cfg.is_none() {
-            let root_for_chrome = root.clone();
+            let root_for_chrome = kim_root.clone();
             match tokio::task::spawn_blocking(move || launch_chrome_for_cdp(&root_for_chrome)).await {
                 Ok(Ok(true)) => {
                     // Chrome was freshly spawned — give it 2 s to open the debug port.
@@ -2300,35 +4262,57 @@ async fn send_task(
         let mut guard = state.lock().await;
         guard.pid = child_pid;
     }
+    // Also sync to the bridge-accessible static so kimctl cancel works.
+    if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
+        *guard = child_pid;
+    }
 
-    if let Some(stdout) = child.stdout.take() {
+    let stdout_handle = if let Some(stdout) = child.stdout.take() {
         let reader = tokio::io::BufReader::new(stdout);
         let app = app_handle.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let _ = app.emit("kim-agent-output", line);
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
-    if let Some(stderr) = child.stderr.take() {
+    let stderr_handle = if let Some(stderr) = child.stderr.take() {
         let reader = tokio::io::BufReader::new(stderr);
         let app = app_handle.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let _ = app.emit("kim-agent-error", line);
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     let status = child.wait().await.map_err(|e| e.to_string())?;
+
+    if let Some(handle) = stdout_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = stderr_handle {
+        let _ = handle.await;
+    }
 
     // Clear the recorded PID regardless of exit reason (normal, error, cancelled).
     {
         let mut guard = state.lock().await;
         guard.pid = None;
+    }
+    // Clear bridge-accessible PID too.
+    if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
+        *guard = None;
     }
 
     let _ = app_handle.emit("kim-agent-done", status.success());
@@ -3207,41 +5191,58 @@ async fn remove_code_project(path: String) -> Result<Vec<String>, String> {
 }
 
 fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
+    // Claw stores sessions bucketed by date: <dir>/<YYYY-MM-DD>/<session_id>.jsonl.
+    // Walk each date subdirectory, then collect the .jsonl files inside.
     let mut sessions = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else { return sessions };
+    let Ok(date_entries) = fs::read_dir(dir) else { return sessions };
 
-    let mut files: Vec<_> = entries
+    let mut date_dirs: Vec<_> = date_entries
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            let n = e.file_name();
-            let s = n.to_string_lossy();
-            s.ends_with(".jsonl") && !s.contains(".summary")
-        })
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .collect();
-    files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
+    date_dirs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
-    for fe in files.iter().take(50) {
-        let session_id = fe.path()
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let message_count = count_lines(&fe.path()).unwrap_or(0);
-        let summary_path = dir.join(format!("{}.summary.txt", session_id));
-        let summary = if summary_path.exists() {
-            fs::read_to_string(&summary_path)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        } else {
-            None
-        };
-        sessions.push(ClawSession {
-            session_id,
-            date: String::new(),
-            message_count,
-            summary,
-        });
+    for date_entry in date_dirs {
+        let date = date_entry.file_name().to_string_lossy().to_string();
+        let date_path = date_entry.path();
+        let Ok(file_entries) = fs::read_dir(&date_path) else { continue };
+
+        let mut files: Vec<_> = file_entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let s = n.to_string_lossy();
+                s.ends_with(".jsonl") && !s.contains(".summary")
+            })
+            .collect();
+        files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
+
+        for fe in files {
+            if sessions.len() >= 50 {
+                return sessions;
+            }
+            let session_id = fe.path()
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let message_count = count_lines(&fe.path()).unwrap_or(0);
+            let summary_path = date_path.join(format!("{}.summary.txt", session_id));
+            let summary = if summary_path.exists() {
+                fs::read_to_string(&summary_path)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            };
+            sessions.push(ClawSession {
+                session_id,
+                date: date.clone(),
+                message_count,
+                summary,
+            });
+        }
     }
     sessions
 }
@@ -3350,14 +5351,22 @@ pub fn run() {
             if let Err(e) = start_webview_bridge_server(app.handle().clone()) {
                 eprintln!("[Kim] Failed to start in-app browser bridge: {}", e);
             }
+            start_bridge_file_watcher(app.handle().clone());
             Ok(())
         })
         .manage(task_state)
         .invoke_handler(tauri::generate_handler![
             list_sessions,
+            delete_sessions,
             load_session_messages,
             get_app_version,
+            add_custom_provider_capability,
             open_browser_signin_window,
+            navigate_browser_window_if_open,
+            show_browser_window,
+            hide_browser_window,
+            hide_main_window,
+            show_main_window,
             send_task,
             cancel_task,
             read_voice_config,
@@ -3374,6 +5383,7 @@ pub fn run() {
             add_code_project,
             remove_code_project,
             send_feedback,
+            show_screenshot_flash,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

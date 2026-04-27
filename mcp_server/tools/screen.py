@@ -1,9 +1,13 @@
 import base64
 import ctypes
 import io
+import json
 import logging
+import os
 
 logger = logging.getLogger(__name__)
+
+
 
 
 async def handle_take_screenshot(args: dict) -> str:
@@ -33,6 +37,10 @@ async def handle_take_screenshot(args: dict) -> str:
 
 
 async def handle_get_screen_info(args: dict) -> str:
+    import platform
+    if platform.system() != "Windows":
+        return "ERROR: get_screen_info is currently only supported on Windows. Please use other context gathering tools."
+
     try:
         user32 = ctypes.windll.user32
         user32.SetProcessDPIAware()
