@@ -20,7 +20,7 @@ model:
 openai_api_key_env: OPENAI_API_KEY
 openai_base_url: ''
 preview_mode: false
-project_root: .
+project_root: /Users/adammaged/Documents/kimTEST/kim
 provider: browser
 relay:
   pc_api_key: ''
@@ -35,8 +35,8 @@ shell:
   - rd /S /Q C:\
   timeout: 30
 voice:
-  enabled: true
-  engine: hume
+  enabled: false
+  engine: kokoro
   human_quirks: false
   hume:
     description: A warm, clear, and friendly female voice.

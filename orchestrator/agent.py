@@ -40,6 +40,7 @@ import os
 import platform
 import queue
 import random
+import re
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -248,10 +249,20 @@ async def mcp_session_context(config: dict):
             os.environ.get("PROJECT_ROOT") or config.get("project_root", str(Path.cwd()))
         ).resolve()
     )
+    # The MCP SDK's stdio_client strips the environment to a safe whitelist
+    # (HOME, PATH, SHELL, etc.) when StdioServerParameters.env is None.
+    # This drops PYTHONPATH, PROJECT_ROOT, and bridge env vars that the MCP
+    # server subprocess needs.  We explicitly propagate them here.
+    _EXTRA_ENV_KEYS = [
+        "PYTHONPATH", "PROJECT_ROOT", "VIRTUAL_ENV",
+        "KIM_WEBVIEW_BRIDGE_URL", "KIM_WEBVIEW_BRIDGE_TOKEN",
+    ]
+    extra_env = {k: os.environ[k] for k in _EXTRA_ENV_KEYS if k in os.environ}
     server_params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "mcp_server.server"],
         cwd=project_root,
+        env=extra_env if extra_env else None,
     )
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
@@ -448,6 +459,58 @@ class KimAgent:
                 self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]})")
                 await self._voice_speak(f"Running {tool_name}")
 
+                if tool_name == "batch":
+                    calls = tool_args.get("calls", [])
+                    if not isinstance(calls, list):
+                        self._session_store.append_message({"role": "user", "content": "[Tool result: batch]\nERROR: 'calls' must be a list."})
+                        continue
+
+                    _BATCH_SAFE = {"read_file", "list_dir", "git_status", "git_diff", "git_log", "search_in_files", "find_files", "get_screen_info"}
+                    batch_results = []
+                    aborted_after = -1
+                    ok = True
+
+                    assistant_msg = {"role": "assistant", "content": json.dumps(response)}
+                    self.memory.add_assistant(json.dumps(response))
+                    self._session_store.append_message(assistant_msg)
+
+                    for idx, call in enumerate(calls):
+                        sub_tool = call.get("tool")
+                        sub_args = call.get("args", {})
+
+                        if sub_tool not in _BATCH_SAFE:
+                            batch_results.append(f"Call {idx} ({sub_tool}): ERROR: Tool '{sub_tool}' is not safe for batching. Allowed: {', '.join(_BATCH_SAFE)}.")
+                            ok = False
+                            aborted_after = idx
+                            break
+
+                        if self._is_preview_mode() and self._ui_bridge:
+                            confirmed = await self._ui_bridge.confirm_action(sub_tool, sub_args)
+                            if not confirmed:
+                                batch_results.append(f"Call {idx} ({sub_tool}): ERROR: Denied by user.")
+                                ok = False
+                                aborted_after = idx
+                                break
+
+                        try:
+                            sub_result = await self._execute_tool(sub_tool, sub_args)
+                            batch_results.append(f"Call {idx} ({sub_tool}):\n{sub_result}")
+                        except Exception as e:
+                            batch_results.append(f"Call {idx} ({sub_tool}): ERROR: {e}")
+                            ok = False
+                            aborted_after = idx
+                            break
+
+                    summary_obj = {"ok": ok}
+                    if not ok: summary_obj["aborted_after"] = aborted_after
+                    result_text = json.dumps(summary_obj) + "\n\n" + "\n---\n".join(batch_results)
+                    self._log("INFO", f"Batch result: {result_text[:200]}")
+                    
+                    user_content = f"[Tool result: batch]\n{result_text}"
+                    self.memory.add_user(user_content)
+                    self._session_store.append_message({"role": "user", "content": user_content})
+                    continue
+
                 # Preview mode — pause and ask for confirmation
                 if self._is_preview_mode() and self._ui_bridge:
                     self._log("INFO", f"[Preview] Waiting for confirmation: {tool_name}")
@@ -468,26 +531,33 @@ class KimAgent:
                 result_text = await self._execute_tool(tool_name, tool_args)
                 self._log("INFO", f"Result: {result_text[:200]}")
 
-                # Fresh screenshot after action
-                screenshot_b64 = await self._take_screenshot()
-                last_screenshot_b64 = screenshot_b64
+                # Only include a screenshot if the LLM explicitly called take_screenshot
+                if tool_name == "take_screenshot":
+                    screenshot_b64 = result_text
+                    if screenshot_b64.startswith("data:image/png;base64,"):
+                        screenshot_b64 = screenshot_b64[len("data:image/png;base64,"):]
+                    last_screenshot_b64 = screenshot_b64
 
-                # Stuck detection
-                if self._is_stuck(screenshot_b64) and iteration > 3:
-                    self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
-                    await self._voice_speak("I appear to be stuck. The screen is not changing.")
-                    return {
-                        "success": False,
-                        "summary": "STUCK: Screen not changing after repeated actions.",
-                        "screenshot": screenshot_b64,
-                    }
+                    # Stuck detection
+                    if self._is_stuck(screenshot_b64) and iteration > 3:
+                        self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
+                        await self._voice_speak("I appear to be stuck. The screen is not changing.")
+                        return {
+                            "success": False,
+                            "summary": "STUCK: Screen not changing after repeated actions.",
+                            "screenshot": screenshot_b64,
+                        }
 
-                user_content = [
-                    {"type": "text", "text": f"[Tool result: {tool_name}]\n{result_text}"},
-                    {"type": "image", "data": screenshot_b64, "media_type": "image/png"},
-                ]
-                self.memory.add_user(user_content, has_screenshot=True)
-                self._session_store.append_message({"role": "user", "content": user_content})
+                    user_content = [
+                        {"type": "text", "text": f"[Tool result: {tool_name}]\nScreenshot captured."},
+                        {"type": "image", "data": screenshot_b64, "media_type": "image/png"},
+                    ]
+                    self.memory.add_user(user_content, has_screenshot=True)
+                    self._session_store.append_message({"role": "user", "content": user_content})
+                else:
+                    user_content = f"[Tool result: {tool_name}]\n{result_text}"
+                    self.memory.add_user(user_content)
+                    self._session_store.append_message({"role": "user", "content": user_content})
                 continue
 
             # ── Text response ────────────────────────────────────────────
@@ -496,27 +566,22 @@ class KimAgent:
                 self.memory.add_assistant(content)
                 self._session_store.append_message({"role": "assistant", "content": content})
 
-                if content.startswith("TASK_COMPLETE:"):
-                    summary = content[len("TASK_COMPLETE:"):].strip()
+                _tc = re.search(r"\bTASK_COMPLETE:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
+                if _tc:
+                    summary = _tc.group(1).strip()
                     self._log("DEBUG", f"TASK_COMPLETE: {summary}")
                     await self._generate_and_save_summary(task, summary)
                     return {"success": True, "summary": summary, "screenshot": last_screenshot_b64}
 
-                if content.startswith("NEED_HELP:"):
-                    reason = content[len("NEED_HELP:"):].strip()
+                _nh = re.search(r"\bNEED_HELP:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
+                if _nh:
+                    reason = _nh.group(1).strip()
                     self._log("DEBUG", f"NEED_HELP: {reason}")
                     return {"success": False, "summary": f"NEED_HELP: {reason}", "screenshot": last_screenshot_b64}
 
                 self._log("DEBUG", f"Text (continuing): {content[:120]}")
-                screenshot_b64 = await self._take_screenshot()
-                last_screenshot_b64 = screenshot_b64
-                self.memory.add_user(
-                    [
-                        {"type": "text", "text": "Current screen. What is your next action?"},
-                        {"type": "image", "data": screenshot_b64, "media_type": "image/png"},
-                    ],
-                    has_screenshot=True,
-                )
+                # Don't force a screenshot — let the LLM call take_screenshot if it needs one.
+                self.memory.add_user("Continue. What is your next action? Use take_screenshot if you need to see the screen.")
                 continue
 
         self._log("WARN", f"Max iterations ({self.max_iterations}) reached")
@@ -558,7 +623,22 @@ class KimAgent:
                 except (OSError, IOError):
                     _before_lines = 0
 
+        # ── Pre-screenshot: show flash overlay then hide main window ──
+        _is_screenshot = (name == "take_screenshot")
+        if _is_screenshot:
+            # SCREENSHOT_FLASH tells ChatView to trigger the aura animation AND
+            # hide only the main window (not the flash overlay window).
+            print("[UI] SCREENSHOT_FLASH", flush=True)
+            if self._ui_bridge:
+                try:
+                    await self._ui_bridge.hide_for_screenshot()
+                except Exception:
+                    pass
+            # 0.8 s: enough for macOS to finish the window hide + flash to appear
+            await asyncio.sleep(0.8)
+
         t0 = _time.monotonic()
+        output = ""
 
         try:
             result = await self.session.call_tool(name=name, arguments=args)
@@ -566,7 +646,15 @@ class KimAgent:
             output = "\n".join(parts) if parts else "(no output)"
         except Exception as e:
             logger.error(f"MCP tool '{name}' failed: {e}", exc_info=True)
-            return f"ERROR calling {name}: {e}"
+            output = f"ERROR calling {name}: {e}"
+        finally:
+            if _is_screenshot:
+                print("[UI] SHOW", flush=True)
+                if self._ui_bridge:
+                    try:
+                        await self._ui_bridge.show_after_screenshot()
+                    except Exception:
+                        pass
 
         duration_ms = int((_time.monotonic() - t0) * 1000)
 
@@ -586,31 +674,11 @@ class KimAgent:
         return output
 
     async def _take_screenshot(self) -> str:
-        """Take a screenshot, blinking the Kim UI off and back on so it
-        doesn't appear in the capture."""
-        # Hide
-        if self._ui_bridge:
-            try:
-                await self._ui_bridge.hide_for_screenshot()
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)  # let the window manager process
-
-        try:
-            raw = await self._execute_tool("take_screenshot", {"scale": self.screenshot_scale})
-            if raw.startswith("data:image/png;base64,"):
-                return raw[len("data:image/png;base64,"):]
-            return raw
-        except Exception as e:
-            logger.warning(f"MCP screenshot failed ({e}), falling back to direct capture")
-            return _direct_screenshot(self.screenshot_scale)
-        finally:
-            # Always restore
-            if self._ui_bridge:
-                try:
-                    await self._ui_bridge.show_after_screenshot()
-                except Exception:
-                    pass
+        """Take a screenshot via MCP (hide/show is handled inside _execute_tool)."""
+        raw = await self._execute_tool("take_screenshot", {"scale": self.screenshot_scale})
+        if raw.startswith("data:image/png;base64,"):
+            return raw[len("data:image/png;base64,"):]
+        return raw
 
     # ------------------------------------------------------------------
     # Stuck detection
@@ -726,6 +794,10 @@ You MUST respond in EXACTLY one of these formats on every turn:
 1. **Tool call** (JSON, no markdown, no extra text):
    {{"tool": "<tool_name>", "args": {{<arguments>}}}}
 
+   You can also batch multiple read-only/independent tools at once to save time:
+   {{"tool": "batch", "args": {{"calls": [{{"tool": "list_dir", "args": {{"path": "."}}}}, {{"tool": "read_file", ...}}]}}}}
+   (NOTE: Do NOT put mutating tools like write_file, run_command, or take_screenshot inside a batch. Use them standalone.)
+
 2. **Task complete**:
    TASK_COMPLETE: <one-sentence summary of what was accomplished>
 
@@ -733,12 +805,19 @@ You MUST respond in EXACTLY one of these formats on every turn:
    NEED_HELP: <brief reason you cannot proceed autonomously>
 
 ## Operational Guidelines
-- Always examine the screenshot before deciding what to do next.
-- After every click or keyboard action, verify the result in the next screenshot.
+- Use take_screenshot when you need to see what's on screen (e.g. to verify a click worked,
+  find a UI element, or understand the current state). Don't call it unnecessarily.
+- After every click or keyboard action, consider whether you need to verify the result.
+- Before TASK_COMPLETE on any visual task, take a final screenshot to verify.
 - Prefer run_command for launching apps (e.g. {_LAUNCH_EXAMPLE}).
+- For shell commands, prefer single quotes over double quotes inside the cmd string. Example: `grep -E 'mcp|playwright'` instead of `grep -E "mcp|playwright"`.
+- Prefer the batch tool over chaining shell commands when the goal is information retrieval.
 - Use {_PATH_STYLE}.
 - Use focus_window before typing into an application.
 - Maximum {self.max_iterations} iterations are allowed.
+- If the task is a simple question (math, facts, logic, knowledge) that does NOT require
+  interacting with the computer, answer directly with TASK_COMPLETE: <answer>.
+  Do NOT call tools for questions you can answer from your own knowledge.
 """
         if self.config.get("voice", {}).get("human_quirks", False):
             prompt += (
@@ -766,28 +845,19 @@ You MUST respond in EXACTLY one of these formats on every turn:
         return prompt
 
     async def _generate_and_save_summary(self, task: str, result_summary: str) -> None:
-        """Ask the LLM for a 1-paragraph session summary and save to disk."""
+        """Save a session summary to disk.
+
+        Previously this sent a second LLM prompt to generate a fancy summary,
+        but that caused the browser provider to queue another prompt while the
+        previous response was still streaming — blocking the user from seeing
+        'task complete' until the summary round-trip finished (which often
+        never completed).  Now we just save a plain summary immediately.
+        """
+        summary_text = f"Task: {task}. Result: {result_summary}"
         try:
-            summary_prompt = (
-                f"Write a single paragraph (3-4 sentences) summarizing this session. "
-                f"Task: {task}\nOutcome: {result_summary}\n\n"
-                f"Focus on what was done, what tools were used, and the final result. "
-                f"Write in past tense, third person. No markdown. Plain text only."
-            )
-            response = await self.provider.complete(
-                messages=[{"role": "user", "content": summary_prompt}],
-                tools=[],
-                system="You are a session summarizer. Output ONLY the summary paragraph, nothing else.",
-            )
-            summary_text = str(response.get("content", result_summary)).strip()
-            # Fallback: if the LLM returned a tool call instead of text
-            if not summary_text or response.get("type") != "text":
-                summary_text = f"Task: {task}. Result: {result_summary}"
             self._session_store.save_summary(summary_text)
         except Exception as e:
-            logger.warning(f"Failed to generate session summary: {e}")
-            # Save a basic summary as fallback
-            self._session_store.save_summary(f"Task: {task}. Result: {result_summary}")
+            logger.warning(f"Failed to save session summary: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +875,7 @@ def _direct_screenshot(scale: float = 0.75) -> str:
         img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
+    img.close()
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -819,6 +890,7 @@ async def mcp_agent_context(
     ui_bridge: Optional[UIBridge] = None,
     voice_engine: Optional["VoiceEngine"] = None,
     resume_session_id: Optional[str] = None,
+    session_dir: Optional[str] = None,
 ):
     """
     Yields a KimAgent ready to run tasks.
@@ -842,7 +914,7 @@ async def mcp_agent_context(
                 logger.debug("tray.voice not available — voice disabled")
 
     async with mcp_session_context(config) as session:
-        store = SessionStore(session_id=resume_session_id) if resume_session_id else SessionStore()
+        store = SessionStore(base_dir=session_dir, session_id=resume_session_id) if (session_dir or resume_session_id) else SessionStore()
         agent = KimAgent(
             config=config, session=session, provider=provider,
             ui_bridge=ui_bridge, voice_engine=_voice,
@@ -879,6 +951,7 @@ async def _cli_main(args: argparse.Namespace) -> None:
     async with mcp_agent_context(
         config,
         resume_session_id=args.resume,
+        session_dir=args.session_dir,
     ) as agent:
         result = await agent.run(task)
 
@@ -908,6 +981,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-iter", type=int)
     p.add_argument("--resume", "-r", metavar="SESSION_ID",
                    help="Resume a previous session by ID (loads saved messages)")
+    p.add_argument("--session-dir", help="Directory to save session files")
     p.add_argument("--verbose", "-v", action="store_true")
     return p
 

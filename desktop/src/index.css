@@ -1009,8 +1009,6 @@ kbd {
 
 /* Activity feed — replaces raw log output */
 .kim-activity-feed {
-  max-width: 720px;
-  margin: 16px auto 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1026,7 +1024,6 @@ kbd {
   animation: kim-fade-in 0.18s ease;
 }
 .kim-activity-item--tool {
-  background: var(--bg-elevated);
   color: var(--text);
 }
 .kim-activity-item--status {
@@ -1225,6 +1222,184 @@ kbd {
 }
 .kim-composer__hint-sep { opacity: 0.6; }
 
+/* ── Provider pill in composer hint ──────────────────────────────────────── */
+.kim-composer__provider-pill {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 4px 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent-muted);
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.kim-composer__provider-pill:hover {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border-color: var(--accent-hover);
+}
+
+.kim-composer__signin-btn {
+  appearance: none;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.kim-composer__signin-btn:hover {
+  color: var(--text);
+  border-color: var(--border-hover);
+}
+.kim-composer__provider-select {
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-weight: 600;
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  outline: none;
+  padding: 0 2px 0 0;
+  line-height: 1.3;
+}
+.kim-composer__provider-select option {
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 12px;
+}
+.kim-composer__provider-chevron {
+  color: var(--accent);
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
+/* ── Sidebar delete action button ────────────────────────────────────────── */
+.kim-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 7px;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  transition: background 0.12s, opacity 0.12s;
+}
+.kim-action-btn--danger {
+  background: var(--danger);
+  color: #fff;
+}
+.kim-action-btn--danger:hover {
+  background: color-mix(in srgb, var(--danger) 85%, black);
+}
+.kim-action-btn--danger:active {
+  opacity: 0.85;
+}
+
+/* ── Session item edit mode ──────────────────────────────────────────────── */
+.kim-session-item--edit {
+  border-radius: 8px;
+  padding: 7px 8px;
+  transition: background 0.12s;
+}
+.kim-session-item--edit:hover {
+  background: var(--bg-card);
+}
+.kim-session-item--selected {
+  background: var(--danger-muted, rgba(239, 68, 68, 0.08));
+  border-left: 2px solid var(--danger);
+}
+
+/* ── Delete confirmation dialog ──────────────────────────────────────────── */
+.kim-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9000;
+  animation: kim-fade-in 0.15s ease;
+}
+@keyframes kim-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.kim-confirm-dialog {
+  width: 380px;
+  max-width: calc(100vw - 48px);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 28px 24px 20px;
+  box-shadow: var(--shadow-xl);
+  text-align: center;
+  animation: kim-scale-in 0.2s ease;
+}
+.kim-confirm-dialog__icon {
+  margin-bottom: 12px;
+}
+.kim-confirm-dialog__title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-strong);
+  margin-bottom: 8px;
+  letter-spacing: -0.02em;
+}
+.kim-confirm-dialog__text {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin-bottom: 20px;
+}
+.kim-confirm-dialog__actions {
+  display: flex;
+  gap: 8px;
+}
+.kim-confirm-dialog__btn {
+  flex: 1;
+  padding: 9px 16px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  transition: background 0.12s, opacity 0.12s;
+}
+.kim-confirm-dialog__btn--cancel {
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.kim-confirm-dialog__btn--cancel:hover {
+  background: var(--bg-card-hover);
+}
+.kim-confirm-dialog__btn--danger {
+  background: var(--danger);
+  color: #fff;
+}
+.kim-confirm-dialog__btn--danger:hover {
+  background: color-mix(in srgb, var(--danger) 85%, black);
+}
+.kim-confirm-dialog__btn--danger:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 /* Send / Stop buttons */
 .kim-btn {
   width: 34px;
@@ -1418,6 +1593,16 @@ kbd {
   border-radius: 18px 18px 4px 4px;
   margin-bottom: 2px;
 }
+.kim-bubble--live {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  padding: 10px 14px;
+  border-radius: 4px 18px 18px 18px;
+  margin-left: 0;
+}
+.kim-msg-row--live {
+  padding-top: 0;
+}
 
 .kim-system-note {
   font-size: 11.5px;
@@ -1504,6 +1689,9 @@ kbd {
   border-color: var(--border-strong);
   box-shadow: var(--shadow-xs);
 }
+.kim-tool-card--error {
+  border-color: var(--danger-muted);
+}
 .kim-tool-card__header {
   display: flex;
   align-items: center;
@@ -1532,6 +1720,7 @@ kbd {
   flex-shrink: 0;
 }
 .kim-tool-card__icon--result { background: var(--success-muted); color: var(--success); }
+.kim-tool-card__icon--error { background: var(--danger-muted); color: var(--danger); }
 .kim-tool-card__name {
   font-family: "JetBrains Mono", "SF Mono", monospace;
   font-size: 12.5px;
@@ -1543,6 +1732,7 @@ kbd {
   white-space: nowrap;
 }
 .kim-tool-card__name--neutral { color: var(--text-muted); }
+.kim-tool-card__name--error { color: var(--danger); }
 .kim-tool-card__chevron {
   font-size: 10px;
   color: var(--text-subtle);

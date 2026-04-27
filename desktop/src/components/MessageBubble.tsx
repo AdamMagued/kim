@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { KimMessage, ContentBlock, ToolUseBlock, ToolResultBlock, TypingAnimation } from '../types';
-import { ToolUseCard, ToolResultCard } from './ToolCallCard';
+import { ToolUseCard, ToolResultCard, SignalCard } from './ToolCallCard';
+import { friendlyError } from './ChatView';
 
 function isToolUse(b: ContentBlock): b is ToolUseBlock { return b.type === 'tool_use'; }
 function isToolResult(b: ContentBlock): b is ToolResultBlock { return b.type === 'tool_result'; }
@@ -42,7 +43,7 @@ function renderText(text: string) {
  *
  * When animation === 'none' OR the text is already shown (reopen), render inline.
  */
-function AnimatedText({
+export function AnimatedText({
   text,
   animation,
   active,
@@ -146,11 +147,48 @@ interface Props {
   /** Whether this specific message should animate in (only newest). */
   animate?: boolean;
   typingAnimation?: TypingAnimation;
+  onRetry?: () => void;
 }
 
-export function MessageBubble({ message, animate = false, typingAnimation = 'none' }: Props) {
+export function MessageBubble({ message, animate = false, typingAnimation = 'none', onRetry }: Props) {
   const isUser   = message.role === 'user';
   const isSystem = message.role === 'system';
+
+  let fullText = '';
+  if (typeof message.content === 'string') {
+    fullText = message.content;
+  } else if (Array.isArray(message.content)) {
+    fullText = message.content
+      .filter(b => b.type === 'text')
+      .map(b => (b as { type: 'text'; text: string }).text)
+      .join('\n');
+  }
+
+  const stripped = fullText.replace(/^(?:\[truncated.*?\]\n)?(?:\[err\]\s*)?(?:\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.,]?\d*\s+)?/, '').trim();
+  
+  // Hide internal orchestrator prompts
+  if (stripped.startsWith('[Tool result:') || stripped === 'Current screen. What is your next action?') {
+    return null;
+  }
+
+  let taskCompleteText = '';
+  const taskCompleteMatch = stripped.match(/^TASK_COMPLETE:\s*(.+)$/is);
+  if (taskCompleteMatch) {
+    taskCompleteText = taskCompleteMatch[1].trim();
+  }
+
+  const needHelpMatch = stripped.match(/^NEED_HELP:\s*(.+)$/is);
+  if (needHelpMatch) {
+    const text = friendlyError(needHelpMatch[1].trim() || 'Kim needs your help to continue.');
+    return (
+      <div className={`kim-msg-row kim-msg-row--${isUser ? 'user' : isSystem ? 'system' : 'assistant'}`}>
+        <div style={{ maxWidth: '78%', minWidth: 0 }}>
+          <SignalCard kind="error" text={text} onAction={onRetry} actionLabel="Resend Task" />
+        </div>
+      </div>
+    );
+  }
+
 
   if (isSystem) {
     return (
@@ -163,13 +201,18 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
   }
 
   if (isUser) {
-    const text =
+    let text =
       typeof message.content === 'string'
         ? message.content
         : message.content
             .filter(b => b.type === 'text')
             .map(b => (b as { type: 'text'; text: string }).text)
             .join('\n');
+            
+    if (text.startsWith('Task: ')) {
+      text = text.substring(6).trim();
+    }
+    
     return (
       <div className="kim-msg-row kim-msg-row--user">
         <div className="kim-bubble kim-bubble--user">{text}</div>
@@ -195,10 +238,39 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
   const content = message.content;
 
   if (typeof content === 'string') {
+    let rawToolCall = null;
+    if (content.trim().startsWith('{') && content.includes('"type"')) {
+      try {
+        const parsed = JSON.parse(content);
+        if (parsed && (parsed.type === 'tool_call' || parsed.type === 'tool_use') && (parsed.tool || parsed.name)) {
+          rawToolCall = parsed;
+        }
+      } catch {
+        // Not a JSON tool call
+      }
+    }
+
+    if (rawToolCall) {
+      return (
+        <div className="kim-msg-row kim-msg-row--assistant">
+          <div style={{ maxWidth: '78%', minWidth: 0 }}>
+            <ToolUseCard
+              block={{
+                type: 'tool_use',
+                id: rawToolCall.id || `tc-${Date.now()}`,
+                name: rawToolCall.tool || rawToolCall.name,
+                input: rawToolCall.args || rawToolCall.input || {},
+              }}
+            />
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="kim-msg-row kim-msg-row--assistant">
         <div className="kim-bubble kim-bubble--assistant">
-          <AnimatedText text={content} animation={typingAnimation} active={animate} />
+          <AnimatedText text={taskCompleteText || content} animation={typingAnimation} active={animate} />
           {message.tool_calls && message.tool_calls.length > 0 && (
             <div style={{ marginTop: 10 }}>
               {message.tool_calls.map(tc => (
@@ -238,7 +310,7 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
             {textBlocks.map((b, i) => (
               <div key={i}>
                 <AnimatedText
-                  text={b.text}
+                  text={b.text.replace(/^TASK_COMPLETE:\s*/i, '')}
                   animation={typingAnimation}
                   active={animate && i === textBlocks.length - 1}
                 />

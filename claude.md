@@ -636,15 +636,8 @@ The `## FILE:` and `## CMD:` block format is sacred. The user's bridge depends o
 
 ---
 
-## Clarifying questions to ask before coding
-
-If the user's request is ambiguous, ask:
-1. Which phase are we building?
-2. What has already been built and tested?
-3. Are there any files I should read first?
-4. Any constraints on dependencies or Python version?
-
-Do not assume. Ask. Then build completely.
+## Clarifying questions
+If a reasonable assumption unblocks the task, state it inline and build. Only ask if truly unbuildable without the answer — one question max.
 
 ---
 
@@ -656,3 +649,17 @@ A phase is done when:
 - There are no placeholders, TODOs, or stub functions
 - Basic usage is demonstrated in a docstring or README section
 - The user can run it and confirm it works before you start the next phase
+
+## Token efficiency rules
+
+- Output code only — no explanation unless asked
+- No "here's what I changed" summaries after edits
+- No inline comments unless the logic is non-obvious
+- When editing a file, output only the changed functions/blocks with a `# ... rest unchanged` marker, unless the full file is needed for correctness
+- Skip docstrings on private/internal functions
+- One-line error messages only (no multi-sentence explanations)
+- Do not repeat requirements back before coding
+- Do not confirm understanding before starting — just start
+
+
+

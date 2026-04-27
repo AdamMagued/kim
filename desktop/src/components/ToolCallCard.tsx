@@ -46,13 +46,18 @@ export function ToolUseCard({ block, result }: ToolUseCardProps) {
   const [open, setOpen] = useState(false);
   const argsStr = JSON.stringify(block.input, null, 2);
 
+  let displayName = block.name;
+  if (block.name === 'run_command') {
+    displayName = 'Ran a command';
+  }
+
   return (
     <div className="kim-tool-card">
       <button onClick={() => setOpen(o => !o)} className="kim-tool-card__header">
         <span className="kim-tool-card__icon" aria-hidden>
           <WrenchIcon />
         </span>
-        <span className="kim-tool-card__name">{block.name}</span>
+        <span className="kim-tool-card__name">{displayName}</span>
         <Chevron open={open} />
       </button>
 
@@ -98,6 +103,50 @@ export function ToolResultCard({ block }: ToolResultCardProps) {
       {open && (
         <div className="kim-tool-card__body">
           <pre className="kim-tool-card__pre">{content}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Signal card (for NEED_HELP and TASK_COMPLETE) ─────────────────────────────
+
+interface SignalCardProps {
+  kind: 'success' | 'error';
+  text: string;
+  onAction?: () => void;
+  actionLabel?: string;
+}
+
+export function SignalCard({ kind, text, onAction, actionLabel }: SignalCardProps) {
+  const [open, setOpen] = useState(false);
+  const isError = kind === 'error';
+
+  return (
+    <div className={`kim-tool-card ${isError ? 'kim-tool-card--error' : ''}`}>
+      <button onClick={() => setOpen(o => !o)} className="kim-tool-card__header">
+        <span className={`kim-tool-card__icon ${isError ? 'kim-tool-card__icon--error' : 'kim-tool-card__icon--result'}`} aria-hidden>
+          {isError ? '⚠' : <CheckIcon />}
+        </span>
+        <span className={`kim-tool-card__name ${isError ? 'kim-tool-card__name--error' : 'kim-tool-card__name--neutral'}`}>
+          {isError ? 'Needs Help' : 'Task Complete'}
+        </span>
+        <Chevron open={open} />
+      </button>
+      {open && (
+        <div className="kim-tool-card__body">
+          <pre className="kim-tool-card__pre" style={{ whiteSpace: 'pre-wrap' }}>{text}</pre>
+          {onAction && actionLabel && (
+            <div style={{ marginTop: '8px' }}>
+              <button 
+                type="button" 
+                className="kim-task-error__retry" 
+                onClick={onAction}
+              >
+                {actionLabel}
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

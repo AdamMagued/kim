@@ -71,6 +71,7 @@ export default function App() {
   // so the component fully remounts (clearing all transient state) each time.
   const [chatSerial, setChatSerial] = useState(0);
   const [activeTab, setActiveTab] = useState<'chat' | 'code'>('chat');
+  const [activeProjectPath, setActiveProjectPath] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
@@ -148,6 +149,23 @@ export default function App() {
     setChatSerial(s => s + 1);   // force ChatView remount → clean slate
   }
 
+  function handleTabChange(tab: 'chat' | 'code') {
+    setActiveTab(tab);
+    setActiveSession(null);
+    setNewChatMode(false);
+    // When switching tabs, don't automatically clear the selected project,
+    // but maybe we just leave it so if they go back to Code it's there.
+  }
+
+  function handleSelectProject(path: string) {
+    setActiveTab('code');
+    setActiveProjectPath(path);
+    // Selecting a project opens a new chat contextualized to that project
+    setActiveSession(null);
+    setNewChatMode(true);
+    setChatSerial(s => s + 1);
+  }
+
   const handleTaskDone = useCallback(() => {
     refresh();
     setTimeout(() => { refresh(); }, 500);
@@ -193,7 +211,7 @@ export default function App() {
 
   return (
     <div className="kim-app">
-      <header className="kim-header">
+      <header className="kim-header" data-tauri-drag-region>
         <div className="kim-header__traffic-lights-spacer" />
 
         <div className="kim-header__brand">
@@ -220,7 +238,10 @@ export default function App() {
         {newChatMode && (
           <div className="kim-header__breadcrumb">
             <span className="kim-header__slash">/</span>
-            <span className="kim-header__new-chat-label">
+            <span className={`kim-header__session-badge kim-header__session-badge--${activeTab === 'chat' ? 'kim' : 'claw'}`}>
+              {activeTab === 'chat' ? 'Kim' : 'Code'}
+            </span>
+            <span className="kim-header__new-chat-label" style={{ marginLeft: '8px' }}>
               <span className="kim-pulse-dot" /> New chat
             </span>
           </div>
@@ -243,7 +264,12 @@ export default function App() {
           account={account}
           onAccountChange={setAccount}
           activeTab={activeTab}
-          onTabChange={setActiveTab}
+          onTabChange={handleTabChange}
+          activeProjectPath={activeProjectPath}
+          onSelectProject={handleSelectProject}
+          onRefreshSessions={refresh}
+          kimSessionsDir={settings.kim_sessions_dir || null}
+          clawSessionsDir={settings.claw_sessions_dir || null}
         />
 
         <ChatView
@@ -253,6 +279,8 @@ export default function App() {
           settings={settings}
           onTaskDone={handleTaskDone}
           account={account}
+          activeTab={activeTab}
+          activeProjectPath={activeProjectPath}
         />
       </div>
 

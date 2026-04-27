@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "browser-bridge-ipc",
+  "description": "Grant the in-app browser webview IPC access so the persistent JS bridge can call back into Rust via native postMessage instead of polling document.title.",
+  "windows": ["kim-browser-signin"],
+  "remote": {
+    "urls": [
+      "https://claude.ai/*",
+      "https://chatgpt.com/*",
+      "https://gemini.google.com/*",
+      "https://grok.com/*",
+      "https://chat.deepseek.com/*"
+    ]
+  },
+  "permissions": [
+    "core:default",
+    "core:event:allow-emit"
+  ]
+}

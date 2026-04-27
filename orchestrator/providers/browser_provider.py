@@ -61,6 +61,7 @@ import logging
 import os
 import platform
 import re
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -262,10 +263,14 @@ class BrowserProvider(BaseProvider):
         cdp_url = bp_cfg.get("cdp_url", CDP_URL)
         self._cdp_url = cdp_url
         self._max_history_messages = int(bp_cfg.get("max_history_messages", 6))
-        self._max_inject_chars = int(bp_cfg.get("max_inject_chars", 12000))
+        self._max_inject_chars = int(bp_cfg.get("max_inject_chars", 60000))
         self._headless = bool(bp_cfg.get("browser_headless", False))
-        # When set (e.g. from desktop `browser:chatgpt`), pick that site's tab first.
         self._preferred_site = (bp_cfg.get("preferred_site") or "").strip().lower() or None
+        
+        env_site = os.environ.get("KIM_PREFERRED_SITE", "").strip().lower()
+        if env_site:
+            self._preferred_site = env_site
+            
         self._bridge_url = os.environ.get("KIM_WEBVIEW_BRIDGE_URL", "").strip().rstrip("/")
         self._bridge_token = os.environ.get("KIM_WEBVIEW_BRIDGE_TOKEN", "").strip()
         self._use_webview_bridge = bool(self._bridge_url and self._bridge_token)
@@ -362,14 +367,14 @@ class BrowserProvider(BaseProvider):
         4. Paste the cleaned text prompt via clipboard.
         5. Click Send and wait for the AI response.
         """
-        prompt, attachments = self._format_prompt(messages, tools, system)
+        prompt, attachments, completion_hash = self._format_prompt(messages, tools, system)
         logger.debug(
             f"Prompt ready: {len(prompt)} chars, "
-            f"{len(attachments)} attachment(s) extracted"
+            f"{len(attachments)} attachment(s) extracted, hash={completion_hash}"
         )
 
         if self._use_webview_bridge:
-            return await self._complete_via_webview_bridge(prompt, attachments)
+            return await self._complete_via_webview_bridge(prompt, attachments, completion_hash)
 
         try:
             async with async_playwright() as pw:
@@ -399,7 +404,7 @@ class BrowserProvider(BaseProvider):
                     )
 
                     # ── Step 2: Let the UI render the image ──────────────
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(5000)
 
                     # ── Step 3: Dismiss popups (Gemini "I agree", etc.) ──
                     await self._dismiss_popups(page)
@@ -407,7 +412,7 @@ class BrowserProvider(BaseProvider):
                 # ── Step 4: Paste cleaned text prompt ────────────────────
                 # ── Step 5: Click Send + wait for response ───────────────
                 raw_response = await self._send_and_wait(page, cfg, prompt)
-                return self._parse_response(raw_response)
+                return self._parse_response(raw_response, completion_hash)
         except Exception as e:
             logger.error(f"BrowserProvider.complete failed: {e}", exc_info=True)
             return {"type": "text", "content": f"NEED_HELP: Browser connection failed — {e}"}
@@ -416,11 +421,16 @@ class BrowserProvider(BaseProvider):
         self,
         prompt: str,
         attachments: list[dict],
+        completion_hash: str,
     ) -> dict:
         """Run completion through Kim desktop's in-app webview bridge.
 
-        This mode is used when the agent is launched from the desktop app,
-        where Rust starts a localhost bridge and passes auth env vars.
+        Uses the split send/result API for instant send confirmation:
+          1. POST /v1/send → get req_id (~150ms)
+          2. GET /v1/result/{req_id} → long-poll for response
+
+        Falls back to monolithic POST /v1/complete if /v1/send returns 404
+        (backward compat with older Rust binaries).
         """
         if not self._bridge_url or not self._bridge_token:
             return {
@@ -467,8 +477,139 @@ class BrowserProvider(BaseProvider):
             "site": site,
             "prompt": prompt,
             "attachments": bridge_attachments,
+            "completion_hash": completion_hash,
         }
 
+        # ── Try split send/result API first ──────────────────────────────
+        try:
+            async with httpx.AsyncClient(timeout=30) as send_client:
+                send_resp = await send_client.post(
+                    f"{self._bridge_url}/v1/send",
+                    headers=headers,
+                    json=payload,
+                )
+
+            if send_resp.status_code == 404:
+                # Old Rust binary — fall back to monolithic /v1/complete
+                logger.info("Bridge /v1/send returned 404, falling back to /v1/complete")
+                return await self._complete_via_webview_bridge_legacy(
+                    prompt, headers, payload, completion_hash
+                )
+
+            try:
+                send_data = send_resp.json()
+            except ValueError:
+                body_preview = send_resp.text[:300]
+                return {
+                    "type": "text",
+                    "content": (
+                        "NEED_HELP: Bridge /v1/send returned invalid JSON "
+                        f"(status {send_resp.status_code}): {body_preview}"
+                    ),
+                }
+
+            if send_resp.status_code == 409:
+                msg = send_data.get("error") or (
+                    "Kim opened the in-app browser window. Sign in and resend your task."
+                )
+                return {"type": "text", "content": f"NEED_HELP: {msg}"}
+
+            if send_resp.status_code >= 400:
+                msg = send_data.get("error") or f"HTTP {send_resp.status_code}"
+                return {
+                    "type": "text",
+                    "content": f"NEED_HELP: In-app browser bridge send error — {msg}",
+                }
+
+            req_id = send_data.get("req_id")
+            if not req_id:
+                return {
+                    "type": "text",
+                    "content": "NEED_HELP: Bridge /v1/send did not return a req_id.",
+                }
+
+            sent_confirmed = send_data.get("sent_confirmed", False)
+            logger.info(
+                f"Bridge send OK: req_id={req_id}, site={send_data.get('site')}, "
+                f"confirmed={sent_confirmed}"
+            )
+
+        except httpx.ReadTimeout:
+            logger.warning("Bridge /v1/send timed out, falling back to /v1/complete")
+            return await self._complete_via_webview_bridge_legacy(
+                prompt, headers, payload, completion_hash
+            )
+        except Exception as e:
+            logger.warning(f"Bridge /v1/send failed ({e}), falling back to /v1/complete")
+            return await self._complete_via_webview_bridge_legacy(
+                prompt, headers, payload, completion_hash
+            )
+
+        # ── Long-poll for result ─────────────────────────────────────────
+        try:
+            async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_S) as result_client:
+                result_resp = await result_client.get(
+                    f"{self._bridge_url}/v1/result/{req_id}",
+                    headers=headers,
+                )
+        except httpx.ReadTimeout as e:
+            logger.error("Bridge /v1/result timed out", exc_info=True)
+            detail = str(e).strip() or "Timed out waiting for provider response"
+            return {
+                "type": "text",
+                "content": f"NEED_HELP: In-app browser bridge timeout — {detail}",
+            }
+        except Exception as e:
+            logger.error(f"Bridge /v1/result failed: {e}", exc_info=True)
+            detail = str(e).strip() or e.__class__.__name__
+            return {
+                "type": "text",
+                "content": f"NEED_HELP: In-app browser bridge result poll failed — {detail}",
+            }
+
+        try:
+            data = result_resp.json()
+        except ValueError:
+            body_preview = result_resp.text[:300]
+            return {
+                "type": "text",
+                "content": (
+                    "NEED_HELP: In-app browser bridge returned invalid JSON "
+                    f"(status {result_resp.status_code}): {body_preview}"
+                ),
+            }
+
+        if result_resp.status_code >= 400:
+            msg = data.get("error") or f"HTTP {result_resp.status_code}"
+            return {
+                "type": "text",
+                "content": f"NEED_HELP: In-app browser bridge error — {msg}",
+            }
+
+        if not data.get("ok", False):
+            msg = data.get("error") or "Unknown in-app bridge failure"
+            return {
+                "type": "text",
+                "content": f"NEED_HELP: In-app browser execution failed — {msg}",
+            }
+
+        raw_response = data.get("response")
+        if not raw_response or not isinstance(raw_response, str) or not raw_response.strip():
+            return {
+                "type": "text",
+                "content": "NEED_HELP: In-app browser bridge returned an empty response.",
+            }
+
+        return self._parse_response(raw_response.strip(), completion_hash)
+
+    async def _complete_via_webview_bridge_legacy(
+        self,
+        prompt: str,
+        headers: dict,
+        payload: dict,
+        completion_hash: str,
+    ) -> dict:
+        """Monolithic /v1/complete fallback for older Rust binaries."""
         try:
             async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_S) as client:
                 resp = await client.post(
@@ -523,14 +664,14 @@ class BrowserProvider(BaseProvider):
                 "content": f"NEED_HELP: In-app browser execution failed — {msg}",
             }
 
-        raw_response = str(data.get("response", "")).strip()
-        if not raw_response:
+        raw_response = data.get("response")
+        if not raw_response or not isinstance(raw_response, str) or not raw_response.strip():
             return {
                 "type": "text",
                 "content": "NEED_HELP: In-app browser bridge returned an empty response.",
             }
 
-        return self._parse_response(raw_response)
+        return self._parse_response(raw_response.strip(), completion_hash)
 
     # ==================================================================
     # CDP connection / headless auto-launch
@@ -1215,7 +1356,7 @@ class BrowserProvider(BaseProvider):
 
     def _format_prompt(
         self, messages: list[dict], tools: list[dict], system: str
-    ) -> tuple[str, list[dict]]:
+    ) -> tuple[str, list[dict], str]:
         """
         Stateful prompt formatter for browser-based chat UIs.
 
@@ -1281,6 +1422,8 @@ class BrowserProvider(BaseProvider):
 
         last_text = last_text.strip()
 
+        completion_hash = f"KIM_{uuid.uuid4().hex[:8]}"
+
         # ── First message: include system prompt + tools ─────────────────
         if not self._sent_system_prompt:
             compact_tools = [
@@ -1316,13 +1459,15 @@ class BrowserProvider(BaseProvider):
                 '{"tool": "<name>", "args": {<args>}}\n'
                 "2. TASK_COMPLETE: <one-line summary>\n"
                 "3. NEED_HELP: <reason you cannot proceed>\n"
-                "Do NOT include markdown formatting around the JSON.\n\n"
+                "Do NOT include markdown formatting around the JSON.\n"
+                "CRITICAL: If your JSON arguments contain double quotes (e.g., HTML attributes or code), you MUST escape them (\\\") so the JSON is valid.\n"
+                f"IMPORTANT: Always append the exact string {completion_hash} at the very end of your entire response.\n\n"
                 f"{last_text}"
             )
             self._sent_system_prompt = True
         else:
             # ── Subsequent calls: delta only ─────────────────────────────
-            prompt = last_text
+            prompt = last_text + f"\n\nRemember: append {completion_hash} at the very end of your response."
 
         # Trim if too long
         if len(prompt) > self._max_inject_chars:
@@ -1333,13 +1478,13 @@ class BrowserProvider(BaseProvider):
                 + prompt[-200:]
             )
 
-        return prompt, attachments
+        return prompt, attachments, completion_hash
 
     # ==================================================================
     # Response parsing
     # ==================================================================
 
-    def _parse_response(self, text: str) -> dict:
+    def _parse_response(self, text: str, completion_hash: str) -> dict:
         """
         Parse the scraped DOM text into the canonical response format.
         Handles:
@@ -1347,15 +1492,16 @@ class BrowserProvider(BaseProvider):
             - fenced ``json`` code blocks           → ``{"type": "tool_call", …}``
             - bare JSON ``{"tool": …}``             → ``{"type": "tool_call", …}``
         """
-        text = text.strip()
+        # Strip the bridge sentinel before any parsing
+        text = text.replace(completion_hash, "").strip()
 
-        # Explicit completion/help signals
+        # Explicit completion/help signals — use word-boundary search so Gemini's
+        # DOM label ("Gemini TASK_COMPLETE: ...") doesn't block detection after
+        # normalizeText collapses newlines into spaces.
         for prefix in ("TASK_COMPLETE:", "NEED_HELP:"):
-            if text.startswith(prefix) or f"\n{prefix}" in text:
-                for line in text.splitlines():
-                    line = line.strip()
-                    if line.startswith(prefix):
-                        return {"type": "text", "content": line}
+            m = re.search(r"\b" + re.escape(prefix) + r"\s*(.+)$", text, re.IGNORECASE | re.MULTILINE)
+            if m:
+                return {"type": "text", "content": f"{prefix} {m.group(1).strip()}"}
 
         # JSON in fenced code block
         for pattern in [
@@ -1385,6 +1531,38 @@ class BrowserProvider(BaseProvider):
                     "args": data.get("args", data.get("arguments", {})),
                 }
         except (json.JSONDecodeError, KeyError):
+            # Fallback for models that produce unescaped double quotes inside the JSON string
+            m_tool = re.search(r'"tool"\s*:\s*"([^"]+)"', s)
+            if m_tool:
+                tool_name = m_tool.group(1)
+                if tool_name == "write_file":
+                    m_path = re.search(r'"path"\s*:\s*"([^"]+)"', s)
+                    # Extract everything after "content": " up to the closing brace
+                    m_content = re.search(r'"content"\s*:\s*"(.*)"\s*\}\s*\}?\s*$', s, re.DOTALL)
+                    if m_path and m_content:
+                        # Fix up trailing quotes if the regex captured the closing quote of content
+                        content = m_content.group(1)
+                        if content.endswith('"'):
+                            content = content[:-1]
+                        return {
+                            "type": "tool_call",
+                            "tool": tool_name,
+                            "args": {
+                                "path": m_path.group(1),
+                                "content": content
+                            }
+                        }
+                elif tool_name == "run_command":
+                    m_cmd = re.search(r'"cmd"\s*:\s*"(.*)"\s*\}\s*\}?\s*$', s, re.DOTALL)
+                    if m_cmd:
+                        cmd = m_cmd.group(1)
+                        if cmd.endswith('"'):
+                            cmd = cmd[:-1]
+                        return {
+                            "type": "tool_call",
+                            "tool": "run_command",
+                            "args": {"cmd": cmd}
+                        }
             pass
         return None
 

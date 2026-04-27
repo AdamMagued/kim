@@ -127,11 +127,24 @@ export function BrowserProviderPicker({ selected, onSelect }: Props) {
 
     setOpeningId(provider.id);
     try {
+      if (provider.id === 'custom') {
+        try {
+          await invoke('add_custom_provider_capability', { url: targetUrl });
+        } catch (err) {
+          const msg = typeof err === 'string' ? err : `Could not register custom AI provider.`;
+          toast(msg, 'error', 5000);
+          setOpeningId(null);
+          return;
+        }
+      }
+
       await invoke<string>('open_browser_signin_window', {
         url: targetUrl,
         providerName: provider.name,
       });
-      toast(`${provider.name} opened inside Kim. Browser mode runs through this in-app window.`, 'info', 7000);
+      // Explicitly show the window (in case it was previously hidden/headless)
+      await invoke('show_browser_window').catch(() => {});
+      toast(`${provider.name} opened! Close the window when you're done signing in — Kim will keep running in the background.`, 'info', 7000);
     } catch (err) {
       const msg = typeof err === 'string' ? err : `Could not open ${provider.name}.`;
       toast(msg, 'error', 5000);

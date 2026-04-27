@@ -16,6 +16,11 @@ interface Props {
   onAccountChange: (a: KimAccount) => Promise<void>;
   activeTab: 'chat' | 'code';
   onTabChange: (tab: 'chat' | 'code') => void;
+  activeProjectPath: string | null;
+  onSelectProject: (path: string) => void;
+  onRefreshSessions: () => void;
+  kimSessionsDir: string | null;
+  clawSessionsDir: string | null;
 }
 
 // ── Icons ──────────────────────────────────────────────────────────────────────
@@ -81,13 +86,35 @@ function XIcon() {
 
 // ── Session item ───────────────────────────────────────────────────────────────
 
-function SessionItem({ session, active, onClick }: {
+function SessionItem({ session, active, onClick, editMode, selected, onToggleSelect }: {
   session: SessionInfo; active: boolean; onClick: () => void;
+  editMode?: boolean; selected?: boolean; onToggleSelect?: () => void;
 }) {
   const chatTitle = session.title?.trim() || session.session_id;
-  const preview = session.summary
-    ? session.summary.slice(0, 60) + (session.summary.length > 60 ? '…' : '')
+  let summaryText = session.summary || '';
+  if (summaryText) {
+    const match = summaryText.match(/^Task:.*?(?:\.\s*Result:\s*|\nResult:\s*)([\s\S]*)$/i);
+    if (match) {
+      summaryText = match[1].trim();
+    }
+  }
+
+  const preview = summaryText
+    ? summaryText.slice(0, 60) + (summaryText.length > 60 ? '…' : '')
     : `${session.message_count} message${session.message_count !== 1 ? 's' : ''}`;
+  
+  if (editMode) {
+    return (
+      <div className={`kim-session-item kim-session-item--edit${selected ? ' kim-session-item--selected' : ''}`} onClick={onToggleSelect} style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, paddingRight: 8 }}>
+        <input type="checkbox" checked={selected} onChange={() => {}} style={{ cursor: 'pointer' }} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="kim-session-item__title">{chatTitle}</div>
+          <div className="kim-session-item__preview">{preview}</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <button
       onClick={onClick}
@@ -116,21 +143,23 @@ function ClawSessionItem({ session }: { session: { session_id: string; message_c
 
 // ── Project tree in Code tab ───────────────────────────────────────────────────
 
-function ClawProjectTree({ project, onRemove }: {
+function ClawProjectTree({ project, onRemove, isActive, onSelect }: {
   project: ClawProject;
   onRemove: (path: string) => void;
+  isActive: boolean;
+  onSelect: () => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(isActive);
   const totalSessions = project.branches.reduce((n, b) => n + b.sessions.length, 0);
 
   return (
-    <div className="kim-project-item">
-      <div className="kim-project-item__header">
-        <button className="kim-project-item__toggle" onClick={() => setOpen(o => !o)}>
+    <div className={`kim-project-item${isActive ? ' kim-project-item--active' : ''}`}>
+      <div className="kim-project-item__header" onClick={() => { onSelect(); setOpen(true); }} style={{ cursor: 'pointer' }}>
+        <button className="kim-project-item__toggle" onClick={(e) => { e.stopPropagation(); setOpen(o => !o); }}>
           <ChevronIcon open={open} />
-          <span className="kim-project-item__icon"><FolderIcon /></span>
-          <span className="kim-project-item__name">{project.name}</span>
         </button>
+        <span className="kim-project-item__icon"><FolderIcon /></span>
+        <span className="kim-project-item__name">{project.name}</span>
         <span className="kim-project-item__branch-pill">{project.current_branch}</span>
         <button
           className="kim-project-item__remove"
@@ -146,7 +175,7 @@ function ClawProjectTree({ project, onRemove }: {
         <div className="kim-project-item__sessions">
           {totalSessions === 0 ? (
             <div className="kim-empty-section" style={{ paddingLeft: 28 }}>
-              No Claw sessions found in .claw/sessions/
+              No Claw sessions yet.
             </div>
           ) : (
             project.branches.map(branch => (
@@ -201,12 +230,19 @@ export function Sidebar({
   onSelectSession, onNewChat,
   collapsed, onToggle, onOpenSettings, loading,
   account, onAccountChange, activeTab, onTabChange,
+  activeProjectPath, onSelectProject, onRefreshSessions,
+  kimSessionsDir, clawSessionsDir,
 }: Props) {
   const [kimExpanded, setKimExpanded] = useState(true);
   const [clawProjects, setClawProjects] = useState<ClawProject[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(false);
   const [projectsAdding, setProjectsAdding] = useState(false);
   const [projectsErr, setProjectsErr] = useState('');
+  
+  const [editMode, setEditMode] = useState(false);
+  const [selectedSessions, setSelectedSessions] = useState<Set<string>>(new Set());
+  const [deleteConfirmStep, setDeleteConfirmStep] = useState<0 | 1 | 2>(0); // 0=hidden, 1=first confirm, 2=final confirm
+  const [deleting, setDeleting] = useState(false);
 
   const projectPaths = account.code_projects ?? [];
 
@@ -245,6 +281,7 @@ export function Sidebar({
     .split(' ').map((w: string) => w[0]).join('').slice(0, 2).toUpperCase();
 
   return (
+    <>
     <aside className={`kim-sidebar${collapsed ? ' kim-sidebar--collapsed' : ''}`}>
       {/* Top controls */}
       <div className="kim-sidebar__top">
@@ -298,11 +335,44 @@ export function Sidebar({
           ) : activeTab === 'chat' ? (
             // ── Chat tab ──
             <div>
-              <button className="kim-section-header" onClick={() => setKimExpanded(v => !v)}>
-                <ChevronIcon open={kimExpanded} />
-                <span className="kim-section-header__label">Kim</span>
-                <span className="kim-section-header__count">{kimSessions.length}</span>
-              </button>
+              <div className="kim-section-header" style={{ display: 'flex', alignItems: 'center' }}>
+                <button style={{ flex: 1, display: 'flex', alignItems: 'center', background: 'none', border: 'none', color: 'inherit', padding: 0, font: 'inherit', cursor: 'pointer' }} onClick={() => setKimExpanded(v => !v)}>
+                  <ChevronIcon open={kimExpanded} />
+                  <span className="kim-section-header__label">Kim</span>
+                  <span className="kim-section-header__count">{kimSessions.length}</span>
+                </button>
+                {kimSessions.length > 0 && (
+                  <button 
+                    className={editMode ? 'kim-action-btn' : 'kim-action-btn'}
+                    style={{ 
+                      fontSize: 11, 
+                      padding: '3px 10px',
+                      background: editMode ? 'var(--accent)' : 'var(--bg-card)',
+                      color: editMode ? '#fff' : 'var(--text-muted)',
+                      border: `1px solid ${editMode ? 'var(--accent)' : 'var(--border)'}`,
+                      borderRadius: 6,
+                    }} 
+                    onClick={() => { setEditMode(!editMode); setSelectedSessions(new Set()); }}
+                  >
+                    {editMode ? 'Done' : 'Edit'}
+                  </button>
+                )}
+              </div>
+              
+              {editMode && selectedSessions.size > 0 && (
+                <div style={{ padding: '4px 8px 8px', display: 'flex', gap: 6 }}>
+                  <button 
+                    className="kim-action-btn kim-action-btn--danger"
+                    style={{ flex: 1, fontSize: 12, padding: '7px 12px' }}
+                    onClick={() => setDeleteConfirmStep(1)}
+                  >
+                    <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M2 4h12M5.333 4V2.667a1.333 1.333 0 0 1 1.334-1.334h2.666a1.333 1.333 0 0 1 1.334 1.334V4M13 4v9.333a1.333 1.333 0 0 1-1.333 1.334H4.333A1.333 1.333 0 0 1 3 13.333V4" />
+                    </svg>
+                    Delete {selectedSessions.size} chat{selectedSessions.size > 1 ? 's' : ''}
+                  </button>
+                </div>
+              )}
               {kimExpanded && (
                 <div style={{ marginTop: 1 }}>
                   {kimSessions.length === 0 ? (
@@ -314,6 +384,14 @@ export function Sidebar({
                         session={s}
                         active={s.session_id === activeSessionId}
                         onClick={() => onSelectSession(s)}
+                        editMode={editMode}
+                        selected={selectedSessions.has(s.session_id)}
+                        onToggleSelect={() => {
+                          const next = new Set(selectedSessions);
+                          if (next.has(s.session_id)) next.delete(s.session_id);
+                          else next.add(s.session_id);
+                          setSelectedSessions(next);
+                        }}
                       />
                     ))
                   )}
@@ -361,14 +439,16 @@ export function Sidebar({
                         key={path}
                         project={loaded}
                         onRemove={handleRemoveProject}
+                        isActive={activeProjectPath === path}
+                        onSelect={() => onSelectProject(path)}
                       />
                     );
                   }
                   // Project path exists but no .claw/sessions/ yet
                   const name = path.split('/').filter(Boolean).pop() ?? path;
                   return (
-                    <div key={path} className="kim-project-item">
-                      <div className="kim-project-item__header">
+                    <div key={path} className={`kim-project-item${activeProjectPath === path ? ' kim-project-item--active' : ''}`}>
+                      <div className="kim-project-item__header" onClick={() => onSelectProject(path)} style={{ cursor: 'pointer' }}>
                         <button className="kim-project-item__toggle" style={{ flex: 1, cursor: 'default' }}>
                           <span className="kim-project-item__icon"><FolderIcon /></span>
                           <span className="kim-project-item__name">{name}</span>
@@ -421,5 +501,59 @@ export function Sidebar({
         </button>
       </div>
     </aside>
+
+      {/* ── Delete confirmation modal ── */}
+      {deleteConfirmStep > 0 && (
+        <div className="kim-confirm-overlay" onClick={() => setDeleteConfirmStep(0)}>
+          <div className="kim-confirm-dialog" onClick={e => e.stopPropagation()}>
+            <div className="kim-confirm-dialog__icon">
+              <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="var(--danger)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+              </svg>
+            </div>
+            {deleteConfirmStep === 1 ? (
+              <>
+                <div className="kim-confirm-dialog__title">Delete {selectedSessions.size} chat{selectedSessions.size > 1 ? 's' : ''}?</div>
+                <div className="kim-confirm-dialog__text">This action cannot be undone. The selected chat{selectedSessions.size > 1 ? 's' : ''} will be permanently removed.</div>
+                <div className="kim-confirm-dialog__actions">
+                  <button className="kim-confirm-dialog__btn kim-confirm-dialog__btn--cancel" onClick={() => setDeleteConfirmStep(0)}>Cancel</button>
+                  <button className="kim-confirm-dialog__btn kim-confirm-dialog__btn--danger" onClick={() => setDeleteConfirmStep(2)}>Yes, delete</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="kim-confirm-dialog__title">Are you absolutely sure?</div>
+                <div className="kim-confirm-dialog__text">This will <strong>permanently delete {selectedSessions.size} chat{selectedSessions.size > 1 ? 's' : ''}</strong>. There is no way to recover them.</div>
+                <div className="kim-confirm-dialog__actions">
+                  <button className="kim-confirm-dialog__btn kim-confirm-dialog__btn--cancel" onClick={() => setDeleteConfirmStep(0)}>No, keep them</button>
+                  <button 
+                    className="kim-confirm-dialog__btn kim-confirm-dialog__btn--danger" 
+                    disabled={deleting}
+                    onClick={async () => {
+                      setDeleting(true);
+                      try {
+                        await invoke('delete_sessions', { 
+                          sessionIds: Array.from(selectedSessions),
+                          kimDir: kimSessionsDir,
+                          clawDir: clawSessionsDir,
+                        });
+                        setEditMode(false);
+                        setSelectedSessions(new Set());
+                        setDeleteConfirmStep(0);
+                        onRefreshSessions();
+                      } catch (e) {
+                        alert(`Failed to delete: ${e}`);
+                      } finally {
+                        setDeleting(false);
+                      }
+                    }}
+                  >{deleting ? 'Deleting…' : 'Delete permanently'}</button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
