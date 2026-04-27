@@ -1026,16 +1026,17 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           </div>
         </div>
           <div className="kim-composer__bloop" aria-hidden="true">
-            <Bloop
-              state={(cancelling
-                ? 'error'
-                : isRunning
-                  ? 'processing'
-                  : taskInput.trim()
-                    ? 'thinking'
-                    : 'idle') as BloopState}
-              scale={0.42}
-            />
+            <div className="kim-composer__bloop-inner">
+              <Bloop
+                state={(taskError || cancelling
+                  ? 'error'
+                  : isRunning
+                    ? 'processing'
+                    : taskInput.trim()
+                      ? 'thinking'
+                      : 'idle') as BloopState}
+              />
+            </div>
           </div>
         </div>
         <div className="kim-composer__hint">
