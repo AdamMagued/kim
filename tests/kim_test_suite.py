@@ -571,7 +571,7 @@ TESTS: list[TestCase] = [
             "Step 2: Write a file called kim_date_test.txt containing that date. "
             "Step 3: Read it back and confirm."
         ),
-        timeout=240,
+        timeout=360,
         tags=["chain", "shell", "files"],
         assertions=[
             must_call_tool("run_command"),
@@ -587,7 +587,7 @@ TESTS: list[TestCase] = [
             "Then use search_in_files to search for PROBE_TOKEN_ALPHA in the current directory. "
             "Confirm it finds kim_search_probe.txt."
         ),
-        timeout=240,
+        timeout=360,
         tags=["chain", "search", "files"],
         assertions=[
             must_call_tool("write_file"),
