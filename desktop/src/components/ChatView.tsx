@@ -5,6 +5,7 @@ import type { SessionInfo, KimMessage, Settings, KimAccount } from '../types';
 import { MessageBubble, AnimatedText } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
 import { BrowserProviderPicker } from './BrowserProviderPicker';
+import { Bloop, type BloopState } from './Bloop';
 import { useChromaShader } from '../hooks/useChromaShader';
 import { toast } from './Toast';
 
@@ -978,6 +979,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   function renderComposer() {
     return (
       <form className="kim-composer" onSubmit={handleSubmit}>
+        <div className="kim-composer__row">
         <div className={'kim-composer__box' + (isRunning ? ' kim-composer__box--running' : '')}>
           <textarea
             ref={textareaRef}
@@ -1021,6 +1023,19 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                 <path d="M5 12h14M13 5l7 7-7 7" />
               </svg>
             </button>
+          </div>
+        </div>
+          <div className="kim-composer__bloop" aria-hidden="true">
+            <Bloop
+              state={(cancelling
+                ? 'error'
+                : isRunning
+                  ? 'processing'
+                  : taskInput.trim()
+                    ? 'thinking'
+                    : 'idle') as BloopState}
+              scale={0.42}
+            />
           </div>
         </div>
         <div className="kim-composer__hint">
