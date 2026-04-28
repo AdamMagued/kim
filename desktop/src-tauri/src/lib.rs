@@ -4166,11 +4166,17 @@ async fn send_task(
     // Chat tab this is typically the Kim repo itself.  For the Code tab it is
     // the user's external code project.  MCP tools use PROJECT_ROOT to know
     // which directory to operate in (file reads/writes, git, search, etc.).
-    let is_claw = project_root.is_some();
     let target_root = project_root
         .map(PathBuf::from)
         .filter(|p| p.exists())
         .unwrap_or_else(|| kim_root.clone());
+
+    // Claw mode is ONLY when the target project is a real external project,
+    // i.e. distinct from the Kim repo itself. The Chat tab passes the Kim
+    // repo as project_root (so MCP tools know the workspace), but those
+    // sessions must still land in kim_sessions/, not .claw/sessions/.
+    let is_claw = target_root.canonicalize().ok()
+        != kim_root.canonicalize().ok();
 
     let python = find_python_interpreter(&kim_root)?;
 
