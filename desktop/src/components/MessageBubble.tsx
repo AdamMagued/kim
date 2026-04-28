@@ -148,9 +148,10 @@ interface Props {
   animate?: boolean;
   typingAnimation?: TypingAnimation;
   onRetry?: () => void;
+  retries?: number;
 }
 
-export function MessageBubble({ message, animate = false, typingAnimation = 'none', onRetry }: Props) {
+export function MessageBubble({ message, animate = false, typingAnimation = 'none', onRetry, retries = 0 }: Props) {
   const isUser   = message.role === 'user';
   const isSystem = message.role === 'system';
 
@@ -239,11 +240,19 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
 
   if (typeof content === 'string') {
     let rawToolCall = null;
-    if (content.trim().startsWith('{') && content.includes('"type"')) {
+    let cleanContent = content.trim().replace(/^(?:Gemini said|Claude said|Assistant said):\s*/i, '');
+    
+    if (cleanContent.startsWith('{')) {
       try {
-        const parsed = JSON.parse(content);
-        if (parsed && (parsed.type === 'tool_call' || parsed.type === 'tool_use') && (parsed.tool || parsed.name)) {
-          rawToolCall = parsed;
+        const parsed = JSON.parse(cleanContent);
+        if (parsed) {
+          if ((parsed.type === 'tool_call' || parsed.type === 'tool_use') && (parsed.tool || parsed.name)) {
+            rawToolCall = parsed;
+          } else if (parsed.tool || parsed.name) {
+            rawToolCall = parsed;
+          } else if (parsed.tool_calls && Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
+            rawToolCall = parsed.tool_calls[0];
+          }
         }
       } catch {
         // Not a JSON tool call
@@ -258,10 +267,15 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
               block={{
                 type: 'tool_use',
                 id: rawToolCall.id || `tc-${Date.now()}`,
-                name: rawToolCall.tool || rawToolCall.name,
+                name: rawToolCall.tool || rawToolCall.name || 'unknown',
                 input: rawToolCall.args || rawToolCall.input || {},
               }}
             />
+            {retries > 0 && (
+              <div style={{ fontSize: 11, color: 'var(--kim-text-muted)', marginTop: 4, paddingLeft: 12 }}>
+                (retried {retries}x)
+              </div>
+            )}
           </div>
         </div>
       );

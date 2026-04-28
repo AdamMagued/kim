@@ -35,6 +35,28 @@ interface ActivityItem {
 
 let _activityCounter = 0;
 
+export function collapseMessages(msgs: KimMessage[]) {
+  const res: {msg: KimMessage, retries: number}[] = [];
+  for (const msg of msgs) {
+    if (res.length > 0 && msg.role === 'assistant' && typeof msg.content === 'string') {
+      const prev = res[res.length - 1];
+      if (prev.msg.role === 'assistant' && typeof prev.msg.content === 'string') {
+        const c1 = msg.content.trim().replace(/^(?:Gemini said|Claude said|Assistant said):\s*/i, '');
+        const c2 = prev.msg.content.trim().replace(/^(?:Gemini said|Claude said|Assistant said):\s*/i, '');
+        if (c1 === c2 && c1.startsWith('{')) {
+          try {
+            JSON.parse(c1);
+            prev.retries += 1;
+            continue;
+          } catch {}
+        }
+      }
+    }
+    res.push({ msg, retries: 0 });
+  }
+  return res;
+}
+
 // ── Aggressive log suppression ───────────────────────────────────────────────
 // Nothing that matches these rules should ever reach the activity feed.
 
@@ -1245,14 +1267,18 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           )}
 
           {/* Live conversation history */}
-          {liveHistory.map((msg, i) => {
+          {collapseMessages(liveHistory).map(({msg, retries}, i) => {
             // Show activity feed right after the last user message (current task)
             const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
             return (
               <div key={`live-${i}`}>
-                <div className={`kim-msg-row kim-msg-row--${msg.role}`}>
-                  <div className={`kim-bubble kim-bubble--${msg.role}`}>{msg.content}</div>
-                </div>
+                <MessageBubble
+                  message={msg}
+                  animate={i === liveHistory.length - 1}
+                  typingAnimation={settings.typing_animation ?? 'none'}
+                  onRetry={handleRetryLast}
+                  retries={retries}
+                />
                 {showActivityAfter && renderActivityFeed()}
               </div>
             );
@@ -1402,28 +1428,28 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           </div>
         ) : (
           <>
-            {messages.map((msg, i) => (
+            {collapseMessages(messages).map(({msg, retries}, i) => (
               <MessageBubble
                 key={i}
                 message={msg}
                 animate={i === newestMsgIdx}
                 typingAnimation={settings.typing_animation ?? 'none'}
                 onRetry={handleRetryLast}
+                retries={retries}
               />
             ))}
 
             {/* Newly added messages in this session */}
-            {liveHistory.map((msg, i) => {
-              if ((msg.role as string) === 'system') return null;
-              if (msg.role === 'assistant' && typeof msg.content === 'string' && msg.content.startsWith('NEED_HELP:')) return null;
-              return (
-                <div key={`live-${i}`} className={`kim-msg-row kim-msg-row--${msg.role}`}>
-                  <div className={`kim-bubble kim-bubble--${msg.role}`}>
-                    {msg.role === 'assistant' ? <AnimatedText text={msg.content} animation={settings.typing_animation ?? 'none'} active={i === liveHistory.length - 1} /> : msg.content}
-                  </div>
-                </div>
-              );
-            })}
+            {collapseMessages(liveHistory).map(({msg, retries}, i) => (
+              <MessageBubble
+                key={`live-${i}`}
+                message={msg}
+                animate={i === liveHistory.length - 1}
+                typingAnimation={settings.typing_animation ?? 'none'}
+                onRetry={handleRetryLast}
+                retries={retries}
+              />
+            ))}
             
             {/* Activity feed and errors */}
             {renderActivityFeed()}
