@@ -35,11 +35,11 @@ if not _root_path.is_absolute():
     _root_path = _PROJECT_DIR / _root_path
 PROJECT_ROOT = _root_path.resolve()
 
-# Resolve allowed_paths the same way
+# Resolve allowed_paths the same way (with ~ expansion)
 _raw_allowed = _cfg.get("allowed_paths", [str(PROJECT_ROOT)])
 ALLOWED_PATHS = []
 for p in _raw_allowed:
-    pp = Path(p)
+    pp = Path(p).expanduser()
     if not pp.is_absolute():
         pp = _PROJECT_DIR / pp
     ALLOWED_PATHS.append(pp.resolve())
