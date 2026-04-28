@@ -129,25 +129,26 @@ function SessionItem({ session, active, onClick, editMode, selected, onToggleSel
 
 // ── Claw session item (no onSelectSession needed yet) ─────────────────────────
 
-function ClawSessionItem({ session }: { session: { session_id: string; message_count: number; summary?: string | null } }) {
+function ClawSessionItem({ session, onSelectSession }: { session: { session_id: string; message_count: number; summary?: string | null; date?: string }, onSelectSession: (s: SessionInfo) => void }) {
   const preview = session.summary
     ? session.summary.slice(0, 55) + (session.summary.length > 55 ? '…' : '')
     : `${session.message_count} message${session.message_count !== 1 ? 's' : ''}`;
   return (
-    <div className="kim-session-item" title={session.summary ?? session.session_id}>
+    <button className="kim-session-item" title={session.summary ?? session.session_id} onClick={() => onSelectSession({ session_id: session.session_id, session_type: 'claw', message_count: session.message_count, has_summary: !!session.summary, summary: session.summary ?? undefined, date: session.date || new Date().toISOString() })}>
       <div className="kim-session-item__title">{session.session_id.slice(0, 18)}</div>
       <div className="kim-session-item__preview">{preview}</div>
-    </div>
+    </button>
   );
 }
 
 // ── Project tree in Code tab ───────────────────────────────────────────────────
 
-function ClawProjectTree({ project, onRemove, isActive, onSelect }: {
+function ClawProjectTree({ project, onRemove, isActive, onSelect, onSelectSession }: {
   project: ClawProject;
   onRemove: (path: string) => void;
   isActive: boolean;
   onSelect: () => void;
+  onSelectSession: (s: SessionInfo) => void;
 }) {
   const [open, setOpen] = useState(isActive);
   const totalSessions = project.branches.reduce((n, b) => n + b.sessions.length, 0);
@@ -185,7 +186,7 @@ function ClawProjectTree({ project, onRemove, isActive, onSelect }: {
                 )}
                 {branch.sessions.map(s => (
                   <div key={s.session_id} style={{ paddingLeft: 12 }}>
-                    <ClawSessionItem session={s} />
+                    <ClawSessionItem session={s as any} onSelectSession={(session) => onSelectSession({ ...session, project_path: project.path })} />
                   </div>
                 ))}
               </div>
@@ -441,6 +442,7 @@ export function Sidebar({
                         onRemove={handleRemoveProject}
                         isActive={activeProjectPath === path}
                         onSelect={() => onSelectProject(path)}
+                        onSelectSession={onSelectSession}
                       />
                     );
                   }

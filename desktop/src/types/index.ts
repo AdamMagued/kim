@@ -8,6 +8,7 @@ export interface SessionInfo {
   has_summary: boolean;
   summary?: string;
   session_type: 'kim' | 'claw';
+  project_path?: string;
 }
 
 // ── Message / content types ──────────────────────────────────────────────────

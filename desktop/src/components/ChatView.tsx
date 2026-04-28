@@ -531,7 +531,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     invoke<KimMessage[]>('load_session_messages', {
       sessionId: session.session_id,
       kimDir: settings.kim_sessions_dir || null,
-      clawDir: settings.claw_sessions_dir || null,
+      clawDir: session.session_type === 'claw' && session.project_path 
+        ? `${session.project_path}/.claw/sessions` 
+        : settings.claw_sessions_dir || null,
     })
       .then(msgs => {
         const prev = prevMsgCountRef.current;
@@ -1412,7 +1414,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
             {/* Newly added messages in this session */}
             {liveHistory.map((msg, i) => {
-              if (msg.role === 'system') return null;
+              if ((msg.role as string) === 'system') return null;
               if (msg.role === 'assistant' && typeof msg.content === 'string' && msg.content.startsWith('NEED_HELP:')) return null;
               return (
                 <div key={`live-${i}`} className={`kim-msg-row kim-msg-row--${msg.role}`}>
