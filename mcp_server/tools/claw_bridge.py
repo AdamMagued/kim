@@ -212,7 +212,12 @@ async def _relay_one_request(
                 '"tool_calls": [{"name": "tool", "input": {...}}]}\n\n'
                 "If you just want to reply with text and no tool calls:\n"
                 '{"text": "your answer"}\n\n'
-                "Do NOT include markdown fences. Output raw JSON only."
+                "Do NOT include markdown fences. Output raw JSON only.\n\n"
+                "CRITICAL: ALL file content (code, HTML, markdown, anything > 5 lines) "
+                "MUST go in a write_file tool_call, never in the text field. "
+                "If asked to create index.html, respond with "
+                '{"tool_calls": [{"name": "write_file", "input": {"path": "index.html", "content": "<html>...</html>"}}]}, '
+                "NOT with the HTML inline in text."
             ),
         )
     except Exception as e:
@@ -222,7 +227,7 @@ async def _relay_one_request(
         return
 
     # Convert BrowserProvider response to bridge format
-    bridge_response = _provider_response_to_bridge(response)
+    bridge_response = _provider_response_to_bridge(response, prompt)
 
     logger.info(
         f"[relay #{relay_number}] Got browser response — writing bridge_response.json"
@@ -271,7 +276,7 @@ def _build_browser_prompt(raw_request: str) -> str:
     return "\n".join(parts)
 
 
-def _provider_response_to_bridge(response: dict) -> dict:
+def _provider_response_to_bridge(response: dict, prompt: str = "") -> dict:
     """
     Convert a BrowserProvider response dict to the bridge JSON format.
 
@@ -306,6 +311,38 @@ def _provider_response_to_bridge(response: dict) -> dict:
                 return parsed
     except (json.JSONDecodeError, TypeError):
         pass
+
+    # Recovery path: synthesize a write_file tool call from markdown code blocks
+    import re
+    prompt_lower = prompt.lower()
+    if "create" in prompt_lower or "write" in prompt_lower or "generate" in prompt_lower:
+        match = re.search(r"```(\w*)\n(.*?)```", content, re.DOTALL)
+        if match:
+            lang = match.group(1).strip()
+            code_content = match.group(2).strip()
+            
+            filename = "output.txt"
+            name_match = re.search(r"(?:create|write|generate) ([\w\.-]+\.(?:html|py|js|ts|css|json|md|txt))", prompt_lower)
+            if name_match:
+                filename = name_match.group(1)
+            elif lang == "html":
+                filename = "index.html"
+            elif lang == "python":
+                filename = "main.py"
+            elif lang == "javascript" or lang == "js":
+                filename = "script.js"
+            
+            return {
+                "tool_calls": [
+                    {
+                        "name": "write_file",
+                        "input": {
+                            "path": filename,
+                            "content": code_content
+                        }
+                    }
+                ]
+            }
 
     return {"text": content}
 
