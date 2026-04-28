@@ -217,7 +217,11 @@ async def _relay_one_request(
                 "MUST go in a write_file tool_call, never in the text field. "
                 "If asked to create index.html, respond with "
                 '{"tool_calls": [{"name": "write_file", "input": {"path": "index.html", "content": "<html>...</html>"}}]}, '
-                "NOT with the HTML inline in text."
+                "NOT with the HTML inline in text.\n\n"
+                "NEVER use bash with echo/cat/printf to write file content. ALWAYS use write_file. "
+                "If write_file fails, report the error — do not work around it with shell commands.\n"
+                "Inside JSON string values, ALWAYS escape double quotes as \\\". "
+                "Example: {\"content\": \"<div class=\\\"x\\\">\"}."
             ),
         )
     except Exception as e:
@@ -310,7 +314,19 @@ def _provider_response_to_bridge(response: dict, prompt: str = "") -> dict:
             if "tool_calls" in parsed or "text" in parsed:
                 return parsed
     except (json.JSONDecodeError, TypeError):
-        pass
+        import re
+        # Attempt one-shot repair for unescaped inner quotes in content/text fields
+        match = re.search(r'("content"|"text")\s*:\s*"(.*)"(\s*}|\s*,)', content, re.DOTALL)
+        if match:
+            val = match.group(2)
+            repaired_val = re.sub(r'(?<!\\)"', r'\"', val)
+            repaired_content = content[:match.start(2)] + repaired_val + content[match.end(2):]
+            try:
+                parsed = json.loads(repaired_content)
+                if isinstance(parsed, dict) and ("tool_calls" in parsed or "text" in parsed):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
 
     # Recovery path: synthesize a write_file tool call from markdown code blocks
     import re
@@ -343,6 +359,10 @@ def _provider_response_to_bridge(response: dict, prompt: str = "") -> dict:
                     }
                 ]
             }
+
+    # If repair and recovery failed, but it looks like a botched JSON tool call
+    if content.strip().startswith("{") and "tool_calls" in content:
+        return {"text": 'ERROR: Your previous tool call had invalid JSON — escape inner double quotes with \\". Try again.'}
 
     return {"text": content}
 
