@@ -101,6 +101,10 @@ fi
 mkdir -p logs
 mkdir -p sessions/chrome_data
 
+# ── Write project root for .app bundle discovery ─────────────────────────
+echo "$PWD" > "$HOME/.kim_root"
+echo "  Saved project root to ~/.kim_root (used by Kim.app)"
+
 echo ""
 echo "  ╔═══════════════════════════════════════════════════════╗"
 echo "  ║          Setup complete!                              ║"
