@@ -39,6 +39,7 @@ export function UpdateModal({ currentVersion, latestVersion, releaseNotes, onDis
 
     try {
       await invoke('run_update');
+      // If we get here without restarting, source was already up to date
       setStage('done');
     } catch (e: unknown) {
       setErrorMsg(String(e));
@@ -118,7 +119,7 @@ export function UpdateModal({ currentVersion, latestVersion, releaseNotes, onDis
             )}
             {stage === 'done' && (
               <div style={{ color: 'var(--success, #4ade80)', marginTop: 4 }}>
-                ✓ Restarting…
+                ✓ {progress.some(l => l.includes('already up to date')) ? 'Already up to date.' : 'Restarting…'}
               </div>
             )}
           </div>
@@ -142,6 +143,11 @@ export function UpdateModal({ currentVersion, latestVersion, releaseNotes, onDis
           {stage === 'updating' && (
             <button disabled className="kim-btn kim-btn--primary" style={{ opacity: 0.6, cursor: 'not-allowed' }}>
               Updating…
+            </button>
+          )}
+          {stage === 'done' && (
+            <button onClick={onDismiss} className="kim-btn kim-btn--primary">
+              {progress.some(l => l.toLowerCase().includes('already up to date')) ? 'Close' : 'Restarting…'}
             </button>
           )}
           {stage === 'error' && (

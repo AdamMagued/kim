@@ -4019,10 +4019,16 @@ async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
         return Err(format!("git pull failed: {stderr}"));
     }
     let git_stdout = String::from_utf8_lossy(&git_out.stdout).trim().to_string();
+    let already_latest = git_stdout.contains("Already up to date") || git_stdout.contains("Already up-to-date");
     let _ = app_handle.emit(
         "kim-update-progress",
-        if git_stdout.is_empty() { "Source up to date.".to_string() } else { git_stdout },
+        if git_stdout.is_empty() { "Source updated.".to_string() } else { git_stdout.clone() },
     );
+
+    if already_latest {
+        let _ = app_handle.emit("kim-update-progress", "Source is already up to date — no restart needed.");
+        return Ok(());
+    }
 
     // ── Step 2: pip install ───────────────────────────────────────────────
     let _ = app_handle.emit("kim-update-progress", "Updating Python dependencies…");
@@ -4040,7 +4046,6 @@ async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
             let _ = app_handle.emit("kim-update-progress", "Python dependencies updated.");
         }
         Ok(out) => {
-            // Non-fatal — warn but continue
             let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
             let _ = app_handle.emit("kim-update-progress", format!("Warning (pip): {msg}"));
         }
@@ -4052,7 +4057,38 @@ async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     // ── Step 3: Restart ───────────────────────────────────────────────────
     let _ = app_handle.emit("kim-update-progress", "Update complete — restarting Kim…");
     tokio::time::sleep(Duration::from_millis(800)).await;
-    app_handle.restart();
+
+    // app_handle.restart() closes the process but doesn't reliably reopen the
+    // .app bundle on macOS. Use `open -a Kim` then exit instead.
+    #[cfg(target_os = "macos")]
+    {
+        // Try to reopen by app bundle name first, fall back to exe path.
+        let reopened = std::process::Command::new("open")
+            .args(["-a", "Kim"])
+            .spawn()
+            .is_ok();
+        if !reopened {
+            if let Ok(exe) = std::env::current_exe() {
+                // Walk up to find the .app bundle and open it.
+                let mut path = exe.as_path();
+                loop {
+                    if path.extension().map_or(false, |e| e == "app") {
+                        let _ = std::process::Command::new("open").arg(path).spawn();
+                        break;
+                    }
+                    match path.parent() {
+                        Some(p) => path = p,
+                        None => break,
+                    }
+                }
+            }
+        }
+        std::process::exit(0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        app_handle.restart();
+    }
 }
 
 #[tauri::command]
