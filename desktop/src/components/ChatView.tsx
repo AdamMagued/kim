@@ -123,6 +123,8 @@ const HIDDEN_REGEX: RegExp[] = [
 ];
 
 function isNoiseLine(raw: string): boolean {
+  // Never suppress explicit status lines from the agent
+  if (raw.startsWith('[STATUS]')) return false;
   // Strip the [err] prefix that appendRaw prepends before pattern-matching,
   // otherwise regex anchors like /^\s*\|/ never fire.
   const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
@@ -274,6 +276,14 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
       icon: '⚠',
       text: friendlyError(reason || 'Kim needs your help to continue.'),
     };
+  }
+
+  // [STATUS] lines — emitted by browser_provider for live Gemini/Claude feedback
+  if (stripped.startsWith('[STATUS]') || raw.startsWith('[STATUS]')) {
+    const text = (stripped.startsWith('[STATUS]') ? stripped : raw)
+      .replace(/^\[STATUS\]\s*/, '').trim();
+    if (text) return { id, kind: 'status', icon: '›', text };
+    return null;
   }
 
   // [TOOL] lines — 'module:' prefix is optional in newer agent log format

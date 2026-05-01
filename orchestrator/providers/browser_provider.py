@@ -399,6 +399,7 @@ class BrowserProvider(BaseProvider):
 
                 # ── Step 1: Paste screenshot via clipboard (if any) ──────
                 if image_attachments:
+                    print(f"[STATUS] Uploading screenshot to {site}…", flush=True)
                     await self._inject_image_clipboard(
                         page, cfg, str(image_attachments[-1]["data_base64"])
                     )
@@ -406,12 +407,17 @@ class BrowserProvider(BaseProvider):
                     # ── Step 2: Let the UI render the image ──────────────
                     await page.wait_for_timeout(5000)
 
-                    # ── Step 3: Dismiss popups (Gemini "I agree", etc.) ──
-                    await self._dismiss_popups(page)
+                # ── Step 3: Always dismiss popups before every send ───────
+                # Gemini (and other sites) show consent dialogs / marketing
+                # overlays that block the input. We press Escape + click
+                # known dismiss buttons regardless of whether an image was sent.
+                print(f"[STATUS] Preparing {site}…", flush=True)
+                await self._dismiss_popups(page)
 
                 # ── Step 4: Paste cleaned text prompt ────────────────────
                 # ── Step 5: Click Send + wait for response ───────────────
-                raw_response = await self._send_and_wait(page, cfg, prompt)
+                print(f"[STATUS] Sending message to {site}…", flush=True)
+                raw_response = await self._send_and_wait(page, cfg, prompt, site)
                 return self._parse_response(raw_response, completion_hash)
         except Exception as e:
             logger.error(f"BrowserProvider.complete failed: {e}", exc_info=True)
@@ -1137,14 +1143,17 @@ class BrowserProvider(BaseProvider):
     # Send + wait + scrape
     # ==================================================================
 
-    async def _send_and_wait(self, page: Page, cfg: dict, message: str) -> str:
+    async def _send_and_wait(self, page: Page, cfg: dict, message: str, site: str = "AI") -> str:
         """Inject the prompt, click Send, and wait for the full response."""
         # Count current responses before sending
         response_sel = cfg["response_selectors"][0]
         initial_count = await page.locator(response_sel).count()
         logger.debug(f"Response count before send: {initial_count}")
 
-        # Locate the input box
+        # Locate the input box — press Escape first to dismiss any focused popups
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.2)
+
         input_sel = await self._find_selector(page, cfg["input_selectors"])
         if not input_sel:
             raise RuntimeError("Could not locate chat input box")
@@ -1161,6 +1170,7 @@ class BrowserProvider(BaseProvider):
             logger.warning("Send button not found; pressing Enter")
             await page.keyboard.press("Enter")
 
+        print(f"[STATUS] Waiting for {site} to respond…", flush=True)
         logger.info("Message sent, waiting for response…")
 
         # Wait for response count to increase (generation started)
@@ -1172,12 +1182,15 @@ class BrowserProvider(BaseProvider):
                 f"No new response appeared after {RESPONSE_WAIT_S}s"
             )
 
+        print(f"[STATUS] {site} is responding…", flush=True)
+
         # Wait for generation to finish (stop button disappears)
-        await self._wait_for_generation_complete(page, cfg["stop_selectors"])
+        await self._wait_for_generation_complete(page, cfg["stop_selectors"], site)
 
         # Extra settle time
         await asyncio.sleep(1.5)
 
+        print(f"[STATUS] Reading {site}'s response…", flush=True)
         # Scrape the last response
         return await self._scrape_last_response(page, cfg["response_selectors"])
 
@@ -1209,13 +1222,16 @@ class BrowserProvider(BaseProvider):
         return False
 
     async def _wait_for_generation_complete(
-        self, page: Page, stop_selectors: list[str]
+        self, page: Page, stop_selectors: list[str], site: str = "AI"
     ) -> None:
         """
         Wait until all known stop-button selectors are invisible (generation
         finished) or until ``GENERATION_WAIT_S`` seconds elapse.
+        Emits a status line every 10 s so the UI shows live progress.
         """
         deadline = asyncio.get_running_loop().time() + GENERATION_WAIT_S
+        last_status = asyncio.get_running_loop().time()
+        elapsed = 0
         while asyncio.get_running_loop().time() < deadline:
             any_stop_visible = False
             for sel in stop_selectors:
@@ -1228,6 +1244,11 @@ class BrowserProvider(BaseProvider):
             if not any_stop_visible:
                 logger.debug("Generation complete (stop button gone)")
                 return
+            now = asyncio.get_running_loop().time()
+            if now - last_status >= 10:
+                elapsed = int(now - (deadline - GENERATION_WAIT_S))
+                print(f"[STATUS] {site} still thinking… ({elapsed}s)", flush=True)
+                last_status = now
             await asyncio.sleep(0.75)
         logger.warning(
             f"Generation did not complete after {GENERATION_WAIT_S}s "
