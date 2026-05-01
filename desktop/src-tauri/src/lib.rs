@@ -154,6 +154,28 @@ fn exe_ancestor_kim_root() -> Option<PathBuf> {
 }
 
 fn default_project_root() -> PathBuf {
+    // 0a. Compile-time baked path — the only reliable option when the app runs
+    //     from inside a .app bundle where no ancestor contains orchestrator/.
+    //     Set by build.rs from CARGO_MANIFEST_DIR at build time.
+    if let Some(baked) = option_env!("KIM_COMPILE_TIME_ROOT") {
+        let p = PathBuf::from(baked);
+        if p.exists() && p.join("orchestrator").join("agent.py").exists() {
+            return p;
+        }
+    }
+
+    // 0b. ~/.kim_root — written by install.sh so even a moved/renamed project
+    //     can be found at runtime without a rebuild.
+    if let Some(home) = dirs::home_dir() {
+        let root_file = home.join(".kim_root");
+        if let Ok(contents) = std::fs::read_to_string(&root_file) {
+            let p = PathBuf::from(contents.trim());
+            if p.exists() && p.join("orchestrator").join("agent.py").exists() {
+                return p;
+            }
+        }
+    }
+
     // 1. Environment override wins (explicit user intent).
     if let Ok(env_root) = std::env::var("KIM_PROJECT_ROOT") {
         let p = PathBuf::from(env_root);
