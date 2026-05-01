@@ -3983,6 +3983,79 @@ async fn get_app_version() -> String {
 }
 
 #[tauri::command]
+fn get_platform_info() -> String {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    match (os, arch) {
+        ("macos",   "aarch64") => "macOS (Apple Silicon)".into(),
+        ("macos",   _        ) => "macOS (Intel)".into(),
+        ("windows", "x86_64" ) => "Windows x64".into(),
+        ("windows", "x86"    ) => "Windows x86".into(),
+        ("linux",   "aarch64") => "Linux ARM64".into(),
+        ("linux",   _        ) => "Linux x64".into(),
+        (os, arch)             => format!("{os} ({arch})"),
+    }
+}
+
+/// Pull the latest source from git, refresh Python deps, then restart the app.
+/// Progress lines are emitted as "kim-update-progress" events.
+#[tauri::command]
+async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let kim_root = default_project_root();
+
+    // ── Step 1: git pull ──────────────────────────────────────────────────
+    let _ = app_handle.emit("kim-update-progress", "Pulling latest source from GitHub…");
+
+    // Try to find git
+    let git_cmd = if cfg!(target_os = "windows") { "git.exe" } else { "git" };
+    let git_out = std::process::Command::new(git_cmd)
+        .args(["pull", "--ff-only"])
+        .current_dir(&kim_root)
+        .output()
+        .map_err(|e| format!("git not found — make sure Git is installed: {e}"))?;
+
+    if !git_out.status.success() {
+        let stderr = String::from_utf8_lossy(&git_out.stderr);
+        return Err(format!("git pull failed: {stderr}"));
+    }
+    let git_stdout = String::from_utf8_lossy(&git_out.stdout).trim().to_string();
+    let _ = app_handle.emit(
+        "kim-update-progress",
+        if git_stdout.is_empty() { "Source up to date.".to_string() } else { git_stdout },
+    );
+
+    // ── Step 2: pip install ───────────────────────────────────────────────
+    let _ = app_handle.emit("kim-update-progress", "Updating Python dependencies…");
+
+    let python = find_python_interpreter(&kim_root)
+        .map_err(|e| format!("Python not found: {e}"))?;
+
+    let pip_out = std::process::Command::new(&python)
+        .args(["-m", "pip", "install", "-r", "requirements.txt", "-q", "--disable-pip-version-check"])
+        .current_dir(&kim_root)
+        .output();
+
+    match pip_out {
+        Ok(out) if out.status.success() => {
+            let _ = app_handle.emit("kim-update-progress", "Python dependencies updated.");
+        }
+        Ok(out) => {
+            // Non-fatal — warn but continue
+            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let _ = app_handle.emit("kim-update-progress", format!("Warning (pip): {msg}"));
+        }
+        Err(e) => {
+            let _ = app_handle.emit("kim-update-progress", format!("Warning: pip update skipped ({e})."));
+        }
+    }
+
+    // ── Step 3: Restart ───────────────────────────────────────────────────
+    let _ = app_handle.emit("kim-update-progress", "Update complete — restarting Kim…");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    app_handle.restart();
+}
+
+#[tauri::command]
 async fn open_browser_signin_window(
     url: String,
     provider_name: Option<String>,
@@ -5388,6 +5461,8 @@ pub fn run() {
             delete_sessions,
             load_session_messages,
             get_app_version,
+            get_platform_info,
+            run_update,
             add_custom_provider_capability,
             open_browser_signin_window,
             navigate_browser_window_if_open,

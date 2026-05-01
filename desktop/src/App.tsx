@@ -301,7 +301,6 @@ export default function App() {
           currentVersion={appVersion}
           latestVersion={updateInfo.tag_name.replace(/^v/, '')}
           releaseNotes={updateInfo.body ?? ''}
-          downloadUrl={updateInfo.html_url}
           onDismiss={() => setShowUpdate(false)}
         />
       )}
