@@ -464,7 +464,7 @@ interface Props {
   session: SessionInfo | null;
   newChatMode: boolean;
   settings: Settings;
-  onTaskDone: () => void;
+  onTaskDone: (sessionId?: string) => void;
   account: KimAccount;
   activeTab: 'chat' | 'code';
   activeProjectPath?: string | null;
@@ -741,7 +741,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       // after every run completion to reflect newly appended turns.
       setMessageReloadNonce(v => v + 1);
       // Always refresh sessions — failed runs still create session files.
-      onTaskDoneRef.current();
+      // Pass the session ID so App.tsx can auto-navigate to the completed session.
+      onTaskDoneRef.current(activeResumeSessionId);
       if (!event.payload && !wasCancelled) {
         if (!hadNeedHelp) {
           setTaskError('agent-error');
@@ -826,7 +827,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         setIsRunning(false);
         setTaskError(friendlyError(String(err)));
         setLastFailedTask(pending);
-        onTaskDoneRef.current(); // refresh sidebar even on invoke-level failures
+        onTaskDoneRef.current(activeResumeSessionId); // refresh sidebar even on invoke-level failures
       }
     }
   }, [activeResumeSessionId, settings.project_root, activeTab, activeProjectPath]);
