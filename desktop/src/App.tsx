@@ -67,6 +67,9 @@ export default function App() {
 
   const [activeSession, setActiveSession] = useState<SessionInfo | null>(null);
   const [newChatMode, setNewChatMode] = useState(false);
+  // When a task completes in newChatMode, ChatView tells us the session ID.
+  // We store it here and auto-select the session once kimSessions refreshes.
+  const [pendingSelectSessionId, setPendingSelectSessionId] = useState<string | null>(null);
   // Incremented every time the user presses New Chat — used as ChatView's key
   // so the component fully remounts (clearing all transient state) each time.
   const [chatSerial, setChatSerial] = useState(0);
@@ -166,10 +169,22 @@ export default function App() {
     setChatSerial(s => s + 1);
   }
 
-  const handleTaskDone = useCallback(() => {
+  const handleTaskDone = useCallback((sessionId?: string) => {
+    if (sessionId) setPendingSelectSessionId(sessionId);
     refresh();
     setTimeout(() => { refresh(); }, 500);
   }, [refresh]);
+
+  // Auto-select the just-completed session once it appears in kimSessions.
+  useEffect(() => {
+    if (!pendingSelectSessionId) return;
+    const session = kimSessions.find(s => s.session_id === pendingSelectSessionId);
+    if (session) {
+      setActiveSession(session);
+      setNewChatMode(false);
+      setPendingSelectSessionId(null);
+    }
+  }, [kimSessions, pendingSelectSessionId]);
 
   async function checkForUpdates() {
     toast('Checking for updates…', 'info', 2000);

@@ -381,13 +381,23 @@ class BrowserProvider(BaseProvider):
                 browser = await self._connect(pw)
                 page, site = await self._find_chat_page(browser)
                 if page is None or site is None:
+                    # Try to open Gemini automatically before giving up
+                    print("[STATUS] No AI chat tab found — opening Gemini…", flush=True)
+                    try:
+                        new_page = await browser.new_page()
+                        await new_page.goto("https://gemini.google.com/app", timeout=15000)
+                        await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                        await asyncio.sleep(2)
+                        page, site = await self._find_chat_page(browser)
+                    except Exception:
+                        pass
+
+                if page is None or site is None:
                     return {
                         "type": "text",
                         "content": (
                             "NEED_HELP: No AI chat tab found. "
-                            "Please open Claude, ChatGPT, or Gemini in Chrome "
-                            f"(launched with --remote-debugging-port=9222). "
-                            f"Detected pages: {await self._list_pages(browser)}"
+                            "Gemini was closed — please reopen it in Chrome and try again."
                         ),
                     }
                 cfg = self._site_configs[site]
