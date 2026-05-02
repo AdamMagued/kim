@@ -3297,7 +3297,7 @@ fn handle_webview_bridge_request(
                         use std::io::BufRead;
                         let app_handle_out = app_handle.clone();
                         Some(std::thread::spawn(move || {
-                            for l in reader.lines().flatten() {
+                            for l in reader.lines().map_while(Result::ok) {
                                 let _ = app_handle_out.emit("kim-agent-output", l);
                             }
                         }))
