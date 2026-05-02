@@ -266,11 +266,11 @@ class BrowserProvider(BaseProvider):
         self._max_inject_chars = int(bp_cfg.get("max_inject_chars", 60000))
         self._headless = bool(bp_cfg.get("browser_headless", False))
         self._preferred_site = (bp_cfg.get("preferred_site") or "").strip().lower() or None
-        
+
         env_site = os.environ.get("KIM_PREFERRED_SITE", "").strip().lower()
         if env_site:
             self._preferred_site = env_site
-            
+
         self._bridge_url = os.environ.get("KIM_WEBVIEW_BRIDGE_URL", "").strip().rstrip("/")
         self._bridge_token = os.environ.get("KIM_WEBVIEW_BRIDGE_TOKEN", "").strip()
         self._use_webview_bridge = bool(self._bridge_url and self._bridge_token)
@@ -637,7 +637,7 @@ class BrowserProvider(BaseProvider):
     ) -> dict:
         """Monolithic /v1/complete fallback for older Rust binaries."""
         try:
-            print(f"[STATUS] Sending to AI provider…", flush=True)
+            print("[STATUS] Sending to AI provider…", flush=True)
             async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_S) as client:
                 resp = await client.post(
                     f"{self._bridge_url}/v1/complete",
@@ -1186,7 +1186,7 @@ class BrowserProvider(BaseProvider):
         # Click the send button (prefer aria-label="Send message")
         send_sel = await self._find_selector(page, cfg["send_selectors"])
         if send_sel:
-            # Click the last matching button (fixes DeepSeek where generic 
+            # Click the last matching button (fixes DeepSeek where generic
             # selectors like div[role='button'] match earlier elements)
             loc = page.locator(send_sel)
             count = await loc.count()
@@ -1507,8 +1507,11 @@ class BrowserProvider(BaseProvider):
                 "2. TASK_COMPLETE: <one-line summary>\n"
                 "3. NEED_HELP: <reason you cannot proceed>\n"
                 "Do NOT include markdown formatting around the JSON.\n"
-                "CRITICAL: If your JSON arguments contain double quotes (e.g., HTML attributes or code), you MUST escape them (\\\") so the JSON is valid.\n"
-                f"IMPORTANT: Always append the exact string {completion_hash} at the very end of your entire response.\n\n"
+                "CRITICAL: If your JSON arguments contain double quotes (e.g., "
+                "HTML attributes or code), you MUST escape them (\\\") so the "
+                "JSON is valid.\n"
+                f"IMPORTANT: Always append the exact string {completion_hash} "
+                "at the very end of your entire response.\n\n"
                 f"{last_text}"
             )
             self._sent_system_prompt = True

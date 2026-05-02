@@ -4215,7 +4215,6 @@ async fn hide_main_window(app_handle: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn show_main_window(app_handle: tauri::AppHandle) -> Result<(), String> {
-    let _ = app_handle.show();
     if let Some(win) = app_handle.get_webview_window("main") {
         let _ = win.show();
         let _ = win.set_focus();
