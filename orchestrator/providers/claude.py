@@ -52,7 +52,7 @@ class AnthropicProvider(BaseProvider):
             raise  # 403 — non-retryable
         except anthropic.APIError as e:
             logger.error(f"Anthropic API error: {e}")
-            return {"type": "text", "content": f"API_ERROR: {e}"}
+            raise
 
         return self._parse_response(response)
 
@@ -109,16 +109,27 @@ class AnthropicProvider(BaseProvider):
                 "output": getattr(response.usage, "output_tokens", 0),
             }
 
-        for block in response.content:
-            if block.type == "tool_use":
-                return {
-                    "type": "tool_call",
-                    "tool": block.name,
-                    "args": dict(block.input),
-                    "usage": usage,
-                }
-            if block.type == "text":
-                return {"type": "text", "content": block.text, "usage": usage}
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+
+        if len(tool_blocks) == 1:
+            b = tool_blocks[0]
+            return {
+                "type": "tool_call",
+                "tool": b.name,
+                "args": dict(b.input),
+                "usage": usage,
+            }
+
+        if len(tool_blocks) > 1:
+            # Claude returned multiple tool_use blocks — wrap as a batch call
+            # so the agent executes all of them rather than silently dropping extras.
+            logger.debug("Claude returned %d parallel tool_use blocks; wrapping as batch", len(tool_blocks))
+            return {
+                "type": "tool_call",
+                "tool": "batch",
+                "args": {"calls": [{"tool": b.name, "args": dict(b.input)} for b in tool_blocks]},
+                "usage": usage,
+            }
 
         # Fallback: concatenate all text blocks
         text = " ".join(

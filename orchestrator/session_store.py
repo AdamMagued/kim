@@ -198,7 +198,8 @@ class SessionStore:
                 session_id = jsonl_file.stem
                 summary_file = date_dir / f"{session_id}.summary.txt"
                 try:
-                    msg_count = sum(1 for _ in open(jsonl_file, encoding="utf-8"))
+                    with open(jsonl_file, encoding="utf-8") as f:
+                        msg_count = sum(1 for _ in f)
                 except Exception:
                     msg_count = 0
 

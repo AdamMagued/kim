@@ -45,24 +45,30 @@ class GeminiProvider(BaseProvider):
         tools: list[dict],
         system: str,
     ) -> dict:
-        gemini_tools = self._to_gemini_tools(tools)
-        model = genai.GenerativeModel(
-            model_name=self._model_name,
-            tools=gemini_tools,
-            system_instruction=system,
-            generation_config=genai.GenerationConfig(max_output_tokens=self._max_tokens),
-        )
+        if not messages:
+            return {"type": "text", "content": "SYSTEM ERROR: No messages provided."}
+
+        # #24: Cache GenerativeModel since it takes time to initialize and validate schemas
+        if not hasattr(self, "_cached_model") or getattr(self, "_last_tools_repr", None) != repr(tools):
+            gemini_tools = self._to_gemini_tools(tools)
+            self._cached_model = genai.GenerativeModel(
+                model_name=self._model_name,
+                tools=gemini_tools,
+                system_instruction=system,
+                generation_config=genai.GenerationConfig(max_output_tokens=self._max_tokens),
+            )
+            self._last_tools_repr = repr(tools)
 
         # Split into history (all but last message) + current message
         history = self._to_gemini_contents(messages[:-1])
         current_parts = self._to_parts(messages[-1]["content"])
 
-        chat = model.start_chat(history=history)
+        chat = self._cached_model.start_chat(history=history)
         try:
             response = await chat.send_message_async(current_parts)
         except Exception as e:
             logger.error(f"Gemini API error: {e}", exc_info=True)
-            return {"type": "text", "content": f"API_ERROR: {e}"}
+            raise
 
         return self._parse_response(response)
 

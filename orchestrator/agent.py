@@ -249,20 +249,22 @@ async def mcp_session_context(config: dict):
             os.environ.get("PROJECT_ROOT") or config.get("project_root", str(Path.cwd()))
         ).resolve()
     )
-    # The MCP SDK's stdio_client strips the environment to a safe whitelist
-    # (HOME, PATH, SHELL, etc.) when StdioServerParameters.env is None.
-    # This drops PYTHONPATH, PROJECT_ROOT, and bridge env vars that the MCP
-    # server subprocess needs.  We explicitly propagate them here.
+    # The MCP SDK's stdio_client may use a restricted environment when
+    # StdioServerParameters.env is provided.  We merge our extra keys
+    # with the full parent environment so nothing critical is lost.
     _EXTRA_ENV_KEYS = [
         "PYTHONPATH", "PROJECT_ROOT", "VIRTUAL_ENV",
         "KIM_WEBVIEW_BRIDGE_URL", "KIM_WEBVIEW_BRIDGE_TOKEN",
     ]
     extra_env = {k: os.environ[k] for k in _EXTRA_ENV_KEYS if k in os.environ}
+    merged_env = {**os.environ, **extra_env} if extra_env else None
+    if extra_env:
+        logger.debug(f"MCP subprocess env keys propagated: {list(extra_env.keys())}")
     server_params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "mcp_server.server"],
         cwd=project_root,
-        env=extra_env if extra_env else None,
+        env=merged_env,
     )
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
@@ -410,6 +412,7 @@ class KimAgent:
             return {"success": False, "summary": "No MCP tools available", "screenshot": ""}
 
         system_prompt = self._build_system_prompt(task)
+        consecutive_continues = 0
 
         first_msg = {"role": "user", "content": f"Task: {task}"}
         self.memory.add_user(f"Task: {task}")
@@ -454,6 +457,7 @@ class KimAgent:
 
             # ── Tool call ────────────────────────────────────────────────
             if response["type"] == "tool_call":
+                consecutive_continues = 0
                 tool_name = response["tool"]
                 tool_args = response.get("args", {})
                 self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]})")
@@ -554,6 +558,44 @@ class KimAgent:
                     ]
                     self.memory.add_user(user_content, has_screenshot=True)
                     self._session_store.append_message({"role": "user", "content": user_content})
+
+                elif tool_name == "take_annotated_screenshot":
+                    # Parse the JSON result to extract annotated image + grid
+                    try:
+                        ann_data = json.loads(result_text)
+                    except (json.JSONDecodeError, TypeError):
+                        ann_data = {}
+
+                    ann_image_b64 = ann_data.get("image", "")
+                    if ann_image_b64.startswith("data:image/png;base64,"):
+                        ann_image_b64 = ann_image_b64[len("data:image/png;base64,"):]
+                    last_screenshot_b64 = ann_image_b64
+
+                    # Build text context with the grid mapping + instructions
+                    grid_map = ann_data.get("grid", {})
+                    instructions = ann_data.get("instructions", "")
+                    screen_w = ann_data.get("screen_width", "?")
+                    screen_h = ann_data.get("screen_height", "?")
+                    grid_text = (
+                        f"[Tool result: {tool_name}]\n"
+                        f"Annotated screenshot captured (screen: {screen_w}×{screen_h}).\n"
+                        f"{instructions}\n\n"
+                        f"Grid marker coordinates (label → [x, y] in real screen pixels):\n"
+                        f"{json.dumps(grid_map, separators=(',', ':'))}"
+                    )
+
+                    if ann_image_b64:
+                        user_content = [
+                            {"type": "text", "text": grid_text},
+                            {"type": "image", "data": ann_image_b64, "media_type": "image/png"},
+                        ]
+                        self.memory.add_user(user_content, has_screenshot=True)
+                        self._session_store.append_message({"role": "user", "content": user_content})
+                    else:
+                        # Fallback: no image, just text
+                        self.memory.add_user(grid_text)
+                        self._session_store.append_message({"role": "user", "content": grid_text})
+
                 else:
                     user_content = f"[Tool result: {tool_name}]\n{result_text}"
                     self.memory.add_user(user_content)
@@ -580,6 +622,13 @@ class KimAgent:
                     return {"success": False, "summary": f"NEED_HELP: {reason}", "screenshot": last_screenshot_b64}
 
                 self._log("DEBUG", f"Text (continuing): {content[:120]}")
+                
+                consecutive_continues += 1
+                if consecutive_continues >= 3:
+                    msg = "NEED_HELP: Model is stuck in a conversational loop without calling tools."
+                    self._log("WARN", msg)
+                    return {"success": False, "summary": msg, "screenshot": last_screenshot_b64}
+                
                 # Don't force a screenshot — let the LLM call take_screenshot if it needs one.
                 self.memory.add_user("Continue. What is your next action? Use take_screenshot if you need to see the screen.")
                 continue
@@ -624,7 +673,7 @@ class KimAgent:
                     _before_lines = 0
 
         # ── Pre-screenshot: show flash overlay then hide main window ──
-        _is_screenshot = (name == "take_screenshot")
+        _is_screenshot = (name in ("take_screenshot", "take_annotated_screenshot"))
         if _is_screenshot:
             # SCREENSHOT_FLASH tells ChatView to trigger the aura animation AND
             # hide only the main window (not the flash overlay window).
@@ -818,6 +867,30 @@ You MUST respond in EXACTLY one of these formats on every turn:
 - If the task is a simple question (math, facts, logic, knowledge) that does NOT require
   interacting with the computer, answer directly with TASK_COMPLETE: <answer>.
   Do NOT call tools for questions you can answer from your own knowledge.
+
+## Visual Ruler Grid (Calibration Dots)
+When you need to click something on screen, use `take_annotated_screenshot` instead of
+`take_screenshot`. The annotated screenshot has a grid of labeled cross-markers
+(columns A–J, rows 1–10) drawn onto the image as visual rulers.
+
+The tool response is JSON containing:
+- `image`: the screenshot with the grid overlaid (base64 PNG)
+- `grid`: a mapping of marker labels to exact screen coordinates, e.g. {{"A1": [57, 36], "B3": [215, 250]}}
+- `screen_width` / `screen_height`: actual monitor dimensions
+
+**How to use the grid to click precisely:**
+1. Look at the annotated screenshot and identify your click target.
+2. Find the 2–4 nearest grid markers surrounding the target.
+3. Look up those markers' exact coordinates from the `grid` mapping.
+4. Interpolate: estimate the target's (x, y) based on its visual position
+   relative to the nearby markers.
+5. Call the `click` tool with those interpolated coordinates.
+
+Example: If marker D5 is at (430, 450) and marker E5 is at (573, 450), and your
+target is visually ~30% of the way from D5 to E5, estimate x ≈ 430 + 0.3×(573-430) = 473.
+
+Use `take_screenshot` (without grid) only when you just need to read text or verify
+a result — NOT when planning to click.
 """
         if self.config.get("voice", {}).get("human_quirks", False):
             prompt += (

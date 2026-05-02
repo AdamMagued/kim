@@ -2,7 +2,8 @@
 Kim MCP Server — Shell Execution Tools
 
 Provides run_command and run_powershell tools with:
-  - Blocked-command filtering
+  - Blocked-command filtering (shlex-based, exact-match deny set)
+  - Metacharacter rejection for command chaining
   - Cross-platform command translation via os_utils
   - Platform-aware PowerShell / bash fallback
 """
@@ -11,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import shlex
 
-from mcp_server.config import BLOCKED_COMMANDS, SHELL_TIMEOUT, validate_path, PROJECT_ROOT
+from mcp_server.config import SHELL_TIMEOUT, validate_path, PROJECT_ROOT
 from mcp_server.os_utils import (
     CURRENT_OS,
     IS_WINDOWS,
@@ -23,12 +26,60 @@ from mcp_server.os_utils import (
 
 logger = logging.getLogger(__name__)
 
+# ── Deny sets (#2 — stronger shell blocklist) ─────────────────────────────────
 
-def _check_blocked(cmd: str) -> str | None:
-    cmd_lower = cmd.lower().strip()
-    for blocked in BLOCKED_COMMANDS:
-        if blocked.lower() in cmd_lower:
-            return f"BLOCKED: Command matches blocked pattern '{blocked}'"
+# Commands that are unconditionally blocked (first token after shlex.split)
+_DENY_COMMANDS = frozenset({
+    "rm", "rmdir", "del", "format", "diskpart", "mkfs", "dd", "shred",
+})
+
+# Regex patterns that catch common destructive payloads even in arguments
+_DENY_PATTERNS = [
+    re.compile(r":\(\)\s*\{[^}]*\|[^}]*&\s*\}\s*;?\s*:", re.DOTALL),  # fork bomb
+    re.compile(r"\bchmod\s+(-\w\s+)*777\s+/\s*$"),  # chmod -R 777 /
+    re.compile(r"\bdd\b.*\bif=/dev/zero\b"),  # dd if=/dev/zero
+]
+
+# Metacharacters that enable command chaining / injection
+_CHAIN_METACHAR_RE = re.compile(r"[;|&`]|\$\(")
+
+
+def _check_blocked(cmd: str, allow_chaining: bool = False) -> str | None:
+    """Check if a command should be blocked. Returns an error message or None."""
+    cmd_stripped = cmd.strip()
+
+    # 1. Check for dangerous regex patterns in raw command
+    for pat in _DENY_PATTERNS:
+        if pat.search(cmd_stripped):
+            return f"BLOCKED: Command matches dangerous pattern"
+
+    # 2. Reject command chaining metacharacters unless explicitly allowed
+    if not allow_chaining and _CHAIN_METACHAR_RE.search(cmd_stripped):
+        return (
+            "BLOCKED: Command contains chaining metacharacters (;, &&, ||, |, `, $(...)). "
+            "Use separate run_command calls for each command, or pass allow_chaining=True."
+        )
+
+    # 3. Parse with shlex and check first token against deny set
+    try:
+        tokens = shlex.split(cmd_stripped)
+    except ValueError:
+        # Malformed quoting — treat as suspicious
+        return "BLOCKED: Command has malformed shell quoting"
+
+    if not tokens:
+        return None
+
+    first_cmd = tokens[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()  # basename
+    if first_cmd in _DENY_COMMANDS:
+        return f"BLOCKED: '{first_cmd}' is a blocked command"
+
+    # 4. Special case: rm with -r/-rf and a path that looks like root or parent traversal
+    if first_cmd == "rm" or (len(tokens) > 1 and tokens[0] in ("sudo",) and tokens[1] == "rm"):
+        flags = " ".join(tokens)
+        if re.search(r"-\w*r\w*", flags) and re.search(r"\s+/\s*$|\s+\.\.\s*$", " " + flags):
+            return "BLOCKED: recursive rm targeting root or parent directory"
+
     return None
 
 
@@ -36,8 +87,9 @@ async def handle_run_command(args: dict) -> str:
     cmd = args["cmd"]
     cwd = str(args.get("cwd", str(PROJECT_ROOT)))
     timeout = int(args.get("timeout", SHELL_TIMEOUT))
+    allow_chaining = bool(args.get("allow_chaining", False))
 
-    block_msg = _check_blocked(cmd)
+    block_msg = _check_blocked(cmd, allow_chaining=allow_chaining)
     if block_msg:
         logger.warning(f"run_command BLOCKED: {cmd}")
         return block_msg
@@ -61,7 +113,15 @@ async def handle_run_command(args: dict) -> str:
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                logger.warning("run_command process did not exit after kill")
+            return f"TIMEOUT: command exceeded {timeout}s"
         out = stdout.decode("utf-8", errors="replace")
         err = stderr.decode("utf-8", errors="replace")
         exit_code = proc.returncode
@@ -71,8 +131,6 @@ async def handle_run_command(args: dict) -> str:
         if err:
             parts.append(f"stderr:\n{err}")
         return "\n".join(parts)
-    except asyncio.TimeoutError:
-        return f"ERROR: Command timed out after {timeout}s"
     except Exception as e:
         logger.error(f"run_command failed: {e}", exc_info=True)
         return f"ERROR: {e}"
@@ -91,7 +149,7 @@ async def handle_run_powershell(args: dict) -> str:
     script = args["script"]
     timeout = int(args.get("timeout", SHELL_TIMEOUT))
 
-    block_msg = _check_blocked(script)
+    block_msg = _check_blocked(script, allow_chaining=True)  # PS scripts naturally chain
     if block_msg:
         logger.warning("run_powershell BLOCKED")
         return block_msg
@@ -131,7 +189,15 @@ async def handle_run_powershell(args: dict) -> str:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(PROJECT_ROOT),
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                logger.warning("run_powershell process did not exit after kill")
+            return f"TIMEOUT: PowerShell exceeded {timeout}s"
         out = stdout.decode("utf-8", errors="replace")
         err = stderr.decode("utf-8", errors="replace")
         parts = [f"exit_code: {proc.returncode}"]
@@ -140,8 +206,6 @@ async def handle_run_powershell(args: dict) -> str:
         if err:
             parts.append(f"stderr:\n{err}")
         return "\n".join(parts)
-    except asyncio.TimeoutError:
-        return f"ERROR: PowerShell timed out after {timeout}s"
     except Exception as e:
         logger.error(f"run_powershell failed: {e}", exc_info=True)
         return f"ERROR: {e}"

@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import tempfile
 import os
 
-from mcp_server.config import PROJECT_ROOT, SHELL_TIMEOUT, validate_path
+from mcp_server.config import PROJECT_ROOT, CODE_TIMEOUT, SHELL_TIMEOUT, validate_path
 from mcp_server.os_utils import check_tool_available
 
 logger = logging.getLogger(__name__)
@@ -26,12 +27,18 @@ async def _run_exec(
     cmd: list[str],
     cwd: str = None,
     timeout: int = None,
+    extra_env: dict = None,
 ) -> str:
     """Run a command via create_subprocess_exec and return formatted output."""
     resolved_cwd = cwd or str(PROJECT_ROOT)
-    resolved_timeout = timeout or SHELL_TIMEOUT
+    resolved_timeout = timeout or CODE_TIMEOUT
 
     logger.info(f"code exec: {' '.join(cmd)} (cwd={resolved_cwd})")
+
+    env = None
+    if extra_env:
+        import os as _os
+        env = {**_os.environ, **extra_env}
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -39,10 +46,19 @@ async def _run_exec(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=resolved_cwd,
+            env=env,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=resolved_timeout
-        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=resolved_timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                logger.warning("code exec process did not exit after kill")
+            return f"TIMEOUT: command exceeded {resolved_timeout}s"
         out = stdout.decode("utf-8", errors="replace")
         err = stderr.decode("utf-8", errors="replace")
         exit_code = proc.returncode
@@ -55,8 +71,6 @@ async def _run_exec(
         if not out.strip() and not err.strip():
             parts.append("(no output)")
         return "\n".join(parts)
-    except asyncio.TimeoutError:
-        return f"ERROR: Command timed out after {resolved_timeout}s"
     except FileNotFoundError:
         return f"ERROR: '{cmd[0]}' is not installed or not found on PATH."
     except Exception as e:
@@ -75,9 +89,29 @@ def _find_python() -> str:
 
 def _find_node() -> str:
     """Find the best available Node.js executable."""
-    if check_tool_available("node"):
-        return "node"
-    return "node"  # fallback
+    for name in ("node", "nodejs"):
+        if check_tool_available(name):
+            return name
+    raise RuntimeError("OS_LIMITATION: node not installed")
+
+
+# Inline code blocklist patterns (#4)
+_CODE_BLOCKLIST = [
+    re.compile(r"\bos\.system\b"),
+    re.compile(r"\bsubprocess\b"),
+    re.compile(r"__import__\s*\(\s*['\"]os['\"]\s*\)"),
+    re.compile(r"\beval\s*\("),
+    re.compile(r"\bexec\s*\("),
+]
+
+
+def _check_code_blocked(code: str) -> str | None:
+    """Scan the first 4KB of inline code for dangerous patterns."""
+    snippet = code[:4096]
+    for pat in _CODE_BLOCKLIST:
+        if pat.search(snippet):
+            return f"BLOCKED: Inline code contains blocked pattern '{pat.pattern}'"
+    return None
 
 
 async def handle_run_python(args: dict) -> str:
@@ -93,7 +127,13 @@ async def handle_run_python(args: dict) -> str:
     file_path = args.get("file", "")
     code = args.get("code", "")
     cwd = args.get("cwd", str(PROJECT_ROOT))
-    timeout = int(args.get("timeout", SHELL_TIMEOUT))
+    timeout = int(args.get("timeout", CODE_TIMEOUT))
+
+    # Validate cwd (#4)
+    try:
+        validate_path(cwd)
+    except PermissionError as e:
+        return f"PERMISSION_ERROR: cwd {e}"
 
     python = _find_python()
 
@@ -112,8 +152,18 @@ async def handle_run_python(args: dict) -> str:
         return await _run_exec([python, str(resolved)], cwd=cwd, timeout=timeout)
 
     elif code:
-        # Execute an inline snippet via -c flag
-        return await _run_exec([python, "-c", code], cwd=cwd, timeout=timeout)
+        # Check for dangerous patterns in inline code
+        block_msg = _check_code_blocked(code)
+        if block_msg:
+            return block_msg
+
+        # Execute in isolated mode: -I strips user site-packages, no PYTHONSTARTUP
+        return await _run_exec(
+            [python, "-I", "-c", code],
+            cwd=cwd,
+            timeout=timeout,
+            extra_env={"PYTHONNOUSERSITE": "1"},
+        )
 
     else:
         return "ERROR: Provide either 'file' (path to .py file) or 'code' (inline Python snippet)."
@@ -132,15 +182,18 @@ async def handle_run_node(args: dict) -> str:
     file_path = args.get("file", "")
     code = args.get("code", "")
     cwd = args.get("cwd", str(PROJECT_ROOT))
-    timeout = int(args.get("timeout", SHELL_TIMEOUT))
+    timeout = int(args.get("timeout", CODE_TIMEOUT))
 
-    node = _find_node()
+    # Validate cwd (#4)
+    try:
+        validate_path(cwd)
+    except PermissionError as e:
+        return f"PERMISSION_ERROR: cwd {e}"
 
-    if not check_tool_available(node):
-        return (
-            "ERROR: Node.js ('node') is not installed or not found on PATH. "
-            "Install Node.js from https://nodejs.org and try again."
-        )
+    try:
+        node = _find_node()
+    except RuntimeError as e:
+        return f"ERROR: {e}"
 
     if file_path:
         # Execute a .js file
@@ -157,8 +210,12 @@ async def handle_run_node(args: dict) -> str:
         return await _run_exec([node, str(resolved)], cwd=cwd, timeout=timeout)
 
     elif code:
-        # Execute an inline snippet via -e flag
-        return await _run_exec([node, "-e", code], cwd=cwd, timeout=timeout)
+        # Execute inline snippet with restricted flags
+        return await _run_exec(
+            [node, "--disable-proto=delete", "-e", code],
+            cwd=cwd,
+            timeout=timeout,
+        )
 
     else:
         return "ERROR: Provide either 'file' (path to .js file) or 'code' (inline JavaScript snippet)."

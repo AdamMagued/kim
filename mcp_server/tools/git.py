@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from mcp_server.config import PROJECT_ROOT, SHELL_TIMEOUT
+from mcp_server.config import PROJECT_ROOT, SHELL_TIMEOUT, validate_path
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,11 @@ async def _run_git(*args: str, cwd: str = None, timeout: int = None) -> str:
     Returns formatted output string with exit code, stdout, and stderr.
     """
     resolved_cwd = cwd or str(PROJECT_ROOT)
+    try:
+        validate_path(resolved_cwd)
+    except PermissionError as e:
+        return f"PERMISSION_ERROR: cwd {e}"
+        
     resolved_timeout = timeout or SHELL_TIMEOUT
 
     cmd = ["git"] + list(args)

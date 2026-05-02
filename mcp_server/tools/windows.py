@@ -23,6 +23,23 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# AppleScript escaping helper (#1 — prevent injection via window titles)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _applescript_quote(s: str) -> str:
+    """Escape a string for safe interpolation into AppleScript source.
+
+    Escapes backslashes and double-quotes, then wraps in literal "...".
+    Raises ValueError if the string contains a null byte (unsupported by
+    osascript and could indicate an injection attempt).
+    """
+    if "\x00" in s:
+        raise ValueError("OS_LIMITATION: title contains null byte")
+    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Windows backend (pygetwindow)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -75,7 +92,15 @@ async def _run_osascript(script: str) -> tuple[int, str, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except asyncio.TimeoutError:
+        proc.kill()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            logger.warning("osascript process did not exit after kill")
+        return (1, "", "TIMEOUT: osascript exceeded 10s")
     return (
         proc.returncode or 0,
         stdout.decode("utf-8", errors="replace").strip(),
@@ -111,13 +136,17 @@ async def _get_windows_mac() -> str:
 
 
 async def _focus_window_mac(title: str) -> str:
-    # First find which app owns a window matching the title
+    try:
+        safe_title = _applescript_quote(title)
+    except ValueError as e:
+        return f"ERROR: {e}"
+    # Use AppleScript 'contains' with safely escaped string
     script = f'''
         tell application "System Events"
             set allProcs to (every process whose visible is true)
             repeat with proc in allProcs
                 try
-                    set wins to every window of proc whose name contains "{title}"
+                    set wins to every window of proc whose name contains {safe_title}
                     if (count of wins) > 0 then
                         set frontmost of proc to true
                         perform action "AXRaise" of item 1 of wins
@@ -126,7 +155,7 @@ async def _focus_window_mac(title: str) -> str:
                 end try
             end repeat
         end tell
-        return "ERROR: No window found with title containing '{title}'"
+        return "ERROR: No window found with title containing " & {safe_title}
     '''
     exit_code, out, err = await _run_osascript(script)
     if exit_code != 0:
@@ -135,12 +164,16 @@ async def _focus_window_mac(title: str) -> str:
 
 
 async def _resize_window_mac(title: str, x: int, y: int, width: int, height: int) -> str:
+    try:
+        safe_title = _applescript_quote(title)
+    except ValueError as e:
+        return f"ERROR: {e}"
     script = f'''
         tell application "System Events"
             set allProcs to (every process whose visible is true)
             repeat with proc in allProcs
                 try
-                    set wins to every window of proc whose name contains "{title}"
+                    set wins to every window of proc whose name contains {safe_title}
                     if (count of wins) > 0 then
                         set w to item 1 of wins
                         set position of w to {{{x}, {y}}}
@@ -150,7 +183,7 @@ async def _resize_window_mac(title: str, x: int, y: int, width: int, height: int
                 end try
             end repeat
         end tell
-        return "ERROR: No window found with title containing '{title}'"
+        return "ERROR: No window found with title containing " & {safe_title}
     '''
     exit_code, out, err = await _run_osascript(script)
     if exit_code != 0:

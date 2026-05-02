@@ -20,7 +20,20 @@ Usage (Claude Code CLI):
 
 import asyncio
 import logging
+import os
 import sys
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Protect MCP stdio pipe from print() corruption
+# ──────────────────────────────────────────────────────────────────────────────
+import builtins
+_orig_print = builtins.print
+def _safe_print(*args, **kwargs):
+    if "file" not in kwargs or kwargs["file"] is None:
+        kwargs["file"] = sys.stderr
+    _orig_print(*args, **kwargs)
+builtins.print = _safe_print
+# ──────────────────────────────────────────────────────────────────────────────
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -45,7 +58,11 @@ from mcp_server.tools.mouse import (
     handle_right_click,
     handle_scroll,
 )
-from mcp_server.tools.screen import handle_get_screen_info, handle_take_screenshot
+from mcp_server.tools.screen import (
+    handle_get_screen_info,
+    handle_take_annotated_screenshot,
+    handle_take_screenshot,
+)
 from mcp_server.tools.shell import handle_run_command, handle_run_powershell
 from mcp_server.tools.windows import (
     handle_focus_window,
@@ -175,6 +192,26 @@ _TOOLS: list[Tool] = [
         name="get_screen_info",
         description="Get screen resolution, DPI, and monitor layout.",
         inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="take_annotated_screenshot",
+        description=(
+            "Capture the screen with a visual ruler grid overlaid on the image. "
+            "The grid has labeled cross-markers (columns A-J, rows 1-10) that you can "
+            "use as reference points to calculate exact (X, Y) pixel coordinates for clicking. "
+            "Returns JSON with the annotated image (base64), a grid mapping of marker labels "
+            "to real screen coordinates, and instructions on how to interpolate coordinates. "
+            "USE THIS instead of take_screenshot when you need to click something on screen."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "scale": {"type": "number", "description": "Scale factor (0.0–1.0, default 0.75)", "default": 0.75},
+                "monitor": {"type": "integer", "description": "Monitor index (1 = primary)", "default": 1},
+                "grid_cols": {"type": "integer", "description": "Number of grid columns (default 10)", "default": 10},
+                "grid_rows": {"type": "integer", "description": "Number of grid rows (default 10)", "default": 10},
+            },
+        },
     ),
     # ── Mouse ────────────────────────────────────────────────────────────────
     Tool(
@@ -490,6 +527,7 @@ _DISPATCH = {
     "run_powershell": handle_run_powershell,
     "take_screenshot": handle_take_screenshot,
     "get_screen_info": handle_get_screen_info,
+    "take_annotated_screenshot": handle_take_annotated_screenshot,
     "click": handle_click,
     "double_click": handle_double_click,
     "right_click": handle_right_click,

@@ -23,9 +23,7 @@ class DeepSeekProvider(OpenAIProvider):
         if not api_key:
             raise EnvironmentError("DEEPSEEK_API_KEY is not set")
 
-        # Temporarily inject key so parent __init__ picks it up
-        os.environ.setdefault("OPENAI_API_KEY", api_key)
-
+        # Initialize the client directly without polluting OPENAI_API_KEY (#18)
         import openai
         self._client = openai.AsyncOpenAI(
             api_key=api_key,

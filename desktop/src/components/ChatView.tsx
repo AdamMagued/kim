@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { SessionInfo, KimMessage, Settings, KimAccount } from '../types';
+import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
 import { BrowserProviderPicker } from './BrowserProviderPicker';
@@ -33,7 +33,6 @@ interface ActivityItem {
   text: string;
 }
 
-let _activityCounter = 0;
 
 export function collapseMessages(msgs: KimMessage[]) {
   const res: {msg: KimMessage, retries: number}[] = [];
@@ -473,6 +472,7 @@ interface Props {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export function ChatView({ session, newChatMode, settings, onTaskDone, account, activeTab, activeProjectPath }: Props) {
+  const activityCounterRef = useRef(0);
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [newestMsgIdx, setNewestMsgIdx] = useState<number | null>(null);
@@ -494,6 +494,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [browserProvider, setBrowserProvider] = useState('claude');
   const [conversationId] = useState(() => makeConversationId());
   const activeResumeSessionId = session?.session_id ?? conversationId;
+  const activeResumeSessionIdRef = useRef(activeResumeSessionId);
+  useEffect(() => { activeResumeSessionIdRef.current = activeResumeSessionId; }, [activeResumeSessionId]);
 
   // Live conversation history for new-chat mode — persists across task runs
   // and doesn't get wiped by the disk-based message reload.
@@ -653,7 +655,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // ── Append to activity feed ─────────────────────────────────────────────────
   function appendRaw(line: string) {
     if (isDuplicate(line)) return;   // drop stdout/stderr duplicates
-    const id = ++_activityCounter;
+    const id = ++activityCounterRef.current;
 
     // Handle [STATS] token lines — update token counter, don't add to feed
     const statsMatch = line.match(/\[STATS\]\s+input_tokens=(\d+)\s+output_tokens=(\d+)\s+total_tokens=(\d+)/);
@@ -682,11 +684,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     if (!item) {
       if (line.includes('[UI] SCREENSHOT_FLASH')) {
         invoke('show_screenshot_flash').catch(() => {});
-        invoke('hide_main_window').catch(() => {});
-      } else if (line.includes('[UI] HIDE')) {
-        invoke('hide_main_window').catch(() => {});
-      } else if (line.includes('[UI] SHOW')) {
-        invoke('show_main_window').catch(() => {});
       }
       return;
     }
@@ -730,6 +727,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     }).then(fn => { unlistenError = fn; });
 
     listen<boolean>('kim-agent-done', event => {
+      invoke('set_task_active_mode', { active: false }).catch(() => {});
       const wasCancelled = cancelFlagRef.current;
       const hadNeedHelp = needHelpFlagRef.current;
       doneHandledRef.current = true;
@@ -742,7 +740,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       setMessageReloadNonce(v => v + 1);
       // Always refresh sessions — failed runs still create session files.
       // Pass the session ID so App.tsx can auto-navigate to the completed session.
-      onTaskDoneRef.current(activeResumeSessionId);
+      onTaskDoneRef.current(activeResumeSessionIdRef.current);
       if (!event.payload && !wasCancelled) {
         if (!hadNeedHelp) {
           setTaskError('agent-error');
@@ -757,6 +755,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     }).then(fn => { unlistenDone = fn; });
 
     listen<boolean>('kim-agent-cancelled', () => {
+      invoke('set_task_active_mode', { active: false }).catch(() => {});
       cancelFlagRef.current = true; // safety: also set here in case done fires later
       appendRaw('⏹ Task cancelled');
       setIsRunning(false);
@@ -813,6 +812,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     // Add user message to live history for chat bubble display
     setLiveHistory(prev => [...prev, { role: 'user', content: pending.text }]);
 
+    // Enter active task mode: hide main window, show cancel widget
+    invoke('set_task_active_mode', { active: true }).catch(() => {});
+
     try {
       await invoke('send_task', {
         task: pending.text,
@@ -824,6 +826,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       // kim-agent-done fires BEFORE invoke() rejects on process failure.
       // If the event already handled everything, skip the duplicate rejection.
       if (!doneHandledRef.current) {
+        // Always restore the main window — it was hidden before send_task was called.
+        invoke('set_task_active_mode', { active: false }).catch(() => {});
         setIsRunning(false);
         setTaskError(friendlyError(String(err)));
         setLastFailedTask(pending);
@@ -904,7 +908,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           const msg = messages[i];
           let text = typeof msg.content === 'string'
             ? msg.content
-            : msg.content.filter(b => b.type === 'text').map(b => (b as any).text).join('\n');
+            : msg.content.filter(b => b.type === 'text').map(b => (b as TextBlock).text).join('\n');
             
           if (text.startsWith('Task: ')) {
             text = text.substring(6).trim();

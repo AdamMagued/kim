@@ -318,9 +318,12 @@ class BrowserProvider(BaseProvider):
         # Each entry must have url_pattern + at least input/send/response selectors.
         # Selectors can be a string or a list; strings are wrapped in a list.
         self._site_configs = dict(SITE_CONFIGS)  # copy so class-level dict is untouched
-        for site_key, site_def in (self._config.get("custom_sites") or {}).items():
-            if not site_def.get("url_pattern"):
-                logger.warning(f"custom_sites.{site_key}: missing url_pattern, skipping")
+        custom_sites_cfg = self._config.get("custom_sites")
+        if not isinstance(custom_sites_cfg, dict):
+            custom_sites_cfg = {}
+        for site_key, site_def in custom_sites_cfg.items():
+            if not isinstance(site_def, dict) or not site_def.get("url_pattern"):
+                logger.warning(f"custom_sites.{site_key}: missing url_pattern or not a dict, skipping")
                 continue
             self._site_configs[site_key] = {
                 "url_pattern": site_def["url_pattern"],
@@ -498,6 +501,7 @@ class BrowserProvider(BaseProvider):
 
         # ── Try split send/result API first ──────────────────────────────
         try:
+            print(f"[STATUS] Sending message to {site}…", flush=True)
             async with httpx.AsyncClient(timeout=30) as send_client:
                 send_resp = await send_client.post(
                     f"{self._bridge_url}/v1/send",
@@ -549,6 +553,10 @@ class BrowserProvider(BaseProvider):
                 f"Bridge send OK: req_id={req_id}, site={send_data.get('site')}, "
                 f"confirmed={sent_confirmed}"
             )
+            if sent_confirmed:
+                print(f"[STATUS] Message sent to {site}. Waiting for response…", flush=True)
+            else:
+                print(f"[STATUS] Waiting for {site} to process…", flush=True)
 
         except httpx.ReadTimeout:
             logger.warning("Bridge /v1/send timed out, falling back to /v1/complete")
@@ -563,6 +571,7 @@ class BrowserProvider(BaseProvider):
 
         # ── Long-poll for result ─────────────────────────────────────────
         try:
+            print(f"[STATUS] {site} is thinking…", flush=True)
             async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_S) as result_client:
                 result_resp = await result_client.get(
                     f"{self._bridge_url}/v1/result/{req_id}",
@@ -609,6 +618,7 @@ class BrowserProvider(BaseProvider):
                 "content": f"NEED_HELP: In-app browser execution failed — {msg}",
             }
 
+        print(f"[STATUS] Reading {site}'s response…", flush=True)
         raw_response = data.get("response")
         if not raw_response or not isinstance(raw_response, str) or not raw_response.strip():
             return {
@@ -627,6 +637,7 @@ class BrowserProvider(BaseProvider):
     ) -> dict:
         """Monolithic /v1/complete fallback for older Rust binaries."""
         try:
+            print(f"[STATUS] Sending to AI provider…", flush=True)
             async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_S) as client:
                 resp = await client.post(
                     f"{self._bridge_url}/v1/complete",
@@ -1175,7 +1186,12 @@ class BrowserProvider(BaseProvider):
         # Click the send button (prefer aria-label="Send message")
         send_sel = await self._find_selector(page, cfg["send_selectors"])
         if send_sel:
-            await page.click(send_sel)
+            # Click the last matching button (fixes DeepSeek where generic 
+            # selectors like div[role='button'] match earlier elements)
+            loc = page.locator(send_sel)
+            count = await loc.count()
+            if count > 0:
+                await loc.nth(count - 1).click()
         else:
             logger.warning("Send button not found; pressing Enter")
             await page.keyboard.press("Enter")
@@ -1553,48 +1569,25 @@ class BrowserProvider(BaseProvider):
         return {"type": "text", "content": text}
 
     def _try_parse_tool_json(self, s: str) -> Optional[dict]:
+        import json5
+        import json_repair
         try:
             data = json.loads(s.strip())
-            if isinstance(data, dict) and "tool" in data:
-                return {
-                    "type": "tool_call",
-                    "tool": data["tool"],
-                    "args": data.get("args", data.get("arguments", {})),
-                }
-        except (json.JSONDecodeError, KeyError):
-            # Fallback for models that produce unescaped double quotes inside the JSON string
-            m_tool = re.search(r'"tool"\s*:\s*"([^"]+)"', s)
-            if m_tool:
-                tool_name = m_tool.group(1)
-                if tool_name == "write_file":
-                    m_path = re.search(r'"path"\s*:\s*"([^"]+)"', s)
-                    # Extract everything after "content": " up to the closing brace
-                    m_content = re.search(r'"content"\s*:\s*"(.*)"\s*\}\s*\}?\s*$', s, re.DOTALL)
-                    if m_path and m_content:
-                        # Fix up trailing quotes if the regex captured the closing quote of content
-                        content = m_content.group(1)
-                        if content.endswith('"'):
-                            content = content[:-1]
-                        return {
-                            "type": "tool_call",
-                            "tool": tool_name,
-                            "args": {
-                                "path": m_path.group(1),
-                                "content": content
-                            }
-                        }
-                elif tool_name == "run_command":
-                    m_cmd = re.search(r'"cmd"\s*:\s*"(.*)"\s*\}\s*\}?\s*$', s, re.DOTALL)
-                    if m_cmd:
-                        cmd = m_cmd.group(1)
-                        if cmd.endswith('"'):
-                            cmd = cmd[:-1]
-                        return {
-                            "type": "tool_call",
-                            "tool": "run_command",
-                            "args": {"cmd": cmd}
-                        }
-            pass
+        except json.JSONDecodeError:
+            try:
+                data = json5.loads(s.strip())
+            except Exception:
+                try:
+                    data = json_repair.loads(s.strip())
+                except Exception:
+                    return None
+
+        if isinstance(data, dict) and "tool" in data:
+            return {
+                "type": "tool_call",
+                "tool": data["tool"],
+                "args": data.get("args", data.get("arguments", {})),
+            }
         return None
 
     def _scan_for_json(self, text: str) -> Optional[dict]:

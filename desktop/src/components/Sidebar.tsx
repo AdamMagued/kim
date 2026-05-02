@@ -186,7 +186,7 @@ function ClawProjectTree({ project, onRemove, isActive, onSelect, onSelectSessio
                 )}
                 {branch.sessions.map(s => (
                   <div key={s.session_id} style={{ paddingLeft: 12 }}>
-                    <ClawSessionItem session={s as any} onSelectSession={(session) => onSelectSession({ ...session, project_path: project.path })} />
+                    <ClawSessionItem session={s} onSelectSession={(session) => onSelectSession({ ...session, project_path: project.path })} />
                   </div>
                 ))}
               </div>

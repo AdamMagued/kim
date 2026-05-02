@@ -145,15 +145,13 @@ async def handle_search_in_files(args: dict) -> str:
             cmd.append("/I")
         if is_regex:
             cmd.append("/R")
-        else:
-            cmd.append("/C:" + pattern)
-            pattern = None  # already embedded in /C:
+        
+        cmd.append("/C:" + pattern)
+        
         if include:
             cmd.append(os.path.join(search_dir, include))
         else:
             cmd.append(os.path.join(search_dir, "*"))
-        if pattern:
-            cmd.append(pattern)
 
         logger.info(f"search_in_files [findstr]: path={search_dir}")
         return await _run_search_cmd(cmd, cwd=search_dir, timeout=timeout)

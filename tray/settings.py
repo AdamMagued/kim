@@ -168,6 +168,9 @@ class SettingsWindow(tk.Toplevel):
             messagebox.showerror("Kim", f"Failed to save settings:\n{e}", parent=self)
             logger.error(f"Settings save error: {e}", exc_info=True)
 
+    # Fields whose entry values should be coerced to numeric types on save.
+    _NUMERIC_ENTRY_KEYS = {"screenshot_scale"}
+
     def _collect_config(self) -> None:
         for key, _label, wtype, _opts in _CONFIG_FIELDS:
             widget = self._config_widgets.get(key)
@@ -182,8 +185,9 @@ class SettingsWindow(tk.Toplevel):
                     continue
             elif wtype == "entry":
                 value = widget.get().strip()
-                # Coerce numeric-looking strings
-                if re.fullmatch(r"\d+(\.\d+)?", value):
+                # Only coerce numeric-looking strings for known-numeric keys
+                # (avoids mangling URLs or paths that happen to contain digits)
+                if key in self._NUMERIC_ENTRY_KEYS and re.fullmatch(r"\d+(\.\d+)?", value):
                     value = float(value) if "." in value else int(value)
             else:  # combo
                 value = widget.get().strip()
@@ -299,6 +303,10 @@ class SettingsWindow(tk.Toplevel):
             )
             w.grid(row=row_idx, column=1, sticky=tk.EW, padx=(0, 8), pady=6)
             self._env_widgets[key] = var
+            # Store direct reference to the Entry widget for fast show/hide toggle
+            if not hasattr(self, '_env_entry_widgets'):
+                self._env_entry_widgets: dict[str, tk.Entry] = {}
+            self._env_entry_widgets[key] = w
 
         # Toggle show/hide passwords
         tk.Button(
@@ -311,22 +319,11 @@ class SettingsWindow(tk.Toplevel):
     def _toggle_show_keys(self) -> None:
         self._keys_hidden = not self._keys_hidden
         show = "*" if self._keys_hidden else ""
+        entries = getattr(self, '_env_entry_widgets', {})
         for key, _label in _ENV_KEYS:
-            widget_var = self._env_widgets.get(key)
-            if widget_var is None:
-                continue
-            # find the Entry widget in the tab frame
-            for child in self.winfo_children():
-                self._set_show_recursive(child, key, show)
-
-    def _set_show_recursive(self, widget: tk.Widget, key: str, show: str) -> None:
-        """Recursively search for Entry widgets bound to the env key variable."""
-        if isinstance(widget, tk.Entry):
-            try:
-                var = self._env_widgets.get(key)
-                if var and str(widget.cget("textvariable")) == str(var):
-                    widget.config(show=show)
-            except Exception:
-                pass
-        for child in widget.winfo_children():
-            self._set_show_recursive(child, key, show)
+            entry = entries.get(key)
+            if entry is not None:
+                try:
+                    entry.config(show=show)
+                except Exception:
+                    pass
