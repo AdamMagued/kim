@@ -306,13 +306,24 @@ class BrowserProvider(BaseProvider):
         self._last_chat_site: Optional[str] = None
 
     def reset_session(self) -> None:
-        """Call before each new task to force system prompt re-injection.
-        Without this, reusing the same BrowserProvider instance for multiple
-        tasks skips the system prompt on the second task and beyond.
+        """Call before each new task to prepare for the next completion.
+
+        We intentionally do NOT reset _sent_system_prompt here.  The browser
+        chat UI (Gemini, Claude.ai, ChatGPT) retains full conversation history
+        between tasks.  Re-injecting the system prompt + tool list on every task
+        causes the LLM to see it as a new conversation and respond with a
+        greeting instead of using tools.
+
+        _sent_system_prompt is only reset to False on the very first use
+        (in __init__) or when the chat tab URL changes (detected lazily in
+        _find_chat_page).  This ensures the system prompt is sent once per
+        browser session, not once per user message.
         """
-        self._sent_system_prompt = False
-        self._last_chat_page_url = None
-        self._last_chat_site = None
+        # Do NOT reset _sent_system_prompt — see docstring above.
+        # Only clear the sticky tab preference so _find_chat_page re-validates
+        # the tab is still alive (it will flip _sent_system_prompt itself if
+        # the URL has changed since the last task).
+        pass
 
         # Merge user-defined custom sites from config.yaml into the lookup table.
         # Each entry must have url_pattern + at least input/send/response selectors.
@@ -887,6 +898,7 @@ class BrowserProvider(BaseProvider):
 
         if focused_matches:
             page, site_key = focused_matches[0]
+            self._maybe_reset_system_prompt(page.url)
             self._last_chat_page_url = page.url
             self._last_chat_site = site_key
             logger.info(f"Using focused {site_key} tab: {page.url}")
@@ -895,16 +907,32 @@ class BrowserProvider(BaseProvider):
         if self._preferred_site:
             for page, site_key in matches:
                 if site_key == self._preferred_site:
+                    self._maybe_reset_system_prompt(page.url)
                     self._last_chat_page_url = page.url
                     self._last_chat_site = site_key
                     logger.info(f"Found preferred {site_key} tab: {page.url}")
                     return page, site_key
 
         page, site_key = matches[0]
+        self._maybe_reset_system_prompt(page.url)
         self._last_chat_page_url = page.url
         self._last_chat_site = site_key
         logger.info(f"Found {site_key} tab: {page.url}")
         return page, site_key
+
+    def _maybe_reset_system_prompt(self, new_url: str) -> None:
+        """Reset _sent_system_prompt if the chat tab URL has changed.
+
+        This is the ONLY place where _sent_system_prompt is reset after init.
+        A URL change means the user opened a new chat or navigated away, so the
+        system prompt needs to be re-injected on the next completion call.
+        """
+        if self._last_chat_page_url and self._last_chat_page_url != new_url:
+            logger.info(
+                f"Chat tab URL changed ({self._last_chat_page_url!r} → {new_url!r}), "
+                "will re-inject system prompt."
+            )
+            self._sent_system_prompt = False
 
     # ==================================================================
     # Popup dismissal
@@ -1542,8 +1570,11 @@ class BrowserProvider(BaseProvider):
             - fenced ``json`` code blocks           → ``{"type": "tool_call", …}``
             - bare JSON ``{"tool": …}``             → ``{"type": "tool_call", …}``
         """
-        # Strip the bridge sentinel before any parsing
-        text = text.replace(completion_hash, "").strip()
+        # Strip the bridge sentinel before any parsing.
+        # Use a regex that matches ANY KIM_ hash (not just the current one) so
+        # that stale hashes from previous turns — which Gemini sometimes repeats
+        # from its own chat history — are always removed.
+        text = re.sub(r'\bKIM_[a-f0-9]{8}\b', '', text).strip()
 
         # Explicit completion/help signals — use word-boundary search so Gemini's
         # DOM label ("Gemini TASK_COMPLETE: ...") doesn't block detection after
