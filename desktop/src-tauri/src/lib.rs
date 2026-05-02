@@ -2291,6 +2291,7 @@ fn build_bridge_complete_script(
     }
     }, 0);
 })();
+"#;
     let script = format!("{}{}", header, body);
     Ok(script)
 }
