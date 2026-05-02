@@ -91,15 +91,15 @@ class ConversationMemory:
         """Trim to max_messages, keeping a coherent user/assistant sequence."""
         if len(self._messages) <= self.max_messages:
             return
-            
+
         excess = len(self._messages) - self.max_messages
         # Find the first user message within the allowed window
         for i in range(excess, len(self._messages)):
             if self._messages[i]["role"] == "user":
                 self._messages = self._messages[i:]
                 return
-                
-        # If no user message is found in the trailing portion, 
+
+        # If no user message is found in the trailing portion,
         # keep at least the very last message rather than emptying.
         self._messages = self._messages[-1:]
 

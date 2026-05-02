@@ -151,8 +151,12 @@ class OpenAIProvider(BaseProvider):
         if msg.tool_calls:
             if len(msg.tool_calls) > 1:
                 return {
-                    "type": "text", 
-                    "content": f"SYSTEM ERROR: You requested {len(msg.tool_calls)} parallel tool calls, but only 1 is supported at a time. Please pick the most important one and try again.",
+                    "type": "text",
+                    "content": (
+                        f"SYSTEM ERROR: You requested {len(msg.tool_calls)} "
+                        "parallel tool calls, but only 1 is supported at a time. "
+                        "Please pick the most important one and try again."
+                    ),
                     "usage": usage
                 }
             tc = msg.tool_calls[0]

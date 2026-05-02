@@ -466,10 +466,12 @@ class KimAgent:
                 if tool_name == "batch":
                     calls = tool_args.get("calls", [])
                     if not isinstance(calls, list):
-                        self._session_store.append_message({"role": "user", "content": "[Tool result: batch]\nERROR: 'calls' must be a list."})
+                        self._session_store.append_message(
+                            {"role": "user", "content": "[Tool result: batch]\nERROR: 'calls' must be a list."})
                         continue
 
-                    _BATCH_SAFE = {"read_file", "list_dir", "git_status", "git_diff", "git_log", "search_in_files", "find_files", "get_screen_info"}
+                    _BATCH_SAFE = {"read_file", "list_dir", "git_status", "git_diff",
+                                   "git_log", "search_in_files", "find_files", "get_screen_info"}
                     batch_results = []
                     aborted_after = -1
                     ok = True
@@ -483,7 +485,10 @@ class KimAgent:
                         sub_args = call.get("args", {})
 
                         if sub_tool not in _BATCH_SAFE:
-                            batch_results.append(f"Call {idx} ({sub_tool}): ERROR: Tool '{sub_tool}' is not safe for batching. Allowed: {', '.join(_BATCH_SAFE)}.")
+                            batch_results.append(
+                                f"Call {idx} ({sub_tool}): ERROR: Tool '{sub_tool}' "
+                                f"is not safe for batching. Allowed: {', '.join(_BATCH_SAFE)}."
+                            )
                             ok = False
                             aborted_after = idx
                             break
@@ -506,10 +511,11 @@ class KimAgent:
                             break
 
                     summary_obj = {"ok": ok}
-                    if not ok: summary_obj["aborted_after"] = aborted_after
+                    if not ok:
+                        summary_obj["aborted_after"] = aborted_after
                     result_text = json.dumps(summary_obj) + "\n\n" + "\n---\n".join(batch_results)
                     self._log("INFO", f"Batch result: {result_text[:200]}")
-                    
+
                     user_content = f"[Tool result: batch]\n{result_text}"
                     self.memory.add_user(user_content)
                     self._session_store.append_message({"role": "user", "content": user_content})
@@ -622,15 +628,16 @@ class KimAgent:
                     return {"success": False, "summary": f"NEED_HELP: {reason}", "screenshot": last_screenshot_b64}
 
                 self._log("DEBUG", f"Text (continuing): {content[:120]}")
-                
+
                 consecutive_continues += 1
                 if consecutive_continues >= 3:
                     msg = "NEED_HELP: Model is stuck in a conversational loop without calling tools."
                     self._log("WARN", msg)
                     return {"success": False, "summary": msg, "screenshot": last_screenshot_b64}
-                
+
                 # Don't force a screenshot — let the LLM call take_screenshot if it needs one.
-                self.memory.add_user("Continue. What is your next action? Use take_screenshot if you need to see the screen.")
+                self.memory.add_user(
+                    "Continue. What is your next action? Use take_screenshot if you need to see the screen.")
                 continue
 
         self._log("WARN", f"Max iterations ({self.max_iterations}) reached")
@@ -844,8 +851,12 @@ You MUST respond in EXACTLY one of these formats on every turn:
    {{"tool": "<tool_name>", "args": {{<arguments>}}}}
 
    You can also batch multiple read-only/independent tools at once to save time:
-   {{"tool": "batch", "args": {{"calls": [{{"tool": "list_dir", "args": {{"path": "."}}}}, {{"tool": "read_file", ...}}]}}}}
-   (NOTE: Do NOT put mutating tools like write_file, run_command, or take_screenshot inside a batch. Use them standalone.)
+   {{"tool": "batch", "args": {{"calls": [
+     {{"tool": "list_dir", "args": {{"path": "."}}}},
+     {{"tool": "read_file", "args": {{"path": "file.txt"}}}}
+   ]}}}}
+   (NOTE: Do NOT put mutating tools like write_file, run_command, or
+   take_screenshot inside a batch. Use them standalone.)
 
 2. **Task complete**:
    TASK_COMPLETE: <one-sentence summary of what was accomplished>
@@ -859,7 +870,8 @@ You MUST respond in EXACTLY one of these formats on every turn:
 - After every click or keyboard action, consider whether you need to verify the result.
 - Before TASK_COMPLETE on any visual task, take a final screenshot to verify.
 - Prefer run_command for launching apps (e.g. {_LAUNCH_EXAMPLE}).
-- For shell commands, prefer single quotes over double quotes inside the cmd string. Example: `grep -E 'mcp|playwright'` instead of `grep -E "mcp|playwright"`.
+- For shell commands, prefer single quotes over double quotes inside the cmd string.
+  Example: `grep -E 'mcp|playwright'` instead of `grep -E "mcp|playwright"`.
 - Prefer the batch tool over chaining shell commands when the goal is information retrieval.
 - Use {_PATH_STYLE}.
 - Use focus_window before typing into an application.
@@ -987,7 +999,8 @@ async def mcp_agent_context(
                 logger.debug("tray.voice not available — voice disabled")
 
     async with mcp_session_context(config) as session:
-        store = SessionStore(base_dir=session_dir, session_id=resume_session_id) if (session_dir or resume_session_id) else SessionStore()
+        store = SessionStore(base_dir=session_dir, session_id=resume_session_id) if (
+            session_dir or resume_session_id) else SessionStore()
         agent = KimAgent(
             config=config, session=session, provider=provider,
             ui_bridge=ui_bridge, voice_engine=_voice,
