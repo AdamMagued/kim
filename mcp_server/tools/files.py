@@ -21,10 +21,26 @@ async def handle_read_file(args: dict) -> str:
     return content
 
 
+import base64
+
 async def handle_write_file(args: dict) -> str:
     path = validate_path(args["path"])
     content = args["content"]
     path.parent.mkdir(parents=True, exist_ok=True)
+    
+    if content.startswith("data:") and ";base64," in content:
+        try:
+            # Format: data:[<mediatype>][;base64],<data>
+            _, b64data = content.split(";base64,", 1)
+            binary_content = base64.b64decode(b64data)
+            async with aiofiles.open(path, "wb") as f:
+                await f.write(binary_content)
+            logger.info(f"write_file: {path} ({len(binary_content)} bytes)")
+            return f"Written {len(binary_content)} bytes to {path}"
+        except Exception as e:
+            logger.warning(f"Failed to decode base64 for {path}: {e}")
+            # Fall back to text if decoding fails
+
     async with aiofiles.open(path, "w", encoding="utf-8") as f:
         await f.write(content)
     logger.info(f"write_file: {path} ({len(content)} chars)")
@@ -41,13 +57,23 @@ async def handle_list_dir(args: dict) -> str:
     entries = []
     if recursive:
         for root, dirs, files in os.walk(path):
+            # Prune noisy directories in-place so os.walk doesn't descend into them
+            dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "venv", ".venv", "__pycache__", ".next", ".nuxt"}]
             rel_root = Path(root).relative_to(path)
             for d in sorted(dirs):
                 entries.append(f"[DIR]  {rel_root / d}")
             for fname in sorted(files):
                 fpath = Path(root) / fname
-                size = fpath.stat().st_size
+                try:
+                    size = fpath.stat().st_size
+                except OSError:
+                    size = 0
                 entries.append(f"[FILE] {rel_root / fname}  ({size} bytes)")
+            
+            if len(entries) > 500:
+                entries = entries[:500]
+                entries.append("... (truncated at 500 items. Use find_files or search instead)")
+                break
     else:
         for entry in sorted(path.iterdir(), key=lambda e: (e.is_file(), e.name)):
             if entry.is_dir():

@@ -121,9 +121,14 @@
 
   // ── MutationObserver ─────────────────────────────────────────────────────
 
+  let observerTimer = null;
   const observer = new MutationObserver(() => {
     if (loopEnabled && !busy && isSendReady()) {
-      setTimeout(handleResponse, 600); // debounce
+      if (observerTimer) clearTimeout(observerTimer);
+      observerTimer = setTimeout(() => {
+        observerTimer = null;
+        handleResponse();
+      }, 600);
     }
   });
 

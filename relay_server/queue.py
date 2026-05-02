@@ -36,7 +36,11 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.environ.get("RELAY_DB_PATH", "relay.db")
+from pathlib import Path
+
+# Default DB is created next to queue.py if RELAY_DB_PATH isn't set
+_DEFAULT_DB = str(Path(__file__).resolve().parent / "relay.db")
+DB_PATH = os.environ.get("RELAY_DB_PATH", _DEFAULT_DB)
 
 STALE_PENDING_S = int(os.environ.get("STALE_PENDING_S", 300))   # 5 min
 STALE_RUNNING_S = int(os.environ.get("STALE_RUNNING_S", 600))   # 10 min

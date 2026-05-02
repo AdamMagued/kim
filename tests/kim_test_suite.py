@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -184,7 +185,7 @@ def number_in_range(lo: float, hi: float):
 
 
 # ---------------------------------------------------------------------------
-# kimctl wrappers
+# kimctl wrappers (bridge mode — requires running desktop app)
 # ---------------------------------------------------------------------------
 
 def kimctl_send(task: str, provider: Optional[str], timeout: int) -> dict:
@@ -234,6 +235,140 @@ def kimctl_cancel():
 
 def kimctl_new_chat():
     subprocess.run(KIMCTL + ["browser", "new-chat"], capture_output=True, timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# Direct mode helpers (no bridge — runs agent subprocess directly)
+# ---------------------------------------------------------------------------
+
+PYTHON_VENV = REPO_ROOT / "venv" / "bin" / "python"
+SESSIONS_DIR = REPO_ROOT / "kim_sessions"
+
+
+def _find_python() -> str:
+    """Find the venv Python interpreter."""
+    if PYTHON_VENV.exists():
+        return str(PYTHON_VENV)
+    # Fallback
+    for candidate in [REPO_ROOT / ".venv" / "bin" / "python", "python3", "python"]:
+        p = Path(candidate) if "/" in str(candidate) else candidate
+        try:
+            if isinstance(p, Path) and p.exists():
+                return str(p)
+            subprocess.run([str(p), "--version"], capture_output=True, timeout=5)
+            return str(p)
+        except Exception:
+            continue
+    return sys.executable
+
+
+def direct_send(task: str, provider: str, timeout: int) -> dict:
+    """Run the agent directly as a subprocess and wait for completion."""
+    python = _find_python()
+
+    # Generate a unique session ID for this test
+    ts = int(time.time() * 1000)
+    session_id = f"test-{ts:x}"
+
+    session_dir = str(SESSIONS_DIR)
+
+    cmd = [
+        python, "-m", "orchestrator.agent",
+        "--task", task,
+        "--provider", provider,
+        "--session-dir", session_dir,
+        "--resume", session_id,
+    ]
+
+    env = os.environ.copy()
+    env["PROJECT_ROOT"] = str(REPO_ROOT)
+    env["PYTHONPATH"] = str(REPO_ROOT)
+
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 10,
+            cwd=str(REPO_ROOT),
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "status": "timeout", "error": "agent subprocess timed out",
+                "session_id": session_id}
+
+    combined = r.stdout + r.stderr
+
+    # Check for TASK_COMPLETE in output
+    m_complete = re.search(
+        r"\bTASK_COMPLETE:\s*(.+)$", combined, re.IGNORECASE | re.MULTILINE
+    )
+    if m_complete:
+        return {
+            "ok": True,
+            "status": "complete",
+            "summary": m_complete.group(1).strip(),
+            "session_id": session_id,
+        }
+
+    # Check for NEED_HELP
+    m_help = re.search(
+        r"\bNEED_HELP:\s*(.+)$", combined, re.IGNORECASE | re.MULTILINE
+    )
+    if m_help:
+        return {
+            "ok": False,
+            "status": "need_help",
+            "reason": m_help.group(1).strip(),
+            "session_id": session_id,
+        }
+
+    # Check for SUCCESS/FAILED in the output
+    m_result = re.search(r"\[(SUCCESS|FAILED)\]\s*(.+)$", combined, re.MULTILINE)
+    if m_result:
+        status_str = m_result.group(1)
+        summary = m_result.group(2).strip()
+        return {
+            "ok": status_str == "SUCCESS",
+            "status": "complete" if status_str == "SUCCESS" else "failed",
+            "summary": summary,
+            "session_id": session_id,
+        }
+
+    # If the process exited with error, report it
+    if r.returncode != 0:
+        return {
+            "ok": False,
+            "status": "failed",
+            "error": f"Agent exited with code {r.returncode}: {combined[-500:]}",
+            "session_id": session_id,
+        }
+
+    return {
+        "ok": False,
+        "status": "failed",
+        "error": f"No TASK_COMPLETE found: {combined[-300:]}",
+        "session_id": session_id,
+    }
+
+
+def direct_show(session_id: str) -> list[dict]:
+    """Load session messages from JSONL files directly."""
+    if not SESSIONS_DIR.exists():
+        return []
+    for date_dir in sorted(SESSIONS_DIR.iterdir(), reverse=True):
+        if not date_dir.is_dir():
+            continue
+        candidate = date_dir / f"{session_id}.jsonl"
+        if candidate.exists():
+            messages = []
+            for line in candidate.read_text(encoding="utf-8").strip().splitlines():
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            return messages
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +876,156 @@ TESTS: list[TestCase] = [
             must_contain("v4"),
         ],
     ),
+
+    # ════════════════════════════════════════════════════════════════════════
+    # VISUAL RULER GRID — annotated screenshot calibration dots
+    # ════════════════════════════════════════════════════════════════════════
+
+    TestCase(
+        name="annotated_screenshot_basic",
+        task=(
+            "Take an annotated screenshot (use take_annotated_screenshot) and tell me "
+            "which grid marker (e.g. A1, E5, J10) is closest to the Apple menu icon "
+            "in the top-left corner of the screen."
+        ),
+        timeout=180,
+        tags=["visual", "grid"],
+        assertions=[
+            must_call_tool("take_annotated_screenshot"),
+            must_match(r"[A-J]\d"),  # Should mention a grid marker
+        ],
+    ),
+    TestCase(
+        name="annotated_screenshot_grid_mapping",
+        task=(
+            "Take an annotated screenshot and report the grid coordinates of "
+            "marker E5. Just give me the x,y numbers from the grid mapping."
+        ),
+        timeout=120,
+        tags=["visual", "grid"],
+        assertions=[
+            must_call_tool("take_annotated_screenshot"),
+            must_match(r"\d{2,4}"),  # Should report coordinates
+        ],
+    ),
+
+    # ════════════════════════════════════════════════════════════════════════
+    # CLICK — OS-level clicking via annotated screenshot + click tool
+    # ════════════════════════════════════════════════════════════════════════
+
+    TestCase(
+        name="click_open_safari_from_dock",
+        task=(
+            "Open Safari by clicking its icon in the macOS Dock. "
+            "Use take_annotated_screenshot to see the screen with the ruler grid, "
+            "identify where the Safari icon is in the Dock, use the grid markers "
+            "to calculate the exact coordinates, and click it. "
+            "Then take a regular screenshot to verify Safari opened."
+        ),
+        timeout=240,
+        tags=["click", "visual", "chain"],
+        assertions=[
+            must_call_tool("take_annotated_screenshot"),
+            must_call_tool("click"),
+            must_call_tool("take_screenshot"),
+        ],
+    ),
+    TestCase(
+        name="click_open_finder_from_dock",
+        task=(
+            "Open Finder by clicking its icon in the macOS Dock. "
+            "Use take_annotated_screenshot to see the screen with the ruler grid, "
+            "find the Finder icon (blue smiley face, usually leftmost in the Dock), "
+            "use the grid markers to calculate the exact click coordinates, "
+            "and click it. Then verify it opened with a screenshot."
+        ),
+        timeout=240,
+        tags=["click", "visual", "chain"],
+        assertions=[
+            must_call_tool("take_annotated_screenshot"),
+            must_call_tool("click"),
+        ],
+    ),
+    TestCase(
+        name="click_apple_menu",
+        task=(
+            "Click the Apple menu (the Apple logo in the top-left corner of the screen). "
+            "Use take_annotated_screenshot to see the screen, calculate the position "
+            "of the Apple logo using the grid markers, and click it. "
+            "Then take a screenshot to verify the Apple menu opened."
+        ),
+        timeout=180,
+        tags=["click", "visual"],
+        assertions=[
+            must_call_tool("take_annotated_screenshot"),
+            must_call_tool("click"),
+            must_call_tool("take_screenshot"),
+        ],
+    ),
+
+    # ════════════════════════════════════════════════════════════════════════
+    # HARD — complex multi-step tasks requiring reasoning + tools
+    # ════════════════════════════════════════════════════════════════════════
+
+    TestCase(
+        name="hard_find_largest_file",
+        task=(
+            "Find the 3 largest Python files (by line count) in the orchestrator/ directory. "
+            "Report their names and approximate line counts."
+        ),
+        timeout=180,
+        tags=["hard", "shell", "search"],
+        assertions=[
+            must_match(r"\d+"),  # Should report line counts
+            must_contain(".py"),
+        ],
+    ),
+    TestCase(
+        name="hard_git_status_and_write",
+        task=(
+            "Check the git status of this repository. Write the number of modified files "
+            "to a file called kim_git_report.txt. Then read it back to confirm."
+        ),
+        timeout=180,
+        tags=["hard", "chain", "files"],
+        assertions=[
+            must_call_tool("git_status"),
+            must_call_tool("write_file"),
+            must_call_tool("read_file"),
+            file_was_created("kim_git_report.txt"),
+        ],
+    ),
+    TestCase(
+        name="hard_screenshot_then_describe_and_log",
+        task=(
+            "Take a screenshot of the current screen. Describe what application windows "
+            "are currently visible. Write your description to a file called "
+            "kim_screen_report.txt. Then read it back to confirm."
+        ),
+        timeout=240,
+        tags=["hard", "visual", "files", "chain"],
+        assertions=[
+            must_call_tool("take_screenshot"),
+            must_call_tool("write_file"),
+            file_was_created("kim_screen_report.txt"),
+        ],
+    ),
+    TestCase(
+        name="hard_conditional_logic",
+        task=(
+            "Check if the file 'config.yaml' exists (use list_dir or read_file). "
+            "If it exists, write 'CONFIG_EXISTS' to kim_condition_test.txt. "
+            "If it doesn't exist, write 'CONFIG_MISSING'. "
+            "Then read the file back and report what you wrote."
+        ),
+        timeout=180,
+        tags=["hard", "chain", "files"],
+        assertions=[
+            file_was_created("kim_condition_test.txt"),
+            file_contains("kim_condition_test.txt", "CONFIG_EXISTS"),
+            must_contain("CONFIG_EXISTS"),
+        ],
+    ),
 ]
 
 
@@ -769,6 +1054,10 @@ ARTIFACTS = [
     "kim_stress_4.txt",
     "kim_stress_5.txt",
     "batch_unsafe_test.txt",
+    # New test artifacts
+    "kim_git_report.txt",
+    "kim_screen_report.txt",
+    "kim_condition_test.txt",
 ]
 
 
@@ -781,7 +1070,8 @@ def cleanup():
 # Runner
 # ---------------------------------------------------------------------------
 
-def run_test(tc: TestCase, provider: Optional[str], skip_slow: bool) -> TestResult:
+def run_test(tc: TestCase, provider: Optional[str], skip_slow: bool,
+             direct: bool = False) -> TestResult:
     if skip_slow and "stress" in tc.tags:
         return TestResult(tc.name, "skip", 0, failure_reason="--skip-slow")
 
@@ -795,19 +1085,26 @@ def run_test(tc: TestCase, provider: Optional[str], skip_slow: bool) -> TestResu
 
     start = time.monotonic()
 
-    status = kimctl_status()
-    if not status:
-        return TestResult(tc.name, "transport", 0,
-                          failure_reason="kimctl status failed — is the bridge running?")
+    if direct:
+        # Direct mode: run agent subprocess directly (no bridge needed)
+        effective_provider = provider or "gemini"
+        result = direct_send(tc.task, effective_provider, tc.timeout)
+    else:
+        # Bridge mode: use kimctl → desktop app
+        status = kimctl_status()
+        if not status:
+            return TestResult(tc.name, "transport", 0,
+                              failure_reason="kimctl status failed — is the bridge running? Use --direct to bypass.")
 
-    if status.get("has_running_task"):
-        kimctl_cancel()
+        if status.get("has_running_task"):
+            kimctl_cancel()
+            time.sleep(2)
+
+        kimctl_new_chat()
         time.sleep(2)
 
-    kimctl_new_chat()
-    time.sleep(2)
+        result = kimctl_send(tc.task, provider, tc.timeout)
 
-    result = kimctl_send(tc.task, provider, tc.timeout)
     duration = time.monotonic() - start
 
     session_id = result.get("session_id", "")
@@ -819,11 +1116,16 @@ def run_test(tc: TestCase, provider: Optional[str], skip_slow: bool) -> TestResu
 
     if not result.get("ok") and result.get("status") not in ("need_help", "complete"):
         return TestResult(tc.name, "transport", duration,
-                          failure_reason=result.get("error", "unknown"),
+                          failure_reason=result.get("error", "unknown")[:100],
                           session_id=session_id)
 
     summary = result.get("summary") or result.get("reason") or ""
-    msgs = kimctl_show(session_id) if session_id else []
+
+    # Load session messages
+    if direct:
+        msgs = direct_show(session_id) if session_id else []
+    else:
+        msgs = kimctl_show(session_id) if session_id else []
 
     for assertion in tc.assertions:
         err = assertion(summary, msgs)
@@ -852,12 +1154,20 @@ def print_human(results: list[TestResult]):
 
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Kim end-to-end test suite")
     p.add_argument("--only", help="Comma-separated tag or test name filter")
-    p.add_argument("--provider", help="Override provider (e.g. browser:gemini)")
+    p.add_argument("--provider", help="Override provider (e.g. gemini, claude, openai)")
     p.add_argument("--json", action="store_true")
     p.add_argument("--list", action="store_true")
     p.add_argument("--skip-slow", action="store_true", help="Skip stress-tagged tests")
+    p.add_argument(
+        "--direct", action="store_true",
+        help=(
+            "Run agent directly as a subprocess (no desktop app needed). "
+            "Requires a valid API key for the chosen provider. "
+            "Default provider in direct mode: gemini."
+        ),
+    )
     args = p.parse_args()
 
     tests = TESTS
@@ -871,7 +1181,13 @@ def main():
             print(f"{t.name:<38} tags={','.join(t.tags) or '-':<30} timeout={t.timeout}s")
         return
 
-    results = [run_test(t, args.provider, args.skip_slow) for t in tests]
+    if args.direct:
+        print(f"Running in DIRECT mode (provider: {args.provider or 'gemini'})")
+        print(f"Agent: {_find_python()} -m orchestrator.agent")
+        print(f"Sessions: {SESSIONS_DIR}")
+        print()
+
+    results = [run_test(t, args.provider, args.skip_slow, direct=args.direct) for t in tests]
 
     if args.json:
         print(json.dumps([r.__dict__ for r in results], indent=2))

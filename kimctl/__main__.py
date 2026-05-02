@@ -55,15 +55,32 @@ def _resolve_bridge() -> tuple[str, str]:
     if url and token:
         return url, token
 
-    # Try reading kim_sessions/.bridge_token
+    # Default token is KIM_API_KEY
+    if not token:
+        token = os.environ.get("KIM_API_KEY", "").strip()
+        if not token:
+            from mcp_server.config import get_config
+            token = get_config().get("api_key", "")
+
+    # Try reading kim_sessions/.bridge_url
     root = _kim_root()
-    token_file = root / "kim_sessions" / ".bridge_token"
+    token_file = root / "kim_sessions" / ".bridge_url"
     if token_file.exists():
         try:
-            lines = token_file.read_text(encoding="utf-8").strip().splitlines()
-            if len(lines) >= 2:
+            url_text = token_file.read_text(encoding="utf-8").strip()
+            if url_text:
                 if not url:
-                    url = lines[0]
+                    url = url_text
+        except Exception:
+            pass
+
+    # Backwards compatibility: try reading kim_sessions/.bridge_token
+    legacy_token_file = root / "kim_sessions" / ".bridge_token"
+    if legacy_token_file.exists() and not url:
+        try:
+            lines = legacy_token_file.read_text(encoding="utf-8").strip().splitlines()
+            if len(lines) >= 2:
+                url = lines[0]
                 if not token:
                     token = lines[1]
         except Exception:
@@ -92,14 +109,15 @@ def _resolve_bridge() -> tuple[str, str]:
     return url, token
 
 
-def _bridge_client() -> tuple[httpx.Client, str]:
-    """Return (httpx.Client with auth header, base_url)."""
+def _bridge_request(method: str, endpoint: str, **kwargs) -> httpx.Response:
+    """Send an HTTP request to the bridge, closing the connection immediately."""
     base_url, token = _resolve_bridge()
-    headers = {}
+    headers = kwargs.pop("headers", {})
     if token:
         headers["X-Kim-Token"] = token
-    client = httpx.Client(timeout=10.0, headers=headers)
-    return client, base_url
+    kwargs["headers"] = headers
+    kwargs.setdefault("timeout", 10.0)
+    return httpx.request(method, f"{base_url}{endpoint}", **kwargs)
 
 
 def _sessions_dir() -> Path:
@@ -229,8 +247,7 @@ def _format_message(msg: dict) -> str:
 
 def cmd_status(args):
     try:
-        client, base = _bridge_client()
-        resp = client.get(f"{base}/v1/status")
+        resp = _bridge_request("GET", "/v1/status")
         data = resp.json()
     except Exception as e:
         print(f"Error connecting to Kim bridge: {e}", file=sys.stderr)
@@ -281,8 +298,6 @@ def cmd_show(args):
 
 
 def cmd_send(args):
-    client, base = _bridge_client()
-
     payload: dict = {"task": args.task}
     if args.session:
         payload["session_id"] = args.session
@@ -290,7 +305,7 @@ def cmd_send(args):
         payload["provider"] = args.provider
 
     try:
-        resp = client.post(f"{base}/v1/task", json=payload)
+        resp = _bridge_request("POST", "/v1/task", json=payload)
         data = resp.json()
     except Exception as e:
         print(f"Error connecting to Kim bridge: {e}", file=sys.stderr)
@@ -415,8 +430,7 @@ def cmd_send(args):
 
 def cmd_cancel(args):
     try:
-        client, base = _bridge_client()
-        resp = client.post(f"{base}/v1/cancel", json={})
+        resp = _bridge_request("POST", "/v1/cancel", json={})
         data = resp.json()
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -430,19 +444,17 @@ def cmd_cancel(args):
 
 
 def cmd_browser(args):
-    client, base = _bridge_client()
-
     if args.browser_action == "show":
-        resp = client.post(f"{base}/v1/browser/show", json={})
+        resp = _bridge_request("POST", "/v1/browser/show", json={})
     elif args.browser_action == "hide":
-        resp = client.post(f"{base}/v1/browser/hide", json={})
+        resp = _bridge_request("POST", "/v1/browser/hide", json={})
     elif args.browser_action == "new-chat":
-        resp = client.post(f"{base}/v1/browser/new-chat", json={})
+        resp = _bridge_request("POST", "/v1/browser/new-chat", json={})
     elif args.browser_action == "click":
         if not args.selector:
             print("Error: --selector is required for 'click'", file=sys.stderr)
             sys.exit(1)
-        resp = client.post(f"{base}/v1/browser/click", json={"selector": args.selector})
+        resp = _bridge_request("POST", "/v1/browser/click", json={"selector": args.selector})
     else:
         print(f"Unknown browser action: {args.browser_action}", file=sys.stderr)
         sys.exit(1)

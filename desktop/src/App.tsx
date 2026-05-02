@@ -170,10 +170,14 @@ export default function App() {
   }
 
   const handleTaskDone = useCallback((sessionId?: string) => {
-    if (sessionId) setPendingSelectSessionId(sessionId);
+    // Only auto-navigate to the session when NOT in newChatMode.
+    // In newChatMode the liveHistory state already displays the conversation
+    // inline — auto-selecting the session would change the ChatView key,
+    // causing a full unmount/remount (the "refresh flash" bug).
+    if (sessionId && !newChatMode) setPendingSelectSessionId(sessionId);
     refresh();
     setTimeout(() => { refresh(); }, 500);
-  }, [refresh]);
+  }, [refresh, newChatMode]);
 
   // Auto-select the just-completed session once it appears in kimSessions.
   useEffect(() => {

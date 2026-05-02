@@ -80,8 +80,9 @@
         reject(new Error("FileReader error"));
       };
 
-      // Read as text; binary files (images etc.) will be base64 if needed
-      reader.readAsText(file, "utf-8");
+      // Read as Data URL (base64) so binary files are safely encoded
+      // and text files are also preserved without UTF-8 decoder replacement corruption.
+      reader.readAsDataURL(file);
     });
   }
 

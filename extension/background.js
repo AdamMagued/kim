@@ -30,14 +30,23 @@ let bridgeUrl = DEFAULT_BRIDGE_URL;
 let relayUrl = "";
 let relayConnected = false;
 
+function isLocalUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    return u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
 // Load persisted settings on startup
 chrome.storage.local.get(["bridgeUrl", "relayUrl"], (data) => {
-  if (data.bridgeUrl) bridgeUrl = data.bridgeUrl;
+  if (data.bridgeUrl && isLocalUrl(data.bridgeUrl)) bridgeUrl = data.bridgeUrl;
   if (data.relayUrl) relayUrl = data.relayUrl;
 });
 
 chrome.storage.onChanged.addListener((changes) => {
-  if (changes.bridgeUrl) bridgeUrl = changes.bridgeUrl.newValue;
+  if (changes.bridgeUrl && isLocalUrl(changes.bridgeUrl.newValue)) bridgeUrl = changes.bridgeUrl.newValue;
   if (changes.relayUrl)  relayUrl  = changes.relayUrl.newValue;
 });
 
@@ -195,8 +204,13 @@ async function handleMessage(message, sender) {
 
   // ── Popup: save settings ─────────────────────────────────────────────────
   if (type === "KIM_SAVE_SETTINGS") {
+    let newBridgeUrl = message.bridgeUrl || DEFAULT_BRIDGE_URL;
+    if (!isLocalUrl(newBridgeUrl)) {
+      return { ok: false, error: "bridgeUrl must be a local URL (localhost or 127.0.0.1)" };
+    }
+
     await chrome.storage.local.set({
-      bridgeUrl: message.bridgeUrl || DEFAULT_BRIDGE_URL,
+      bridgeUrl: newBridgeUrl,
       relayUrl:  message.relayUrl  || "",
     });
     return { ok: true };

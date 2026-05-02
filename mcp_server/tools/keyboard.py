@@ -5,12 +5,17 @@ logger = logging.getLogger(__name__)
 
 async def handle_type_text(args: dict) -> str:
     import pyautogui
+    import pyperclip
+    import sys
     text = str(args["text"])
-    interval = float(args.get("interval", 0.02))
     try:
-        pyautogui.typewrite(text, interval=interval)
+        pyperclip.copy(text)
+        if sys.platform == "darwin":
+            pyautogui.hotkey("command", "v")
+        else:
+            pyautogui.hotkey("ctrl", "v")
         logger.info(f"type_text: {len(text)} chars")
-        return f"Typed {len(text)} characters"
+        return f"Typed {len(text)} characters (via clipboard)"
     except Exception as e:
         logger.error(f"type_text failed: {e}", exc_info=True)
         return f"ERROR: {e}"

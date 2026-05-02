@@ -5,13 +5,13 @@ Spawns the compiled `claw` Rust binary as a subprocess with `CLAW_FILE_BRIDGE=1`
 then relays LLM requests/responses between the binary and Kim's BrowserProvider.
 
 The bridge protocol is file-based:
-    claw writes  → /tmp/claw_bridge/bridge_request.json
+    claw writes  → <session_dir>/bridge_request.json
     Kim reads, routes through browser LLM, writes ← bridge_response.json
     claw reads, continues tool loop
 
 Completion signal: process exit.  When claw's ConversationRuntime finishes its
 tool loop (the LLM responds with no tool calls), the process exits and
-`process.poll()` returns a non-None exit code.
+`process.returncode` returns a non-None exit code.
 
 Usage:
     from mcp_server.tools.claw_bridge import run_claw_subtask
@@ -29,7 +29,7 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
+import shutil
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -40,10 +40,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger("kim.claw_bridge")
 
 # ── Constants ────────────────────────────────────────────────────────────────
-
-BRIDGE_DIR = Path("/tmp/claw_bridge")
-REQUEST_FILE = BRIDGE_DIR / "bridge_request.json"
-RESPONSE_FILE = BRIDGE_DIR / "bridge_response.json"
 
 # Where the compiled claw binary lives
 CLAW_BINARY = (
@@ -57,7 +53,7 @@ CLAW_BINARY = (
 )
 
 POLL_INTERVAL = 0.5  # seconds between file checks
-PROCESS_CHECK_INTERVAL = 0.5  # seconds between process.poll() checks
+MAX_OUTPUT_BYTES = 64 * 1024 * 1024  # 64MB cap on captured output (#6)
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -91,9 +87,10 @@ async def run_claw_subtask(
 
     working_dir = cwd or os.getcwd()
 
-    # Ensure bridge directory exists and is clean
-    BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
-    _clean_bridge_files()
+    # Create a per-session temp directory (#7 — no predictable /tmp paths)
+    bridge_dir = Path(tempfile.mkdtemp(prefix="kim-claw-"))
+    request_file = bridge_dir / "bridge_request.json"
+    response_file = bridge_dir / "bridge_response.json"
 
     # Save current browser state so we can restore after
     saved_url = await _save_browser_state(browser_provider)
@@ -101,38 +98,45 @@ async def run_claw_subtask(
     logger.info(f"Starting claw subtask: {task[:80]}…")
     logger.info(f"  binary: {binary}")
     logger.info(f"  cwd: {working_dir}")
+    logger.info(f"  bridge_dir: {bridge_dir}")
 
-    process = subprocess.Popen(
-        [str(binary), task],
-        env={**os.environ, "CLAW_FILE_BRIDGE": "1"},
+    # Use asyncio subprocess (#6 — no pipe deadlock)
+    process = await asyncio.create_subprocess_exec(
+        str(binary), task,
+        env={**os.environ, "CLAW_FILE_BRIDGE": "1", "CLAW_BRIDGE_DIR": str(bridge_dir)},
         cwd=working_dir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
 
     relay_count = 0
     try:
         # Relay loop — runs until claw exits
-        while process.poll() is None:
-            if REQUEST_FILE.exists():
+        while process.returncode is None:
+            if request_file.exists():
                 relay_count += 1
-                await _relay_one_request(browser_provider, relay_count)
+                await _relay_one_request(browser_provider, relay_count, bridge_dir)
             else:
                 await asyncio.sleep(POLL_INTERVAL)
+            # Check if process has exited
+            try:
+                await asyncio.wait_for(process.wait(), timeout=0.01)
+            except asyncio.TimeoutError:
+                pass
 
         # Process exited — check for one final request that might have been
         # written just before exit (race condition)
-        if REQUEST_FILE.exists():
+        if request_file.exists():
             relay_count += 1
-            await _relay_one_request(browser_provider, relay_count)
+            await _relay_one_request(browser_provider, relay_count, bridge_dir)
 
     except Exception as e:
         logger.error(f"Claw bridge relay error: {e}", exc_info=True)
-        process.terminate()
+        process.kill()
         try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            logger.warning("Claw process did not exit after kill")
         return {
             "success": False,
             "exit_code": process.returncode or -1,
@@ -141,15 +145,16 @@ async def run_claw_subtask(
     finally:
         # Restore browser state
         await _restore_browser_state(browser_provider, saved_url)
-        _clean_bridge_files()
+        # Clean up temp dir (#7)
+        shutil.rmtree(str(bridge_dir), ignore_errors=True)
 
     exit_code = process.returncode
     success = exit_code == 0
 
-    # Capture stderr for diagnostic info
+    # Capture stderr for diagnostic info (capped at 64MB)
     stderr_output = ""
     try:
-        _, stderr_bytes = process.communicate(timeout=1)
+        stderr_bytes = await process.stderr.read(MAX_OUTPUT_BYTES)
         stderr_output = stderr_bytes.decode("utf-8", errors="replace")[-500:]
     except Exception:
         pass
@@ -174,21 +179,23 @@ async def run_claw_subtask(
 async def _relay_one_request(
     browser_provider: "BrowserProvider",
     relay_number: int,
+    bridge_dir: Path,
 ) -> None:
     """Read a bridge request, route through the browser LLM, write response."""
 
     # Brief delay to ensure claw has finished writing
     await asyncio.sleep(0.15)
 
+    request_file = bridge_dir / "bridge_request.json"
     try:
-        raw_request = REQUEST_FILE.read_text(encoding="utf-8")
+        raw_request = request_file.read_text(encoding="utf-8")
     except Exception as e:
         logger.warning(f"[relay #{relay_number}] Failed to read request: {e}")
         return
 
     # Remove request file immediately to signal claw we've picked it up
     # (not strictly necessary, but prevents re-reading on the next poll)
-    REQUEST_FILE.unlink(missing_ok=True)
+    request_file.unlink(missing_ok=True)
 
     logger.info(
         f"[relay #{relay_number}] Got request ({len(raw_request)} chars) — "
@@ -227,7 +234,7 @@ async def _relay_one_request(
     except Exception as e:
         logger.error(f"[relay #{relay_number}] Browser LLM call failed: {e}")
         # Write an error response so claw doesn't hang
-        _write_bridge_response(json.dumps({"text": f"Error: {e}"}))
+        _write_bridge_response(json.dumps({"text": f"Error: {e}"}), bridge_dir)
         return
 
     # Convert BrowserProvider response to bridge format
@@ -237,7 +244,7 @@ async def _relay_one_request(
         f"[relay #{relay_number}] Got browser response — writing bridge_response.json"
     )
 
-    _write_bridge_response(json.dumps(bridge_response, ensure_ascii=False))
+    _write_bridge_response(json.dumps(bridge_response, ensure_ascii=False), bridge_dir)
 
 
 def _build_browser_prompt(raw_request: str) -> str:
@@ -314,18 +321,21 @@ def _provider_response_to_bridge(response: dict, prompt: str = "") -> dict:
             if "tool_calls" in parsed or "text" in parsed:
                 return parsed
     except (json.JSONDecodeError, TypeError):
-        import re
-        # Attempt one-shot repair for unescaped inner quotes in content/text fields
-        match = re.search(r'("content"|"text")\s*:\s*"(.*)"(\s*}|\s*,)', content, re.DOTALL)
-        if match:
-            val = match.group(2)
-            repaired_val = re.sub(r'(?<!\\)"', r'\"', val)
-            repaired_content = content[:match.start(2)] + repaired_val + content[match.end(2):]
+        # #8: Use json5 + json-repair instead of regex
+        import json5
+        import json_repair
+        try:
+            # Try json5 first (good for unquoted keys, trailing commas)
+            parsed = json5.loads(content)
+            if isinstance(parsed, dict) and ("tool_calls" in parsed or "text" in parsed):
+                return parsed
+        except Exception:
             try:
-                parsed = json.loads(repaired_content)
+                # Try json-repair (good for truncated JSON, unescaped quotes)
+                parsed = json_repair.loads(content)
                 if isinstance(parsed, dict) and ("tool_calls" in parsed or "text" in parsed):
                     return parsed
-            except json.JSONDecodeError:
+            except Exception:
                 pass
 
     # Recovery path: synthesize a write_file tool call from markdown code blocks
@@ -367,12 +377,13 @@ def _provider_response_to_bridge(response: dict, prompt: str = "") -> dict:
     return {"text": content}
 
 
-def _write_bridge_response(data: str) -> None:
+def _write_bridge_response(data: str, bridge_dir: Path) -> None:
     """Write bridge_response.json atomically using rename."""
-    BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    response_file = bridge_dir / "bridge_response.json"
 
     # Write to temp file in the same directory (same filesystem for atomic rename)
-    fd, tmp_path = tempfile.mkstemp(dir=str(BRIDGE_DIR), suffix=".tmp")
+    fd, tmp_path = tempfile.mkstemp(dir=str(bridge_dir), suffix=".tmp")
     try:
         os.write(fd, data.encode("utf-8"))
         os.fsync(fd)
@@ -380,23 +391,10 @@ def _write_bridge_response(data: str) -> None:
         os.close(fd)
 
     # Atomic rename
-    os.rename(tmp_path, str(RESPONSE_FILE))
+    os.rename(tmp_path, str(response_file))
 
 
-def _clean_bridge_files() -> None:
-    """Remove any stale bridge files."""
-    for f in [REQUEST_FILE, RESPONSE_FILE]:
-        try:
-            f.unlink(missing_ok=True)
-        except Exception:
-            pass
-    # Also clean any leftover .tmp files
-    if BRIDGE_DIR.exists():
-        for tmp in BRIDGE_DIR.glob("*.tmp"):
-            try:
-                tmp.unlink()
-            except Exception:
-                pass
+
 
 
 async def _save_browser_state(browser_provider: "BrowserProvider") -> Optional[str]:

@@ -82,7 +82,10 @@ class _WsManager:
         logger.info(f"WS client connected ({len(self._connections)} total)")
 
     def disconnect(self, ws: WebSocket) -> None:
-        self._connections.discard_if_present(ws)
+        try:
+            self._connections.remove(ws)
+        except ValueError:
+            pass
         logger.info(f"WS client disconnected ({len(self._connections)} remaining)")
 
     async def broadcast(self, payload: dict) -> None:
@@ -96,17 +99,8 @@ class _WsManager:
             if ws in self._connections:
                 self._connections.remove(ws)
 
-    # list doesn't have discard — add helper
-    def _remove(self, ws: WebSocket) -> None:
-        try:
-            self._connections.remove(ws)
-        except ValueError:
-            pass
-
 
 ws_manager = _WsManager()
-# Patch the helper name used in disconnect
-_WsManager.disconnect = lambda self, ws: self._remove(ws)  # type: ignore[method-assign]
 
 
 # ── App lifespan ───────────────────────────────────────────────────────────────
@@ -129,9 +123,12 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+allowed_origins_str = os.environ.get("ALLOWED_ORIGINS", "")
+allowed_origins = [o.strip() for o in allowed_origins_str.split(",")] if allowed_origins_str else []
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -241,13 +238,14 @@ async def get_result(task_id: str) -> TaskStatusResponse:
 @app.get(
     "/status",
     response_model=StatusResponse,
-    summary="Public health check",
+    summary="Health check (auth required)",
+    dependencies=[Depends(require_any_key)],
 )
 async def get_status() -> StatusResponse:
     """
     Returns whether the PC agent is connected (polling within the last 15 s),
     the ISO-8601 timestamp of the last PC poll, and the current queue depth.
-    No API key required.
+    Requires either PC or Phone API key.
     """
     depth = await db.queue_depth()
     last = _last_pc_seen.strftime("%Y-%m-%dT%H:%M:%SZ") if _last_pc_seen else None
@@ -259,27 +257,38 @@ async def get_status() -> StatusResponse:
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket, token: str = ""):
+async def websocket_endpoint(ws: WebSocket):
     """
     Real-time result push to the phone.
-    Connect with:  wss://your-relay.app/ws?token=<phone_api_key>
+    Connect with:  wss://your-relay.app/ws (requires X-API-Key header)
 
     The server pushes a JSON object whenever a task completes:
         {"task_id": "...", "status": "done"|"failed", "summary": "...", "screenshot": "..."}
     """
-    # Validate token (phone key) before accepting
+    # The client must send X-API-Key header instead of query param.
+    # Note: browser JS WebSocket API doesn't support custom headers easily,
+    # but since this is for the phone client (which might be native or using a library),
+    # we enforce header-based auth to avoid token leakage in URL logs.
+    token_header = ws.headers.get("x-api-key", "")
     phone_key = os.environ.get("RELAY_PHONE_API_KEY", "")
-    if not phone_key or not token or not secrets.compare_digest(token, phone_key):
-        await ws.close(code=4001, reason="Invalid or missing token")
+    if not phone_key or not token_header or not secrets.compare_digest(token_header, phone_key):
+        await ws.close(code=4001, reason="Invalid or missing token header")
         return
 
     await ws_manager.connect(ws)
     try:
+        import asyncio
         while True:
             # Keep alive — client should send periodic pings; we echo them
-            data = await ws.receive_text()
-            if data == "ping":
-                await ws.send_text("pong")
+            try:
+                # Add a timeout so half-open connections eventually close
+                data = await asyncio.wait_for(ws.receive_text(), timeout=60.0)
+                if data == "ping":
+                    await ws.send_text("pong")
+            except asyncio.TimeoutError:
+                # No ping received within 60s, assume connection is dead
+                await ws.close(code=1011, reason="Ping timeout")
+                break
     except WebSocketDisconnect:
         pass
     finally:

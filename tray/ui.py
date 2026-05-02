@@ -190,7 +190,7 @@ class ControlPanel(tk.Toplevel):
         ).pack(side=tk.LEFT, padx=(0, 4))
         self._voice_toggle = _Toggle(
             settings_bar,
-            initial=self._app._voice.enabled if hasattr(self._app, '_voice') else False,
+            initial=self._app._voice.enabled if getattr(self._app, '_voice', None) else False,
             command=self._on_voice_toggle,
             bg=_BG_SETTINGS,
         )
@@ -625,7 +625,7 @@ class ControlPanel(tk.Toplevel):
 
     def _on_voice_toggle(self) -> None:
         enabled = self._voice_toggle.get()
-        if hasattr(self._app, '_voice'):
+        if getattr(self._app, '_voice', None):
             self._app._voice.set_enabled(enabled)
         # Persist to config.yaml (canonical key: voice.enabled)
         if "voice" not in self._app._config:
@@ -657,9 +657,13 @@ class ControlPanel(tk.Toplevel):
         """Write the current in-memory config to config.yaml."""
         try:
             import yaml
+            import tempfile
+            import os
             from tray.app import _CONFIG_PATH
-            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+            fd, tmp_path = tempfile.mkstemp(dir=_CONFIG_PATH.parent, prefix="kim_config_", suffix=".yaml")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 yaml.dump(self._app._config, f, default_flow_style=False, allow_unicode=True)
+            os.replace(tmp_path, _CONFIG_PATH)
         except Exception as e:
             logger.warning(f"Failed to persist config: {e}")
 
@@ -686,23 +690,14 @@ class ControlPanel(tk.Toplevel):
         def _task():
             try:
                 # Execute hot swap with memory flush
-                if hasattr(self._app, '_voice') and self._app._voice:
+                if getattr(self._app, '_voice', None):
                     self._app._voice.switch_engine(new_engine, self._app._config)
                 
                 # Persist setting to config.yaml
-                import yaml
-                from tray.app import _CONFIG_PATH
-                
-                if _CONFIG_PATH.exists():
-                    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
-                        c = yaml.safe_load(f) or {}
-                    
-                    if "voice" not in c:
-                        c["voice"] = {}
-                    c["voice"]["engine"] = new_engine
-                    
-                    with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-                        yaml.dump(c, f, default_flow_style=False, allow_unicode=True)
+                if "voice" not in self._app._config:
+                    self._app._config["voice"] = {}
+                self._app._config["voice"]["engine"] = new_engine
+                self._persist_config()
                 
                 self._app._root.after(0, lambda: self._add_system_message(f"🔄 Switched voice engine to: {selected_ui_name}", fg=_FG_SUCCESS))
             except Exception as e:

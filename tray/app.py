@@ -68,18 +68,30 @@ def _load_config() -> dict:
     return {}
 
 
+import tempfile
+
+def _atomic_write_yaml(path: Path, data: dict) -> None:
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+    os.replace(tmp_path, str(path))
+
 def _save_provider(provider: str) -> None:
     """Persist the active provider to config.yaml."""
     config = _load_config()
     config["provider"] = provider
-    with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+    _atomic_write_yaml(_CONFIG_PATH, config)
 
 
 def _save_config(config: dict) -> None:
     """Persist the full config dict to config.yaml."""
-    with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+    _atomic_write_yaml(_CONFIG_PATH, config)
 
 
 # ── toaster (optional) ────────────────────────────────────────────────────────
@@ -115,12 +127,18 @@ class _AsyncRunner:
 
     def submit(self, coro) -> None:
         """Schedule a coroutine on the asyncio loop from any thread."""
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future
+        self._current_task = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return self._current_task
 
     def cancel_current(self) -> None:
         if self._current_task and not self._current_task.done():
-            self._loop.call_soon_threadsafe(self._current_task.cancel)
+            self._current_task.cancel()
+
+    def stop(self) -> None:
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread:
+            self._thread.join(timeout=2.0)
 
 
 # ── main application ──────────────────────────────────────────────────────────
@@ -199,6 +217,7 @@ class KimApp:
                 self._icon.stop()
             except Exception:
                 pass
+        self._runner.stop()
 
     # ── tray icon ─────────────────────────────────────────────────────────────
 
@@ -475,11 +494,11 @@ class KimApp:
                     self._bridge.log_queue.get_nowait()
                 except queue.Empty:
                     break
-            # Auto-confirm when panel is closed
+            # Restore panel to show confirmation
             try:
                 tool_name, args, event, result = self._bridge._confirm_queue.get_nowait()
-                result[0] = True
-                event.set()
+                self._show_control_panel()
+                self._control_panel.show_confirm(tool_name, args, event, result)
             except queue.Empty:
                 pass
 

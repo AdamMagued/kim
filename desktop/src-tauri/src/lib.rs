@@ -512,10 +512,12 @@ fn agent_debug_log(hypothesis_id: &str, message: &str, data: serde_json::Value) 
         "data": data,
         "timestamp": ts,
     });
+    let log_path = default_sessions_dir().join("bridge_debug.log");
+    let _ = std::fs::create_dir_all(default_sessions_dir());
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/Users/adammaged/Desktop/Personal/kim/.cursor/debug-16b33e.log")
+        .open(log_path)
     {
         use std::io::Write;
         let _ = writeln!(f, "{}", line);
@@ -1432,20 +1434,29 @@ fn build_bridge_complete_script(
     let callback_token_json = serde_json::to_string(callback_token).map_err(|e| e.to_string())?;
     let hash_json = serde_json::to_string(&completion_hash).unwrap_or_else(|_| "null".to_string());
 
-        let mut script = r#"
-(() => {
-    setTimeout(async () => {
-    try {
-  const __kimSite = __KIM_SITE__;
-  const __kimPrompt = __KIM_PROMPT__;
-  const __kimReqId = __KIM_REQID__;
-    const __kimAttachments = __KIM_ATTACHMENTS__;
-    const __kimCallbackUrl = __KIM_CALLBACK_URL__;
-    const __kimCallbackToken = __KIM_CALLBACK_TOKEN__;
-  const __kimCompletionHash = __KIM_COMPLETION_HASH__;
+    let header = format!(r#"(() => {{
+    setTimeout(async () => {{
+    try {{
+  const __kimSite = {site};
+  const __kimPrompt = {prompt};
+  const __kimReqId = {req_id};
+  const __kimAttachments = {attachments};
+  const __kimCallbackUrl = {callback_url};
+  const __kimCallbackToken = {callback_token};
+  const __kimCompletionHash = {hash};
     let __kimFinished = false;
     let __kimWatchdog = null;
+"#, 
+        site=site_json, 
+        prompt=prompt_json, 
+        req_id=req_json, 
+        attachments=attachments_json, 
+        callback_url=callback_url_json, 
+        callback_token=callback_token_json, 
+        hash=hash_json
+    );
 
+    let body = r#"
   const SITE_CONFIGS = {
     claude: {
       input_selectors: ["div[contenteditable='true'].ProseMirror", "div[contenteditable='true']"],
@@ -1582,13 +1593,16 @@ fn build_bridge_complete_script(
         return true;
     };
 
-    const findElement = (selectors, opts = { visible: false, enabled: false }) => {
+    const findElement = (selectors, opts = { visible: false, enabled: false, last: false }) => {
         for (const sel of selectors || []) {
             let nodes = [];
             try {
                 nodes = Array.from(document.querySelectorAll(sel));
             } catch (_) {
                 continue;
+            }
+            if (opts.last) {
+                nodes = nodes.reverse();
             }
             for (const el of nodes) {
                 if (opts.visible && !isVisible(el)) continue;
@@ -1696,11 +1710,10 @@ fn build_bridge_complete_script(
 
         let fileInput = findFileInput();
         if (!fileInput) {
-            const uploadSel = findSelector(cfg.upload_button_selectors);
-            if (uploadSel) {
+            const uploadBtn = findElement(cfg.upload_button_selectors, { visible: true, enabled: true, last: true });
+            if (uploadBtn) {
                 try {
-                    const uploadBtn = document.querySelector(uploadSel);
-                    uploadBtn?.click();
+                    uploadBtn.click();
                     await sleep(280);
                     fileInput = findFileInput();
                 } catch (_) {}
@@ -2278,15 +2291,7 @@ fn build_bridge_complete_script(
     }
     }, 0);
 })();
-"#.to_string();
-
-    script = script.replace("__KIM_SITE__", &site_json);
-    script = script.replace("__KIM_PROMPT__", &prompt_json);
-    script = script.replace("__KIM_REQID__", &req_json);
-    script = script.replace("__KIM_ATTACHMENTS__", &attachments_json);
-    script = script.replace("__KIM_CALLBACK_URL__", &callback_url_json);
-    script = script.replace("__KIM_CALLBACK_TOKEN__", &callback_token_json);
-    script = script.replace("__KIM_COMPLETION_HASH__", &hash_json);
+    let script = format!("{}{}", header, body);
     Ok(script)
 }
 
@@ -2872,12 +2877,9 @@ fn handle_webview_bridge_request(
                 .map(|cfg| format!("{}/v1/callback", cfg.base_url))
                 .unwrap_or_else(|| "http://127.0.0.1:18991/v1/callback".to_string());
 
-            let was_hidden = window.is_visible().map(|v| !v).unwrap_or(false);
-            if was_hidden {
-                let _ = window.show();
-                let _ = window.set_focus();
-                std::thread::sleep(std::time::Duration::from_millis(400));
-            }
+            // The window stays offscreen (1x1 at -10000,-10000) during
+            // headless operation.  JS keeps running at 1x1 size, so we
+            // do NOT need to show it to the user.
 
             let mut completion = run_bridge_completion_once(
                 &window,
@@ -2916,9 +2918,7 @@ fn handle_webview_bridge_request(
                 }
             }
 
-            if was_hidden {
-                hide_browser_window_offscreen(&window);
-            }
+            // Window was never shown, no need to re-hide.
 
             match completion {
                 Ok(payload) => {
@@ -3042,11 +3042,10 @@ fn handle_webview_bridge_request(
                 hash = hash_json,
             );
 
-            let was_hidden = window.is_visible().map(|v| !v).unwrap_or(false);
-            if was_hidden {
-                let _ = window.show();
-                let _ = window.set_focus();
-                std::thread::sleep(std::time::Duration::from_millis(400));
+            // The window stays offscreen (1x1 at -10000,-10000) during
+            // headless operation.  JS keeps running at 1x1, no need to
+            // show it to the user.
+            if is_browser_window_offscreen(&window) {
                 if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
                     guard.insert(req_id.clone());
                 }
@@ -3058,8 +3057,26 @@ fn handle_webview_bridge_request(
                 "promptLen": parsed.prompt.len(),
             }));
 
-            // Acquire lock to prevent overlapping window manipulations
-            let _guard = WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(())).try_lock();
+            // Acquire lock to prevent overlapping window manipulations (#34)
+            let _guard = match WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(())).try_lock() {
+                Ok(g) => g,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    respond_json(
+                        request,
+                        429,
+                        serde_json::json!({"ok": false, "error": "bridge busy"}),
+                    );
+                    return;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    respond_json(
+                        request,
+                        500,
+                        serde_json::json!({"ok": false, "error": "lock poisoned"}),
+                    );
+                    return;
+                }
+            };
 
             if let Err(e) = window.eval(&bridge_call) {
                 respond_json(
@@ -3801,11 +3818,35 @@ fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Result<(), Strin
     let (server, port) = selected
         .ok_or_else(|| "Could not bind local in-app bridge port (18991-19010).".to_string())?;
 
-    let token = format!(
-        "kim-{}-{}",
-        std::process::id(),
-        WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
-    );
+    let mut token = std::env::var("KIM_API_KEY").unwrap_or_default();
+    if token.is_empty() {
+        let env_path = default_project_root().join(".env");
+        if let Ok(content) = std::fs::read_to_string(env_path) {
+            for line in content.lines() {
+                if line.starts_with("KIM_API_KEY=") || line.starts_with("RELAY_API_KEY=") {
+                    token = line.splitn(2, '=').nth(1).unwrap_or("").trim().to_string();
+                    if token.starts_with('"') && token.ends_with('"') && token.len() >= 2 {
+                        token = token[1..token.len()-1].to_string();
+                    } else if token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2 {
+                        token = token[1..token.len()-1].to_string();
+                    }
+                    if !token.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    if token.is_empty() {
+        token = format!(
+            "kim-{}-{}",
+            std::process::id(),
+            WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        eprintln!("[Kim] WARNING: KIM_API_KEY not found in env or .env. Falling back to random bridge token.");
+    }
+
     let base_url = format!("http://127.0.0.1:{}", port);
 
     let _ = WEBVIEW_BRIDGE_CFG.set(WebviewBridgeConfig {
@@ -3813,10 +3854,12 @@ fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Result<(), Strin
         token: token.clone(),
     });
 
-    // Write token to kim_sessions/.bridge_token for kimctl
+    // Write only base_url to kim_sessions/.bridge_url (no cleartext tokens on disk)
     let sessions_dir = default_project_root().join("kim_sessions");
     let _ = std::fs::create_dir_all(&sessions_dir);
-    let _ = std::fs::write(sessions_dir.join(".bridge_token"), format!("{}\n{}", base_url, token));
+    let _ = std::fs::write(sessions_dir.join(".bridge_url"), &base_url);
+    // Best-effort remove legacy cleartext token
+    let _ = std::fs::remove_file(sessions_dir.join(".bridge_token"));
 
     std::thread::spawn(move || {
         eprintln!(
@@ -4110,8 +4153,20 @@ async fn open_browser_signin_window(
 /// invisible to the user. `show_browser_window_impl` restores it.
 fn hide_browser_window_offscreen(win: &tauri::WebviewWindow) {
     let _ = win.set_decorations(false);
-    let _ = win.set_size(tauri::PhysicalSize::new(0, 0));
+    // Use 1x1 instead of 0x0 — WKWebView on macOS throttles or suspends
+    // JavaScript execution (setTimeout, requestAnimationFrame, DOM events)
+    // when the window has zero dimensions, which breaks the bridge JS.
+    let _ = win.set_size(tauri::PhysicalSize::new(1, 1));
     let _ = win.set_position(tauri::PhysicalPosition::new(-10000, -10000));
+}
+
+/// Detect whether the browser window has been moved off-screen by
+/// `hide_browser_window_offscreen`.  `is_visible()` always returns true
+/// because we never call `win.hide()`, so we check position/size instead.
+fn is_browser_window_offscreen(win: &tauri::WebviewWindow) -> bool {
+    let pos = win.outer_position().unwrap_or(tauri::PhysicalPosition::new(0, 0));
+    let size = win.outer_size().unwrap_or(tauri::PhysicalSize::new(100, 100));
+    pos.x <= -9000 || pos.y <= -9000 || (size.width <= 1 && size.height <= 1)
 }
 
 fn show_browser_window_impl(app_handle: &tauri::AppHandle) {
@@ -4163,6 +4218,60 @@ async fn show_main_window(app_handle: tauri::AppHandle) -> Result<(), String> {
     if let Some(win) = app_handle.get_webview_window("main") {
         let _ = win.show();
         let _ = win.set_focus();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_task_active_mode(app_handle: tauri::AppHandle, active: bool) -> Result<(), String> {
+    let cancel_label = "cancel-widget";
+    if active {
+        // Hide main window
+        if let Some(main_win) = app_handle.get_webview_window("main") {
+            let _ = main_win.hide();
+        }
+
+        // Show or create cancel widget
+        if let Some(cancel_win) = app_handle.get_webview_window(cancel_label) {
+            let _ = cancel_win.show();
+            let _ = cancel_win.set_focus();
+        } else {
+            let cancel_win = tauri::WebviewWindowBuilder::new(
+                &app_handle,
+                cancel_label,
+                tauri::WebviewUrl::App("/?window=cancel".into()),
+            )
+            .title("Cancel Task")
+            .inner_size(180.0, 50.0)
+            .resizable(false)
+            .always_on_top(true)
+            .decorations(false)
+            .transparent(true)
+            .build()
+            .map_err(|e| format!("Failed to build cancel widget: {}", e))?;
+
+            // Position at bottom center
+            if let Ok(Some(monitor)) = cancel_win.current_monitor() {
+                let size = monitor.size();
+                let scale_factor = monitor.scale_factor();
+                let width = 180.0 * scale_factor;
+                let height = 50.0 * scale_factor;
+                let x = (size.width as f64 - width) / 2.0;
+                let y = size.height as f64 - height - (80.0 * scale_factor); // 80px from bottom
+                let _ = cancel_win.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x as i32, y as i32)));
+            }
+        }
+    } else {
+        // Hide cancel widget
+        if let Some(cancel_win) = app_handle.get_webview_window(cancel_label) {
+            let _ = cancel_win.hide();
+        }
+
+        // Show main window
+        if let Some(main_win) = app_handle.get_webview_window("main") {
+            let _ = main_win.show();
+            let _ = main_win.set_focus();
+        }
     }
     Ok(())
 }
@@ -5056,12 +5165,32 @@ fn import_from_json(src: &Path, base: &Path) -> Result<String, String> {
 
     for session in sessions {
         let rel = session["session"].as_str().unwrap_or("unknown/session.jsonl");
-        let messages = session["messages"].as_array().cloned().unwrap_or_default();
+
+        // Guard against path traversal attacks (#32)
+        // Fast-path rejection: disallow .., leading /, and Windows drive prefixes
+        if rel.contains("..") || rel.starts_with('/') || rel.starts_with('\\') {
+            return Err(format!("path traversal attempt: {:?}", rel));
+        }
+        if rel.len() >= 2 && rel.as_bytes()[1] == b':' {
+            return Err(format!("path traversal attempt (drive prefix): {:?}", rel));
+        }
 
         let dest = base.join(rel);
+
+        // Canonicalize and verify the destination stays inside base
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if let (Ok(canon_dest_parent), Ok(canon_base)) = (parent.canonicalize(), base.canonicalize()) {
+                let full = canon_dest_parent.join(dest.file_name().unwrap_or_default());
+                if !full.starts_with(&canon_base) {
+                    return Err(format!("path traversal attempt: {:?}", rel));
+                }
+            }
+        } else {
+            fs::create_dir_all(base).map_err(|e| e.to_string())?;
         }
+
+        let messages = session["messages"].as_array().cloned().unwrap_or_default();
 
         let mut lines = String::new();
         for msg in &messages {
@@ -5506,6 +5635,7 @@ pub fn run() {
             hide_browser_window,
             hide_main_window,
             show_main_window,
+            set_task_active_mode,
             send_task,
             cancel_task,
             read_voice_config,
@@ -5526,4 +5656,27 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_bridge_complete_script_no_poisoning() {
+        let script = build_bridge_complete_script(
+            "gemini",
+            "hello __KIM_SITE__",
+            "req_123",
+            &[],
+            "http://local",
+            "token__KIM_REQID__",
+            None
+        ).unwrap();
+        
+        assert!(script.contains("const __kimSite = \"gemini\";"));
+        assert!(script.contains("const __kimPrompt = \"hello __KIM_SITE__\";"));
+        assert!(script.contains("const __kimReqId = \"req_123\";"));
+        assert!(script.contains("const __kimCallbackToken = \"token__KIM_REQID__\";"));
+    }
 }

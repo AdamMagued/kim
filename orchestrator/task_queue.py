@@ -51,7 +51,7 @@ class TaskQueue:
 
     async def submit_local(self, task: str) -> str:
         """Enqueue a task locally.  Returns the generated task_id."""
-        task_id = f"local_{uuid4().hex[:8]}"
+        task_id = f"local_{uuid4().hex}"
         await self._local_queue.put({"task_id": task_id, "task": task})
         logger.info(f"Local task queued: {task_id!r} — {task[:60]}")
         return task_id

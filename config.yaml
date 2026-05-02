@@ -1,6 +1,5 @@
 allowed_paths:
 - .
-- "~"
 browser_provider:
   browser_headless: false
   cdp_url: http://localhost:9222
