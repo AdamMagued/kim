@@ -50,7 +50,7 @@ jobs:
       # ── Node.js ─────────────────────────────────────────────────────────────
       - uses: actions/setup-node@v4
         with:
-          node-version: lts/*
+          node-version: '20'
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
@@ -58,7 +58,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.rust-target != '' && matrix.rust-target || '' }}
+          targets: ${{ matrix.rust-target }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -79,7 +79,7 @@ jobs:
       # ── Frontend deps ────────────────────────────────────────────────────
       - name: Install frontend dependencies
         working-directory: desktop
-        run: npm ci
+        run: npm ci --prefer-offline --no-audit
 
       # ── Upload raw binaries on workflow_dispatch (dry run) ────────────────
       - name: Build (dry run — upload artifact)
