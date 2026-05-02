@@ -3150,7 +3150,7 @@ fn handle_webview_bridge_request(
             let has_running_task = {
                 let store = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None));
                 if let Ok(guard) = store.lock() {
-                    guard.map(|pid| process_exists(pid)).unwrap_or(false)
+                    guard.map(process_exists).unwrap_or(false)
                 } else {
                     false
                 }
@@ -3297,10 +3297,8 @@ fn handle_webview_bridge_request(
                         use std::io::BufRead;
                         let app_handle_out = app_handle.clone();
                         Some(std::thread::spawn(move || {
-                            for line in reader.lines() {
-                                if let Ok(l) = line {
-                                    let _ = app_handle_out.emit("kim-agent-output", l);
-                                }
+                            for l in reader.lines().flatten() {
+                                let _ = app_handle_out.emit("kim-agent-output", l);
                             }
                         }))
                     } else {
@@ -3518,7 +3516,7 @@ fn handle_webview_bridge_request(
 
             if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
                 if let Ok(js_url) = serde_json::to_string(url) {
-                    let _ = win.eval(&format!("window.location.href = {};", js_url));
+                    let _ = win.eval(format!("window.location.href = {};", js_url));
                 }
                 respond_json(request, 200, serde_json::json!({"ok": true, "site": site}));
             } else {
@@ -3636,7 +3634,7 @@ fn start_bridge_file_watcher(app_handle: tauri::AppHandle) {
             // ── Handle browser_cmd.json ─────────────────────────────────────
             if let Ok(meta) = fs::metadata(&cmd_path) {
                 if let Ok(modified) = meta.modified() {
-                    let is_new = last_cmd_mtime.map_or(true, |prev| modified > prev);
+                    let is_new = last_cmd_mtime.is_none_or(|prev| modified > prev);
                     if is_new {
                         last_cmd_mtime = Some(modified);
                         if let Ok(text) = fs::read_to_string(&cmd_path) {
@@ -3825,10 +3823,8 @@ fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Result<(), Strin
         if let Ok(content) = std::fs::read_to_string(env_path) {
             for line in content.lines() {
                 if line.starts_with("KIM_API_KEY=") || line.starts_with("RELAY_API_KEY=") {
-                    token = line.splitn(2, '=').nth(1).unwrap_or("").trim().to_string();
-                    if token.starts_with('"') && token.ends_with('"') && token.len() >= 2 {
-                        token = token[1..token.len()-1].to_string();
-                    } else if token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2 {
+                    token = line.split_once('=').map(|x| x.1).unwrap_or("").trim().to_string();
+                    if (token.starts_with('"') && token.ends_with('"') && token.len() >= 2) || (token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2) {
                         token = token[1..token.len()-1].to_string();
                     }
                     if !token.is_empty() {
@@ -3864,9 +3860,8 @@ fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Result<(), Strin
 
     std::thread::spawn(move || {
         eprintln!(
-            "[Kim] In-app browser bridge listening at {} (mode={}, timeout={}s)",
+            "[Kim] In-app browser bridge listening at {} (mode=sentinel_v1, timeout={}s)",
             base_url,
-            "sentinel_v1",
             BRIDGE_COMPLETION_TIMEOUT_S,
         );
         for request in server.incoming_requests() {
@@ -4303,7 +4298,7 @@ async fn navigate_browser_window_if_open(url: String, app_handle: tauri::AppHand
 
     if let Some(existing) = app_handle.get_webview_window("kim-browser-signin") {
         let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
-        let _ = existing.eval(&format!("window.location.href = {};", js_url));
+        let _ = existing.eval(format!("window.location.href = {};", js_url));
         Ok(true)
     } else {
         Ok(false)
