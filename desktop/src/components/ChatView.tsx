@@ -684,6 +684,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     if (!item) {
       if (line.includes('[UI] SCREENSHOT_FLASH')) {
         invoke('show_screenshot_flash').catch(() => {});
+        // Only now hide the main window and show the cancel widget — the agent
+        // is actually going to look at the screen. Simple tasks ("hi", etc.)
+        // never emit this so they run with the window visible the whole time.
+        invoke('set_task_active_mode', { active: true }).catch(() => {});
       }
       return;
     }
@@ -811,9 +815,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
     // Add user message to live history for chat bubble display
     setLiveHistory(prev => [...prev, { role: 'user', content: pending.text }]);
-
-    // Enter active task mode: hide main window, show cancel widget
-    invoke('set_task_active_mode', { active: true }).catch(() => {});
 
     try {
       await invoke('send_task', {
