@@ -20,7 +20,7 @@ model:
 openai_api_key_env: OPENAI_API_KEY
 openai_base_url: ''
 preview_mode: false
-project_root: /Users/adammaged/Documents/kimTEST/kim
+project_root: /home/ahmeed/Documents/NEEDS/Personaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/DA_ORG/KIM
 provider: browser
 relay:
   pc_api_key: ''
