@@ -4149,10 +4149,17 @@ async fn open_browser_signin_window(
 /// invisible to the user. `show_browser_window_impl` restores it.
 fn hide_browser_window_offscreen(win: &tauri::WebviewWindow) {
     let _ = win.set_decorations(false);
-    // Use 1x1 instead of 0x0 — WKWebView on macOS throttles or suspends
-    // JavaScript execution (setTimeout, requestAnimationFrame, DOM events)
-    // when the window has zero dimensions, which breaks the bridge JS.
-    let _ = win.set_size(tauri::PhysicalSize::new(1, 1));
+    // Use 1024x768 — the page MUST have a real viewport for layout to work.
+    // - 0x0 makes WKWebView throttle/suspend JS (setTimeout, RAF, DOM events).
+    // - 1x1 keeps JS alive but collapses CSS layout: elements like Gemini's
+    //   <rich-textarea> get offsetParent=null, so isVisible() returns false,
+    //   findGeminiInput()/findElement({visible:true}) return null, and the
+    //   bridge throws "Could not find input selector" → headless prompts
+    //   silently fail.
+    // - 1024x768 gives the page enough room to compute a valid layout while
+    //   staying entirely off-screen at (-10000, -10000). Invisible to the
+    //   user, fully functional for the bridge.
+    let _ = win.set_size(tauri::PhysicalSize::new(1024, 768));
     let _ = win.set_position(tauri::PhysicalPosition::new(-10000, -10000));
 }
 

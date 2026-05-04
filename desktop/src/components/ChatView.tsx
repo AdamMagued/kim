@@ -520,6 +520,11 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // the cancel poller emits cancelled), so a closure variable would still be false.
   const cancelFlagRef = useRef(false);
   const needHelpFlagRef = useRef(false);
+  // Once the user sends their first message in a new-chat session, this stays
+  // true for the lifetime of that session — even after the task completes and
+  // isRunning/activity reset. This prevents the welcome section from
+  // re-appearing (which also caused the visible scroll reset).
+  const hasSentMessageRef = useRef(false);
 
   // ── Deduplication (per-session, not module-global) ───────────────────────
   // Python writes many lines to both stdout AND stderr, causing duplicates.
@@ -555,35 +560,56 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   }, [isRunning]);
 
   // ── Load messages ───────────────────────────────────────────────────────────
+  // Two trigger paths:
+  //   1. Session change (user picked a different chat)  → full reload + spinner.
+  //   2. messageReloadNonce bump (task done in same chat) → SILENT refresh:
+  //      no spinner, don't wipe liveHistory until new disk messages arrive,
+  //      don't re-animate the latest bubble (liveHistory already animated it).
+  const lastLoadedSessionIdRef = useRef<string | null>(null);
   useEffect(() => {
     if (!session) {
       setMessages([]);
+      lastLoadedSessionIdRef.current = null;
       return;
     }
-    setLoadingMessages(true);
-    setLiveHistory([]);
+    const isSessionChange = lastLoadedSessionIdRef.current !== session.session_id;
+    lastLoadedSessionIdRef.current = session.session_id;
+
+    if (isSessionChange) {
+      setLoadingMessages(true);
+      setLiveHistory([]);
+    }
     invoke<KimMessage[]>('load_session_messages', {
       sessionId: session.session_id,
       kimDir: settings.kim_sessions_dir || null,
-      clawDir: session.session_type === 'claw' && session.project_path 
-        ? `${session.project_path}/.claw/sessions` 
+      clawDir: session.session_type === 'claw' && session.project_path
+        ? `${session.project_path}/.claw/sessions`
         : settings.claw_sessions_dir || null,
     })
       .then(msgs => {
         const prev = prevMsgCountRef.current;
         const lastAssistantIdx = msgs.reduceRight((found, m, i) =>
           found === -1 && m.role === 'assistant' ? i : found, -1);
-        // Only animate if this is a refresh after task done (new messages appeared)
-        if (prev > 0 && msgs.length > prev && lastAssistantIdx >= prev) {
+        // Animate only on session change. On silent refresh the bubble was
+        // already shown (and animated) via liveHistory — re-animating it
+        // looks like the chat is "refreshing".
+        if (isSessionChange && prev > 0 && msgs.length > prev && lastAssistantIdx >= prev) {
           setNewestMsgIdx(lastAssistantIdx);
         } else {
           setNewestMsgIdx(null);
         }
         prevMsgCountRef.current = msgs.length;
         setMessages(msgs);
+        // Silent refresh: now that disk messages include the new turns,
+        // it's safe to clear liveHistory without leaving a visible gap.
+        if (!isSessionChange) {
+          setLiveHistory([]);
+        }
       })
       .catch(err => console.error('Failed to load messages:', err))
-      .finally(() => setLoadingMessages(false));
+      .finally(() => {
+        if (isSessionChange) setLoadingMessages(false);
+      });
   }, [session, settings.kim_sessions_dir, settings.claw_sessions_dir, messageReloadNonce]);
 
   // ── Scroll behavior ─────────────────────────────────────────────────────────
@@ -626,6 +652,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       setTaskError(null);
       setTokenStats(null);
       setElapsed(0);
+      hasSentMessageRef.current = false;
       // Note: do NOT set isRunning=false here — if a task is actually still
       // running we should show that state. But if not running, we want clean UI.
     }
@@ -739,6 +766,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       needHelpFlagRef.current = false; // reset
       setIsRunning(false);
       setCancelling(false);
+      setActivity([]);
       // Existing session view is now interactive, so reload message history
       // after every run completion to reflect newly appended turns.
       setMessageReloadNonce(v => v + 1);
@@ -804,6 +832,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     // next task if it failed for a real (non-cancel) reason.
     cancelFlagRef.current = false;
     needHelpFlagRef.current = false;
+    hasSentMessageRef.current = true; // Hide welcome section permanently for this session
     currentTaskRef.current = pending;
     lastRunTaskRef.current = pending;
     setIsRunning(true);
@@ -1202,8 +1231,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     );
   }
 
-  const hasStarted = isRunning || activity.length > 0 || !!taskError;
-
   // ── New chat mode ─────────────────────────────────────────────────────────────
   if (newChatMode) {
     return (
@@ -1212,7 +1239,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         <div className="kim-chat__output" ref={outputRef}>
 
 
-          {!hasStarted && (
+          {!hasSentMessageRef.current && (
             <div className="kim-new-chat-empty">
               <div className="kim-new-chat-empty__badge">
                 <span className="kim-pulse-dot kim-pulse-dot--accent" />
@@ -1456,19 +1483,21 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
             ))}
 
             {/* Newly added messages in this session */}
-            {collapseMessages(liveHistory).map(({msg, retries}, i) => (
-              <MessageBubble
-                key={`live-${i}`}
-                message={msg}
-                animate={i === liveHistory.length - 1}
-                typingAnimation={settings.typing_animation ?? 'none'}
-                onRetry={handleRetryLast}
-                retries={retries}
-              />
-            ))}
-            
-            {/* Activity feed and errors */}
-            {renderActivityFeed()}
+            {collapseMessages(liveHistory).map(({msg, retries}, i) => {
+              const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
+              return (
+                <div key={`live-${i}`}>
+                  <MessageBubble
+                    message={msg}
+                    animate={i === liveHistory.length - 1}
+                    typingAnimation={settings.typing_animation ?? 'none'}
+                    onRetry={handleRetryLast}
+                    retries={retries}
+                  />
+                  {showActivityAfter && renderActivityFeed()}
+                </div>
+              );
+            })}
 
             {/* Working indicator with blobby loader */}
             {isRunning && (
