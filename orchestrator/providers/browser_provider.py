@@ -1473,7 +1473,18 @@ class BrowserProvider(BaseProvider):
                             str(item["data"]),
                             str(item.get("name") or "").strip() or None,
                         )
-                        text_parts.append("[Screenshot attached]")
+                        if self._use_webview_bridge:
+                            # The bridge will attempt to inject the screenshot via the
+                            # macOS clipboard + execCommand('paste').  Include explicit
+                            # fallback instructions so the model can respond gracefully
+                            # if the image upload fails (which happens on Gemini's
+                            # interface when the clipboard paste isn't accepted).
+                            text_parts.append(
+                                "[Screenshot attached — if you cannot see it, respond with "
+                                "NEED_HELP: Screenshot not visible in current interface mode.]"
+                            )
+                        else:
+                            text_parts.append("[Screenshot attached]")
                     elif item_type in {"file", "document", "attachment"} and item.get("data"):
                         file_name = str(item.get("name") or item.get("filename") or "").strip() or None
                         mime_type = str(

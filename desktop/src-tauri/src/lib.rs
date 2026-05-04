@@ -546,6 +546,60 @@ fn default_site_url(site: &str) -> &'static str {
     }
 }
 
+/// Write the first PNG attachment to the macOS system clipboard via osascript.
+///
+/// This allows the bridge JS to call `document.execCommand('paste')` inside
+/// the WKWebView, generating a *trusted* paste event (isTrusted: true) that
+/// Gemini's editor accepts — unlike synthetic ClipboardEvent which is always
+/// rejected (isTrusted: false).
+///
+/// Non-blocking best-effort: errors are logged but never propagate.
+#[cfg(target_os = "macos")]
+fn write_first_png_to_clipboard(attachments: &[BridgeAttachment]) -> bool {
+    let att = match attachments.iter().find(|a| a.mime_type == "image/png") {
+        Some(a) => a,
+        None => return false,
+    };
+
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(&att.data_base64) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[Kim] clipboard: base64 decode failed: {}", e);
+            return false;
+        }
+    };
+
+    let temp_path = format!("/tmp/kim_clip_{}.png", std::process::id());
+    if let Err(e) = std::fs::write(&temp_path, &bytes) {
+        eprintln!("[Kim] clipboard: write temp failed: {}", e);
+        return false;
+    }
+
+    // «class PNGf» is the four-char AppleScript type for PNG data.
+    let script = format!(
+        "set the clipboard to (read (POSIX file \"{}\") as «class PNGf»)",
+        temp_path
+    );
+    let ok = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let _ = std::fs::remove_file(&temp_path);
+
+    if !ok {
+        eprintln!("[Kim] clipboard: osascript failed (non-fatal)");
+    }
+    ok
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_first_png_to_clipboard(_attachments: &[BridgeAttachment]) -> bool {
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Persistent JS bridge — injected ONCE via initialization_script.
 //
@@ -969,45 +1023,77 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       return files.length;
     }
 
-    // Fallback: image clipboard paste via ClipboardEvent('paste').
-    // Synthetic KeyboardEvent('keydown', {key:'v'}) does NOT trigger the
-    // browser's native paste handler — only a real ClipboardEvent with
-    // clipboardData will be picked up by ProseMirror / React editors.
+    // Fallback: image paste. Two strategies in order:
+    //
+    // 1. document.execCommand('paste') — reads from the REAL system clipboard that
+    //    the Rust bridge pre-populated via osascript before evaluating this script.
+    //    This triggers a TRUSTED paste event (isTrusted: true) that Gemini's editor
+    //    accepts.  Synthetic ClipboardEvent is always isTrusted: false and is silently
+    //    rejected by Gemini's React/Lit frontend.
+    //
+    // 2. ClipboardEvent fallback — kept for sites (Claude, ChatGPT) that do honour
+    //    synthetic paste events.
+    //
+    // Returns 1 only when a thumbnail appears, 0 when all methods fail.
     const imageFile = files.find(f => String(f.type || '').startsWith('image/'));
     if (imageFile && inputEl) {
       try {
         inputEl.focus();
         await new Promise(r => setTimeout(r, 300));
 
-        // Build a DataTransfer with the image file
+        // Strategy 1: execCommand paste from real system clipboard
+        let thumbnailFound = false;
+        try {
+          document.execCommand('paste');
+          console.log('[KimBridge] execCommand paste fired');
+        } catch (_) {}
+
+        let waited = 0;
+        while (waited < 4000) {
+          await new Promise(r => setTimeout(r, 200));
+          waited += 200;
+          if (document.querySelector('img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view')) {
+            thumbnailFound = true;
+            break;
+          }
+        }
+        if (thumbnailFound) {
+          await dismissPopups();
+          console.log('[KimBridge] execCommand paste succeeded');
+          return 1;
+        }
+
+        // Strategy 2: synthetic ClipboardEvent (isTrusted: false — may be ignored)
         const dt = new DataTransfer();
         dt.items.add(imageFile);
-
-        // Dispatch a real ClipboardEvent('paste') — this is what editors listen for
         const pasteEvent = new ClipboardEvent('paste', {
           bubbles: true,
           cancelable: true,
           clipboardData: dt,
         });
         inputEl.dispatchEvent(pasteEvent);
-        console.log('[KimBridge] Dispatched ClipboardEvent paste with image:', imageFile.name, imageFile.type);
+        console.log('[KimBridge] ClipboardEvent paste dispatched:', imageFile.name);
 
-        // Give the UI time to process the pasted image (thumbnail render, upload)
-        let waited = 0;
-        while (waited < 5000) {
+        waited = 0;
+        while (waited < 3000) {
           await new Promise(r => setTimeout(r, 200));
           waited += 200;
           if (document.querySelector('img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view')) {
+            thumbnailFound = true;
             break;
           }
         }
-        
-        // Dismiss any consent popups (like Gemini's "I agree" dialog for first-time uploads)
-        await dismissPopups();
-        
-        return 1;
+        if (thumbnailFound) {
+          await dismissPopups();
+          console.log('[KimBridge] ClipboardEvent paste succeeded');
+          return 1;
+        }
+
+        // All methods failed — return 0 so send() can append a fallback note
+        console.warn('[KimBridge] All paste strategies failed after 7s — returning 0');
+        return 0;
       } catch (e) {
-        console.warn('[KimBridge] ClipboardEvent paste fallback failed:', e);
+        console.warn('[KimBridge] injectAttachments error:', e);
       }
     }
     return 0;
@@ -1062,9 +1148,15 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
 
       const uploadedCount = await injectAttachments(cfg, inputEl, attachments);
 
-      // 3. Inject text — verify with rAF loop instead of hardcoded sleep
-      const injectedLen = await injectPromptText(inputEl, prompt);
-      if (injectedLen < Math.min(8, normalizeText(prompt).length)) {
+      // 3. Inject text — verify with rAF loop instead of hardcoded sleep.
+      // When attachments were expected but couldn't be injected (uploadedCount === 0),
+      // append an explanatory note so the model can respond gracefully instead of
+      // looping with repeated take_screenshot calls.
+      const effectivePrompt = (attachments && attachments.length > 0 && uploadedCount === 0)
+        ? prompt + '\n[System note: The screenshot could not be attached to this message (image upload unavailable in current interface). Please respond with what you can based on text context, or NEED_HELP if you truly cannot proceed without the image.]'
+        : prompt;
+      const injectedLen = await injectPromptText(inputEl, effectivePrompt);
+      if (injectedLen < Math.min(8, normalizeText(effectivePrompt).length)) {
         throw new Error('Prompt text was not accepted by the chat input.');
       }
 
@@ -3056,7 +3148,18 @@ fn handle_webview_bridge_request(
                 "reqId": req_id,
                 "site": site,
                 "promptLen": parsed.prompt.len(),
+                "attachments": attachments.len(),
             }));
+
+            // Best-effort: pre-populate the macOS system clipboard with the first PNG
+            // attachment so the bridge JS can use document.execCommand('paste') to
+            // generate a TRUSTED paste event that Gemini's editor will accept.
+            // This runs BEFORE window.eval so the clipboard is ready when the async
+            // JS bridge calls injectAttachments → execCommand('paste').
+            if !attachments.is_empty() {
+                let _clip_ok = write_first_png_to_clipboard(attachments);
+                agent_debug_log("H1", "clipboard write", serde_json::json!({ "ok": _clip_ok }));
+            }
 
             // Acquire lock to prevent overlapping window manipulations (#34)
             let _guard = match WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(())).try_lock() {
