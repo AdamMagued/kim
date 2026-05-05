@@ -4130,6 +4130,34 @@ kbd {
     filter: none !important;
     transform: none !important;
   }
-  .kim-anim-caret { animation: none !important; }
+}
+
+/* ── Credits ─────────────────────────────────────────────────────────────── */
+.kim-credits {
+  position: absolute;
+  bottom: 8px;
+  right: 12px;
+  font-size: 11px;
+  color: var(--text-muted);
+  z-index: 1000;
+  pointer-events: auto;
+  opacity: 0.5;
+  transition: opacity 0.2s ease, color 0.2s ease;
+  font-family: var(--font-mono);
+}
+.kim-credits:hover {
+  opacity: 1;
+  color: var(--text);
+}
+.kim-credits a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 2px;
+  transition: text-decoration-color 0.2s ease, color 0.2s ease;
+}
+.kim-credits a:hover {
+  color: var(--accent);
+  text-decoration-color: var(--accent);
 }
 
