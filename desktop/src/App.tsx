@@ -298,6 +298,10 @@ export default function App() {
         />
       </div>
 
+      <div className="kim-credits">
+        built by <a href="https://github.com/AdamMagued" target="_blank" rel="noreferrer">adam</a> and <a href="https://github.com/Ahmed" target="_blank" rel="noreferrer">ahmed</a> for linux
+      </div>
+
       {showSettings && (
         <SettingsPanel
           settings={settings}
