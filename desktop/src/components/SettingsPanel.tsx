@@ -4,7 +4,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type { Settings, Provider, Theme, VoiceEngine, VoiceSettings, AccentTheme, KimAccount, TypingAnimation } from '../types';
 import { VOICES_BY_ENGINE } from '../types';
 import { toast } from './Toast';
-import { useChromaShader } from '../hooks/useChromaShader';
+
 
 const PROVIDERS: { value: Provider; label: string }[] = [
   { value: 'browser', label: 'Browser (no API key)' },
@@ -22,12 +22,12 @@ const VOICE_ENGINES: { value: VoiceEngine; label: string }[] = [
 ];
 
 const ACCENTS: { value: AccentTheme; label: string; light: string; dark: string }[] = [
-  { value: 'indigo', label: 'Indigo', light: '#6366f1', dark: '#818cf8' },
-  { value: 'ocean',  label: 'Ocean',  light: '#2563eb', dark: '#60a5fa' },
-  { value: 'ember',  label: 'Ember',  light: '#ea6c0a', dark: '#fb923c' },
-  { value: 'teal',   label: 'Teal',   light: '#0891b2', dark: '#22d3ee' },
-  { value: 'jade',   label: 'Jade',   light: '#059669', dark: '#34d399' },
-  { value: 'mono',   label: 'Mono',   light: '#18181b', dark: '#e4e4e7' },
+  { value: 'indigo', label: 'Terracotta', light: '#b88a74', dark: '#d4a08a' },
+  { value: 'ocean',  label: 'Mist',       light: '#6a8f9d', dark: '#90b7c3' },
+  { value: 'ember',  label: 'Sienna',     light: '#c4835a', dark: '#e4a37a' },
+  { value: 'teal',   label: 'Sage',       light: '#6a8f66', dark: '#a8c5a3' },
+  { value: 'jade',   label: 'Rose',       light: '#9d7a7a', dark: '#d4a0a0' },
+  { value: 'mono',   label: 'Mono',       light: '#2d2822', dark: '#e8dfd6' },
 ];
 
 const TYPING_ANIMATIONS: { value: string; label: string; desc: string; icon: string }[] = [
@@ -1145,9 +1145,7 @@ function FeedbackSection() {
 
 export function SettingsPanel({ settings, onChange, onClose, appVersion, onCheckUpdate, account, onAccountChange }: Props) {
   const [activeSection, setActiveSection] = useState<NavSection>('appearance');
-  const canvasRef  = useRef<HTMLCanvasElement>(null);
   const backdropRef = useRef<HTMLDivElement>(null);
-  useChromaShader(canvasRef, backdropRef);
 
   return (
     <div
@@ -1155,8 +1153,6 @@ export function SettingsPanel({ settings, onChange, onClose, appVersion, onCheck
       className="kim-settings-backdrop"
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}
     >
-      {/* Live chrome shader behind the panel */}
-      <canvas ref={canvasRef} className="kim-settings-canvas" />
 
       {/* Glass panel */}
       <div className="kim-settings-panel" role="dialog" aria-labelledby="settings-title">

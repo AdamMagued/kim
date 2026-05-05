@@ -6,21 +6,7 @@ import { MessageBubble } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
 import { BrowserProviderPicker } from './BrowserProviderPicker';
 import { Bloop, type BloopState } from './Bloop';
-import { useChromaShader } from '../hooks/useChromaShader';
 import { toast } from './Toast';
-
-/** Subtle chrome WebGL backdrop, matching the onboarding shader. */
-function ChatChromaBackdrop() {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  useChromaShader(canvasRef, containerRef);
-  return (
-    <div ref={containerRef} className="kim-chat__backdrop" aria-hidden="true">
-      <canvas ref={canvasRef} className="kim-chat__backdrop-canvas" />
-      <div className="kim-chat__backdrop-scrim" />
-    </div>
-  );
-}
 
 const MAX_ACTIVITY_ITEMS = 300;
 
@@ -1215,7 +1201,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   if (!newChatMode && !session) {
     return (
       <div className="kim-chat">
-        <ChatChromaBackdrop />
+
         <div className="kim-empty-welcome">
           <div className="kim-greeting__text">
             {activeTab === 'code' ? 'Start a new Code session' : getGreeting(account.display_name.split(' ')[0])}
@@ -1235,7 +1221,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   if (newChatMode) {
     return (
       <div className="kim-chat">
-        <ChatChromaBackdrop />
+
         <div className="kim-chat__output" ref={outputRef}>
 
 
@@ -1417,7 +1403,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // ── Existing session view ─────────────────────────────────────────────────────
   return (
     <div className="kim-chat">
-      <ChatChromaBackdrop />
       {/* Session header */}
       <div className="kim-session-header">
         <div className="kim-session-header__main">

@@ -9,6 +9,7 @@ import { useAccount } from './hooks/useAccount';
 import { Sidebar } from './components/Sidebar';
 import { ChatView } from './components/ChatView';
 import { SettingsPanel } from './components/SettingsPanel';
+import { KimLogo } from './components/KimLogo';
 import { UpdateModal } from './components/UpdateModal';
 import { ThemeToggle } from './components/ThemeToggle';
 import { OnboardingFlow } from './components/OnboardingFlow';
@@ -234,13 +235,7 @@ export default function App() {
         <div className="kim-header__traffic-lights-spacer" />
 
         <div className="kim-header__brand">
-          <svg className="kim-logo-mark" viewBox="0 0 52 52" fill="none">
-            <circle cx="26" cy="26" r="6" fill="currentColor" />
-            <path d="M26 8 A18 18 0 0 1 44 26" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" fill="none" opacity="0.9" />
-            <path d="M26 44 A18 18 0 0 1 8 26" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" fill="none" opacity="0.9" />
-            <circle cx="44" cy="26" r="3" fill="currentColor" opacity="0.7" />
-            <circle cx="8" cy="26" r="3" fill="currentColor" opacity="0.7" />
-          </svg>
+          <KimLogo layout="icon" size={20} />
           <span className="kim-header__title">Kim</span>
           <span className="kim-header__version">v{appVersion}</span>
         </div>

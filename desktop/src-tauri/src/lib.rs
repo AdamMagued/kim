@@ -1002,7 +1002,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       for (const sel of cfg.upload_button_selectors || []) {
         try {
           const btn = document.querySelector(sel);
-          if (btn) { btn.click(); await new Promise(r => setTimeout(r, 280)); }
+          if (btn) { btn.click(); await new Promise(r => setTimeout(r, 100)); }
           for (const fsel of cfg.file_input_selectors || []) {
             const fi = document.querySelector(fsel);
             if (fi && fi instanceof HTMLInputElement && fi.type === 'file') { fileInput = fi; break; }
@@ -1019,7 +1019,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       }
       fileInput.dispatchEvent(new Event('input', { bubbles: true }));
       fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-      await new Promise(r => setTimeout(r, 700));
+      await new Promise(r => setTimeout(r, 250));
       return files.length;
     }
 
@@ -1039,7 +1039,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
     if (imageFile && inputEl) {
       try {
         inputEl.focus();
-        await new Promise(r => setTimeout(r, 300));
+        await new Promise(r => setTimeout(r, 100));
 
         // Strategy 1: execCommand paste from real system clipboard
         let thumbnailFound = false;
@@ -1049,9 +1049,9 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         } catch (_) {}
 
         let waited = 0;
-        while (waited < 4000) {
-          await new Promise(r => setTimeout(r, 200));
-          waited += 200;
+        while (waited < 1500) {
+          await new Promise(r => setTimeout(r, 100));
+          waited += 100;
           if (document.querySelector('img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view')) {
             thumbnailFound = true;
             break;
@@ -1075,9 +1075,9 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         console.log('[KimBridge] ClipboardEvent paste dispatched:', imageFile.name);
 
         waited = 0;
-        while (waited < 3000) {
-          await new Promise(r => setTimeout(r, 200));
-          waited += 200;
+        while (waited < 1000) {
+          await new Promise(r => setTimeout(r, 100));
+          waited += 100;
           if (document.querySelector('img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view')) {
             thumbnailFound = true;
             break;
@@ -1090,7 +1090,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         }
 
         // All methods failed — return 0 so send() can append a fallback note
-        console.warn('[KimBridge] All paste strategies failed after 7s — returning 0');
+        console.warn('[KimBridge] All paste strategies failed after 2.5s — returning 0');
         return 0;
       } catch (e) {
         console.warn('[KimBridge] injectAttachments error:', e);
@@ -1161,7 +1161,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       }
 
       // Allow UI framework to sync state before sending
-      await new Promise(r => setTimeout(r, 150));
+      await new Promise(r => setTimeout(r, 80));
 
       // 4a. Wait for the PREVIOUS request's completion hash to appear in the
       //     DOM before pressing Enter.  This ensures we never interrupt an
@@ -1216,7 +1216,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
           if (sendBtn) {
             try { sendBtn.click(); sendClicked = true; console.log('[KimBridge] Send button clicked on attempt', attempt + 1); break; } catch (_) {}
           }
-          await new Promise(r => setTimeout(r, 500));
+          await new Promise(r => setTimeout(r, 200));
         }
         if (!sendClicked) {
           console.warn('[KimBridge] Could not find/click enabled send button after 15 attempts, Enter may have worked');
@@ -1239,7 +1239,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       //    The LLM was instructed to append the hash at the very end of its
       //    response.  When we see it in the page text, the response is complete
       //    and we know exactly which text belongs to this request.
-      const POLL_MS = 500;
+      const POLL_MS = 300;
       let responseText = '';
 
       let noPostStopCount = 0;
@@ -1409,7 +1409,12 @@ fn open_browser_signin_window_impl(
     });
 
     if let Some(existing) = app_handle.get_webview_window(label) {
-        let _ = existing.set_focus();
+        // Only steal focus if the window is actually visible on-screen.
+        // In headless mode (offscreen at -10000,-10000) we must NOT focus
+        // because it would pull the user away from their current page.
+        if !is_browser_window_offscreen(&existing) {
+            let _ = existing.set_focus();
+        }
     }
 
     Ok("Opened in Kim browser window".to_string())
@@ -3139,6 +3144,13 @@ fn handle_webview_bridge_request(
             // headless operation.  JS keeps running at 1x1, no need to
             // show it to the user.
             if is_browser_window_offscreen(&window) {
+                if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
+                    guard.insert(req_id.clone());
+                }
+            } else if let Ok(false) = window.is_focused() {
+                // If the window is on-screen but in the background, hide it offscreen
+                // so the upcoming JS `inputEl.focus()` doesn't steal focus from Kim.
+                hide_browser_window_offscreen(&window);
                 if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
                     guard.insert(req_id.clone());
                 }

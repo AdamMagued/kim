@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { KimAccount } from '../types';
-import { useChromaShader } from '../hooks/useChromaShader';
+import { KimLogo } from './KimLogo';
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
@@ -34,16 +34,8 @@ function CheckIcon() {
 
 function KimAsterisk() {
   return (
-    <div className="kim-ob__logo-mark">
-      <svg viewBox="0 0 28 28" fill="none">
-        <line x1="14" y1="3" x2="14" y2="25" stroke="rgba(255,255,255,.88)" strokeWidth="1.5" strokeLinecap="round" />
-        <line x1="3.8" y1="8.5" x2="24.2" y2="19.5" stroke="rgba(255,255,255,.88)" strokeWidth="1.5" strokeLinecap="round" />
-        <line x1="3.8" y1="19.5" x2="24.2" y2="8.5" stroke="rgba(255,255,255,.88)" strokeWidth="1.5" strokeLinecap="round" />
-        <line x1="11.2" y1="6.5" x2="14" y2="9.8" stroke="rgba(255,255,255,.38)" strokeWidth="1" strokeLinecap="round" />
-        <line x1="16.8" y1="6.5" x2="14" y2="9.8" stroke="rgba(255,255,255,.38)" strokeWidth="1" strokeLinecap="round" />
-        <line x1="11.2" y1="21.5" x2="14" y2="18.2" stroke="rgba(255,255,255,.38)" strokeWidth="1" strokeLinecap="round" />
-        <line x1="16.8" y1="21.5" x2="14" y2="18.2" stroke="rgba(255,255,255,.38)" strokeWidth="1" strokeLinecap="round" />
-      </svg>
+    <div className="kim-ob__logo-mark" style={{ marginBottom: '16px' }}>
+      <KimLogo layout="stacked" size={80} />
     </div>
   );
 }
@@ -55,8 +47,6 @@ interface Props {
 }
 
 export function OnboardingFlow({ onComplete }: Props) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  useChromaShader(canvasRef);
 
   // Step: 'name' → 'github' → 'done'
   const [step, setStep] = useState<'name' | 'github'>('name');
@@ -135,11 +125,6 @@ export function OnboardingFlow({ onComplete }: Props) {
 
   return (
     <div className="kim-ob">
-      {/* Full-bleed WebGL canvas */}
-      <canvas ref={canvasRef} className="kim-ob__canvas" />
-
-      {/* Radial scrim */}
-      <div className="kim-ob__scrim" />
 
       {/* Content */}
       {step === 'name' && (

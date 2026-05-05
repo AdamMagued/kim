@@ -17,7 +17,7 @@ function applyTheme(resolved: 'dark' | 'light') {
   }
 }
 
-export function useTheme(initial: Theme = 'system') {
+export function useTheme(initial: Theme = 'light') {
   const [theme, setThemeState] = useState<Theme>(() => {
     const stored = localStorage.getItem('kim-theme') as Theme | null;
     return stored ?? initial;
