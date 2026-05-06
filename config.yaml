@@ -1,11 +1,13 @@
 allowed_paths:
 - .
+anthropic_base_url: http://localhost:8046/v1
 browser_provider:
   browser_headless: false
   cdp_url: http://localhost:9222
   max_history_messages: 6
   max_inject_chars: 12000
 custom_sites: {}
+kimtools_url: http://localhost:8046
 logging:
   level: INFO
 max_iterations: 25
@@ -18,7 +20,7 @@ model:
   gemini: gemini-2.0-flash
   openai: gpt-4o
 openai_api_key_env: OPENAI_API_KEY
-openai_base_url: ''
+openai_base_url: http://localhost:8046/v1
 preview_mode: false
 project_root: /home/ahmeed/Documents/NEEDS/Personaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/DA_ORG/KIM
 provider: browser
@@ -48,3 +50,4 @@ voice:
     use_4bit: false
   speed: 1.0
   voice_id: af_heart
+selected_account_id: 4

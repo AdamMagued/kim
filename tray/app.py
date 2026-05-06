@@ -152,6 +152,8 @@ class KimApp:
         self._runner = _AsyncRunner()
         self._agent_running = False
         self._active_provider: str = self._config.get("provider", "browser")
+        self._active_account_id: Optional[int] = self._config.get("selected_account_id")
+        self._accounts: list[dict] = []
 
         # Tkinter root (hidden — acts as event dispatcher)
         self._root = tk.Tk()
@@ -189,12 +191,82 @@ class KimApp:
         self._voice.set_status_callback(self._on_voice_status)
         self._voice.warm_up()
 
+        # Initial account fetch
+        self._fetch_accounts()
+
         # Poll for cross-thread events every 50 ms
         self._root.after(50, self._poll)
+        # Periodically fetch accounts every 30 seconds
+        self._root.after(30000, self._periodic_fetch_accounts)
+        
+        # Start relay polling if configured
+        self._root.after(2000, self._poll_relay)
+        
         try:
             self._root.mainloop()
         finally:
             self._cleanup()
+
+    def _poll_relay(self) -> None:
+        """Poll the remote relay server for new tasks."""
+        if self._agent_running:
+            # Don't poll if we're already busy
+            self._root.after(2000, self._poll_relay)
+            return
+
+        relay_url = self._config.get("relay", {}).get("url")
+        pc_key = os.environ.get("RELAY_PC_API_KEY")
+        
+        if not relay_url or not pc_key:
+            # Relay not configured or missing key
+            self._root.after(5000, self._poll_relay)
+            return
+
+        import httpx
+        try:
+            headers = {"x-api-key": pc_key}
+            resp = httpx.get(f"{relay_url}/prompt/next", headers=headers, timeout=5.0)
+            
+            if resp.status_code == 200:
+                item = resp.json()
+                task_id = item.get("task_id")
+                task_text = item.get("task")
+                if task_id and task_text:
+                    logger.info(f"Relay: Received remote task {task_id}: {task_text}")
+                    self._root.after(0, lambda: self.submit_task(task_text, task_id=task_id))
+            elif resp.status_code == 204:
+                # No tasks in queue
+                pass
+            else:
+                logger.debug(f"Relay poll status: {resp.status_code}")
+        except Exception as e:
+            logger.debug(f"Relay poll failed: {e}")
+
+        # Poll again after interval (from config or default 2s)
+        interval = self._config.get("relay", {}).get("poll_interval", 2)
+        self._root.after(int(interval * 1000), self._poll_relay)
+
+    def _fetch_accounts(self) -> None:
+        """Fetch active accounts from kimTools API."""
+        import httpx
+        try:
+            # kimTools is typically on 8046
+            url = self._config.get("kimtools_url", "http://localhost:8046")
+            resp = httpx.get(f"{url}/api/accounts/active", timeout=2.0)
+            if resp.status_code == 200:
+                self._accounts = resp.json()
+                logger.info(f"Fetched {len(self._accounts)} accounts from kimTools")
+                # Update menu if icon exists
+                if self._icon:
+                    self._icon.menu = self._build_menu()
+                if self._control_panel and self._control_panel.winfo_exists():
+                    self._control_panel.refresh_accounts()
+        except Exception as e:
+            logger.debug(f"Failed to fetch accounts: {e}")
+
+    def _periodic_fetch_accounts(self) -> None:
+        self._fetch_accounts()
+        self._root.after(30000, self._periodic_fetch_accounts)
 
     def _on_voice_status(self, status: VoiceStatus, message: str) -> None:
         """Callback from VoiceEngine (may fire from any thread).
@@ -244,6 +316,26 @@ class KimApp:
             for p in _PROVIDERS
         ]
 
+        account_items = [
+            Item(
+                "None / Local",
+                self._make_account_setter(None),
+                checked=lambda _: self._active_account_id is None,
+                radio=True,
+            )
+        ]
+        for acc in self._accounts:
+            acc_id = acc["id"]
+            label = f"{acc['label']} ({acc['provider']})"
+            account_items.append(
+                Item(
+                    label,
+                    self._make_account_setter(acc_id),
+                    checked=lambda _, aid=acc_id: self._active_account_id == aid,
+                    radio=True,
+                )
+            )
+
         return pystray.Menu(
             Item("Open Control Panel", self._open_control_panel),
             Item("Run Task…", self._prompt_task),
@@ -251,6 +343,10 @@ class KimApp:
             Item(
                 "Provider",
                 pystray.Menu(*provider_items),
+            ),
+            Item(
+                "Account",
+                pystray.Menu(*account_items),
             ),
             Item(
                 "Agent",
@@ -337,6 +433,11 @@ class KimApp:
             self._root.after(0, lambda: self._set_provider(provider))
         return _set
 
+    def _make_account_setter(self, account_id: Optional[int]):
+        def _set(icon=None, item=None):
+            self._root.after(0, lambda: self._set_account(account_id))
+        return _set
+
     # ── tkinter-thread actions ────────────────────────────────────────────────
 
     def _show_control_panel(self) -> None:
@@ -380,6 +481,17 @@ class KimApp:
         if self._control_panel and self._control_panel.winfo_exists():
             self._control_panel.refresh_status()
 
+    def _set_account(self, account_id: Optional[int]) -> None:
+        self._active_account_id = account_id
+        self._config["selected_account_id"] = account_id
+        _save_config(self._config)
+        logger.info(f"Account switched to {account_id}")
+        # Rebuild menu
+        if self._icon:
+            self._icon.menu = self._build_menu()
+        if self._control_panel and self._control_panel.winfo_exists():
+            self._control_panel.refresh_status()
+
     def _do_cancel(self) -> None:
         self._bridge.cancel()
         self._runner.cancel_current()
@@ -394,9 +506,12 @@ class KimApp:
 
     # ── task submission ───────────────────────────────────────────────────────
 
-    def submit_task(self, task: str) -> None:
+    def submit_task(self, task: str, task_id: Optional[str] = None) -> None:
         """Called from tkinter thread to start an agent task."""
         if self._agent_running:
+            if task_id:
+                # If it's a relay task, we just skip it (it will stay in queue or be re-polled)
+                return
             messagebox.showwarning(
                 "Kim", "An agent task is already running.", parent=self._root
             )
@@ -417,27 +532,33 @@ class KimApp:
                     voice_engine=self._voice,
                 ) as agent:
                     result = await agent.run(task)
-                self._root.after(0, self._on_task_done, result, True)
+                self._root.after(0, self._on_task_done, result, True, task_id)
             except asyncio.CancelledError:
-                self._root.after(0, self._on_task_done, "Cancelled", False)
+                self._root.after(0, self._on_task_done, "Cancelled", False, task_id)
             except Exception as e:
                 logger.error(f"Agent error: {e}", exc_info=True)
-                self._root.after(0, self._on_task_done, str(e), False)
+                self._root.after(0, self._on_task_done, str(e), False, task_id)
 
         self._runner.submit(_run())
 
-    def _on_task_done(self, result, success: bool) -> None:
+    def _on_task_done(self, result, success: bool, task_id: Optional[str] = None) -> None:
         # Extract a clean summary for voice (before stringifying the full result)
         if isinstance(result, dict):
             voice_summary = result.get("summary", "")
+            screenshot = result.get("screenshot", "")
         else:
             voice_summary = str(result)
+            screenshot = ""
 
         # Stringify for display / logging
         display = voice_summary if voice_summary else str(result)
         self._agent_running = False
         colour = _COLOUR_IDLE if success else _COLOUR_ERROR
         self._update_icon_colour(colour)
+
+        # Upload result to relay if this was a remote task
+        if task_id:
+            self._report_relay_result(task_id, display, screenshot, success)
 
         title = "Kim — Task Complete" if success else "Kim — Task Failed"
         _toast(title, display)
@@ -450,6 +571,29 @@ class KimApp:
 
         if self._control_panel and self._control_panel.winfo_exists():
             self._control_panel.on_task_done(display, success)
+
+    def _report_relay_result(self, task_id: str, summary: str, screenshot: str, success: bool) -> None:
+        relay_url = self._config.get("relay", {}).get("url")
+        pc_key = os.environ.get("RELAY_PC_API_KEY")
+        if not relay_url or not pc_key:
+            return
+
+        import httpx
+        def _target():
+            try:
+                headers = {"x-api-key": pc_key}
+                payload = {
+                    "task_id": task_id,
+                    "summary": summary,
+                    "screenshot": screenshot,
+                    "success": success
+                }
+                httpx.post(f"{relay_url}/result", json=payload, headers=headers, timeout=10.0)
+                logger.info(f"Relay: Reported result for {task_id}")
+            except Exception as e:
+                logger.warning(f"Relay: Failed to report result for {task_id}: {e}")
+        
+        threading.Thread(target=_target, daemon=True).start()
 
     # ── cross-thread poll ─────────────────────────────────────────────────────
 

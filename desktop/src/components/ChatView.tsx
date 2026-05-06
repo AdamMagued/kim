@@ -7,6 +7,7 @@ import { SignalCard } from './ToolCallCard';
 import { BrowserProviderPicker } from './BrowserProviderPicker';
 import { Bloop, type BloopState } from './Bloop';
 import { toast } from './Toast';
+import { useGatewayAccounts } from '../hooks/useGatewayAccounts';
 
 const MAX_ACTIVITY_ITEMS = 300;
 
@@ -478,6 +479,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [autoFollowOutput, setAutoFollowOutput] = useState(true);
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
+  const { accounts: gatewayAccounts, selectedAccountId, setSelectedAccountId } = useGatewayAccounts(settings.project_root || null);
   const [conversationId] = useState(() => makeConversationId());
   const activeResumeSessionId = session?.session_id ?? conversationId;
   const activeResumeSessionIdRef = useRef(activeResumeSessionId);
@@ -1151,6 +1153,32 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               <path d="M2 4l3 3 3-3" />
             </svg>
           </span>
+          {gatewayAccounts.length > 0 && (
+            <>
+              <span className="kim-composer__hint-sep">·</span>
+              <span className="kim-composer__provider-pill">
+                <select
+                  value={selectedAccountId ?? ''}
+                  onChange={e => {
+                    const val = e.target.value;
+                    void setSelectedAccountId(val === '' ? null : Number(val));
+                  }}
+                  className="kim-composer__provider-select"
+                  title="Gateway account"
+                >
+                  <option value="">Auto account</option>
+                  {gatewayAccounts.map(a => (
+                    <option key={a.id} value={a.id}>
+                      {a.label}
+                    </option>
+                  ))}
+                </select>
+                <svg className="kim-composer__provider-chevron" viewBox="0 0 10 10" width="8" height="8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M2 4l3 3 3-3" />
+                </svg>
+              </span>
+            </>
+          )}
           {resolveProvider().startsWith('browser:') && resolveProvider().split(':')[1] !== 'custom' && (
             <>
               <span className="kim-composer__hint-sep">·</span>

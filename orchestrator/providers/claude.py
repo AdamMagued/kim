@@ -19,9 +19,21 @@ logger = logging.getLogger(__name__)
 class AnthropicProvider(BaseProvider):
     def __init__(self, config: dict):
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
+        base_url = config.get("anthropic_base_url")
+
+        if not api_key and not base_url:
             raise EnvironmentError("ANTHROPIC_API_KEY is not set")
-        self._client = anthropic.AsyncAnthropic(api_key=api_key)
+            
+        kwargs: dict = {"api_key": api_key or "placeholder"}
+        if base_url:
+            kwargs["base_url"] = base_url
+            
+        # Support for kimTools specific account selection
+        self._selected_account_id = config.get("selected_account_id")
+        if self._selected_account_id and base_url:
+            kwargs["default_headers"] = {"X-Account-ID": str(self._selected_account_id)}
+
+        self._client = anthropic.AsyncAnthropic(**kwargs)
         models = config.get("model", {})
         self._model = models.get("claude", "claude-opus-4-5")
         self._max_tokens = int(config.get("max_tokens", 4096))

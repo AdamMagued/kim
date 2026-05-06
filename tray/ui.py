@@ -265,12 +265,38 @@ class ControlPanel(tk.Toplevel):
         )
         self._preview_toggle.pack(side=tk.LEFT)
 
-        # Provider label (right side)
+        # Provider label
         self._provider_label = tk.Label(
             settings_bar, text="", bg=_BG_SETTINGS, fg=_FG_ACCENT,
             font=self._font_small,
         )
         self._provider_label.pack(side=tk.RIGHT)
+
+        # Account dropdown
+        tk.Label(
+            settings_bar, text="Account:", bg=_BG_SETTINGS, fg=_FG_DIM,
+            font=self._font_small,
+        ).pack(side=tk.RIGHT, padx=(12, 4))
+        
+        # Refresh button for accounts
+        self._refresh_btn = tk.Button(
+            settings_bar, text="↻", bg=_BG_SETTINGS, fg=_FG_DIM,
+            font=_resolve_font(12), relief=tk.FLAT, border=0,
+            command=self._on_refresh_accounts, activebackground=_BG_HOVER,
+            activeforeground=_FG, cursor="hand2", padx=4
+        )
+        self._refresh_btn.pack(side=tk.RIGHT)
+
+        self._account_var = tk.StringVar(value="None / Local")
+        self._account_dropdown = tk.OptionMenu(
+            settings_bar, self._account_var, "None / Local",
+            command=self._on_account_change
+        )
+        self._account_dropdown.config(
+            bg=_BG_SETTINGS, fg=_FG_DIM, font=self._font_small,
+            highlightthickness=0, bd=0, indicatoron=0
+        )
+        self._account_dropdown.pack(side=tk.RIGHT, padx=(0, 12))
 
         # Voice status label (reflects VoiceEngine state)
         self._voice_status_label = tk.Label(
@@ -567,9 +593,32 @@ class ControlPanel(tk.Toplevel):
         self._add_kim_message(f"{icon}  {display[:300]}", fg=colour)
 
     def refresh_status(self) -> None:
-        """Update provider label from current config."""
+        """Update provider and account labels from current config."""
         provider = self._app._active_provider
         self._provider_label.config(text=f"{provider}")
+        
+        # Update account dropdown selection
+        self.refresh_accounts()
+        acc_id = self._app._active_account_id
+        if acc_id is None:
+            self._account_var.set("None / Local")
+        else:
+            acc = next((a for a in self._app._accounts if a["id"] == acc_id), None)
+            if acc:
+                self._account_var.set(f"{acc['label']} ({acc['provider']})")
+
+    def refresh_accounts(self) -> None:
+        """Update the account dropdown menu options."""
+        menu = self._account_dropdown["menu"]
+        menu.delete(0, "end")
+        
+        options = ["None / Local"]
+        menu.add_command(label="None / Local", command=lambda: self._on_account_change("None / Local"))
+        
+        for acc in self._app._accounts:
+            label = f"{acc['label']} ({acc['provider']})"
+            options.append(label)
+            menu.add_command(label=label, command=lambda l=label: self._on_account_change(l))
 
     def set_voice_status(self, status, message: str) -> None:
         """Update the voice status label. Called from KimApp on the Tk thread.
@@ -606,6 +655,24 @@ class ControlPanel(tk.Toplevel):
         self._stop_btn.pack(side=tk.RIGHT)
         self._status_label.config(text="running…", fg=_FG_TOOL)
         self._app.submit_task(task)
+
+    def _on_refresh_accounts(self) -> None:
+        """Manually trigger an account fetch from the gateway."""
+        self._add_system_message("Refreshing accounts from gateway...", fg=_FG_DIM)
+        self._app._fetch_accounts()
+
+    def _on_account_change(self, selected_label: str) -> None:
+        """Called when the user selects a different account from the UI."""
+        if selected_label == "None / Local":
+            self._app._set_account(None)
+            return
+            
+        # Find account by label
+        for acc in self._app._accounts:
+            label = f"{acc['label']} ({acc['provider']})"
+            if label == selected_label:
+                self._app._set_account(acc["id"])
+                break
 
     def _on_stop(self) -> None:
         self._app._do_cancel()

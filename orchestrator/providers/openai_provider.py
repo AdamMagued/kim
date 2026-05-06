@@ -54,6 +54,12 @@ class OpenAIProvider(BaseProvider):
         kwargs: dict = {"api_key": api_key or "placeholder"}
         if base_url:
             kwargs["base_url"] = base_url
+            
+        # Support for kimTools specific account selection
+        self._selected_account_id = config.get("selected_account_id")
+        if self._selected_account_id and base_url:
+            kwargs["default_headers"] = {"X-Account-ID": str(self._selected_account_id)}
+
         self._client = openai.AsyncOpenAI(**kwargs)
         models = config.get("model", {})
         self._model = models.get("openai", "gpt-4o")

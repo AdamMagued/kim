@@ -284,7 +284,12 @@ class BrowserProvider(BaseProvider):
             os.environ.get("PROJECT_ROOT")
             or config.get("project_root", str(Path.cwd()))
         ).resolve()
-        default_data_dir = str(project_root / "sessions" / "chrome_data")
+        
+        # Multi-account support: append account_id to session directory
+        account_id = config.get("selected_account_id")
+        session_suffix = f"_{account_id}" if account_id is not None else ""
+        default_data_dir = str(project_root / "sessions" / f"chrome_data{session_suffix}")
+        
         self._user_data_dir = str(
             Path(bp_cfg.get("user_data_dir", default_data_dir)).resolve()
         )
@@ -294,7 +299,7 @@ class BrowserProvider(BaseProvider):
         logger.info(
             f"BrowserProvider: session dir = {self._user_data_dir}  "
             f"headless = {self._headless}  preferred_site = {self._preferred_site!r} "
-            f"in_app_bridge = {self._use_webview_bridge}"
+            f"in_app_bridge = {self._use_webview_bridge} account_id = {account_id}"
         )
 
         # Stateful flag — tracks whether we've already sent the system
@@ -502,6 +507,8 @@ class BrowserProvider(BaseProvider):
                 "were omitted due to attachment limit.]"
             )
 
+        account_email = self._config.get("selected_account_email")
+
         headers = {"X-Kim-Token": self._bridge_token}
         payload = {
             "site": site,
@@ -509,6 +516,8 @@ class BrowserProvider(BaseProvider):
             "attachments": bridge_attachments,
             "completion_hash": completion_hash,
         }
+        if account_email:
+            payload["account_email"] = account_email
 
         # ── Try split send/result API first ──────────────────────────────
         try:
@@ -540,10 +549,51 @@ class BrowserProvider(BaseProvider):
                 }
 
             if send_resp.status_code == 409:
-                msg = send_data.get("error") or (
-                    "Kim opened the in-app browser window. Sign in and resend your task."
-                )
-                return {"type": "text", "content": f"NEED_HELP: {msg}"}
+                # Browser window just opened — auto sign-in JS is running.
+                # Wait up to 25 s for sign-in to complete, then retry once.
+                print("[STATUS] Browser sign-in required — signing in automatically…", flush=True)
+                for _attempt in range(5):
+                    await asyncio.sleep(5)
+                    try:
+                        async with httpx.AsyncClient(timeout=30) as retry_client:
+                            retry_resp = await retry_client.post(
+                                f"{self._bridge_url}/v1/send",
+                                headers=headers,
+                                json=payload,
+                            )
+                        if retry_resp.status_code == 200:
+                            send_resp = retry_resp
+                            try:
+                                send_data = retry_resp.json()
+                            except ValueError:
+                                pass
+                            break
+                        if retry_resp.status_code != 409:
+                            send_resp = retry_resp
+                            try:
+                                send_data = retry_resp.json()
+                            except ValueError:
+                                pass
+                            break
+                    except Exception:
+                        pass
+                else:
+                    return {
+                        "type": "text",
+                        "content": (
+                            "NEED_HELP: Could not sign in automatically. "
+                            "Please sign in using the browser window and try again."
+                        ),
+                    }
+                # Re-check status after retries
+                if send_resp.status_code == 409:
+                    return {
+                        "type": "text",
+                        "content": (
+                            "NEED_HELP: Auto sign-in timed out. "
+                            "Please sign in using the browser window and try again."
+                        ),
+                    }
 
             if send_resp.status_code >= 400:
                 msg = send_data.get("error") or f"HTTP {send_resp.status_code}"

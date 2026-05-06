@@ -50,6 +50,9 @@ struct BridgeCompleteRequest {
     attachments: Vec<BridgeAttachment>,
     #[serde(default)]
     completion_hash: Option<String>,
+    /// Google account email to use for auto sign-in account picker.
+    #[serde(default)]
+    account_email: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1323,6 +1326,96 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
   };
 
   console.log('[KimBridge] Persistent bridge v2 installed for', detectSite() || 'unknown site');
+
+  // ── Auto sign-in ──────────────────────────────────────────────────────────
+  // Detects sign-in pages and automatically clicks "Continue with Google",
+  // then picks the right account if window.__kimSelectedAccountEmail is set.
+
+  const _GOOGLE_BTN_RE = /^(sign.?in|continue|log.?in) with google$|^google$/i;
+
+  function _kimFindGoogleBtn() {
+    const els = document.querySelectorAll('button, a[role="button"], div[role="button"]');
+    for (const el of els) {
+      if (!isVisible(el)) continue;
+      const txt = (el.innerText || el.getAttribute('aria-label') || '').trim();
+      if (_GOOGLE_BTN_RE.test(txt)) return el;
+      if (/google/i.test(txt) && /continue|sign.?in|log.?in/i.test(txt)) return el;
+    }
+    return null;
+  }
+
+  function _kimIsSignInPage() {
+    const href = window.location.href;
+    if (href.includes('claude.ai')) {
+      const cfg = SITE_CONFIGS['claude'];
+      if (cfg && findElement(cfg.input_selectors, { visible: true })) return false;
+      if (href.includes('/login') || href.includes('/onboarding') || href.includes('/auth')) return true;
+    }
+    if (href.includes('chatgpt.com')) {
+      if (document.querySelector('#prompt-textarea')) return false;
+      if (href.includes('/auth') || href.includes('/login')) return true;
+    }
+    if (href.includes('gemini.google.com')) {
+      if (document.querySelector('rich-textarea')) return false;
+      return true;
+    }
+    if (href.includes('accounts.google.com') || href.includes('auth0.com')) return true;
+    if (href.includes('deepseek.com') && (href.includes('sign_in') || href.includes('login'))) return true;
+    const knownDomains = ['claude.ai', 'chatgpt.com', 'gemini.google.com', 'chat.deepseek.com'];
+    for (const domain of knownDomains) {
+      if (href.includes(domain)) {
+        const emailInput = document.querySelector('input[type="email"], input[name="email"]');
+        if (emailInput && isVisible(emailInput)) return true;
+      }
+    }
+    return false;
+  }
+
+  function _kimPickGoogleAccount() {
+    const target = window.__kimSelectedAccountEmail;
+    if (!target) return false;
+    const rows = document.querySelectorAll('[data-email], [data-identifier], li[role="link"], li[role="option"], div[data-authuser]');
+    for (const row of rows) {
+      const email = row.getAttribute('data-email') || row.getAttribute('data-identifier') || '';
+      const text = row.textContent || '';
+      if (email === target || text.includes(target)) {
+        row.click();
+        console.log('[KimBridge] Auto sign-in: picked account', target);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function _kimRunAutoSignIn() {
+    const href = window.location.href;
+    if (href.includes('accounts.google.com')) {
+      _kimPickGoogleAccount();
+      return;
+    }
+    if (!_kimIsSignInPage()) return;
+    const btn = _kimFindGoogleBtn();
+    if (btn) {
+      btn.click();
+      console.log('[KimBridge] Auto sign-in: clicked Google button');
+    } else {
+      setTimeout(() => {
+        const b = _kimFindGoogleBtn();
+        if (b) { b.click(); console.log('[KimBridge] Auto sign-in: retry click'); }
+      }, 1200);
+    }
+  }
+
+  let _kimSignInTimer = null;
+  const _kimScheduleSignIn = () => {
+    clearTimeout(_kimSignInTimer);
+    _kimSignInTimer = setTimeout(_kimRunAutoSignIn, 1500);
+  };
+  _kimScheduleSignIn();
+  const _kPush = history.pushState.bind(history);
+  history.pushState = function() { _kPush.apply(this, arguments); setTimeout(_kimScheduleSignIn, 400); };
+  const _kReplace = history.replaceState.bind(history);
+  history.replaceState = function() { _kReplace.apply(this, arguments); setTimeout(_kimScheduleSignIn, 400); };
 })();
 "#;
 
@@ -3124,15 +3217,18 @@ fn handle_webview_bridge_request(
             let site_json = serde_json::to_string(&site).unwrap_or_else(|_| "\"\"".to_string());
             let attachments_json = serde_json::to_string(&attachments).unwrap_or_else(|_| "\"[]\"".to_string());
             let hash_json = serde_json::to_string(&parsed.completion_hash).unwrap_or_else(|_| "null".to_string());
+            let account_email_json = serde_json::to_string(&parsed.account_email).unwrap_or_else(|_| "null".to_string());
 
             let bridge_call = format!(
                 r#"(() => {{
+                    window.__kimSelectedAccountEmail = {account_email};
                     if (window.__kimBridge && window.__kimBridge._v >= 2) {{
                         window.__kimBridge.send({prompt}, {req_id}, {site}, {attachments}, null, {hash});
                     }} else {{
                         document.title = '__KIMBRIDGE_NO_PERSISTENT__';
                     }}
                 }})()"#,
+                account_email = account_email_json,
                 prompt = prompt_json,
                 req_id = req_id_json,
                 site = site_json,
@@ -4946,6 +5042,76 @@ async fn write_voice_config(
 }
 
 // ---------------------------------------------------------------------------
+// Generic config.yaml key read/write (top-level scalar keys)
+// ---------------------------------------------------------------------------
+
+/// Read a top-level scalar key from config.yaml.
+#[tauri::command]
+async fn read_config_key(key: String, project_root: Option<String>) -> Result<Option<String>, String> {
+    let path = config_yaml_path(project_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let yaml = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    for line in yaml.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            if let Some(rest) = line.strip_prefix(&format!("{}:", &key)) {
+                let val = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+                if val.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(val.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Write (or remove) a top-level scalar key in config.yaml.
+/// Passing `value: null` removes the key.
+#[tauri::command]
+async fn write_config_key(
+    key: String,
+    value: Option<String>,
+    project_root: Option<String>,
+) -> Result<(), String> {
+    let path = config_yaml_path(project_root);
+    let original = if path.exists() {
+        fs::read_to_string(&path).map_err(|e| e.to_string())?
+    } else {
+        String::new()
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for line in original.lines() {
+        if !line.starts_with(char::is_whitespace) && line.starts_with(&format!("{}:", &key)) {
+            if let Some(ref v) = value {
+                out.push(format!("{}: {}", key, v));
+            }
+            replaced = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !replaced {
+        if let Some(ref v) = value {
+            out.push(format!("{}: {}", key, v));
+        }
+    }
+
+    let mut content = out.join("\n");
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Account — ~/.config/kim/account.json (platform-native config dir)
 // ---------------------------------------------------------------------------
 
@@ -5757,6 +5923,8 @@ pub fn run() {
             cancel_task,
             read_voice_config,
             write_voice_config,
+            read_config_key,
+            write_config_key,
             load_account,
             save_account,
             clear_account,

@@ -316,9 +316,86 @@ function AppearanceSection({ settings, onChange }: { settings: Settings; onChang
   );
 }
 
+interface BrowserAccount {
+  id: string;
+  email: string;
+}
+
+function loadBrowserAccounts(): BrowserAccount[] {
+  try {
+    const raw = localStorage.getItem('kim-browser-accounts');
+    if (raw) return JSON.parse(raw) as BrowserAccount[];
+  } catch { /* ignore */ }
+  return [];
+}
+
+function saveBrowserAccounts(accounts: BrowserAccount[]) {
+  localStorage.setItem('kim-browser-accounts', JSON.stringify(accounts));
+}
+
 function AISection({ settings, onChange }: { settings: Settings; onChange: (s: Settings) => void }) {
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
     onChange({ ...settings, [key]: value });
+  }
+
+  const [browserAccounts, setBrowserAccounts] = useState<BrowserAccount[]>(loadBrowserAccounts);
+  const [selectedEmail, setSelectedEmail] = useState<string | null>(null);
+  const [addingEmail, setAddingEmail] = useState('');
+  const [showAddForm, setShowAddForm] = useState(false);
+
+  // Load selected email from config.yaml on mount
+  useEffect(() => {
+    invoke<string | null>('read_config_key', { key: 'selected_account_email', projectRoot: settings.project_root || null })
+      .then(val => { if (val) setSelectedEmail(val); })
+      .catch(() => {});
+  }, [settings.project_root]);
+
+  async function selectAccount(email: string | null) {
+    await invoke('write_config_key', {
+      key: 'selected_account_email',
+      value: email,
+      projectRoot: settings.project_root || null,
+    });
+    setSelectedEmail(email);
+  }
+
+  async function handleOpenGoogleSignIn() {
+    try {
+      await invoke<string>('open_browser_signin_window', { url: 'https://accounts.google.com/AddAccount', providerName: 'Google' });
+      await invoke('show_browser_window').catch(() => {});
+      setShowAddForm(true);
+    } catch (err) {
+      toast(`Could not open browser: ${String(err)}`, 'error', 4000);
+    }
+  }
+
+  function handleSaveAccount() {
+    const email = addingEmail.trim().toLowerCase();
+    if (!email || !email.includes('@')) {
+      toast('Enter a valid email address.', 'warning', 3000);
+      return;
+    }
+    if (browserAccounts.some(a => a.email === email)) {
+      toast('This account is already added.', 'info', 2000);
+      setShowAddForm(false);
+      setAddingEmail('');
+      return;
+    }
+    const next = [...browserAccounts, { id: Date.now().toString(), email }];
+    setBrowserAccounts(next);
+    saveBrowserAccounts(next);
+    void selectAccount(email);
+    setShowAddForm(false);
+    setAddingEmail('');
+    toast(`Added ${email}`, 'success', 2500);
+  }
+
+  function handleDeleteAccount(id: string, email: string) {
+    const next = browserAccounts.filter(a => a.id !== id);
+    setBrowserAccounts(next);
+    saveBrowserAccounts(next);
+    if (selectedEmail === email) void selectAccount(null);
+    toast('Account removed.', 'success', 2000);
   }
 
   return (
@@ -350,6 +427,98 @@ function AISection({ settings, onChange }: { settings: Settings; onChange: (s: S
           className={`kim-switch${settings.allow_message_queue ? ' kim-switch--on' : ''}`}
         />
       </div>
+
+      {/* Google accounts for browser LLMs */}
+      <div className="kim-settings-section__header" style={{ marginTop: 24, marginBottom: 10 }}>
+        <span className="kim-settings-section__title" style={{ fontSize: 13 }}>Google accounts</span>
+      </div>
+
+      <div className="kim-field__hint" style={{ marginBottom: 12 }}>
+        Add your Google accounts here. When you send a task with a browser provider, Kim automatically signs in using the selected account — no manual sign-in needed.
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 12 }}>
+        {/* Auto / none */}
+        <div
+          onClick={() => void selectAccount(null)}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px',
+            borderRadius: 8, cursor: 'pointer',
+            background: selectedEmail === null ? 'var(--accent-soft)' : 'var(--surface-raised)',
+            border: `1px solid ${selectedEmail === null ? 'var(--accent)' : 'var(--border)'}`,
+          }}
+        >
+          <div style={{ width: 26, height: 26, borderRadius: '50%', background: 'var(--surface-raised)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12 }}>·</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>No account</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Let Google pick (or sign in manually)</div>
+          </div>
+          {selectedEmail === null && (
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="var(--accent)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8l3.5 3.5L13 4" /></svg>
+          )}
+        </div>
+
+        {browserAccounts.map(a => (
+          <div
+            key={a.id}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 8,
+              background: selectedEmail === a.email ? 'var(--accent-soft)' : 'var(--surface-raised)',
+              border: `1px solid ${selectedEmail === a.email ? 'var(--accent)' : 'var(--border)'}`,
+            }}
+          >
+            <div
+              onClick={() => void selectAccount(a.email)}
+              style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, cursor: 'pointer' }}
+            >
+              <div style={{ width: 26, height: 26, borderRadius: '50%', background: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white', fontSize: 11, fontWeight: 600 }}>
+                {a.email[0].toUpperCase()}
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>{a.email}</div>
+              </div>
+              {selectedEmail === a.email && (
+                <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="var(--accent)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8l3.5 3.5L13 4" /></svg>
+              )}
+            </div>
+            <button
+              className="kim-btn kim-btn--secondary"
+              style={{ fontSize: 11, padding: '3px 8px' }}
+              onClick={() => handleDeleteAccount(a.id, a.email)}
+              title="Remove"
+            >✕</button>
+          </div>
+        ))}
+      </div>
+
+      {showAddForm ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div className="kim-field__hint">
+            Sign in with Google in the browser window that just opened, then enter your email address below.
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input
+              type="email"
+              className="kim-input"
+              placeholder="you@gmail.com"
+              value={addingEmail}
+              onChange={e => setAddingEmail(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') handleSaveAccount(); if (e.key === 'Escape') { setShowAddForm(false); setAddingEmail(''); } }}
+              autoFocus
+              style={{ flex: 1 }}
+            />
+            <button className="kim-btn kim-btn--primary" onClick={handleSaveAccount}>Add</button>
+            <button className="kim-btn kim-btn--secondary" onClick={() => { setShowAddForm(false); setAddingEmail(''); }}>Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <button className="kim-btn kim-btn--secondary" style={{ width: '100%' }} onClick={() => void handleOpenGoogleSignIn()}>
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="8" cy="8" r="7" /><path d="M8 5v6M5 8h6" />
+          </svg>
+          <span>Add Google account</span>
+        </button>
+      )}
     </div>
   );
 }
