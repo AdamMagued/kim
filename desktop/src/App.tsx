@@ -293,6 +293,7 @@ export default function App() {
           settings={settings}
           onTaskDone={handleTaskDone}
           account={account}
+          onAccountChange={setAccount}
           activeTab={activeTab}
           activeProjectPath={activeProjectPath}
         />

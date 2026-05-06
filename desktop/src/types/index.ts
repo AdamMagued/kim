@@ -66,6 +66,10 @@ export interface KimAccount {
   created_at: string;
   /** Explicit project roots shown in the Code tab — scans .claw/sessions/ inside each */
   code_projects?: string[];
+  /** Google accounts used for Gemini browser sign-in. */
+  google_accounts?: string[];
+  /** Active Google account email for Gemini browser sessions. */
+  google_active_account?: string;
 }
 
 // ── Claw (Code) project types ────────────────────────────────────────────────

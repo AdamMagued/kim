@@ -451,13 +451,14 @@ interface Props {
   settings: Settings;
   onTaskDone: (sessionId?: string) => void;
   account: KimAccount;
+  onAccountChange: (account: KimAccount) => Promise<void>;
   activeTab: 'chat' | 'code';
   activeProjectPath?: string | null;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function ChatView({ session, newChatMode, settings, onTaskDone, account, activeTab, activeProjectPath }: Props) {
+export function ChatView({ session, newChatMode, settings, onTaskDone, account, onAccountChange, activeTab, activeProjectPath }: Props) {
   const activityCounterRef = useRef(0);
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
@@ -478,10 +479,29 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [autoFollowOutput, setAutoFollowOutput] = useState(true);
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
+  const [googleAccountInput, setGoogleAccountInput] = useState('');
+  const [googleAccountError, setGoogleAccountError] = useState<string | null>(null);
+  const [showGoogleAccountInput, setShowGoogleAccountInput] = useState(false);
+  const [selectedGoogleAccount, setSelectedGoogleAccount] = useState(
+    account.google_active_account ?? account.google_accounts?.[0] ?? ''
+  );
   const [conversationId] = useState(() => makeConversationId());
   const activeResumeSessionId = session?.session_id ?? conversationId;
   const activeResumeSessionIdRef = useRef(activeResumeSessionId);
   useEffect(() => { activeResumeSessionIdRef.current = activeResumeSessionId; }, [activeResumeSessionId]);
+  useEffect(() => {
+    const accounts = account.google_accounts ?? [];
+    const active = account.google_active_account;
+    if (active && accounts.some(a => a.toLowerCase() === active.toLowerCase())) {
+      setSelectedGoogleAccount(active);
+      return;
+    }
+    if (accounts.length > 0) {
+      setSelectedGoogleAccount(accounts[0]);
+      return;
+    }
+    setSelectedGoogleAccount('');
+  }, [account.google_active_account, account.google_accounts]);
 
   // Live conversation history for new-chat mode — persists across task runs
   // and doesn't get wiped by the disk-based message reload.
@@ -793,6 +813,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // ── Actions ─────────────────────────────────────────────────────────────────
 
   const queueEnabled = Boolean(settings.allow_message_queue);
+  const googleAccounts = account.google_accounts ?? [];
+  const GOOGLE_SIGNIN_URL =
+    'https://accounts.google.com/AddSession?continue=https%3A%2F%2Fgemini.google.com%2Fapp';
 
   const resolveProvider = useCallback((): string => {
     const p = localProvider ?? settings.provider;
@@ -973,6 +996,52 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     }
   }
 
+  async function handleOpenGoogleSignin() {
+    setGoogleAccountError(null);
+    setShowGoogleAccountInput(true);
+    try {
+      await invoke<string>('open_browser_signin_window', { url: GOOGLE_SIGNIN_URL, providerName: 'Google' });
+      await invoke('show_browser_window').catch(() => {});
+      toast('Google sign-in opened. Add an account, then enter the email below.', 'info', 7000);
+    } catch (err) {
+      const msg = typeof err === 'string' ? err : 'Could not open Google sign-in.';
+      setGoogleAccountError(msg);
+      toast(msg, 'error', 5000);
+    }
+  }
+
+  async function handleSaveGoogleAccount() {
+    const trimmed = googleAccountInput.trim();
+    if (!trimmed) return;
+    const normalized = trimmed.toLowerCase();
+    if (googleAccounts.some(a => a.toLowerCase() === normalized)) {
+      setGoogleAccountError('That Google account is already saved.');
+      return;
+    }
+    try {
+      await onAccountChange({
+        ...account,
+        google_accounts: [...googleAccounts, trimmed],
+        google_active_account: trimmed,
+      });
+      setGoogleAccountInput('');
+      setShowGoogleAccountInput(false);
+      setGoogleAccountError(null);
+    } catch (err) {
+      setGoogleAccountError(String(err));
+    }
+  }
+
+  async function handleSelectGoogleAccount(nextAccount: string) {
+    setSelectedGoogleAccount(nextAccount);
+    if (!nextAccount || nextAccount === account.google_active_account) return;
+    try {
+      await onAccountChange({ ...account, google_active_account: nextAccount });
+    } catch (err) {
+      setGoogleAccountError(String(err));
+    }
+  }
+
   function handleTextareaInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
     setTaskInput(e.target.value);
     const el = e.target;
@@ -1032,6 +1101,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // ── Composer ─────────────────────────────────────────────────────────────────
 
   function renderComposer() {
+    const isGeminiBrowser = resolveProvider() === 'browser:gemini';
     return (
       <form className="kim-composer" onSubmit={handleSubmit}>
         <div className="kim-composer__row">
@@ -1182,6 +1252,34 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               </button>
             </>
           )}
+          {isGeminiBrowser && (
+            <>
+              <span className="kim-composer__hint-sep">·</span>
+              {googleAccounts.length > 0 && (
+                <span className="kim-composer__account-pill">
+                  <select
+                    value={selectedGoogleAccount || googleAccounts[0] || ''}
+                    onChange={e => { void handleSelectGoogleAccount(e.target.value); }}
+                    className="kim-composer__account-select"
+                  >
+                    {googleAccounts.map(email => (
+                      <option key={email} value={email}>{email}</option>
+                    ))}
+                  </select>
+                  <svg className="kim-composer__account-chevron" viewBox="0 0 10 10" width="8" height="8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M2 4l3 3 3-3" />
+                  </svg>
+                </span>
+              )}
+              <button
+                type="button"
+                className="kim-composer__account-add"
+                onClick={handleOpenGoogleSignin}
+              >
+                Add more accounts
+              </button>
+            </>
+          )}
           {(queuedTasks.length > 0 || interruptTask) && (
             <>
               <span className="kim-composer__hint-sep">·</span>
@@ -1193,6 +1291,34 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
             </>
           )}
         </div>
+        {isGeminiBrowser && showGoogleAccountInput && (
+          <div className="kim-composer__account-add-row">
+            <input
+              type="email"
+              className="kim-composer__account-input"
+              placeholder="name@gmail.com"
+              value={googleAccountInput}
+              onChange={e => { setGoogleAccountInput(e.target.value); setGoogleAccountError(null); }}
+              onKeyDown={e => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void handleSaveGoogleAccount();
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="kim-btn kim-btn--secondary"
+              onClick={() => void handleSaveGoogleAccount()}
+              disabled={!googleAccountInput.trim()}
+            >
+              Save
+            </button>
+            {googleAccountError && (
+              <span className="kim-composer__account-error">{googleAccountError}</span>
+            )}
+          </div>
+        )}
       </form>
     );
   }

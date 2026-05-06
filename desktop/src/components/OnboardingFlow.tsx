@@ -106,6 +106,8 @@ export function OnboardingFlow({ onComplete }: Props) {
       github_avatar_url: githubUser?.avatar_url,
       gist_id: undefined,
       created_at: new Date().toISOString(),
+      google_accounts: [],
+      google_active_account: undefined,
     };
     try {
       await invoke('save_account', { account });
