@@ -4963,6 +4963,11 @@ pub struct KimAccount {
     /// Kim scans <path>/.claw/sessions/ for each — never ~/.claude/projects/.
     #[serde(default)]
     pub code_projects: Vec<String>,
+    /// Google account emails used for Gemini browser sign-in.
+    #[serde(default)]
+    pub google_accounts: Vec<String>,
+    /// Active Google account for Gemini browser sessions.
+    pub google_active_account: Option<String>,
 }
 
 fn account_dir() -> PathBuf {
