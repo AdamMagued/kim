@@ -1,8 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { KimAccount } from '../types';
-import { KimLogo } from './KimLogo';
-
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
 function ArrowIcon() {
@@ -32,13 +30,13 @@ function CheckIcon() {
 
 // ── KimLogoMark ───────────────────────────────────────────────────────────────
 
-function KimAsterisk() {
-  return (
-    <div className="kim-ob__logo-mark" style={{ marginBottom: '16px' }}>
-      <KimLogo layout="stacked" size={80} />
-    </div>
-  );
-}
+// function KimAsterisk() {
+//   return (
+//     <div className="kim-ob__logo-mark" style={{ marginBottom: '16px' }}>
+//       <KimLogo layout="stacked" size={80} />
+//     </div>
+//   );
+// }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
@@ -130,7 +128,7 @@ export function OnboardingFlow({ onComplete }: Props) {
       {step === 'name' && (
         <div className={screenClass} key="name">
           <div className="kim-ob__inner">
-            <KimAsterisk />
+            
 
             <div className="kim-ob__wordmark">Kim</div>
             <div className="kim-ob__tagline">What should I call you?</div>

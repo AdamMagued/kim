@@ -651,6 +651,7 @@ kbd {
 
 /* Session cards */
 .kim-session-item {
+  position: relative;
   width: 100%;
   padding: 9px 11px;
   border-radius: 8px;
