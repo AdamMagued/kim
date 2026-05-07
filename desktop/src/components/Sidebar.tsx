@@ -86,6 +86,10 @@ function XIcon() {
 
 // ── Session item ───────────────────────────────────────────────────────────────
 
+function sessionKey(session: SessionInfo): string {
+  return session.session_key ?? `${session.session_type}:${session.date}:${session.session_id}`;
+}
+
 function SessionItem({ session, active, onClick, editMode, selected, onToggleSelect }: {
   session: SessionInfo; active: boolean; onClick: () => void;
   editMode?: boolean; selected?: boolean; onToggleSelect?: () => void;
@@ -379,22 +383,24 @@ export function Sidebar({
                   {kimSessions.length === 0 ? (
                     <div className="kim-empty-section">No sessions yet</div>
                   ) : (
-                    kimSessions.map(s => (
+                    kimSessions.map(s => {
+                      const key = sessionKey(s);
+                      return (
                       <SessionItem
-                        key={s.session_id}
+                        key={key}
                         session={s}
-                        active={s.session_id === activeSessionId}
+                        active={key === activeSessionId}
                         onClick={() => onSelectSession(s)}
                         editMode={editMode}
-                        selected={selectedSessions.has(s.session_id)}
+                        selected={selectedSessions.has(key)}
                         onToggleSelect={() => {
                           const next = new Set(selectedSessions);
-                          if (next.has(s.session_id)) next.delete(s.session_id);
-                          else next.add(s.session_id);
+                          if (next.has(key)) next.delete(key);
+                          else next.add(key);
                           setSelectedSessions(next);
                         }}
                       />
-                    ))
+                    )})
                   )}
                 </div>
               )}
@@ -534,8 +540,11 @@ export function Sidebar({
                     onClick={async () => {
                       setDeleting(true);
                       try {
+                        const selectedSessionIds = kimSessions
+                          .filter(session => selectedSessions.has(sessionKey(session)))
+                          .map(session => session.session_id);
                         await invoke('delete_sessions', { 
-                          sessionIds: Array.from(selectedSessions),
+                          sessionIds: selectedSessionIds,
                           kimDir: kimSessionsDir,
                           clawDir: clawSessionsDir,
                         });

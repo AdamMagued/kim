@@ -2,6 +2,7 @@
 
 export interface SessionInfo {
   session_id: string;
+  session_key?: string;
   title?: string;
   date: string;
   message_count: number;
@@ -57,6 +58,11 @@ export interface KimMessage {
 
 // ── Account ──────────────────────────────────────────────────────────────────
 
+export interface GoogleAccount {
+  email: string;
+  authuser_index: number;
+}
+
 export interface KimAccount {
   display_name: string;
   github_username?: string;
@@ -67,7 +73,7 @@ export interface KimAccount {
   /** Explicit project roots shown in the Code tab — scans .claw/sessions/ inside each */
   code_projects?: string[];
   /** Google accounts used for Gemini browser sign-in. */
-  google_accounts?: string[];
+  google_accounts?: GoogleAccount[];
   /** Active Google account email for Gemini browser sessions. */
   google_active_account?: string;
 }

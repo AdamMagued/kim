@@ -662,10 +662,9 @@ kbd {
   transition: background 0.12s, transform 0.08s;
   display: block;
   margin-bottom: 1px;
-  position: relative;
 }
-.kim-session-item:hover {
-  background: var(--bg-card);
+.kim-session-item:not(.kim-session-item--active):hover {
+  background: color-mix(in srgb, var(--bg-card) 55%, transparent);
 }
 .kim-session-item--active {
   background: var(--accent-muted);
@@ -4028,6 +4027,14 @@ kbd {
 .kim-settings-body .kim-select option {
   background: #1a1614;
   color: #e8dfd6;
+}
+.kim-settings-body .kim-toggle-row {
+  background: rgba(232, 223, 214, 0.06);
+  border-color: rgba(232, 223, 214, 0.12);
+}
+.kim-settings-body .kim-toggle-row:hover {
+  background: rgba(232, 223, 214, 0.09);
+  border-color: rgba(232, 223, 214, 0.18);
 }
 .kim-settings-body .kim-toggle-row__label { color: rgba(232,223,214,.8); }
 .kim-settings-body .kim-toggle-row__hint  { color: rgba(232,223,214,.38); }

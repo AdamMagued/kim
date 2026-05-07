@@ -319,74 +319,12 @@ function AppearanceSection({ settings, onChange }: { settings: Settings; onChang
 function AISection({
   settings,
   onChange,
-  account,
-  onAccountChange,
 }: {
   settings: Settings;
   onChange: (s: Settings) => void;
-  account: KimAccount;
-  onAccountChange: (a: KimAccount) => Promise<void>;
 }) {
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
     onChange({ ...settings, [key]: value });
-  }
-
-  const [googleEmail, setGoogleEmail] = useState('');
-  const [googleStatus, setGoogleStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
-  const [googleError, setGoogleError] = useState<string | null>(null);
-
-  const googleAccounts = account.google_accounts ?? [];
-  const activeGoogle = account.google_active_account ?? googleAccounts[0] ?? '';
-
-  const GOOGLE_SIGNIN_URL =
-    'https://accounts.google.com/AddSession?continue=https%3A%2F%2Fgemini.google.com%2Fapp';
-
-  async function openGoogleSignin() {
-    try {
-      await invoke<string>('open_browser_signin_window', { url: GOOGLE_SIGNIN_URL, providerName: 'Google' });
-      await invoke('show_browser_window').catch(() => {});
-      toast('Google sign-in opened. Add an account, then enter the email below.', 'info', 7000);
-    } catch (err) {
-      toast(typeof err === 'string' ? err : 'Could not open Google sign-in.', 'error', 5000);
-    }
-  }
-
-  async function saveGoogleAccount() {
-    const trimmed = googleEmail.trim();
-    if (!trimmed) return;
-    const normalized = trimmed.toLowerCase();
-    if (googleAccounts.some(a => a.toLowerCase() === normalized)) {
-      setGoogleError('That Google account is already saved.');
-      setGoogleStatus('error');
-      return;
-    }
-    setGoogleStatus('saving');
-    setGoogleError(null);
-    try {
-      const nextAccounts = [...googleAccounts, trimmed];
-      const nextActive = activeGoogle || trimmed;
-      await onAccountChange({
-        ...account,
-        google_accounts: nextAccounts,
-        google_active_account: nextActive,
-      });
-      setGoogleEmail('');
-      setGoogleStatus('saved');
-      setTimeout(() => setGoogleStatus('idle'), 1500);
-    } catch (err) {
-      setGoogleStatus('error');
-      setGoogleError(String(err));
-    }
-  }
-
-  async function removeGoogleAccount(email: string) {
-    const nextAccounts = googleAccounts.filter(a => a !== email);
-    const nextActive = email === activeGoogle ? (nextAccounts[0] ?? '') : activeGoogle;
-    await onAccountChange({
-      ...account,
-      google_accounts: nextAccounts,
-      google_active_account: nextActive || undefined,
-    });
   }
 
   return (
@@ -419,79 +357,6 @@ function AISection({
         />
       </div>
 
-      <div className="kim-settings-section__header" style={{ marginTop: 24, marginBottom: 12 }}>
-        <span className="kim-settings-section__title" style={{ fontSize: 13 }}>Google accounts (Gemini browser)</span>
-      </div>
-
-      <div className="kim-field__hint" style={{ marginBottom: 12 }}>
-        Open the sign-in window, add your Google account, then enter the email below.
-        If the sign-in page shows a 404, close it and click <strong>Add Google account</strong> again.
-      </div>
-
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-        <button
-          className="kim-btn kim-btn--secondary"
-          onClick={openGoogleSignin}
-        >
-          Add Google account
-        </button>
-        <div style={{ fontSize: 12, color: 'var(--text-muted)', alignSelf: 'center' }}>
-          {googleStatus === 'saving' ? 'Saving…' : googleStatus === 'saved' ? 'Saved' : ''}
-        </div>
-      </div>
-
-      {googleError && <div className="kim-inline-error">{googleError}</div>}
-
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-        <input
-          type="email"
-          className="kim-input"
-          placeholder="name@gmail.com"
-          value={googleEmail}
-          onChange={e => { setGoogleEmail(e.target.value); setGoogleError(null); setGoogleStatus('idle'); }}
-          style={{ flex: 1 }}
-        />
-        <button
-          className="kim-btn kim-btn--secondary"
-          onClick={saveGoogleAccount}
-          disabled={!googleEmail.trim()}
-        >
-          Save
-        </button>
-      </div>
-
-      {googleAccounts.length > 0 ? (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {googleAccounts.map(email => (
-            <div
-              key={email}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                padding: '8px 10px',
-                borderRadius: 8,
-                background: 'var(--surface-raised)',
-                border: '1px solid var(--border)',
-              }}
-            >
-              <span style={{ fontSize: 12, color: 'var(--text)' }}>{email}</span>
-              {email === activeGoogle && (
-                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Active</span>
-              )}
-              <button
-                className="kim-btn kim-btn--secondary"
-                onClick={() => removeGoogleAccount(email)}
-                style={{ marginLeft: 'auto', fontSize: 11 }}
-              >
-                Remove
-              </button>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="kim-field__hint">No Google accounts added yet.</div>
-      )}
     </div>
   );
 }
@@ -1337,8 +1202,6 @@ export function SettingsPanel({ settings, onChange, onClose, appVersion, onCheck
             <AISection
               settings={settings}
               onChange={onChange}
-              account={account}
-              onAccountChange={onAccountChange}
             />
           )}
           {activeSection === 'voice'      && <VoiceSection settings={settings} onChange={onChange} />}
