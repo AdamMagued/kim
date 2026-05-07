@@ -304,27 +304,9 @@ class BrowserProvider(BaseProvider):
         # Sticky tab preference to keep the loop anchored to one chat tab.
         self._last_chat_page_url: Optional[str] = None
         self._last_chat_site: Optional[str] = None
+        self._load_site_configs()
 
-    def reset_session(self) -> None:
-        """Call before each new task to prepare for the next completion.
-
-        We intentionally do NOT reset _sent_system_prompt here.  The browser
-        chat UI (Gemini, Claude.ai, ChatGPT) retains full conversation history
-        between tasks.  Re-injecting the system prompt + tool list on every task
-        causes the LLM to see it as a new conversation and respond with a
-        greeting instead of using tools.
-
-        _sent_system_prompt is only reset to False on the very first use
-        (in __init__) or when the chat tab URL changes (detected lazily in
-        _find_chat_page).  This ensures the system prompt is sent once per
-        browser session, not once per user message.
-        """
-        # Do NOT reset _sent_system_prompt — see docstring above.
-        # Only clear the sticky tab preference so _find_chat_page re-validates
-        # the tab is still alive (it will flip _sent_system_prompt itself if
-        # the URL has changed since the last task).
-        pass
-
+    def _load_site_configs(self) -> None:
         # Merge user-defined custom sites from config.yaml into the lookup table.
         # Each entry must have url_pattern + at least input/send/response selectors.
         # Selectors can be a string or a list; strings are wrapped in a list.
@@ -361,6 +343,23 @@ class BrowserProvider(BaseProvider):
             f"BrowserProvider: cdp_url={self._cdp_url}  sites={list(self._site_configs)}"
         )
 
+    def reset_session(self) -> None:
+        """Call before each new task to prepare for the next completion.
+
+        We intentionally do NOT reset _sent_system_prompt here.  The browser
+        chat UI (Gemini, Claude.ai, ChatGPT) retains full conversation history
+        between tasks.  Re-injecting the system prompt + tool list on every task
+        causes the LLM to see it as a new conversation and respond with a
+        greeting instead of using tools.
+
+        _sent_system_prompt is only reset to False on the very first use
+        (in __init__) or when the chat tab URL changes (detected lazily in
+        _find_chat_page).  This ensures the system prompt is sent once per
+        browser session, not once per user message.
+        """
+        # Do NOT reset _sent_system_prompt or rebuild site config here.
+        pass
+
     # ==================================================================
     # Main entry point
     # ==================================================================
@@ -395,36 +394,21 @@ class BrowserProvider(BaseProvider):
                 browser = await self._connect(pw)
                 page, site = await self._find_chat_page(browser)
                 if page is None or site is None:
-                    # Only open a new tab if we have NEVER connected to a chat
-                    # in this session. If _last_chat_site is set, the tab exists
-                    # but CDP may have lost the reference — retry once before
-                    # opening a new window (which would lose conversation context).
                     if self._last_chat_site:
                         logger.warning(
                             f"Lost reference to {self._last_chat_site} tab "
-                            f"(was at {self._last_chat_page_url!r}). "
-                            "Retrying page scan…"
+                            f"(was at {self._last_chat_page_url!r}). Retrying page scan once…"
                         )
                         await asyncio.sleep(1)
                         page, site = await self._find_chat_page(browser)
-                    if (page is None or site is None) and not self._last_chat_site:
-                        # First time — no chat tab has ever been found this session
-                        logger.info("[STATUS] No AI chat tab found — opening Gemini…")
-                        try:
-                            new_page = await browser.new_page()
-                            await new_page.goto("https://gemini.google.com/app", timeout=15000)
-                            await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
-                            await asyncio.sleep(2)
-                            page, site = await self._find_chat_page(browser)
-                        except Exception:
-                            pass
 
                 if page is None or site is None:
                     return {
                         "type": "text",
                         "content": (
-                            "NEED_HELP: No AI chat tab found. "
-                            "Gemini was closed — please reopen it in Chrome and try again."
+                            "NEED_HELP: Kim lost the active browser chat during this task. "
+                            "I will not open a new provider tab because that would lose the LLM context. "
+                            "Please reopen the existing provider chat window and resend."
                         ),
                     }
                 cfg = self._site_configs[site]
@@ -815,12 +799,15 @@ class BrowserProvider(BaseProvider):
             ignore_default_args=["--enable-automation"],
         )
 
-        # Navigate to a known chat URL if no pages exist yet
+        # Do not create a fresh chat tab during an active send. A missing page
+        # means there is no stateful provider chat to preserve.
         if not context.pages:
-            page = await context.new_page()
-            await page.goto("https://claude.ai/new", wait_until="domcontentloaded")
-            await asyncio.sleep(2)  # Let the page settle
-            logger.info("Opened default chat page: claude.ai/new")
+            raise RuntimeError(
+                "NEED_HELP: No existing provider chat page was found in the saved "
+                "browser session. Kim will not open a new provider tab because "
+                "that would lose the LLM context. Reopen the existing provider "
+                "chat window and resend."
+            )
 
         # The caller expects a Browser object for _find_chat_page.
         # launch_persistent_context returns a BrowserContext, so we
