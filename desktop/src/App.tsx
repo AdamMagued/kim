@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import './index.css';
 
 import { useTheme } from './hooks/useTheme';
@@ -55,6 +56,16 @@ function compareSemver(a: string, b: string): number {
 
 function applyAccent(accent: AccentTheme) {
   document.documentElement.setAttribute('data-accent', accent);
+}
+
+function isNoDragTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && Boolean(target.closest(
+    'button, input, select, textarea, a, [role="button"], .kim-no-drag'
+  ));
+}
+
+function sessionKey(session: SessionInfo): string {
+  return session.session_key ?? `${session.session_type}:${session.date}:${session.session_id}`;
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -170,6 +181,11 @@ export default function App() {
     setChatSerial(s => s + 1);
   }
 
+  function handleHeaderMouseDown(e: React.MouseEvent<HTMLElement>) {
+    if (e.button !== 0 || isNoDragTarget(e.target)) return;
+    void getCurrentWindow().startDragging();
+  }
+
   const handleTaskDone = useCallback((sessionId?: string) => {
     // Only auto-navigate to the session when NOT in newChatMode.
     // In newChatMode the liveHistory state already displays the conversation
@@ -231,7 +247,7 @@ export default function App() {
 
   return (
     <div className="kim-app">
-      <header className="kim-header" data-tauri-drag-region>
+      <header className="kim-header" data-tauri-drag-region onMouseDown={handleHeaderMouseDown}>
         <div className="kim-header__traffic-lights-spacer" />
 
         <div className="kim-header__brand">
@@ -268,7 +284,7 @@ export default function App() {
       <div className="kim-body">
         <Sidebar
           kimSessions={kimSessions}
-          activeSessionId={activeSession?.session_id ?? null}
+          activeSessionId={activeSession ? sessionKey(activeSession) : null}
           onSelectSession={handleSelectSession}
           onNewChat={handleNewChat}
           collapsed={sidebarCollapsed}
@@ -287,7 +303,7 @@ export default function App() {
         />
 
         <ChatView
-          key={activeSession ? activeSession.session_id : `new-${chatSerial}`}
+          key={activeSession ? sessionKey(activeSession) : `new-${chatSerial}`}
           session={activeSession}
           newChatMode={newChatMode}
           settings={settings}

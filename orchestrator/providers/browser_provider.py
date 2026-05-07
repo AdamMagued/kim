@@ -395,16 +395,29 @@ class BrowserProvider(BaseProvider):
                 browser = await self._connect(pw)
                 page, site = await self._find_chat_page(browser)
                 if page is None or site is None:
-                    # Try to open Gemini automatically before giving up
-                    print("[STATUS] No AI chat tab found — opening Gemini…", flush=True)
-                    try:
-                        new_page = await browser.new_page()
-                        await new_page.goto("https://gemini.google.com/app", timeout=15000)
-                        await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
-                        await asyncio.sleep(2)
+                    # Only open a new tab if we have NEVER connected to a chat
+                    # in this session. If _last_chat_site is set, the tab exists
+                    # but CDP may have lost the reference — retry once before
+                    # opening a new window (which would lose conversation context).
+                    if self._last_chat_site:
+                        logger.warning(
+                            f"Lost reference to {self._last_chat_site} tab "
+                            f"(was at {self._last_chat_page_url!r}). "
+                            "Retrying page scan…"
+                        )
+                        await asyncio.sleep(1)
                         page, site = await self._find_chat_page(browser)
-                    except Exception:
-                        pass
+                    if (page is None or site is None) and not self._last_chat_site:
+                        # First time — no chat tab has ever been found this session
+                        logger.info("[STATUS] No AI chat tab found — opening Gemini…")
+                        try:
+                            new_page = await browser.new_page()
+                            await new_page.goto("https://gemini.google.com/app", timeout=15000)
+                            await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                            await asyncio.sleep(2)
+                            page, site = await self._find_chat_page(browser)
+                        except Exception:
+                            pass
 
                 if page is None or site is None:
                     return {
@@ -423,7 +436,7 @@ class BrowserProvider(BaseProvider):
 
                 # ── Step 1: Paste screenshot via clipboard (if any) ──────
                 if image_attachments:
-                    print(f"[STATUS] Uploading screenshot to {site}…", flush=True)
+                    logger.info(f"[STATUS] Uploading screenshot to {site}…")
                     await self._inject_image_clipboard(
                         page, cfg, str(image_attachments[-1]["data_base64"])
                     )
@@ -435,12 +448,12 @@ class BrowserProvider(BaseProvider):
                 # Gemini (and other sites) show consent dialogs / marketing
                 # overlays that block the input. We press Escape + click
                 # known dismiss buttons regardless of whether an image was sent.
-                print(f"[STATUS] Preparing {site}…", flush=True)
+                logger.info(f"[STATUS] Preparing {site}…")
                 await self._dismiss_popups(page)
 
                 # ── Step 4: Paste cleaned text prompt ────────────────────
                 # ── Step 5: Click Send + wait for response ───────────────
-                print(f"[STATUS] Sending message to {site}…", flush=True)
+                logger.info(f"[STATUS] Sending message to {site}…")
                 raw_response = await self._send_and_wait(page, cfg, prompt, site)
                 return self._parse_response(raw_response, completion_hash)
         except Exception as e:
@@ -512,7 +525,7 @@ class BrowserProvider(BaseProvider):
 
         # ── Try split send/result API first ──────────────────────────────
         try:
-            print(f"[STATUS] Sending message to {site}…", flush=True)
+            logger.info(f"[STATUS] Sending message to {site}…")
             async with httpx.AsyncClient(timeout=30) as send_client:
                 send_resp = await send_client.post(
                     f"{self._bridge_url}/v1/send",
@@ -565,9 +578,9 @@ class BrowserProvider(BaseProvider):
                 f"confirmed={sent_confirmed}"
             )
             if sent_confirmed:
-                print(f"[STATUS] Message sent to {site}. Waiting for response…", flush=True)
+                logger.info(f"[STATUS] Message sent to {site}. Waiting for response…")
             else:
-                print(f"[STATUS] Waiting for {site} to process…", flush=True)
+                logger.info(f"[STATUS] Waiting for {site} to process…")
 
         except httpx.ReadTimeout:
             logger.warning("Bridge /v1/send timed out, falling back to /v1/complete")
@@ -582,7 +595,7 @@ class BrowserProvider(BaseProvider):
 
         # ── Long-poll for result ─────────────────────────────────────────
         try:
-            print(f"[STATUS] {site} is thinking…", flush=True)
+            logger.info(f"[STATUS] {site} is thinking…")
             async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_S) as result_client:
                 result_resp = await result_client.get(
                     f"{self._bridge_url}/v1/result/{req_id}",
@@ -629,7 +642,7 @@ class BrowserProvider(BaseProvider):
                 "content": f"NEED_HELP: In-app browser execution failed — {msg}",
             }
 
-        print(f"[STATUS] Reading {site}'s response…", flush=True)
+        logger.info(f"[STATUS] Reading {site}'s response…")
         raw_response = data.get("response")
         if not raw_response or not isinstance(raw_response, str) or not raw_response.strip():
             return {
@@ -648,7 +661,7 @@ class BrowserProvider(BaseProvider):
     ) -> dict:
         """Monolithic /v1/complete fallback for older Rust binaries."""
         try:
-            print("[STATUS] Sending to AI provider…", flush=True)
+            logger.info("[STATUS] Sending to AI provider…")
             async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_S) as client:
                 resp = await client.post(
                     f"{self._bridge_url}/v1/complete",
@@ -880,11 +893,29 @@ class BrowserProvider(BaseProvider):
 
         # Prefer the previously used tab if still available. This prevents
         # hopping between multiple same-site tabs across iterations.
-        if self._last_chat_page_url and self._last_chat_site:
-            for page, site_key in matches:
-                if site_key == self._last_chat_site and page.url == self._last_chat_page_url:
-                    logger.info(f"Reusing previous {site_key} tab: {page.url}")
-                    return page, site_key
+        # Match by site key first (not exact URL) because chat sites change
+        # their URL after the first message (e.g. /new → /chat/<id>).
+        if self._last_chat_site:
+            same_site_matches = [
+                (p, sk) for p, sk in matches if sk == self._last_chat_site
+            ]
+            if same_site_matches:
+                # Prefer exact URL match if available (same tab)
+                if self._last_chat_page_url:
+                    for page, site_key in same_site_matches:
+                        if page.url == self._last_chat_page_url:
+                            logger.info(f"Reusing exact tab for {site_key}: {page.url}")
+                            return page, site_key
+                # Otherwise reuse the first tab matching the same site —
+                # the URL likely changed mid-conversation (e.g. /new → /chat/id)
+                page, site_key = same_site_matches[0]
+                if page.url != self._last_chat_page_url:
+                    logger.info(
+                        f"Tab URL changed for {site_key}: "
+                        f"{self._last_chat_page_url!r} → {page.url!r} (same site, keeping context)"
+                    )
+                self._last_chat_page_url = page.url
+                return page, site_key
 
         # Next prefer the currently focused tab among matches.
         focused_matches: list[tuple[Page, str]] = []
@@ -921,18 +952,39 @@ class BrowserProvider(BaseProvider):
         return page, site_key
 
     def _maybe_reset_system_prompt(self, new_url: str) -> None:
-        """Reset _sent_system_prompt if the chat tab URL has changed.
+        """Reset _sent_system_prompt if the chat tab has moved to a DIFFERENT site.
 
-        This is the ONLY place where _sent_system_prompt is reset after init.
-        A URL change means the user opened a new chat or navigated away, so the
-        system prompt needs to be re-injected on the next completion call.
+        A URL change within the same site (e.g. claude.ai/new → claude.ai/chat/123)
+        is normal — the conversation continues in the same tab. Only reset when
+        the domain/site actually changes, indicating a genuinely new conversation.
         """
-        if self._last_chat_page_url and self._last_chat_page_url != new_url:
-            logger.info(
-                f"Chat tab URL changed ({self._last_chat_page_url!r} → {new_url!r}), "
-                "will re-inject system prompt."
+        if not self._last_chat_page_url:
+            return
+        if self._last_chat_page_url == new_url:
+            return
+
+        # Check if the site (domain) actually changed
+        old_site = self._last_chat_site
+        new_site = None
+        site_configs = getattr(self, "_site_configs", SITE_CONFIGS)
+        for site_key, cfg in site_configs.items():
+            if cfg["url_pattern"] in new_url:
+                new_site = site_key
+                break
+
+        if old_site and new_site and old_site == new_site:
+            # Same site, URL just changed (normal for chat apps) — keep context
+            logger.debug(
+                f"URL changed within same site {old_site}: "
+                f"{self._last_chat_page_url!r} → {new_url!r} (keeping system prompt)"
             )
-            self._sent_system_prompt = False
+            return
+
+        logger.info(
+            f"Chat site changed ({old_site!r} → {new_site!r}), "
+            "will re-inject system prompt."
+        )
+        self._sent_system_prompt = False
 
     # ==================================================================
     # Popup dismissal
@@ -1224,7 +1276,7 @@ class BrowserProvider(BaseProvider):
             logger.warning("Send button not found; pressing Enter")
             await page.keyboard.press("Enter")
 
-        print(f"[STATUS] Waiting for {site} to respond…", flush=True)
+        logger.info(f"[STATUS] Waiting for {site} to respond…")
         logger.info("Message sent, waiting for response…")
 
         # Wait for response count to increase (generation started)
@@ -1236,7 +1288,7 @@ class BrowserProvider(BaseProvider):
                 f"No new response appeared after {RESPONSE_WAIT_S}s"
             )
 
-        print(f"[STATUS] {site} is responding…", flush=True)
+        logger.info(f"[STATUS] {site} is responding…")
 
         # Wait for generation to finish (stop button disappears)
         await self._wait_for_generation_complete(page, cfg["stop_selectors"], site)
@@ -1244,7 +1296,7 @@ class BrowserProvider(BaseProvider):
         # Extra settle time
         await asyncio.sleep(1.5)
 
-        print(f"[STATUS] Reading {site}'s response…", flush=True)
+        logger.info(f"[STATUS] Reading {site}'s response…")
         # Scrape the last response
         return await self._scrape_last_response(page, cfg["response_selectors"])
 
@@ -1301,7 +1353,7 @@ class BrowserProvider(BaseProvider):
             now = asyncio.get_running_loop().time()
             if now - last_status >= 10:
                 elapsed = int(now - (deadline - GENERATION_WAIT_S))
-                print(f"[STATUS] {site} still thinking… ({elapsed}s)", flush=True)
+                logger.info(f"[STATUS] {site} still thinking… ({elapsed}s)")
                 last_status = now
             await asyncio.sleep(0.75)
         logger.warning(
