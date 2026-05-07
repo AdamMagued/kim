@@ -575,6 +575,14 @@ fn gemini_site_url(authuser: Option<u32>) -> String {
     }
 }
 
+fn is_bridge_task_running() -> bool {
+    BRIDGE_TASK_PID
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false)
+}
+
 fn webview_current_href(window: &tauri::WebviewWindow) -> String {
     if let Ok(url) = window.url() {
         let current = url.to_string();
@@ -594,6 +602,14 @@ fn webview_current_href(window: &tauri::WebviewWindow) -> String {
 
 fn prepare_gemini_webview(window: &tauri::WebviewWindow, authuser: Option<u32>, force: bool) {
     let current_url = webview_current_href(window);
+    let task_running = is_bridge_task_running();
+
+    if task_running {
+        // Preserve the exact provider URL during active tasks.
+        // Do not rewrite /app/<chat-id> to /app?authuser=N.
+        return;
+    }
+
     let selected_changed = WEBVIEW_LAST_GEMINI_AUTHUSER
         .get_or_init(|| StdMutex::new(None))
         .lock()
@@ -1424,11 +1440,29 @@ fn open_browser_signin_window_impl(
 
     let label = "kim-browser-signin";
     if let Some(existing) = app_handle.get_webview_window(label) {
+        let task_running = BRIDGE_TASK_PID
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+
+        if task_running {
+            return Ok(
+                "Reused existing Kim browser window without navigation because a task is active."
+                    .to_string(),
+            );
+        }
+
         let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
         let _ = existing.eval(format!("window.location.href = {};", js_url));
-        // Don't show/focus — keep it hidden if the user previously closed it.
-        // The user can explicitly show it via show_browser_window.
         return Ok("Navigated existing Kim browser window".to_string());
+    }
+
+    if is_bridge_task_running() {
+        return Err(
+            "Cannot open the provider browser while Kim is running a task; this would lose LLM context."
+                .to_string(),
+        );
     }
 
     let title = provider_name
@@ -1497,6 +1531,10 @@ fn open_browser_signin_window_impl(
                     Err(_) => break, // window gone
                 };
                 if title == "__KIM_SIGNIN_COMPLETE__" {
+                    if is_bridge_task_running() {
+                        break;
+                    }
+
                     // Sign-in detected! Navigate to account chooser to scrape accounts.
                     let chooser_url = "https://accounts.google.com/SignOutOptions?continue=https%3A%2F%2Fgemini.google.com%2Fapp";
                     if let Ok(js_url) = serde_json::to_string(chooser_url) {
@@ -1574,7 +1612,9 @@ fn open_browser_signin_window_impl(
                     }
 
                     // Navigate back to Gemini
-                    let _ = poll_window.eval("window.location.href = 'https://gemini.google.com/app';");
+                    if !is_bridge_task_running() {
+                        let _ = poll_window.eval("window.location.href = 'https://gemini.google.com/app';");
+                    }
                     break;
                 }
             }
@@ -3141,6 +3181,18 @@ fn handle_webview_bridge_request(
             let window = if let Some(w) = app_handle.get_webview_window("kim-browser-signin") {
                 w
             } else {
+                if is_bridge_task_running() {
+                    respond_json(
+                        request,
+                        409,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": "No existing provider browser window is available. Kim will not open a new provider window while a task is active because that would lose LLM context.",
+                        }),
+                    );
+                    return;
+                }
+
                 let open_url = if site == "gemini" {
                     gemini_site_url(gemini_authuser)
                 } else {
@@ -3208,8 +3260,6 @@ fn handle_webview_bridge_request(
                 parsed.completion_hash.as_deref(),
             );
 
-            // If the input selector still wasn't found (page may have navigated away
-            // from the chat view), reload the provider's root URL and try once more.
             let needs_nav_retry = match &completion {
                 Ok(payload) => {
                     let err = payload.error.clone().unwrap_or_default().to_lowercase();
@@ -3219,24 +3269,17 @@ fn handle_webview_bridge_request(
             };
 
             if needs_nav_retry {
-                let nav_url = if site == "gemini" {
-                    gemini_site_url(gemini_authuser)
-                } else {
-                    default_site_url(&site).to_string()
-                };
-                if let Ok(js_url) = serde_json::to_string(&nav_url) {
-                    let _ = window.eval(format!("window.location.href = {};", js_url));
-                    std::thread::sleep(Duration::from_millis(2000));
-                    completion = run_bridge_completion_once(
-                        &window,
-                        &site,
-                        &parsed.prompt,
-                        &parsed.attachments,
-                        &callback_url,
-                        token.as_str(),
-                        parsed.completion_hash.as_deref(),
-                    );
-                }
+                completion = Ok(BridgeCompleteResponse {
+                    ok: false,
+                    response: None,
+                    error: Some(
+                        "Could not find the provider input box in the existing chat. \
+                         Kim will not navigate to a new provider page because that would lose task context. \
+                         Show the browser window, make sure the current chat is open, then resend."
+                            .to_string(),
+                    ),
+                    site: Some(site.clone()),
+                });
             }
 
             // Window was never shown, no need to re-hide.
@@ -3306,6 +3349,18 @@ fn handle_webview_bridge_request(
             let window = if let Some(w) = app_handle.get_webview_window("kim-browser-signin") {
                 w
             } else {
+                if is_bridge_task_running() {
+                    respond_json(
+                        request,
+                        409,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": "No existing provider browser window is available. Kim will not open a new provider window while a task is active because that would lose LLM context.",
+                        }),
+                    );
+                    return;
+                }
+
                 let open_url = if site == "gemini" {
                     gemini_site_url(gemini_authuser)
                 } else {
@@ -3808,6 +3863,18 @@ fn handle_webview_bridge_request(
         (Method::Post, "/v1/browser/new-chat") => {
             // Reset bridge state and start a fresh conversation in the active
             // chat UI. Uses provider-specific selectors with sensible fallbacks.
+            if is_bridge_task_running() {
+                respond_json(
+                    request,
+                    409,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "Cannot start a new provider chat while Kim is running a task; this would lose LLM context.",
+                    }),
+                );
+                return;
+            }
+
             if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
                 let js = r#"(() => {
                     try {
@@ -3878,11 +3945,35 @@ fn handle_webview_bridge_request(
             let url = default_site_url(&site);
 
             if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
+                if is_bridge_task_running() {
+                    respond_json(
+                        request,
+                        409,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": "Cannot navigate the provider browser while Kim is running a task; this would lose LLM context.",
+                        }),
+                    );
+                    return;
+                }
+
                 if let Ok(js_url) = serde_json::to_string(url) {
                     let _ = win.eval(format!("window.location.href = {};", js_url));
                 }
                 respond_json(request, 200, serde_json::json!({"ok": true, "site": site}));
             } else {
+                if is_bridge_task_running() {
+                    respond_json(
+                        request,
+                        409,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": "Cannot open the provider browser while Kim is running a task; this would lose LLM context.",
+                        }),
+                    );
+                    return;
+                }
+
                 // Open the browser window with this provider
                 match open_browser_signin_window_impl(url, Some(site.clone()), &app_handle) {
                     Ok(_) => {
@@ -4687,6 +4778,19 @@ async fn navigate_browser_window_if_open(url: String, app_handle: tauri::AppHand
     }
 
     if let Some(existing) = app_handle.get_webview_window("kim-browser-signin") {
+        let task_running = BRIDGE_TASK_PID
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+
+        if task_running {
+            return Err(
+                "Cannot navigate the provider browser while Kim is running a task; this would lose LLM context."
+                    .to_string(),
+            );
+        }
+
         let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
         let _ = existing.eval(format!("window.location.href = {};", js_url));
         Ok(true)
@@ -5338,6 +5442,13 @@ async fn detect_google_accounts(app_handle: tauri::AppHandle) -> Result<Vec<Goog
     let window = app_handle
         .get_webview_window("kim-browser-signin")
         .ok_or("Browser window is not open. Sign in to Google first.")?;
+
+    if is_bridge_task_running() {
+        return Err(
+            "Cannot detect Google accounts while Kim is running a task; this would navigate the provider browser and lose LLM context."
+                .to_string(),
+        );
+    }
 
     // Navigate to the Google account chooser page which lists all signed-in accounts.
     let chooser_url = "https://accounts.google.com/SignOutOptions?continue=https%3A%2F%2Fgemini.google.com%2Fapp";
