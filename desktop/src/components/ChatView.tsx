@@ -823,6 +823,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // ── Actions ─────────────────────────────────────────────────────────────────
 
   const queueEnabled = Boolean(settings.allow_message_queue);
+  const keepBrowserVisible = Boolean(settings.keep_browser_visible);
   const googleAccounts = uniqueGoogleAccounts(account.google_accounts);
 
   const getActiveGoogleAccount = useCallback(() => {
@@ -834,6 +835,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     }
     return googleAccounts[0]?.email ?? '';
   }, [account.google_active_account, googleAccounts, selectedGoogleAccount]);
+
+  useEffect(() => {
+    void invoke('set_browser_keep_visible', { keepVisible: keepBrowserVisible });
+  }, [keepBrowserVisible]);
 
   const resolveProvider = useCallback((): string => {
     const p = localProvider ?? settings.provider;

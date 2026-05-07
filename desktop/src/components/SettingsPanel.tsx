@@ -357,6 +357,21 @@ function AISection({
         />
       </div>
 
+      <div className="kim-toggle-row">
+        <div>
+          <div className="kim-toggle-row__label">Keep browser visible while running</div>
+          <div className="kim-toggle-row__hint">
+            Testing only: leaves the provider window on-screen so you can watch what Kim sends and what Gemini/Claude/ChatGPT does.
+          </div>
+        </div>
+        <button
+          role="switch"
+          aria-checked={settings.keep_browser_visible}
+          onClick={() => update('keep_browser_visible', !settings.keep_browser_visible)}
+          className={`kim-switch${settings.keep_browser_visible ? ' kim-switch--on' : ''}`}
+        />
+      </div>
+
     </div>
   );
 }

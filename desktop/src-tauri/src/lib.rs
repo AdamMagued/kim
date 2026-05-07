@@ -101,6 +101,8 @@ static WEBVIEW_BRIDGE_RESULTS: OnceLock<StdMutex<HashMap<String, BridgeCompleteR
 static WEBVIEW_BRIDGE_NOTIFY: OnceLock<(StdMutex<()>, Condvar)> = OnceLock::new();
 /// Tracks whether the browser window was hidden before a specific /v1/send request, so /v1/result knows to hide it after.
 static WEBVIEW_WAS_HIDDEN: OnceLock<StdMutex<std::collections::HashSet<String>>> = OnceLock::new();
+/// Debug/testing mode: keep the provider webview visible while sending.
+static WEBVIEW_KEEP_VISIBLE: OnceLock<StdMutex<bool>> = OnceLock::new();
 const BRIDGE_COMPLETION_TIMEOUT_S: u64 = 720;
 /// PID of the currently-running agent subprocess, accessible from both the
 /// sync bridge thread (/v1/task, /v1/cancel) and the async Tauri commands.
@@ -580,6 +582,14 @@ fn is_bridge_task_running() -> bool {
         .get_or_init(|| StdMutex::new(None))
         .lock()
         .map(|guard| guard.is_some())
+        .unwrap_or(false)
+}
+
+fn should_keep_browser_visible() -> bool {
+    WEBVIEW_KEEP_VISIBLE
+        .get_or_init(|| StdMutex::new(false))
+        .lock()
+        .map(|guard| *guard)
         .unwrap_or(false)
 }
 
@@ -3238,6 +3248,10 @@ fn handle_webview_bridge_request(
                 prepare_gemini_webview(&window, gemini_authuser, opened_window);
             }
 
+            if should_keep_browser_visible() {
+                show_browser_window_impl(&app_handle);
+            }
+
             // Window is managed permanently off-screen by show/hide_browser_window.
             // No need to manually reposition it here.
 
@@ -3405,6 +3419,11 @@ fn handle_webview_bridge_request(
             if site == "gemini" {
                 prepare_gemini_webview(&window, gemini_authuser, opened_window);
             }
+
+            if should_keep_browser_visible() {
+                show_browser_window_impl(&app_handle);
+            }
+
             // Generate req_id
             let req_id = format!(
                 "r-{}-{}",
@@ -3446,7 +3465,9 @@ fn handle_webview_bridge_request(
             // The window stays offscreen (1x1 at -10000,-10000) during
             // headless operation.  JS keeps running at 1x1, no need to
             // show it to the user.
-            if is_browser_window_offscreen(&window) {
+            if should_keep_browser_visible() {
+                show_browser_window_impl(&app_handle);
+            } else if is_browser_window_offscreen(&window) {
                 if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
                     guard.insert(req_id.clone());
                 }
@@ -4768,6 +4789,19 @@ async fn hide_browser_window(app_handle: tauri::AppHandle) -> Result<(), String>
     } else {
         Ok(())
     }
+}
+
+#[tauri::command]
+async fn set_browser_keep_visible(keep_visible: bool, app_handle: tauri::AppHandle) -> Result<(), String> {
+    if let Ok(mut guard) = WEBVIEW_KEEP_VISIBLE.get_or_init(|| StdMutex::new(false)).lock() {
+        *guard = keep_visible;
+    }
+
+    if keep_visible && app_handle.get_webview_window("kim-browser-signin").is_some() {
+        show_browser_window_impl(&app_handle);
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -6259,6 +6293,7 @@ pub fn run() {
             navigate_browser_window_if_open,
             show_browser_window,
             hide_browser_window,
+            set_browser_keep_visible,
             hide_main_window,
             show_main_window,
             set_task_active_mode,
