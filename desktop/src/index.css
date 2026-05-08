@@ -809,86 +809,163 @@ kbd {
 }
 
 /* Keep chat content above the backdrop */
-.kim-chat > *:not(.kim-chat__backdrop) { position: relative; z-index: 1; }
+.kim-chat > *:not(.kim-chat__backdrop):not(.kim-connectors-trigger):not(.kim-connectors-layer) {
+  position: relative;
+  z-index: 1;
+}
 
-.kim-connectors-trigger {
+.kim-chat .kim-connectors-trigger {
   position: absolute;
-  top: 16px;
-  right: 18px;
-  z-index: 5;
+  top: 50%;
+  right: 0;
+  z-index: 20;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  height: 32px;
-  padding: 0 12px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--bg-elevated) 86%, transparent);
+  justify-content: center;
+  width: 42px;
+  height: 46px;
+  padding: 0;
+  border-radius: 10px 0 0 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 66%, var(--text-strong));
+  border-right: 0;
+  background: var(--bg-elevated);
   color: var(--text-muted);
   font-family: inherit;
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  box-shadow: var(--shadow-xs);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--bg-elevated) 72%, transparent),
+    var(--shadow-sm);
+  transform: translateY(-50%);
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
 }
-.kim-connectors-trigger:hover {
+.kim-chat .kim-connectors-trigger:hover {
   background: var(--bg-elevated);
   color: var(--text);
-  border-color: var(--border-strong);
+  border-color: color-mix(in srgb, var(--accent) 78%, var(--text-strong));
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--accent-muted) 62%, transparent),
+    var(--shadow-md);
+  transform: translate(-2px, -50%);
 }
-.kim-connectors-trigger__dot {
+.kim-connectors-trigger__glyph {
+  width: 17px;
+  height: 17px;
+  position: relative;
+  display: inline-block;
+}
+.kim-connectors-trigger__glyph::before,
+.kim-connectors-trigger__glyph::after,
+.kim-connectors-trigger__glyph span {
+  content: "";
+  position: absolute;
+  border-radius: 999px;
+  background: var(--accent);
+}
+.kim-connectors-trigger__glyph::before {
   width: 7px;
   height: 7px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-muted);
+  left: 0;
+  top: 0;
+}
+.kim-connectors-trigger__glyph::after {
+  width: 7px;
+  height: 7px;
+  right: 0;
+  bottom: 0;
+}
+.kim-connectors-trigger__glyph span:first-child {
+  width: 7px;
+  height: 7px;
+  right: 0;
+  top: 0;
+  opacity: 0.68;
+}
+.kim-connectors-trigger__glyph span:last-child {
+  width: 2px;
+  height: 12px;
+  left: 7px;
+  top: 2px;
+  transform: rotate(-45deg);
+  opacity: 0.45;
 }
 
-.kim-connectors-layer {
+.kim-chat .kim-connectors-layer {
   position: absolute;
   inset: 0;
-  z-index: 30;
+  z-index: 40;
   pointer-events: none;
+  animation: kim-connectors-layer-in 0.24s ease both;
+}
+.kim-chat .kim-connectors-layer.is-closing {
+  animation: kim-connectors-layer-out 0.26s ease both;
 }
 .kim-connectors-scrim {
   position: absolute;
   inset: 0;
   border: 0;
-  background: transparent;
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
   cursor: default;
   pointer-events: auto;
+  animation: kim-connectors-scrim-in 0.24s ease both;
+}
+.kim-connectors-layer.is-closing .kim-connectors-scrim {
+  animation: kim-connectors-scrim-out 0.26s ease both;
 }
 .kim-connectors-panel {
   position: absolute;
   top: 0;
   right: 0;
-  width: min(360px, calc(100vw - 72px));
+  width: min(390px, calc(100vw - 44px));
   height: 100%;
   display: flex;
   flex-direction: column;
   border-left: 1px solid var(--border);
-  background: color-mix(in srgb, var(--bg-elevated) 96%, var(--bg));
+  background: var(--bg-sidebar);
   box-shadow: var(--shadow-xl);
   pointer-events: auto;
-  animation: kim-connectors-in 0.22s ease both;
+  animation: kim-connectors-in 0.28s cubic-bezier(0.19, 1, 0.22, 1) both;
+}
+.kim-connectors-layer.is-closing .kim-connectors-panel {
+  animation: kim-connectors-out 0.24s cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+@keyframes kim-connectors-layer-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes kim-connectors-layer-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes kim-connectors-scrim-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes kim-connectors-scrim-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
 }
 @keyframes kim-connectors-in {
-  from { opacity: 0; transform: translateX(18px); }
+  from { opacity: 0; transform: translateX(28px); }
   to { opacity: 1; transform: translateX(0); }
+}
+@keyframes kim-connectors-out {
+  from { opacity: 1; transform: translateX(0); }
+  to { opacity: 0; transform: translateX(22px); }
 }
 .kim-connectors-panel__header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  padding: 20px 18px 14px;
+  padding: 22px 22px 16px;
   border-bottom: 1px solid var(--border);
 }
 .kim-connectors-panel__title {
-  font-size: 18px;
+  font-size: 20px;
   line-height: 1.1;
   font-weight: 700;
   color: var(--text-strong);
@@ -916,7 +993,7 @@ kbd {
 }
 .kim-connectors-search {
   display: block;
-  padding: 14px 18px;
+  padding: 16px 22px;
   border-bottom: 1px solid var(--border);
 }
 .kim-connectors-search input {
@@ -942,95 +1019,94 @@ kbd {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 12px;
+  padding: 8px 0 18px;
 }
-.kim-connector-item {
+.kim-connector-row {
   display: flex;
-  gap: 12px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-card);
-  margin-bottom: 10px;
+  align-items: center;
+  gap: 14px;
+  min-height: 86px;
+  padding: 13px 22px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  background: transparent;
+  transition: background 0.14s ease;
 }
-.kim-connector-item__icon {
-  width: 36px;
-  height: 36px;
-  flex: 0 0 36px;
+.kim-connector-row:hover {
+  background: color-mix(in srgb, var(--bg-card) 62%, transparent);
+}
+.kim-connector-row__icon {
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 8px;
-  background: var(--accent-muted);
-  color: var(--accent);
-  font-weight: 800;
-}
-.kim-connector-item__body {
-  min-width: 0;
-  flex: 1;
-}
-.kim-connector-item__top {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.kim-connector-item__name {
-  min-width: 0;
-  flex: 1;
-  font-size: 13.5px;
-  font-weight: 700;
-  color: var(--text);
-}
-.kim-connector-item__status {
-  flex: 0 0 auto;
-  font-size: 10.5px;
-  font-weight: 700;
-  color: var(--text-subtle);
-  background: var(--bg-inset);
+  border-radius: 12px;
   border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 2px 7px;
-}
-.kim-connector-item__desc {
-  margin-top: 5px;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent-muted) 78%, var(--bg-elevated)), var(--bg-card));
+  color: var(--accent);
   font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  box-shadow: var(--shadow-xs);
+}
+.kim-connector-row__body {
+  min-width: 0;
+  flex: 1;
+}
+.kim-connector-row__name {
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--text-strong);
+  letter-spacing: -0.01em;
+}
+.kim-connector-row__desc {
+  margin-top: 4px;
+  max-width: 190px;
+  font-size: 12.5px;
   line-height: 1.45;
   color: var(--text-muted);
 }
-.kim-connector-item__actions {
-  margin-top: 11px;
+.kim-connector-row__action {
+  flex: 0 0 auto;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: space-between;
+  gap: 7px;
+}
+.kim-connector-connect {
+  height: 34px;
+  min-width: 116px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   gap: 10px;
-}
-.kim-connector-item__signin {
-  height: 30px;
-  padding: 0 11px;
-  border-radius: 7px;
-  border: 1px solid var(--border);
-  background: var(--bg-elevated);
-  color: var(--text-subtle);
-  font: inherit;
-  font-size: 12px;
-  font-weight: 600;
-}
-.kim-connector-switch {
-  width: 42px;
-  height: 24px;
+  padding: 0 10px 0 14px;
   border: 0;
-  border-radius: 999px;
-  background: var(--border-strong);
-  padding: 3px;
-  opacity: 0.7;
+  border-radius: 8px;
+  background: var(--bg-card-hover);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  opacity: 0.78;
 }
-.kim-connector-switch span {
-  display: block;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background: var(--bg-elevated);
-  box-shadow: var(--shadow-xs);
+.kim-connector-connect__divider {
+  width: 1px;
+  align-self: stretch;
+  background: color-mix(in srgb, var(--border-strong) 72%, transparent);
+}
+.kim-connector-connect__chevron {
+  font-size: 18px;
+  line-height: 1;
+  color: var(--text-muted);
+  transform: translateY(-1px);
+}
+.kim-connector-item__actions {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-subtle);
 }
 .kim-connectors-empty {
   padding: 30px 10px;
