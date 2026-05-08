@@ -471,7 +471,8 @@ class KimAgent:
                         continue
 
                     _BATCH_SAFE = {"read_file", "list_dir", "git_status", "git_diff",
-                                   "git_log", "search_in_files", "find_files", "get_screen_info"}
+                                   "git_log", "search_in_files", "find_files",
+                                   "get_screen_info", "get_windows", "observe_ui"}
                     batch_results = []
                     aborted_after = -1
                     ok = True
@@ -635,9 +636,10 @@ class KimAgent:
                     self._log("WARN", msg)
                     return {"success": False, "summary": msg, "screenshot": last_screenshot_b64}
 
-                # Don't force a screenshot — let the LLM call take_screenshot if it needs one.
+                # Don't force a screenshot. Nudge toward the fast structured UI path.
                 self.memory.add_user(
-                    "Continue. What is your next action? Use take_screenshot if you need to see the screen.")
+                    "Continue. What is your next action? For UI state, use observe_ui first. "
+                    "Use screenshots only for genuinely visual questions or when structured UI is insufficient.")
                 continue
 
         self._log("WARN", f"Max iterations ({self.max_iterations}) reached")
@@ -834,7 +836,8 @@ class KimAgent:
 
     def _build_system_prompt(self, task: str) -> str:
         tool_names = [t["name"] for t in self._tools]
-        prompt = f"""You are Kim, an autonomous AI agent controlling a {_OS_NAME} computer.
+        prompt = f"""You are operating as Kim, a local desktop agent controlling a {_OS_NAME} computer through tools.
+The chat/model provider name is irrelevant. Do not say "I am Claude/Gemini/ChatGPT" or refuse because "I do not have access to your Mac"; Kim's tools provide that access.
 
 ## Current Task
 {task}
@@ -865,10 +868,15 @@ You MUST respond in EXACTLY one of these formats on every turn:
    NEED_HELP: <brief reason you cannot proceed autonomously>
 
 ## Operational Guidelines
-- Use take_screenshot when you need to see what's on screen (e.g. to verify a click worked,
-  find a UI element, or understand the current state). Don't call it unnecessarily.
-- After every click or keyboard action, consider whether you need to verify the result.
-- Before TASK_COMPLETE on any visual task, take a final screenshot to verify.
+- For normal UI tasks, use observe_ui first. It is fast, text-only, and returns buttons,
+  inputs, labels, element IDs, and coordinates from the accessibility tree.
+- Use click_ui with an element_id from observe_ui when possible. Use type_text after
+  focusing an input. Use keyboard shortcuts when they are faster and reliable.
+- Do NOT use screenshots for ordinary tasks like opening email, clicking buttons,
+  filling forms, changing settings, launching apps, or verifying text UI state.
+- Use take_screenshot or take_annotated_screenshot only when the user asks a visual
+  question ("what's on my screen", image/color/layout inspection) or observe_ui is
+  empty/ambiguous and keyboard/accessibility actions are insufficient.
 - Prefer run_command for launching apps (e.g. {_LAUNCH_EXAMPLE}).
 - For shell commands, prefer single quotes over double quotes inside the cmd string.
   Example: `grep -E 'mcp|playwright'` instead of `grep -E "mcp|playwright"`.
@@ -880,29 +888,15 @@ You MUST respond in EXACTLY one of these formats on every turn:
   interacting with the computer, answer directly with TASK_COMPLETE: <answer>.
   Do NOT call tools for questions you can answer from your own knowledge.
 
-## Visual Ruler Grid (Calibration Dots)
-When you need to click something on screen, use `take_annotated_screenshot` instead of
-`take_screenshot`. The annotated screenshot has a grid of labeled cross-markers
-(columns A–J, rows 1–10) drawn onto the image as visual rulers.
+## UI Perception Policy
+Default loop for desktop/app tasks:
+1. focus_window/open_url/run_command if needed.
+2. observe_ui to inspect active controls.
+3. click_ui/type_text/key_press/hotkey/scroll to act.
+4. observe_ui again only when state may have changed.
 
-The tool response is JSON containing:
-- `image`: the screenshot with the grid overlaid (base64 PNG)
-- `grid`: a mapping of marker labels to exact screen coordinates, e.g. {{"A1": [57, 36], "B3": [215, 250]}}
-- `screen_width` / `screen_height`: actual monitor dimensions
-
-**How to use the grid to click precisely:**
-1. Look at the annotated screenshot and identify your click target.
-2. Find the 2–4 nearest grid markers surrounding the target.
-3. Look up those markers' exact coordinates from the `grid` mapping.
-4. Interpolate: estimate the target's (x, y) based on its visual position
-   relative to the nearby markers.
-5. Call the `click` tool with those interpolated coordinates.
-
-Example: If marker D5 is at (430, 450) and marker E5 is at (573, 450), and your
-target is visually ~30% of the way from D5 to E5, estimate x ≈ 430 + 0.3×(573-430) = 473.
-
-Use `take_screenshot` (without grid) only when you just need to read text or verify
-a result — NOT when planning to click.
+Screenshots are an expensive fallback. Prefer structured UI unless the task is
+actually visual or observe_ui cannot expose the needed target.
 """
         if self.config.get("voice", {}).get("human_quirks", False):
             prompt += (

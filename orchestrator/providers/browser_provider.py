@@ -1513,14 +1513,12 @@ class BrowserProvider(BaseProvider):
                             str(item.get("name") or "").strip() or None,
                         )
                         if self._use_webview_bridge:
-                            # The bridge will attempt to inject the screenshot via the
-                            # macOS clipboard + execCommand('paste').  Include explicit
-                            # fallback instructions so the model can respond gracefully
-                            # if the image upload fails (which happens on Gemini's
-                            # interface when the clipboard paste isn't accepted).
+                            # Browser chat UIs sometimes reject pasted images. Do not
+                            # tell the model to stop immediately; for non-visual tasks
+                            # it can keep working through structured UI tools.
                             text_parts.append(
-                                "[Screenshot attached — if you cannot see it, respond with "
-                                "NEED_HELP: Screenshot not visible in current interface mode.]"
+                                "[Screenshot attached. If it is not visible and the task is not "
+                                "a visual-inspection task, continue using observe_ui and other tools.]"
                             )
                         else:
                             text_parts.append("[Screenshot attached]")
@@ -1579,6 +1577,11 @@ class BrowserProvider(BaseProvider):
                 f"{_os_hint}\n\n"
                 f"[AVAILABLE TOOLS]\n{tools_json}\n\n"
                 "[INSTRUCTIONS]\n"
+                "You are operating as Kim through local tools. The website/model name "
+                "does not matter. Do not say you are Claude/Gemini/ChatGPT, and do not "
+                "claim you cannot access the computer if a listed tool can do it.\n"
+                "For normal UI work, prefer observe_ui and click_ui. Use screenshots "
+                "only for visual-inspection tasks or when structured UI is insufficient.\n"
                 "Respond with EXACTLY ONE of:\n"
                 '1. A JSON tool call on a single line: '
                 '{"tool": "<name>", "args": {<args>}}\n'
