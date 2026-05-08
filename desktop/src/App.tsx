@@ -350,8 +350,6 @@ export default function App() {
             <span className="kim-topbar__connectors-glyph" aria-hidden="true">
               <span />
               <span />
-              <span />
-              <span />
             </span>
           </button>
         </header>

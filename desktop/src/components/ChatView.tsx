@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock } from '../types';
@@ -590,8 +591,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   }, [connectorsClosing, connectorsOpen]);
 
   // Topbar's connectors button dispatches `kim-open-connectors`. Listen here
-  // so the trigger lives in the topbar but the panel still renders inside the
-  // chat area (preserving its absolute positioning over chat content).
+  // so the trigger lives in the topbar but the panel still renders from this
+  // component. The panel itself is portaled to <body> so it overlays the
+  // topbar and sidebar (instead of being clipped to .kim-chat).
   useEffect(() => {
     function onOpen() { openConnectors(); }
     window.addEventListener('kim-open-connectors', onOpen);
@@ -599,20 +601,19 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   }, [openConnectors]);
 
   function renderConnectorsChrome() {
-    return (
-      <>
-        {connectorsOpen && (
-          <div
-            className={`kim-connectors-layer${connectorsClosing ? ' is-closing' : ''}`}
-            aria-hidden={connectorsClosing}
-          >
-            <button
-              type="button"
-              className="kim-connectors-scrim"
-              aria-label="Close connectors"
-              onClick={closeConnectors}
-            />
-            <aside className="kim-connectors-panel" aria-label="Connectors">
+    if (!connectorsOpen) return null;
+    return createPortal(
+      <div
+        className={`kim-connectors-layer${connectorsClosing ? ' is-closing' : ''}`}
+        aria-hidden={connectorsClosing}
+      >
+        <button
+          type="button"
+          className="kim-connectors-scrim"
+          aria-label="Close connectors"
+          onClick={closeConnectors}
+        />
+        <aside className="kim-connectors-panel" aria-label="Connectors">
               <div className="kim-connectors-panel__header">
                 <div>
                   <div className="kim-connectors-panel__title">Connectors</div>
@@ -665,10 +666,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                   <div className="kim-connectors-empty">No connectors found</div>
                 )}
               </div>
-            </aside>
-          </div>
-        )}
-      </>
+        </aside>
+      </div>,
+      document.body,
     );
   }
 

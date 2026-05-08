@@ -1168,33 +1168,57 @@ kbd {
 .kim-topbar__connectors-glyph {
   position: relative;
   display: inline-block;
-  width: 14px;
-  height: 14px;
+  width: 15px;
+  height: 15px;
 }
+.kim-topbar__connectors-glyph::before,
+.kim-topbar__connectors-glyph::after,
 .kim-topbar__connectors-glyph span {
+  content: "";
   position: absolute;
-  width: 5px;
-  height: 5px;
   border-radius: 999px;
   background: var(--accent);
 }
-.kim-topbar__connectors-glyph span:nth-child(1) { left: 0;  top: 0; }
-.kim-topbar__connectors-glyph span:nth-child(2) { right: 0; top: 0; opacity: 0.78; }
-.kim-topbar__connectors-glyph span:nth-child(3) { left: 0;  bottom: 0; opacity: 0.62; }
-.kim-topbar__connectors-glyph span:nth-child(4) { right: 0; bottom: 0; opacity: 0.92; }
+.kim-topbar__connectors-glyph::before {
+  width: 6px;
+  height: 6px;
+  left: 0;
+  top: 0;
+}
+.kim-topbar__connectors-glyph::after {
+  width: 6px;
+  height: 6px;
+  right: 0;
+  bottom: 0;
+}
+.kim-topbar__connectors-glyph span:first-child {
+  width: 6px;
+  height: 6px;
+  right: 0;
+  top: 0;
+  opacity: 0.68;
+}
+.kim-topbar__connectors-glyph span:last-child {
+  width: 2px;
+  height: 11px;
+  left: 6px;
+  top: 2px;
+  transform: rotate(-45deg);
+  opacity: 0.45;
+}
 
-.kim-chat .kim-connectors-layer {
-  position: absolute;
+.kim-connectors-layer {
+  position: fixed;
   inset: 0;
-  z-index: 40;
+  z-index: 200;
   pointer-events: none;
   animation: kim-connectors-layer-in 0.24s ease both;
 }
-.kim-chat .kim-connectors-layer.is-closing {
+.kim-connectors-layer.is-closing {
   animation: kim-connectors-layer-out 0.26s ease both;
 }
 .kim-connectors-scrim {
-  position: absolute;
+  position: fixed;
   inset: 0;
   border: 0;
   background: rgba(14, 12, 10, 0.08);
@@ -1206,11 +1230,11 @@ kbd {
   animation: kim-connectors-scrim-out 0.26s ease both;
 }
 .kim-connectors-panel {
-  position: absolute;
+  position: fixed;
   top: 0;
   right: 0;
   width: min(390px, calc(100vw - 44px));
-  height: 100%;
+  height: 100vh;
   display: flex;
   flex-direction: column;
   border-left: 1px solid var(--sidebar-glass-border);
