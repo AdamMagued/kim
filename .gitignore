@@ -51,4 +51,3 @@ config.yaml
 
 # Relay database
 relay_server/relay.db
-pythonExperimentTool/
