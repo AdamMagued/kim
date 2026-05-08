@@ -10,13 +10,11 @@ import { useAccount } from './hooks/useAccount';
 import { Sidebar } from './components/Sidebar';
 import { ChatView } from './components/ChatView';
 import { SettingsPanel } from './components/SettingsPanel';
-import { KimLogo } from './components/KimLogo';
 import { UpdateModal } from './components/UpdateModal';
-import { ThemeToggle } from './components/ThemeToggle';
 import { OnboardingFlow } from './components/OnboardingFlow';
 import { ToastProvider, toast } from './components/Toast';
 
-import type { SessionInfo, Settings, Theme, AccentTheme, KimAccount } from './types';
+import type { SessionInfo, Settings, AccentTheme, KimAccount } from './types';
 import { DEFAULT_SETTINGS } from './types';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -72,7 +70,7 @@ function sessionKey(session: SessionInfo): string {
 
 export default function App() {
   const [settings, setSettings] = useState<Settings>(loadSettings);
-  const { setTheme } = useTheme(settings.theme);
+  useTheme(settings.theme);
   const { account, loading: accountLoading, setAccount } = useAccount();
 
   const { kimSessions, loading, refresh } = useSessions(settings);
@@ -93,6 +91,43 @@ export default function App() {
   const [appVersion, setAppVersion] = useState('0.1.0');
   const [updateInfo, setUpdateInfo] = useState<GithubRelease | null>(null);
   const [showUpdate, setShowUpdate] = useState(false);
+
+  // Globally suppress the WebView's native context menu. Right-click should
+  // never show "Inspect Element", "Reload", "Back" etc. on our app. Components
+  // that want a custom context menu (e.g. session items) attach their own
+  // onContextMenu and call e.stopPropagation() before our handler runs.
+  useEffect(() => {
+    const onContextMenu = (e: MouseEvent) => {
+      // Allow text inputs/textareas to keep their context menu so users can
+      // paste/copy. Everywhere else, swallow the event.
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+        return;
+      }
+      e.preventDefault();
+    };
+    // Block the F12 / Cmd+Opt+I devtools shortcuts as a belt-and-braces
+    // measure on top of Tauri's release-build devtools-off default.
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'F12') {
+        e.preventDefault();
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.altKey && (e.key === 'I' || e.key === 'i' || e.key === 'J' || e.key === 'j' || e.key === 'C' || e.key === 'c')) {
+        e.preventDefault();
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'I' || e.key === 'i' || e.key === 'J' || e.key === 'j' || e.key === 'C' || e.key === 'c')) {
+        e.preventDefault();
+      }
+    };
+    document.addEventListener('contextmenu', onContextMenu);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('contextmenu', onContextMenu);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, []);
 
   useEffect(() => {
     invoke<string>('get_app_version')
@@ -126,7 +161,6 @@ export default function App() {
     }
   }
 
-  useEffect(() => { setTheme(settings.theme); }, [settings.theme, setTheme]);
   useEffect(() => { applyAccent(settings.accent ?? 'indigo'); }, [settings.accent]);
 
   useEffect(() => {
@@ -147,10 +181,6 @@ export default function App() {
   function handleSettingsChange(next: Settings) {
     setSettings(next);
     saveSettings(next);
-  }
-
-  function handleThemeChange(next: Theme) {
-    handleSettingsChange({ ...settings, theme: next });
   }
 
   function handleSelectSession(session: SessionInfo) {
@@ -246,61 +276,85 @@ export default function App() {
   }
 
   return (
-    <div className="kim-app">
-      <header className="kim-header" data-tauri-drag-region onMouseDown={handleHeaderMouseDown}>
-        <div className="kim-header__traffic-lights-spacer" />
+    <div className="kim-app kim-app--row">
+      <Sidebar
+        kimSessions={kimSessions}
+        activeSessionId={activeSession ? sessionKey(activeSession) : null}
+        onSelectSession={handleSelectSession}
+        onNewChat={handleNewChat}
+        collapsed={sidebarCollapsed}
+        onToggle={() => setSidebarCollapsed(v => !v)}
+        onOpenSettings={() => setShowSettings(true)}
+        loading={loading}
+        account={account}
+        onAccountChange={setAccount}
+        activeTab={activeTab}
+        onTabChange={handleTabChange}
+        activeProjectPath={activeProjectPath}
+        onSelectProject={handleSelectProject}
+        onRefreshSessions={refresh}
+        kimSessionsDir={settings.kim_sessions_dir || null}
+        clawSessionsDir={settings.claw_sessions_dir || null}
+        appVersion={appVersion}
+      />
 
-        <div className="kim-header__brand">
-          <KimLogo layout="icon" size={20} />
-          <span className="kim-header__title">Kim</span>
-          <span className="kim-header__version">v{appVersion}</span>
-        </div>
+      <main className="kim-main">
+        <header className="kim-topbar" data-tauri-drag-region onMouseDown={handleHeaderMouseDown}>
+          {activeSession && !newChatMode && (
+            <div className="kim-topbar__title">
+              {activeSession.session_type !== 'kim' && (
+                <span className="kim-header__session-badge kim-header__session-badge--claw">Code</span>
+              )}
+              <span className="kim-topbar__title-text">{activeSession.title?.trim() || activeSession.session_id}</span>
+              <button
+                type="button"
+                className="kim-header__summarize-btn kim-no-drag"
+                title={activeSession.has_summary ? 'Re-generate summary' : 'Summarize this conversation'}
+                onClick={async () => {
+                  try {
+                    await invoke('summarize_session', {
+                      sessionId: activeSession.session_id,
+                      sessionType: activeSession.session_type,
+                      projectRoot: activeProjectPath ?? null,
+                    });
+                    toast('Summary generated', 'success');
+                    await refresh();
+                  } catch (e) {
+                    toast(`Summarize failed: ${e}`, 'error');
+                  }
+                }}
+              >
+                {activeSession.has_summary ? 'Re-summarize' : 'Summarize'}
+              </button>
+            </div>
+          )}
+          {newChatMode && (
+            <div className="kim-topbar__title">
+              {activeTab !== 'chat' && (
+                <span className="kim-header__session-badge kim-header__session-badge--claw">Code</span>
+              )}
+              <span className="kim-topbar__title-text">
+                <span className="kim-pulse-dot" /> New chat
+              </span>
+            </div>
+          )}
 
-        {activeSession && !newChatMode && (
-          <div className="kim-header__breadcrumb">
-            <span className="kim-header__slash">/</span>
-            <span className={`kim-header__session-badge kim-header__session-badge--${activeSession.session_type}`}>
-              {activeSession.session_type === 'kim' ? 'Kim' : 'Code'}
+          <div style={{ flex: 1 }} />
+          <button
+            type="button"
+            className="kim-topbar__connectors-btn kim-no-drag"
+            onClick={() => window.dispatchEvent(new CustomEvent('kim-open-connectors'))}
+            aria-label="Open connectors"
+            title="Connectors"
+          >
+            <span className="kim-topbar__connectors-glyph" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+              <span />
             </span>
-            <span className="kim-header__session-id">{activeSession.title?.trim() || activeSession.session_id}</span>
-          </div>
-        )}
-        {newChatMode && (
-          <div className="kim-header__breadcrumb">
-            <span className="kim-header__slash">/</span>
-            <span className={`kim-header__session-badge kim-header__session-badge--${activeTab === 'chat' ? 'kim' : 'claw'}`}>
-              {activeTab === 'chat' ? 'Kim' : 'Code'}
-            </span>
-            <span className="kim-header__new-chat-label" style={{ marginLeft: '8px' }}>
-              <span className="kim-pulse-dot" /> New chat
-            </span>
-          </div>
-        )}
-
-        <div style={{ flex: 1 }} />
-        <ThemeToggle theme={settings.theme} onChange={handleThemeChange} />
-      </header>
-
-      <div className="kim-body">
-        <Sidebar
-          kimSessions={kimSessions}
-          activeSessionId={activeSession ? sessionKey(activeSession) : null}
-          onSelectSession={handleSelectSession}
-          onNewChat={handleNewChat}
-          collapsed={sidebarCollapsed}
-          onToggle={() => setSidebarCollapsed(v => !v)}
-          onOpenSettings={() => setShowSettings(true)}
-          loading={loading}
-          account={account}
-          onAccountChange={setAccount}
-          activeTab={activeTab}
-          onTabChange={handleTabChange}
-          activeProjectPath={activeProjectPath}
-          onSelectProject={handleSelectProject}
-          onRefreshSessions={refresh}
-          kimSessionsDir={settings.kim_sessions_dir || null}
-          clawSessionsDir={settings.claw_sessions_dir || null}
-        />
+          </button>
+        </header>
 
         <ChatView
           key={activeSession ? sessionKey(activeSession) : `new-${chatSerial}`}
@@ -313,11 +367,7 @@ export default function App() {
           activeTab={activeTab}
           activeProjectPath={activeProjectPath}
         />
-      </div>
-
-      <div className="kim-credits">
-        built by <a href="https://github.com/AdamMagued" target="_blank" rel="noreferrer">adam</a> and <a href="https://github.com/Ahmed" target="_blank" rel="noreferrer">ahmed</a> for linux
-      </div>
+      </main>
 
       {showSettings && (
         <SettingsPanel
