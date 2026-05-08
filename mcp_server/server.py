@@ -64,6 +64,7 @@ from mcp_server.tools.screen import (
     handle_take_screenshot,
 )
 from mcp_server.tools.shell import handle_run_command, handle_run_powershell
+from mcp_server.tools.ui_observe import handle_click_ui, handle_observe_ui
 from mcp_server.tools.windows import (
     handle_focus_window,
     handle_get_windows,
@@ -179,7 +180,10 @@ _TOOLS: list[Tool] = [
     # ── Screen ──────────────────────────────────────────────────────────────
     Tool(
         name="take_screenshot",
-        description="Capture the screen as a base64-encoded PNG. Returns 'data:image/png;base64,...'.",
+        description=(
+            "Capture the screen as a base64-encoded PNG. Use only for genuinely visual "
+            "inspection tasks or when observe_ui cannot expose the needed UI state."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -194,6 +198,38 @@ _TOOLS: list[Tool] = [
         inputSchema={"type": "object", "properties": {}},
     ),
     Tool(
+        name="observe_ui",
+        description=(
+            "Fast text-only UI observation of the active app/window using the accessibility tree. "
+            "Use this BEFORE screenshots for normal desktop tasks like opening apps, reading buttons, "
+            "finding inputs, and navigating email/browser UI. Returns element IDs, roles, labels, "
+            "bounds, and click centers. Does not capture pixels."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum elements to return", "default": 80},
+                "depth": {"type": "integer", "description": "Accessibility traversal depth", "default": 5},
+            },
+        },
+    ),
+    Tool(
+        name="click_ui",
+        description=(
+            "Click an element by ID from the most recent observe_ui result. "
+            "Use this for accessible buttons, links, menu items, and inputs instead of screenshot coordinates."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "element_id": {"type": "string", "description": "Element ID from observe_ui, e.g. e12"},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
+                "clicks": {"type": "integer", "description": "Number of clicks", "default": 1},
+            },
+            "required": ["element_id"],
+        },
+    ),
+    Tool(
         name="take_annotated_screenshot",
         description=(
             "Capture the screen with a visual ruler grid overlaid on the image. "
@@ -201,7 +237,7 @@ _TOOLS: list[Tool] = [
             "use as reference points to calculate exact (X, Y) pixel coordinates for clicking. "
             "Returns JSON with the annotated image (base64), a grid mapping of marker labels "
             "to real screen coordinates, and instructions on how to interpolate coordinates. "
-            "USE THIS instead of take_screenshot when you need to click something on screen."
+            "Use only as a fallback when observe_ui/click_ui cannot identify the target."
         ),
         inputSchema={
             "type": "object",
@@ -527,6 +563,8 @@ _DISPATCH = {
     "run_powershell": handle_run_powershell,
     "take_screenshot": handle_take_screenshot,
     "get_screen_info": handle_get_screen_info,
+    "observe_ui": handle_observe_ui,
+    "click_ui": handle_click_ui,
     "take_annotated_screenshot": handle_take_annotated_screenshot,
     "click": handle_click,
     "double_click": handle_double_click,
