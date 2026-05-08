@@ -13,7 +13,7 @@ interface BrowserProvider {
 const BROWSER_PROVIDERS: BrowserProvider[] = [
   { id: 'claude',   name: 'Claude',   url: 'https://claude.ai',          hint: 'Sign in with your Anthropic account' },
   { id: 'chatgpt',  name: 'ChatGPT',  url: 'https://chatgpt.com',        hint: 'Sign in with your OpenAI account' },
-  { id: 'gemini',   name: 'Gemini',   url: 'https://gemini.google.com',  hint: 'Sign in with your Google account' },
+  { id: 'gemini',   name: 'Gemini',   url: 'https://gemini.google.com/app',  hint: 'Sign in with your Google account' },
   { id: 'grok',     name: 'Grok',     url: 'https://grok.com',           hint: 'Sign in with your X (Twitter) account' },
   {
     id: 'deepseek', name: 'DeepSeek', url: 'https://chat.deepseek.com',  hint: 'Sign in with your DeepSeek account',
