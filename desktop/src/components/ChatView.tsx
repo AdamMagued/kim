@@ -370,14 +370,14 @@ const CONNECTORS = [
   {
     id: 'guc-cms',
     name: 'GUC CMS',
-    description: 'Sign in with your GUC credentials and give Kim CMS-specific tools.',
-    status: 'Not wired yet',
+    description: 'Course content, announcements, enrollment, and CMS actions.',
+    icon: 'CMS',
   },
   {
     id: 'guc-mail',
     name: 'GUC Mail',
-    description: 'Connect your GUC mailbox and expose mail-specific tools to Kim.',
-    status: 'Not wired yet',
+    description: 'GUC inbox, sent mail, search, drafts, and email actions.',
+    icon: '@',
   },
 ];
 
@@ -493,6 +493,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
   const [autoFollowOutput, setAutoFollowOutput] = useState(true);
   const [connectorsOpen, setConnectorsOpen] = useState(false);
+  const [connectorsClosing, setConnectorsClosing] = useState(false);
   const [connectorSearch, setConnectorSearch] = useState('');
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
@@ -508,6 +509,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const bottomRef = useRef<HTMLDivElement>(null);
   const outputRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const connectorsCloseTimerRef = useRef<number | null>(null);
   const startTimeRef = useRef<number | null>(null);
   const currentTaskRef = useRef<PendingTask | null>(null);
   // Tracks the most recently submitted task — never cleared, so retry always works
@@ -572,38 +574,72 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     );
   });
 
+  useEffect(() => {
+    return () => {
+      if (connectorsCloseTimerRef.current !== null) {
+        window.clearTimeout(connectorsCloseTimerRef.current);
+      }
+    };
+  }, []);
+
+  const openConnectors = useCallback(() => {
+    if (connectorsCloseTimerRef.current !== null) {
+      window.clearTimeout(connectorsCloseTimerRef.current);
+      connectorsCloseTimerRef.current = null;
+    }
+    setConnectorsClosing(false);
+    setConnectorsOpen(true);
+  }, []);
+
+  const closeConnectors = useCallback(() => {
+    if (!connectorsOpen || connectorsClosing) return;
+    setConnectorsClosing(true);
+    connectorsCloseTimerRef.current = window.setTimeout(() => {
+      setConnectorsOpen(false);
+      setConnectorsClosing(false);
+      connectorsCloseTimerRef.current = null;
+    }, 260);
+  }, [connectorsClosing, connectorsOpen]);
+
   function renderConnectorsChrome() {
     return (
       <>
         <button
           type="button"
           className="kim-connectors-trigger kim-no-drag"
-          onClick={() => setConnectorsOpen(true)}
+          onClick={openConnectors}
           aria-label="Open connectors"
+          title="Connectors"
         >
-          <span className="kim-connectors-trigger__dot" />
-          <span>Connectors</span>
+          <span className="kim-connectors-trigger__glyph" aria-hidden="true">
+            <span />
+            <span />
+          </span>
+          <span className="sr-only">Connectors</span>
         </button>
 
         {connectorsOpen && (
-          <div className="kim-connectors-layer" aria-hidden={!connectorsOpen}>
+          <div
+            className={`kim-connectors-layer${connectorsClosing ? ' is-closing' : ''}`}
+            aria-hidden={connectorsClosing}
+          >
             <button
               type="button"
               className="kim-connectors-scrim"
               aria-label="Close connectors"
-              onClick={() => setConnectorsOpen(false)}
+              onClick={closeConnectors}
             />
             <aside className="kim-connectors-panel" aria-label="Connectors">
               <div className="kim-connectors-panel__header">
                 <div>
                   <div className="kim-connectors-panel__title">Connectors</div>
-                  <div className="kim-connectors-panel__subtitle">Optional tool packs for Kim</div>
+                  <div className="kim-connectors-panel__subtitle">Turn on tool packs for Kim</div>
                 </div>
                 <button
                   type="button"
                   className="kim-connectors-panel__close"
                   aria-label="Close connectors"
-                  onClick={() => setConnectorsOpen(false)}
+                  onClick={closeConnectors}
                 >
                   ×
                 </button>
@@ -621,29 +657,22 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
               <div className="kim-connectors-list">
                 {filteredConnectors.map(connector => (
-                  <div className="kim-connector-item" key={connector.id}>
-                    <div className="kim-connector-item__icon" aria-hidden="true">
-                      {connector.id === 'guc-cms' ? 'C' : 'M'}
+                  <div className="kim-connector-row" key={connector.id}>
+                    <div className="kim-connector-row__icon" aria-hidden="true">
+                      {connector.icon}
                     </div>
-                    <div className="kim-connector-item__body">
-                      <div className="kim-connector-item__top">
-                        <div className="kim-connector-item__name">{connector.name}</div>
-                        <span className="kim-connector-item__status">{connector.status}</span>
-                      </div>
-                      <div className="kim-connector-item__desc">{connector.description}</div>
+                    <div className="kim-connector-row__body">
+                      <div className="kim-connector-row__name">{connector.name}</div>
+                      <div className="kim-connector-row__desc">{connector.description}</div>
+                    </div>
+                    <div className="kim-connector-row__action">
+                      <button type="button" className="kim-connector-connect" disabled>
+                        <span>Connect</span>
+                        <span className="kim-connector-connect__divider" />
+                        <span className="kim-connector-connect__chevron" aria-hidden="true">⌄</span>
+                      </button>
                       <div className="kim-connector-item__actions">
-                        <button type="button" className="kim-connector-item__signin" disabled>
-                          Sign in
-                        </button>
-                        <button
-                          type="button"
-                          className="kim-connector-switch"
-                          disabled
-                          aria-pressed="false"
-                          aria-label={`${connector.name} connector not wired yet`}
-                        >
-                          <span />
-                        </button>
+                        <span>Coming soon</span>
                       </div>
                     </div>
                   </div>
