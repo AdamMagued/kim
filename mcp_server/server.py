@@ -65,6 +65,18 @@ from mcp_server.tools.screen import (
 )
 from mcp_server.tools.shell import handle_run_command, handle_run_powershell
 from mcp_server.tools.ui_observe import handle_click_ui, handle_observe_ui
+from mcp_server.tools.web import (
+    handle_web_back,
+    handle_web_click,
+    handle_web_close,
+    handle_web_fill,
+    handle_web_observe,
+    handle_web_open,
+    handle_web_press,
+    handle_web_screenshot,
+    handle_web_text,
+    handle_web_wait_for,
+)
 from mcp_server.tools.windows import (
     handle_focus_window,
     handle_get_windows,
@@ -228,6 +240,143 @@ _TOOLS: list[Tool] = [
             },
             "required": ["element_id"],
         },
+    ),
+    Tool(
+        name="web_open",
+        description=(
+            "Navigate Kim's controlled browser (a persistent Chromium window separate from "
+            "the user's main browser) to a URL. ALWAYS prefer the web_* tools over native "
+            "screenshot/click for any web-based task — they read the actual DOM with full "
+            "fidelity, unlike observe_ui which can't see web page contents in Chrome. The "
+            "browser persists cookies between runs, so the user only signs in once per site."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Absolute URL or domain (https:// added if missing)."},
+            },
+            "required": ["url"],
+        },
+    ),
+    Tool(
+        name="web_observe",
+        description=(
+            "Return a structured list of every visible interactive element on the current "
+            "web page (buttons, links, inputs, textareas, selects, ARIA widgets) with stable "
+            "element IDs (w1, w2, …), labels, values, types, and bounding boxes. The IDs are "
+            "valid input to web_click and web_fill until the next web_observe call. Use this "
+            "INSTEAD of screenshots for web tasks — it sees form fields, hidden ARIA widgets, "
+            "and dynamic content that AX/screenshots miss."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max elements to return", "default": 80},
+            },
+        },
+    ),
+    Tool(
+        name="web_click",
+        description=(
+            "Click a web element by ID returned from the most recent web_observe call. "
+            "Works on real DOM elements, so it triggers full event chains (onclick, React "
+            "handlers, form submission) just like a real user click."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "element_id": {"type": "string", "description": "Element ID from web_observe (e.g. w12)."},
+            },
+            "required": ["element_id"],
+        },
+    ),
+    Tool(
+        name="web_fill",
+        description=(
+            "Fill an input/textarea/contenteditable on the current web page by element ID "
+            "from web_observe. Clears existing value first. For non-input fields, use "
+            "web_click to focus and then type_text via the OS keyboard."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "element_id": {"type": "string", "description": "Element ID from web_observe (e.g. w7)."},
+                "text": {"type": "string", "description": "Text to enter."},
+            },
+            "required": ["element_id", "text"],
+        },
+    ),
+    Tool(
+        name="web_press",
+        description=(
+            "Press a single key in the controlled browser (Enter, Tab, Escape, ArrowDown, "
+            "etc.). The key is sent to whichever element currently has focus, so call "
+            "web_click or web_fill on the target field first."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Key name, e.g. 'Enter', 'Tab', 'Escape'."},
+            },
+            "required": ["key"],
+        },
+    ),
+    Tool(
+        name="web_text",
+        description=(
+            "Return the visible plain text of the current web page (document.body.innerText). "
+            "Use for reading articles, search results, or verifying a page's contents. "
+            "Truncated to ~8000 chars by default."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "max_chars": {"type": "integer", "description": "Truncate threshold", "default": 8000},
+            },
+        },
+    ),
+    Tool(
+        name="web_screenshot",
+        description=(
+            "Capture the controlled browser page as a base64 PNG. Use ONLY when web_observe "
+            "and web_text cannot answer the question (image content, layout, visual styling). "
+            "Returns 'WEB_SCREENSHOT_BASE64:image/png:<b64>' — much faster than the OS screenshot."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "full_page": {"type": "boolean", "description": "Capture full scroll height", "default": False},
+            },
+        },
+    ),
+    Tool(
+        name="web_wait_for",
+        description=(
+            "Wait until specific text or a CSS selector becomes visible on the current page. "
+            "Use after navigation, form submission, or any action that triggers async UI "
+            "updates, before re-running web_observe."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Substring of visible text to wait for."},
+                "selector": {"type": "string", "description": "CSS selector instead of text."},
+                "timeout_ms": {"type": "integer", "description": "Timeout in ms", "default": 10000},
+            },
+        },
+    ),
+    Tool(
+        name="web_back",
+        description="Navigate the controlled browser back one entry in its history.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="web_close",
+        description=(
+            "Close Kim's controlled browser. Profile data (cookies, logins) is preserved "
+            "on disk and reloaded next time web_open is called."
+        ),
+        inputSchema={"type": "object", "properties": {}},
     ),
     Tool(
         name="take_annotated_screenshot",
@@ -565,6 +714,16 @@ _DISPATCH = {
     "get_screen_info": handle_get_screen_info,
     "observe_ui": handle_observe_ui,
     "click_ui": handle_click_ui,
+    "web_open": handle_web_open,
+    "web_observe": handle_web_observe,
+    "web_click": handle_web_click,
+    "web_fill": handle_web_fill,
+    "web_press": handle_web_press,
+    "web_text": handle_web_text,
+    "web_screenshot": handle_web_screenshot,
+    "web_wait_for": handle_web_wait_for,
+    "web_back": handle_web_back,
+    "web_close": handle_web_close,
     "take_annotated_screenshot": handle_take_annotated_screenshot,
     "click": handle_click,
     "double_click": handle_double_click,
