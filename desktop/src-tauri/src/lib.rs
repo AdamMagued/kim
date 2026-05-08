@@ -4396,6 +4396,92 @@ async fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Worked-for run history persistence — stores the activity-feed snapshot for
+// each completed task as a sidecar `<session_id>.runs.json` next to the
+// session JSONL file. Survives chat reloads.
+// ---------------------------------------------------------------------------
+
+fn find_session_date_dir(
+    session_id: &str,
+    session_date: Option<&str>,
+    kim_dir: Option<&str>,
+    claw_dir: Option<&str>,
+) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = vec![
+        kim_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir),
+    ];
+    if let Some(p) = claw_dir { dirs.push(PathBuf::from(p)); }
+    for base in &dirs {
+        if !base.exists() { continue; }
+        if let Some(date) = session_date {
+            let dd = base.join(date);
+            if dd.join(format!("{}.jsonl", session_id)).exists() {
+                return Some(dd);
+            }
+        }
+        if let Ok(entries) = fs::read_dir(base) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let dd = entry.path();
+                if dd.is_dir() && dd.join(format!("{}.jsonl", session_id)).exists() {
+                    return Some(dd);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[tauri::command]
+async fn save_run_history(
+    session_id: String,
+    session_date: Option<String>,
+    kim_dir: Option<String>,
+    claw_dir: Option<String>,
+    runs: serde_json::Value,
+) -> Result<(), String> {
+    validate_session_id(&session_id)?;
+    if let Some(d) = session_date.as_deref() { validate_session_id(d)?; }
+
+    let dir = find_session_date_dir(&session_id, session_date.as_deref(), kim_dir.as_deref(), claw_dir.as_deref())
+        .or_else(|| {
+            // Fallback: write into today's directory under the kim sessions dir.
+            let base = kim_dir.as_deref().map(PathBuf::from).unwrap_or_else(default_sessions_dir);
+            let today = chrono_now().get(0..10).map(|s| s.to_string()).unwrap_or_default();
+            let dd = base.join(today);
+            fs::create_dir_all(&dd).ok()?;
+            Some(dd)
+        })
+        .ok_or_else(|| "Could not locate a session directory to save runs.json into".to_string())?;
+
+    let path = dir.join(format!("{}.runs.json", session_id));
+    let body = serde_json::to_string(&runs).map_err(|e| e.to_string())?;
+    fs::write(&path, body).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn load_run_history(
+    session_id: String,
+    session_date: Option<String>,
+    kim_dir: Option<String>,
+    claw_dir: Option<String>,
+) -> Result<serde_json::Value, String> {
+    validate_session_id(&session_id)?;
+    if let Some(d) = session_date.as_deref() { validate_session_id(d)?; }
+
+    let dir = match find_session_date_dir(&session_id, session_date.as_deref(), kim_dir.as_deref(), claw_dir.as_deref()) {
+        Some(d) => d,
+        None => return Ok(serde_json::json!([])),
+    };
+    let path = dir.join(format!("{}.runs.json", session_id));
+    if !path.exists() {
+        return Ok(serde_json::json!([]));
+    }
+    let body = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&body).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn get_platform_info() -> String {
     let os = std::env::consts::OS;
@@ -4779,6 +4865,42 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
     Err("Chrome/Chromium not found. Install Google Chrome to use the browser provider.".to_string())
 }
 
+/// Locate the `claw` binary. Search order:
+/// 1. CLAW_BIN env var (explicit override)
+/// 2. <kim-fork-root>/pythonExperimentTool/claw-code/rust/target/release/claw
+/// 3. <kim-fork-root>/pythonExperimentTool/claw-code/rust/target/debug/claw
+/// 4. `claw` on PATH
+fn find_claw_binary(kim_root: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CLAW_BIN") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // kim_root is typically <fork>/kim-pro; claw lives in <fork>/pythonExperimentTool/...
+    if let Some(fork_root) = kim_root.parent() {
+        let candidates = [
+            fork_root.join("pythonExperimentTool/claw-code/rust/target/release/claw"),
+            fork_root.join("pythonExperimentTool/claw-code/rust/target/debug/claw"),
+        ];
+        for c in candidates.iter() {
+            if c.is_file() {
+                return Some(c.clone());
+            }
+        }
+    }
+    // Fall back to PATH
+    if let Ok(out) = std::process::Command::new("which").arg("claw").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(PathBuf::from(s));
+            }
+        }
+    }
+    None
+}
+
 #[tauri::command]
 async fn send_task(
     task: String,
@@ -4821,65 +4943,73 @@ async fn send_task(
     let is_claw = target_root.canonicalize().ok()
         != kim_root.canonicalize().ok();
 
-    let python = find_python_interpreter(&kim_root)?;
-
     let session_dir = if is_claw {
         target_root.join(".claw").join("sessions")
     } else {
         kim_root.join("kim_sessions")
     };
 
-    let mut cmd = Command::new(&python);
-    cmd.args(["-m", "orchestrator.agent"])
-        .arg("--task")
-        .arg(&task)
-        .arg("--session-dir")
-        .arg(session_dir.to_string_lossy().to_string())
-        .current_dir(&kim_root)
-        // Tell the MCP server which directory to operate on (file tools, git, etc.).
-        // For the Code tab this is the user's external project; for Chat it is
-        // the Kim repo itself.
-        .env("PROJECT_ROOT", target_root.to_str().unwrap_or(""))
-        // Ensure `import orchestrator` and `import mcp_server` always resolve
-        // from the Kim repo, regardless of the target project.
-        .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    // Code (Claw) sessions run the `claw` binary directly against the user's
+    // project, with Claw's own coding-agent system prompt. Chat (Kim) sessions
+    // continue to run `python -m orchestrator.agent` with the desktop-control
+    // system prompt. Routing them through different binaries is what keeps the
+    // two personas separate end-to-end.
+    let mut cmd = if is_claw {
+        let claw_bin = find_claw_binary(&kim_root)
+            .ok_or_else(|| "Claw binary not found. Build it with `cargo build --release` in pythonExperimentTool/claw-code/rust, or set CLAW_BIN to the binary path.".to_string())?;
+        let mut c = Command::new(&claw_bin);
+        c.arg("--output-format").arg("json")
+            .arg("prompt").arg(&task)
+            .current_dir(&target_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        c
+    } else {
+        let python = find_python_interpreter(&kim_root)?;
+        let mut c = Command::new(&python);
+        c.args(["-m", "orchestrator.agent"])
+            .arg("--task")
+            .arg(&task)
+            .arg("--session-dir")
+            .arg(session_dir.to_string_lossy().to_string())
+            .current_dir(&kim_root)
+            // Tell the MCP server which directory to operate on (file tools, git, etc.).
+            // For the Chat tab this is the Kim repo itself.
+            .env("PROJECT_ROOT", target_root.to_str().unwrap_or(""))
+            // Ensure `import orchestrator` and `import mcp_server` always resolve
+            // from the Kim repo, regardless of the target project.
+            .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        c
+    };
 
     let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();
-    if let Some(cfg) = &bridge_cfg {
-        cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
-            .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
-            .env("KIM_WEBVIEW_WINDOW_LABEL", "kim-browser-signin");
+    if !is_claw {
+        if let Some(cfg) = &bridge_cfg {
+            cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
+                .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
+                .env("KIM_WEBVIEW_WINDOW_LABEL", "kim-browser-signin");
+        }
     }
 
     // Default to the browser provider (no API key required) when the caller
     // omits one or passes an empty string. Never silently fall through to a
-    // paid API key provider.
+    // paid API key provider. Claw does its own provider/auth handling.
     let provider_arg = provider
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "browser".to_string());
 
-    // For browser provider: ensure Chrome is running with the CDP debug port
-    // before the Python agent tries to connect. This is a best-effort launch;
-    // if Chrome is already running on :9222 this is a no-op.
-    //
-    // launch_chrome_for_cdp() uses blocking I/O (TcpStream::connect, fs::create_dir_all,
-    // std::process::Command::spawn).  We run it on the blocking thread pool so we don't
-    // stall the Tokio executor, then do the post-launch wait with tokio::time::sleep.
-    if provider_arg == "browser" || provider_arg.starts_with("browser:") {
+    // Chrome CDP launch only matters for the Kim browser provider.
+    if !is_claw && (provider_arg == "browser" || provider_arg.starts_with("browser:")) {
         if bridge_cfg.is_none() {
             let root_for_chrome = kim_root.clone();
             match tokio::task::spawn_blocking(move || launch_chrome_for_cdp(&root_for_chrome)).await {
                 Ok(Ok(true)) => {
-                    // Chrome was freshly spawned — give it 2 s to open the debug port.
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                Ok(Ok(false)) => {
-                    // Chrome was already running — no wait needed.
-                }
+                Ok(Ok(false)) => {}
                 Ok(Err(e)) => {
-                    // Non-fatal: the Python agent will surface a NEED_HELP if it can't connect.
                     eprintln!("[Kim] Chrome launch skipped: {}", e);
                 }
                 Err(e) => {
@@ -4891,15 +5021,22 @@ async fn send_task(
         }
     }
 
-    if let Some(resume_id) = resume_session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    let resume_arg = if is_claw {
+        None
+    } else {
+        resume_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+    if let Some(resume_id) = resume_arg {
         cmd.arg("--resume").arg(resume_id);
     }
 
-    cmd.arg("--provider").arg(&provider_arg);
+    if !is_claw {
+        cmd.arg("--provider").arg(&provider_arg);
+    }
 
     let mut child = cmd
         .spawn()
@@ -6094,6 +6231,20 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::window::{Effect, EffectState, EffectsBuilder};
+
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_effects(
+                        EffectsBuilder::new()
+                            .effect(Effect::WindowBackground)
+                            .state(EffectState::Active)
+                            .build(),
+                    );
+                }
+            }
+
             if let Err(e) = start_webview_bridge_server(app.handle().clone()) {
                 eprintln!("[Kim] Failed to start in-app browser bridge: {}", e);
             }
@@ -6105,6 +6256,8 @@ pub fn run() {
             list_sessions,
             delete_sessions,
             load_session_messages,
+            save_run_history,
+            load_run_history,
             get_app_version,
             get_platform_info,
             run_update,

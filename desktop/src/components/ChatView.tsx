@@ -4,7 +4,6 @@ import { listen } from '@tauri-apps/api/event';
 import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
-import { BrowserProviderPicker } from './BrowserProviderPicker';
 import { Bloop, type BloopState } from './Bloop';
 import { toast } from './Toast';
 
@@ -17,6 +16,13 @@ interface ActivityItem {
   kind: 'tool' | 'info' | 'error' | 'success' | 'cancelled' | 'status';
   icon: string;
   text: string;
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return s === 0 ? `${m}m` : `${m}m ${s}s`;
 }
 
 
@@ -323,29 +329,6 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
 
 // ── Greeting ──────────────────────────────────────────────────────────────────
 
-const EXAMPLE_PROMPTS: { title: string; hint: string }[] = [
-  { title: 'Summarize the PDF on my desktop', hint: 'Read and extract key insights' },
-  { title: 'Find all TODOs in my project', hint: 'Search files and list them' },
-  { title: 'Stage, commit, and push my changes', hint: 'Full git workflow' },
-  { title: 'Search the web and write a report', hint: 'Browse and summarize' },
-];
-
-const KIM_CAPABILITIES = [
-  { label: 'See your screen', desc: 'Kim takes screenshots to understand what\'s happening' },
-  { label: 'Control your mouse', desc: 'Click buttons, drag files, navigate any app' },
-  { label: 'Type and edit', desc: 'Write code, fill forms, compose emails' },
-  { label: 'Manage files', desc: 'Read, write, move, search files on your computer' },
-  { label: 'Browse the web', desc: 'Search, visit websites, extract information' },
-  { label: 'Run commands', desc: 'Terminal commands, scripts, git operations' },
-];
-
-const KIM_SHORTCUTS = [
-  { keys: ['⌘', 'N'], label: 'New chat' },
-  { keys: ['⌘', 'B'], label: 'Toggle sidebar' },
-  { keys: ['⌘', ','], label: 'Settings' },
-  { keys: ['⇧', '↵'], label: 'New line in message' },
-];
-
 const PROVIDER_LABELS: Record<string, string> = {
   claude: 'Claude',
   openai: 'OpenAI',
@@ -485,6 +468,11 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [isRunning, setIsRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [activity, setActivity] = useState<ActivityItem[]>([]);
+  // Snapshots of completed runs, in order. Each successful task completion pushes
+  // one entry; rendered as a collapsible "Worked for Xm Ys" badge before the
+  // corresponding assistant turn in liveHistory.
+  const [runHistory, setRunHistory] = useState<{ activity: ActivityItem[]; durationSec: number }[]>([]);
+  const [expandedRunIdx, setExpandedRunIdx] = useState<number | null>(null);
   const [taskError, setTaskError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
@@ -601,23 +589,18 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     }, 260);
   }, [connectorsClosing, connectorsOpen]);
 
+  // Topbar's connectors button dispatches `kim-open-connectors`. Listen here
+  // so the trigger lives in the topbar but the panel still renders inside the
+  // chat area (preserving its absolute positioning over chat content).
+  useEffect(() => {
+    function onOpen() { openConnectors(); }
+    window.addEventListener('kim-open-connectors', onOpen);
+    return () => window.removeEventListener('kim-open-connectors', onOpen);
+  }, [openConnectors]);
+
   function renderConnectorsChrome() {
     return (
       <>
-        <button
-          type="button"
-          className="kim-connectors-trigger kim-no-drag"
-          onClick={openConnectors}
-          aria-label="Open connectors"
-          title="Connectors"
-        >
-          <span className="kim-connectors-trigger__glyph" aria-hidden="true">
-            <span />
-            <span />
-          </span>
-          <span className="sr-only">Connectors</span>
-        </button>
-
         {connectorsOpen && (
           <div
             className={`kim-connectors-layer${connectorsClosing ? ' is-closing' : ''}`}
@@ -708,6 +691,21 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     if (isSessionChange) {
       setLoadingMessages(true);
       setLiveHistory([]);
+      // Reset run history and re-hydrate from the sidecar `<id>.runs.json` file.
+      setRunHistory([]);
+      setExpandedRunIdx(null);
+      invoke<{ activity: ActivityItem[]; durationSec: number }[]>('load_run_history', {
+        sessionId: session.session_id,
+        sessionDate: session.date || null,
+        kimDir: settings.kim_sessions_dir || null,
+        clawDir: session.session_type === 'claw' && session.project_path
+          ? `${session.project_path}/.claw/sessions`
+          : settings.claw_sessions_dir || null,
+      })
+        .then(runs => {
+          if (Array.isArray(runs)) setRunHistory(runs);
+        })
+        .catch(() => { /* non-fatal */ });
     }
     invoke<KimMessage[]>('load_session_messages', {
       sessionId: session.session_id,
@@ -780,6 +778,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   useEffect(() => {
     if (newChatMode) {
       setActivity([]);
+      setRunHistory([]);
+      setExpandedRunIdx(null);
       setTaskError(null);
       setTokenStats(null);
       setElapsed(0);
@@ -897,7 +897,30 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       needHelpFlagRef.current = false; // reset
       setIsRunning(false);
       setCancelling(false);
-      setActivity([]);
+      // Snapshot the activity into run history before clearing so the
+      // "Worked for X" disclosure can replay it. Persist to disk so the
+      // disclosure survives a chat reload.
+      const startedAt = startTimeRef.current;
+      const durationSec = startedAt ? Math.max(1, Math.round((Date.now() - startedAt) / 1000)) : 0;
+      setActivity(currentActivity => {
+        if (event.payload && !wasCancelled && currentActivity.length > 0) {
+          setRunHistory(prev => {
+            const next = [...prev, { activity: currentActivity, durationSec }];
+            const sid = activeResumeSessionIdRef.current;
+            if (sid) {
+              invoke('save_run_history', {
+                sessionId: sid,
+                sessionDate: session?.date ?? null,
+                kimDir: settings.kim_sessions_dir || null,
+                clawDir: settings.claw_sessions_dir || null,
+                runs: next,
+              }).catch(() => { /* non-fatal */ });
+            }
+            return next;
+          });
+        }
+        return [];
+      });
       // Existing session view is now interactive, so reload message history
       // after every run completion to reflect newly appended turns.
       setMessageReloadNonce(v => v + 1);
@@ -1035,6 +1058,24 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     }
   }
 
+  // Edit a previously-sent live-history user message and resend. The edited
+  // message replaces the original (and drops everything after it). If a task
+  // is currently running we cancel it first; the new task then runs.
+  function handleEditLiveMessage(idx: number, newText: string) {
+    const trimmed = newText.trim();
+    if (!trimmed) return;
+    setLiveHistory(prev => prev.slice(0, idx)); // truncate; runPendingTask re-appends
+    const pending = makePendingTask(trimmed);
+    setTaskError(null);
+    if (isRunning) {
+      setQueuedTasks([]);
+      setInterruptTask(pending);
+      if (!cancelling) void handleCancel();
+    } else {
+      void runPendingTask(pending);
+    }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const task = taskInput.trim();
@@ -1107,39 +1148,11 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     await runPendingTask(retryTask);
   }
 
-  function handleBrowserProviderSelect(nextProvider: string) {
-    if (nextProvider === browserProvider) return;
-    const previous = browserProvider;
-    setBrowserProvider(nextProvider);
-    setLocalProvider(`browser:${nextProvider}`);
-
-    if (activity.length > 0 || isRunning || queuedTasks.length > 0 || interruptTask) {
-      toast(
-        `Switched from ${providerLabel(`browser:${previous}`)} to ${providerLabel(`browser:${nextProvider}`)}. ` +
-          'Next message keeps this chat memory and uses the new provider.',
-        'info',
-        7500,
-      );
-    }
-  }
-
   function handleTextareaInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
     setTaskInput(e.target.value);
     const el = e.target;
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
-  }
-
-  function pickExample(p: string) {
-    setTaskInput(p);
-    setTimeout(() => {
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-        textareaRef.current.style.height =
-          Math.min(textareaRef.current.scrollHeight, 200) + 'px';
-        textareaRef.current.focus();
-      }
-    }, 0);
   }
 
   // ── Activity feed render ─────────────────────────────────────────────────────
@@ -1166,6 +1179,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     return (
       <div className="kim-msg-row kim-msg-row--assistant kim-msg-row--live">
         <div className="kim-bubble kim-bubble--assistant kim-bubble--live">
+          <div className="kim-thinking-header">
+            <span className="kim-thinking-header__dot" aria-hidden="true" />
+            <span className="kim-thinking-header__label">Thinking…</span>
+            {elapsed > 0 && (
+              <span className="kim-thinking-header__timer">{formatDuration(elapsed)}</span>
+            )}
+          </div>
           <div className="kim-activity-feed">
             {activity.map(item => (
               <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
@@ -1174,6 +1194,39 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               </div>
             ))}
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderWorkedFor(idx: number, run: { activity: ActivityItem[]; durationSec: number }) {
+    const expanded = expandedRunIdx === idx;
+    return (
+      <div className="kim-msg-row kim-msg-row--assistant">
+        <div className="kim-worked-for">
+          <button
+            type="button"
+            className={`kim-worked-for__chip${expanded ? ' is-expanded' : ''}`}
+            onClick={() => setExpandedRunIdx(expanded ? null : idx)}
+            aria-expanded={expanded}
+          >
+            <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="kim-worked-for__chevron">
+              <path d="M5 3l5 5-5 5" />
+            </svg>
+            <span>Worked for {formatDuration(run.durationSec)}</span>
+          </button>
+          {expanded && (
+            <div className="kim-worked-for__panel">
+              <div className="kim-activity-feed kim-activity-feed--archive">
+                {run.activity.map(item => (
+                  <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
+                    <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
+                    <span className="kim-activity-item__text">{renderActivityText(item.text)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1390,82 +1443,36 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               </div>
               <div className="kim-new-chat-empty__subtitle">
                 {activeTab === 'code'
-                  ? 'Select a codebase from the sidebar, or just ask Kim to analyze a specific path.'
-                  : 'Describe any task in plain English below — Kim will figure out how to do it.'}
-              </div>
-
-              {(localProvider?.startsWith('browser') || (!localProvider && settings.provider === 'browser')) && (
-                <BrowserProviderPicker
-                  selected={browserProvider}
-                  onSelect={handleBrowserProviderSelect}
-                />
-              )}
-
-              {/* Example prompts */}
-              <div className="kim-examples" style={{ marginTop: (localProvider?.startsWith('browser') || (!localProvider && settings.provider === 'browser')) ? 24 : 0 }}>
-                {EXAMPLE_PROMPTS.map((ex, i) => (
-                  <button
-                    key={i}
-                    className="kim-example-card"
-                    onClick={() => pickExample(ex.title)}
-                  >
-                    <div className="kim-example-card__body">
-                      <div className="kim-example-card__title">{ex.title}</div>
-                      <div className="kim-example-card__hint">{ex.hint}</div>
-                    </div>
-                    <div className="kim-example-card__arrow">↗</div>
-                  </button>
-                ))}
-              </div>
-
-              {/* What Kim can do */}
-              <div className="kim-capabilities">
-                <div className="kim-capabilities__label">What Kim can do</div>
-                <div className="kim-capabilities__grid">
-                  {KIM_CAPABILITIES.map((cap, i) => (
-                    <div key={i} className="kim-capability-item">
-                      <div>
-                        <div className="kim-capability-item__label">{cap.label}</div>
-                        <div className="kim-capability-item__desc">{cap.desc}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* Keyboard shortcuts */}
-              <div className="kim-shortcuts">
-                <div className="kim-shortcuts__label">Keyboard shortcuts</div>
-
-                <div className="kim-shortcuts__row">
-                  {KIM_SHORTCUTS.map((s, i) => (
-                    <span key={i} className="kim-shortcut">
-                      {s.keys.map((k, ki) => <kbd key={ki}>{k}</kbd>)}
-                      <span className="kim-shortcut__label">{s.label}</span>
-                    </span>
-                  ))}
-                </div>
+                  ? 'Tell Kim what to inspect, fix, or build.'
+                  : 'Tell Kim what you want done. Short, messy, or half-formed is fine.'}
               </div>
             </div>
           )}
 
           {/* Live conversation history */}
-          {collapseMessages(liveHistory).map(({msg, retries}, i) => {
-            // Show activity feed right after the last user message (current task)
-            const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
-            return (
-              <div key={`live-${i}`}>
-                <MessageBubble
-                  message={msg}
-                  animate={i === liveHistory.length - 1}
-                  typingAnimation={settings.typing_animation ?? 'none'}
-                  onRetry={handleRetryLast}
-                  retries={retries}
-                />
-                {showActivityAfter && renderActivityFeed()}
-              </div>
-            );
-          })}
+          {(() => {
+            const collapsed = collapseMessages(liveHistory);
+            let assistantIdx = -1;
+            return collapsed.map(({msg, retries}, i) => {
+              if (msg.role === 'assistant') assistantIdx += 1;
+              const workedRun = msg.role === 'assistant' ? runHistory[assistantIdx] : null;
+              const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
+              return (
+                <div key={`live-${i}`}>
+                  {workedRun && renderWorkedFor(assistantIdx, workedRun)}
+                  <MessageBubble
+                    message={msg}
+                    animate={i === liveHistory.length - 1}
+                    typingAnimation={settings.typing_animation ?? 'none'}
+                    onRetry={handleRetryLast}
+                    retries={retries}
+                    onEdit={msg.role === 'user' ? (newText) => handleEditLiveMessage(i, newText) : undefined}
+                  />
+                  {showActivityAfter && renderActivityFeed()}
+                </div>
+              );
+            });
+          })()}
 
           {/* Error / retry — inside an assistant-aligned row */}
           {taskError && taskError !== 'agent-error' && (
@@ -1558,36 +1565,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   return (
     <div className="kim-chat">
       {renderConnectorsChrome()}
-      {/* Session header */}
-      <div className="kim-session-header">
-        <div className="kim-session-header__main">
-          <div className="kim-session-header__row">
-            <span className={`kim-session-badge kim-session-badge--${session!.session_type}`}>
-              {session!.session_type === 'kim' ? 'Kim' : 'Claw Code'}
-            </span>
-            <span className="kim-session-header__id">{session!.session_id}</span>
-          </div>
-          <div className="kim-session-header__meta">
-            <span>{session!.date}</span>
-            <span className="kim-session-header__dot">·</span>
-            <span>{session!.message_count} message{session!.message_count !== 1 ? 's' : ''}</span>
-            {session!.has_summary && (
-              <>
-                <span className="kim-session-header__dot">·</span>
-                <span className="kim-session-header__summary-tag">summarized</span>
-              </>
-            )}
-          </div>
-          {session!.summary && (
-            <div className="kim-session-header__summary">
-              {(() => {
-                const match = session!.summary!.match(/^Task:.*?(?:\.\s*Result:\s*|\nResult:\s*)([\s\S]*)$/i);
-                return match ? match[1].trim() : session!.summary;
-              })()}
-            </div>
-          )}
-        </div>
-      </div>
 
       {/* Messages */}
       <div className="kim-messages">
@@ -1623,21 +1600,29 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
             ))}
 
             {/* Newly added messages in this session */}
-            {collapseMessages(liveHistory).map(({msg, retries}, i) => {
-              const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
-              return (
-                <div key={`live-${i}`}>
-                  <MessageBubble
-                    message={msg}
-                    animate={i === liveHistory.length - 1}
-                    typingAnimation={settings.typing_animation ?? 'none'}
-                    onRetry={handleRetryLast}
-                    retries={retries}
-                  />
-                  {showActivityAfter && renderActivityFeed()}
-                </div>
-              );
-            })}
+            {(() => {
+              const collapsed = collapseMessages(liveHistory);
+              let assistantIdx = -1;
+              return collapsed.map(({msg, retries}, i) => {
+                if (msg.role === 'assistant') assistantIdx += 1;
+                const workedRun = msg.role === 'assistant' ? runHistory[assistantIdx] : null;
+                const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
+                return (
+                  <div key={`live-${i}`}>
+                    {workedRun && renderWorkedFor(assistantIdx, workedRun)}
+                    <MessageBubble
+                      message={msg}
+                      animate={i === liveHistory.length - 1}
+                      typingAnimation={settings.typing_animation ?? 'none'}
+                      onRetry={handleRetryLast}
+                      retries={retries}
+                      onEdit={msg.role === 'user' ? (newText) => handleEditLiveMessage(i, newText) : undefined}
+                    />
+                    {showActivityAfter && renderActivityFeed()}
+                  </div>
+                );
+              });
+            })()}
 
             {/* Working indicator with blobby loader */}
             {isRunning && (

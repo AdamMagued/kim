@@ -2,6 +2,146 @@ import { useEffect, useRef, useState } from 'react';
 import type { KimMessage, ContentBlock, ToolUseBlock, ToolResultBlock, TypingAnimation } from '../types';
 import { ToolUseCard, ToolResultCard, SignalCard } from './ToolCallCard';
 import { friendlyError } from './ChatView';
+import { toast } from './Toast';
+
+// ── Inline action buttons (copy / edit) ───────────────────────────────────────
+
+function CopyIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="5" y="5" width="9" height="9" rx="1.5" />
+      <path d="M3 11V3.5A1.5 1.5 0 0 1 4.5 2H11" />
+    </svg>
+  );
+}
+function EditIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M11.5 2.5l2 2L5 13H3v-2l8.5-8.5z" />
+    </svg>
+  );
+}
+function CheckIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 8.5l3.5 3.5L13 5" />
+    </svg>
+  );
+}
+
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Copied', 'success', 1400);
+  } catch {
+    toast('Could not copy', 'error', 2000);
+  }
+}
+
+// User bubble with copy + (optional) inline edit. When `onEdit` is provided,
+// hovering reveals a pencil; clicking it swaps the bubble for a textarea.
+function UserBubble({ text, onEdit }: { text: string; onEdit?: (newText: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(text);
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    if (!editing) return;
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 240) + 'px';
+  }, [editing]);
+
+  function startEdit() {
+    setDraft(text);
+    setEditing(true);
+  }
+  function cancelEdit() {
+    setEditing(false);
+    setDraft(text);
+  }
+  function confirmEdit() {
+    const next = draft.trim();
+    if (!next || !onEdit) { cancelEdit(); return; }
+    if (next === text) { cancelEdit(); return; }
+    setEditing(false);
+    onEdit(next);
+  }
+
+  if (editing) {
+    return (
+      <div className="kim-msg-row kim-msg-row--user">
+        <div className="kim-bubble kim-bubble--user kim-bubble--editing">
+          <textarea
+            ref={taRef}
+            className="kim-bubble__edit-textarea"
+            value={draft}
+            onChange={e => {
+              setDraft(e.target.value);
+              const el = e.target;
+              el.style.height = 'auto';
+              el.style.height = Math.min(el.scrollHeight, 240) + 'px';
+            }}
+            onKeyDown={e => {
+              if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
+              else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); confirmEdit(); }
+            }}
+          />
+          <div className="kim-bubble__edit-actions">
+            <button type="button" className="kim-bubble__edit-btn" onClick={cancelEdit}>Cancel</button>
+            <button type="button" className="kim-bubble__edit-btn kim-bubble__edit-btn--primary" onClick={confirmEdit}>
+              Send
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="kim-msg-row kim-msg-row--user">
+      <div className="kim-bubble-wrap kim-bubble-wrap--user">
+        <div className="kim-bubble kim-bubble--user">{text}</div>
+        <div className="kim-bubble-actions kim-bubble-actions--user">
+          <button type="button" className="kim-bubble-action" title="Copy" aria-label="Copy" onClick={() => void copyText(text)}>
+            <CopyIcon />
+          </button>
+          {onEdit && (
+            <button type="button" className="kim-bubble-action" title="Edit and resend" aria-label="Edit and resend" onClick={startEdit}>
+              <EditIcon />
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Wraps an assistant bubble with a hover-revealed Copy button.
+function AssistantBubbleActions({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  if (!text.trim()) return null;
+  return (
+    <div className="kim-bubble-actions kim-bubble-actions--assistant">
+      <button
+        type="button"
+        className="kim-bubble-action"
+        title={copied ? 'Copied' : 'Copy'}
+        aria-label="Copy"
+        onClick={async () => {
+          await copyText(text);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1400);
+        }}
+      >
+        {copied ? <CheckIcon /> : <CopyIcon />}
+      </button>
+    </div>
+  );
+}
 
 function isToolUse(b: ContentBlock): b is ToolUseBlock { return b.type === 'tool_use'; }
 function isToolResult(b: ContentBlock): b is ToolResultBlock { return b.type === 'tool_result'; }
@@ -149,9 +289,12 @@ interface Props {
   typingAnimation?: TypingAnimation;
   onRetry?: () => void;
   retries?: number;
+  /** When provided, the user bubble shows an Edit affordance; calling this
+   *  cancels the running task (if any) and resends the edited text. */
+  onEdit?: (newText: string) => void;
 }
 
-export function MessageBubble({ message, animate = false, typingAnimation = 'none', onRetry, retries = 0 }: Props) {
+export function MessageBubble({ message, animate = false, typingAnimation = 'none', onRetry, retries = 0, onEdit }: Props) {
   const isUser   = message.role === 'user';
   const isSystem = message.role === 'system';
 
@@ -209,16 +352,12 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
             .filter(b => b.type === 'text')
             .map(b => (b as { type: 'text'; text: string }).text)
             .join('\n');
-            
+
     if (text.startsWith('Task: ')) {
       text = text.substring(6).trim();
     }
-    
-    return (
-      <div className="kim-msg-row kim-msg-row--user">
-        <div className="kim-bubble kim-bubble--user">{text}</div>
-      </div>
-    );
+
+    return <UserBubble text={text} onEdit={onEdit} />;
   }
 
   if (message.role === 'tool') {
@@ -283,26 +422,29 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
 
     return (
       <div className="kim-msg-row kim-msg-row--assistant">
-        <div className="kim-bubble kim-bubble--assistant">
-          <AnimatedText text={taskCompleteText || content} animation={typingAnimation} active={animate} />
-          {message.tool_calls && message.tool_calls.length > 0 && (
-            <div style={{ marginTop: 10 }}>
-              {message.tool_calls.map(tc => (
-                <ToolUseCard
-                  key={tc.id}
-                  block={{
-                    type: 'tool_use',
-                    id: tc.id,
-                    name: tc.function.name,
-                    input: (() => {
-                      try { return JSON.parse(tc.function.arguments) as Record<string, unknown>; }
-                      catch { return { raw: tc.function.arguments }; }
-                    })(),
-                  }}
-                />
-              ))}
-            </div>
-          )}
+        <div className="kim-bubble-wrap kim-bubble-wrap--assistant">
+          <div className="kim-bubble kim-bubble--assistant">
+            <AnimatedText text={taskCompleteText || content} animation={typingAnimation} active={animate} />
+            {message.tool_calls && message.tool_calls.length > 0 && (
+              <div style={{ marginTop: 10 }}>
+                {message.tool_calls.map(tc => (
+                  <ToolUseCard
+                    key={tc.id}
+                    block={{
+                      type: 'tool_use',
+                      id: tc.id,
+                      name: tc.function.name,
+                      input: (() => {
+                        try { return JSON.parse(tc.function.arguments) as Record<string, unknown>; }
+                        catch { return { raw: tc.function.arguments }; }
+                      })(),
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+          <AssistantBubbleActions text={taskCompleteText || content} />
         </div>
       </div>
     );
@@ -316,24 +458,29 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
 
   if (!hasText && !hasTools) return null;
 
+  const fullAssistantText = textBlocks.map(b => b.text.replace(/^TASK_COMPLETE:\s*/i, '')).join('\n\n');
+
   return (
     <div className="kim-msg-row kim-msg-row--assistant">
-      <div style={{ maxWidth: '78%', minWidth: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {hasText && (
-          <div className={`kim-bubble kim-bubble--assistant${hasTools ? ' kim-bubble--assistant-group-top' : ''}`}>
-            {textBlocks.map((b, i) => (
-              <div key={i}>
-                <AnimatedText
-                  text={b.text.replace(/^TASK_COMPLETE:\s*/i, '')}
-                  animation={typingAnimation}
-                  active={animate && i === textBlocks.length - 1}
-                />
-              </div>
-            ))}
-          </div>
-        )}
-        {toolUseBlocks.map(b => <ToolUseCard key={b.id} block={b} />)}
-        {toolResultBlocks.map((b, i) => <ToolResultCard key={i} block={b} />)}
+      <div className="kim-bubble-wrap kim-bubble-wrap--assistant" style={{ maxWidth: '78%', minWidth: 0 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
+          {hasText && (
+            <div className={`kim-bubble kim-bubble--assistant${hasTools ? ' kim-bubble--assistant-group-top' : ''}`}>
+              {textBlocks.map((b, i) => (
+                <div key={i}>
+                  <AnimatedText
+                    text={b.text.replace(/^TASK_COMPLETE:\s*/i, '')}
+                    animation={typingAnimation}
+                    active={animate && i === textBlocks.length - 1}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+          {toolUseBlocks.map(b => <ToolUseCard key={b.id} block={b} />)}
+          {toolResultBlocks.map((b, i) => <ToolResultCard key={i} block={b} />)}
+        </div>
+        {hasText && <AssistantBubbleActions text={fullAssistantText} />}
       </div>
     </div>
   );
