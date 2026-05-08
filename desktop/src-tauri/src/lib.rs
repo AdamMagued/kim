@@ -3147,13 +3147,6 @@ fn handle_webview_bridge_request(
                 prepare_gemini_webview(&window, gemini_authuser, opened_window);
             }
 
-            if should_keep_browser_visible() {
-                show_browser_window_impl(&app_handle);
-            }
-
-            // Window is managed permanently off-screen by show/hide_browser_window.
-            // No need to manually reposition it here.
-
             let callback_url = WEBVIEW_BRIDGE_CFG
                 .get()
                 .map(|cfg| format!("{}/v1/callback", cfg.base_url))
@@ -3162,6 +3155,14 @@ fn handle_webview_bridge_request(
             // The window stays offscreen (1x1 at -10000,-10000) during
             // headless operation.  JS keeps running at 1x1 size, so we
             // do NOT need to show it to the user.
+            if should_keep_browser_visible() {
+                show_browser_window_impl(&app_handle);
+            } else if !is_browser_window_offscreen(&window) {
+                // Legacy /v1/complete fallback must follow the same rule as
+                // split /v1/send: normal provider sends should not take focus
+                // or cover the user's target app.
+                hide_browser_window_offscreen(&window);
+            }
 
             let mut completion = run_bridge_completion_once(
                 &window,

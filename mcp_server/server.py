@@ -244,16 +244,16 @@ _TOOLS: list[Tool] = [
     Tool(
         name="web_open",
         description=(
-            "Navigate Kim's controlled browser (a persistent Chromium window separate from "
-            "the user's main browser) to a URL. ALWAYS prefer the web_* tools over native "
-            "screenshot/click for any web-based task — they read the actual DOM with full "
-            "fidelity, unlike observe_ui which can't see web page contents in Chrome. The "
-            "browser persists cookies between runs, so the user only signs in once per site."
+            "Navigate Kim's controlled browser to a URL. "
+            "Use 'username' and 'password' arguments if the site requires a login popup (Basic Auth). "
+            "Returns AUTH_REQUIRED/AUTH_FAILED instead of success when page content is blocked."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "Absolute URL or domain (https:// added if missing)."},
+                "url": {"type": "string", "description": "The destination URL."},
+                "username": {"type": "string", "description": "Optional: username for login popups."},
+                "password": {"type": "string", "description": "Optional: password for login popups."},
             },
             "required": ["url"],
         },
@@ -373,8 +373,8 @@ _TOOLS: list[Tool] = [
     Tool(
         name="web_close",
         description=(
-            "Close Kim's controlled browser. Profile data (cookies, logins) is preserved "
-            "on disk and reloaded next time web_open is called."
+            "Indicate that the browser task is finished. The browser will remain open "
+            "to preserve your login session and tabs for the next task."
         ),
         inputSchema={"type": "object", "properties": {}},
     ),
@@ -736,7 +736,7 @@ _DISPATCH = {
     "get_windows": handle_get_windows,
     "focus_window": handle_focus_window,
     "resize_window": handle_resize_window,
-    "open_url": handle_open_url,
+    "open_url": handle_web_open,
     # Git
     "git_status": handle_git_status,
     "git_diff": handle_git_diff,

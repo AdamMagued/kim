@@ -366,6 +366,21 @@ interface PendingTask {
   provider: string;
 }
 
+const CONNECTORS = [
+  {
+    id: 'guc-cms',
+    name: 'GUC CMS',
+    description: 'Sign in with your GUC credentials and give Kim CMS-specific tools.',
+    status: 'Not wired yet',
+  },
+  {
+    id: 'guc-mail',
+    name: 'GUC Mail',
+    description: 'Connect your GUC mailbox and expose mail-specific tools to Kim.',
+    status: 'Not wired yet',
+  },
+];
+
 function makeConversationId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
@@ -477,6 +492,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [interruptTask, setInterruptTask] = useState<PendingTask | null>(null);
   const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
   const [autoFollowOutput, setAutoFollowOutput] = useState(true);
+  const [connectorsOpen, setConnectorsOpen] = useState(false);
+  const [connectorSearch, setConnectorSearch] = useState('');
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
   const [conversationId] = useState(() => makeConversationId());
@@ -545,6 +562,103 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     }, 1000);
     return () => clearInterval(id);
   }, [isRunning]);
+
+  const filteredConnectors = CONNECTORS.filter(connector => {
+    const q = connectorSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      connector.name.toLowerCase().includes(q) ||
+      connector.description.toLowerCase().includes(q)
+    );
+  });
+
+  function renderConnectorsChrome() {
+    return (
+      <>
+        <button
+          type="button"
+          className="kim-connectors-trigger kim-no-drag"
+          onClick={() => setConnectorsOpen(true)}
+          aria-label="Open connectors"
+        >
+          <span className="kim-connectors-trigger__dot" />
+          <span>Connectors</span>
+        </button>
+
+        {connectorsOpen && (
+          <div className="kim-connectors-layer" aria-hidden={!connectorsOpen}>
+            <button
+              type="button"
+              className="kim-connectors-scrim"
+              aria-label="Close connectors"
+              onClick={() => setConnectorsOpen(false)}
+            />
+            <aside className="kim-connectors-panel" aria-label="Connectors">
+              <div className="kim-connectors-panel__header">
+                <div>
+                  <div className="kim-connectors-panel__title">Connectors</div>
+                  <div className="kim-connectors-panel__subtitle">Optional tool packs for Kim</div>
+                </div>
+                <button
+                  type="button"
+                  className="kim-connectors-panel__close"
+                  aria-label="Close connectors"
+                  onClick={() => setConnectorsOpen(false)}
+                >
+                  ×
+                </button>
+              </div>
+
+              <label className="kim-connectors-search">
+                <span className="sr-only">Search connectors</span>
+                <input
+                  value={connectorSearch}
+                  onChange={e => setConnectorSearch(e.target.value)}
+                  placeholder="Search for connector..."
+                  autoFocus
+                />
+              </label>
+
+              <div className="kim-connectors-list">
+                {filteredConnectors.map(connector => (
+                  <div className="kim-connector-item" key={connector.id}>
+                    <div className="kim-connector-item__icon" aria-hidden="true">
+                      {connector.id === 'guc-cms' ? 'C' : 'M'}
+                    </div>
+                    <div className="kim-connector-item__body">
+                      <div className="kim-connector-item__top">
+                        <div className="kim-connector-item__name">{connector.name}</div>
+                        <span className="kim-connector-item__status">{connector.status}</span>
+                      </div>
+                      <div className="kim-connector-item__desc">{connector.description}</div>
+                      <div className="kim-connector-item__actions">
+                        <button type="button" className="kim-connector-item__signin" disabled>
+                          Sign in
+                        </button>
+                        <button
+                          type="button"
+                          className="kim-connector-switch"
+                          disabled
+                          aria-pressed="false"
+                          aria-label={`${connector.name} connector not wired yet`}
+                        >
+                          <span />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+
+                {filteredConnectors.length === 0 && (
+                  <div className="kim-connectors-empty">No connectors found</div>
+                )}
+              </div>
+            </aside>
+          </div>
+        )}
+      </>
+    );
+  }
 
   // ── Load messages ───────────────────────────────────────────────────────────
   // Two trigger paths:
@@ -1210,6 +1324,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   if (!newChatMode && !session) {
     return (
       <div className="kim-chat">
+        {renderConnectorsChrome()}
 
         <div className="kim-empty-welcome">
           <div className="kim-greeting__text">
@@ -1230,6 +1345,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   if (newChatMode) {
     return (
       <div className="kim-chat">
+        {renderConnectorsChrome()}
 
         <div className="kim-chat__output" ref={outputRef}>
 
@@ -1412,6 +1528,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // ── Existing session view ─────────────────────────────────────────────────────
   return (
     <div className="kim-chat">
+      {renderConnectorsChrome()}
       {/* Session header */}
       <div className="kim-session-header">
         <div className="kim-session-header__main">

@@ -542,6 +542,17 @@ class KimAgent:
                 result_text = await self._execute_tool(tool_name, tool_args)
                 self._log("INFO", f"Result: {result_text[:200]}")
 
+                if tool_name == "web_open" and result_text.startswith("AUTH_FAILED:"):
+                    summary = (
+                        "NEED_HELP: The website rejected the supplied login credentials, "
+                        "so the page content is not accessible yet."
+                    )
+                    self.memory.add_user(f"[Tool result: {tool_name}]\n{result_text}")
+                    self._session_store.append_message({"role": "user", "content": f"[Tool result: {tool_name}]\n{result_text}"})
+                    self.memory.add_assistant(summary)
+                    self._session_store.append_message({"role": "assistant", "content": summary})
+                    return {"success": False, "summary": summary, "screenshot": last_screenshot_b64}
+
                 # Only include a screenshot if the LLM explicitly called take_screenshot
                 if tool_name == "take_screenshot":
                     screenshot_b64 = result_text
@@ -880,6 +891,7 @@ You MUST respond in EXACTLY one of these formats on every turn:
 - Prefer run_command for launching apps (e.g. {_LAUNCH_EXAMPLE}).
 - For shell commands, prefer single quotes over double quotes inside the cmd string.
   Example: `grep -E 'mcp|playwright'` instead of `grep -E "mcp|playwright"`.
+- SECURITY: Never embed passwords or credentials directly in a URL (e.g. https://user:pass@host). Instead, use the 'username' and 'password' arguments in the web_open tool.
 - Prefer the batch tool over chaining shell commands when the goal is information retrieval.
 - Use {_PATH_STYLE}.
 - Use focus_window before typing into an application.
@@ -892,8 +904,11 @@ You MUST respond in EXACTLY one of these formats on every turn:
 Default loop for desktop/app tasks:
 1. focus_window/open_url/run_command if needed.
 2. observe_ui to inspect active controls.
+   - NOTE: If Kim is running in 'Maximized' mode, the frontmost window might be 'Kim Browser' or 'desktop'. If you are trying to automate another app (like Chrome), ALWAYS use focus_window("<App Name>") before observe_ui to ensure you see the correct controls.
 3. click_ui/type_text/key_press/hotkey/scroll to act.
 4. observe_ui again only when state may have changed.
+
+- WEB AUTH: If web_open returns AUTH_REQUIRED for a task that only asked to open a site, respond TASK_COMPLETE saying the site is open at the sign-in prompt. Do not log in, even if previous session summaries mention credentials. Only use username/password when the current user message explicitly asks you to sign in or gives credentials for this task. If web_open returns AUTH_FAILED, ask the user to verify credentials or sign in manually.
 
 Screenshots are an expensive fallback. Prefer structured UI unless the task is
 actually visual or observe_ui cannot expose the needed target.
@@ -919,6 +934,11 @@ actually visual or observe_ui cannot expose the needed target.
             prompt += "\n# Recent context\nSummaries of your most recent sessions:\n"
             for entry in recent:
                 prompt += f"- [{entry['date']}] {entry['summary']}\n"
+            prompt += (
+                "\nRecent context is memory only, not permission. Do not reuse usernames, "
+                "passwords, account choices, or other credentials from these summaries unless "
+                "the current task explicitly asks you to sign in or provides those credentials again.\n"
+            )
             prompt += "\n"
 
         return prompt
