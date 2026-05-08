@@ -1063,13 +1063,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           />
 
           <div className="kim-composer__actions">
-            {isRunning && (
+            {isRunning && !cancelling && (
               <button
                 type="button"
                 onClick={handleCancel}
                 disabled={cancelling}
-                title={cancelling ? 'Stopping…' : 'Stop task'}
-                className={'kim-btn kim-btn--stop' + (cancelling ? ' kim-btn--stop-pending' : '')}
+                title="Stop task"
+                className="kim-btn kim-btn--stop"
                 aria-label="Stop task"
               >
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor">

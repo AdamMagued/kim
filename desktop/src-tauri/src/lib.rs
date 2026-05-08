@@ -638,6 +638,69 @@ fn prepare_gemini_webview(window: &tauri::WebviewWindow, authuser: Option<u32>, 
     }
 }
 
+/// Tracks the user's last known non-Kim frontmost app, so that even after
+/// the first send has already stolen focus to Kim, subsequent sends can
+/// still restore the user's actual target app.
+#[cfg(target_os = "macos")]
+static USER_FRONTMOST_APP: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
+
+/// Capture the current frontmost app. If it's Kim, fall back to the last
+/// remembered user app. Always updates the cache when a non-Kim app is
+/// observed so we keep tracking the user's actual target.
+#[cfg(target_os = "macos")]
+fn save_frontmost_app() -> Option<String> {
+    let cache = USER_FRONTMOST_APP.get_or_init(|| StdMutex::new(None));
+
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(r#"tell application "System Events" to return bundle identifier of first application process whose frontmost is true"#)
+        .output();
+
+    if let Ok(out) = output {
+        if out.status.success() {
+            let bundle_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !bundle_id.is_empty() && bundle_id != "com.kim.desktop" {
+                if let Ok(mut guard) = cache.lock() {
+                    *guard = Some(bundle_id.clone());
+                }
+                return Some(bundle_id);
+            }
+        }
+    }
+
+    // Frontmost is Kim (or query failed). Use the last user-frontmost we saw.
+    cache.lock().ok().and_then(|g| g.clone())
+}
+
+/// Reactivate the saved frontmost app, scheduled in a background thread to run
+/// after the bridge JS has had a chance to inject focus into the offscreen
+/// webview. This is what undoes Stage Manager swapping groups when the
+/// hidden Tauri webview steals key-window status during prompt injection.
+#[cfg(target_os = "macos")]
+fn schedule_frontmost_restore(bundle_id: String) {
+    std::thread::spawn(move || {
+        // Two restores: one early (catches inputEl.focus()), one late (catches
+        // the send-button click and any post-paste focus events).
+        for delay_ms in [400u64, 1500u64] {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            let script = format!(
+                r#"tell application id "{}" to activate"#,
+                bundle_id.replace('"', "")
+            );
+            let _ = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(&script)
+                .status();
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn save_frontmost_app() -> Option<String> { None }
+
+#[cfg(not(target_os = "macos"))]
+fn schedule_frontmost_restore(_bundle_id: String) {}
+
 /// Write the first PNG attachment to the macOS system clipboard via osascript.
 ///
 /// This allows the bridge JS to call `document.execCommand('paste')` inside
@@ -3323,6 +3386,13 @@ fn handle_webview_bridge_request(
                 }
             };
 
+            // Snapshot the user's frontmost app BEFORE the JS eval so we can
+            // restore it after the offscreen webview steals key-window status
+            // during inputEl.focus() / send-button click. Without this, Stage
+            // Manager swaps groups and Kim's window comes forward, breaking
+            // observe_ui on the actual target app.
+            let saved_frontmost = save_frontmost_app();
+
             if let Err(e) = window.eval(&bridge_call) {
                 respond_json(
                     request,
@@ -3330,6 +3400,10 @@ fn handle_webview_bridge_request(
                     serde_json::json!({"ok": false, "error": format!("Eval failed: {}", e)}),
                 );
                 return;
+            }
+
+            if let Some(app) = saved_frontmost {
+                schedule_frontmost_restore(app);
             }
 
             // Fallback for NO_PERSISTENT
@@ -4901,6 +4975,16 @@ async fn send_task(
 // Cancel a running task — SIGTERM, then SIGKILL after 2s if still alive.
 // ---------------------------------------------------------------------------
 
+/// Clear the task PID from BOTH tracking stores so subsequent cancel/status
+/// calls don't see a stale PID regardless of how the task was started.
+async fn clear_task_pid(state: &TaskState) {
+    let mut guard = state.lock().await;
+    guard.pid = None;
+    if let Ok(mut bridge_guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
+        *bridge_guard = None;
+    }
+}
+
 #[tauri::command]
 async fn cancel_task(
     app_handle: tauri::AppHandle,
@@ -4910,6 +4994,17 @@ async fn cancel_task(
         let guard = state.lock().await;
         guard.pid
     };
+
+    // Fall back to the bridge-registered PID. Tasks started via kimctl /v1/task
+    // register in BRIDGE_TASK_PID, not TaskState — so the GUI Stop button needs
+    // to check both stores or it silently no-ops while the task keeps running.
+    let pid = pid.or_else(|| {
+        BRIDGE_TASK_PID
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+    });
 
     let Some(pid) = pid else {
         return Err("No task is currently running.".to_string());
@@ -4930,16 +5025,14 @@ async fn cancel_task(
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if !process_exists(pid) {
-                let mut guard = state_clone.lock().await;
-                guard.pid = None;
+                clear_task_pid(&state_clone).await;
                 let _ = app.emit("kim-agent-cancelled", true);
                 return;
             }
         }
         // Still alive after 2s → SIGKILL / taskkill /F.
         let _ = send_signal(pid, true);
-        let mut guard = state_clone.lock().await;
-        guard.pid = None;
+        clear_task_pid(&state_clone).await;
         let _ = app.emit("kim-agent-cancelled", true);
     });
 

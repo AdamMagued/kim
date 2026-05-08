@@ -39,7 +39,7 @@ class UIElement:
 _LAST_ELEMENTS: dict[str, UIElement] = {}
 
 
-async def _run_osascript(script: str, timeout: float = 4.0) -> tuple[int, str, str]:
+async def _run_osascript(script: str, timeout: float = 15.0) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         "osascript", "-e", script,
         stdout=asyncio.subprocess.PIPE,
@@ -120,7 +120,23 @@ def _format_observation(app: str, window: str, elements: list[UIElement], limit:
     ]
 
     if not elements:
-        lines.append("- No accessible controls found. Try get_windows/focus_window, keyboard shortcuts, or vision only if the task is visual.")
+        is_browser = any(b in app.lower() for b in ("chrome", "safari", "firefox", "edge", "arc", "brave"))
+        if is_browser:
+            lines.append(
+                "- No web controls visible YET. Chrome/Safari lazy-enable AX "
+                "after the first query — the second or third observe_ui call "
+                "usually returns the form fields. Retry observe_ui ONCE more "
+                "with depth=4. If still empty, the page may be using "
+                "non-standard widgets; only then fall back to "
+                "take_annotated_screenshot."
+            )
+        else:
+            lines.append(
+                "- No interactive controls at this depth. The window may be "
+                "Electron-based (no AX). Try focus_window on a different app "
+                "or take_annotated_screenshot for visual tasks. Do not loop "
+                "observe_ui on the same window."
+            )
         return "\n".join(lines)
 
     role_order = {
@@ -171,9 +187,8 @@ async def _observe_ui_macos(limit: int, depth: int) -> str:
     if "-1719" in preflight_out or "-1719" in preflight_err:
         return (
             "PERMISSION_ERROR: macOS Accessibility access is required for observe_ui. "
-            "Grant accessibility permission to Kim/Codex/Terminal in System Settings > "
-            "Privacy & Security > Accessibility, then retry. Until then, use keyboard "
-            "shortcuts or run_command/open_url where possible."
+            "Open System Settings → Privacy & Security → Accessibility and add the "
+            "process running Kim. NEED_HELP and ask the user to grant it."
         )
 
     # AppleScript returns tab-separated rows to avoid fragile JSON escaping.
@@ -200,29 +215,38 @@ async def _observe_ui_macos(limit: int, depth: int) -> str:
         on emitElement(el, depth)
             global output, itemCount, maxDepth, maxItems
             if itemCount > maxItems then return
+            -- All property reads MUST be wrapped in `tell application "System
+            -- Events"` because this handler runs outside the top-level tell
+            -- block. Without the wrap, every read errors silently and we
+            -- mis-report "No accessible controls found".
             try
-                set r to role of el as text
+                tell application "System Events" to set r to role of el as text
             on error
                 set r to ""
             end try
             try
-                set n to my cleanText(name of el)
+                tell application "System Events" to set rawN to name of el
+                set n to my cleanText(rawN)
             on error
                 set n to ""
             end try
             try
-                set d to my cleanText(description of el)
+                tell application "System Events" to set rawD to description of el
+                set d to my cleanText(rawD)
             on error
                 set d to ""
             end try
             try
-                set v to my cleanText(value of el)
+                tell application "System Events" to set rawV to value of el
+                set v to my cleanText(rawV)
             on error
                 set v to ""
             end try
             try
-                set {{px, py}} to position of el
-                set {{sx, sy}} to size of el
+                tell application "System Events"
+                    set {{px, py}} to position of el
+                    set {{sx, sy}} to size of el
+                end tell
             on error
                 set px to 0
                 set py to 0
@@ -281,7 +305,10 @@ async def _observe_ui_macos(limit: int, depth: int) -> str:
 async def handle_observe_ui(args: dict) -> str:
     """Return a compact structured view of the active app/window."""
     limit = int(args.get("limit", 80))
-    depth = int(args.get("depth", 5))
+    # Cap depth aggressively. AppleScript AX traversal is O(n^d) and the
+    # `tell application "System Events"` round-trip per property read makes
+    # depth>4 impractical on rich apps like Finder/Xcode (>15s).
+    depth = min(int(args.get("depth", 4)), 5)
     if IS_MACOS:
         result = await _observe_ui_macos(limit=limit, depth=depth)
         logger.info(f"observe_ui [{CURRENT_OS}]: returned {len(result)} chars")
