@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { SessionInfo, KimMessage, Settings, KimAccount, GoogleAccount, TextBlock } from '../types';
+import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
 import { BrowserProviderPicker } from './BrowserProviderPicker';
@@ -360,18 +360,6 @@ const PROVIDER_LABELS: Record<string, string> = {
   'browser:custom': 'Browser Custom',
 };
 
-function uniqueGoogleAccounts(accounts: GoogleAccount[] | undefined): GoogleAccount[] {
-  const seen = new Set<string>();
-  const unique: GoogleAccount[] = [];
-  for (const account of accounts ?? []) {
-    const email = account.email.trim().toLowerCase();
-    if (!email || seen.has(email)) continue;
-    seen.add(email);
-    unique.push({ ...account, email });
-  }
-  return unique;
-}
-
 interface PendingTask {
   id: number;
   text: string;
@@ -470,7 +458,7 @@ interface Props {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function ChatView({ session, newChatMode, settings, onTaskDone, account, onAccountChange, activeTab, activeProjectPath }: Props) {
+export function ChatView({ session, newChatMode, settings, onTaskDone, account, activeTab, activeProjectPath }: Props) {
   const activityCounterRef = useRef(0);
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
@@ -491,26 +479,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [autoFollowOutput, setAutoFollowOutput] = useState(true);
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
-  const [selectedGoogleAccount, setSelectedGoogleAccount] = useState(
-    account.google_active_account ?? account.google_accounts?.[0]?.email ?? ''
-  );
   const [conversationId] = useState(() => makeConversationId());
   const activeResumeSessionId = session?.session_id ?? conversationId;
   const activeResumeSessionIdRef = useRef(activeResumeSessionId);
   useEffect(() => { activeResumeSessionIdRef.current = activeResumeSessionId; }, [activeResumeSessionId]);
-  useEffect(() => {
-    const accounts = uniqueGoogleAccounts(account.google_accounts);
-    const active = account.google_active_account;
-    if (active && accounts.some(a => a.email.toLowerCase() === active.toLowerCase())) {
-      setSelectedGoogleAccount(active);
-      return;
-    }
-    if (accounts.length > 0) {
-      setSelectedGoogleAccount(accounts[0].email);
-      return;
-    }
-    setSelectedGoogleAccount('');
-  }, [account.google_active_account, account.google_accounts]);
 
   // Live conversation history for new-chat mode — persists across task runs
   // and doesn't get wiped by the disk-based message reload.
@@ -824,17 +796,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
   const queueEnabled = Boolean(settings.allow_message_queue);
   const keepBrowserVisible = Boolean(settings.keep_browser_visible);
-  const googleAccounts = uniqueGoogleAccounts(account.google_accounts);
-
-  const getActiveGoogleAccount = useCallback(() => {
-    if (selectedGoogleAccount && googleAccounts.some(acc => acc.email === selectedGoogleAccount)) {
-      return selectedGoogleAccount;
-    }
-    if (account.google_active_account && googleAccounts.some(acc => acc.email === account.google_active_account)) {
-      return account.google_active_account;
-    }
-    return googleAccounts[0]?.email ?? '';
-  }, [account.google_active_account, googleAccounts, selectedGoogleAccount]);
 
   useEffect(() => {
     void invoke('set_browser_keep_visible', { keepVisible: keepBrowserVisible });
@@ -855,13 +816,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       provider: providerOverride ?? resolveProvider(),
     };
   }, [resolveProvider]);
-
-  async function persistGoogleSelectionForTask(provider: string) {
-    if (provider !== 'browser:gemini') return;
-    const email = getActiveGoogleAccount();
-    if (!email || email === account.google_active_account) return;
-    await onAccountChange({ ...account, google_active_account: email });
-  }
 
   const runPendingTask = useCallback(async (pending: PendingTask) => {
     doneHandledRef.current = false;
@@ -885,7 +839,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     setLiveHistory(prev => [...prev, { role: 'user', content: pending.text }]);
 
     try {
-      await persistGoogleSelectionForTask(pending.provider);
       await invoke('send_task', {
         task: pending.text,
         provider: pending.provider,
@@ -904,7 +857,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         onTaskDoneRef.current(activeResumeSessionId); // refresh sidebar even on invoke-level failures
       }
     }
-  }, [activeResumeSessionId, settings.project_root, activeTab, activeProjectPath, account, getActiveGoogleAccount, onAccountChange]);
+  }, [activeResumeSessionId, settings.project_root, activeTab, activeProjectPath]);
 
   useEffect(() => {
     if (isRunning) return;
@@ -1027,50 +980,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     }
   }
 
-  async function saveDetectedGoogleAccounts(detected: GoogleAccount[], selectLatest: boolean) {
-    detected = uniqueGoogleAccounts(detected);
-    if (detected.length === 0) return;
-    const merged = [...googleAccounts];
-    for (const detectedAccount of detected) {
-      const existingIndex = merged.findIndex(acc => acc.email.toLowerCase() === detectedAccount.email.toLowerCase());
-      if (existingIndex >= 0) {
-        merged[existingIndex] = detectedAccount;
-      } else {
-        merged.push(detectedAccount);
-      }
-    }
-    const active = selectLatest
-      ? detected[detected.length - 1]?.email
-      : account.google_active_account && merged.some(acc => acc.email === account.google_active_account)
-        ? account.google_active_account
-        : merged[0]?.email;
-    const nextAccount = {
-      ...account,
-      google_accounts: uniqueGoogleAccounts(merged),
-      google_active_account: active,
-    };
-    await onAccountChange(nextAccount);
-    toast('Google account saved for Browser Gemini.', 'success', 3000);
-  }
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    listen<GoogleAccount[]>('google-accounts-detected', event => {
-      void saveDetectedGoogleAccounts(event.payload, true);
-    }).then(fn => { unlisten = fn; });
-    return () => { unlisten?.(); };
-  }, [account, googleAccounts, onAccountChange]);
-
-  async function handleSelectGoogleAccount(nextAccount: string) {
-    setSelectedGoogleAccount(nextAccount);
-    if (!nextAccount || nextAccount === account.google_active_account) return;
-    try {
-      await onAccountChange({ ...account, google_active_account: nextAccount });
-    } catch (err) {
-      toast(String(err), 'error', 5000);
-    }
-  }
-
   function handleTextareaInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
     setTaskInput(e.target.value);
     const el = e.target;
@@ -1132,7 +1041,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   function renderComposer() {
     const resolvedProvider = resolveProvider();
     const browserProviderId = resolvedProvider.startsWith('browser:') ? resolvedProvider.split(':')[1] : '';
-    const providerAccounts = browserProviderId === 'gemini' ? googleAccounts : [];
     return (
       <form className="kim-composer" onSubmit={handleSubmit}>
         <div className="kim-composer__row">
@@ -1218,7 +1126,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                   const urlMap: Record<string, string> = {
                     claude: 'https://claude.ai',
                     chatgpt: 'https://chatgpt.com',
-                    gemini: 'https://gemini.google.com',
+                    gemini: 'https://gemini.google.com/app',
                     grok: 'https://grok.com',
                     deepseek: 'https://chat.deepseek.com',
                   };
@@ -1264,7 +1172,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                   let url = '';
                   if (p === 'claude') url = 'https://claude.ai';
                   else if (p === 'chatgpt') url = 'https://chatgpt.com';
-                  else if (p === 'gemini') url = 'https://gemini.google.com';
+                  else if (p === 'gemini') url = 'https://gemini.google.com/app';
                   else if (p === 'grok') url = 'https://grok.com';
                   else if (p === 'deepseek') url = 'https://chat.deepseek.com';
 
@@ -1273,13 +1181,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                       await invoke<string>('open_browser_signin_window', { url, providerName });
                       await invoke('show_browser_window').catch(() => {});
                       toast(`${providerName} opened! Close the window when you're done signing in.`, 'info', 7000);
-                      if (p === 'gemini') {
-                        setTimeout(() => {
-                          invoke<GoogleAccount[]>('detect_google_accounts')
-                            .then(accounts => saveDetectedGoogleAccounts(accounts, true))
-                            .catch(() => {});
-                        }, 4000);
-                      }
                     } catch (err) {
                       toast(typeof err === 'string' ? err : `Could not open ${providerName}.`, 'error', 5000);
                     }
@@ -1288,29 +1189,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               >
                 Sign into {browserProviderId.charAt(0).toUpperCase() + browserProviderId.slice(1)}
               </button>
-            </>
-          )}
-          {browserProviderId && (
-            <>
-              {providerAccounts.length > 0 && (
-                <>
-                  <span className="kim-composer__hint-sep">·</span>
-                  <span className="kim-composer__account-pill">
-                    <select
-                      value={selectedGoogleAccount || providerAccounts[0]?.email || ''}
-                      onChange={e => { void handleSelectGoogleAccount(e.target.value); }}
-                      className="kim-composer__account-select"
-                    >
-                      {providerAccounts.map(acc => (
-                        <option key={acc.email} value={acc.email}>{acc.email}</option>
-                      ))}
-                    </select>
-                    <svg className="kim-composer__account-chevron" viewBox="0 0 10 10" width="8" height="8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M2 4l3 3 3-3" />
-                    </svg>
-                  </span>
-                </>
-              )}
             </>
           )}
           {(queuedTasks.length > 0 || interruptTask) && (

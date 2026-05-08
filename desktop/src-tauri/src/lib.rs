@@ -550,24 +550,11 @@ fn normalize_site(site: &str) -> String {
 fn default_site_url(site: &str) -> &'static str {
     match normalize_site(site).as_str() {
         "chatgpt" => "https://chatgpt.com",
-        "gemini" => "https://gemini.google.com",
+        "gemini" => "https://gemini.google.com/app",
         "deepseek" => "https://chat.deepseek.com",
         "grok" => "https://grok.com",
         _ => "https://claude.ai/new",
     }
-}
-
-fn resolve_gemini_authuser(request_authuser: Option<u32>) -> Option<u32> {
-    request_authuser.or_else(|| {
-        let raw = fs::read_to_string(account_path()).ok()?;
-        let account = serde_json::from_str::<KimAccount>(&raw).ok()?;
-        let active_email = account.google_active_account.as_ref()?;
-        account
-            .google_accounts
-            .iter()
-            .find(|entry| entry.email.eq_ignore_ascii_case(active_email))
-            .map(|entry| entry.authuser_index)
-    })
 }
 
 fn gemini_site_url(authuser: Option<u32>) -> String {
@@ -1489,19 +1476,6 @@ fn open_browser_signin_window_impl(
     .resizable(true)
     .visible(true) // Open visible + centered so the sign-in page is reachable.
     .initialization_script(PERSISTENT_BRIDGE_JS)
-    // Inject a script that watches for successful Google sign-in redirect
-    .initialization_script(r#"
-        (function() {
-            if (window.__kimSigninWatcher) return;
-            window.__kimSigninWatcher = true;
-            var iv = setInterval(function() {
-                if (window.location.hostname === 'gemini.google.com') {
-                    clearInterval(iv);
-                    document.title = '__KIM_SIGNIN_COMPLETE__';
-                }
-            }, 500);
-        })();
-    "#)
     .build()
     .map_err(|e| format!("Failed to open Kim browser window: {}", e))?;
 
@@ -1523,113 +1497,6 @@ fn open_browser_signin_window_impl(
             let _ = app_for_close.emit("kim-browser-hidden", true);
         }
     });
-
-    // ── Auto-detect Google accounts after sign-in ──────────────────────────
-    // Spawn a background thread that polls the webview title for the
-    // __KIM_SIGNIN_COMPLETE__ signal set by the injected JS above.
-    // When detected, scrape account list, save to disk, and emit event.
-    {
-        let poll_window = window.clone();
-        let poll_app = app_handle.clone();
-        std::thread::spawn(move || {
-            use std::time::Duration;
-            // Poll for up to 5 minutes (600 iterations × 500ms)
-            for _ in 0..600 {
-                std::thread::sleep(Duration::from_millis(500));
-                let title = match poll_window.title() {
-                    Ok(t) => t,
-                    Err(_) => break, // window gone
-                };
-                if title == "__KIM_SIGNIN_COMPLETE__" {
-                    if is_bridge_task_running() {
-                        break;
-                    }
-
-                    // Sign-in detected! Navigate to account chooser to scrape accounts.
-                    let chooser_url = "https://accounts.google.com/SignOutOptions?continue=https%3A%2F%2Fgemini.google.com%2Fapp";
-                    if let Ok(js_url) = serde_json::to_string(chooser_url) {
-                        let _ = poll_window.eval(format!("window.location.href = {};", js_url));
-                    }
-                    std::thread::sleep(Duration::from_millis(3000));
-
-                    // Scrape accounts using the same JS as detect_google_accounts
-                    let scrape_js = r#"
-                        document.title = (function() {
-                            var accounts = [];
-                            document.querySelectorAll('[data-email]').forEach(function(el, idx) {
-                                var email = el.getAttribute('data-email');
-                                if (email && email.includes('@')) {
-                                    accounts.push({ email: email.trim().toLowerCase(), authuser_index: idx });
-                                }
-                            });
-                            if (accounts.length > 0) return JSON.stringify(accounts);
-                            var rows = document.querySelectorAll('li[data-authuser], div[data-authuser]');
-                            rows.forEach(function(row) {
-                                var authuser = parseInt(row.getAttribute('data-authuser'), 10);
-                                var text = row.textContent || '';
-                                var match = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
-                                if (match) {
-                                    accounts.push({ email: match[0].toLowerCase(), authuser_index: isNaN(authuser) ? accounts.length : authuser });
-                                }
-                            });
-                            if (accounts.length > 0) return JSON.stringify(accounts);
-                            var allText = document.body.innerText || '';
-                            var emailRegex = /[a-zA-Z0-9._%+-]+@(?:gmail\.com|googlemail\.com|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
-                            var found = allText.match(emailRegex) || [];
-                            var unique = [...new Set(found.map(function(e) { return e.toLowerCase(); }))];
-                            unique.forEach(function(email, idx) {
-                                accounts.push({ email: email, authuser_index: idx });
-                            });
-                            return JSON.stringify(accounts);
-                        })();
-                    "#;
-                    let _ = poll_window.eval(scrape_js);
-                    std::thread::sleep(Duration::from_millis(800));
-
-                    let scraped_title = match poll_window.title() {
-                        Ok(t) => t,
-                        Err(_) => break,
-                    };
-
-                    if let Ok(detected) = serde_json::from_str::<Vec<GoogleAccountEntry>>(&scraped_title) {
-                        if !detected.is_empty() {
-                            // Merge into account.json
-                            let path = account_path();
-                            let mut acct: KimAccount = fs::read_to_string(&path)
-                                .ok()
-                                .and_then(|raw| serde_json::from_str(&raw).ok())
-                                .unwrap_or_default();
-
-                            let existing: std::collections::HashSet<String> = acct.google_accounts.iter()
-                                .map(|a| a.email.to_lowercase()).collect();
-                            for acc in &detected {
-                                if !existing.contains(&acc.email.to_lowercase()) {
-                                    acct.google_accounts.push(acc.clone());
-                                }
-                            }
-                            if acct.google_active_account.is_none() {
-                                acct.google_active_account = Some(acct.google_accounts[0].email.clone());
-                            }
-
-                            // Save to disk
-                            if let Ok(json) = serde_json::to_string_pretty(&acct) {
-                                let _ = fs::write(&path, json);
-                            }
-
-                            // Emit event to frontend
-                            let _ = poll_app.emit("google-accounts-detected", &detected);
-                        }
-                    }
-
-                    // Navigate back to Gemini
-                    if !is_bridge_task_running() {
-                        let _ = poll_window.eval("window.location.href = 'https://gemini.google.com/app';");
-                    }
-                    break;
-                }
-            }
-        });
-    }
 
     // Listen for IPC events from the persistent JS bridge only once per app instance.
     IPC_LISTENER_REGISTERED.get_or_init(|| {
@@ -3158,11 +3025,7 @@ fn handle_webview_bridge_request(
             }
 
             let site = normalize_site(parsed.site.as_deref().unwrap_or("claude"));
-            let gemini_authuser = if site == "gemini" {
-                resolve_gemini_authuser(parsed.authuser)
-            } else {
-                None
-            };
+            let gemini_authuser = if site == "gemini" { parsed.authuser } else { None };
             let bridge_lock = WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(()));
             let _guard = match bridge_lock.try_lock() {
                 Ok(g) => g,
@@ -3187,22 +3050,10 @@ fn handle_webview_bridge_request(
                 }
             };
 
-            let mut opened_window = false;
+            let opened_window = false;
             let window = if let Some(w) = app_handle.get_webview_window("kim-browser-signin") {
                 w
             } else {
-                if is_bridge_task_running() {
-                    respond_json(
-                        request,
-                        409,
-                        serde_json::json!({
-                            "ok": false,
-                            "error": "No existing provider browser window is available. Kim will not open a new provider window while a task is active because that would lose LLM context.",
-                        }),
-                    );
-                    return;
-                }
-
                 let open_url = if site == "gemini" {
                     gemini_site_url(gemini_authuser)
                 } else {
@@ -3217,31 +3068,16 @@ fn handle_webview_bridge_request(
                     );
                     return;
                 }
-                opened_window = true;
-                if site != "gemini" {
-                    show_browser_window_impl(&app_handle);
-                    respond_json(
-                        request,
-                        409,
-                        serde_json::json!({
-                            "ok": false,
-                            "error": "In-app browser window opened. Sign in to the provider, then resend your task.",
-                        }),
-                    );
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(1500));
-                match app_handle.get_webview_window("kim-browser-signin") {
-                    Some(w) => w,
-                    None => {
-                        respond_json(
-                            request,
-                            500,
-                            serde_json::json!({"ok": false, "error": "Could not open in-app browser window."}),
-                        );
-                        return;
-                    }
-                }
+                show_browser_window_impl(&app_handle);
+                respond_json(
+                    request,
+                    409,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "Provider browser window opened. Sign in to the provider, then resend your task.",
+                    }),
+                );
+                return;
             };
 
             if site == "gemini" {
@@ -3353,28 +3189,12 @@ fn handle_webview_bridge_request(
             }
 
             let site = normalize_site(parsed.site.as_deref().unwrap_or("claude"));
-            let gemini_authuser = if site == "gemini" {
-                resolve_gemini_authuser(parsed.authuser)
-            } else {
-                None
-            };
+            let gemini_authuser = if site == "gemini" { parsed.authuser } else { None };
 
-            let mut opened_window = false;
+            let opened_window = false;
             let window = if let Some(w) = app_handle.get_webview_window("kim-browser-signin") {
                 w
             } else {
-                if is_bridge_task_running() {
-                    respond_json(
-                        request,
-                        409,
-                        serde_json::json!({
-                            "ok": false,
-                            "error": "No existing provider browser window is available. Kim will not open a new provider window while a task is active because that would lose LLM context.",
-                        }),
-                    );
-                    return;
-                }
-
                 let open_url = if site == "gemini" {
                     gemini_site_url(gemini_authuser)
                 } else {
@@ -3389,31 +3209,16 @@ fn handle_webview_bridge_request(
                     );
                     return;
                 }
-                opened_window = true;
-                if site != "gemini" {
-                    show_browser_window_impl(&app_handle);
-                    respond_json(
-                        request,
-                        409,
-                        serde_json::json!({
-                            "ok": false,
-                            "error": "In-app browser window opened. Sign in to the provider, then resend your task.",
-                        }),
-                    );
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(1500));
-                match app_handle.get_webview_window("kim-browser-signin") {
-                    Some(w) => w,
-                    None => {
-                        respond_json(
-                            request,
-                            500,
-                            serde_json::json!({"ok": false, "error": "Could not open in-app browser window."}),
-                        );
-                        return;
-                    }
-                }
+                show_browser_window_impl(&app_handle);
+                respond_json(
+                    request,
+                    409,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "Provider browser window opened. Sign in to the provider, then resend your task.",
+                    }),
+                );
+                return;
             };
 
             if site == "gemini" {
@@ -3471,9 +3276,9 @@ fn handle_webview_bridge_request(
                 if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
                     guard.insert(req_id.clone());
                 }
-            } else if let Ok(false) = window.is_focused() {
-                // If the window is on-screen but in the background, hide it offscreen
-                // so the upcoming JS `inputEl.focus()` doesn't steal focus from Kim.
+            } else {
+                // Keep the provider webview off-screen during normal sends so it
+                // does not cover the user's target app before screenshot tools run.
                 hide_browser_window_offscreen(&window);
                 if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
                     guard.insert(req_id.clone());
@@ -5469,85 +5274,6 @@ async fn clear_account() -> Result<(), String> {
     Ok(())
 }
 
-/// Detect signed-in Google accounts by evaluating JS in the browser webview.
-/// Scrapes the Google account switcher to find all signed-in emails.
-#[tauri::command]
-async fn detect_google_accounts(app_handle: tauri::AppHandle) -> Result<Vec<GoogleAccountEntry>, String> {
-    let window = app_handle
-        .get_webview_window("kim-browser-signin")
-        .ok_or("Browser window is not open. Sign in to Google first.")?;
-
-    if is_bridge_task_running() {
-        return Err(
-            "Cannot detect Google accounts while Kim is running a task; this would navigate the provider browser and lose LLM context."
-                .to_string(),
-        );
-    }
-
-    // Navigate to the Google account chooser page which lists all signed-in accounts.
-    let chooser_url = "https://accounts.google.com/SignOutOptions?continue=https%3A%2F%2Fgemini.google.com%2Fapp";
-    let js_nav = format!("window.location.href = {};", serde_json::to_string(chooser_url).unwrap());
-    window.eval(&js_nav).map_err(|e| format!("Failed to navigate: {}", e))?;
-
-    // Wait for the page to load
-    std::thread::sleep(std::time::Duration::from_millis(2500));
-
-    // Scrape all signed-in account emails from the chooser page DOM.
-    // Google's account chooser shows a list of accounts with data-email attributes
-    // or visible email text in each account row.
-    let scrape_js = r#"
-        (function() {
-            var accounts = [];
-            // Strategy 1: data-email attributes on account list items
-            document.querySelectorAll('[data-email]').forEach(function(el, idx) {
-                var email = el.getAttribute('data-email');
-                if (email && email.includes('@')) {
-                    accounts.push({ email: email.trim().toLowerCase(), authuser_index: idx });
-                }
-            });
-            if (accounts.length > 0) return JSON.stringify(accounts);
-
-            // Strategy 2: look for email-like text in account rows
-            var rows = document.querySelectorAll('li[data-authuser], div[data-authuser]');
-            rows.forEach(function(row) {
-                var authuser = parseInt(row.getAttribute('data-authuser'), 10);
-                var text = row.textContent || '';
-                var match = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
-                if (match) {
-                    accounts.push({ email: match[0].toLowerCase(), authuser_index: isNaN(authuser) ? accounts.length : authuser });
-                }
-            });
-            if (accounts.length > 0) return JSON.stringify(accounts);
-
-            // Strategy 3: any email-like text on the page in account-related containers
-            var allText = document.body.innerText || '';
-            var emailRegex = /[a-zA-Z0-9._%+-]+@(?:gmail\.com|googlemail\.com|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
-            var found = allText.match(emailRegex) || [];
-            var unique = [...new Set(found.map(function(e) { return e.toLowerCase(); }))];
-            unique.forEach(function(email, idx) {
-                accounts.push({ email: email, authuser_index: idx });
-            });
-            return JSON.stringify(accounts);
-        })();
-    "#;
-
-    // Use eval + title trick to get the result back from the webview
-    let title_js = format!("document.title = {};", scrape_js.trim());
-    window.eval(&title_js).map_err(|e| format!("Failed to run scrape JS: {}", e))?;
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    let title = window.title().map_err(|e| format!("Failed to read title: {}", e))?;
-
-    let accounts: Vec<GoogleAccountEntry> = serde_json::from_str(&title)
-        .map_err(|e| format!("Failed to parse accounts from page: {} — raw: {}", e, &title[..title.len().min(200)]))?;
-
-    if accounts.is_empty() {
-        return Err("No signed-in Google accounts detected. Make sure you're signed in.".to_string());
-    }
-
-    Ok(accounts)
-}
-
 // ---------------------------------------------------------------------------
 // GitHub PAT verification — get user identity from token
 // ---------------------------------------------------------------------------
@@ -6314,7 +6040,6 @@ pub fn run() {
             remove_code_project,
             send_feedback,
             show_screenshot_flash,
-            detect_google_accounts,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
