@@ -1582,6 +1582,11 @@ class BrowserProvider(BaseProvider):
                 "claim you cannot access the computer if a listed tool can do it.\n"
                 "For normal UI work, prefer observe_ui and click_ui. Use screenshots "
                 "only for visual-inspection tasks or when structured UI is insufficient.\n"
+                "If web_open returns AUTH_REQUIRED or AUTH_FAILED, the page content is "
+                "not usable yet. If the current task only asked to open a site, respond "
+                "TASK_COMPLETE saying it is open at the sign-in prompt. Do not log in "
+                "unless the current task explicitly asks you to sign in or provides "
+                "credentials. Never reuse credentials from recent context alone.\n"
                 "Respond with EXACTLY ONE of:\n"
                 '1. A JSON tool call on a single line: '
                 '{"tool": "<name>", "args": {<args>}}\n'

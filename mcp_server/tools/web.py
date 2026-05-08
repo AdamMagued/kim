@@ -30,10 +30,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
-from mcp_server.config import PROJECT_ROOT
+from mcp_server.config import PROJECT_ROOT, USE_REAL_BROWSER
+from mcp_server.os_utils import IS_MACOS, IS_WINDOWS, IS_LINUX
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +48,9 @@ _playwright: Any = None
 _browser_ctx: Any = None
 _active_page: Any = None
 _element_map: dict[str, str] = {}
+_is_real_browser: bool = False
+_last_connection_error: str = ""
+_DEDICATED_CDP_PORT = int(os.environ.get("KIM_DEDICATED_BROWSER_CDP_PORT", "9333"))
 
 def _resolve_user_data_dir() -> Path:
     """Pick a writable directory for the persistent Chromium profile.
@@ -69,9 +76,114 @@ def _resolve_user_data_dir() -> Path:
 USER_DATA_DIR = _resolve_user_data_dir()
 
 
+async def _launch_real_browser() -> bool:
+    """Attempt to launch the user's real browser with remote debugging enabled."""
+    cdp_arg = "--remote-debugging-port=9222"
+
+    try:
+        if IS_MACOS:
+            # On macOS, simply launching with the flag is often blocked if another
+            # instance is open. We use 'open' which is cleaner.
+            subprocess.Popen(["open", "-a", "Google Chrome", "--args", cdp_arg])
+            return True
+        elif IS_WINDOWS:
+            for p in [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            ]:
+                if Path(p).exists():
+                    subprocess.Popen([p, cdp_arg])
+                    return True
+        elif IS_LINUX:
+            for bin_name in ["google-chrome", "chromium-browser", "chromium"]:
+                if shutil.which(bin_name):
+                    subprocess.Popen([bin_name, cdp_arg])
+                    return True
+    except Exception as e:
+        logger.warning(f"web: failed to launch real browser: {e}")
+
+    return False
+
+
+def _browser_executable() -> str | None:
+    env_path = os.environ.get("KIM_BROWSER_EXECUTABLE", "").strip()
+    if env_path and Path(env_path).exists():
+        return env_path
+    if IS_MACOS:
+        chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if Path(chrome).exists():
+            return chrome
+        chromium = "/Applications/Chromium.app/Contents/MacOS/Chromium"
+        if Path(chromium).exists():
+            return chromium
+    elif IS_WINDOWS:
+        for path in [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]:
+            if Path(path).exists():
+                return path
+    else:
+        for bin_name in ["google-chrome", "chromium-browser", "chromium"]:
+            found = shutil.which(bin_name)
+            if found:
+                return found
+    return None
+
+
+async def _connect_over_cdp(port: int) -> Any | None:
+    global _last_connection_error
+    for host in ["127.0.0.1", "localhost"]:
+        try:
+            return await _playwright.chromium.connect_over_cdp(f"http://{host}:{port}")
+        except Exception as e:
+            _last_connection_error = str(e)
+    return None
+
+
+async def _launch_dedicated_browser() -> bool:
+    """Launch Kim's own detached browser process so it survives MCP exit."""
+    executable = _browser_executable()
+    if not executable:
+        _last_connection_error = "No Chrome/Chromium executable found"
+        return False
+
+    args = [
+        executable,
+        f"--remote-debugging-port={_DEDICATED_CDP_PORT}",
+        f"--user-data-dir={USER_DATA_DIR}",
+        "--no-default-browser-check",
+        "--no-first-run",
+        "--disable-blink-features=AutomationControlled",
+        "about:blank",
+    ]
+    try:
+        subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"web: failed to launch dedicated browser: {e}")
+        _last_connection_error = str(e)
+        return False
+
+
+async def _active_browser_context() -> Any:
+    if hasattr(_browser_ctx, "pages"):
+        return _browser_ctx
+    contexts = getattr(_browser_ctx, "contexts", [])
+    if contexts:
+        return contexts[0]
+    return await _browser_ctx.new_context()
+
+
 async def _ensure_browser() -> None:
     """Lazily start Playwright + Chromium, reuse across tool calls."""
-    global _playwright, _browser_ctx, _active_page
+    global _playwright, _browser_ctx, _active_page, _is_real_browser
 
     if _active_page is not None:
         try:
@@ -87,20 +199,67 @@ async def _ensure_browser() -> None:
         _playwright = await async_playwright().start()
 
     if _browser_ctx is None:
-        _browser_ctx = await _playwright.chromium.launch_persistent_context(
-            user_data_dir=str(USER_DATA_DIR),
-            headless=False,
-            viewport={"width": 1280, "height": 820},
-            args=[
-                "--no-default-browser-check",
-                "--no-first-run",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        _browser_ctx.on("close", lambda: _on_context_closed())
+        global _last_connection_error
+        _last_connection_error = ""
 
-    pages = _browser_ctx.pages
-    _active_page = pages[-1] if pages else await _browser_ctx.new_page()
+        if USE_REAL_BROWSER:
+            # 1. Try to connect to an existing browser on 9222
+            _browser_ctx = await _connect_over_cdp(9222)
+            if _browser_ctx is not None:
+                _is_real_browser = True
+                logger.info("web: connected to existing browser via CDP on port 9222")
+
+            if _browser_ctx is None:
+                # 2. If connection fails, try to launch the real browser with CDP flag
+                logger.info(f"web: no browser on 9222 ({_last_connection_error}), attempting launch...")
+                if await _launch_real_browser():
+                    # Retry connection a few times
+                    for attempt in range(1, 6):
+                        logger.info(f"web: connection attempt {attempt}/5...")
+                        await asyncio.sleep(2)
+                        _browser_ctx = await _connect_over_cdp(9222)
+                        if _browser_ctx is not None:
+                            _is_real_browser = True
+                            logger.info("web: connected to real browser via CDP after launch")
+                        if _browser_ctx:
+                            break
+
+        # 3. Fallback to Kim's own persistent context if CDP failed or was disabled
+        if _browser_ctx is None:
+            _is_real_browser = False
+            _browser_ctx = await _connect_over_cdp(_DEDICATED_CDP_PORT)
+            if _browser_ctx is None:
+                logger.info(
+                    f"web: launching detached dedicated Kim browser profile "
+                    f"(Reason: {_last_connection_error})"
+                )
+                if await _launch_dedicated_browser():
+                    for attempt in range(1, 8):
+                        logger.info(f"web: dedicated browser connection attempt {attempt}/7...")
+                        await asyncio.sleep(1)
+                        _browser_ctx = await _connect_over_cdp(_DEDICATED_CDP_PORT)
+                        if _browser_ctx is not None:
+                            break
+
+            if _browser_ctx is None:
+                logger.warning(
+                    "web: detached dedicated browser failed; falling back to "
+                    f"Playwright-owned persistent context ({_last_connection_error})"
+                )
+                _browser_ctx = await _playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(USER_DATA_DIR),
+                    headless=False,
+                    viewport={"width": 1280, "height": 820},
+                    args=[
+                        "--no-default-browser-check",
+                        "--no-first-run",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                )
+
+    context = await _active_browser_context()
+    pages = context.pages
+    _active_page = pages[-1] if pages else await context.new_page()
 
 
 def _on_context_closed() -> None:
@@ -120,20 +279,70 @@ async def _page():
 
 async def handle_web_open(args: dict) -> str:
     url = str(args.get("url", "")).strip()
+    username = str(args.get("username", "")).strip()
+    password = str(args.get("password", "")).strip()
+
     if not url:
         return "ERROR: url is required"
-    if not url.startswith(("http://", "https://", "file://", "about:", "chrome://")):
+    if not url.startswith(("http://", "https://", "file://", "about:", "chrome://", "data:")):
         url = "https://" + url
+
     page = await _page()
+
+    if username and password:
+        auth = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        await page.set_extra_http_headers({"Authorization": f"Basic {auth}"})
+    else:
+        await page.set_extra_http_headers({})
+
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=25000)
     except Exception as e:
+        err_text = str(e)
+        if (
+            "ERR_INVALID_AUTH_CREDENTIALS" in err_text
+            or "ERR_HTTP_RESPONSE_CODE_FAILURE" in err_text
+            or "401" in err_text
+        ):
+            mode_str = " (Real Browser)" if _is_real_browser else " (Dedicated Kim Browser)"
+            if username or password:
+                return (
+                    f"AUTH_FAILED: {url}{mode_str}\n"
+                    "The site rejected the supplied HTTP authentication credentials. "
+                    "Do not call web_observe/web_text/web_screenshot for page content yet; "
+                    "ask the user to verify the username/password or sign in manually."
+                )
+            return (
+                f"AUTH_REQUIRED: {url}{mode_str}\n"
+                "The site is open but blocked by an HTTP authentication popup. "
+                "Call web_open again with username and password if you have them; "
+                "otherwise ask the user to sign in manually."
+            )
         return f"ERROR: navigation failed: {e}"
+
+    if page.url.startswith("chrome-error://"):
+        mode_str = " (Real Browser)" if _is_real_browser else " (Dedicated Kim Browser)"
+        return (
+            f"ERROR: browser error page after opening {url}{mode_str}\n"
+            "The controlled browser did not reach usable page content. "
+            "Do not treat this as open; ask for help or retry with valid credentials."
+        )
     try:
         title = await page.title()
     except Exception:
         title = ""
-    return f"Opened: {page.url}\nTitle: {title}"
+
+    if not _is_real_browser and USE_REAL_BROWSER:
+        err_hint = f" ({_last_connection_error})" if _last_connection_error else ""
+        if "target closed" in err_hint.lower() or "connection closed" in err_hint.lower():
+            err_hint += " — This usually means Chrome is already open with your profile. You must QUIT Chrome completely before Kim can control it."
+        mode_str = f" (Fallback: Dedicated Kim Browser — Could not connect to your real browser{err_hint})"
+    elif _is_real_browser:
+        mode_str = " (Real Browser)"
+    else:
+        mode_str = " (Dedicated Kim Browser)"
+
+    return f"Opened: {page.url}{mode_str}\nTitle: {title}"
 
 
 # JS that walks the live DOM and returns interactive elements with stable
@@ -404,14 +613,8 @@ async def handle_web_back(args: dict) -> str:
 
 
 async def handle_web_close(args: dict) -> str:
-    """Close the controlled browser. Profile data is preserved on disk."""
-    global _browser_ctx, _active_page
-    if _browser_ctx is not None:
-        try:
-            await _browser_ctx.close()
-        except Exception as e:
-            logger.warning(f"web: error during close: {e}")
-    _browser_ctx = None
-    _active_page = None
-    _element_map.clear()
-    return "Closed Kim browser. Profile saved at " + str(USER_DATA_DIR)
+    """
+    Prevent the LLM from closing the browser automatically.
+    The browser should stay open so the user remains signed in.
+    """
+    return "The Kim browser remains open so that your session and logins are preserved for the next task."
