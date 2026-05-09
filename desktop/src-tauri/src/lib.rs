@@ -4896,8 +4896,8 @@ fn read_env_file_var(kim_root: &Path, key: &str) -> Option<String> {
 
 /// Locate the `claw` binary. Search order:
 /// 1. CLAW_BIN env var (explicit override)
-/// 2. <kim-fork-root>/pythonExperimentTool/claw-code/rust/target/release/claw
-/// 3. <kim-fork-root>/pythonExperimentTool/claw-code/rust/target/debug/claw
+/// 2. <kim_root>/pythonExperimentTool/... (nested layout — pythonExperimentTool inside kim-pro)
+/// 3. <kim_root.parent()>/pythonExperimentTool/... (sibling layout — classic fork structure)
 /// 4. `claw` on PATH
 fn find_claw_binary(kim_root: &Path) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CLAW_BIN") {
@@ -4906,15 +4906,19 @@ fn find_claw_binary(kim_root: &Path) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    // kim_root is typically <fork>/kim-pro; claw lives in <fork>/pythonExperimentTool/...
-    if let Some(fork_root) = kim_root.parent() {
-        let candidates = [
-            fork_root.join("pythonExperimentTool/claw-code/rust/target/release/claw"),
-            fork_root.join("pythonExperimentTool/claw-code/rust/target/debug/claw"),
-        ];
-        for c in candidates.iter() {
-            if c.is_file() {
-                return Some(c.clone());
+    // Search both the kim_root itself and its parent so the binary is found
+    // regardless of whether pythonExperimentTool is nested inside kim-pro
+    // (e.g. kim-pro/pythonExperimentTool/...) or lives alongside it as a
+    // sibling (e.g. <fork>/kim-pro + <fork>/pythonExperimentTool/...).
+    let mut roots: Vec<PathBuf> = vec![kim_root.to_path_buf()];
+    if let Some(parent) = kim_root.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    for root in &roots {
+        for sub in &["release", "debug"] {
+            let p = root.join(format!("pythonExperimentTool/claw-code/rust/target/{}/claw", sub));
+            if p.is_file() {
+                return Some(p);
             }
         }
     }
@@ -5061,8 +5065,6 @@ async fn send_task(
         }
     } else {
         let python = find_python_interpreter(&kim_root)?;
-        // Status line so the user can tell Kim is the active agent (vs Claw).
-        let _ = app_handle.emit("kim-agent-output", format!("[STATUS] Routing to Kim ({} interpreter)", python));
         let mut c = Command::new(&python);
         c.args(["-m", "orchestrator.agent"])
             .arg("--task")

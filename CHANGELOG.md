@@ -2,6 +2,13 @@
 
 Changes on `fix/observe-ui-and-cancel` compared with `origin/main` as of 2026-05-09.
 
+## Bug fixes — binary discovery, status visibility (2026-05-09)
+
+- **Claw binary discovery** (`lib.rs find_claw_binary`): now searches both `<kim_root>/pythonExperimentTool/…` (nested layout where pythonExperimentTool lives inside kim-pro) **and** `<kim_root.parent()>/pythonExperimentTool/…` (sibling layout). Previously only the sibling path was checked, causing "Claw binary not found" when pythonExperimentTool is inside kim-pro. Users no longer need to set `CLAW_BIN` manually.
+- **Removed noisy interpreter-path message** (`lib.rs`): the `[STATUS] Routing to Kim (/path/to/venv/bin/python interpreter)` line that was being shown in the activity feed is now gone — it exposed internal implementation details with no user value.
+- **Status messages now visible during headless tasks** (`ChatView.tsx`): browser_provider STATUS messages arrive on stderr with a Python log prefix (`[INFO] …: [STATUS] …`). `isNoiseLine` now protects any line containing `[STATUS]` from being filtered. `parseLogLine` now also detects `[STATUS]` embedded inside stderr log records. This fixes the "nothing happens" appearance when Kim is routing through the browser provider in headless mode.
+- **Immediate task-start feedback** (`agent.py`): `KimAgent.run()` now prints `[STATUS] Kim is working on it…` to stdout at the very start of every task, so the activity feed is never blank while the provider is loading.
+
 ## Claw via Browser Provider (no API key)
 
 Wired up the long-dormant file-bridge path so Code-tab tasks can run Claw without an Anthropic API key — they relay through Kim's logged-in browser session instead.

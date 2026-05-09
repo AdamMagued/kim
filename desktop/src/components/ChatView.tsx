@@ -115,8 +115,9 @@ const HIDDEN_REGEX: RegExp[] = [
 ];
 
 function isNoiseLine(raw: string): boolean {
-  // Never suppress explicit status lines from the agent
-  if (raw.startsWith('[STATUS]')) return false;
+  // Never suppress status lines — from stdout ("[STATUS] …") or embedded in
+  // a stderr log record ("[err] … [STATUS] …"). These are user-facing signals.
+  if (raw.startsWith('[STATUS]') || raw.includes('[STATUS]')) return false;
   // Strip the [err] prefix that appendRaw prepends before pattern-matching,
   // otherwise regex anchors like /^\s*\|/ never fire.
   const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
@@ -270,12 +271,19 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
     };
   }
 
-  // [STATUS] lines — emitted by browser_provider for live Gemini/Claude feedback
+  // [STATUS] lines — emitted by agent/browser_provider for live feedback.
+  // May arrive on stdout (raw starts with [STATUS]) or embedded inside a
+  // stderr log line like "[INFO] orchestrator.providers.browser_provider: [STATUS] …"
   if (stripped.startsWith('[STATUS]') || raw.startsWith('[STATUS]')) {
     const text = (stripped.startsWith('[STATUS]') ? stripped : raw)
       .replace(/^\[STATUS\]\s*/, '').trim();
     if (text) return { id, kind: 'status', icon: '›', text };
     return null;
+  }
+  const embeddedStatusIdx = stripped.indexOf('[STATUS]');
+  if (isErr && embeddedStatusIdx !== -1) {
+    const text = stripped.slice(embeddedStatusIdx + '[STATUS]'.length).trim();
+    if (text) return { id, kind: 'status', icon: '›', text };
   }
 
   // [TOOL] lines — 'module:' prefix is optional in newer agent log format

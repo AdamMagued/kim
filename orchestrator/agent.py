@@ -377,6 +377,7 @@ class KimAgent:
             {"success": bool, "summary": str, "screenshot": str (base64)}
         """
         self._log("INFO", f"=== Starting task: {task!r} ===")
+        print("[STATUS] Kim is working on it…", flush=True)
         self._screenshot_hashes = []
 
         # Let the provider reset any per-session state (e.g. BrowserProvider
