@@ -462,8 +462,8 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
 
   return (
     <div className="kim-msg-row kim-msg-row--assistant">
-      <div className="kim-bubble-wrap kim-bubble-wrap--assistant" style={{ maxWidth: '78%', minWidth: 0 }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
+      <div className="kim-bubble-wrap kim-bubble-wrap--assistant">
+        <div className="kim-bubble-wrap__inner">
           {hasText && (
             <div className={`kim-bubble kim-bubble--assistant${hasTools ? ' kim-bubble--assistant-group-top' : ''}`}>
               {textBlocks.map((b, i) => (

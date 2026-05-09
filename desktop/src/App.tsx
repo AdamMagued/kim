@@ -186,6 +186,7 @@ export default function App() {
   function handleSelectSession(session: SessionInfo) {
     setActiveSession(session);
     setNewChatMode(false);
+    setChatSerial(s => s + 1);   // user-initiated select → remount for clean slate
   }
 
   function handleNewChat() {
@@ -217,14 +218,19 @@ export default function App() {
   }
 
   const handleTaskDone = useCallback((sessionId?: string) => {
-    // Only auto-navigate to the session when NOT in newChatMode.
-    // In newChatMode the liveHistory state already displays the conversation
-    // inline — auto-selecting the session would change the ChatView key,
-    // causing a full unmount/remount (the "refresh flash" bug).
-    if (sessionId && !newChatMode) setPendingSelectSessionId(sessionId);
+    // Auto-navigate to the just-completed session even from newChatMode so the
+    // sidebar highlights it and the user can clearly see "this chat is saved"
+    // (issue #3 §4: chats appearing to vanish after task completion). The
+    // ChatView's key continues to use the same id so transitioning from
+    // newChatMode → loaded does not remount.
+    if (sessionId) setPendingSelectSessionId(sessionId);
     refresh();
-    setTimeout(() => { refresh(); }, 500);
-  }, [refresh, newChatMode]);
+    // Poll a few times — Python flushes the last JSONL line right before
+    // exit, and the OS may take a beat to make the file visible to readdir.
+    setTimeout(() => { refresh(); }, 400);
+    setTimeout(() => { refresh(); }, 1200);
+    setTimeout(() => { refresh(); }, 2400);
+  }, [refresh]);
 
   // Auto-select the just-completed session once it appears in kimSessions.
   useEffect(() => {
@@ -355,7 +361,7 @@ export default function App() {
         </header>
 
         <ChatView
-          key={activeSession ? sessionKey(activeSession) : `new-${chatSerial}`}
+          key={`chat-${chatSerial}`}
           session={activeSession}
           newChatMode={newChatMode}
           settings={settings}

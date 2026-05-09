@@ -554,6 +554,17 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     return () => clearInterval(id);
   }, [isRunning]);
 
+  // Defensive: whenever isRunning flips to false from any source (done,
+  // cancelled, error), also tear down the floating cancel widget. The Rust
+  // side already does this on `kim-agent-done`, but if that event is missed
+  // (e.g. a previous run left isRunning stuck), this guard prevents the
+  // overlay from getting orphaned. (issue #3 §5)
+  useEffect(() => {
+    if (!isRunning) {
+      invoke('set_task_active_mode', { active: false }).catch(() => {});
+    }
+  }, [isRunning]);
+
   const filteredConnectors = CONNECTORS.filter(connector => {
     const q = connectorSearch.trim().toLowerCase();
     if (!q) return true;
@@ -685,10 +696,20 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       lastLoadedSessionIdRef.current = null;
       return;
     }
-    const isSessionChange = lastLoadedSessionIdRef.current !== session.session_id;
+    const prevId = lastLoadedSessionIdRef.current;
+    const isSessionChange = prevId !== session.session_id;
+    // "Self transition": we were in newChatMode (no prior session) and the
+    // newly-selected session is the conversation we just ran (its id matches
+    // our in-flight conversationId). Treat this like a silent refresh — keep
+    // liveHistory and skip the spinner so the chat doesn't appear to vanish
+    // and then reappear (issue #3 §4).
+    const isSelfTransition =
+      isSessionChange &&
+      prevId === null &&
+      session.session_id === activeResumeSessionIdRef.current;
     lastLoadedSessionIdRef.current = session.session_id;
 
-    if (isSessionChange) {
+    if (isSessionChange && !isSelfTransition) {
       setLoadingMessages(true);
       setLiveHistory([]);
       // Reset run history and re-hydrate from the sidecar `<id>.runs.json` file.
@@ -722,22 +743,22 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         // Animate only on session change. On silent refresh the bubble was
         // already shown (and animated) via liveHistory — re-animating it
         // looks like the chat is "refreshing".
-        if (isSessionChange && prev > 0 && msgs.length > prev && lastAssistantIdx >= prev) {
+        if (isSessionChange && !isSelfTransition && prev > 0 && msgs.length > prev && lastAssistantIdx >= prev) {
           setNewestMsgIdx(lastAssistantIdx);
         } else {
           setNewestMsgIdx(null);
         }
         prevMsgCountRef.current = msgs.length;
         setMessages(msgs);
-        // Silent refresh: now that disk messages include the new turns,
-        // it's safe to clear liveHistory without leaving a visible gap.
-        if (!isSessionChange) {
+        // Silent refresh AND self-transition: clear liveHistory only after
+        // disk messages are loaded so the chat doesn't blink empty.
+        if (!isSessionChange || isSelfTransition) {
           setLiveHistory([]);
         }
       })
       .catch(err => console.error('Failed to load messages:', err))
       .finally(() => {
-        if (isSessionChange) setLoadingMessages(false);
+        if (isSessionChange && !isSelfTransition) setLoadingMessages(false);
       });
   }, [session, settings.kim_sessions_dir, settings.claw_sessions_dir, messageReloadNonce]);
 
@@ -820,6 +841,31 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     if (statsMatch) {
       setTokenStats({ input: parseInt(statsMatch[1]), output: parseInt(statsMatch[2]), total: parseInt(statsMatch[3]) });
       return;
+    }
+
+    // Surface Claw's structured JSON error output as a real error banner
+    // instead of silently dropping the line and showing only "Agent Error".
+    // Claw emits e.g. {"error":"missing Anthropic credentials …","type":"error"}
+    // on stdout right before exiting non-zero.
+    const stdoutLine = line.startsWith('[err]') ? line.slice(5).trimStart() : line;
+    if (stdoutLine.startsWith('{') && stdoutLine.includes('"error"')) {
+      try {
+        const parsed = JSON.parse(stdoutLine) as { error?: string; type?: string; message?: string };
+        const msg = (parsed.error ?? parsed.message ?? '').trim();
+        if (msg && (parsed.type === 'error' || /credential|api[_ ]?key|unauthorized/i.test(msg))) {
+          setTaskError(friendlyError(msg));
+          if (lastRunTaskRef.current) setLastFailedTask(lastRunTaskRef.current);
+          needHelpFlagRef.current = true; // reuse the flag so kim-agent-done suppresses the generic banner
+          setActivity(prev => {
+            const next = [...prev, { id, kind: 'error' as const, icon: '⚠', text: friendlyError(msg) }];
+            if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
+            return next;
+          });
+          return;
+        }
+      } catch {
+        /* not JSON, fall through */
+      }
     }
 
     // Handle [DIFF] lines — annotate the previous file-write activity item

@@ -4725,9 +4725,10 @@ async fn set_task_active_mode(app_handle: tauri::AppHandle, active: bool) -> Res
             }
         }
     } else {
-        // Hide cancel widget
+        // Destroy (not just hide) the cancel widget so a stale instance can
+        // never end up stacked under a new one on the next run. (issue #3 §5)
         if let Some(cancel_win) = app_handle.get_webview_window(cancel_label) {
-            let _ = cancel_win.hide();
+            let _ = cancel_win.close();
         }
 
         // Show main window
@@ -4865,6 +4866,34 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
     Err("Chrome/Chromium not found. Install Google Chrome to use the browser provider.".to_string())
 }
 
+/// Read a single value from `<kim_root>/.env` (best-effort, no dependency).
+/// Real env vars take priority over file values; `claw` and `python` already
+/// inherit the parent process env, so this only acts as a fallback.
+fn read_env_file_var(kim_root: &Path, key: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(key) {
+        if !v.trim().is_empty() {
+            return Some(v);
+        }
+    }
+    let path = kim_root.join(".env");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let prefix = format!("{}=", key);
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            let mut v = rest.trim().to_string();
+            if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
+                || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+            {
+                v = v[1..v.len() - 1].to_string();
+            }
+            if !v.is_empty() { return Some(v); }
+        }
+    }
+    None
+}
+
 /// Locate the `claw` binary. Search order:
 /// 1. CLAW_BIN env var (explicit override)
 /// 2. <kim-fork-root>/pythonExperimentTool/claw-code/rust/target/release/claw
@@ -4957,15 +4986,39 @@ async fn send_task(
     let mut cmd = if is_claw {
         let claw_bin = find_claw_binary(&kim_root)
             .ok_or_else(|| "Claw binary not found. Build it with `cargo build --release` in pythonExperimentTool/claw-code/rust, or set CLAW_BIN to the binary path.".to_string())?;
+        // Emit a clear status line so the activity feed shows that the task is
+        // running through Claw (not Gemini/Kim). This makes silent fallbacks
+        // impossible to miss — see issue #3 §2 "Incorrect Provider Routing".
+        let _ = app_handle.emit("kim-agent-output", format!("[STATUS] Routing to Claw: {}", claw_bin.display()));
+        // Pre-flight: surface a readable error before invoking Claw if no
+        // Anthropic credentials are reachable. Otherwise Claw exits with a
+        // bare JSON error and the UI just shows "Agent Error". (issue #3 §3)
+        let claw_key = read_env_file_var(&kim_root, "ANTHROPIC_API_KEY")
+            .or_else(|| read_env_file_var(&kim_root, "CLAUDE_API_KEY"));
+        if claw_key.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            return Err(
+                "Claw needs an Anthropic API key. Add `ANTHROPIC_API_KEY=sk-ant-…` to your .env (in the Kim repo root) or export it in your shell before launching Kim, then try again.".to_string()
+            );
+        }
         let mut c = Command::new(&claw_bin);
         c.arg("--output-format").arg("json")
             .arg("prompt").arg(&task)
             .current_dir(&target_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(k) = claw_key { c.env("ANTHROPIC_API_KEY", k); }
+        // Forward optional helpers if present in .env or env so users can pin
+        // a model or proxy without re-launching Kim.
+        for k in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAW_MODEL", "CLAUDE_MODEL"] {
+            if let Some(v) = read_env_file_var(&kim_root, k) {
+                c.env(k, v);
+            }
+        }
         c
     } else {
         let python = find_python_interpreter(&kim_root)?;
+        // Status line so the user can tell Kim is the active agent (vs Claw).
+        let _ = app_handle.emit("kim-agent-output", format!("[STATUS] Routing to Kim ({} interpreter)", python));
         let mut c = Command::new(&python);
         c.args(["-m", "orchestrator.agent"])
             .arg("--task")
