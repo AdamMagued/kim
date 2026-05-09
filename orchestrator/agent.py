@@ -549,7 +549,9 @@ class KimAgent:
                         "so the page content is not accessible yet."
                     )
                     self.memory.add_user(f"[Tool result: {tool_name}]\n{result_text}")
-                    self._session_store.append_message({"role": "user", "content": f"[Tool result: {tool_name}]\n{result_text}"})
+                    self._session_store.append_message(
+                        {"role": "user", "content": f"[Tool result: {tool_name}]\n{result_text}"}
+                    )
                     self.memory.add_assistant(summary)
                     self._session_store.append_message({"role": "assistant", "content": summary})
                     return {"success": False, "summary": summary, "screenshot": last_screenshot_b64}

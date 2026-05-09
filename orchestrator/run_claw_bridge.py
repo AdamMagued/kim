@@ -59,6 +59,7 @@ def _load_config(path: str | None) -> dict:
     except Exception:  # noqa: BLE001
         return {}
 
+
 logger = logging.getLogger("kim.run_claw_bridge")
 
 

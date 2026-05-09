@@ -4572,7 +4572,7 @@ async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
                 // Walk up to find the .app bundle and open it.
                 let mut path = exe.as_path();
                 loop {
-                    if path.extension().map_or(false, |e| e == "app") {
+                    if path.extension().is_some_and(|e| e == "app") {
                         let _ = std::process::Command::new("open").arg(path).spawn();
                         break;
                     }
