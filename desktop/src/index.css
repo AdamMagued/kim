@@ -2349,10 +2349,32 @@ kbd {
   position: relative;
   display: flex;
   flex-direction: column;
-  min-width: 0;
+  /* Width is content-driven, capped per-side below. min-width is intentionally
+     unset (defaults to auto) so the wrap doesn't collapse to 0 and squeeze the
+     bubble narrower than its text content (which would force "hi" → "h\ni"). */
 }
-.kim-bubble-wrap--user { align-items: flex-end; max-width: 75%; }
-.kim-bubble-wrap--assistant { align-items: flex-start; }
+.kim-bubble-wrap--user {
+  align-items: flex-end;
+  max-width: 75%;
+}
+.kim-bubble-wrap--assistant {
+  align-items: flex-start;
+  max-width: 82%;
+}
+/* Inside the wrap, the bubble's `max-width: 75/82%` would resolve against the
+   wrap's auto width, producing a smaller-than-content bubble. Override to
+   100% of the wrap so the bubble fits its text. */
+.kim-bubble-wrap .kim-bubble--user,
+.kim-bubble-wrap .kim-bubble--assistant {
+  max-width: 100%;
+}
+.kim-bubble-wrap__inner {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  width: 100%;
+}
 .kim-bubble-actions {
   display: flex;
   gap: 4px;
