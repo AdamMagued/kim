@@ -2,6 +2,20 @@
 
 Changes on `fix/observe-ui-and-cancel` compared with `origin/main` as of 2026-05-09.
 
+## Claw via Browser Provider (no API key)
+
+Wired up the long-dormant file-bridge path so Code-tab tasks can run Claw without an Anthropic API key — they relay through Kim's logged-in browser session instead.
+
+- `pythonExperimentTool/claw-code/rust/crates/rusty-claude-cli/src/file_bridge.rs`: `FileBridgeClient::new` now honors the `CLAW_BRIDGE_DIR` env var (falls back to `/tmp/claw_bridge`). Two concurrent Claw runs no longer clobber each other on `bridge_request.json`. Bridge timeout extended from 5 → 10 minutes for browser-scrape latency. Rebuilt release binary.
+- `orchestrator/run_claw_bridge.py` (NEW): one-shot Python entrypoint. Takes `--task`, `--cwd`, `--provider`. Builds a `BrowserProvider`, calls the existing `mcp_server.tools.claw_bridge.run_claw_subtask` to spawn Claw with `CLAW_FILE_BRIDGE=1` and relay every LLM request through the browser. Honors `CLAW_BIN` env var.
+- `desktop/src-tauri/src/lib.rs send_task`: Code-tab branch now picks between
+  - **Browser-bridge mode** (provider starts with `browser`): spawns `python -m orchestrator.run_claw_bridge --task … --cwd … --provider browser:gemini` instead of Claw directly.
+  - **Direct API mode** (any other provider): spawns Claw with `ANTHROPIC_API_KEY` from `.env` (existing behavior).
+  The pre-flight error for direct mode now points users back to "Browser" if they don't have a key.
+- Chrome CDP launch now triggers for browser-bridge Claw runs too (was previously gated on `!is_claw`), so the BrowserProvider has a CDP target to attach to.
+- Webview-bridge env (`KIM_WEBVIEW_BRIDGE_URL`, `KIM_WEBVIEW_BRIDGE_TOKEN`) is forwarded to the Python relay so the in-app sign-in window remains drivable.
+- Activity feed shows `[STATUS] Routing to Claw via Kim's browser provider (browser:gemini)` on bridge runs and `[STATUS] Routing to Claw (direct Anthropic API)` on direct runs.
+
 ## Browser Provider Lifecycle
 
 - Added stronger lifecycle guards for the in-app browser provider so active tasks keep the existing provider chat instead of navigating or replacing it.
