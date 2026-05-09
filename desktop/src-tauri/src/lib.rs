@@ -4978,6 +4978,17 @@ async fn send_task(
         kim_root.join("kim_sessions")
     };
 
+    // Default to the browser provider (no API key required) when the caller
+    // omits one or passes an empty string. Never silently fall through to a
+    // paid API key provider. Claw does its own provider/auth handling.
+    let provider_arg = provider
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "browser".to_string());
+    // Whether the user picked a browser-backed provider in the composer (e.g.
+    // "browser:gemini"). For Code-tab tasks this routes Claw through Kim's
+    // BrowserProvider via the file-bridge instead of calling Anthropic.
+    let is_browser_provider = provider_arg == "browser" || provider_arg.starts_with("browser:");
+
     // Code (Claw) sessions run the `claw` binary directly against the user's
     // project, with Claw's own coding-agent system prompt. Chat (Kim) sessions
     // continue to run `python -m orchestrator.agent` with the desktop-control
@@ -4986,35 +4997,68 @@ async fn send_task(
     let mut cmd = if is_claw {
         let claw_bin = find_claw_binary(&kim_root)
             .ok_or_else(|| "Claw binary not found. Build it with `cargo build --release` in pythonExperimentTool/claw-code/rust, or set CLAW_BIN to the binary path.".to_string())?;
-        // Emit a clear status line so the activity feed shows that the task is
-        // running through Claw (not Gemini/Kim). This makes silent fallbacks
-        // impossible to miss — see issue #3 §2 "Incorrect Provider Routing".
-        let _ = app_handle.emit("kim-agent-output", format!("[STATUS] Routing to Claw: {}", claw_bin.display()));
-        // Pre-flight: surface a readable error before invoking Claw if no
-        // Anthropic credentials are reachable. Otherwise Claw exits with a
-        // bare JSON error and the UI just shows "Agent Error". (issue #3 §3)
         let claw_key = read_env_file_var(&kim_root, "ANTHROPIC_API_KEY")
             .or_else(|| read_env_file_var(&kim_root, "CLAUDE_API_KEY"));
-        if claw_key.as_deref().map(str::trim).unwrap_or("").is_empty() {
-            return Err(
-                "Claw needs an Anthropic API key. Add `ANTHROPIC_API_KEY=sk-ant-…` to your .env (in the Kim repo root) or export it in your shell before launching Kim, then try again.".to_string()
+
+        if is_browser_provider {
+            // ── Browser-bridge mode ──────────────────────────────────────
+            // Spawn `python -m orchestrator.run_claw_bridge`, which spawns
+            // Claw with CLAW_FILE_BRIDGE=1 and relays each LLM request
+            // through Kim's BrowserProvider. No Anthropic key required.
+            let python = find_python_interpreter(&kim_root)?;
+            let _ = app_handle.emit(
+                "kim-agent-output",
+                format!("[STATUS] Routing to Claw via Kim's browser provider ({})", provider_arg),
             );
-        }
-        let mut c = Command::new(&claw_bin);
-        c.arg("--output-format").arg("json")
-            .arg("prompt").arg(&task)
-            .current_dir(&target_root)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(k) = claw_key { c.env("ANTHROPIC_API_KEY", k); }
-        // Forward optional helpers if present in .env or env so users can pin
-        // a model or proxy without re-launching Kim.
-        for k in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAW_MODEL", "CLAUDE_MODEL"] {
-            if let Some(v) = read_env_file_var(&kim_root, k) {
-                c.env(k, v);
+            let _ = app_handle.emit(
+                "kim-agent-output",
+                format!("[STATUS] claw binary: {}", claw_bin.display()),
+            );
+            let mut c = Command::new(&python);
+            c.args(["-m", "orchestrator.run_claw_bridge"])
+                .arg("--task").arg(&task)
+                .arg("--cwd").arg(target_root.to_string_lossy().to_string())
+                .arg("--provider").arg(&provider_arg)
+                .current_dir(&kim_root)
+                .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
+                // Tell run_claw_subtask exactly which claw binary to spawn,
+                // so it doesn't have to repeat the search dance.
+                .env("CLAW_BIN", claw_bin.to_string_lossy().to_string())
+                // Forward webview-bridge creds so BrowserProvider can drive
+                // the in-app sign-in window in headless mode if configured.
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            c
+        } else {
+            // ── Direct API mode ──────────────────────────────────────────
+            // Pre-flight: surface a readable error before invoking Claw if
+            // no Anthropic credentials are reachable. Otherwise Claw exits
+            // with a bare JSON error and the UI just shows "Agent Error".
+            if claw_key.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                return Err(
+                    "Claw needs an Anthropic API key for direct-API mode. Add `ANTHROPIC_API_KEY=sk-ant-…` to your .env (Kim repo root) or switch the provider dropdown back to 'Browser' to run Claw through your logged-in browser session.".to_string()
+                );
             }
+            let _ = app_handle.emit(
+                "kim-agent-output",
+                format!("[STATUS] Routing to Claw (direct Anthropic API): {}", claw_bin.display()),
+            );
+            let mut c = Command::new(&claw_bin);
+            c.arg("--output-format").arg("json")
+                .arg("prompt").arg(&task)
+                .current_dir(&target_root)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(k) = claw_key { c.env("ANTHROPIC_API_KEY", k); }
+            // Forward optional helpers if present in .env or env so users can
+            // pin a model or proxy without re-launching Kim.
+            for k in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAW_MODEL", "CLAUDE_MODEL"] {
+                if let Some(v) = read_env_file_var(&kim_root, k) {
+                    c.env(k, v);
+                }
+            }
+            c
         }
-        c
     } else {
         let python = find_python_interpreter(&kim_root)?;
         // Status line so the user can tell Kim is the active agent (vs Claw).
@@ -5038,7 +5082,10 @@ async fn send_task(
     };
 
     let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();
-    if !is_claw {
+    // The webview-bridge creds let BrowserProvider drive the in-app sign-in
+    // window. Forward them whenever a browser provider is in play, including
+    // Claw-via-browser-bridge runs, so headless flows stay consistent.
+    if !is_claw || is_browser_provider {
         if let Some(cfg) = &bridge_cfg {
             cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
                 .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
@@ -5046,15 +5093,10 @@ async fn send_task(
         }
     }
 
-    // Default to the browser provider (no API key required) when the caller
-    // omits one or passes an empty string. Never silently fall through to a
-    // paid API key provider. Claw does its own provider/auth handling.
-    let provider_arg = provider
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "browser".to_string());
-
-    // Chrome CDP launch only matters for the Kim browser provider.
-    if !is_claw && (provider_arg == "browser" || provider_arg.starts_with("browser:")) {
+    // Chrome CDP launch is needed whenever a browser provider is in play —
+    // both for Kim's Chat-tab tasks and for Claw running in browser-bridge
+    // mode (which calls into BrowserProvider via run_claw_bridge).
+    if is_browser_provider {
         if bridge_cfg.is_none() {
             let root_for_chrome = kim_root.clone();
             match tokio::task::spawn_blocking(move || launch_chrome_for_cdp(&root_for_chrome)).await {

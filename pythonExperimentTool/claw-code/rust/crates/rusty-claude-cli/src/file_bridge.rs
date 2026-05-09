@@ -24,11 +24,11 @@ use serde_json::{json, Value};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const BRIDGE_DIR: &str = "/tmp/claw_bridge";
+const DEFAULT_BRIDGE_DIR: &str = "/tmp/claw_bridge";
 const REQUEST_FILE: &str = "bridge_request.json";
 const RESPONSE_FILE: &str = "bridge_response.json";
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-const TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes — browser scrapes can be slow
 
 // ── FileBridgeClient ─────────────────────────────────────────────────────────
 
@@ -38,12 +38,19 @@ pub struct FileBridgeClient {
 
 impl FileBridgeClient {
     pub fn new() -> Self {
-        let bridge_dir = PathBuf::from(BRIDGE_DIR);
+        // Honor `CLAW_BRIDGE_DIR` so a relay process can give each Claw run an
+        // isolated temp directory (avoids two concurrent runs racing on
+        // bridge_request.json). Falls back to /tmp/claw_bridge when unset.
+        let bridge_dir = std::env::var("CLAW_BRIDGE_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_BRIDGE_DIR));
         fs::create_dir_all(&bridge_dir).expect("Failed to create bridge directory");
         // Clean any stale files from a previous run
         let _ = fs::remove_file(bridge_dir.join(REQUEST_FILE));
         let _ = fs::remove_file(bridge_dir.join(RESPONSE_FILE));
-        eprintln!("[file-bridge] Initialized at {BRIDGE_DIR}");
+        eprintln!("[file-bridge] Initialized at {}", bridge_dir.display());
         Self { bridge_dir }
     }
 
