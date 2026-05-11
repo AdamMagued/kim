@@ -27,20 +27,17 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import logging.handlers
+import queue
 import sys
-import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-class JSONLineHandler(logging.Handler):
+class _InternalJSONLineHandler(logging.Handler):
     """
-    Logging handler that writes one JSON object per line to a .jsonl file.
-
-    Log files are named kim_{YYYY-MM-DD}.jsonl and rotate daily by filename.
-    The handler auto-creates the log directory if needed.
+    Synchronous internal handler that writes one JSON object per line.
     """
 
     def __init__(self, log_dir: str = "logs", level: int = logging.DEBUG):
@@ -49,7 +46,6 @@ class JSONLineHandler(logging.Handler):
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._current_date: str = ""
         self._file = None
-        self._lock = threading.Lock()
 
     def _get_file(self):
         """Get (or open) the log file for today's date."""
@@ -66,57 +62,89 @@ class JSONLineHandler(logging.Handler):
         return self._file
 
     def emit(self, record: logging.LogRecord) -> None:
-        with self._lock:
-            try:
-                entry = {
-                    "timestamp": datetime.fromtimestamp(
-                        record.created, tz=timezone.utc
-                    ).isoformat(),
-                    "level": record.levelname,
-                    "logger": record.name,
-                    "message": record.getMessage(),
-                    "module": record.module,
-                    "function": record.funcName,
-                    "line": record.lineno,
+        try:
+            entry = {
+                "timestamp": datetime.fromtimestamp(
+                    record.created, tz=timezone.utc
+                ).isoformat(),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+                "module": record.module,
+                "function": record.funcName,
+                "line": record.lineno,
+            }
+
+            # Include exception info if present
+            if record.exc_info and record.exc_info[0] is not None:
+                entry["exception"] = {
+                    "type": record.exc_info[0].__name__,
+                    "message": str(record.exc_info[1]),
+                    "traceback": traceback.format_exception(*record.exc_info),
                 }
 
-                # Include exception info if present
-                if record.exc_info and record.exc_info[0] is not None:
-                    entry["exception"] = {
-                        "type": record.exc_info[0].__name__,
-                        "message": str(record.exc_info[1]),
-                        "traceback": traceback.format_exception(*record.exc_info),
-                    }
+            # Include any extra fields set via logger.info("msg", extra={...})
+            standard_attrs = {
+                "name", "msg", "args", "created", "relativeCreated",
+                "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+                "filename", "module", "pathname", "thread", "threadName",
+                "process", "processName", "levelname", "levelno", "message",
+                "msecs", "taskName",
+            }
+            extras = {
+                k: v for k, v in record.__dict__.items()
+                if k not in standard_attrs and not k.startswith("_")
+            }
+            if extras:
+                entry["extra"] = extras
 
-                # Include any extra fields set via logger.info("msg", extra={...})
-                standard_attrs = {
-                    "name", "msg", "args", "created", "relativeCreated",
-                    "exc_info", "exc_text", "stack_info", "lineno", "funcName",
-                    "filename", "module", "pathname", "thread", "threadName",
-                    "process", "processName", "levelname", "levelno", "message",
-                    "msecs", "taskName",
-                }
-                extras = {
-                    k: v for k, v in record.__dict__.items()
-                    if k not in standard_attrs and not k.startswith("_")
-                }
-                if extras:
-                    entry["extra"] = extras
-
-                f = self._get_file()
-                f.write(json.dumps(entry, default=str, ensure_ascii=False) + "\n")
-                f.flush()
-            except Exception:
-                self.handleError(record)
+            f = self._get_file()
+            f.write(json.dumps(entry, default=str, ensure_ascii=False) + "\n")
+            f.flush()
+        except Exception:
+            self.handleError(record)
 
     def close(self) -> None:
-        with self._lock:
-            if self._file is not None:
-                try:
-                    self._file.close()
-                except Exception:
-                    pass
-                self._file = None
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+        super().close()
+
+
+class JSONLineHandler(logging.handlers.QueueHandler):
+    """
+    Logging handler that writes one JSON object per line to a .jsonl file asynchronously.
+
+    Log files are named kim_{YYYY-MM-DD}.jsonl and rotate daily by filename.
+    The handler auto-creates the log directory if needed.
+    """
+
+    def __init__(self, log_dir: str = "logs", level: int = logging.DEBUG):
+        self._queue = queue.Queue(-1)
+        super().__init__(self._queue)
+        self.setLevel(level)
+        self._internal_handler = _InternalJSONLineHandler(log_dir=log_dir, level=level)
+        self._listener = logging.handlers.QueueListener(
+            self._queue, self._internal_handler, respect_handler_level=True
+        )
+        self._listener.start()
+        self._closed = False
+
+    def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+        """
+        Prepare a record for queuing. Override to prevent stripping exc_info,
+        as we're using a local thread queue, not multiprocessing.
+        """
+        return record
+
+    def close(self) -> None:
+        if not self._closed:
+            self._listener.stop()
+            self._internal_handler.close()
+            self._closed = True
         super().close()
 
 
