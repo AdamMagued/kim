@@ -3,11 +3,13 @@ import threading
 import time
 from mcp_server.logger import setup_structured_logging
 
+
 def worker(logger, num_logs, times):
     start = time.time()
     for i in range(num_logs):
         logger.info("This is a test log message", extra={"my_thread": threading.get_ident(), "iteration": i})
     times.append(time.time() - start)
+
 
 def run_benchmark(num_threads=10, logs_per_thread=1000):
     logger = logging.getLogger("benchmark")
@@ -25,6 +27,7 @@ def run_benchmark(num_threads=10, logs_per_thread=1000):
 
     end_time = time.time()
     return sum(times)/len(times), end_time - start_time
+
 
 if __name__ == "__main__":
     import shutil

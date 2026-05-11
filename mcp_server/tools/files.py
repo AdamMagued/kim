@@ -1,7 +1,7 @@
 import logging
 import os
+import base64
 from pathlib import Path
-
 import aiofiles
 
 from mcp_server.config import validate_path, PROJECT_ROOT
@@ -21,13 +21,11 @@ async def handle_read_file(args: dict) -> str:
     return content
 
 
-import base64
-
 async def handle_write_file(args: dict) -> str:
     path = validate_path(args["path"])
     content = args["content"]
     path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     if content.startswith("data:") and ";base64," in content:
         try:
             # Format: data:[<mediatype>][;base64],<data>
@@ -69,7 +67,7 @@ async def handle_list_dir(args: dict) -> str:
                 except OSError:
                     size = 0
                 entries.append(f"[FILE] {rel_root / fname}  ({size} bytes)")
-            
+
             if len(entries) > 500:
                 entries = entries[:500]
                 entries.append("... (truncated at 500 items. Use find_files or search instead)")
