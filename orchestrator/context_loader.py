@@ -43,6 +43,46 @@ _INSTRUCTION_FILES = [
 ]
 
 
+def _get_ancestor_directories(cwd: Path) -> list[Path]:
+    """Build ancestor chain: [/, /Users, /Users/adam, ..., /Users/adam/project]"""
+    directories: list[Path] = []
+    cursor: Optional[Path] = cwd
+    while cursor is not None:
+        directories.append(cursor)
+        parent = cursor.parent
+        if parent == cursor:
+            break
+        cursor = parent
+    directories.reverse()  # root first
+    return directories
+
+
+def _read_and_dedup_file(candidate: Path, seen_hashes: set[str]) -> Optional[dict]:
+    """Read file content, handle errors, and dedup by content hash."""
+    try:
+        if not candidate.is_file():
+            return None
+        content = candidate.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+
+        # Dedup by content hash
+        content_hash = hashlib.md5(
+            _normalize(content).encode()
+        ).hexdigest()
+        if content_hash in seen_hashes:
+            return None
+        seen_hashes.add(content_hash)
+
+        return {
+            "path": str(candidate),
+            "content": content,
+        }
+    except (OSError, UnicodeDecodeError) as e:
+        logger.debug(f"Skipping {candidate}: {e}")
+        return None
+
+
 def discover_instruction_files(cwd: Optional[Path] = None) -> list[dict]:
     """
     Walk from ``cwd`` upward to root, collecting instruction files.
@@ -53,16 +93,7 @@ def discover_instruction_files(cwd: Optional[Path] = None) -> list[dict]:
     """
     cwd = (cwd or Path.cwd()).resolve()
 
-    # Build ancestor chain: [/, /Users, /Users/adam, ..., /Users/adam/project]
-    directories: list[Path] = []
-    cursor: Optional[Path] = cwd
-    while cursor is not None:
-        directories.append(cursor)
-        parent = cursor.parent
-        if parent == cursor:
-            break
-        cursor = parent
-    directories.reverse()  # root first
+    directories = _get_ancestor_directories(cwd)
 
     files: list[dict] = []
     seen_hashes: set[str] = set()
@@ -70,27 +101,9 @@ def discover_instruction_files(cwd: Optional[Path] = None) -> list[dict]:
     for directory in directories:
         for candidate_name in _INSTRUCTION_FILES:
             candidate = directory / candidate_name
-            try:
-                if not candidate.is_file():
-                    continue
-                content = candidate.read_text(encoding="utf-8").strip()
-                if not content:
-                    continue
-
-                # Dedup by content hash
-                content_hash = hashlib.md5(
-                    _normalize(content).encode()
-                ).hexdigest()
-                if content_hash in seen_hashes:
-                    continue
-                seen_hashes.add(content_hash)
-
-                files.append({
-                    "path": str(candidate),
-                    "content": content,
-                })
-            except (OSError, UnicodeDecodeError) as e:
-                logger.debug(f"Skipping {candidate}: {e}")
+            file_data = _read_and_dedup_file(candidate, seen_hashes)
+            if file_data:
+                files.append(file_data)
 
     if files:
         logger.info(
