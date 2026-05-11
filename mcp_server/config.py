@@ -95,7 +95,7 @@ def validate_path(path_str: str) -> Path:
     an allowed root. Raises PermissionError if outside allowed paths or
     inside a sensitive directory.
     """
-    p = Path(path_str)
+    p = Path(path_str).expanduser()
     if not p.is_absolute():
         p = PROJECT_ROOT / p
     p = p.resolve()
