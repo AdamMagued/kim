@@ -43,17 +43,8 @@ _INSTRUCTION_FILES = [
 ]
 
 
-def discover_instruction_files(cwd: Optional[Path] = None) -> list[dict]:
-    """
-    Walk from ``cwd`` upward to root, collecting instruction files.
-
-    Returns:
-        List of ``{"path": str, "content": str}`` dicts, ordered from
-        root-most to deepest (matching Claw's convention).
-    """
-    cwd = (cwd or Path.cwd()).resolve()
-
-    # Build ancestor chain: [/, /Users, /Users/adam, ..., /Users/adam/project]
+def _get_search_directories(cwd: Path) -> list[Path]:
+    """Build ancestor chain from cwd up to root."""
     directories: list[Path] = []
     cursor: Optional[Path] = cwd
     while cursor is not None:
@@ -63,6 +54,45 @@ def discover_instruction_files(cwd: Optional[Path] = None) -> list[dict]:
             break
         cursor = parent
     directories.reverse()  # root first
+    return directories
+
+
+def _process_candidate(candidate: Path, seen_hashes: set[str]) -> Optional[dict]:
+    """Read, validate, and deduplicate a potential instruction file."""
+    try:
+        if not candidate.is_file():
+            return None
+        content = candidate.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+
+        # Dedup by content hash
+        content_hash = hashlib.md5(
+            _normalize(content).encode()
+        ).hexdigest()
+        if content_hash in seen_hashes:
+            return None
+        seen_hashes.add(content_hash)
+
+        return {
+            "path": str(candidate),
+            "content": content,
+        }
+    except (OSError, UnicodeDecodeError) as e:
+        logger.debug(f"Skipping {candidate}: {e}")
+        return None
+
+
+def discover_instruction_files(cwd: Optional[Path] = None) -> list[dict]:
+    """
+    Walk from ``cwd`` upward to root, collecting instruction files.
+
+    Returns:
+        List of ``{"path": str, "content": str}`` dicts, ordered from
+        root-most to deepest (matching Claw's convention).
+    """
+    cwd = (cwd or Path.cwd()).resolve()
+    directories = _get_search_directories(cwd)
 
     files: list[dict] = []
     seen_hashes: set[str] = set()
@@ -70,27 +100,9 @@ def discover_instruction_files(cwd: Optional[Path] = None) -> list[dict]:
     for directory in directories:
         for candidate_name in _INSTRUCTION_FILES:
             candidate = directory / candidate_name
-            try:
-                if not candidate.is_file():
-                    continue
-                content = candidate.read_text(encoding="utf-8").strip()
-                if not content:
-                    continue
-
-                # Dedup by content hash
-                content_hash = hashlib.md5(
-                    _normalize(content).encode()
-                ).hexdigest()
-                if content_hash in seen_hashes:
-                    continue
-                seen_hashes.add(content_hash)
-
-                files.append({
-                    "path": str(candidate),
-                    "content": content,
-                })
-            except (OSError, UnicodeDecodeError) as e:
-                logger.debug(f"Skipping {candidate}: {e}")
+            result = _process_candidate(candidate, seen_hashes)
+            if result:
+                files.append(result)
 
     if files:
         logger.info(
