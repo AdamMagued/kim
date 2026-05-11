@@ -956,7 +956,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
   };
 
   // ── Helpers ──────────────────────────────────────────────────────────
-  const normalizeText = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+  const normalizeText = (v) => String(v || '').replace(/\s+/g, ' ').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/[—–]/g, '--').replace(/…/g, '...').trim();
 
   const isVisible = (el) => {
     if (!el) return false;
@@ -1066,8 +1066,10 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
     if (actual === expected) return true;
     if (expected.length < 500) return false;
     if (actual.length < Math.floor(expected.length * 0.98)) return false;
-    return actual.slice(0, 220) === expected.slice(0, 220)
-      && actual.slice(-220) === expected.slice(-220);
+    
+    const fuzzyMatch = (a, b) => a.replace(/\W+/g, '') === b.replace(/\W+/g, '');
+    return fuzzyMatch(actual.slice(0, 220), expected.slice(0, 220))
+      && fuzzyMatch(actual.slice(-220), expected.slice(-220));
   };
 
   // ── IPC emit (Tauri native) ──────────────────────────────────────────
@@ -2290,7 +2292,7 @@ fn build_bridge_complete_script(
         return 0;
     };
 
-    const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/[—–]/g, '--').replace(/…/g, '...').trim();
 
     const selectorCounts = (selectors) => {
         const out = {};
@@ -2346,8 +2348,10 @@ fn build_bridge_complete_script(
         if (actual === expected) return true;
         if (expected.length < 500) return false;
         if (actual.length < Math.floor(expected.length * 0.98)) return false;
-        return actual.slice(0, 220) === expected.slice(0, 220)
-            && actual.slice(-220) === expected.slice(-220);
+        
+        const fuzzyMatch = (a, b) => a.replace(/\W+/g, '') === b.replace(/\W+/g, '');
+        return fuzzyMatch(actual.slice(0, 220), expected.slice(0, 220))
+            && fuzzyMatch(actual.slice(-220), expected.slice(-220));
     };
 
     const injectPromptText = async (inputEl, promptText) => {

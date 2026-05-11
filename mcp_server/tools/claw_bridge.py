@@ -178,9 +178,9 @@ async def run_claw_subtask(
         pass
 
     result_msg = (
-        f"Claw completed ({relay_count} LLM calls, exit code {exit_code})"
+        "Task completed successfully."
         if success
-        else f"Claw failed (exit code {exit_code}): {stderr_output[:200]}"
+        else f"Kim encountered an error: {stderr_output[:200]}"
     )
 
     logger.info(result_msg)
@@ -671,7 +671,17 @@ def _surface_bridge_reasoning(response: dict, previous: str = "") -> str:
                 reasoning = str(parsed["text"]).strip()
         except (json.JSONDecodeError, TypeError):
             pass
-    # Drop lines that are pure JSON fragments
+            
+    # Aggressively strip `{"text": "` prefix if it got truncated and couldn't be parsed
+    if reasoning.startswith("{") and '"text"' in reasoning[:20]:
+        match = re.search(r'^\{\s*"text"\s*:\s*["\']?(.*)', reasoning, re.DOTALL)
+        if match:
+            reasoning = match.group(1).strip()
+            
+    # Drop trailing quotes or braces if they were left over
+    reasoning = re.sub(r'["\']?\s*\}?\s*$', '', reasoning)
+
+    # Drop lines that are pure JSON fragments (if the above still left an array or object)
     if reasoning.startswith("{") or reasoning.startswith("["):
         return previous
     # Replace provider brand names with "Kim"
