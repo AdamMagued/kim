@@ -1675,11 +1675,7 @@ fn open_browser_signin_window_impl(
 
     let label = "kim-browser-signin";
     if let Some(existing) = app_handle.get_webview_window(label) {
-        let task_running = BRIDGE_TASK_PID
-            .get_or_init(|| StdMutex::new(None))
-            .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false);
+        let task_running = is_bridge_task_running();
 
         if task_running {
             return Ok(
@@ -2874,7 +2870,7 @@ fn collect_bridge_payload(
                     if let Ok(mut pg) = WEBVIEW_BRIDGE_PROGRESS.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
                         pg.remove(req_id);
                     }
-                    if let Ok(mut hg) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+                    if let Ok(mut hg) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
                         hg.remove(req_id);
                     }
                     return Ok(payload);
@@ -2899,7 +2895,7 @@ fn collect_bridge_payload(
             if let Ok(mut pg) = WEBVIEW_BRIDGE_PROGRESS.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
                 pg.remove(req_id);
             }
-            if let Ok(mut hg) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+            if let Ok(mut hg) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
                 hg.remove(req_id);
             }
             agent_debug_log(
@@ -3937,8 +3933,9 @@ fn handle_webview_bridge_request(
                     // Background thread: wait for child to exit, then clear PID
                     let app_for_wait = app_handle.clone();
                     std::thread::spawn(move || {
-                        let mut child = child;
-                        let _ = child.wait();
+                    let mut child = child;
+                        let status = child.wait();
+                        let success = status.as_ref().map(|s| s.success()).unwrap_or(false);
                         if let Some(handle) = reader_handle {
                             let _ = handle.join();
                         }
@@ -3948,7 +3945,7 @@ fn handle_webview_bridge_request(
                         if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
                             *guard = None;
                         }
-                        let _ = app_for_wait.emit("kim-agent-done", true);
+                        let _ = app_for_wait.emit("kim-agent-done", success);
                     });
 
                     respond_json(request, 200, serde_json::json!({
@@ -5268,11 +5265,7 @@ async fn navigate_browser_window_if_open(url: String, app_handle: tauri::AppHand
     }
 
     if let Some(existing) = app_handle.get_webview_window("kim-browser-signin") {
-        let task_running = BRIDGE_TASK_PID
-            .get_or_init(|| StdMutex::new(None))
-            .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false);
+        let task_running = is_bridge_task_running();
 
         if task_running {
             return Err(

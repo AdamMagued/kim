@@ -572,15 +572,19 @@ class BrowserProvider(BaseProvider):
                 logger.info("[STATUS] Kim is preparing the request…")
 
         except httpx.ReadTimeout:
-            logger.warning("Bridge /v1/send timed out, falling back to /v1/complete")
-            return await self._complete_via_webview_bridge_legacy(
-                prompt, headers, payload, completion_hash
-            )
+            # Do NOT fall back to /v1/complete — the prompt may already have been
+            # injected by Rust, and resending would duplicate it (#5).
+            logger.warning("Bridge /v1/send timed out (prompt may already be injected)")
+            return {
+                "type": "text",
+                "content": "NEED_HELP: Bridge /v1/send timed out. The prompt may have been partially sent. Please check the browser window and retry if needed.",
+            }
         except Exception as e:
-            logger.warning(f"Bridge /v1/send failed ({e}), falling back to /v1/complete")
-            return await self._complete_via_webview_bridge_legacy(
-                prompt, headers, payload, completion_hash
-            )
+            logger.warning(f"Bridge /v1/send failed ({e})")
+            return {
+                "type": "text",
+                "content": f"NEED_HELP: Bridge /v1/send failed — {e}",
+            }
 
         # ── Long-poll for result ─────────────────────────────────────────
         try:
@@ -904,8 +908,10 @@ class BrowserProvider(BaseProvider):
                 if page.url != self._last_chat_page_url:
                     logger.info(
                         f"Tab URL changed for {site_key}: "
-                        f"{self._last_chat_page_url!r} → {page.url!r} (same site, keeping context)"
+                        f"{self._last_chat_page_url!r} → {page.url!r} (same site)"
                     )
+                    # The tab changed — could be a new conversation (#10)
+                    self._maybe_reset_system_prompt(page.url)
                 self._last_chat_page_url = page.url
                 return page, site_key
 

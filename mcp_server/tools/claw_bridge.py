@@ -132,6 +132,10 @@ async def run_claw_subtask(
                 if relay_count > MAX_RELAYS:
                     logger.error(f"Relay count exceeded {MAX_RELAYS} — stopping to prevent infinite loop")
                     process.kill()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        logger.warning("Claw process did not exit after kill (MAX_RELAYS)")
                     break
                 await _relay_one_request(browser_provider, relay_count, bridge_dir)
             else:
@@ -787,37 +791,51 @@ def _extract_first_bridge_json(text: str) -> Optional[dict]:
         [END_OF_RESPONSE]
 
     This function finds and extracts that embedded JSON.
+    String-aware: braces inside JSON strings are not counted (#11).
     """
     depth = 0
     start = -1
+    in_str = False
+    escape = False
     for i, ch in enumerate(text):
-        if ch == "{":
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
             if depth == 0:
                 start = i
             depth += 1
         elif ch == "}":
-            depth -= 1
-            if depth == 0 and start >= 0:
-                candidate = text[start: i + 1]
-                try:
-                    parsed = json.loads(candidate)
-                    if isinstance(parsed, dict) and ("text" in parsed or "tool_calls" in parsed):
-                        return parsed
-                except json.JSONDecodeError:
+            if depth > 0:  # Guard against negative depth
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidate = text[start: i + 1]
                     try:
-                        import json5
-                        parsed = json5.loads(candidate)
+                        parsed = json.loads(candidate)
                         if isinstance(parsed, dict) and ("text" in parsed or "tool_calls" in parsed):
                             return parsed
-                    except Exception:
+                    except json.JSONDecodeError:
                         try:
-                            import json_repair
-                            parsed = json_repair.loads(candidate)
+                            import json5
+                            parsed = json5.loads(candidate)
                             if isinstance(parsed, dict) and ("text" in parsed or "tool_calls" in parsed):
                                 return parsed
                         except Exception:
-                            pass
-                start = -1
+                            try:
+                                import json_repair
+                                parsed = json_repair.loads(candidate)
+                                if isinstance(parsed, dict) and ("text" in parsed or "tool_calls" in parsed):
+                                    return parsed
+                            except Exception:
+                                pass
+                    start = -1
     return None
 
 
