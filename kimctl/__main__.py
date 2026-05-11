@@ -47,6 +47,59 @@ def _kim_root() -> Path:
     return Path.cwd()
 
 
+def _get_fallback_token() -> str:
+    """Return fallback token from KIM_API_KEY or mcp_server config."""
+    token = os.environ.get("KIM_API_KEY", "").strip()
+    if not token:
+        try:
+            from mcp_server.config import get_config
+            token = get_config().get("api_key", "")
+        except ImportError:
+            pass
+    return token
+
+
+def _read_bridge_url_file(root: Path) -> str:
+    """Read URL from kim_sessions/.bridge_url."""
+    token_file = root / "kim_sessions" / ".bridge_url"
+    if token_file.exists():
+        try:
+            url_text = token_file.read_text(encoding="utf-8").strip()
+            if url_text:
+                return url_text
+        except Exception:
+            pass
+    return ""
+
+
+def _read_legacy_token_file(root: Path) -> tuple[str, str]:
+    """Read (url, token) from kim_sessions/.bridge_token."""
+    legacy_token_file = root / "kim_sessions" / ".bridge_token"
+    if legacy_token_file.exists():
+        try:
+            lines = legacy_token_file.read_text(encoding="utf-8").strip().splitlines()
+            if len(lines) >= 2:
+                return lines[0], lines[1]
+        except Exception:
+            pass
+    return "", ""
+
+
+def _read_config_yaml_bridge(root: Path) -> tuple[str, str]:
+    """Read (url, token) from config.yaml."""
+    config_file = root / "config.yaml"
+    if config_file.exists():
+        try:
+            import yaml  # type: ignore
+            with open(config_file) as f:
+                cfg = yaml.safe_load(f) or {}
+            bp = cfg.get("browser_provider", {})
+            return bp.get("bridge_url", ""), bp.get("bridge_token", "")
+        except Exception:
+            pass
+    return "", ""
+
+
 def _resolve_bridge() -> tuple[str, str]:
     """Return (base_url, token) for the bridge HTTP server."""
     url = os.environ.get("KIM_WEBVIEW_BRIDGE_URL", "").strip()
@@ -55,60 +108,33 @@ def _resolve_bridge() -> tuple[str, str]:
     if url and token:
         return url, token
 
-    # Default token is KIM_API_KEY
     if not token:
-        token = os.environ.get("KIM_API_KEY", "").strip()
-        if not token:
-            try:
-                from mcp_server.config import get_config
-                token = get_config().get("api_key", "")
-            except ImportError:
-                pass
+        token = _get_fallback_token()
 
-    # Try reading kim_sessions/.bridge_url
     root = _kim_root()
-    token_file = root / "kim_sessions" / ".bridge_url"
-    if token_file.exists():
-        try:
-            url_text = token_file.read_text(encoding="utf-8").strip()
-            if url_text:
-                if not url:
-                    url = url_text
-        except Exception:
-            pass
 
-    # Backwards compatibility: try reading kim_sessions/.bridge_token
-    legacy_token_file = root / "kim_sessions" / ".bridge_token"
-    if legacy_token_file.exists() and not url:
-        try:
-            lines = legacy_token_file.read_text(encoding="utf-8").strip().splitlines()
-            if len(lines) >= 2:
-                url = lines[0]
-                if not token:
-                    token = lines[1]
-        except Exception:
-            pass
+    if not url:
+        url = _read_bridge_url_file(root)
+
+    if not url:
+        legacy_url, legacy_token = _read_legacy_token_file(root)
+        if legacy_url:
+            url = legacy_url
+            if not token:
+                token = legacy_token
 
     if url and token:
         return url, token
 
-    # Try reading config.yaml
-    config_file = root / "config.yaml"
-    if config_file.exists():
-        try:
-            import yaml  # type: ignore
-            with open(config_file) as f:
-                cfg = yaml.safe_load(f) or {}
-            bp = cfg.get("browser_provider", {})
-            if not url:
-                url = bp.get("bridge_url", "")
-            if not token:
-                token = bp.get("bridge_token", "")
-        except Exception:
-            pass
+    config_url, config_token = _read_config_yaml_bridge(root)
+    if not url:
+        url = config_url
+    if not token:
+        token = config_token
 
     if not url:
         url = "http://127.0.0.1:18991"
+
     return url, token
 
 
