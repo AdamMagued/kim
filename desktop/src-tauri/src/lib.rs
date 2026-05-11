@@ -646,11 +646,17 @@ fn gemini_site_url(authuser: Option<u32>) -> String {
 }
 
 fn is_bridge_task_running() -> bool {
-    BRIDGE_TASK_PID
-        .get_or_init(|| StdMutex::new(None))
-        .lock()
-        .map(|guard| guard.is_some())
-        .unwrap_or(false)
+    let store = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None));
+    let Ok(mut guard) = store.lock() else { return false };
+    match *guard {
+        Some(pid) if process_exists(pid) => true,
+        Some(_) => {
+            // Process exited but PID was never cleared — clean it up
+            *guard = None;
+            false
+        }
+        None => false,
+    }
 }
 
 fn should_keep_browser_visible() -> bool {
@@ -1353,7 +1359,8 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         inputEl.dispatchEvent(pasteEvent);
         console.log('[KimBridge] ClipboardEvent paste dispatched:', imageFile.name);
 
-        waited = 0;
+        let waited = 0;
+        let thumbnailFound = false;
         while (waited < 1000) {
           await new Promise(r => setTimeout(r, 100));
           waited += 100;
@@ -1418,9 +1425,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       return String(value || '').replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
     };
 
-    const extractBridgeTextField = (raw) => {
-      return ''; // Disabled: let Python bridge parse JSON
-    };
+    // extractBridgeTextField removed (was dead code returning empty string)
 
     const cleanProgressText = (raw) => {
       let text = String(raw || '');
@@ -1439,14 +1444,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       lastProgressText = text;
       lastProgressAt = now;
       const payload = { ok: true, event: 'progress', req_id: reqId, site: siteKey, text };
-      if (!ipcEmit(payload) && callbackUrl) {
-        try {
-          const pingUrl = callbackUrl.replace('/callback', '/ping');
-          const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
-          const img = new Image();
-          img.src = `${pingUrl}?req_id=${encodeURIComponent(reqId)}&data=${encodeURIComponent(encoded)}`;
-        } catch (_) {}
-      }
+      ipcEmit(payload);
     };
 
     // Mark this as the current in-flight request. Any earlier send() call
@@ -1491,7 +1489,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
           const preDeadline = Date.now() + PRE_SEND_TIMEOUT;
           let noStopCount = 0;
           while (Date.now() < preDeadline) {
-            if (isSuperseded()) { console.log('[KimBridge] send superseded during pre-send wait, bailing'); return; }
+            if (isSuperseded()) { console.log('[KimBridge] send superseded during pre-send wait, bailing'); ipcEmit({ ok: false, event: 'error', req_id: reqId, error: 'Request superseded by newer send', site: siteKey }); return; }
             const pageText = getLatestResponseText(cfg, siteKey) || '';
             if (pageText.includes(prevHash)) break;
 
@@ -1511,23 +1509,34 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         }
       }
 
-      // 4b. Record THIS request's hash so the NEXT request can wait for it
-      if (completionHash) {
-        window.__kimBridge._lastHash = completionHash;
-      }
-
       if (!promptMatchesInput(inputEl, effectivePrompt)) {
         throw new Error('Prompt changed after injection. Refusing to send a partial prompt.');
       }
 
-      // 4c. Submit via synthetic Enter event.
-      // We already wrote the prompt to the clipboard and injected it at once,
-      // so there is no risk of sending an incomplete/split prompt.
+      // 4b. Submit via send button (preferred) or synthetic Enter (fallback).
       inputEl.focus();
-      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-      inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-      inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-      console.log('[KimBridge] Synthetic Enter dispatched to send message');
+      let sendClicked = false;
+      for (let attempt = 0; attempt < 15; attempt++) {
+        const sendBtn = findElement(cfg.send_selectors || [], { visible: true, enabled: true });
+        if (sendBtn) {
+          sendBtn.click();
+          sendClicked = true;
+          break;
+        }
+        await new Promise(r => setTimeout(r, 100));
+      }
+      if (!sendClicked) {
+        // Fallback: synthetic Enter
+        inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      }
+      console.log('[KimBridge] Message submitted via', sendClicked ? 'send button' : 'synthetic Enter');
+
+      // 4c. Record THIS request's hash AFTER submit so the NEXT request can wait for it
+      if (completionHash) {
+        window.__kimBridge._lastHash = completionHash;
+      }
 
       // 5. Emit "sent" immediately via IPC only — NOT via the legacy store,
       //    because the store is used by Rust's title-pull fallback which can't
@@ -1547,7 +1556,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
 
       while (Date.now() < hardDeadlineAt) {
         await new Promise(r => setTimeout(r, POLL_MS));
-        if (isSuperseded()) { console.log('[KimBridge] send superseded during response wait, bailing'); return; }
+        if (isSuperseded()) { console.log('[KimBridge] send superseded during response wait, bailing'); ipcEmit({ ok: false, event: 'error', req_id: reqId, error: 'Request superseded by newer send', site: siteKey }); return; }
 
         const latestText = getLatestResponseText(cfg, siteKey) || '';
         reportProgress(latestText);
@@ -1610,12 +1619,26 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
     if (!site) return false;
     const cfg = SITE_CONFIGS[site];
     if (!cfg) return false;
+    if (site === 'gemini') return !!findGeminiInput();
     return !!findElement(cfg.input_selectors, { visible: true });
   };
 
+  // ── Clear _lastHash when URL changes (new chat detected) ──────────────
+  let _lastObservedUrl = window.location.href;
+  setInterval(() => {
+    const currentUrl = window.location.href;
+    if (currentUrl !== _lastObservedUrl) {
+      _lastObservedUrl = currentUrl;
+      if (window.__kimBridge) {
+        window.__kimBridge._lastHash = null;
+        console.log('[KimBridge] URL changed, cleared _lastHash');
+      }
+    }
+  }, 1000);
+
   // ── Public API ─────────────────────────────────────────────────────────
   window.__kimBridge = {
-    _v: 8,
+    _v: 9,
     _lastHash: null, // Tracks the completion hash of the most recent request
     _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
     send,
@@ -2838,12 +2861,22 @@ fn collect_bridge_payload(
         // Check if result is already in the store (from IPC or HTTP callback).
         match result_store.lock() {
             Ok(mut guard) => {
-                if let Some(payload) = guard.remove(req_id) {
+                if let Some(payload) = guard.get(req_id).cloned() {
+                    // Remove result and associated markers
+                    guard.remove(req_id);
+                    guard.remove(&format!("{}_sent", req_id));
                     agent_debug_log(
                         "H1",
                         "collect: result found via IPC",
                         serde_json::json!({ "reqId": req_id, "loops": ipc_wait_loops }),
                     );
+                    // Also clean up progress and hidden-state entries
+                    if let Ok(mut pg) = WEBVIEW_BRIDGE_PROGRESS.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+                        pg.remove(req_id);
+                    }
+                    if let Ok(mut hg) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+                        hg.remove(req_id);
+                    }
                     return Ok(payload);
                 }
             }
@@ -2858,6 +2891,17 @@ fn collect_bridge_payload(
         }
 
         if started.elapsed() >= timeout {
+            // Clean up leaked entries on timeout
+            if let Ok(mut guard) = result_store.lock() {
+                guard.remove(req_id);
+                guard.remove(&format!("{}_sent", req_id));
+            }
+            if let Ok(mut pg) = WEBVIEW_BRIDGE_PROGRESS.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+                pg.remove(req_id);
+            }
+            if let Ok(mut hg) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+                hg.remove(req_id);
+            }
             agent_debug_log(
                 "H3",
                 "collect timeout waiting payload",
@@ -3511,6 +3555,28 @@ fn handle_webview_bridge_request(
             let site = normalize_site(parsed.site.as_deref().unwrap_or("claude"));
             let gemini_authuser = if site == "gemini" { parsed.authuser } else { None };
 
+            // Acquire lock early to prevent overlapping sends from clobbering
+            // clipboard, window state, or req_id stores (#33, #34)
+            let _bridge_guard = match WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(())).try_lock() {
+                Ok(g) => g,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    respond_json(
+                        request,
+                        429,
+                        serde_json::json!({"ok": false, "error": "bridge busy"}),
+                    );
+                    return;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    respond_json(
+                        request,
+                        500,
+                        serde_json::json!({"ok": false, "error": "lock poisoned"}),
+                    );
+                    return;
+                }
+            };
+
             let opened_window = false;
             let window = if let Some(w) = app_handle.get_webview_window("kim-browser-signin") {
                 w
@@ -3629,26 +3695,7 @@ fn handle_webview_bridge_request(
                 agent_debug_log("H1", "prompt clipboard write", serde_json::json!({ "ok": _clip_ok, "promptLen": parsed.prompt.len() }));
             }
 
-            // Acquire lock to prevent overlapping window manipulations (#34)
-            let _guard = match WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(())).try_lock() {
-                Ok(g) => g,
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    respond_json(
-                        request,
-                        429,
-                        serde_json::json!({"ok": false, "error": "bridge busy"}),
-                    );
-                    return;
-                }
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    respond_json(
-                        request,
-                        500,
-                        serde_json::json!({"ok": false, "error": "lock poisoned"}),
-                    );
-                    return;
-                }
-            };
+            // Lock already acquired at the top of /v1/send handler (#33)
 
             // Snapshot the user's frontmost app BEFORE the JS eval so we can
             // restore it after the offscreen webview steals key-window status
@@ -3979,9 +4026,8 @@ fn handle_webview_bridge_request(
             }
         }
         (Method::Post, "/v1/browser/show") => {
-            if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
-                let _ = win.show();
-                let _ = win.set_focus();
+            if app_handle.get_webview_window("kim-browser-signin").is_some() {
+                show_browser_window_impl(&app_handle);
                 respond_json(request, 200, serde_json::json!({"ok": true}));
             } else {
                 respond_json(request, 200, serde_json::json!({"ok": false, "message": "No browser window exists yet."}));
@@ -5083,8 +5129,9 @@ fn show_browser_window_impl(app_handle: &tauri::AppHandle) {
             let monitor_size = monitor.size();
             let width = 1280;
             let height = 860;
-            let x = (monitor_size.width as i32 - width) / 2;
-            let y = (monitor_size.height as i32 - height) / 2;
+            let pos = monitor.position();
+            let x = pos.x + (monitor_size.width as i32 - width) / 2;
+            let y = pos.y + (monitor_size.height as i32 - height) / 2;
             let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
             let _ = win.set_size(tauri::PhysicalSize::new(width as u32, height as u32));
         } else {
@@ -5736,15 +5783,28 @@ async fn cancel_task(
 fn send_signal(pid: u32, force: bool) -> std::io::Result<()> {
     use std::process::Command;
     let sig = if force { "-KILL" } else { "-TERM" };
+    // Kill the process group (-pid) so child processes are also terminated (#64).
+    // If group kill fails (e.g. the process is not a group leader), fall back
+    // to killing only the parent process.
+    let neg_pid = format!("-{}", pid);
     let status = Command::new("kill")
-        .args([sig, &pid.to_string()])
-        .status()?;
-    if !status.success() {
-        return Err(std::io::Error::other(
-            format!("kill {} {} failed with {}", sig, pid, status),
-        ));
+        .args([sig, &neg_pid])
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        _ => {
+            // Fallback: kill just the parent process
+            let status = Command::new("kill")
+                .args([sig, &pid.to_string()])
+                .status()?;
+            if !status.success() {
+                return Err(std::io::Error::other(
+                    format!("kill {} {} failed with {}", sig, pid, status),
+                ));
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 #[cfg(unix)]

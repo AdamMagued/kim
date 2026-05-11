@@ -943,12 +943,28 @@ class BrowserProvider(BaseProvider):
         logger.info(f"Found {site_key} tab: {page.url}")
         return page, site_key
 
-    def _maybe_reset_system_prompt(self, new_url: str) -> None:
-        """Reset _sent_system_prompt if the chat tab has moved to a DIFFERENT site.
+    @staticmethod
+    def _extract_conversation_id(url: str) -> str:
+        """Extract a conversation-identifying path from a provider URL.
+        
+        Examples:
+            claude.ai/chat/abc-123  → /chat/abc-123
+            chatgpt.com/c/xyz       → /c/xyz
+            gemini.google.com/app   → /app  (new chat, no ID)
+            gemini.google.com/app/x → /app/x
+        """
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        return parsed.path or "/"
 
-        A URL change within the same site (e.g. claude.ai/new → claude.ai/chat/123)
-        is normal — the conversation continues in the same tab. Only reset when
-        the domain/site actually changes, indicating a genuinely new conversation.
+    def _maybe_reset_system_prompt(self, new_url: str) -> None:
+        """Reset _sent_system_prompt if the chat has changed.
+
+        Resets when:
+        1. The site/domain changed (e.g. claude.ai → gemini.google.com)
+        2. The conversation ID changed within the same site (e.g. /chat/123 → /chat/456)
+        
+        Does NOT reset for trivial URL changes like query param updates.
         """
         if not self._last_chat_page_url:
             return
@@ -965,11 +981,20 @@ class BrowserProvider(BaseProvider):
                 break
 
         if old_site and new_site and old_site == new_site:
-            # Same site, URL just changed (normal for chat apps) — keep context
-            logger.debug(
-                f"URL changed within same site {old_site}: "
-                f"{self._last_chat_page_url!r} → {new_url!r} (keeping system prompt)"
-            )
+            # Same site — check if conversation path changed (#53, #54)
+            old_conv = self._extract_conversation_id(self._last_chat_page_url)
+            new_conv = self._extract_conversation_id(new_url)
+            if old_conv != new_conv:
+                logger.info(
+                    f"Conversation changed within {old_site}: "
+                    f"{old_conv!r} → {new_conv!r}, will re-inject system prompt."
+                )
+                self._sent_system_prompt = False
+            else:
+                logger.debug(
+                    f"URL changed within same site {old_site}: "
+                    f"{self._last_chat_page_url!r} → {new_url!r} (keeping system prompt)"
+                )
             return
 
         logger.info(
@@ -1304,8 +1329,10 @@ class BrowserProvider(BaseProvider):
 
     async def _send_and_wait(self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = "") -> str:
         """Inject the prompt, click Send, and wait for the full response."""
-        # Count current responses before sending
-        response_sel = cfg["response_selectors"][0]
+        # Find the best response selector and count current responses before sending
+        response_sel = await self._find_selector(page, cfg["response_selectors"])
+        if not response_sel:
+            response_sel = cfg["response_selectors"][0]
         initial_count = await page.locator(response_sel).count()
         logger.debug(f"Response count before send: {initial_count}")
 
@@ -1323,13 +1350,23 @@ class BrowserProvider(BaseProvider):
         if not await self._verify_injection(page, input_sel, message):
             raise RuntimeError("Prompt changed after injection; refusing to send a partial prompt")
 
-        # Native Enter to submit without relying on brittle button ARIA selectors
-        # For multi-line inputs, many UIs require Cmd+Enter or Ctrl+Enter
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(0.1)
-        await page.keyboard.press("Meta+Enter")
-        await asyncio.sleep(0.1)
-        await page.keyboard.press("Control+Enter")
+        # Submit via send button click (preferred) or Enter fallback (#14, #15)
+        send_sel = await self._find_selector(page, cfg.get("send_selectors", []))
+        if send_sel:
+            await page.locator(send_sel).first.click()
+            logger.debug("Submitted via send button click")
+        else:
+            # Fallback: try Enter variants one at a time, stop if input clears
+            for key in ["Enter", "Meta+Enter", "Control+Enter"]:
+                await page.keyboard.press(key)
+                await asyncio.sleep(0.3)
+                try:
+                    remaining = await self._read_editor_text(page, input_sel)
+                    if len(remaining.strip()) < len(message) * 0.1:
+                        break  # Input cleared = message was sent
+                except Exception:
+                    break
+            logger.debug("Submitted via keyboard Enter fallback")
 
         logger.info(f"[STATUS] Waiting for {site} to respond…")
         logger.info("Message sent, waiting for response…")
@@ -1370,11 +1407,17 @@ class BrowserProvider(BaseProvider):
     async def _find_selector(
         self, page: Page, selectors: list[str]
     ) -> Optional[str]:
-        """Return the first selector from the list that matches ≥1 element."""
+        """Return the first selector from the list that matches ≥1 visible element."""
         for sel in selectors:
             try:
-                if await page.locator(sel).count() > 0:
-                    return sel
+                loc = page.locator(sel)
+                count = await loc.count()
+                for i in range(count):
+                    try:
+                        if await loc.nth(i).is_visible():
+                            return sel
+                    except Exception:
+                        pass
             except Exception:
                 continue
         return None
@@ -1405,14 +1448,18 @@ class BrowserProvider(BaseProvider):
         OR until ``GENERATION_WAIT_S`` seconds elapse.
         Emits a status line every 10 s so the UI shows live progress.
         """
-        deadline = asyncio.get_running_loop().time() + GENERATION_WAIT_S
-        last_status = asyncio.get_running_loop().time()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + GENERATION_WAIT_S
+        last_status = loop.time()
+        # Minimum time to wait before allowing idle-exit, to prevent
+        # returning old responses when TTFT is slow (#21)
+        min_generation_time = loop.time() + 5.0
         elapsed = 0
         
         last_text_len = 0
         idle_count = 0
         
-        while asyncio.get_running_loop().time() < deadline:
+        while loop.time() < deadline:
             # Check for completion hash first to short-circuit
             current_text = ""
             try:
@@ -1435,8 +1482,16 @@ class BrowserProvider(BaseProvider):
             any_stop_visible = False
             for sel in stop_selectors:
                 try:
-                    if await page.locator(sel).is_visible():
-                        any_stop_visible = True
+                    loc = page.locator(sel)
+                    count = await loc.count()
+                    for i in range(count):
+                        try:
+                            if await loc.nth(i).is_visible():
+                                any_stop_visible = True
+                                break
+                        except Exception:
+                            pass
+                    if any_stop_visible:
                         break
                 except Exception:
                     pass
@@ -1448,13 +1503,13 @@ class BrowserProvider(BaseProvider):
                 #   - completion hash found (handled above)
                 #   - GENERATION_WAIT_S hard deadline (the while condition)
                 idle_count = 0
-            elif idle_count > 3:  # ~2.25s idle + no stop button = done
+            elif idle_count > 8 and loop.time() > min_generation_time:  # ~6s idle + no stop + past min wait = done
                 if completion_hash and completion_hash not in current_text:
                     logger.warning("Generation complete (stop button hidden) but completion hash missing!")
                 else:
                     logger.debug("Generation complete (stop button hidden & text settled)")
                 return
-            now = asyncio.get_running_loop().time()
+            now = loop.time()
             if now - last_status >= 3:
                 elapsed = int(now - (deadline - GENERATION_WAIT_S))
                 if any_stop_visible:
@@ -1667,7 +1722,7 @@ class BrowserProvider(BaseProvider):
         extracted into attachment records and replaced with placeholders.
 
         Returns:
-            ``(prompt_text, attachments)``
+            ``(prompt_text, attachments, completion_hash)``
         """
         attachments: list[dict] = []
 
@@ -1886,18 +1941,32 @@ class BrowserProvider(BaseProvider):
         return {"type": "text", "content": text}
 
     def _try_parse_tool_json(self, s: str) -> Optional[dict]:
-        import json5
-        import json_repair
+        # Safe imports: these packages are optional (#28)
+        try:
+            import json5
+        except ImportError:
+            json5 = None
+        try:
+            import json_repair
+        except ImportError:
+            json_repair = None
+
+        data = None
         try:
             data = json.loads(s.strip())
         except json.JSONDecodeError:
-            try:
-                data = json5.loads(s.strip())
-            except Exception:
+            if json5:
+                try:
+                    data = json5.loads(s.strip())
+                except Exception:
+                    pass
+            if data is None and json_repair:
                 try:
                     data = json_repair.loads(s.strip())
                 except Exception:
-                    return None
+                    pass
+            if data is None:
+                return None
 
         if isinstance(data, dict) and "tool" in data:
             return {
@@ -1908,20 +1977,34 @@ class BrowserProvider(BaseProvider):
         return None
 
     def _scan_for_json(self, text: str) -> Optional[dict]:
-        """Find the first balanced JSON object in text that has a 'tool' key."""
+        """Find the first balanced JSON object in text that has a 'tool' key.
+        String-aware: braces inside JSON strings are not counted (#26, #27)."""
         depth = 0
         start = -1
+        in_str = False
+        escape = False
         for i, ch in enumerate(text):
-            if ch == "{":
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
                 if depth == 0:
                     start = i
                 depth += 1
             elif ch == "}":
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    candidate = text[start: i + 1]
-                    parsed = self._try_parse_tool_json(candidate)
-                    if parsed:
-                        return parsed
-                    start = -1
+                if depth > 0:  # Guard against negative depth (#27)
+                    depth -= 1
+                    if depth == 0 and start >= 0:
+                        candidate = text[start: i + 1]
+                        parsed = self._try_parse_tool_json(candidate)
+                        if parsed:
+                            return parsed
+                        start = -1
         return None
