@@ -9,13 +9,9 @@ Cross-platform: uses ripgrep (rg) if available, falls back to grep,
 and uses Python's pathlib.glob as the universal fallback for find.
 """
 
-from __future__ import annotations
-
 import asyncio
-import fnmatch
 import logging
 import os
-from pathlib import Path
 
 from mcp_server.config import PROJECT_ROOT, SHELL_TIMEOUT, validate_path
 from mcp_server.os_utils import check_tool_available, IS_WINDOWS
@@ -145,9 +141,9 @@ async def handle_search_in_files(args: dict) -> str:
             cmd.append("/I")
         if is_regex:
             cmd.append("/R")
-        
+
         cmd.append("/C:" + pattern)
-        
+
         if include:
             cmd.append(os.path.join(search_dir, include))
         else:
