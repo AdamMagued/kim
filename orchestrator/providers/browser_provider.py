@@ -61,7 +61,7 @@ import logging
 import os
 import platform
 import re
-import uuid
+
 from pathlib import Path
 from typing import Optional
 
@@ -407,13 +407,13 @@ class BrowserProvider(BaseProvider):
                             "Please reopen the existing provider chat window and resend."
                         ),
                     }
-                
+
                 if clear_chat:
                     logger.info(f"Clearing chat context by reloading {page.url}...")
                     await page.goto(page.url, wait_until="domcontentloaded")
                     await asyncio.sleep(2.0)
                     self._sent_system_prompt = False
-                    
+
                 cfg = self._site_configs[site]
 
                 image_attachments = [
@@ -952,7 +952,7 @@ class BrowserProvider(BaseProvider):
     @staticmethod
     def _extract_conversation_id(url: str) -> str:
         """Extract a conversation-identifying path from a provider URL.
-        
+
         Examples:
             claude.ai/chat/abc-123  → /chat/abc-123
             chatgpt.com/c/xyz       → /c/xyz
@@ -969,7 +969,7 @@ class BrowserProvider(BaseProvider):
         Resets when:
         1. The site/domain changed (e.g. claude.ai → gemini.google.com)
         2. The conversation ID changed within the same site (e.g. /chat/123 → /chat/456)
-        
+
         Does NOT reset for trivial URL changes like query param updates.
         """
         if not self._last_chat_page_url:
@@ -1287,7 +1287,7 @@ class BrowserProvider(BaseProvider):
         prompt as multiple broken messages.
         """
         actual = await self._read_editor_text(page, selector)
-        
+
         def normalize_typo(s: str) -> str:
             return (
                 " ".join(s.split())
@@ -1296,7 +1296,7 @@ class BrowserProvider(BaseProvider):
                 .replace("—", "--").replace("–", "--")
                 .replace("…", "...")
             )
-            
+
         expected_norm = normalize_typo(expected)
         actual_norm = normalize_typo(actual)
 
@@ -1311,7 +1311,7 @@ class BrowserProvider(BaseProvider):
         if len(actual_norm) < max(_VERIFY_MIN_CHARS, int(len(expected_norm) * 0.98)):
             logger.warning(f"Injection failed: actual length {len(actual_norm)} is < 98% of expected {len(expected_norm)}")
             return False
-            
+
         # We only need the first/last few chars to match to ensure it wasn't truncated.
         # But we use a fuzzy check in case of stray punctuation that wasn't normalized.
         def fuzzy_match(a: str, b: str) -> bool:
@@ -1322,7 +1322,7 @@ class BrowserProvider(BaseProvider):
         if not fuzzy_match(actual_norm[:200], expected_norm[:200]):
             logger.warning(f"Injection failed: Prefix mismatch. Actual: {actual_norm[:50]}... Expected: {expected_norm[:50]}...")
             return False
-            
+
         if not fuzzy_match(actual_norm[-200:], expected_norm[-200:]):
             logger.warning(f"Injection failed: Suffix mismatch. Actual: ...{actual_norm[-50:]} Expected: ...{expected_norm[-50:]}")
             return False
@@ -1395,10 +1395,10 @@ class BrowserProvider(BaseProvider):
 
         # Wait for generation to finish (stop button disappears or completion hash found)
         await self._wait_for_generation_complete(
-            page, 
-            cfg["stop_selectors"], 
-            cfg["response_selectors"], 
-            completion_hash, 
+            page,
+            cfg["stop_selectors"],
+            cfg["response_selectors"],
+            completion_hash,
             site,
             min_index=new_element_index
         )
@@ -1461,10 +1461,10 @@ class BrowserProvider(BaseProvider):
         # returning old responses when TTFT is slow (#21)
         min_generation_time = loop.time() + 5.0
         elapsed = 0
-        
+
         last_text_len = 0
         idle_count = 0
-        
+
         while loop.time() < deadline:
             # Check for completion hash first to short-circuit
             current_text = ""
