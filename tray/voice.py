@@ -311,7 +311,7 @@ class MayaVoiceProvider(BaseVoiceProvider):
                 torch_dtype = torch.float16
                 load_kwargs = {
                     "torch_dtype": torch_dtype,
-                    "trust_remote_code": True,
+                    "trust_remote_code": False,
                 }
 
                 if self._use_4bit:
