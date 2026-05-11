@@ -1,0 +1,23 @@
+8a15a03 Merge branch 'fix/observe-ui-and-cancel' into main
+e3ec0fe fix(desktop): chat persistence and technical UI polish
+6f49baa Style cancel widget with Kim's brand colors and breathing animation
+250afca Fix claw binary discovery, remove noisy status message, surface browser_provider STATUS lines
+1224936 ci: fix flake8 + clippy failures on the branch
+715c8ca Wire Claw to run through Kim's browser provider (no API key)
+6c19185 Fix #3: bubble wrap, Claw credentials, chat persistence, cancel widget
+0590841 chore: add pythonExperimentTool and update gitignore
+12e0781 docs: add comprehensive project knowledge base
+d10d0eb Restore original connectors glyph; portal panel above topbar
+04a6ce1 UI overhaul: chat editing, sidebar resize, claw routing, prompt-injection defense
+7037dee Refine connectors drawer UI
+b323190 Document and finalize browser connector updates
+e1f5315 Add web_* tools — Playwright-driven Chromium for accurate DOM scraping
+0f6de1f Fix observe_ui AX traversal, cancel button, and Stage Manager focus theft
+09135ae Scrap broken browser account switcher
+155e500 Add structured UI observation tools
+1944399 chore: save current changes
+a1b8329 Guard browser provider lifecycle during tasks
+c87007c Refine browser provider account flow
+7e93a01 Merge remote-tracking branch 'origin/main' into feat/google-account-auto-management
+13d65ef Add Google account management UI
+ac490eb Initial plan

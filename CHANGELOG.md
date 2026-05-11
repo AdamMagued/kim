@@ -2,6 +2,25 @@
 
 Changes on `fix/observe-ui-and-cancel` compared with `origin/main` as of 2026-05-11.
 
+## 47-Bug Fix Sweep (2026-05-11)
+
+- **JS Variable Declarations** (`lib.rs`): Fixed implicit globals `waited` and `thumbnailFound` in `injectAttachments` that created silent bugs in strict mode.
+- **Send Button Click** (`lib.rs`, `browser_provider.py`): Replaced triple-Enter shotgun with send button click (preferred) + single Enter fallback, preventing duplicate sends and unwanted newlines.
+- **Response Scraping** (`browser_provider.py`): Increased idle threshold from 3→8 with 5s minimum wait, fixing the root cause of "returns old response" bug. Added visibility checks to `_find_selector`.
+- **JSON Scanner** (`browser_provider.py`): Made string-aware (ignores braces inside JSON strings), guarded against negative depth, and made json5/json_repair imports safe.
+- **Completion Hash Timing** (`lib.rs`): Moved `_lastHash` assignment to after submit confirmation. Added URL change observer to clear stale hashes on new chats.
+- **Bridge Lock** (`lib.rs`): Moved `/v1/send` lock acquisition to before clipboard/window work, preventing concurrent sends from corrupting state.
+- **Process-Aware Task State** (`lib.rs`): `is_bridge_task_running()` now checks if the PID is actually alive, auto-clearing stale PIDs.
+- **Superseded Sends** (`lib.rs`): Superseded send() calls now emit error events instead of silently returning, preventing Rust-side timeouts.
+- **Result Delivery** (`lib.rs`): Result retrieval now also cleans up `_sent` markers, progress entries, and hidden-state entries. Timeout path cleans leaked entries.
+- **Context Loss Prevention** (`browser_provider.py`): System prompt now resets when conversation path changes within the same provider (e.g. `/chat/123` → `/chat/456`).
+- **Process Group Kill** (`lib.rs`): Cancel now kills the process group (`-pid`) on Unix so child processes (Playwright, etc.) are also terminated.
+- **Dead Code Removal** (`lib.rs`): Removed `extractBridgeTextField` (was returning empty string), broken `/v1/ping` image fallback. Fixed `checkReady` to use Gemini shadow DOM finder.
+- **Monitor Position** (`lib.rs`): `show_browser_window_impl` now uses monitor origin offset for correct positioning on non-primary displays.
+- **Browser Show** (`lib.rs`): `/v1/browser/show` now uses `show_browser_window_impl` instead of raw `win.show()`, preventing offscreen windows.
+- **Docstring Fix** (`browser_provider.py`): `_format_prompt` docstring now correctly documents 3-tuple return.
+- **Bridge Version Bump**: Persistent bridge version bumped to v9.
+
 ## Browser Bridge Stability & Game Implementation (2026-05-11)
 
 - **Typography Normalization** (`browser_provider.py`, `lib.rs`): Fixed the "Prompt changed after injection" error. Rich-text editors (like Gemini) automatically format pasted text (converting straight quotes to smart quotes, double-dashes to em-dashes, and ellipses). Both the Python and Rust layers now normalize these typographic characters before verification.
