@@ -24,7 +24,8 @@ CLI usage:
     python -m orchestrator.agent --task "..." --max-iter 10
 
 Programmatic usage:
-    async with mcp_agent_context(config) as agent:
+    params = AgentContextParams(config)
+    async with mcp_agent_context(params) as agent:
         agent.set_ui_bridge(bridge)
         result = await agent.run("open Chrome")
 """
@@ -45,6 +46,7 @@ import secrets
 import sys
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -1013,49 +1015,53 @@ def _direct_screenshot(scale: float = 0.75) -> str:
 # Convenience context manager
 # ---------------------------------------------------------------------------
 
+@dataclass
+class AgentContextParams:
+    config: dict
+    provider_name: Optional[str] = None
+    ui_bridge: Optional["UIBridge"] = None
+    voice_engine: Optional["VoiceEngine"] = None
+    resume_session_id: Optional[str] = None
+    session_dir: Optional[str] = None
+
+
 @asynccontextmanager
-async def mcp_agent_context(
-    config: dict,
-    provider_name: Optional[str] = None,
-    ui_bridge: Optional[UIBridge] = None,
-    voice_engine: Optional["VoiceEngine"] = None,
-    resume_session_id: Optional[str] = None,
-    session_dir: Optional[str] = None,
-):
+async def mcp_agent_context(params: AgentContextParams):
     """
     Yields a KimAgent ready to run tasks.
 
-        async with mcp_agent_context(config, ui_bridge=bridge) as agent:
+        params = AgentContextParams(config, ui_bridge=bridge)
+        async with mcp_agent_context(params) as agent:
             result = await agent.run("open Notepad")
     """
-    name = provider_name or config.get("provider", "claude")
-    provider = create_provider(name, config)
+    name = params.provider_name or params.config.get("provider", "claude")
+    provider = create_provider(name, params.config)
 
     # Auto-create VoiceEngine if voice enabled and none provided
-    _voice = voice_engine
+    _voice = params.voice_engine
     if _voice is None:
-        voice_cfg = config.get("voice", {})
-        voice_enabled = voice_cfg.get("enabled", config.get("voice_enabled", False))
+        voice_cfg = params.config.get("voice", {})
+        voice_enabled = voice_cfg.get("enabled", params.config.get("voice_enabled", False))
         if voice_enabled:
             try:
                 from tray.voice import VoiceEngine as _VE
-                _voice = _VE(config)
+                _voice = _VE(params.config)
             except ImportError:
                 logger.debug("tray.voice not available — voice disabled")
 
-    async with mcp_session_context(config) as session:
-        store = SessionStore(base_dir=session_dir, session_id=resume_session_id) if (
-            session_dir or resume_session_id) else SessionStore()
+    async with mcp_session_context(params.config) as session:
+        store = SessionStore(base_dir=params.session_dir, session_id=params.resume_session_id) if (
+            params.session_dir or params.resume_session_id) else SessionStore()
         agent = KimAgent(
-            config=config, session=session, provider=provider,
-            ui_bridge=ui_bridge, voice_engine=_voice,
+            config=params.config, session=session, provider=provider,
+            ui_bridge=params.ui_bridge, voice_engine=_voice,
             session_store=store,
-            resume_session_id=resume_session_id,
+            resume_session_id=params.resume_session_id,
         )
         try:
             yield agent
         finally:
-            if _voice and voice_engine is None:
+            if _voice and params.voice_engine is None:
                 _voice.shutdown()
 
 
@@ -1079,11 +1085,12 @@ async def _cli_main(args: argparse.Namespace) -> None:
     task = args.task or input("Task: ").strip()
     print(f"Running: {task!r}  provider={config.get('provider', 'claude')}", file=sys.stderr)
 
-    async with mcp_agent_context(
-        config,
+    params = AgentContextParams(
+        config=config,
         resume_session_id=args.resume,
         session_dir=args.session_dir,
-    ) as agent:
+    )
+    async with mcp_agent_context(params) as agent:
         result = await agent.run(task)
 
     status = "SUCCESS" if result["success"] else "FAILED"
