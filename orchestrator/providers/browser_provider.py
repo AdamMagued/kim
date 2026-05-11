@@ -577,7 +577,11 @@ class BrowserProvider(BaseProvider):
             logger.warning("Bridge /v1/send timed out (prompt may already be injected)")
             return {
                 "type": "text",
-                "content": "NEED_HELP: Bridge /v1/send timed out. The prompt may have been partially sent. Please check the browser window and retry if needed.",
+                "content": (
+                    "NEED_HELP: Bridge /v1/send timed out. "
+                    "The prompt may have been partially sent. "
+                    "Please check the browser window and retry if needed."
+                ),
             }
         except Exception as e:
             logger.warning(f"Bridge /v1/send failed ({e})")
@@ -1227,7 +1231,9 @@ class BrowserProvider(BaseProvider):
                     if (!el) return false;
                     el.focus();
                     if ('value' in el) {
-                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, "value"
+                        )?.set;
                         if (nativeInputValueSetter) {
                             nativeInputValueSetter.call(el, text);
                         } else {
@@ -1309,7 +1315,10 @@ class BrowserProvider(BaseProvider):
             return actual_norm == expected_norm
 
         if len(actual_norm) < max(_VERIFY_MIN_CHARS, int(len(expected_norm) * 0.98)):
-            logger.warning(f"Injection failed: actual length {len(actual_norm)} is < 98% of expected {len(expected_norm)}")
+            logger.warning(
+                f"Injection failed: actual length {len(actual_norm)} "
+                f"is < 98% of expected {len(expected_norm)}"
+            )
             return False
 
         # We only need the first/last few chars to match to ensure it wasn't truncated.
@@ -1320,11 +1329,17 @@ class BrowserProvider(BaseProvider):
             return re.sub(r'\W+', '', a) == re.sub(r'\W+', '', b)
 
         if not fuzzy_match(actual_norm[:200], expected_norm[:200]):
-            logger.warning(f"Injection failed: Prefix mismatch. Actual: {actual_norm[:50]}... Expected: {expected_norm[:50]}...")
+            logger.warning(
+                f"Injection failed: Prefix mismatch. "
+                f"Actual: {actual_norm[:50]}... Expected: {expected_norm[:50]}..."
+            )
             return False
 
         if not fuzzy_match(actual_norm[-200:], expected_norm[-200:]):
-            logger.warning(f"Injection failed: Suffix mismatch. Actual: ...{actual_norm[-50:]} Expected: ...{expected_norm[-50:]}")
+            logger.warning(
+                f"Injection failed: Suffix mismatch. "
+                f"Actual: ...{actual_norm[-50:]} Expected: ...{expected_norm[-50:]}"
+            )
             return False
 
         return True
@@ -1333,7 +1348,9 @@ class BrowserProvider(BaseProvider):
     # Send + wait + scrape
     # ==================================================================
 
-    async def _send_and_wait(self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = "") -> str:
+    async def _send_and_wait(
+        self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = ""
+    ) -> str:
         """Inject the prompt, click Send, and wait for the full response."""
         # Find the best response selector and count current responses before sending
         response_sel = await self._find_selector(page, cfg["response_selectors"])
@@ -1428,8 +1445,6 @@ class BrowserProvider(BaseProvider):
                 continue
         return None
 
-
-
     async def _wait_for_new_response(
         self, page: Page, response_sel: str, initial_count: int
     ) -> bool:
@@ -1446,7 +1461,8 @@ class BrowserProvider(BaseProvider):
         return False
 
     async def _wait_for_generation_complete(
-        self, page: Page, stop_selectors: list[str], response_selectors: list[str], completion_hash: str | None, site: str = "AI", min_index: int = 0
+        self, page: Page, stop_selectors: list[str], response_selectors: list[str],
+        completion_hash: str | None, site: str = "AI", min_index: int = 0
     ) -> None:
         """
         Wait until all known stop-button selectors are invisible (generation
@@ -1470,7 +1486,10 @@ class BrowserProvider(BaseProvider):
             current_text = ""
             try:
                 current_text = await self._scrape_last_response(page, response_selectors, min_index=min_index)
-                logger.debug(f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}")
+                logger.debug(
+                    f"[DEBUG] _wait_for_generation_complete text "
+                    f"(len={len(current_text)}): {current_text[-100:]!r}"
+                )
                 if completion_hash and completion_hash in current_text:
                     logger.debug("Generation complete (completion hash found)")
                     return
