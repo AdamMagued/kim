@@ -218,9 +218,9 @@ _MOD_KEY = "Meta" if platform.system() == "Darwin" else "Control"
 
 CDP_URL = "http://localhost:9222"
 # Seconds to wait for a new response to appear after sending
-RESPONSE_WAIT_S = 90
-# Seconds to wait for generation to complete after response appears
-GENERATION_WAIT_S = 180
+RESPONSE_WAIT_S = 600
+# Maximum time to wait for generation to finish once started (10 minutes)
+GENERATION_WAIT_S = 600
 # Minimum chars expected in editor after paste, for verification
 _VERIFY_MIN_CHARS = 20
 # Maximum retries for clipboard paste injection
@@ -263,7 +263,7 @@ class BrowserProvider(BaseProvider):
         cdp_url = bp_cfg.get("cdp_url", CDP_URL)
         self._cdp_url = cdp_url
         self._max_history_messages = int(bp_cfg.get("max_history_messages", 6))
-        self._max_inject_chars = int(bp_cfg.get("max_inject_chars", 60000))
+        self._max_inject_chars = int(bp_cfg.get("max_inject_chars", 120000))
         self._headless = bool(bp_cfg.get("browser_headless", False))
         self._preferred_site = (bp_cfg.get("preferred_site") or "").strip().lower() or None
 
@@ -367,18 +367,14 @@ class BrowserProvider(BaseProvider):
     async def complete(
         self,
         messages: list[dict],
-        tools: list[dict],
-        system: str,
+        tools: list[dict] = None,
+        system: str = "",
+        clear_chat: bool = False,
+        **kwargs,
     ) -> dict:
         """
-        Pure-clipboard approach — no temp files.
-
-        1. Build a text-only prompt (base64 blobs extracted, not embedded).
-        2. If a screenshot was extracted, inject it into the browser
-           clipboard as an image blob and paste it into the editor.
-        3. Dismiss any privacy/consent popups.
-        4. Paste the cleaned text prompt via clipboard.
-        5. Click Send and wait for the AI response.
+        Send a prompt via the browser UI and wait for the generation to finish.
+        If clear_chat is True, the page is refreshed to start a fresh session before sending.
         """
         prompt, attachments, completion_hash = self._format_prompt(messages, tools, system)
         logger.debug(
@@ -411,6 +407,13 @@ class BrowserProvider(BaseProvider):
                             "Please reopen the existing provider chat window and resend."
                         ),
                     }
+                
+                if clear_chat:
+                    logger.info(f"Clearing chat context by reloading {page.url}...")
+                    await page.goto(page.url, wait_until="domcontentloaded")
+                    await asyncio.sleep(2.0)
+                    self._sent_system_prompt = False
+                    
                 cfg = self._site_configs[site]
 
                 image_attachments = [
@@ -425,8 +428,10 @@ class BrowserProvider(BaseProvider):
                         page, cfg, str(image_attachments[-1]["data_base64"])
                     )
 
-                    # ── Step 2: Let the UI render the image ──────────────
-                    await page.wait_for_timeout(5000)
+                    # ── Step 2: Let the UI start rendering the image ─────
+                    # The send step below waits for an enabled send button, so
+                    # avoid a fixed multi-second pause on every vision turn.
+                    await page.wait_for_timeout(1200)
 
                 # ── Step 3: Always dismiss popups before every send ───────
                 # Gemini (and other sites) show consent dialogs / marketing
@@ -438,7 +443,7 @@ class BrowserProvider(BaseProvider):
                 # ── Step 4: Paste cleaned text prompt ────────────────────
                 # ── Step 5: Click Send + wait for response ───────────────
                 logger.info(f"[STATUS] Sending message to {site}…")
-                raw_response = await self._send_and_wait(page, cfg, prompt, site)
+                raw_response = await self._send_and_wait(page, cfg, prompt, site, completion_hash)
                 return self._parse_response(raw_response, completion_hash)
         except Exception as e:
             logger.error(f"BrowserProvider.complete failed: {e}", exc_info=True)
@@ -562,9 +567,9 @@ class BrowserProvider(BaseProvider):
                 f"confirmed={sent_confirmed}"
             )
             if sent_confirmed:
-                logger.info(f"[STATUS] Message sent to {site}. Waiting for response…")
+                logger.info("[STATUS] Kim is working…")
             else:
-                logger.info(f"[STATUS] Waiting for {site} to process…")
+                logger.info("[STATUS] Kim is preparing the request…")
 
         except httpx.ReadTimeout:
             logger.warning("Bridge /v1/send timed out, falling back to /v1/complete")
@@ -579,7 +584,7 @@ class BrowserProvider(BaseProvider):
 
         # ── Long-poll for result ─────────────────────────────────────────
         try:
-            logger.info(f"[STATUS] {site} is thinking…")
+            logger.info("[STATUS] Kim is thinking…")
             async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_S) as result_client:
                 result_resp = await result_client.get(
                     f"{self._bridge_url}/v1/result/{req_id}",
@@ -1109,8 +1114,10 @@ class BrowserProvider(BaseProvider):
           4. Verify the injection landed (retry up to ``_INJECT_MAX_RETRIES``
              times).
 
-        Falls back to a synthetic ``ClipboardEvent('paste')`` dispatch, and
-        finally to ``page.keyboard.type()`` in chunks as a last resort.
+        Falls back to a synthetic ``ClipboardEvent('paste')`` dispatch and a
+        DOM value setter. It deliberately does not fall back to
+        ``page.keyboard.type()``: large prompts contain many newlines, and rich
+        chat inputs can interpret typed newlines as real Enter presses.
         """
         for attempt in range(1, _INJECT_MAX_RETRIES + 1):
             # Focus the editor element
@@ -1135,7 +1142,7 @@ class BrowserProvider(BaseProvider):
                 await page.keyboard.press(f"{_MOD_KEY}+v")
                 await asyncio.sleep(0.5)
 
-                if await self._verify_injection(page, selector):
+                if await self._verify_injection(page, selector, text):
                     logger.info(
                         f"Text injected via clipboard paste (attempt {attempt})"
                     )
@@ -1170,27 +1177,45 @@ class BrowserProvider(BaseProvider):
             )
             await asyncio.sleep(0.5)
 
-            if await self._verify_injection(page, selector):
+            if await self._verify_injection(page, selector, text):
                 logger.info(
                     f"Text injected via ClipboardEvent (attempt {attempt})"
                 )
                 return
 
-            # ── Fallback B: page.keyboard.type() in chunks ───────────────
-            logger.debug("ClipboardEvent fallback failed, using keyboard.type()")
+            # ── Fallback B: DOM setter + input event ─────────────────────
+            logger.debug("ClipboardEvent fallback failed, using DOM setter")
             await page.click(selector)
             await page.keyboard.press(f"{_MOD_KEY}+a")
             await page.keyboard.press("Backspace")
             await asyncio.sleep(0.1)
 
-            chunk_size = 500
-            for i in range(0, len(text), chunk_size):
-                await page.keyboard.type(text[i:i + chunk_size], delay=0)
-                await asyncio.sleep(0.05)
+            await page.evaluate(
+                """([selector, text]) => {
+                    const el = document.querySelector(selector);
+                    if (!el) return false;
+                    el.focus();
+                    if ('value' in el) {
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+                        if (nativeInputValueSetter) {
+                            nativeInputValueSetter.call(el, text);
+                        } else {
+                            el.value = text;
+                        }
+                    } else {
+                        el.textContent = text;
+                    }
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                }""",
+                [selector, text],
+            )
+            await asyncio.sleep(0.5)
 
-            if await self._verify_injection(page, selector):
+            if await self._verify_injection(page, selector, text):
                 logger.info(
-                    f"Text injected via keyboard.type() (attempt {attempt})"
+                    f"Text injected via DOM setter (attempt {attempt})"
                 )
                 return
 
@@ -1201,37 +1226,58 @@ class BrowserProvider(BaseProvider):
             await asyncio.sleep(0.3)
 
         # All retries exhausted
-        logger.error(
+        msg = (
             f"Text injection verification failed after {_INJECT_MAX_RETRIES} "
-            "attempts. Proceeding — prompt may be incomplete."
+            "attempts. Refusing to send an incomplete prompt."
         )
+        logger.error(msg)
+        raise RuntimeError(msg)
 
-    async def _verify_injection(self, page: Page, selector: str) -> bool:
-        """
-        Check that the editor element contains a meaningful amount of text
-        after injection.  Returns True if the editor has at least
-        ``_VERIFY_MIN_CHARS`` characters.
-        """
+    async def _read_editor_text(self, page: Page, selector: str) -> str:
         try:
-            text_len = await page.evaluate(
+            value = await page.evaluate(
                 """(selector) => {
                     const el = document.querySelector(selector);
-                    if (!el) return 0;
-                    return (el.innerText || el.textContent || el.value || '').length;
+                    if (!el) return '';
+                    return String(el.value ?? el.innerText ?? el.textContent ?? '');
                 }""",
                 selector,
             )
-            logger.debug(f"Injection verify: editor has {text_len} chars")
-            return text_len >= _VERIFY_MIN_CHARS
+            return value if isinstance(value, str) else ""
         except Exception as e:
-            logger.debug(f"Injection verify error: {e}")
+            logger.debug(f"Editor readback error: {e}")
+            return ""
+
+    async def _verify_injection(self, page: Page, selector: str, expected: str) -> bool:
+        """
+        Check that the editor contains the complete prompt, not just a small
+        prefix. Browser chat UIs sometimes accept only the first chunk of a
+        large paste; a min-length check would incorrectly send that partial
+        prompt as multiple broken messages.
+        """
+        actual = await self._read_editor_text(page, selector)
+        expected_norm = " ".join(expected.split())
+        actual_norm = " ".join(actual.split())
+        logger.debug(
+            f"Injection verify: editor has {len(actual)} chars; "
+            f"expected {len(expected)} chars"
+        )
+
+        if len(expected_norm) < _VERIFY_MIN_CHARS:
+            return actual_norm == expected_norm
+
+        if len(actual_norm) < max(_VERIFY_MIN_CHARS, int(len(expected_norm) * 0.98)):
             return False
+        return (
+            actual_norm[:200] == expected_norm[:200]
+            and actual_norm[-200:] == expected_norm[-200:]
+        )
 
     # ==================================================================
     # Send + wait + scrape
     # ==================================================================
 
-    async def _send_and_wait(self, page: Page, cfg: dict, message: str, site: str = "AI") -> str:
+    async def _send_and_wait(self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = "") -> str:
         """Inject the prompt, click Send, and wait for the full response."""
         # Count current responses before sending
         response_sel = cfg["response_selectors"][0]
@@ -1249,19 +1295,16 @@ class BrowserProvider(BaseProvider):
         # Inject prompt text via clipboard paste (with verification)
         await self._inject_text(page, input_sel, message)
         await asyncio.sleep(0.3)
+        if not await self._verify_injection(page, input_sel, message):
+            raise RuntimeError("Prompt changed after injection; refusing to send a partial prompt")
 
-        # Click the send button (prefer aria-label="Send message")
-        send_sel = await self._find_selector(page, cfg["send_selectors"])
-        if send_sel:
-            # Click the last matching button (fixes DeepSeek where generic
-            # selectors like div[role='button'] match earlier elements)
-            loc = page.locator(send_sel)
-            count = await loc.count()
-            if count > 0:
-                await loc.nth(count - 1).click()
-        else:
-            logger.warning("Send button not found; pressing Enter")
-            await page.keyboard.press("Enter")
+        # Native Enter to submit without relying on brittle button ARIA selectors
+        # For multi-line inputs, many UIs require Cmd+Enter or Ctrl+Enter
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(0.1)
+        await page.keyboard.press("Meta+Enter")
+        await asyncio.sleep(0.1)
+        await page.keyboard.press("Control+Enter")
 
         logger.info(f"[STATUS] Waiting for {site} to respond…")
         logger.info("Message sent, waiting for response…")
@@ -1275,17 +1318,29 @@ class BrowserProvider(BaseProvider):
                 f"No new response appeared after {RESPONSE_WAIT_S}s"
             )
 
+        # Pin to the newest response element so we never accidentally
+        # read the previous turn's [END_OF_RESPONSE] marker.
+        new_count = await page.locator(response_sel).count()
+        new_element_index = max(new_count - 1, 0)
+
         logger.info(f"[STATUS] {site} is responding…")
 
-        # Wait for generation to finish (stop button disappears)
-        await self._wait_for_generation_complete(page, cfg["stop_selectors"], site)
+        # Wait for generation to finish (stop button disappears or completion hash found)
+        await self._wait_for_generation_complete(
+            page, 
+            cfg["stop_selectors"], 
+            cfg["response_selectors"], 
+            completion_hash, 
+            site,
+            min_index=new_element_index
+        )
 
         # Extra settle time
         await asyncio.sleep(1.5)
 
         logger.info(f"[STATUS] Reading {site}'s response…")
-        # Scrape the last response
-        return await self._scrape_last_response(page, cfg["response_selectors"])
+        # Scrape only the newest response element
+        return await self._scrape_last_response(page, cfg["response_selectors"], min_index=new_element_index)
 
     async def _find_selector(
         self, page: Page, selectors: list[str]
@@ -1298,6 +1353,8 @@ class BrowserProvider(BaseProvider):
             except Exception:
                 continue
         return None
+
+
 
     async def _wait_for_new_response(
         self, page: Page, response_sel: str, initial_count: int
@@ -1315,17 +1372,41 @@ class BrowserProvider(BaseProvider):
         return False
 
     async def _wait_for_generation_complete(
-        self, page: Page, stop_selectors: list[str], site: str = "AI"
+        self, page: Page, stop_selectors: list[str], response_selectors: list[str], completion_hash: str | None, site: str = "AI", min_index: int = 0
     ) -> None:
         """
         Wait until all known stop-button selectors are invisible (generation
-        finished) or until ``GENERATION_WAIT_S`` seconds elapse.
+        finished), OR the completion_hash is found in the response text,
+        OR until ``GENERATION_WAIT_S`` seconds elapse.
         Emits a status line every 10 s so the UI shows live progress.
         """
         deadline = asyncio.get_running_loop().time() + GENERATION_WAIT_S
         last_status = asyncio.get_running_loop().time()
         elapsed = 0
+        
+        last_text_len = 0
+        idle_count = 0
+        
         while asyncio.get_running_loop().time() < deadline:
+            # Check for completion hash first to short-circuit
+            current_text = ""
+            try:
+                current_text = await self._scrape_last_response(page, response_selectors, min_index=min_index)
+                logger.debug(f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}")
+                if completion_hash and completion_hash in current_text:
+                    logger.debug("Generation complete (completion hash found)")
+                    return
+            except Exception as e:
+                logger.debug(f"[DEBUG] _scrape_last_response failed: {e}")
+
+            if len(current_text) > last_text_len:
+                idle_count = 0
+                last_text_len = len(current_text)
+            elif len(current_text) > 0 and len(current_text) == last_text_len:
+                # Only count as idle if text length is exactly the same.
+                # If text got shorter (DOM re-render), don't count it.
+                idle_count += 1
+
             any_stop_visible = False
             for sel in stop_selectors:
                 try:
@@ -1334,13 +1415,27 @@ class BrowserProvider(BaseProvider):
                         break
                 except Exception:
                     pass
-            if not any_stop_visible:
-                logger.debug("Generation complete (stop button gone)")
+
+            if any_stop_visible:
+                # Stop button is visible = AI is still generating.
+                # NEVER force-return. Just reset idle and keep waiting.
+                # The only exits while stop is visible are:
+                #   - completion hash found (handled above)
+                #   - GENERATION_WAIT_S hard deadline (the while condition)
+                idle_count = 0
+            elif idle_count > 3:  # ~2.25s idle + no stop button = done
+                if completion_hash and completion_hash not in current_text:
+                    logger.warning("Generation complete (stop button hidden) but completion hash missing!")
+                else:
+                    logger.debug("Generation complete (stop button hidden & text settled)")
                 return
             now = asyncio.get_running_loop().time()
-            if now - last_status >= 10:
+            if now - last_status >= 3:
                 elapsed = int(now - (deadline - GENERATION_WAIT_S))
-                logger.info(f"[STATUS] {site} still thinking… ({elapsed}s)")
+                if any_stop_visible:
+                    logger.info(f"[STATUS] {site} is generating… ({elapsed}s, {len(current_text)} chars)")
+                else:
+                    logger.info(f"[STATUS] Waiting for {site} to finish… ({elapsed}s)")
                 last_status = now
             await asyncio.sleep(0.75)
         logger.warning(
@@ -1349,16 +1444,22 @@ class BrowserProvider(BaseProvider):
         )
 
     async def _scrape_last_response(
-        self, page: Page, response_selectors: list[str]
+        self, page: Page, response_selectors: list[str], min_index: int = 0
     ) -> str:
-        """Return inner text of the last response element."""
+        """Return inner text of the last response element at or after min_index."""
         for sel in response_selectors:
             try:
                 elements = await page.locator(sel).all()
-                if elements:
-                    text = await elements[-1].inner_text()
-                    logger.debug(f"Scraped {len(text)} chars from {sel}")
-                    return text.strip()
+                # Only consider elements from min_index onwards
+                candidates = elements[min_index:] if min_index < len(elements) else []
+                # Iterate backwards to find the last element that actually has text
+                for el in reversed(candidates):
+                    text = await el.inner_text()
+                    if not text or not text.strip():
+                        text = await el.text_content()
+                    if text and text.strip():
+                        logger.debug(f"Scraped {len(text)} chars from {sel}")
+                        return text.strip()
             except Exception:
                 continue
         raise RuntimeError(
@@ -1468,6 +1569,61 @@ class BrowserProvider(BaseProvider):
 
         return "".join(out_parts)
 
+    def _build_history_recap(self, prior_messages: list[dict]) -> str:
+        """Compact recap of prior turns, used on first send of a resumed session.
+
+        Filters out tool-result noise and tool-call JSON to keep the recap
+        readable for the LLM. Caps total length so it fits inside the prompt
+        budget even for long sessions.
+        """
+        lines: list[str] = []
+        for msg in prior_messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if isinstance(content, list):
+                text_parts = [
+                    str(item.get("text", ""))
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ]
+                content = " ".join(p for p in text_parts if p)
+
+            content = str(content).strip()
+            if not content:
+                continue
+            if content.startswith("[Tool result:"):
+                continue
+
+            if role == "user":
+                if content.startswith("Task: "):
+                    content = content[6:].strip()
+                if not content:
+                    continue
+                if len(content) > 400:
+                    content = content[:400] + "…"
+                lines.append(f"User: {content}")
+            elif role == "assistant":
+                stripped = content.lstrip()
+                if stripped.startswith("{") and '"tool"' in stripped:
+                    try:
+                        if isinstance(json.loads(stripped), dict):
+                            continue
+                    except Exception:
+                        pass
+                if len(content) > 400:
+                    content = content[:400] + "…"
+                lines.append(f"Kim: {content}")
+
+        if not lines:
+            return ""
+
+        recap = "\n".join(lines)
+        max_recap = 2000
+        if len(recap) > max_recap:
+            recap = "…\n" + recap[-max_recap:]
+        return recap
+
     def _format_prompt(
         self, messages: list[dict], tools: list[dict], system: str
     ) -> tuple[str, list[dict], str]:
@@ -1545,7 +1701,30 @@ class BrowserProvider(BaseProvider):
 
         last_text = last_text.strip()
 
-        completion_hash = f"KIM_{uuid.uuid4().hex[:8]}"
+        # Use a static, memorable sentinel instead of a random hash.
+        # The scraper is pinned to the newest response element (min_index),
+        # so it will never accidentally match the previous turn's marker.
+        completion_hash = "[END_OF_RESPONSE]"
+
+        # ── Resumed-session recap ────────────────────────────────────────
+        # The browser UI normally retains its own history, but after a Kim
+        # restart the BrowserProvider instance is fresh and the matching
+        # browser tab may be gone (or replaced by a new chat). In that case
+        # the LLM sees only the latest message and replies with no context.
+        # On the first send of a new BrowserProvider instance, replay any
+        # prior turns from the orchestrator's memory as a recap so the model
+        # can pick up where the previous session left off.
+        history_block = ""
+        if not self._sent_system_prompt and len(messages) > 1:
+            recap = self._build_history_recap(messages[:-1])
+            if recap:
+                history_block = (
+                    "[PRIOR CONVERSATION — for context only; do not re-execute, "
+                    "just use as background.]\n"
+                    f"{recap}\n"
+                    "[END PRIOR CONVERSATION]\n\n"
+                    "Now respond to the next user message:\n\n"
+                )
 
         # ── First message: include system prompt + tools ─────────────────
         if not self._sent_system_prompt:
@@ -1572,34 +1751,54 @@ class BrowserProvider(BaseProvider):
             else:
                 _os_hint = f"You are running on Windows. Home is {_home}. Use 'start' to launch apps and Windows paths."
 
-            prompt = (
-                f"[SYSTEM]\n{system}\n"
-                f"{_os_hint}\n\n"
-                f"[AVAILABLE TOOLS]\n{tools_json}\n\n"
-                "[INSTRUCTIONS]\n"
-                "You are operating as Kim through local tools. The website/model name "
-                "does not matter. Do not say you are Claude/Gemini/ChatGPT, and do not "
-                "claim you cannot access the computer if a listed tool can do it.\n"
-                "For normal UI work, prefer observe_ui and click_ui. Use screenshots "
-                "only for visual-inspection tasks or when structured UI is insufficient.\n"
-                "If web_open returns AUTH_REQUIRED or AUTH_FAILED, the page content is "
-                "not usable yet. If the current task only asked to open a site, respond "
-                "TASK_COMPLETE saying it is open at the sign-in prompt. Do not log in "
-                "unless the current task explicitly asks you to sign in or provides "
-                "credentials. Never reuse credentials from recent context alone.\n"
-                "Respond with EXACTLY ONE of:\n"
-                '1. A JSON tool call on a single line: '
-                '{"tool": "<name>", "args": {<args>}}\n'
-                "2. TASK_COMPLETE: <one-line summary>\n"
-                "3. NEED_HELP: <reason you cannot proceed>\n"
-                "Do NOT include markdown formatting around the JSON.\n"
-                "CRITICAL: If your JSON arguments contain double quotes (e.g., "
-                "HTML attributes or code), you MUST escape them (\\\") so the "
-                "JSON is valid.\n"
-                f"IMPORTANT: Always append the exact string {completion_hash} "
-                "at the very end of your entire response.\n\n"
-                f"{last_text}"
+            system_lower = system.lower()
+            is_claw_bridge = (
+                "you are answering claw" in system_lower
+                or "you are claw" in system_lower
+                or "claw bridge json" in system_lower
+                or "claw, a coding agent" in system_lower
+                or "available claw tools" in system_lower
             )
+
+            if is_claw_bridge:
+                prompt = (
+                    f"[SYSTEM]\n{system}\n"
+                    f"{_os_hint}\n\n"
+                    f"IMPORTANT: Always append the exact string {completion_hash} "
+                    "at the very end of your entire response.\n\n"
+                    f"{history_block}"
+                    f"{last_text}"
+                )
+            else:
+                prompt = (
+                    f"[SYSTEM]\n{system}\n"
+                    f"{_os_hint}\n\n"
+                    f"[AVAILABLE TOOLS]\n{tools_json}\n\n"
+                    "[INSTRUCTIONS]\n"
+                    "You are operating as Kim through local tools. The website/model name "
+                    "does not matter. Do not claim you cannot access the computer if "
+                    "a listed tool can do it.\n"
+                    "For normal UI work, prefer observe_ui and click_ui. Use screenshots "
+                    "only for visual-inspection tasks or when structured UI is insufficient.\n"
+                    "If web_open returns AUTH_REQUIRED or AUTH_FAILED, the page content is "
+                    "not usable yet. If the current task only asked to open a site, respond "
+                    "TASK_COMPLETE saying it is open at the sign-in prompt. Do not log in "
+                    "unless the current task explicitly asks you to sign in or provides "
+                    "credentials. Never reuse credentials from recent context alone.\n"
+                    "Respond with EXACTLY ONE of:\n"
+                    '1. A JSON tool call on a single line: '
+                    '{"tool": "<name>", "args": {<args>}}\n'
+                    "2. TASK_COMPLETE: <one-line summary>\n"
+                    "3. NEED_HELP: <reason you cannot proceed>\n"
+                    "Do NOT include markdown formatting around the JSON.\n"
+                    "CRITICAL: If your JSON arguments contain double quotes (e.g., "
+                    "HTML attributes or code), you MUST escape them (\\\") so the "
+                    "JSON is valid.\n"
+                    f"IMPORTANT: Always append the exact string {completion_hash} "
+                    "at the very end of your entire response.\n\n"
+                    f"{history_block}"
+                    f"{last_text}"
+                )
             self._sent_system_prompt = True
         else:
             # ── Subsequent calls: delta only ─────────────────────────────
@@ -1609,9 +1808,9 @@ class BrowserProvider(BaseProvider):
         if len(prompt) > self._max_inject_chars:
             trim_at = self._max_inject_chars - 200
             prompt = (
-                prompt[:trim_at]
-                + "\n…[context trimmed]\n"
-                + prompt[-200:]
+                prompt[:200]
+                + "\n…[earlier context trimmed — see browser history]…\n"
+                + prompt[-trim_at:]
             )
 
         return prompt, attachments, completion_hash
@@ -1629,10 +1828,11 @@ class BrowserProvider(BaseProvider):
             - bare JSON ``{"tool": …}``             → ``{"type": "tool_call", …}``
         """
         # Strip the bridge sentinel before any parsing.
-        # Use a regex that matches ANY KIM_ hash (not just the current one) so
-        # that stale hashes from previous turns — which Gemini sometimes repeats
-        # from its own chat history — are always removed.
+        text = text.replace('[END_OF_RESPONSE]', '').strip()
+        # Also strip any old-style KIM_ hashes from previous sessions.
         text = re.sub(r'\bKIM_[a-f0-9]{8}\b', '', text).strip()
+        # Strip <tool_call> / </tool_call> wrappers DeepSeek sometimes emits.
+        text = re.sub(r'</?tool_call>', '', text).strip()
 
         # Explicit completion/help signals — use word-boundary search so Gemini's
         # DOM label ("Gemini TASK_COMPLETE: ...") doesn't block detection after

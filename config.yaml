@@ -36,7 +36,7 @@ shell:
   - rd /S /Q C:\
   timeout: 30
 voice:
-  enabled: false
+  enabled: true
   engine: kokoro
   human_quirks: false
   hume:

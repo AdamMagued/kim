@@ -77,9 +77,7 @@
   function clickSend() {
     const btn = document.querySelector(SEL.sendBtn);
     if (btn && !btn.disabled) { btn.click(); return true; }
-    // Fallback: press Enter in the input
-    const el = document.querySelector(SEL.input);
-    if (el) el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, bubbles: true }));
+    console.warn("[Kim/chatgpt] Send button unavailable; refusing Enter fallback to avoid split prompts.");
     return false;
   }
 

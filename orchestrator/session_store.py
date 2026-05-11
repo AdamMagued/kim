@@ -49,8 +49,20 @@ class SessionStore:
     ) -> None:
         self.base_dir = Path(base_dir) if base_dir else _DEFAULT_BASE_DIR
         self.session_id = session_id or uuid4().hex[:8]
-        self.session_date = date.today().isoformat()
-        self.session_dir = self.base_dir / self.session_date
+
+        # When resuming a session, append to the original date dir instead of
+        # creating a parallel file under today's date. Otherwise the same
+        # session_id ends up split across two .jsonl files (one in the original
+        # day's dir, one in today's), which surfaces as a duplicate "new chat"
+        # in the sidebar containing only the latest turn.
+        existing = SessionStore.find_session_file(self.session_id, base_dir=self.base_dir)
+        if existing is not None:
+            self.session_dir = existing.parent
+            self.session_date = existing.parent.name
+        else:
+            self.session_date = date.today().isoformat()
+            self.session_dir = self.base_dir / self.session_date
+
         self.session_file = self.session_dir / f"{self.session_id}.jsonl"
         self.summary_file = self.session_dir / f"{self.session_id}.summary.txt"
         self._message_count = 0

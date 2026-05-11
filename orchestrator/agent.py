@@ -707,8 +707,9 @@ class KimAgent:
                     await self._ui_bridge.hide_for_screenshot()
                 except Exception:
                     pass
-            # 0.8 s: enough for macOS to finish the window hide + flash to appear
-            await asyncio.sleep(0.8)
+            # Short settle delay: enough for the main window to hide without
+            # making every screenshot feel sluggish.
+            await asyncio.sleep(0.45)
 
         t0 = _time.monotonic()
         output = ""

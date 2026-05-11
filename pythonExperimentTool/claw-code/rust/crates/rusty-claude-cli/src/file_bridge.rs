@@ -11,6 +11,7 @@
 //! rest of the codebase can remain monomorphic over a single `ApiClient` type.
 
 use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,6 +22,8 @@ use runtime::{
 };
 
 use serde_json::{json, Value};
+
+use crate::render::TerminalRenderer;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -34,10 +37,11 @@ const TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes — browser sc
 
 pub struct FileBridgeClient {
     bridge_dir: PathBuf,
+    emit_output: bool,
 }
 
 impl FileBridgeClient {
-    pub fn new() -> Self {
+    pub fn new(emit_output: bool) -> Self {
         // Honor `CLAW_BRIDGE_DIR` so a relay process can give each Claw run an
         // isolated temp directory (avoids two concurrent runs racing on
         // bridge_request.json). Falls back to /tmp/claw_bridge when unset.
@@ -50,8 +54,13 @@ impl FileBridgeClient {
         // Clean any stale files from a previous run
         let _ = fs::remove_file(bridge_dir.join(REQUEST_FILE));
         let _ = fs::remove_file(bridge_dir.join(RESPONSE_FILE));
-        eprintln!("[file-bridge] Initialized at {}", bridge_dir.display());
-        Self { bridge_dir }
+        if is_bridge_verbose() {
+            eprintln!("[file-bridge] Initialized at {}", bridge_dir.display());
+        }
+        Self {
+            bridge_dir,
+            emit_output,
+        }
     }
 
     /// Serialize an [`ApiRequest`] into a human-readable JSON object that the
@@ -122,7 +131,7 @@ impl FileBridgeClient {
     ///   ]
     /// }
     /// ```
-    fn parse_response(raw: &str) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    fn parse_response(&self, raw: &str) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let mut events = Vec::new();
 
         let parsed: Value = serde_json::from_str(raw).map_err(|e| {
@@ -132,6 +141,16 @@ impl FileBridgeClient {
         // Text
         if let Some(text) = parsed.get("text").and_then(Value::as_str) {
             if !text.is_empty() {
+                if self.emit_output {
+                    let rendered = TerminalRenderer::new().markdown_to_ansi(text);
+                    print!("{rendered}");
+                    if !rendered.ends_with('\n') {
+                        println!();
+                    }
+                    io::stdout()
+                        .flush()
+                        .map_err(|e| RuntimeError::new(format!("File bridge: failed to render text: {e}")))?;
+                }
                 events.push(AssistantEvent::TextDelta(text.to_string()));
             }
         }
@@ -157,6 +176,13 @@ impl FileBridgeClient {
                     Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()),
                     None => "{}".to_string(),
                 };
+
+                if self.emit_output {
+                    println!("\n{}", crate::format_tool_call_start(&name, &input));
+                    io::stdout()
+                        .flush()
+                        .map_err(|e| RuntimeError::new(format!("File bridge: failed to render tool call: {e}")))?;
+                }
 
                 events.push(AssistantEvent::ToolUse { id, name, input });
             }
@@ -193,10 +219,12 @@ impl ApiClient for FileBridgeClient {
         fs::write(&request_path, &payload).map_err(|e| {
             RuntimeError::new(format!("File bridge: failed to write request: {e}"))
         })?;
-        eprintln!(
-            "[file-bridge] Wrote request ({} bytes) — waiting for response…",
-            payload.len()
-        );
+        if is_bridge_verbose() {
+            eprintln!(
+                "[file-bridge] Wrote request ({} bytes) — waiting for response…",
+                payload.len()
+            );
+        }
 
         // 2. Poll for response
         let start = Instant::now();
@@ -234,17 +262,16 @@ impl ApiClient for FileBridgeClient {
         let raw = fs::read_to_string(&response_path).map_err(|e| {
             RuntimeError::new(format!("File bridge: failed to read response: {e}"))
         })?;
-        eprintln!(
-            "[file-bridge] Got response ({} bytes)",
-            raw.len()
-        );
+        if is_bridge_verbose() {
+            eprintln!("[file-bridge] Got response ({} bytes)", raw.len());
+        }
 
         // 4. Clean up
         let _ = fs::remove_file(&request_path);
         let _ = fs::remove_file(&response_path);
 
         // 5. Parse
-        Self::parse_response(&raw)
+        self.parse_response(&raw)
     }
 }
 
@@ -283,4 +310,14 @@ fn generate_tool_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("toolu_{nanos:016x}")
+}
+
+pub(crate) fn is_bridge_verbose() -> bool {
+    std::env::var("CLAW_BRIDGE_VERBOSE")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }

@@ -1,10 +1,10 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Listener, Manager, State};
@@ -80,7 +80,7 @@ struct BridgeCallbackRequest {
 /// IPC event payload sent from the persistent JS bridge via Tauri emit.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct BridgeIpcEvent {
-    event: String,     // "sent" | "done" | "error"
+    event: String,     // "sent" | "done" | "error" | "progress"
     req_id: String,
     #[serde(default)]
     response: Option<String>,
@@ -88,6 +88,8 @@ struct BridgeIpcEvent {
     error: Option<String>,
     #[serde(default)]
     site: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 static IPC_LISTENER_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -96,6 +98,7 @@ static WEBVIEW_BRIDGE_CFG: OnceLock<WebviewBridgeConfig> = OnceLock::new();
 static WEBVIEW_BRIDGE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WEBVIEW_BRIDGE_REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 static WEBVIEW_BRIDGE_RESULTS: OnceLock<StdMutex<HashMap<String, BridgeCompleteResponse>>> = OnceLock::new();
+static WEBVIEW_BRIDGE_PROGRESS: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
 /// Condvar notified whenever a result is inserted into WEBVIEW_BRIDGE_RESULTS.
 /// Collectors wait on this instead of polling every 150ms.
 static WEBVIEW_BRIDGE_NOTIFY: OnceLock<(StdMutex<()>, Condvar)> = OnceLock::new();
@@ -128,6 +131,19 @@ pub struct SessionInfo {
     pub has_summary: bool,
     pub summary: Option<String>,
     pub session_type: String, // "kim" or "claw"
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CompletedClawSession {
+    pub session_id: String,
+    pub session_key: String,
+    pub title: String,
+    pub date: String,
+    pub message_count: usize,
+    pub has_summary: bool,
+    pub summary: Option<String>,
+    pub session_type: String,
+    pub project_path: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -390,11 +406,66 @@ fn parse_jsonl(path: &Path) -> Result<Vec<KimMessage>, String> {
         }
         match serde_json::from_str::<KimMessage>(trimmed) {
             Ok(msg) => messages.push(msg),
-            Err(e) => eprintln!("Skipping malformed JSONL line {}: {}", i + 1, e),
+            Err(e) => {
+                match serde_json::from_str::<serde_json::Value>(trimmed)
+                    .ok()
+                    .and_then(claw_jsonl_line_to_kim_message)
+                {
+                    Some(msg) => messages.push(msg),
+                    None => eprintln!("Skipping malformed JSONL line {}: {}", i + 1, e),
+                }
+            }
         }
     }
 
     Ok(messages)
+}
+
+fn claw_jsonl_line_to_kim_message(value: serde_json::Value) -> Option<KimMessage> {
+    if value.get("type").and_then(|v| v.as_str()) != Some("message") {
+        return None;
+    }
+
+    let message = value.get("message")?;
+    let role = message.get("role")?.as_str()?.to_string();
+    let content = message
+        .get("blocks")
+        .cloned()
+        .map(normalize_claw_blocks)
+        .or_else(|| message.get("content").cloned())
+        .unwrap_or_else(|| serde_json::Value::String(String::new()));
+
+    Some(KimMessage {
+        role,
+        content,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    })
+}
+
+fn normalize_claw_blocks(blocks: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(items) = blocks else {
+        return blocks;
+    };
+
+    serde_json::Value::Array(
+        items
+            .into_iter()
+            .map(|mut block| {
+                if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                    if let Some(raw_input) = block.get("input").and_then(|v| v.as_str()) {
+                        let parsed = serde_json::from_str::<serde_json::Value>(raw_input)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": raw_input }));
+                        if let Some(obj) = block.as_object_mut() {
+                            obj.insert("input".to_string(), parsed);
+                        }
+                    }
+                }
+                block
+            })
+            .collect(),
+    )
 }
 
 fn normalize_title_text(raw: &str) -> Option<String> {
@@ -462,6 +533,16 @@ fn infer_session_title(session_file: &Path, summary: Option<&String>, session_id
                 if let Some(content) = value.get("content") {
                     if let Some(title) = extract_title_from_content(content) {
                         return title;
+                    }
+                }
+            } else if value.get("type").and_then(|v| v.as_str()) == Some("message") {
+                let message = value.get("message").unwrap_or(&serde_json::Value::Null);
+                let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                if role == "user" {
+                    if let Some(content) = message.get("blocks").or_else(|| message.get("content")) {
+                        if let Some(title) = extract_title_from_content(content) {
+                            return title;
+                        }
                     }
                 }
             }
@@ -755,6 +836,60 @@ fn write_first_png_to_clipboard(_attachments: &[BridgeAttachment]) -> bool {
     false
 }
 
+/// Stage a text prompt through a temporary file and copy it to the macOS
+/// clipboard. The temporary file is removed immediately after pbcopy reads it.
+#[cfg(target_os = "macos")]
+fn write_text_prompt_to_clipboard(prompt: &str) -> bool {
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_path = format!("/tmp/kim_prompt_{}_{}.txt", std::process::id(), stamp);
+    if let Err(e) = std::fs::write(&temp_path, prompt.as_bytes()) {
+        eprintln!("[Kim] clipboard: prompt temp write failed: {}", e);
+        return false;
+    }
+
+    let bytes = match std::fs::read(&temp_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            eprintln!("[Kim] clipboard: prompt temp read failed: {}", e);
+            return false;
+        }
+    };
+
+    let mut child = match std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            eprintln!("[Kim] clipboard: pbcopy spawn failed: {}", e);
+            return false;
+        }
+    };
+
+    let wrote = child
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(&bytes).is_ok())
+        .unwrap_or(false);
+    let ok = wrote && child.wait().map(|s| s.success()).unwrap_or(false);
+    let _ = std::fs::remove_file(&temp_path);
+
+    if !ok {
+        eprintln!("[Kim] clipboard: pbcopy failed (non-fatal)");
+    }
+    ok
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_text_prompt_to_clipboard(_prompt: &str) -> bool {
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Persistent JS bridge — injected ONCE via initialization_script.
 //
@@ -923,6 +1058,18 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
     return normalizeText(inputEl.innerText || inputEl.textContent || '');
   };
 
+  const promptMatchesInput = (inputEl, promptText) => {
+    const expectedRaw = String(promptText || '');
+    const actual = readInputText(inputEl);
+    const expected = normalizeText(expectedRaw);
+    if (!expected) return true;
+    if (actual === expected) return true;
+    if (expected.length < 500) return false;
+    if (actual.length < Math.floor(expected.length * 0.98)) return false;
+    return actual.slice(0, 220) === expected.slice(0, 220)
+      && actual.slice(-220) === expected.slice(-220);
+  };
+
   // ── IPC emit (Tauri native) ──────────────────────────────────────────
   const ipcEmit = (payload) => {
     try {
@@ -1057,6 +1204,10 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
   // ── Prompt injection ─────────────────────────────────────────────────
   const injectPromptText = async (inputEl, promptText) => {
     const target = String(promptText || '');
+    try {
+      inputEl.focus();
+      document.execCommand('selectAll', false);
+    } catch (_) {}
     if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
       const proto = Object.getPrototypeOf(inputEl);
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
@@ -1075,12 +1226,14 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
     } catch (_) {}
     const currentText = readInputText(inputEl);
     if (!inserted || currentText.length < Math.min(8, target.length)) {
-      inputEl.textContent = '';
-      const lines = target.split('\n');
-      for (const line of lines) {
-        const div = document.createElement('div');
-        div.textContent = line;
-        inputEl.appendChild(div);
+      // Strategy 3: Synthetic ClipboardEvent for ProseMirror (Claude)
+      try {
+        const dt = new DataTransfer();
+        dt.setData('text/plain', target);
+        const pasteEvent = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
+        inputEl.dispatchEvent(pasteEvent);
+      } catch (e) {
+        console.warn('[KimBridge] Synthetic paste failed:', e);
       }
     }
     // Gemini rich-textarea mirror sync
@@ -1098,20 +1251,11 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       }
     } catch (_) {}
     try {
-      const dt = new DataTransfer();
-      dt.setData('text/plain', target);
-      inputEl.dispatchEvent(new ClipboardEvent('paste', {
-        bubbles: true,
-        cancelable: true,
-        clipboardData: dt,
-      }));
-    } catch (_) {}
-    try {
       inputEl.dispatchEvent(new InputEvent('input', { data: target, inputType: 'insertText', bubbles: true, cancelable: true }));
     } catch (_) {}
     inputEl.dispatchEvent(new Event('input', { bubbles: true }));
     inputEl.dispatchEvent(new Event('change', { bubbles: true }));
-    return Math.max(readInputText(inputEl).length, target.length);
+    return readInputText(inputEl).length;
   };
 
   // ── Attachment injection ──────────────────────────────────────────────
@@ -1196,29 +1340,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         inputEl.focus();
         await new Promise(r => setTimeout(r, 100));
 
-        // Strategy 1: execCommand paste from real system clipboard
-        let thumbnailFound = false;
-        try {
-          document.execCommand('paste');
-          console.log('[KimBridge] execCommand paste fired');
-        } catch (_) {}
-
-        let waited = 0;
-        while (waited < 1500) {
-          await new Promise(r => setTimeout(r, 100));
-          waited += 100;
-          if (document.querySelector('img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view')) {
-            thumbnailFound = true;
-            break;
-          }
-        }
-        if (thumbnailFound) {
-          await dismissPopups();
-          console.log('[KimBridge] execCommand paste succeeded');
-          return 1;
-        }
-
-        // Strategy 2: synthetic ClipboardEvent (isTrusted: false — may be ignored)
+        // Strategy 1: synthetic ClipboardEvent (isTrusted: false — may be ignored by some editors)
         const dt = new DataTransfer();
         dt.items.add(imageFile);
         const pasteEvent = new ClipboardEvent('paste', {
@@ -1277,12 +1399,50 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         }
       }
 
-      // 3. Fallback: Legacy store (for title polling)
-      if (payload.event !== 'sent') {
+      // 3. Fallback: Legacy store (for title polling). Only final payloads
+      // go here; live progress is display-only and must never satisfy Rust's
+      // completion collector.
+      if (!payload.event || payload.event === 'done' || payload.event === 'error') {
         try {
           const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
           if (typeof window.__kimBridgeStore !== 'object' || window.__kimBridgeStore === null) window.__kimBridgeStore = {};
           window.__kimBridgeStore[reqId] = { ready: true, data: encoded, err: null, ts: Date.now() };
+        } catch (_) {}
+      }
+    };
+
+    const decodeJsonString = (value) => {
+      try { return JSON.parse('"' + String(value || '').replace(/"/g, '\\"') + '"'); } catch (_) {}
+      return String(value || '').replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    };
+
+    const extractBridgeTextField = (raw) => {
+      return ''; // Disabled: let Python bridge parse JSON
+    };
+
+    const cleanProgressText = (raw) => {
+      let text = String(raw || '');
+      if (completionHash) text = text.replace(completionHash, '');
+      text = text.replace(/KIM_[a-f0-9]{8}/gi, '').trim();
+      return text;
+    };
+
+    let lastProgressText = '';
+    let lastProgressAt = 0;
+    const reportProgress = (raw) => {
+      const text = cleanProgressText(raw);
+      if (!text || text === lastProgressText) return;
+      const now = Date.now();
+      if (now - lastProgressAt < 800 && text.length <= lastProgressText.length + 12) return;
+      lastProgressText = text;
+      lastProgressAt = now;
+      const payload = { ok: true, event: 'progress', req_id: reqId, site: siteKey, text };
+      if (!ipcEmit(payload) && callbackUrl) {
+        try {
+          const pingUrl = callbackUrl.replace('/callback', '/ping');
+          const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+          const img = new Image();
+          img.src = `${pingUrl}?req_id=${encodeURIComponent(reqId)}&data=${encodeURIComponent(encoded)}`;
         } catch (_) {}
       }
     };
@@ -1311,15 +1471,15 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         ? prompt + '\n[System note: The screenshot could not be attached to this message (image upload unavailable in current interface). Please respond with what you can based on text context, or NEED_HELP if you truly cannot proceed without the image.]'
         : prompt;
       const injectedLen = await injectPromptText(inputEl, effectivePrompt);
-      if (injectedLen < Math.min(8, normalizeText(effectivePrompt).length)) {
-        throw new Error('Prompt text was not accepted by the chat input.');
+      if (injectedLen < Math.min(8, normalizeText(effectivePrompt).length) || !promptMatchesInput(inputEl, effectivePrompt)) {
+        console.warn('[KimBridge] Prompt text may not have been fully accepted by the chat input. Proceeding anyway.');
       }
 
       // Allow UI framework to sync state before sending
       await new Promise(r => setTimeout(r, 80));
 
       // 4a. Wait for the PREVIOUS request's completion hash to appear in the
-      //     DOM before pressing Enter.  This ensures we never interrupt an
+      //     DOM before clicking Send.  This ensures we never interrupt an
       //     in-progress generation.  The hash is provider-agnostic — it lives
       //     in the response text itself, so it works regardless of UI changes.
       {
@@ -1354,34 +1514,18 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         window.__kimBridge._lastHash = completionHash;
       }
 
-      // 4c. Submit via Enter key
-      inputEl.focus();
-      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-      inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-      inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-
-      // 4d. Click the send button — only click when it is actually enabled.
-      //     Using enabled:false would match a disabled button (e.g. while an
-      //     uploaded image is still processing) and silently do nothing.
-      //     15 attempts × 500 ms = up to 7.5 s, enough for image uploads.
-      let sendClicked = false;
-      if (siteKey === 'gemini') {
-        for (let attempt = 0; attempt < 15; attempt++) {
-          const sendBtn = findElement(cfg.send_selectors, { visible: true, enabled: true });
-          if (sendBtn) {
-            try { sendBtn.click(); sendClicked = true; console.log('[KimBridge] Send button clicked on attempt', attempt + 1); break; } catch (_) {}
-          }
-          await new Promise(r => setTimeout(r, 200));
-        }
-        if (!sendClicked) {
-          console.warn('[KimBridge] Could not find/click enabled send button after 15 attempts, Enter may have worked');
-          const disabledBtn = findElement(cfg.send_selectors, { visible: true });
-          if (disabledBtn) {
-            console.warn('[KimBridge] Attempting to click disabled send button as last resort...');
-            try { disabledBtn.click(); } catch (_) {}
-          }
-        }
+      if (!promptMatchesInput(inputEl, effectivePrompt)) {
+        throw new Error('Prompt changed after injection. Refusing to send a partial prompt.');
       }
+
+      // 4c. Submit via synthetic Enter event.
+      // We already wrote the prompt to the clipboard and injected it at once,
+      // so there is no risk of sending an incomplete/split prompt.
+      inputEl.focus();
+      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      console.log('[KimBridge] Synthetic Enter dispatched to send message');
 
       // 5. Emit "sent" immediately via IPC only — NOT via the legacy store,
       //    because the store is used by Rust's title-pull fallback which can't
@@ -1396,27 +1540,33 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       //    and we know exactly which text belongs to this request.
       const POLL_MS = 300;
       let responseText = '';
+      let lastTextLength = 0;
+      let idleCount = 0;
 
-      let noPostStopCount = 0;
       while (Date.now() < hardDeadlineAt) {
         await new Promise(r => setTimeout(r, POLL_MS));
         if (isSuperseded()) { console.log('[KimBridge] send superseded during response wait, bailing'); return; }
 
         const latestText = getLatestResponseText(cfg, siteKey) || '';
+        reportProgress(latestText);
         if (completionHash && latestText.includes(completionHash)) {
           responseText = latestText.replace(completionHash, '').trim();
           break;
         }
 
-        if (latestText && latestText.length > 0 && !isAnyStopVisible(cfg)) {
-          noPostStopCount++;
-          if (noPostStopCount >= 5) {
-            console.log('[KimBridge] completionHash not found, but stop button is gone. Falling back to latest text.');
+        if (latestText.length > lastTextLength) {
+          idleCount = 0;
+          lastTextLength = latestText.length;
+        } else if (latestText.length > 0) {
+          idleCount++;
+        }
+
+        if (!completionHash && latestText && latestText.length > 0 && !isAnyStopVisible(cfg)) {
+          if (idleCount >= 10) { // 3 seconds of no text growth
+            console.log('[KimBridge] stop button gone and text idle. Falling back to latest text.');
             responseText = latestText;
             break;
           }
-        } else {
-          noPostStopCount = 0;
         }
       }
 
@@ -1564,11 +1714,12 @@ fn open_browser_signin_window_impl(
     // Listen for IPC events from the persistent JS bridge only once per app instance.
     IPC_LISTENER_REGISTERED.get_or_init(|| {
         let app_for_listener = app_handle.clone();
+        let app_for_event = app_for_listener.clone();
         app_for_listener.listen("kim-bridge-ipc", move |event| {
             let payload_str = event.payload();
             match serde_json::from_str::<BridgeIpcEvent>(payload_str) {
                 Ok(ipc_event) => {
-                    handle_bridge_ipc_event(ipc_event);
+                    handle_bridge_ipc_event(ipc_event, &app_for_event);
                 }
                 Err(e) => {
                     eprintln!(
@@ -1620,7 +1771,70 @@ async fn add_custom_provider_capability(url: String, app_handle: tauri::AppHandl
 
 /// Handle an IPC event from the persistent JS bridge.
 /// Inserts results into the shared store and wakes up any waiting collector.
-fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent) {
+fn clean_bridge_progress_text(text: &str) -> Option<String> {
+    let mut cleaned = text
+        .replace('\u{0000}', "")
+        .replace("\r\n", "\n")
+        .trim()
+        .to_string();
+
+    while cleaned.contains("\n\n\n") {
+        cleaned = cleaned.replace("\n\n\n", "\n\n");
+    }
+    cleaned = cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let lower = cleaned.to_lowercase();
+    if cleaned.len() < 8
+        || lower.starts_with("error:")
+        || lower.starts_with("need_help:")
+        || lower.starts_with("{text")
+        || lower.starts_with("{\"text")
+        || lower.starts_with("{ \"text")
+        || lower.starts_with('{')
+        || lower.contains("\"tool_calls\"")
+        || lower.contains("\"content\"")
+        || lower.contains("<!doctype")
+        || lower.contains("<html")
+        || lower.contains("<style")
+        || lower.contains("kim_")
+    {
+        return None;
+    }
+
+    if cleaned.chars().filter(|ch| *ch == '{' || *ch == '}' || *ch == '\\').count() > 8 {
+        return None;
+    }
+
+    if cleaned.len() > 280 {
+        cleaned.truncate(277);
+        cleaned.push_str("...");
+    }
+
+    Some(cleaned)
+}
+
+fn emit_bridge_progress(app_handle: &tauri::AppHandle, req_id: &str, text: &str) {
+    let Some(cleaned) = clean_bridge_progress_text(text) else {
+        return;
+    };
+
+    let progress_store = WEBVIEW_BRIDGE_PROGRESS.get_or_init(|| StdMutex::new(HashMap::new()));
+    if let Ok(mut guard) = progress_store.lock() {
+        if guard.get(req_id).map(|last| last == &cleaned).unwrap_or(false) {
+            return;
+        }
+        guard.insert(req_id.to_string(), cleaned.clone());
+    }
+
+    let _ = app_handle.emit("kim-agent-output", format!("[STATUS] {}", cleaned));
+}
+
+fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &tauri::AppHandle) {
     agent_debug_log(
         "H1",
         "bridge IPC event received",
@@ -1629,6 +1843,7 @@ fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent) {
             "reqId": ipc_event.req_id,
             "hasResponse": ipc_event.response.is_some(),
             "hasError": ipc_event.error.is_some(),
+            "hasText": ipc_event.text.is_some(),
         }),
     );
 
@@ -1650,6 +1865,12 @@ fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent) {
             notify_bridge_result();
         }
         "done" => {
+            if let Ok(mut guard) = WEBVIEW_BRIDGE_PROGRESS
+                .get_or_init(|| StdMutex::new(HashMap::new()))
+                .lock()
+            {
+                guard.remove(&ipc_event.req_id);
+            }
             let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
             if let Ok(mut guard) = store.lock() {
                 guard.insert(ipc_event.req_id.clone(), BridgeCompleteResponse {
@@ -1661,7 +1882,18 @@ fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent) {
             }
             notify_bridge_result();
         }
+        "progress" => {
+            if let Some(text) = ipc_event.text.as_deref() {
+                emit_bridge_progress(app_handle, &ipc_event.req_id, text);
+            }
+        }
         "error" => {
+            if let Ok(mut guard) = WEBVIEW_BRIDGE_PROGRESS
+                .get_or_init(|| StdMutex::new(HashMap::new()))
+                .lock()
+            {
+                guard.remove(&ipc_event.req_id);
+            }
             let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
             if let Ok(mut guard) = store.lock() {
                 guard.insert(ipc_event.req_id.clone(), BridgeCompleteResponse {
@@ -2106,8 +2338,28 @@ fn build_bridge_complete_script(
         return normalizeText(inputEl.innerText || inputEl.textContent || '');
     };
 
+    const promptMatchesInput = (inputEl, promptText) => {
+        const expectedRaw = String(promptText || '');
+        const actual = readInputText(inputEl);
+        const expected = normalizeText(expectedRaw);
+        if (!expected) return true;
+        if (actual === expected) return true;
+        if (expected.length < 500) return false;
+        if (actual.length < Math.floor(expected.length * 0.98)) return false;
+        return actual.slice(0, 220) === expected.slice(0, 220)
+            && actual.slice(-220) === expected.slice(-220);
+    };
+
     const injectPromptText = async (inputEl, promptText) => {
         const target = String(promptText || '');
+        try {
+            inputEl.focus();
+            document.execCommand('selectAll', false);
+            if (document.execCommand('paste')) {
+                await sleep(120);
+                if (promptMatchesInput(inputEl, target)) return readInputText(inputEl).length;
+            }
+        } catch (_) {}
         if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
             const proto = Object.getPrototypeOf(inputEl);
             const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
@@ -2397,8 +2649,8 @@ fn build_bridge_complete_script(
         const uploadedCount = await injectAttachments(cfg, inputEl);
 
         const injectedLen = await injectPromptText(inputEl, __kimPrompt);
-        if (injectedLen < Math.min(8, normalizeText(__kimPrompt).length)) {
-            throw new Error('Prompt text was not accepted by the chat input.');
+        if (injectedLen < Math.min(8, normalizeText(__kimPrompt).length) || !promptMatchesInput(inputEl, __kimPrompt)) {
+            throw new Error('Prompt text was not fully accepted by the chat input. Refusing to send an incomplete prompt.');
         }
 
     await sleep(80);
@@ -2427,40 +2679,30 @@ fn build_bridge_complete_script(
 
         const stateBeforeSend = captureResponseState(cfg, siteKey);
 
-        // Always submit via Enter key — never click the send button.
+        if (!promptMatchesInput(inputEl, __kimPrompt)) {
+            throw new Error('Prompt changed after injection. Refusing to send a partial prompt.');
+        }
+
+        // Submit by clicking the provider's enabled Send button. Do not use
+        // synthetic Enter events here: long prompts with newlines can be split
+        // into partial provider messages if the editor has not fully committed.
         inputEl.focus();
-        inputEl.dispatchEvent(new KeyboardEvent('keydown', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-        }));
-        inputEl.dispatchEvent(new KeyboardEvent('keypress', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-        }));
-        inputEl.dispatchEvent(new KeyboardEvent('keyup', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-        }));
-        let sent = true;
-        await sleep(400);
-        const postEnterState = captureResponseState(cfg, siteKey);
-        if (!hasNewResponseSince(stateBeforeSend, postEnterState)) {
-            // Enter did not produce a response — try form submission as fallback.
-            try {
-                const form = inputEl.closest('form');
-                if (form) {
-                    if (typeof form.requestSubmit === 'function') {
-                        form.requestSubmit();
-                    } else {
-                        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-                    }
-                } else {
-                    sent = false;
-                }
-            } catch (_) {
-                sent = false;
+        let sent = false;
+        for (let attempt = 0; attempt < 20; attempt++) {
+            const sendBtn = findElement(cfg.send_selectors, { visible: true, enabled: true });
+            if (sendBtn) {
+                try {
+                    sendBtn.click();
+                    sent = true;
+                    break;
+                } catch (_) {}
             }
+            await sleep(200);
         }
         if (!sent) {
-            throw new Error(`Could not submit prompt to provider UI. selectorDiag=${selectorDiagText}`);
+            throw new Error(`Could not find an enabled send button for ${siteKey}. Refusing to submit with Enter because it can split long prompts. selectorDiag=${selectorDiagText}`);
         }
+        await sleep(400);
         // #region agent log
         __kimDbg('H1', 'send stage finished', { sent, hasForm: !!(inputEl && inputEl.closest && inputEl.closest('form')), inputTextLen: readInputText(inputEl).length });
         // #endregion
@@ -2759,6 +3001,12 @@ fn run_bridge_completion_once(
     {
         guard.remove(&req_id);
     }
+    if let Ok(mut guard) = WEBVIEW_BRIDGE_PROGRESS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        guard.remove(&req_id);
+    }
 
     // Try the persistent bridge first (tiny eval call).
     let prompt_json = serde_json::to_string(prompt).map_err(|e| e.to_string())?;
@@ -3030,16 +3278,20 @@ fn handle_webview_bridge_request(
                     Ok(decoded) => {
                         match String::from_utf8(decoded) {
                             Ok(json_str) => {
-                                match serde_json::from_str::<BridgeCompleteResponse>(&json_str) {
-                                    Ok(payload) => {
-                                        let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
-                                        if let Ok(mut guard) = store.lock() {
-                                            guard.insert(req_id, payload);
+                                if let Ok(ipc_event) = serde_json::from_str::<BridgeIpcEvent>(&json_str) {
+                                    handle_bridge_ipc_event(ipc_event, &app_handle);
+                                } else {
+                                    match serde_json::from_str::<BridgeCompleteResponse>(&json_str) {
+                                        Ok(payload) => {
+                                            let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
+                                            if let Ok(mut guard) = store.lock() {
+                                                guard.insert(req_id, payload);
+                                            }
+                                            notify_bridge_result();
                                         }
-                                        notify_bridge_result();
-                                    }
-                                    Err(e) => {
-                                        agent_debug_log("H2", "ping json parse failed", serde_json::json!({ "error": e.to_string(), "json_str": json_str }));
+                                        Err(e) => {
+                                            agent_debug_log("H2", "ping json parse failed", serde_json::json!({ "error": e.to_string(), "json_str": json_str }));
+                                        }
                                     }
                                 }
                             }
@@ -3364,6 +3616,13 @@ fn handle_webview_bridge_request(
             if !attachments.is_empty() {
                 let _clip_ok = write_first_png_to_clipboard(attachments);
                 agent_debug_log("H1", "clipboard write", serde_json::json!({ "ok": _clip_ok }));
+            } else {
+                // For text-only sends, stage the full prompt through a temp file
+                // and copy it to the system clipboard before the browser bridge
+                // runs. The injected JS pastes once, verifies the full text, and
+                // refuses to send if the provider editor only accepted part of it.
+                let _clip_ok = write_text_prompt_to_clipboard(&parsed.prompt);
+                agent_debug_log("H1", "prompt clipboard write", serde_json::json!({ "ok": _clip_ok, "promptLen": parsed.prompt.len() }));
             }
 
             // Acquire lock to prevent overlapping window manipulations (#34)
@@ -3669,6 +3928,16 @@ fn handle_webview_bridge_request(
                 Some(pid) if process_exists(pid) => {
                     match send_signal(pid, false) {
                         Ok(()) => {
+                            if let Some(cancel_win) = app_handle.get_webview_window("cancel-widget") {
+                                let _ = cancel_win.close();
+                            }
+                            if let Some(main_win) = app_handle.get_webview_window("main") {
+                                let _ = main_win.show();
+                                let _ = main_win.set_focus();
+                            }
+                            if let Some(flash_win) = app_handle.get_webview_window("screenshot-flash") {
+                                let _ = flash_win.close();
+                            }
                             // Background cleanup: wait 2s then force-kill if alive
                             std::thread::spawn(move || {
                                 for _ in 0..20 {
@@ -4312,6 +4581,175 @@ async fn delete_sessions(
             eprintln!("Session {} not found for deletion.", session_id);
         }
     }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn summarize_session(
+    session_id: String,
+    session_type: String,
+    project_root: Option<String>,
+) -> Result<(), String> {
+    validate_session_id(&session_id)?;
+
+    // Build the list of directories to search, same logic as load_session_messages
+    let mut dirs_to_search: Vec<PathBuf> = vec![default_sessions_dir()];
+    if session_type == "claw" {
+        if let Some(ref pr) = project_root {
+            let claw_dir = PathBuf::from(pr).join(".claw").join("sessions");
+            if claw_dir.exists() {
+                dirs_to_search.push(claw_dir);
+            }
+        }
+    }
+
+    // Find the JSONL file
+    let mut jsonl_path: Option<PathBuf> = None;
+    for base in &dirs_to_search {
+        if !base.exists() { continue; }
+        if let Ok(entries) = fs::read_dir(base) {
+            let mut date_dirs: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .collect();
+            date_dirs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
+            for entry in date_dirs {
+                let candidate = entry.path().join(format!("{}.jsonl", session_id));
+                if candidate.exists() {
+                    jsonl_path = Some(candidate);
+                    break;
+                }
+            }
+        }
+        if jsonl_path.is_some() { break; }
+    }
+
+    let path = jsonl_path.ok_or_else(|| format!("Session file not found: {}", session_id))?;
+
+    // Read the JSONL and extract summary components
+    let file = fs::File::open(&path).map_err(|e| e.to_string())?;
+    let reader = BufReader::new(file);
+
+    let mut first_user_text: Option<String> = None;
+    let mut last_assistant_text: Option<String> = None;
+    let mut touched_files: Vec<String> = Vec::new();
+
+    for line in reader.lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Handle both Kim format (role at top level) and Claw format (type: "message")
+        let (role, content) = if let Some(r) = value.get("role").and_then(|v| v.as_str()) {
+            (r.to_string(), value.get("content").cloned())
+        } else if value.get("type").and_then(|v| v.as_str()) == Some("message") {
+            let msg = value.get("message").unwrap_or(&serde_json::Value::Null);
+            let r = msg.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let c = msg.get("blocks").or_else(|| msg.get("content")).cloned();
+            (r, c)
+        } else {
+            continue;
+        };
+
+        let text = match &content {
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(serde_json::Value::Array(items)) => {
+                let texts: Vec<String> = items.iter()
+                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .collect();
+                if texts.is_empty() { None } else { Some(texts.join("\n")) }
+            }
+            _ => None,
+        };
+
+        if role == "user" {
+            if let Some(ref t) = text {
+                let clean = t.trim();
+                // Skip tool result pseudo-user messages
+                if !clean.starts_with("[Tool result:") && !clean.is_empty() {
+                    if first_user_text.is_none() {
+                        first_user_text = Some(clean.strip_prefix("Task: ").unwrap_or(clean).to_string());
+                    }
+                }
+            }
+        } else if role == "assistant" {
+            if let Some(ref t) = text {
+                let clean = t.trim()
+                    .trim_start_matches("TASK_COMPLETE:")
+                    .trim();
+                if !clean.is_empty() {
+                    last_assistant_text = Some(clean.to_string());
+                }
+            }
+            if let Some(serde_json::Value::Array(items)) = &content {
+                for block in items {
+                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        if matches!(name, "write_file" | "edit_file" | "create_file") {
+                            // In Claw JSONL, input is often a JSON string rather than an object.
+                            let mut path_str = None;
+                            if let Some(input_val) = block.get("input") {
+                                if let Some(s) = input_val.as_str() {
+                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                                        path_str = parsed.get("path").or_else(|| parsed.get("file_path"))
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+                                    }
+                                } else if let Some(obj) = input_val.as_object() {
+                                    path_str = obj.get("path").or_else(|| obj.get("file_path"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string());
+                                }
+                            }
+                            if let Some(p) = path_str {
+                                let fname = p.rsplit('/').next().unwrap_or(&p);
+                                if !touched_files.contains(&fname.to_string()) {
+                                    touched_files.push(fname.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build summary text
+    let mut summary_parts: Vec<String> = Vec::new();
+    if let Some(ref task) = first_user_text {
+        let truncated = if task.chars().count() > 100 {
+            format!("{}…", task.chars().take(100).collect::<String>())
+        } else {
+            task.clone()
+        };
+        summary_parts.push(format!("Task: {}", truncated));
+    }
+    if let Some(ref result) = last_assistant_text {
+        let truncated = if result.chars().count() > 200 {
+            format!("{}…", result.chars().take(200).collect::<String>())
+        } else {
+            result.clone()
+        };
+        summary_parts.push(format!("Result: {}", truncated));
+    }
+    if !touched_files.is_empty() {
+        summary_parts.push(format!("Files: {}", touched_files.join(", ")));
+    }
+
+    let summary = if summary_parts.is_empty() {
+        "No summary available.".to_string()
+    } else {
+        summary_parts.join("\n")
+    };
+
+    // Write summary file next to the JSONL: abc.jsonl → abc.summary.txt
+    let summary_path = path.with_file_name(format!("{}.summary.txt", session_id));
+    fs::write(&summary_path, &summary).map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -5198,6 +5636,12 @@ async fn send_task(
         *guard = None;
     }
 
+    if is_claw {
+        if let Some(session) = newest_claw_session(&target_root) {
+            let _ = app_handle.emit("kim-agent-code-session", session);
+        }
+    }
+
     let _ = app_handle.emit("kim-agent-done", status.success());
 
     // Always return Ok — the frontend learns about failure via the kim-agent-done
@@ -5248,6 +5692,14 @@ async fn cancel_task(
     // Step 1 — graceful signal.
     send_signal(pid, false)
         .map_err(|e| format!("Failed to send stop signal: {}", e))?;
+
+    // Restore the UI immediately. If the agent is cancelled while a screenshot
+    // tool is blocking, Python may never reach its finally block that normally
+    // shows the main window again.
+    let _ = set_task_active_mode(app_handle.clone(), false).await;
+    if let Some(flash_win) = app_handle.get_webview_window("screenshot-flash") {
+        let _ = flash_win.close();
+    }
 
     // Step 2 — wait up to 2 seconds for the process to exit; if it's still
     // alive, force kill. We poll by re-sending signal 0 (existence check).
@@ -6227,6 +6679,70 @@ fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
     sessions
 }
 
+fn newest_claw_session(project_path: &Path) -> Option<CompletedClawSession> {
+    let sessions_dir = project_path.join(".claw").join("sessions");
+    let date_entries = fs::read_dir(&sessions_dir).ok()?;
+    let mut newest: Option<(SystemTime, PathBuf, String, String)> = None;
+
+    for date_entry in date_entries.filter_map(|e| e.ok()) {
+        let date_path = date_entry.path();
+        if !date_path.is_dir() {
+            continue;
+        }
+        let date = date_entry.file_name().to_string_lossy().to_string();
+        let Ok(file_entries) = fs::read_dir(&date_path) else { continue };
+        for file_entry in file_entries.filter_map(|e| e.ok()) {
+            let path = file_entry.path();
+            let name = file_entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".jsonl") || name.contains(".summary") {
+                continue;
+            }
+            let modified = file_entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let is_newest = newest
+                .as_ref()
+                .map(|(prev, _, _, _)| modified > *prev)
+                .unwrap_or(true);
+            if is_newest {
+                let session_id = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                newest = Some((modified, path, date.clone(), session_id));
+            }
+        }
+    }
+
+    let (_, path, date, session_id) = newest?;
+    let summary_path = sessions_dir.join(&date).join(format!("{}.summary.txt", session_id));
+    let summary = if summary_path.exists() {
+        fs::read_to_string(summary_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let message_count = count_lines(&path).unwrap_or(0);
+    let title = infer_session_title(&path, summary.as_ref(), &session_id);
+    let project_path_str = project_path.to_string_lossy().to_string();
+
+    Some(CompletedClawSession {
+        session_key: format!("claw:{}:{}", date, session_id),
+        session_id,
+        title,
+        date,
+        message_count,
+        has_summary: summary.is_some(),
+        summary,
+        session_type: "claw".to_string(),
+        project_path: project_path_str,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Feedback — POST to a private Discord webhook (URL never exposed to frontend)
 // ---------------------------------------------------------------------------
@@ -6353,6 +6869,7 @@ pub fn run() {
             list_sessions,
             delete_sessions,
             load_session_messages,
+            summarize_session,
             save_run_history,
             load_run_history,
             get_app_version,

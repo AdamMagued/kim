@@ -103,7 +103,7 @@ async def _main_async(args: argparse.Namespace) -> int:
     # project — the relay never executes tools itself, Claw does.
     os.environ["PROJECT_ROOT"] = args.cwd
 
-    print(f"[STATUS] Routing Claw through Kim's browser provider ({args.provider})", flush=True)
+    print("[STATUS] Kim is working on your task…", flush=True)
 
     provider = create_provider(args.provider, config)
 
@@ -127,9 +127,12 @@ async def _main_async(args: argparse.Namespace) -> int:
 
     msg = result.get("message", "")
     if result.get("success"):
-        print(f"[SUCCESS] {msg}", flush=True)
+        # Log the technical detail to stderr; surface a clean message for the UI.
+        logger.info(msg)
+        print("[SUCCESS] Task completed", flush=True)
         return 0
 
+    logger.error(msg)
     print(f"[FAILED] {msg}", flush=True)
     return int(result.get("exit_code") or 1)
 
