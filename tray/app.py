@@ -37,7 +37,7 @@ from PIL import Image
 import pystray
 from pystray import MenuItem as Item
 
-from orchestrator.agent import UIBridge, mcp_agent_context
+from orchestrator.agent import UIBridge, mcp_agent_context, AgentContextParams
 from tray.voice import VoiceEngine, VoiceStatus
 
 logger = logging.getLogger("kim.tray")
@@ -410,12 +410,13 @@ class KimApp:
 
         async def _run():
             try:
-                async with mcp_agent_context(
-                    self._config,
+                params = AgentContextParams(
+                    config=self._config,
                     provider_name=self._active_provider,
                     ui_bridge=self._bridge,
                     voice_engine=self._voice,
-                ) as agent:
+                )
+                async with mcp_agent_context(params) as agent:
                     result = await agent.run(task)
                 self._root.after(0, self._on_task_done, result, True)
             except asyncio.CancelledError:
