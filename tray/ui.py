@@ -19,8 +19,6 @@ This module has NO direct dependency on tray.app — it receives a reference to
 the KimApp instance and calls back through its public methods.
 """
 
-from __future__ import annotations
-
 import datetime
 import logging
 import threading
