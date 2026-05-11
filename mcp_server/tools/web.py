@@ -25,8 +25,6 @@ Tools registered in mcp_server/server.py:
     web_back() / web_close()
 """
 
-from __future__ import annotations
-
 import asyncio
 import base64
 import logging
