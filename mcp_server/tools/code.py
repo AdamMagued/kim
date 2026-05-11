@@ -9,8 +9,6 @@ Provides code execution and linting tools:
 Uses os_utils for cross-platform safety and availability checks.
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import re
