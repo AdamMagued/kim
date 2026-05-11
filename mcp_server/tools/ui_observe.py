@@ -9,7 +9,6 @@ System Events. Other platforms return a clean limitation for now.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -106,6 +105,57 @@ def _parse_elements(raw: str) -> tuple[str, str, list[UIElement]]:
     return (app, window, elements)
 
 
+def _format_empty_observation(app: str) -> str:
+    """Format the message when no elements are found, handling browser specific instructions."""
+    is_browser = any(b in app.lower() for b in ("chrome", "safari", "firefox", "edge", "arc", "brave"))
+    if is_browser:
+        return (
+            "- No web controls visible YET. Chrome/Safari lazy-enable AX "
+            "after the first query — the second or third observe_ui call "
+            "usually returns the form fields. Retry observe_ui ONCE more "
+            "with depth=4. If still empty, the page may be using "
+            "non-standard widgets; only then fall back to "
+            "take_annotated_screenshot."
+        )
+    return (
+        "- No interactive controls at this depth. The window may be "
+        "Electron-based (no AX). Try focus_window on a different app "
+        "or take_annotated_screenshot for visual tasks. Do not loop "
+        "observe_ui on the same window."
+    )
+
+
+def _sort_elements(elements: list[UIElement]) -> list[UIElement]:
+    """Sort elements by role priority, then by position (y, x), then ID."""
+    role_order = {
+        "AXTextField": 0,
+        "AXTextArea": 0,
+        "AXSearchField": 0,
+        "AXButton": 1,
+        "AXCheckBox": 1,
+        "AXRadioButton": 1,
+        "AXPopUpButton": 1,
+        "AXMenuButton": 1,
+        "AXLink": 2,
+        "AXStaticText": 3,
+    }
+    return sorted(
+        elements,
+        key=lambda el: (role_order.get(el.role, 9), el.y, el.x, el.element_id),
+    )
+
+
+def _format_element(el: UIElement) -> str:
+    """Format a single UIElement into its string representation."""
+    label = el.name or el.description or el.value or "(unlabeled)"
+    cx, cy = el.center
+    extra = f" value={el.value!r}" if el.value and el.value != label else ""
+    return (
+        f"- {el.element_id}: {el.role} {label!r} "
+        f"center=({cx},{cy}) bounds=({el.x},{el.y},{el.width},{el.height}){extra}"
+    )
+
+
 def _format_observation(app: str, window: str, elements: list[UIElement], limit: int) -> str:
     global _LAST_ELEMENTS
     _LAST_ELEMENTS = {el.element_id: el for el in elements[:limit]}
@@ -120,53 +170,19 @@ def _format_observation(app: str, window: str, elements: list[UIElement], limit:
     ]
 
     if not elements:
-        is_browser = any(b in app.lower() for b in ("chrome", "safari", "firefox", "edge", "arc", "brave"))
-        if is_browser:
-            lines.append(
-                "- No web controls visible YET. Chrome/Safari lazy-enable AX "
-                "after the first query — the second or third observe_ui call "
-                "usually returns the form fields. Retry observe_ui ONCE more "
-                "with depth=4. If still empty, the page may be using "
-                "non-standard widgets; only then fall back to "
-                "take_annotated_screenshot."
-            )
-        else:
-            lines.append(
-                "- No interactive controls at this depth. The window may be "
-                "Electron-based (no AX). Try focus_window on a different app "
-                "or take_annotated_screenshot for visual tasks. Do not loop "
-                "observe_ui on the same window."
-            )
+        lines.append(_format_empty_observation(app))
         return "\n".join(lines)
 
-    role_order = {
-        "AXTextField": 0,
-        "AXTextArea": 0,
-        "AXSearchField": 0,
-        "AXButton": 1,
-        "AXCheckBox": 1,
-        "AXRadioButton": 1,
-        "AXPopUpButton": 1,
-        "AXMenuButton": 1,
-        "AXLink": 2,
-        "AXStaticText": 3,
-    }
-    sorted_elements = sorted(
-        elements,
-        key=lambda el: (role_order.get(el.role, 9), el.y, el.x, el.element_id),
-    )[:limit]
+    sorted_elements = _sort_elements(elements)[:limit]
 
     for el in sorted_elements:
-        label = el.name or el.description or el.value or "(unlabeled)"
-        cx, cy = el.center
-        extra = f" value={el.value!r}" if el.value and el.value != label else ""
-        lines.append(
-            f"- {el.element_id}: {el.role} {label!r} "
-            f"center=({cx},{cy}) bounds=({el.x},{el.y},{el.width},{el.height}){extra}"
-        )
+        lines.append(_format_element(el))
 
     if len(elements) > limit:
-        lines.append(f"... {len(elements) - limit} more elements omitted. Re-run observe_ui with a higher limit if needed.")
+        lines.append(
+            f"... {len(elements) - limit} more elements omitted. "
+            "Re-run observe_ui with a higher limit if needed."
+        )
 
     return "\n".join(lines)
 
@@ -266,7 +282,8 @@ async def _observe_ui_macos(limit: int, depth: int) -> str:
                 if r contains "Radio" then set interesting to true
                 if interesting then
                     set itemCount to itemCount + 1
-                    set output to output & "EL" & tab & depth & tab & r & tab & n & tab & d & tab & v & tab & px & tab & py & tab & sx & tab & sy & linefeed
+                    set output to output & "EL" & tab & depth & tab & r & tab & n \
+                        & tab & d & tab & v & tab & px & tab & py & tab & sx & tab & sy & linefeed
                 end if
             end if
 
