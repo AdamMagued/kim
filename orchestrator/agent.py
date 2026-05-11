@@ -45,6 +45,7 @@ import secrets
 import sys
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -284,6 +285,15 @@ async def mcp_session_context(config: dict):
 # KimAgent
 # ---------------------------------------------------------------------------
 
+@dataclass
+class KimAgentConfig:
+    config_dict: dict
+    ui_bridge: Optional[UIBridge] = None
+    voice_engine: Optional["VoiceEngine"] = None
+    session_store: Optional[SessionStore] = None
+    resume_session_id: Optional[str] = None
+
+
 class KimAgent:
     """
     Vision-tool agent loop.  Receives a live MCP session and a configured
@@ -293,33 +303,29 @@ class KimAgent:
 
     def __init__(
         self,
-        config: dict,
         session: ClientSession,
         provider: BaseProvider,
-        ui_bridge: Optional[UIBridge] = None,
-        voice_engine: Optional["VoiceEngine"] = None,
-        session_store: Optional[SessionStore] = None,
-        resume_session_id: Optional[str] = None,
+        config: KimAgentConfig,
     ):
-        self.config = config
+        self.config = config.config_dict
         self.session = session
         self.provider = provider
-        self.max_iterations: int = int(config.get("max_iterations", 25))
-        self.screenshot_scale: float = float(config.get("screenshot_scale", 0.75))
+        self.max_iterations: int = int(self.config.get("max_iterations", 25))
+        self.screenshot_scale: float = float(self.config.get("screenshot_scale", 0.75))
         self.memory = ConversationMemory(
-            max_messages=int(config.get("memory_max_messages", 40)),
-            keep_screenshots=int(config.get("memory_keep_screenshots", 4)),
+            max_messages=int(self.config.get("memory_max_messages", 40)),
+            keep_screenshots=int(self.config.get("memory_keep_screenshots", 4)),
         )
         self._screenshot_hashes: list[str] = []
         self._tools: list[dict] = []
-        self._ui_bridge: Optional[UIBridge] = ui_bridge
-        self._voice = voice_engine
-        self._session_store = session_store or SessionStore()
-        self._resume_session_id = resume_session_id
+        self._ui_bridge: Optional[UIBridge] = config.ui_bridge
+        self._voice = config.voice_engine
+        self._session_store = config.session_store or SessionStore()
+        self._resume_session_id = config.resume_session_id
         # Retry configuration for LLM API calls
-        self._max_retries: int = int(config.get("max_retries", 5))
-        self._retry_base_delay: float = float(config.get("retry_base_delay", 1.0))
-        self._retry_max_delay: float = float(config.get("retry_max_delay", 60.0))
+        self._max_retries: int = int(self.config.get("max_retries", 5))
+        self._retry_base_delay: float = float(self.config.get("retry_base_delay", 1.0))
+        self._retry_max_delay: float = float(self.config.get("retry_max_delay", 60.0))
         # Token usage tracking
         self._total_tokens: dict = {"input": 0, "output": 0}
 
@@ -1046,11 +1052,17 @@ async def mcp_agent_context(
     async with mcp_session_context(config) as session:
         store = SessionStore(base_dir=session_dir, session_id=resume_session_id) if (
             session_dir or resume_session_id) else SessionStore()
-        agent = KimAgent(
-            config=config, session=session, provider=provider,
-            ui_bridge=ui_bridge, voice_engine=_voice,
+        agent_config = KimAgentConfig(
+            config_dict=config,
+            ui_bridge=ui_bridge,
+            voice_engine=_voice,
             session_store=store,
             resume_session_id=resume_session_id,
+        )
+        agent = KimAgent(
+            session=session,
+            provider=provider,
+            config=agent_config,
         )
         try:
             yield agent
