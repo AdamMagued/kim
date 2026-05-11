@@ -42,10 +42,6 @@ class SessionStore:
         <base_dir>/<YYYY-MM-DD>/<session_id>.summary.txt
     """
 
-    # Cache for find_session_file to avoid repeated directory scans.
-    # Maps (base_dir_path, session_id) -> path_to_jsonl
-    _path_cache: dict[tuple[Path, str], Path] = {}
-
     def __init__(
         self,
         base_dir: Optional[Path] = None,
@@ -116,23 +112,11 @@ class SessionStore:
         if not base.exists():
             return None
 
-        # Check cache first
-        cache_key = (base, session_id)
-        cached_path = SessionStore._path_cache.get(cache_key)
-        if cached_path is not None and cached_path.exists():
-            return cached_path
-
-        # Clear invalid cache entries safely (avoid KeyError in concurrent cases)
-        if cached_path is not None:
-            SessionStore._path_cache.pop(cache_key, None)
-
-        # Directory traversal fallback
         for date_dir in sorted(base.iterdir(), reverse=True):
             if not date_dir.is_dir():
                 continue
             candidate = date_dir / f"{session_id}.jsonl"
             if candidate.exists():
-                SessionStore._path_cache[cache_key] = candidate
                 return candidate
         return None
 
