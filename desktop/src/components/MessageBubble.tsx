@@ -143,8 +143,16 @@ function AssistantBubbleActions({ text }: { text: string }) {
   );
 }
 
-function isToolUse(b: ContentBlock): b is ToolUseBlock { return b.type === 'tool_use'; }
-function isToolResult(b: ContentBlock): b is ToolResultBlock { return b.type === 'tool_result'; }
+function isToolUse(b: ContentBlock): b is ToolUseBlock {
+  return Boolean(b && typeof b === 'object' && b.type === 'tool_use');
+}
+function isToolResult(b: ContentBlock): b is ToolResultBlock {
+  return Boolean(b && typeof b === 'object' && b.type === 'tool_result');
+}
+
+function isBridgeFillerText(text: string): boolean {
+  return /^Calling\s+[A-Za-z_][\w-]*\.$/.test(text.trim());
+}
 
 // ── Minimal markdown renderer ─────────────────────────────────────────────────
 
@@ -311,7 +319,7 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
   const stripped = fullText.replace(/^(?:\[truncated.*?\]\n)?(?:\[err\]\s*)?(?:\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.,]?\d*\s+)?/, '').trim();
   
   // Hide internal orchestrator prompts
-  if (stripped.startsWith('[Tool result:') || stripped === 'Current screen. What is your next action?') {
+  if (stripped.startsWith('[Tool result:') || stripped === 'Current screen. What is your next action?' || isBridgeFillerText(stripped)) {
     return null;
   }
 
@@ -361,10 +369,21 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
   }
 
   if (message.role === 'tool') {
-    const text =
-      typeof message.content === 'string'
-        ? message.content
-        : JSON.stringify(message.content, null, 2);
+    if (Array.isArray(message.content)) {
+      const resultBlocks = message.content.filter(isToolResult);
+      if (resultBlocks.length === 0) return null;
+      return (
+        <div className="kim-msg-row kim-msg-row--assistant">
+          <div className="kim-bubble-wrap kim-bubble-wrap--assistant">
+            <div className="kim-bubble-wrap__inner">
+              {resultBlocks.map((b, i) => <ToolResultCard key={i} block={b} />)}
+            </div>
+          </div>
+        </div>
+      );
+    }
+    const text = message.content;
+    if (!text.trim()) return null;
     return (
       <div className="kim-tool-result-row">
         <div className="kim-tool-result-inline">
@@ -379,7 +398,7 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
 
   if (typeof content === 'string') {
     let rawToolCall = null;
-    let cleanContent = content.trim().replace(/^(?:Gemini said|Claude said|Assistant said):\s*/i, '');
+    let cleanContent = content.replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said):?\s*/ig, '').trim();
     
     if (cleanContent.startsWith('{')) {
       try {
@@ -450,7 +469,25 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
     );
   }
 
-  const textBlocks    = content.filter(b => b.type === 'text') as Array<{ type: 'text'; text: string }>;
+  if (!Array.isArray(content)) {
+    const fallbackText = typeof content === 'object' && content !== null
+      ? JSON.stringify(content, null, 2)
+      : String(content ?? '');
+    if (!fallbackText.trim() || isBridgeFillerText(fallbackText)) return null;
+    return (
+      <div className="kim-msg-row kim-msg-row--assistant">
+        <div className="kim-bubble-wrap kim-bubble-wrap--assistant">
+          <div className="kim-bubble kim-bubble--assistant">
+            <AnimatedText text={fallbackText} animation={typingAnimation} active={animate} />
+          </div>
+          <AssistantBubbleActions text={fallbackText} />
+        </div>
+      </div>
+    );
+  }
+
+  const textBlocks    = (content.filter(b => b && typeof b === 'object' && b.type === 'text') as Array<{ type: 'text'; text: string }>)
+    .filter(b => !isBridgeFillerText(b.text));
   const toolUseBlocks = content.filter(isToolUse);
   const toolResultBlocks = content.filter(isToolResult);
   const hasText  = textBlocks.length > 0;

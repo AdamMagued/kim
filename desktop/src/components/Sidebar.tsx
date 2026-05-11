@@ -24,7 +24,9 @@ interface Props {
   onTabChange: (tab: 'chat' | 'code') => void;
   activeProjectPath: string | null;
   onSelectProject: (path: string) => void;
+  onNewChatInProject: (path: string) => void;
   onRefreshSessions: () => void;
+  sessionRefreshNonce: number;
   kimSessionsDir: string | null;
   clawSessionsDir: string | null;
   appVersion: string;
@@ -204,7 +206,7 @@ function ClawSessionItem({ session, onSelectSession }: { session: { session_id: 
     ? session.summary.slice(0, 55) + (session.summary.length > 55 ? '…' : '')
     : `${session.message_count} message${session.message_count !== 1 ? 's' : ''}`;
   return (
-    <button className="kim-session-item" title={session.summary ?? session.session_id} onClick={() => onSelectSession({ session_id: session.session_id, session_type: 'claw', message_count: session.message_count, has_summary: !!session.summary, summary: session.summary ?? undefined, date: session.date || new Date().toISOString() })}>
+    <button className="kim-session-item" title={session.summary ?? session.session_id} onClick={() => onSelectSession({ session_id: session.session_id, session_key: `claw:${session.date}:${session.session_id}`, session_type: 'claw', message_count: session.message_count, has_summary: !!session.summary, summary: session.summary ?? undefined, date: session.date || new Date().toISOString() })}>
       <div className="kim-session-item__title">{session.session_id.slice(0, 18)}</div>
       <div className="kim-session-item__preview">{preview}</div>
     </button>
@@ -213,11 +215,12 @@ function ClawSessionItem({ session, onSelectSession }: { session: { session_id: 
 
 // ── Project tree in Code tab ───────────────────────────────────────────────────
 
-function ClawProjectTree({ project, onRemove, isActive, onSelect, onSelectSession }: {
+function ClawProjectTree({ project, onRemove, isActive, onSelect, onNewChat, onSelectSession }: {
   project: ClawProject;
   onRemove: (path: string) => void;
   isActive: boolean;
   onSelect: () => void;
+  onNewChat: () => void;
   onSelectSession: (s: SessionInfo) => void;
 }) {
   const [open, setOpen] = useState(isActive);
@@ -230,11 +233,19 @@ function ClawProjectTree({ project, onRemove, isActive, onSelect, onSelectSessio
           <ChevronIcon open={open} />
         </button>
         <span className="kim-project-item__icon"><FolderIcon /></span>
-        <span className="kim-project-item__name">{project.name}</span>
+        <span className="kim-project-item__name" title={project.path}>{project.name}</span>
         <span className="kim-project-item__branch-pill">{project.current_branch}</span>
         <button
+          className="kim-project-item__new-chat"
+          onClick={(e) => { e.stopPropagation(); onNewChat(); }}
+          title={`New chat in ${project.name}`}
+          aria-label={`New chat in ${project.name}`}
+        >
+          <PlusIcon />
+        </button>
+        <button
           className="kim-project-item__remove"
-          onClick={() => onRemove(project.path)}
+          onClick={(e) => { e.stopPropagation(); onRemove(project.path); }}
           title="Remove project"
           aria-label="Remove project"
         >
@@ -301,8 +312,8 @@ export function Sidebar({
   onSelectSession, onNewChat,
   collapsed, onToggle, onOpenSettings, loading,
   account, onAccountChange, activeTab, onTabChange,
-  activeProjectPath, onSelectProject, onRefreshSessions,
-  kimSessionsDir, clawSessionsDir, appVersion,
+  activeProjectPath, onSelectProject, onNewChatInProject, onRefreshSessions,
+  sessionRefreshNonce, kimSessionsDir, clawSessionsDir, appVersion,
 }: Props) {
   const [kimExpanded, setKimExpanded] = useState(true);
   const [clawProjects, setClawProjects] = useState<ClawProject[]>([]);
@@ -415,7 +426,7 @@ export function Sidebar({
 
   useEffect(() => {
     if (activeTab === 'code') loadProjects();
-  }, [activeTab, loadProjects]);
+  }, [activeTab, loadProjects, sessionRefreshNonce]);
 
   async function handleAddProject(path: string) {
     const newPaths = await invoke<string[]>('add_code_project', { path });
@@ -626,6 +637,7 @@ export function Sidebar({
                         onRemove={handleRemoveProject}
                         isActive={activeProjectPath === path}
                         onSelect={() => onSelectProject(path)}
+                        onNewChat={() => onNewChatInProject(path)}
                         onSelectSession={onSelectSession}
                       />
                     );
@@ -637,11 +649,19 @@ export function Sidebar({
                       <div className="kim-project-item__header" onClick={() => onSelectProject(path)} style={{ cursor: 'pointer' }}>
                         <button className="kim-project-item__toggle" style={{ flex: 1, cursor: 'default' }}>
                           <span className="kim-project-item__icon"><FolderIcon /></span>
-                          <span className="kim-project-item__name">{name}</span>
+                          <span className="kim-project-item__name" title={path}>{name}</span>
+                        </button>
+                        <button
+                          className="kim-project-item__new-chat"
+                          onClick={(e) => { e.stopPropagation(); onNewChatInProject(path); }}
+                          title={`New chat in ${name}`}
+                          aria-label={`New chat in ${name}`}
+                        >
+                          <PlusIcon />
                         </button>
                         <button
                           className="kim-project-item__remove"
-                          onClick={() => handleRemoveProject(path)}
+                          onClick={(e) => { e.stopPropagation(); handleRemoveProject(path); }}
                           title="Remove project"
                         >
                           <XIcon />

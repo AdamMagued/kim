@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Window Recording Aura</title>
+<title>Kim Screenshot Aura</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
 
@@ -16,9 +16,9 @@
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   :root {
-    --aura-1: #b054ff;
-    --aura-2: #7c3aed;
-    --aura-3: #f0abfc;
+    --aura-1: #b88a74;
+    --aura-2: #d4a08a;
+    --aura-3: #f0e5dd;
     --aura-dim: rgba(0,0,0,0);
     --font: 'Inter', system-ui, sans-serif;
   }
@@ -113,14 +113,14 @@
     background: conic-gradient(
       from var(--angle),
       transparent 0%,
-      rgba(176, 84, 255, 0.9) 14%,
-      rgba(124, 58, 237, 1)   20%,
-      rgba(240, 171, 252, 0.9) 26%,
+      rgba(184, 138, 116, 0.9) 14%,
+      rgba(212, 160, 138, 1)   20%,
+      rgba(240, 229, 221, 0.9) 26%,
       transparent 38%,
       transparent 62%,
-      rgba(176, 84, 255, 0.9) 76%,
-      rgba(124, 58, 237, 1)   82%,
-      rgba(240, 171, 252, 0.9) 88%,
+      rgba(184, 138, 116, 0.9) 76%,
+      rgba(212, 160, 138, 1)   82%,
+      rgba(240, 229, 221, 0.9) 88%,
       transparent 100%
     );
     filter: blur(2.5px);
@@ -188,17 +188,17 @@
     display: flex;
     align-items: center;
     gap: 7px;
-    background: rgba(10, 8, 20, 0.85);
+    background: rgba(45, 40, 34, 0.82);
     backdrop-filter: blur(10px);
-    border: 1px solid rgba(176,84,255,0.3);
+    border: 1px solid rgba(184,138,116,0.36);
     border-radius: 999px;
     padding: 4px 12px 4px 9px;
   }
   .rec-dot {
     width: 8px; height: 8px;
     border-radius: 50%;
-    background: #b054ff;
-    box-shadow: 0 0 8px 2px rgba(176, 84, 255, 0.55);
+    background: #b88a74;
+    box-shadow: 0 0 8px 2px rgba(184, 138, 116, 0.55);
     animation: recPulse 1.4s ease-in-out infinite;
     flex-shrink: 0;
   }
@@ -245,7 +245,8 @@
 
 <script>
   const PRESETS = {
-    violet: { a1: '#b054ff', a2: '#7c3aed', a3: '#f0abfc', rec: 'rgba(176,84,255,0.55)' },
+    kim:    { a1: '#b88a74', a2: '#d4a08a', a3: '#f0e5dd', rec: 'rgba(184,138,116,0.55)' },
+    violet: { a1: '#b88a74', a2: '#d4a08a', a3: '#f0e5dd', rec: 'rgba(184,138,116,0.55)' },
     red:    { a1: '#ff3b5c', a2: '#ff6b35', a3: '#ff1a8c', rec: 'rgba(255,59,92,0.55)' },
     cyan:   { a1: '#00e5ff', a2: '#00bcd4', a3: '#40c4ff', rec: 'rgba(0,229,255,0.55)' },
     amber:  { a1: '#ffb300', a2: '#ff6d00', a3: '#ffd740', rec: 'rgba(255,179,0,0.55)' },
@@ -282,7 +283,7 @@
   }
 
   // medium intensity (0.65), lowest speed (0.3)
-  applyColor('violet');
+  applyColor('kim');
   applySpeed(0.3);
   applyIntensity(0.65);
 

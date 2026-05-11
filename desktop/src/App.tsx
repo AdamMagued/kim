@@ -80,6 +80,7 @@ export default function App() {
   // When a task completes in newChatMode, ChatView tells us the session ID.
   // We store it here and auto-select the session once kimSessions refreshes.
   const [pendingSelectSessionId, setPendingSelectSessionId] = useState<string | null>(null);
+  const [sessionRefreshNonce, setSessionRefreshNonce] = useState(0);
   // Incremented every time the user presses New Chat — used as ChatView's key
   // so the component fully remounts (clearing all transient state) each time.
   const [chatSerial, setChatSerial] = useState(0);
@@ -212,25 +213,68 @@ export default function App() {
     setChatSerial(s => s + 1);
   }
 
+  // Per-project "+" button: explicitly start a new chat scoped to this
+  // project, bypassing any stale activeProjectPath. Same effect as
+  // handleSelectProject today but kept as a separate handler so the intent
+  // ("new chat in this project") is unambiguous in the UI.
+  function handleNewChatInProject(path: string) {
+    setActiveTab('code');
+    setActiveProjectPath(path);
+    setActiveSession(null);
+    setNewChatMode(true);
+    setChatSerial(s => s + 1);
+  }
+
   function handleHeaderMouseDown(e: React.MouseEvent<HTMLElement>) {
     if (e.button !== 0 || isNoDragTarget(e.target)) return;
     void getCurrentWindow().startDragging();
   }
 
-  const handleTaskDone = useCallback((sessionId?: string) => {
+  const handleTaskDone = useCallback((sessionId?: string, completedSession?: SessionInfo) => {
     // Auto-navigate to the just-completed session even from newChatMode so the
     // sidebar highlights it and the user can clearly see "this chat is saved"
     // (issue #3 §4: chats appearing to vanish after task completion). The
     // ChatView's key continues to use the same id so transitioning from
     // newChatMode → loaded does not remount.
-    if (sessionId) setPendingSelectSessionId(sessionId);
+    if (completedSession) {
+      // Code-tab (Claw) completion: Claw always creates a NEW session file
+      // (it doesn't support --resume). If the user was already viewing an
+      // OLD session, navigating to the new session replaces the old messages
+      // with just the latest turn — causing the "chat reset" bug. Fix: stay
+      // on the current session so old history + liveHistory remain visible;
+      // the new session still appears in the sidebar for later access.
+      setActiveSession(prev => {
+        if (prev && prev.session_id !== completedSession.session_id) {
+          // Already viewing a different (old) session — don't navigate away.
+          return prev;
+        }
+        // First task from newChatMode or same session — navigate normally.
+        setNewChatMode(false);
+        return completedSession;
+      });
+    } else if (sessionId && activeTab === 'chat') {
+      // Only trigger the pending-select flow when the session isn't already
+      // active. On follow-up tasks the session is already selected — calling
+      // setPendingSelectSessionId again causes the useEffect to fire with a
+      // new session object reference, which triggers a message reload cycle
+      // and makes the UI briefly flash/reset ("chat reset" bug).
+      setActiveSession(prev => {
+        if (prev && prev.session_id === sessionId) {
+          // Already showing this session — skip the re-select dance.
+          return prev;
+        }
+        setPendingSelectSessionId(sessionId);
+        return prev;
+      });
+    }
+    setSessionRefreshNonce(n => n + 1);
     refresh();
     // Poll a few times — Python flushes the last JSONL line right before
     // exit, and the OS may take a beat to make the file visible to readdir.
     setTimeout(() => { refresh(); }, 400);
     setTimeout(() => { refresh(); }, 1200);
     setTimeout(() => { refresh(); }, 2400);
-  }, [refresh]);
+  }, [activeTab, refresh]);
 
   // Auto-select the just-completed session once it appears in kimSessions.
   useEffect(() => {
@@ -298,7 +342,9 @@ export default function App() {
         onTabChange={handleTabChange}
         activeProjectPath={activeProjectPath}
         onSelectProject={handleSelectProject}
+        onNewChatInProject={handleNewChatInProject}
         onRefreshSessions={refresh}
+        sessionRefreshNonce={sessionRefreshNonce}
         kimSessionsDir={settings.kim_sessions_dir || null}
         clawSessionsDir={settings.claw_sessions_dir || null}
         appVersion={appVersion}
@@ -315,7 +361,7 @@ export default function App() {
               <button
                 type="button"
                 className="kim-header__summarize-btn kim-no-drag"
-                title={activeSession.has_summary ? 'Re-generate summary' : 'Summarize this conversation'}
+                title={activeSession.has_summary ? 'Refresh the summary' : 'Generate a summary for this conversation'}
                 onClick={async () => {
                   try {
                     await invoke('summarize_session', {
@@ -330,7 +376,7 @@ export default function App() {
                   }
                 }}
               >
-                {activeSession.has_summary ? 'Re-summarize' : 'Summarize'}
+                {activeSession.has_summary ? 'Refresh summary' : 'Generate summary'}
               </button>
             </div>
           )}

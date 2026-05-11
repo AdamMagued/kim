@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock } from '../types';
+import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock, ToolUseBlock, ToolResultBlock } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
 import { Bloop, type BloopState } from './Bloop';
@@ -33,8 +33,8 @@ export function collapseMessages(msgs: KimMessage[]) {
     if (res.length > 0 && msg.role === 'assistant' && typeof msg.content === 'string') {
       const prev = res[res.length - 1];
       if (prev.msg.role === 'assistant' && typeof prev.msg.content === 'string') {
-        const c1 = msg.content.trim().replace(/^(?:Gemini said|Claude said|Assistant said):\s*/i, '');
-        const c2 = prev.msg.content.trim().replace(/^(?:Gemini said|Claude said|Assistant said):\s*/i, '');
+        const c1 = msg.content.replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said):?\s*/ig, '').trim();
+        const c2 = prev.msg.content.replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said):?\s*/ig, '').trim();
         if (c1 === c2 && c1.startsWith('{')) {
           try {
             JSON.parse(c1);
@@ -47,6 +47,211 @@ export function collapseMessages(msgs: KimMessage[]) {
     res.push({ msg, retries: 0 });
   }
   return res;
+}
+
+// ── Claw session grouping ─────────────────────────────────────────────────────
+
+export interface TouchedFile {
+  path: string;
+  added: number;
+  removed: number;
+}
+
+export interface ClawRunGroup {
+  userMessage: KimMessage;
+  intermediateMessages: KimMessage[];
+  intermediateActivity: ActivityItem[];
+  finalAssistantMessage: KimMessage | null;
+  touchedFiles: TouchedFile[];
+  durationSec: number;
+}
+
+/** A real user message has text content that isn't just tool results. */
+function isRealUserMessage(msg: KimMessage): boolean {
+  if (msg.role !== 'user') return false;
+  if (typeof msg.content === 'string') {
+    return !msg.content.trim().startsWith('[Tool result:');
+  }
+  if (Array.isArray(msg.content)) {
+    if (msg.content.every(b => b.type === 'tool_result')) return false;
+    return msg.content.some(
+      b => b.type === 'text' && !(b as TextBlock).text.trim().startsWith('[Tool result:')
+    );
+  }
+  return false;
+}
+
+/** An assistant message with text but no tool_use blocks = potential final answer. */
+function isTextOnlyAssistant(msg: KimMessage): boolean {
+  if (msg.role !== 'assistant') return false;
+  if (typeof msg.content === 'string') return true;
+  if (Array.isArray(msg.content)) {
+    return msg.content.some(b => b.type === 'text') &&
+           !msg.content.some(b => b.type === 'tool_use');
+  }
+  return false;
+}
+
+function clawBridgeFiller(text: string): boolean {
+  return /^Calling\s+[A-Za-z_][\w-]*\.$/.test(text.trim());
+}
+
+function parseMaybeNestedJson(raw: string): Record<string, unknown> | null {
+  try {
+    let parsed = JSON.parse(raw);
+    if (typeof parsed?.output === 'string') {
+      try { parsed = JSON.parse(parsed.output); } catch { /* keep outer */ }
+    }
+    return (parsed && typeof parsed === 'object') ? parsed : null;
+  } catch { return null; }
+}
+
+function extractTouchedFiles(messages: KimMessage[]): TouchedFile[] {
+  const fileMap = new Map<string, TouchedFile>();
+  const touch = (path: string, added: number, removed: number) => {
+    const existing = fileMap.get(path);
+    if (existing) { existing.added += added; existing.removed += removed; }
+    else fileMap.set(path, { path, added, removed });
+  };
+
+  for (const msg of messages) {
+    if (!Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block.type === 'tool_use') {
+        const tb = block as ToolUseBlock;
+        if (['write_file', 'edit_file', 'create_file'].includes(tb.name)) {
+          const p = String(tb.input?.path ?? tb.input?.file_path ?? '');
+          if (p) touch(p, 0, 0);
+        }
+      }
+      if (block.type === 'tool_result') {
+        const trb = block as ToolResultBlock;
+        const raw = typeof trb.content === 'string' ? trb.content
+          : (trb as unknown as { output?: string }).output
+            ? String((trb as unknown as { output: string }).output) : '';
+        if (!raw.trim()) continue;
+        const parsed = parseMaybeNestedJson(raw);
+        if (!parsed) continue;
+        const filePath = String(parsed.filePath ?? (parsed.file as Record<string, unknown>)?.filePath ?? '');
+        const patch = parsed.structuredPatch;
+        if (filePath && Array.isArray(patch)) {
+          let a = 0, r = 0;
+          for (const hunk of patch) {
+            if (Array.isArray((hunk as Record<string, unknown>)?.lines)) {
+              for (const l of (hunk as { lines: string[] }).lines) {
+                if (typeof l === 'string') { if (l.startsWith('+')) a++; else if (l.startsWith('-')) r++; }
+              }
+            }
+          }
+          touch(filePath, a, r);
+        } else if (filePath) {
+          const content = parsed.content;
+          const lines = typeof content === 'string' ? Math.max(1, content.split(/\r?\n/).length) : 0;
+          touch(filePath, lines, 0);
+        }
+      }
+    }
+  }
+  return Array.from(fileMap.values());
+}
+
+function cleanActivityText(t: string): string {
+  let cleaned = t.replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said):?\s*/ig, '').trim();
+  try {
+    if (cleaned.startsWith('{') && cleaned.endsWith('}')) {
+      const parsed = JSON.parse(cleaned);
+      if (typeof parsed.text === 'string') {
+        cleaned = parsed.text;
+      }
+    }
+  } catch {}
+  return cleaned;
+}
+
+function synthesizeActivityFromMessages(messages: KimMessage[], toolMap: typeof TOOL_MAP): ActivityItem[] {
+  const items: ActivityItem[] = [];
+  let id = 0;
+  for (const msg of messages) {
+    if (typeof msg.content === 'string') {
+      if (msg.role === 'assistant') {
+        const rawT = msg.content.trim().replace(/^TASK_COMPLETE:\s*/i, '');
+        if (rawT) {
+          const t = cleanActivityText(rawT);
+          items.push({ id: ++id, kind: 'status', icon: '›', text: t.length > 120 ? t.slice(0, 120) + '…' : t });
+        }
+      }
+      continue;
+    }
+    if (!Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block.type === 'text') {
+        const rawT = (block as TextBlock).text.trim();
+        if (!rawT || rawT.startsWith('[Tool result:') || clawBridgeFiller(rawT)) continue;
+        if (msg.role === 'assistant') {
+          const t = cleanActivityText(rawT);
+          items.push({ id: ++id, kind: 'status', icon: '›', text: t.length > 120 ? t.slice(0, 120) + '…' : t });
+        }
+      } else if (block.type === 'tool_use') {
+        const tb = block as ToolUseBlock;
+        const def = toolMap[tb.name];
+        const args = (tb.input && typeof tb.input === 'object') ? tb.input as Record<string, unknown> : {};
+        items.push({ id: ++id, kind: 'tool', icon: def?.icon ?? '›', text: def ? def.label(args) : `Using tool: \`${tb.name}\`` });
+      } else if (block.type === 'tool_result') {
+        const raw = typeof (block as ToolResultBlock).content === 'string' ? (block as ToolResultBlock).content as string
+          : String((block as unknown as { output?: string }).output ?? '');
+        if (!raw.trim()) continue;
+        const parsed = parseMaybeNestedJson(raw);
+        if (parsed?.filePath) {
+          const fp = basename(String(parsed.filePath));
+          const patch = parsed.structuredPatch;
+          if (Array.isArray(patch)) {
+            let a = 0, r = 0;
+            for (const h of patch) { if (Array.isArray((h as Record<string, unknown>)?.lines)) { for (const l of (h as { lines: string[] }).lines) { if (typeof l === 'string') { if (l.startsWith('+')) a++; else if (l.startsWith('-')) r++; } } } }
+            items.push({ id: ++id, kind: 'tool', icon: '›', text: `Updated \`${fp}\` +${a} -${r}` });
+          } else {
+            items.push({ id: ++id, kind: 'tool', icon: '›', text: `Updated \`${fp}\`` });
+          }
+        }
+      }
+    }
+  }
+  return items;
+}
+
+function finalizeClawRun(userMessage: KimMessage, intermediates: KimMessage[]): ClawRunGroup {
+  let finalIdx = -1;
+  for (let i = intermediates.length - 1; i >= 0; i--) {
+    if (isTextOnlyAssistant(intermediates[i])) { finalIdx = i; break; }
+  }
+  const finalAssistantMessage = finalIdx >= 0 ? intermediates[finalIdx] : null;
+  const activityMessages = finalIdx >= 0
+    ? [...intermediates.slice(0, finalIdx), ...intermediates.slice(finalIdx + 1)]
+    : intermediates;
+  return {
+    userMessage,
+    intermediateMessages: activityMessages,
+    intermediateActivity: synthesizeActivityFromMessages(activityMessages, TOOL_MAP),
+    finalAssistantMessage,
+    touchedFiles: extractTouchedFiles(activityMessages),
+    durationSec: 0,
+  };
+}
+
+export function groupClawMessages(messages: KimMessage[]): ClawRunGroup[] {
+  const runs: ClawRunGroup[] = [];
+  let currentUser: KimMessage | null = null;
+  let currentIntermediate: KimMessage[] = [];
+  for (const msg of messages) {
+    if (isRealUserMessage(msg)) {
+      if (currentUser) runs.push(finalizeClawRun(currentUser, currentIntermediate));
+      currentUser = msg;
+      currentIntermediate = [];
+    } else if (currentUser) {
+      currentIntermediate.push(msg);
+    }
+  }
+  if (currentUser) runs.push(finalizeClawRun(currentUser, currentIntermediate));
+  return runs;
 }
 
 // ── Aggressive log suppression ───────────────────────────────────────────────
@@ -92,6 +297,13 @@ const HIDDEN_SUBSTRINGS = [
   'unhandled errors in a TaskGroup',
   'return future.result()',
   'File "<frozen runpy>"',
+  // Claw bridge internal output
+  'Claw completed', 'Claw failed', 'LLM calls,', 'bridge_request', 'bridge_response',
+  'relay #', 'sending to browser LLM', 'browser LLM',
+  'CLAW_FILE_BRIDGE', 'CLAW_BRIDGE_DIR', 'claw binary:',
+  // Provider internal noise
+  'sending to gemini', 'sending to claude', 'sending to chatgpt',
+  'Routing to Claw', 'Routing Claw',
   'getattr(logger, level.lower(), logger.info)(message)',
 ];
 
@@ -138,7 +350,10 @@ function isNoiseLine(raw: string): boolean {
 const TOOL_MAP: Record<string, { icon: string; label: (args: Record<string, unknown>) => string }> = {
   // File operations (actual MCP tool names)
   read_file:          { icon: '›', label: a => `Reading \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
-  write_file:         { icon: '›', label: a => `Writing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
+  write_file:         { icon: '›', label: a => {
+    const lines = Number(a.lines ?? 0);
+    return `Writing \`${basename(String(a.path ?? a.file_path ?? ''))}\`${lines > 0 ? ` +${lines}` : ''}`;
+  } },
   create_file:        { icon: '›', label: a => `Creating \`${basename(String(a.path ?? ''))}\`` },
   edit_file:          { icon: '›', label: a => `Editing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
   append_file:        { icon: '›', label: a => `Appending to \`${basename(String(a.path ?? ''))}\`` },
@@ -180,6 +395,16 @@ const TOOL_MAP: Record<string, { icon: string; label: (args: Record<string, unkn
   git_diff:           { icon: '›', label: _a => 'Viewing git diff' },
   // User interaction
   ask_user:           { icon: '›', label: a => `Asking: "${String(a.question ?? '')}"` },
+  // Claw tool names
+  bash:               { icon: '›', label: a => {
+    const cmd = String(a.command ?? a.cmd ?? '');
+    return cmd.trim().startsWith('open ')
+      ? `Opening \`${basename(cmd.trim().slice(5))}\``
+      : `Running \`${shorten(cmd, 60)}\``;
+  } },
+  grep_search:        { icon: '›', label: a => `Searching for \`${String(a.pattern ?? a.query ?? '')}\`` },
+  glob_search:        { icon: '›', label: a => `Searching for \`${String(a.pattern ?? a.glob ?? '')}\`` },
+  list_files:         { icon: '›', label: a => `Listing \`${basename(String(a.path ?? a.directory ?? ''))}\`` },
 };
 
 function basename(p: string): string {
@@ -237,7 +462,11 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
 
   // SUCCESS from stdout
   if (raw.includes('[SUCCESS]')) {
-    const text = raw.replace(/.*\[SUCCESS\]\s*/, '').trim();
+    let text = raw.replace(/.*\[SUCCESS\]\s*/, '').trim();
+    // Strip Claw-internal completion messages — replace with a clean summary.
+    if (/^Claw (?:completed|finished)/i.test(text) || /\bLLM calls\b/i.test(text)) {
+      text = 'Task completed';
+    }
     return { id, kind: 'success', icon: '✓', text: text || 'Task completed successfully' };
   }
 
@@ -456,7 +685,7 @@ interface Props {
   session: SessionInfo | null;
   newChatMode: boolean;
   settings: Settings;
-  onTaskDone: (sessionId?: string) => void;
+  onTaskDone: (sessionId?: string, completedSession?: SessionInfo) => void;
   account: KimAccount;
   onAccountChange: (account: KimAccount) => Promise<void>;
   activeTab: 'chat' | 'code';
@@ -482,6 +711,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // corresponding assistant turn in liveHistory.
   const [runHistory, setRunHistory] = useState<{ activity: ActivityItem[]; durationSec: number }[]>([]);
   const [expandedRunIdx, setExpandedRunIdx] = useState<number | null>(null);
+  const [clawRuns, setClawRuns] = useState<ClawRunGroup[]>([]);
   const [taskError, setTaskError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
@@ -523,6 +753,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // the cancel poller emits cancelled), so a closure variable would still be false.
   const cancelFlagRef = useRef(false);
   const needHelpFlagRef = useRef(false);
+  const completedCodeSessionRef = useRef<SessionInfo | null>(null);
   // Once the user sends their first message in a new-chat session, this stays
   // true for the lifetime of that session — even after the task completes and
   // isRunning/activity reset. This prevents the welcome section from
@@ -711,18 +942,33 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     // our in-flight conversationId). Treat this like a silent refresh — keep
     // liveHistory and skip the spinner so the chat doesn't appear to vanish
     // and then reappear (issue #3 §4).
+    //
+    // "Claw continuation": In Code tab, each follow-up task creates a new
+    // Claw session (Claw doesn't support --resume). When the task completes,
+    // handleTaskDone navigates to the new session, causing a session change.
+    // Without this guard the UI would wipe liveHistory and show a spinner,
+    // making it look like a "chat reset". We detect this by checking that
+    // hasSentMessageRef is true (we were actively chatting, not clicking a
+    // sidebar item) and the session is a claw session.
+    const isClawContinuation =
+      isSessionChange &&
+      prevId !== null &&
+      session.session_type === 'claw' &&
+      hasSentMessageRef.current;
     const isSelfTransition =
       isSessionChange &&
       prevId === null &&
       session.session_id === activeResumeSessionIdRef.current;
+    const isSeamlessTransition = isSelfTransition || isClawContinuation;
     lastLoadedSessionIdRef.current = session.session_id;
 
-    if (isSessionChange && !isSelfTransition) {
+    if (isSessionChange && !isSeamlessTransition) {
       setLoadingMessages(true);
       setLiveHistory([]);
       // Reset run history and re-hydrate from the sidecar `<id>.runs.json` file.
       setRunHistory([]);
       setExpandedRunIdx(null);
+      setClawRuns([]); 
       invoke<{ activity: ActivityItem[]; durationSec: number }[]>('load_run_history', {
         sessionId: session.session_id,
         sessionDate: session.date || null,
@@ -732,7 +978,18 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           : settings.claw_sessions_dir || null,
       })
         .then(runs => {
-          if (Array.isArray(runs)) setRunHistory(runs);
+          if (Array.isArray(runs)) {
+            setRunHistory(runs);
+            // Merge saved durations into clawRuns so the "Worked for X"
+            // badge shows the correct time on old Claw sessions.
+            if (runs.length > 0) {
+              setClawRuns(prev => prev.map((run, i) =>
+                i < runs.length && runs[i].durationSec > 0
+                  ? { ...run, durationSec: runs[i].durationSec }
+                  : run
+              ));
+            }
+          }
         })
         .catch(() => { /* non-fatal */ });
     }
@@ -751,22 +1008,36 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         // Animate only on session change. On silent refresh the bubble was
         // already shown (and animated) via liveHistory — re-animating it
         // looks like the chat is "refreshing".
-        if (isSessionChange && !isSelfTransition && prev > 0 && msgs.length > prev && lastAssistantIdx >= prev) {
+        if (isSessionChange && !isSeamlessTransition && prev > 0 && msgs.length > prev && lastAssistantIdx >= prev) {
           setNewestMsgIdx(lastAssistantIdx);
         } else {
           setNewestMsgIdx(null);
         }
         prevMsgCountRef.current = msgs.length;
         setMessages(msgs);
+        // Group Claw session messages into per-run structures so intermediate
+        // tool calls are hidden behind "Worked on this" disclosures.
+        if (session.session_type === 'claw') {
+          setClawRuns(groupClawMessages(msgs));
+        } else {
+          setClawRuns([]);
+        }
         // Silent refresh AND self-transition: clear liveHistory only after
         // disk messages are loaded so the chat doesn't blink empty.
-        if (!isSessionChange || isSelfTransition) {
-          setLiveHistory([]);
+        // BUT: when staying on an old Claw session after a task completes
+        // (the new turn lives in a different session file), the disk
+        // messages for this session haven't changed. Clearing liveHistory
+        // would wipe the new response. Only clear when the disk data
+        // actually absorbed the new content (msg count grew).
+        if (!isSessionChange || isSeamlessTransition) {
+          if (msgs.length > prev) {
+            setLiveHistory([]);
+          }
         }
       })
       .catch(err => console.error('Failed to load messages:', err))
       .finally(() => {
-        if (isSessionChange && !isSelfTransition) setLoadingMessages(false);
+        if (isSessionChange && !isSeamlessTransition) setLoadingMessages(false);
       });
   }, [session, settings.kim_sessions_dir, settings.claw_sessions_dir, messageReloadNonce]);
 
@@ -809,6 +1080,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       setActivity([]);
       setRunHistory([]);
       setExpandedRunIdx(null);
+      setClawRuns([]);
       setTaskError(null);
       setTokenStats(null);
       setElapsed(0);
@@ -903,6 +1175,29 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       }
       return;
     }
+    if (item.kind === 'status' && /\b(?:gemini|claude|chatgpt|grok|deepseek)\s+(?:is\s+)?(?:still\s+)?thinking/i.test(item.text)) {
+      item.text = item.text.replace(/\b(?:gemini|claude|chatgpt|grok|deepseek)\s+(?:is\s+)?(?:still\s+)?thinking(?:…|\.\.\.)?(?:\s+\(\d+s\))?/ig, 'Kim is thinking…');
+    }
+    // Replace any remaining provider brand mentions in status lines
+    if (item.kind === 'status') {
+      item.text = item.text
+        .replace(/\b(?:Gemini|Claude|ChatGPT|Grok|DeepSeek)\s+(?:is|says?|returned?|respond(?:s|ed)?)/gi, 'Kim')
+        .replace(/\bsending to (?:Gemini|Claude|ChatGPT|Grok|DeepSeek)\b/gi, 'Kim is working')
+        .replace(/\b(?:Gemini|Claude|ChatGPT|Grok|DeepSeek) responded?\b/gi, 'Response received');
+      // Strip JSON fragment leaks: lines that start with { or contain "text":
+      if (/^\s*[{"\[]/.test(item.text) || /"text"\s*:/.test(item.text)) {
+        // Try to extract readable text from JSON
+        try {
+          const parsed = JSON.parse(item.text);
+          if (typeof parsed === 'object' && parsed !== null && typeof parsed.text === 'string') {
+            item.text = parsed.text;
+          }
+        } catch {
+          // Not valid JSON — drop lines that look like raw JSON artifacts
+          if (/^\s*\{.*\}\s*$/.test(item.text)) return;
+        }
+      }
+    }
 
     const needHelpMatch = line.match(/(?:^|\b)NEED_HELP:\s*(.+)$/i);
     if (needHelpMatch) {
@@ -916,12 +1211,20 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
     setActivity(prev => {
       if (item.kind === 'success') return prev; // Skip adding to activity feed to avoid duplicating the assistant bubble
+      // Collapse consecutive status items: replace the previous one so repeated
+      // "gemini is thinking…" lines don't flood the feed.
+      if (item.kind === 'status' && prev.length > 0 && prev[prev.length - 1].kind === 'status') {
+        return [...prev.slice(0, -1), item];
+      }
       const next = [...prev, item];
       if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
       return next;
     });
 
-    // Capture success results as assistant bubbles in liveHistory
+    // Capture success results as assistant bubbles in liveHistory.
+    // This must also happen in Claw (Code-tab) mode: when the user sends a
+    // follow-up from an old Claw session, we stay on that session to
+    // preserve history. The new task's response appears via liveHistory.
     if (item.kind === 'success') {
       setLiveHistory(prev => [...prev, { role: 'assistant', content: item.text }]);
     }
@@ -932,6 +1235,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     let unlistenOutput: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
     let unlistenDone: (() => void) | undefined;
+    let unlistenCodeSession: (() => void) | undefined;
     let unlistenCancelled: (() => void) | undefined;
 
     listen<string>('kim-agent-output', event => {
@@ -960,13 +1264,16 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         if (event.payload && !wasCancelled && currentActivity.length > 0) {
           setRunHistory(prev => {
             const next = [...prev, { activity: currentActivity, durationSec }];
-            const sid = activeResumeSessionIdRef.current;
+            const completedCodeSession = completedCodeSessionRef.current;
+            const sid = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
             if (sid) {
               invoke('save_run_history', {
                 sessionId: sid,
-                sessionDate: session?.date ?? null,
+                sessionDate: completedCodeSession?.date ?? session?.date ?? null,
                 kimDir: settings.kim_sessions_dir || null,
-                clawDir: settings.claw_sessions_dir || null,
+                clawDir: completedCodeSession?.project_path
+                  ? `${completedCodeSession.project_path}/.claw/sessions`
+                  : settings.claw_sessions_dir || null,
                 runs: next,
               }).catch(() => { /* non-fatal */ });
             }
@@ -980,7 +1287,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       setMessageReloadNonce(v => v + 1);
       // Always refresh sessions — failed runs still create session files.
       // Pass the session ID so App.tsx can auto-navigate to the completed session.
-      onTaskDoneRef.current(activeResumeSessionIdRef.current);
+      const completedCodeSession = completedCodeSessionRef.current ?? undefined;
+      onTaskDoneRef.current(completedCodeSession?.session_id ?? activeResumeSessionIdRef.current, completedCodeSession);
+      completedCodeSessionRef.current = null;
       if (!event.payload && !wasCancelled) {
         if (!hadNeedHelp) {
           setTaskError('agent-error');
@@ -993,6 +1302,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       }
       currentTaskRef.current = null;
     }).then(fn => { unlistenDone = fn; });
+
+    listen<SessionInfo>('kim-agent-code-session', event => {
+      completedCodeSessionRef.current = event.payload;
+    }).then(fn => { unlistenCodeSession = fn; });
 
     listen<boolean>('kim-agent-cancelled', () => {
       invoke('set_task_active_mode', { active: false }).catch(() => {});
@@ -1007,6 +1320,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       unlistenOutput?.();
       unlistenError?.();
       unlistenDone?.();
+      unlistenCodeSession?.();
       unlistenCancelled?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1059,11 +1373,16 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     setLiveHistory(prev => [...prev, { role: 'user', content: pending.text }]);
 
     try {
+      // Resolve the session ID dynamically from refs to prevent race conditions
+      // where a queued task starts before React has finished prop-drilling
+      // the new session state from the previous task's completion.
+      const resolvedSessionId = completedCodeSessionRef.current?.session_id ?? activeResumeSessionIdRef.current;
+      
       await invoke('send_task', {
         task: pending.text,
         provider: pending.provider,
         projectRoot: (activeTab === 'code' && activeProjectPath) ? activeProjectPath : (settings.project_root || null),
-        resumeSessionId: activeResumeSessionId,
+        resumeSessionId: resolvedSessionId,
       });
     } catch (err) {
       // kim-agent-done fires BEFORE invoke() rejects on process failure.
@@ -1074,10 +1393,12 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         setIsRunning(false);
         setTaskError(friendlyError(String(err)));
         setLastFailedTask(pending);
-        onTaskDoneRef.current(activeResumeSessionId); // refresh sidebar even on invoke-level failures
+        
+        const resolvedSessionId = completedCodeSessionRef.current?.session_id ?? activeResumeSessionIdRef.current;
+        onTaskDoneRef.current(resolvedSessionId); // refresh sidebar even on invoke-level failures
       }
     }
-  }, [activeResumeSessionId, settings.project_root, activeTab, activeProjectPath]);
+  }, [settings.project_root, activeTab, activeProjectPath]);
 
   useEffect(() => {
     if (isRunning) return;
@@ -1255,6 +1576,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
   function renderWorkedFor(idx: number, run: { activity: ActivityItem[]; durationSec: number }) {
     const expanded = expandedRunIdx === idx;
+    const durationLabel = run.durationSec > 0
+      ? `Worked for ${formatDuration(run.durationSec)}`
+      : 'Worked on this';
     return (
       <div className="kim-msg-row kim-msg-row--assistant">
         <div className="kim-worked-for">
@@ -1267,7 +1591,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
             <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="kim-worked-for__chevron">
               <path d="M5 3l5 5-5 5" />
             </svg>
-            <span>Worked for {formatDuration(run.durationSec)}</span>
+            <span>{durationLabel}</span>
           </button>
           {expanded && (
             <div className="kim-worked-for__panel">
@@ -1281,6 +1605,27 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               </div>
             </div>
           )}
+        </div>
+      </div>
+    );
+  }
+
+  function renderFilePills(files: TouchedFile[]) {
+    if (files.length === 0) return null;
+    return (
+      <div className="kim-msg-row kim-msg-row--assistant">
+        <div className="kim-file-pills">
+          {files.map((f, i) => (
+            <span key={i} className="kim-file-pill">
+              <span className="kim-file-pill__name">{basename(f.path)}</span>
+              {(f.added > 0 || f.removed > 0) && (
+                <span className="kim-file-pill__stats">
+                  {f.added > 0 && <span className="kim-file-pill__stat-add">+{f.added}</span>}
+                  {f.removed > 0 && <span className="kim-file-pill__stat-del">-{f.removed}</span>}
+                </span>
+              )}
+            </span>
+          ))}
         </div>
       </div>
     );
@@ -1642,16 +1987,53 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           </div>
         ) : (
           <>
-            {collapseMessages(messages).map(({msg, retries}, i) => (
-              <MessageBubble
-                key={i}
-                message={msg}
-                animate={i === newestMsgIdx}
-                typingAnimation={settings.typing_animation ?? 'none'}
-                onRetry={handleRetryLast}
-                retries={retries}
-              />
-            ))}
+            {clawRuns.length > 0 ? (
+              /* ── Claw grouped view: per-run user→disclosure→answer→pills ── */
+              clawRuns.map((run, runIdx) => (
+                <div key={`claw-run-${runIdx}`}>
+                  <MessageBubble
+                    message={run.userMessage}
+                    typingAnimation={settings.typing_animation ?? 'none'}
+                    onRetry={handleRetryLast}
+                  />
+                  {run.intermediateActivity.length > 0 && renderWorkedFor(runIdx, {
+                    activity: run.intermediateActivity,
+                    durationSec: run.durationSec,
+                  })}
+                  {run.finalAssistantMessage && (
+                    <MessageBubble
+                      message={run.finalAssistantMessage}
+                      animate={runIdx === clawRuns.length - 1}
+                      typingAnimation={settings.typing_animation ?? 'none'}
+                      onRetry={handleRetryLast}
+                    />
+                  )}
+                  {renderFilePills(run.touchedFiles)}
+                </div>
+              ))
+            ) : (
+              /* ── Normal (Kim) message view ── */
+              (() => {
+                const collapsed = collapseMessages(messages);
+                let assistantIdx = -1;
+                return collapsed.map(({msg, retries}, i) => {
+                  if (msg.role === 'assistant') assistantIdx += 1;
+                  const workedRun = msg.role === 'assistant' ? runHistory[assistantIdx] : null;
+                  return (
+                    <div key={i}>
+                      {workedRun && renderWorkedFor(assistantIdx, workedRun)}
+                      <MessageBubble
+                        message={msg}
+                        animate={i === newestMsgIdx}
+                        typingAnimation={settings.typing_animation ?? 'none'}
+                        onRetry={handleRetryLast}
+                        retries={retries}
+                      />
+                    </div>
+                  );
+                });
+              })()
+            )}
 
             {/* Newly added messages in this session */}
             {(() => {

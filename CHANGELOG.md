@@ -1,6 +1,18 @@
 # Changelog
 
-Changes on `fix/observe-ui-and-cancel` compared with `origin/main` as of 2026-05-09.
+Changes on `fix/observe-ui-and-cancel` compared with `origin/main` as of 2026-05-11.
+
+## Chat Persistence & Display Polish (2026-05-11)
+
+- **Chat Reset Fix** (`App.tsx`): Fixed a critical bug where completing a task in the Code tab caused the UI to navigate away from the current session and wipe the `liveHistory`, resulting in a blank screen and lost conversation history. The old session now correctly stays active.
+- **Chat Reset Prevention** (`ChatView.tsx`): Removed the Claw-mode exclusion so assistant responses are correctly captured in `liveHistory`. Added a guard to prevent `liveHistory` from being wiped on silent same-session reloads unless disk messages actually grew.
+- **"Worked for X" Badges** (`ChatView.tsx`): Fixed a bug where old Claw sessions loaded from disk always showed "Worked on this" (duration 0). The `runHistory` data is now correctly merged into the `clawRuns` entries to restore accurate elapsed times for past tasks.
+- **Technical Output Filtering** (`ChatView.tsx`): Added aggressive noise filtering for Claw bridge internals (`Claw completed`, `LLM calls`, `bridge_request`) and provider leaks (`sending to gemini/claude/chatgpt`, `Routing Claw`).
+- **Clean Task Completion** (`run_claw_bridge.py`, `ChatView.tsx`): Stripped the technical "Claw completed (X LLM calls, exit code 0)" stdout message and replaced it with a clean, user-friendly "Task completed".
+- **Clean Reasoning Output** (`claw_bridge.py`): Enhanced `_surface_bridge_reasoning` to strip JSON wrapping, drop pure JSON fragments, replace provider brand names with "Kim", and remove technical prefixes (e.g., "Calling tool_name.").
+- **Clean Status Messages** (`run_claw_bridge.py`, `claw_bridge.py`): Replaced technical status messages (like "Routing Claw through Kim's browser provider" or "Browser response format was invalid") with clean, polished user-facing messages (like "Kim is working on your task…" and "Kim is refining its response…").
+- **Provider Brand Rewriting** (`ChatView.tsx`): Expanded regex rewriting to catch more patterns (e.g., `{Provider} is/says/returned` → `Kim`, `sending to {Provider}` → `Kim is working`) and added DeepSeek to the clean-thinking regex to ensure all internal logs appear to come natively from Kim.
+
 
 ## Bug fixes — binary discovery, status visibility (2026-05-09)
 
@@ -91,6 +103,12 @@ Wired up the long-dormant file-bridge path so Code-tab tasks can run Claw withou
 - Added pin/delete via right-click on a Kim session: the menu is now portaled to `document.body` so it can paint above the chat pane’s stacking context (previously it was clipped/covered by `.kim-chat`).
 - Pinned chats are persisted in `localStorage` (`kim-pinned-sessions`) and sorted to the top of the list.
 - Single-item delete from the right-click menu reuses the existing two-step confirmation modal.
+
+## Activity Feed — Claw Tool Visibility
+
+- **`claw_bridge.py`**: After each browser-LLM relay turn, the relay loop now emits `[TOOL] tool_name({"path": "…"})` lines to stdout for every tool call in the response. ChatView's `TOOL_MAP` picks these up and renders them as meaningful activity items (`Writing \`index.html\``, `Running \`npm install\``, etc.) instead of raw bridge-communication noise.
+- **`ChatView.tsx` TOOL_MAP**: Added Claw's tool names — `bash`, `grep_search`, `glob_search`, `list_files` — so they display with descriptive labels.
+- **`ChatView.tsx` setActivity**: Consecutive `status`-kind items now collapse: the previous status line is replaced rather than appended, so repeated "gemini is thinking…" / "Sending message to gemini…" entries no longer flood the feed. A new distinct status replaces the old one; a non-status item (`tool`, `error`, etc.) still appends normally.
 
 ## Chat UX
 

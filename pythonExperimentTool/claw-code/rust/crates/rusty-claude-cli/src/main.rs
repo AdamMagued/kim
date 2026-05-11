@@ -1148,7 +1148,33 @@ fn provider_label(kind: ProviderKind) -> &'static str {
     }
 }
 
+fn browser_bridge_provider_label() -> Option<String> {
+    if env::var("CLAW_FILE_BRIDGE").is_err() {
+        return None;
+    }
+    let raw = env::var("KIM_PROVIDER").unwrap_or_else(|_| "browser".to_string());
+    let provider = raw
+        .strip_prefix("browser:")
+        .unwrap_or(raw.as_str())
+        .trim()
+        .to_string();
+    if provider.is_empty() {
+        Some("browser".to_string())
+    } else {
+        Some(provider)
+    }
+}
+
+fn display_model_label(model: &str) -> String {
+    browser_bridge_provider_label()
+        .map(|provider| format!("browser:{provider}"))
+        .unwrap_or_else(|| model.to_string())
+}
+
 fn format_connected_line(model: &str) -> String {
+    if let Some(provider) = browser_bridge_provider_label() {
+        return format!("Connected: browser:{provider} via Kim browser");
+    }
     let provider = provider_label(detect_provider_kind(model));
     format!("Connected: {model} via {provider}")
 }
@@ -3714,7 +3740,7 @@ impl LiveCli {
   \x1b[2mSession\x1b[0m          {}\n\
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
   Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
-            self.model,
+            display_model_label(&self.model),
             self.permission_mode.as_str(),
             git_branch,
             workspace,
@@ -6639,8 +6665,10 @@ fn build_runtime_with_plugin_state(
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
     let api_client = if std::env::var("CLAW_FILE_BRIDGE").is_ok() {
-        eprintln!("[file-bridge] CLAW_FILE_BRIDGE is set — using file bridge client");
-        file_bridge::EitherClient::Bridge(file_bridge::FileBridgeClient::new())
+        if file_bridge::is_bridge_verbose() {
+            eprintln!("[file-bridge] CLAW_FILE_BRIDGE is set — using file bridge client");
+        }
+        file_bridge::EitherClient::Bridge(file_bridge::FileBridgeClient::new(emit_output))
     } else {
         file_bridge::EitherClient::Api(AnthropicRuntimeClient::new(
             session_id,
@@ -7443,7 +7471,7 @@ fn slash_command_completion_candidates_with_sessions(
     completions.into_iter().collect()
 }
 
-fn format_tool_call_start(name: &str, input: &str) -> String {
+pub(crate) fn format_tool_call_start(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
 
