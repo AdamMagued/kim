@@ -59,8 +59,11 @@ def _resolve_bridge() -> tuple[str, str]:
     if not token:
         token = os.environ.get("KIM_API_KEY", "").strip()
         if not token:
-            from mcp_server.config import get_config
-            token = get_config().get("api_key", "")
+            try:
+                from mcp_server.config import get_config
+                token = get_config().get("api_key", "")
+            except ImportError:
+                pass
 
     # Try reading kim_sessions/.bridge_url
     root = _kim_root()
