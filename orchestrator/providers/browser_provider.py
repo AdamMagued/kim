@@ -61,7 +61,6 @@ import logging
 import os
 import platform
 import re
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -99,7 +98,7 @@ SITE_CONFIGS: dict[str, dict] = {
         ],
         "response_selectors": [
             '[data-testid^="conversation-turn"]',
-            '.font-claude-message',
+            ".font-claude-message",
         ],
         "upload_button_selectors": [
             'button[aria-label*="Attach"]',
@@ -276,18 +275,13 @@ class BrowserProvider(BaseProvider):
         self._use_webview_bridge = bool(self._bridge_url and self._bridge_token)
 
         # Track Playwright-managed browser for auto-launch mode
-        self._managed_pw = None      # Playwright context manager
+        self._managed_pw = None  # Playwright context manager
         self._managed_browser = None  # Browser instance we launched ourselves
 
         # ── Persistent session directory ────────────────────────────────
-        project_root = Path(
-            os.environ.get("PROJECT_ROOT")
-            or config.get("project_root", str(Path.cwd()))
-        ).resolve()
+        project_root = Path(os.environ.get("PROJECT_ROOT") or config.get("project_root", str(Path.cwd()))).resolve()
         default_data_dir = str(project_root / "sessions" / "chrome_data")
-        self._user_data_dir = str(
-            Path(bp_cfg.get("user_data_dir", default_data_dir)).resolve()
-        )
+        self._user_data_dir = str(Path(bp_cfg.get("user_data_dir", default_data_dir)).resolve())
         self._project_root = project_root
         # Ensure the directory exists
         Path(self._user_data_dir).mkdir(parents=True, exist_ok=True)
@@ -320,28 +314,19 @@ class BrowserProvider(BaseProvider):
                 continue
             self._site_configs[site_key] = {
                 "url_pattern": site_def["url_pattern"],
-                "input_selectors": _to_list(
-                    site_def.get("input_selectors") or site_def.get("input_selector", "")
-                ),
-                "send_selectors": _to_list(
-                    site_def.get("send_selectors") or site_def.get("send_button", "")
-                ),
-                "stop_selectors": _to_list(
-                    site_def.get("stop_selectors") or site_def.get("stop_button", "")
-                ),
+                "input_selectors": _to_list(site_def.get("input_selectors") or site_def.get("input_selector", "")),
+                "send_selectors": _to_list(site_def.get("send_selectors") or site_def.get("send_button", "")),
+                "stop_selectors": _to_list(site_def.get("stop_selectors") or site_def.get("stop_button", "")),
                 "response_selectors": _to_list(
                     site_def.get("response_selectors") or site_def.get("response_selector", "")
                 ),
                 "upload_button_selectors": _to_list(
-                    site_def.get("upload_button_selectors")
-                    or site_def.get("upload_button", "")
+                    site_def.get("upload_button_selectors") or site_def.get("upload_button", "")
                 ),
             }
             logger.info(f"Registered custom site: {site_key!r} → {site_def['url_pattern']!r}")
 
-        logger.info(
-            f"BrowserProvider: cdp_url={self._cdp_url}  sites={list(self._site_configs)}"
-        )
+        logger.info(f"BrowserProvider: cdp_url={self._cdp_url}  sites={list(self._site_configs)}")
 
     def reset_session(self) -> None:
         """Call before each new task to prepare for the next completion.
@@ -378,8 +363,7 @@ class BrowserProvider(BaseProvider):
         """
         prompt, attachments, completion_hash = self._format_prompt(messages, tools, system)
         logger.debug(
-            f"Prompt ready: {len(prompt)} chars, "
-            f"{len(attachments)} attachment(s) extracted, hash={completion_hash}"
+            f"Prompt ready: {len(prompt)} chars, " f"{len(attachments)} attachment(s) extracted, hash={completion_hash}"
         )
 
         if self._use_webview_bridge:
@@ -407,26 +391,23 @@ class BrowserProvider(BaseProvider):
                             "Please reopen the existing provider chat window and resend."
                         ),
                     }
-                
+
                 if clear_chat:
                     logger.info(f"Clearing chat context by reloading {page.url}...")
                     await page.goto(page.url, wait_until="domcontentloaded")
                     await asyncio.sleep(2.0)
                     self._sent_system_prompt = False
-                    
+
                 cfg = self._site_configs[site]
 
                 image_attachments = [
-                    a for a in attachments
-                    if str(a.get("mime_type", "")).startswith("image/") and a.get("data_base64")
+                    a for a in attachments if str(a.get("mime_type", "")).startswith("image/") and a.get("data_base64")
                 ]
 
                 # ── Step 1: Paste screenshot via clipboard (if any) ──────
                 if image_attachments:
                     logger.info(f"[STATUS] Uploading screenshot to {site}…")
-                    await self._inject_image_clipboard(
-                        page, cfg, str(image_attachments[-1]["data_base64"])
-                    )
+                    await self._inject_image_clipboard(page, cfg, str(image_attachments[-1]["data_base64"]))
 
                     # ── Step 2: Let the UI start rendering the image ─────
                     # The send step below waits for an enabled send button, so
@@ -485,9 +466,7 @@ class BrowserProvider(BaseProvider):
                 continue
             approx_size = (len(data_b64) * 3) // 4
             if approx_size > max_attachment_bytes:
-                logger.warning(
-                    f"Skipping oversized bridge attachment #{i} ({approx_size} bytes, {mime_type})"
-                )
+                logger.warning(f"Skipping oversized bridge attachment #{i} ({approx_size} bytes, {mime_type})")
                 continue
             bridge_attachments.append(
                 {
@@ -525,9 +504,7 @@ class BrowserProvider(BaseProvider):
             if send_resp.status_code == 404:
                 # Old Rust binary — fall back to monolithic /v1/complete
                 logger.info("Bridge /v1/send returned 404, falling back to /v1/complete")
-                return await self._complete_via_webview_bridge_legacy(
-                    prompt, headers, payload, completion_hash
-                )
+                return await self._complete_via_webview_bridge_legacy(prompt, headers, payload, completion_hash)
 
             try:
                 send_data = send_resp.json()
@@ -542,9 +519,7 @@ class BrowserProvider(BaseProvider):
                 }
 
             if send_resp.status_code == 409:
-                msg = send_data.get("error") or (
-                    "Kim opened the in-app browser window. Sign in and resend your task."
-                )
+                msg = send_data.get("error") or ("Kim opened the in-app browser window. Sign in and resend your task.")
                 return {"type": "text", "content": f"NEED_HELP: {msg}"}
 
             if send_resp.status_code >= 400:
@@ -563,8 +538,7 @@ class BrowserProvider(BaseProvider):
 
             sent_confirmed = send_data.get("sent_confirmed", False)
             logger.info(
-                f"Bridge send OK: req_id={req_id}, site={send_data.get('site')}, "
-                f"confirmed={sent_confirmed}"
+                f"Bridge send OK: req_id={req_id}, site={send_data.get('site')}, " f"confirmed={sent_confirmed}"
             )
             if sent_confirmed:
                 logger.info("[STATUS] Kim is working…")
@@ -577,7 +551,10 @@ class BrowserProvider(BaseProvider):
             logger.warning("Bridge /v1/send timed out (prompt may already be injected)")
             return {
                 "type": "text",
-                "content": "NEED_HELP: Bridge /v1/send timed out. The prompt may have been partially sent. Please check the browser window and retry if needed.",
+                "content": (
+                    "NEED_HELP: Bridge /v1/send timed out. The prompt may have "
+                    "been partially sent. Please check the browser window and retry if needed."
+                ),
             }
         except Exception as e:
             logger.warning(f"Bridge /v1/send failed ({e})")
@@ -689,9 +666,7 @@ class BrowserProvider(BaseProvider):
             }
 
         if resp.status_code == 409:
-            msg = data.get("error") or (
-                "Kim opened the in-app browser window. Sign in and resend your task."
-            )
+            msg = data.get("error") or ("Kim opened the in-app browser window. Sign in and resend your task.")
             return {"type": "text", "content": f"NEED_HELP: {msg}"}
 
         if resp.status_code >= 400:
@@ -745,19 +720,13 @@ class BrowserProvider(BaseProvider):
         sys_name = platform.system()
         if sys_name == "Darwin":
             launch_cmd = (
-                '/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome '
+                "/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
                 f'--remote-debugging-port=9222 --user-data-dir="{self._user_data_dir}"'
             )
         elif sys_name == "Linux":
-            launch_cmd = (
-                f'google-chrome --remote-debugging-port=9222 '
-                f'--user-data-dir="{self._user_data_dir}"'
-            )
+            launch_cmd = f"google-chrome --remote-debugging-port=9222 " f'--user-data-dir="{self._user_data_dir}"'
         else:
-            launch_cmd = (
-                f'chrome.exe --remote-debugging-port=9222 '
-                f'--user-data-dir="{self._user_data_dir}"'
-            )
+            launch_cmd = f"chrome.exe --remote-debugging-port=9222 " f'--user-data-dir="{self._user_data_dir}"'
         raise ConnectionError(
             f"Cannot connect to Chrome at {self._cdp_url}.\n"
             f"\n"
@@ -787,9 +756,7 @@ class BrowserProvider(BaseProvider):
                 f"then switch to headless mode."
             )
 
-        logger.info(
-            f"Launching headless Chromium with session dir: {self._user_data_dir}"
-        )
+        logger.info(f"Launching headless Chromium with session dir: {self._user_data_dir}")
 
         # launch_persistent_context gives us a BrowserContext directly;
         # we use its .browser reference for consistency with CDP mode.
@@ -822,9 +789,7 @@ class BrowserProvider(BaseProvider):
         # launch_persistent_context returns a BrowserContext, so we
         # store it and adapt our page-finding to work with it.
         self._managed_context = context
-        logger.info(
-            f"Headless Chromium ready — {len(context.pages)} page(s) loaded"
-        )
+        logger.info(f"Headless Chromium ready — {len(context.pages)} page(s) loaded")
 
         # launch_persistent_context gives us a BrowserContext with .browser == None.
         # Return the context directly; _list_pages and _find_chat_page handle both types.
@@ -833,12 +798,12 @@ class BrowserProvider(BaseProvider):
     async def _list_pages(self, browser) -> list[str]:
         """Return URLs of all open pages. Handles both Browser and BrowserContext."""
         pages: list[str] = []
-        if hasattr(browser, 'contexts'):
+        if hasattr(browser, "contexts"):
             # Standard Browser (CDP mode)
             for ctx in browser.contexts:
                 for page in ctx.pages:
                     pages.append(page.url)
-        elif hasattr(browser, 'pages'):
+        elif hasattr(browser, "pages"):
             # BrowserContext (persistent/headless launch)
             for page in browser.pages:
                 pages.append(page.url)
@@ -854,19 +819,17 @@ class BrowserProvider(BaseProvider):
         BrowserContext objects (headless mode).
         """
         # Check custom sites first, then built-ins
-        ordered = [
-            (k, v) for k, v in self._site_configs.items() if k not in SITE_CONFIGS
-        ] + [
+        ordered = [(k, v) for k, v in self._site_configs.items() if k not in SITE_CONFIGS] + [
             (k, v) for k, v in self._site_configs.items() if k in SITE_CONFIGS
         ]
 
         # Collect all pages from either Browser or BrowserContext
         all_pages = []
-        if hasattr(browser, 'contexts'):
+        if hasattr(browser, "contexts"):
             # Standard Browser object (CDP mode)
             for ctx in browser.contexts:
                 all_pages.extend(ctx.pages)
-        elif hasattr(browser, 'pages'):
+        elif hasattr(browser, "pages"):
             # BrowserContext object (headless persistent mode)
             all_pages.extend(browser.pages)
 
@@ -892,9 +855,7 @@ class BrowserProvider(BaseProvider):
         # Match by site key first (not exact URL) because chat sites change
         # their URL after the first message (e.g. /new → /chat/<id>).
         if self._last_chat_site:
-            same_site_matches = [
-                (p, sk) for p, sk in matches if sk == self._last_chat_site
-            ]
+            same_site_matches = [(p, sk) for p, sk in matches if sk == self._last_chat_site]
             if same_site_matches:
                 # Prefer exact URL match if available (same tab)
                 if self._last_chat_page_url:
@@ -907,8 +868,7 @@ class BrowserProvider(BaseProvider):
                 page, site_key = same_site_matches[0]
                 if page.url != self._last_chat_page_url:
                     logger.info(
-                        f"Tab URL changed for {site_key}: "
-                        f"{self._last_chat_page_url!r} → {page.url!r} (same site)"
+                        f"Tab URL changed for {site_key}: " f"{self._last_chat_page_url!r} → {page.url!r} (same site)"
                     )
                     # The tab changed — could be a new conversation (#10)
                     self._maybe_reset_system_prompt(page.url)
@@ -952,7 +912,7 @@ class BrowserProvider(BaseProvider):
     @staticmethod
     def _extract_conversation_id(url: str) -> str:
         """Extract a conversation-identifying path from a provider URL.
-        
+
         Examples:
             claude.ai/chat/abc-123  → /chat/abc-123
             chatgpt.com/c/xyz       → /c/xyz
@@ -960,6 +920,7 @@ class BrowserProvider(BaseProvider):
             gemini.google.com/app/x → /app/x
         """
         from urllib.parse import urlparse
+
         parsed = urlparse(url)
         return parsed.path or "/"
 
@@ -969,7 +930,7 @@ class BrowserProvider(BaseProvider):
         Resets when:
         1. The site/domain changed (e.g. claude.ai → gemini.google.com)
         2. The conversation ID changed within the same site (e.g. /chat/123 → /chat/456)
-        
+
         Does NOT reset for trivial URL changes like query param updates.
         """
         if not self._last_chat_page_url:
@@ -1003,10 +964,7 @@ class BrowserProvider(BaseProvider):
                 )
             return
 
-        logger.info(
-            f"Chat site changed ({old_site!r} → {new_site!r}), "
-            "will re-inject system prompt."
-        )
+        logger.info(f"Chat site changed ({old_site!r} → {new_site!r}), " "will re-inject system prompt.")
         self._sent_system_prompt = False
 
     # ==================================================================
@@ -1062,10 +1020,7 @@ class BrowserProvider(BaseProvider):
         # Also try generic dialog dismiss patterns (role="dialog" + confirm)
         try:
             dialog_btns = page.locator(
-                '[role="dialog"] button, '
-                '[role="alertdialog"] button, '
-                '.modal button, '
-                '.dialog button'
+                '[role="dialog"] button, ' '[role="alertdialog"] button, ' ".modal button, " ".dialog button"
             )
             count = await dialog_btns.count()
             for i in range(count):
@@ -1086,9 +1041,7 @@ class BrowserProvider(BaseProvider):
     # Screenshot upload
     # ==================================================================
 
-    async def _inject_image_clipboard(
-        self, page: Page, cfg: dict, image_b64: str
-    ) -> None:
+    async def _inject_image_clipboard(self, page: Page, cfg: dict, image_b64: str) -> None:
         """
         Inject a base64 PNG screenshot into the editor via the clipboard.
 
@@ -1174,15 +1127,10 @@ class BrowserProvider(BaseProvider):
                 await asyncio.sleep(0.5)
 
                 if await self._verify_injection(page, selector, text):
-                    logger.info(
-                        f"Text injected via clipboard paste (attempt {attempt})"
-                    )
+                    logger.info(f"Text injected via clipboard paste (attempt {attempt})")
                     return
             except Exception as e:
-                logger.debug(
-                    f"navigator.clipboard.writeText failed ({e}), "
-                    "trying ClipboardEvent fallback"
-                )
+                logger.debug(f"navigator.clipboard.writeText failed ({e}), " "trying ClipboardEvent fallback")
 
             # ── Fallback A: synthetic ClipboardEvent dispatch ────────────
             await page.click(selector)
@@ -1209,9 +1157,7 @@ class BrowserProvider(BaseProvider):
             await asyncio.sleep(0.5)
 
             if await self._verify_injection(page, selector, text):
-                logger.info(
-                    f"Text injected via ClipboardEvent (attempt {attempt})"
-                )
+                logger.info(f"Text injected via ClipboardEvent (attempt {attempt})")
                 return
 
             # ── Fallback B: DOM setter + input event ─────────────────────
@@ -1227,7 +1173,9 @@ class BrowserProvider(BaseProvider):
                     if (!el) return false;
                     el.focus();
                     if ('value' in el) {
-                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, "value"
+                        )?.set;
                         if (nativeInputValueSetter) {
                             nativeInputValueSetter.call(el, text);
                         } else {
@@ -1245,15 +1193,10 @@ class BrowserProvider(BaseProvider):
             await asyncio.sleep(0.5)
 
             if await self._verify_injection(page, selector, text):
-                logger.info(
-                    f"Text injected via DOM setter (attempt {attempt})"
-                )
+                logger.info(f"Text injected via DOM setter (attempt {attempt})")
                 return
 
-            logger.warning(
-                f"Injection verification failed "
-                f"(attempt {attempt}/{_INJECT_MAX_RETRIES}), retrying…"
-            )
+            logger.warning(f"Injection verification failed " f"(attempt {attempt}/{_INJECT_MAX_RETRIES}), retrying…")
             await asyncio.sleep(0.3)
 
         # All retries exhausted
@@ -1287,44 +1230,51 @@ class BrowserProvider(BaseProvider):
         prompt as multiple broken messages.
         """
         actual = await self._read_editor_text(page, selector)
-        
+
         def normalize_typo(s: str) -> str:
             return (
                 " ".join(s.split())
-                .replace("“", '"').replace("”", '"')
-                .replace("‘", "'").replace("’", "'")
-                .replace("—", "--").replace("–", "--")
+                .replace("“", '"')
+                .replace("”", '"')
+                .replace("‘", "'")
+                .replace("’", "'")
+                .replace("—", "--")
+                .replace("–", "--")
                 .replace("…", "...")
             )
-            
+
         expected_norm = normalize_typo(expected)
         actual_norm = normalize_typo(actual)
 
-        logger.debug(
-            f"Injection verify: editor has {len(actual)} chars; "
-            f"expected {len(expected)} chars"
-        )
+        logger.debug(f"Injection verify: editor has {len(actual)} chars; " f"expected {len(expected)} chars")
 
         if len(expected_norm) < _VERIFY_MIN_CHARS:
             return actual_norm == expected_norm
 
         if len(actual_norm) < max(_VERIFY_MIN_CHARS, int(len(expected_norm) * 0.98)):
-            logger.warning(f"Injection failed: actual length {len(actual_norm)} is < 98% of expected {len(expected_norm)}")
+            logger.warning(
+                f"Injection failed: actual length {len(actual_norm)} is < 98% of expected {len(expected_norm)}"
+            )
             return False
-            
+
         # We only need the first/last few chars to match to ensure it wasn't truncated.
         # But we use a fuzzy check in case of stray punctuation that wasn't normalized.
         def fuzzy_match(a: str, b: str) -> bool:
             # Strip all non-alphanumeric chars for the boundary check
             import re
-            return re.sub(r'\W+', '', a) == re.sub(r'\W+', '', b)
+
+            return re.sub(r"\W+", "", a) == re.sub(r"\W+", "", b)
 
         if not fuzzy_match(actual_norm[:200], expected_norm[:200]):
-            logger.warning(f"Injection failed: Prefix mismatch. Actual: {actual_norm[:50]}... Expected: {expected_norm[:50]}...")
+            logger.warning(
+                f"Injection failed: Prefix mismatch. Actual: {actual_norm[:50]}... Expected: {expected_norm[:50]}..."
+            )
             return False
-            
+
         if not fuzzy_match(actual_norm[-200:], expected_norm[-200:]):
-            logger.warning(f"Injection failed: Suffix mismatch. Actual: ...{actual_norm[-50:]} Expected: ...{expected_norm[-50:]}")
+            logger.warning(
+                f"Injection failed: Suffix mismatch. Actual: ...{actual_norm[-50:]} Expected: ...{expected_norm[-50:]}"
+            )
             return False
 
         return True
@@ -1333,7 +1283,9 @@ class BrowserProvider(BaseProvider):
     # Send + wait + scrape
     # ==================================================================
 
-    async def _send_and_wait(self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = "") -> str:
+    async def _send_and_wait(
+        self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = ""
+    ) -> str:
         """Inject the prompt, click Send, and wait for the full response."""
         # Find the best response selector and count current responses before sending
         response_sel = await self._find_selector(page, cfg["response_selectors"])
@@ -1378,13 +1330,9 @@ class BrowserProvider(BaseProvider):
         logger.info("Message sent, waiting for response…")
 
         # Wait for response count to increase (generation started)
-        started = await self._wait_for_new_response(
-            page, response_sel, initial_count
-        )
+        started = await self._wait_for_new_response(page, response_sel, initial_count)
         if not started:
-            raise TimeoutError(
-                f"No new response appeared after {RESPONSE_WAIT_S}s"
-            )
+            raise TimeoutError(f"No new response appeared after {RESPONSE_WAIT_S}s")
 
         # Pin to the newest response element so we never accidentally
         # read the previous turn's [END_OF_RESPONSE] marker.
@@ -1395,12 +1343,7 @@ class BrowserProvider(BaseProvider):
 
         # Wait for generation to finish (stop button disappears or completion hash found)
         await self._wait_for_generation_complete(
-            page, 
-            cfg["stop_selectors"], 
-            cfg["response_selectors"], 
-            completion_hash, 
-            site,
-            min_index=new_element_index
+            page, cfg["stop_selectors"], cfg["response_selectors"], completion_hash, site, min_index=new_element_index
         )
 
         # Extra settle time
@@ -1410,9 +1353,7 @@ class BrowserProvider(BaseProvider):
         # Scrape only the newest response element
         return await self._scrape_last_response(page, cfg["response_selectors"], min_index=new_element_index)
 
-    async def _find_selector(
-        self, page: Page, selectors: list[str]
-    ) -> Optional[str]:
+    async def _find_selector(self, page: Page, selectors: list[str]) -> Optional[str]:
         """Return the first selector from the list that matches ≥1 visible element."""
         for sel in selectors:
             try:
@@ -1428,25 +1369,25 @@ class BrowserProvider(BaseProvider):
                 continue
         return None
 
-
-
-    async def _wait_for_new_response(
-        self, page: Page, response_sel: str, initial_count: int
-    ) -> bool:
+    async def _wait_for_new_response(self, page: Page, response_sel: str, initial_count: int) -> bool:
         """Poll until the response element count increases."""
         deadline = asyncio.get_running_loop().time() + RESPONSE_WAIT_S
         while asyncio.get_running_loop().time() < deadline:
             count = await page.locator(response_sel).count()
             if count > initial_count:
-                logger.debug(
-                    f"Response element count: {initial_count} → {count}"
-                )
+                logger.debug(f"Response element count: {initial_count} → {count}")
                 return True
             await asyncio.sleep(0.5)
         return False
 
     async def _wait_for_generation_complete(
-        self, page: Page, stop_selectors: list[str], response_selectors: list[str], completion_hash: str | None, site: str = "AI", min_index: int = 0
+        self,
+        page: Page,
+        stop_selectors: list[str],
+        response_selectors: list[str],
+        completion_hash: str | None,
+        site: str = "AI",
+        min_index: int = 0,
     ) -> None:
         """
         Wait until all known stop-button selectors are invisible (generation
@@ -1461,16 +1402,18 @@ class BrowserProvider(BaseProvider):
         # returning old responses when TTFT is slow (#21)
         min_generation_time = loop.time() + 5.0
         elapsed = 0
-        
+
         last_text_len = 0
         idle_count = 0
-        
+
         while loop.time() < deadline:
             # Check for completion hash first to short-circuit
             current_text = ""
             try:
                 current_text = await self._scrape_last_response(page, response_selectors, min_index=min_index)
-                logger.debug(f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}")
+                logger.debug(
+                    f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}"
+                )
                 if completion_hash and completion_hash in current_text:
                     logger.debug("Generation complete (completion hash found)")
                     return
@@ -1524,14 +1467,9 @@ class BrowserProvider(BaseProvider):
                     logger.info(f"[STATUS] Waiting for {site} to finish… ({elapsed}s)")
                 last_status = now
             await asyncio.sleep(0.75)
-        logger.warning(
-            f"Generation did not complete after {GENERATION_WAIT_S}s "
-            "— scraping anyway"
-        )
+        logger.warning(f"Generation did not complete after {GENERATION_WAIT_S}s " "— scraping anyway")
 
-    async def _scrape_last_response(
-        self, page: Page, response_selectors: list[str], min_index: int = 0
-    ) -> str:
+    async def _scrape_last_response(self, page: Page, response_selectors: list[str], min_index: int = 0) -> str:
         """Return inner text of the last response element at or after min_index."""
         for sel in response_selectors:
             try:
@@ -1548,9 +1486,7 @@ class BrowserProvider(BaseProvider):
                         return text.strip()
             except Exception:
                 continue
-        raise RuntimeError(
-            "Could not scrape response from any known selector"
-        )
+        raise RuntimeError("Could not scrape response from any known selector")
 
     # ==================================================================
     # Prompt formatting
@@ -1598,11 +1534,7 @@ class BrowserProvider(BaseProvider):
             clean_mime = "application/octet-stream"
         idx = len(attachments_out) + 1
         ext = self._ext_for_mime(clean_mime)
-        default_name = (
-            f"screenshot_{idx}.{ext}"
-            if clean_mime.startswith("image/")
-            else f"attachment_{idx}.{ext}"
-        )
+        default_name = f"screenshot_{idx}.{ext}" if clean_mime.startswith("image/") else f"attachment_{idx}.{ext}"
         attachments_out.append(
             {
                 "name": (name or default_name).strip() or default_name,
@@ -1633,7 +1565,7 @@ class BrowserProvider(BaseProvider):
                 out_parts.append(text[i:])
                 break
 
-            mime_type = text[start + len(prefix):marker_pos].strip().lower()
+            mime_type = text[start + len(prefix) : marker_pos].strip().lower()
             payload_start = marker_pos + len(marker)
             end = payload_start
             while end < len(text) and text[end] not in " \t\n\r\"'<>)],;":
@@ -1650,7 +1582,7 @@ class BrowserProvider(BaseProvider):
                 i = end
             else:
                 # Not a valid data URI payload; advance safely.
-                out_parts.append(text[i:start + len(prefix)])
+                out_parts.append(text[i : start + len(prefix)])
                 i = start + len(prefix)
 
         return "".join(out_parts)
@@ -1710,9 +1642,7 @@ class BrowserProvider(BaseProvider):
             recap = "…\n" + recap[-max_recap:]
         return recap
 
-    def _format_prompt(
-        self, messages: list[dict], tools: list[dict], system: str
-    ) -> tuple[str, list[dict], str]:
+    def _format_prompt(self, messages: list[dict], tools: list[dict], system: str) -> tuple[str, list[dict], str]:
         """
         Stateful prompt formatter for browser-based chat UIs.
 
@@ -1743,9 +1673,7 @@ class BrowserProvider(BaseProvider):
                 for item in content:
                     item_type = item.get("type", "")
                     if item_type == "text" and item.get("text"):
-                        cleaned = self._strip_data_uris(
-                            item["text"], attachments
-                        )
+                        cleaned = self._strip_data_uris(item["text"], attachments)
                         text_parts.append(cleaned)
                     elif item_type == "image" and item.get("data"):
                         self._append_attachment(
@@ -1766,11 +1694,7 @@ class BrowserProvider(BaseProvider):
                             text_parts.append("[Screenshot attached]")
                     elif item_type in {"file", "document", "attachment"} and item.get("data"):
                         file_name = str(item.get("name") or item.get("filename") or "").strip() or None
-                        mime_type = str(
-                            item.get("media_type")
-                            or item.get("mime_type")
-                            or "application/octet-stream"
-                        )
+                        mime_type = str(item.get("media_type") or item.get("mime_type") or "application/octet-stream")
                         self._append_attachment(
                             attachments,
                             mime_type,
@@ -1818,9 +1742,7 @@ class BrowserProvider(BaseProvider):
                 {
                     "name": t["name"],
                     "description": t.get("description", ""),
-                    "args": list(
-                        t.get("parameters", {}).get("properties", {}).keys()
-                    ),
+                    "args": list(t.get("parameters", {}).get("properties", {}).keys()),
                 }
                 for t in tools
             ]
@@ -1828,6 +1750,7 @@ class BrowserProvider(BaseProvider):
 
             import platform as _platform
             import os as _os
+
             _sys = _platform.system()
             _home = _os.path.expanduser("~")
             if _sys == "Darwin":
@@ -1872,13 +1795,13 @@ class BrowserProvider(BaseProvider):
                     "unless the current task explicitly asks you to sign in or provides "
                     "credentials. Never reuse credentials from recent context alone.\n"
                     "Respond with EXACTLY ONE of:\n"
-                    '1. A JSON tool call on a single line: '
+                    "1. A JSON tool call on a single line: "
                     '{"tool": "<name>", "args": {<args>}}\n'
                     "2. TASK_COMPLETE: <one-line summary>\n"
                     "3. NEED_HELP: <reason you cannot proceed>\n"
                     "Do NOT include markdown formatting around the JSON.\n"
                     "CRITICAL: If your JSON arguments contain double quotes (e.g., "
-                    "HTML attributes or code), you MUST escape them (\\\") so the "
+                    'HTML attributes or code), you MUST escape them (\\") so the '
                     "JSON is valid.\n"
                     f"IMPORTANT: Always append the exact string {completion_hash} "
                     "at the very end of your entire response.\n\n"
@@ -1893,11 +1816,7 @@ class BrowserProvider(BaseProvider):
         # Trim if too long
         if len(prompt) > self._max_inject_chars:
             trim_at = self._max_inject_chars - 200
-            prompt = (
-                prompt[:200]
-                + "\n…[earlier context trimmed — see browser history]…\n"
-                + prompt[-trim_at:]
-            )
+            prompt = prompt[:200] + "\n…[earlier context trimmed — see browser history]…\n" + prompt[-trim_at:]
 
         return prompt, attachments, completion_hash
 
@@ -1914,11 +1833,11 @@ class BrowserProvider(BaseProvider):
             - bare JSON ``{"tool": …}``             → ``{"type": "tool_call", …}``
         """
         # Strip the bridge sentinel before any parsing.
-        text = text.replace('[END_OF_RESPONSE]', '').strip()
+        text = text.replace("[END_OF_RESPONSE]", "").strip()
         # Also strip any old-style KIM_ hashes from previous sessions.
-        text = re.sub(r'\bKIM_[a-f0-9]{8}\b', '', text).strip()
+        text = re.sub(r"\bKIM_[a-f0-9]{8}\b", "", text).strip()
         # Strip <tool_call> / </tool_call> wrappers DeepSeek sometimes emits.
-        text = re.sub(r'</?tool_call>', '', text).strip()
+        text = re.sub(r"</?tool_call>", "", text).strip()
 
         # Explicit completion/help signals — use word-boundary search so Gemini's
         # DOM label ("Gemini TASK_COMPLETE: ...") doesn't block detection after
@@ -2008,7 +1927,7 @@ class BrowserProvider(BaseProvider):
                 if depth > 0:  # Guard against negative depth (#27)
                     depth -= 1
                     if depth == 0 and start >= 0:
-                        candidate = text[start: i + 1]
+                        candidate = text[start : i + 1]
                         parsed = self._try_parse_tool_json(candidate)
                         if parsed:
                             return parsed
