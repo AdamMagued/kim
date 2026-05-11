@@ -693,7 +693,7 @@ class KimAgent:
                 try:
                     with open(_file_path, "r", encoding="utf-8", errors="ignore") as _f:
                         _before_lines = sum(1 for _ in _f)
-                except (OSError, IOError):
+                except OSError:
                     _before_lines = 0
 
         # ── Pre-screenshot: show flash overlay then hide main window ──
@@ -742,7 +742,7 @@ class KimAgent:
                 import os as _os
                 basename = _os.path.basename(_file_path)
                 self._log("INFO", f"[DIFF] path={basename} +{added} -{removed} duration_ms={duration_ms}")
-            except (OSError, IOError):
+            except OSError:
                 pass
 
         return output

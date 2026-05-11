@@ -70,11 +70,11 @@ class OpenAIProvider(BaseProvider):
         oai_tools = self._to_oai_tools(tools)
 
         try:
-            kwargs: dict = dict(
-                model=self._model,
-                messages=oai_messages,
-                max_tokens=self._max_tokens,
-            )
+            kwargs: dict = {
+                "model": self._model,
+                "messages": oai_messages,
+                "max_completion_tokens": 8000,
+            }
             if oai_tools:
                 kwargs["tools"] = oai_tools
                 kwargs["tool_choice"] = "auto"
