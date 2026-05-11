@@ -104,6 +104,8 @@ export function OnboardingFlow({ onComplete }: Props) {
       github_avatar_url: githubUser?.avatar_url,
       gist_id: undefined,
       created_at: new Date().toISOString(),
+      google_accounts: [],
+      google_active_account: undefined,
     };
     try {
       await invoke('save_account', { account });
@@ -128,7 +130,7 @@ export function OnboardingFlow({ onComplete }: Props) {
       {step === 'name' && (
         <div className={screenClass} key="name">
           <div className="kim-ob__inner">
-            
+
 
             <div className="kim-ob__wordmark">Kim</div>
             <div className="kim-ob__tagline">What should I call you?</div>

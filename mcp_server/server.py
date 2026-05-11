@@ -64,6 +64,19 @@ from mcp_server.tools.screen import (
     handle_take_screenshot,
 )
 from mcp_server.tools.shell import handle_run_command, handle_run_powershell
+from mcp_server.tools.ui_observe import handle_click_ui, handle_observe_ui
+from mcp_server.tools.web import (
+    handle_web_back,
+    handle_web_click,
+    handle_web_close,
+    handle_web_fill,
+    handle_web_observe,
+    handle_web_open,
+    handle_web_press,
+    handle_web_screenshot,
+    handle_web_text,
+    handle_web_wait_for,
+)
 from mcp_server.tools.windows import (
     handle_focus_window,
     handle_get_windows,
@@ -179,7 +192,10 @@ _TOOLS: list[Tool] = [
     # ── Screen ──────────────────────────────────────────────────────────────
     Tool(
         name="take_screenshot",
-        description="Capture the screen as a base64-encoded PNG. Returns 'data:image/png;base64,...'.",
+        description=(
+            "Capture the screen as a base64-encoded PNG. Use only for genuinely visual "
+            "inspection tasks or when observe_ui cannot expose the needed UI state."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -194,6 +210,175 @@ _TOOLS: list[Tool] = [
         inputSchema={"type": "object", "properties": {}},
     ),
     Tool(
+        name="observe_ui",
+        description=(
+            "Fast text-only UI observation of the active app/window using the accessibility tree. "
+            "Use this BEFORE screenshots for normal desktop tasks like opening apps, reading buttons, "
+            "finding inputs, and navigating email/browser UI. Returns element IDs, roles, labels, "
+            "bounds, and click centers. Does not capture pixels."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum elements to return", "default": 80},
+                "depth": {"type": "integer", "description": "Accessibility traversal depth", "default": 5},
+            },
+        },
+    ),
+    Tool(
+        name="click_ui",
+        description=(
+            "Click an element by ID from the most recent observe_ui result. "
+            "Use this for accessible buttons, links, menu items, and inputs instead of screenshot coordinates."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "element_id": {"type": "string", "description": "Element ID from observe_ui, e.g. e12"},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
+                "clicks": {"type": "integer", "description": "Number of clicks", "default": 1},
+            },
+            "required": ["element_id"],
+        },
+    ),
+    Tool(
+        name="web_open",
+        description=(
+            "Navigate Kim's controlled browser to a URL. "
+            "Use 'username' and 'password' arguments if the site requires a login popup (Basic Auth). "
+            "Returns AUTH_REQUIRED/AUTH_FAILED instead of success when page content is blocked."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The destination URL."},
+                "username": {"type": "string", "description": "Optional: username for login popups."},
+                "password": {"type": "string", "description": "Optional: password for login popups."},
+            },
+            "required": ["url"],
+        },
+    ),
+    Tool(
+        name="web_observe",
+        description=(
+            "Return a structured list of every visible interactive element on the current "
+            "web page (buttons, links, inputs, textareas, selects, ARIA widgets) with stable "
+            "element IDs (w1, w2, …), labels, values, types, and bounding boxes. The IDs are "
+            "valid input to web_click and web_fill until the next web_observe call. Use this "
+            "INSTEAD of screenshots for web tasks — it sees form fields, hidden ARIA widgets, "
+            "and dynamic content that AX/screenshots miss."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max elements to return", "default": 80},
+            },
+        },
+    ),
+    Tool(
+        name="web_click",
+        description=(
+            "Click a web element by ID returned from the most recent web_observe call. "
+            "Works on real DOM elements, so it triggers full event chains (onclick, React "
+            "handlers, form submission) just like a real user click."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "element_id": {"type": "string", "description": "Element ID from web_observe (e.g. w12)."},
+            },
+            "required": ["element_id"],
+        },
+    ),
+    Tool(
+        name="web_fill",
+        description=(
+            "Fill an input/textarea/contenteditable on the current web page by element ID "
+            "from web_observe. Clears existing value first. For non-input fields, use "
+            "web_click to focus and then type_text via the OS keyboard."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "element_id": {"type": "string", "description": "Element ID from web_observe (e.g. w7)."},
+                "text": {"type": "string", "description": "Text to enter."},
+            },
+            "required": ["element_id", "text"],
+        },
+    ),
+    Tool(
+        name="web_press",
+        description=(
+            "Press a single key in the controlled browser (Enter, Tab, Escape, ArrowDown, "
+            "etc.). The key is sent to whichever element currently has focus, so call "
+            "web_click or web_fill on the target field first."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Key name, e.g. 'Enter', 'Tab', 'Escape'."},
+            },
+            "required": ["key"],
+        },
+    ),
+    Tool(
+        name="web_text",
+        description=(
+            "Return the visible plain text of the current web page (document.body.innerText). "
+            "Use for reading articles, search results, or verifying a page's contents. "
+            "Truncated to ~8000 chars by default."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "max_chars": {"type": "integer", "description": "Truncate threshold", "default": 8000},
+            },
+        },
+    ),
+    Tool(
+        name="web_screenshot",
+        description=(
+            "Capture the controlled browser page as a base64 PNG. Use ONLY when web_observe "
+            "and web_text cannot answer the question (image content, layout, visual styling). "
+            "Returns 'WEB_SCREENSHOT_BASE64:image/png:<b64>' — much faster than the OS screenshot."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "full_page": {"type": "boolean", "description": "Capture full scroll height", "default": False},
+            },
+        },
+    ),
+    Tool(
+        name="web_wait_for",
+        description=(
+            "Wait until specific text or a CSS selector becomes visible on the current page. "
+            "Use after navigation, form submission, or any action that triggers async UI "
+            "updates, before re-running web_observe."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Substring of visible text to wait for."},
+                "selector": {"type": "string", "description": "CSS selector instead of text."},
+                "timeout_ms": {"type": "integer", "description": "Timeout in ms", "default": 10000},
+            },
+        },
+    ),
+    Tool(
+        name="web_back",
+        description="Navigate the controlled browser back one entry in its history.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="web_close",
+        description=(
+            "Indicate that the browser task is finished. The browser will remain open "
+            "to preserve your login session and tabs for the next task."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
         name="take_annotated_screenshot",
         description=(
             "Capture the screen with a visual ruler grid overlaid on the image. "
@@ -201,7 +386,7 @@ _TOOLS: list[Tool] = [
             "use as reference points to calculate exact (X, Y) pixel coordinates for clicking. "
             "Returns JSON with the annotated image (base64), a grid mapping of marker labels "
             "to real screen coordinates, and instructions on how to interpolate coordinates. "
-            "USE THIS instead of take_screenshot when you need to click something on screen."
+            "Use only as a fallback when observe_ui/click_ui cannot identify the target."
         ),
         inputSchema={
             "type": "object",
@@ -527,6 +712,18 @@ _DISPATCH = {
     "run_powershell": handle_run_powershell,
     "take_screenshot": handle_take_screenshot,
     "get_screen_info": handle_get_screen_info,
+    "observe_ui": handle_observe_ui,
+    "click_ui": handle_click_ui,
+    "web_open": handle_web_open,
+    "web_observe": handle_web_observe,
+    "web_click": handle_web_click,
+    "web_fill": handle_web_fill,
+    "web_press": handle_web_press,
+    "web_text": handle_web_text,
+    "web_screenshot": handle_web_screenshot,
+    "web_wait_for": handle_web_wait_for,
+    "web_back": handle_web_back,
+    "web_close": handle_web_close,
     "take_annotated_screenshot": handle_take_annotated_screenshot,
     "click": handle_click,
     "double_click": handle_double_click,
@@ -539,7 +736,7 @@ _DISPATCH = {
     "get_windows": handle_get_windows,
     "focus_window": handle_focus_window,
     "resize_window": handle_resize_window,
-    "open_url": handle_open_url,
+    "open_url": handle_web_open,
     # Git
     "git_status": handle_git_status,
     "git_diff": handle_git_diff,

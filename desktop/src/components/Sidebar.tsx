@@ -1,7 +1,13 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { KimLogo } from './KimLogo';
 import type { SessionInfo, KimAccount, ClawProject } from '../types';
+
+const SIDEBAR_MIN_WIDTH = 200;
+const SIDEBAR_MAX_WIDTH = 420;
+const SIDEBAR_DEFAULT_WIDTH = 240;
 
 interface Props {
   kimSessions: SessionInfo[];
@@ -18,9 +24,12 @@ interface Props {
   onTabChange: (tab: 'chat' | 'code') => void;
   activeProjectPath: string | null;
   onSelectProject: (path: string) => void;
+  onNewChatInProject: (path: string) => void;
   onRefreshSessions: () => void;
+  sessionRefreshNonce: number;
   kimSessionsDir: string | null;
   clawSessionsDir: string | null;
+  appVersion: string;
 }
 
 // ── Icons ──────────────────────────────────────────────────────────────────────
@@ -86,9 +95,16 @@ function XIcon() {
 
 // ── Session item ───────────────────────────────────────────────────────────────
 
-function SessionItem({ session, active, onClick, editMode, selected, onToggleSelect }: {
+function sessionKey(session: SessionInfo): string {
+  return session.session_key ?? `${session.session_type}:${session.date}:${session.session_id}`;
+}
+
+function SessionItem({ session, active, onClick, editMode, selected, onToggleSelect, pinned, onTogglePin, onRequestDelete }: {
   session: SessionInfo; active: boolean; onClick: () => void;
   editMode?: boolean; selected?: boolean; onToggleSelect?: () => void;
+  pinned?: boolean;
+  onTogglePin?: () => void;
+  onRequestDelete?: () => void;
 }) {
   const chatTitle = session.title?.trim() || session.session_id;
   let summaryText = session.summary || '';
@@ -102,7 +118,26 @@ function SessionItem({ session, active, onClick, editMode, selected, onToggleSel
   const preview = summaryText
     ? summaryText.slice(0, 60) + (summaryText.length > 60 ? '…' : '')
     : `${session.message_count} message${session.message_count !== 1 ? 's' : ''}`;
-  
+
+  const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!menuPos) return;
+    function close() { setMenuPos(null); }
+    document.addEventListener('mousedown', close);
+    document.addEventListener('keydown', close);
+    return () => {
+      document.removeEventListener('mousedown', close);
+      document.removeEventListener('keydown', close);
+    };
+  }, [menuPos]);
+
+  function handleContextMenu(e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenuPos({ x: e.clientX, y: e.clientY });
+  }
+
   if (editMode) {
     return (
       <div className={`kim-session-item kim-session-item--edit${selected ? ' kim-session-item--selected' : ''}`} onClick={onToggleSelect} style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, paddingRight: 8 }}>
@@ -116,14 +151,51 @@ function SessionItem({ session, active, onClick, editMode, selected, onToggleSel
   }
 
   return (
-    <button
-      onClick={onClick}
-      title={session.summary ?? chatTitle}
-      className={`kim-session-item${active ? ' kim-session-item--active' : ''}`}
-    >
-      <div className="kim-session-item__title">{chatTitle}</div>
-      <div className="kim-session-item__preview">{preview}</div>
-    </button>
+    <>
+      <button
+        onClick={onClick}
+        onContextMenu={handleContextMenu}
+        title={session.summary ?? chatTitle}
+        className={`kim-session-item${active ? ' kim-session-item--active' : ''}${pinned ? ' kim-session-item--pinned' : ''}`}
+      >
+        <div className="kim-session-item__title">
+          {pinned && (
+            <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="kim-session-item__pin-icon">
+              <path d="M8 1.5l2 4.5 4.5.5-3.5 3 1 4.5L8 11.5 4 14l1-4.5-3.5-3 4.5-.5 2-4.5z" />
+            </svg>
+          )}
+          {chatTitle}
+        </div>
+        <div className="kim-session-item__preview">{preview}</div>
+      </button>
+      {menuPos && createPortal(
+        <div
+          ref={menuRef}
+          className="kim-context-menu"
+          style={{ top: menuPos.y, left: menuPos.x }}
+          onMouseDown={e => e.stopPropagation()}
+          role="menu"
+        >
+          <button
+            type="button"
+            className="kim-context-menu__item"
+            onClick={() => { onTogglePin?.(); setMenuPos(null); }}
+            role="menuitem"
+          >
+            {pinned ? 'Unpin' : 'Pin'}
+          </button>
+          <button
+            type="button"
+            className="kim-context-menu__item kim-context-menu__item--danger"
+            onClick={() => { onRequestDelete?.(); setMenuPos(null); }}
+            role="menuitem"
+          >
+            Delete
+          </button>
+        </div>,
+        document.body,
+      )}
+    </>
   );
 }
 
@@ -134,7 +206,7 @@ function ClawSessionItem({ session, onSelectSession }: { session: { session_id: 
     ? session.summary.slice(0, 55) + (session.summary.length > 55 ? '…' : '')
     : `${session.message_count} message${session.message_count !== 1 ? 's' : ''}`;
   return (
-    <button className="kim-session-item" title={session.summary ?? session.session_id} onClick={() => onSelectSession({ session_id: session.session_id, session_type: 'claw', message_count: session.message_count, has_summary: !!session.summary, summary: session.summary ?? undefined, date: session.date || new Date().toISOString() })}>
+    <button className="kim-session-item" title={session.summary ?? session.session_id} onClick={() => onSelectSession({ session_id: session.session_id, session_key: `claw:${session.date}:${session.session_id}`, session_type: 'claw', message_count: session.message_count, has_summary: !!session.summary, summary: session.summary ?? undefined, date: session.date || new Date().toISOString() })}>
       <div className="kim-session-item__title">{session.session_id.slice(0, 18)}</div>
       <div className="kim-session-item__preview">{preview}</div>
     </button>
@@ -143,11 +215,12 @@ function ClawSessionItem({ session, onSelectSession }: { session: { session_id: 
 
 // ── Project tree in Code tab ───────────────────────────────────────────────────
 
-function ClawProjectTree({ project, onRemove, isActive, onSelect, onSelectSession }: {
+function ClawProjectTree({ project, onRemove, isActive, onSelect, onNewChat, onSelectSession }: {
   project: ClawProject;
   onRemove: (path: string) => void;
   isActive: boolean;
   onSelect: () => void;
+  onNewChat: () => void;
   onSelectSession: (s: SessionInfo) => void;
 }) {
   const [open, setOpen] = useState(isActive);
@@ -160,11 +233,19 @@ function ClawProjectTree({ project, onRemove, isActive, onSelect, onSelectSessio
           <ChevronIcon open={open} />
         </button>
         <span className="kim-project-item__icon"><FolderIcon /></span>
-        <span className="kim-project-item__name">{project.name}</span>
+        <span className="kim-project-item__name" title={project.path}>{project.name}</span>
         <span className="kim-project-item__branch-pill">{project.current_branch}</span>
         <button
+          className="kim-project-item__new-chat"
+          onClick={(e) => { e.stopPropagation(); onNewChat(); }}
+          title={`New chat in ${project.name}`}
+          aria-label={`New chat in ${project.name}`}
+        >
+          <PlusIcon />
+        </button>
+        <button
           className="kim-project-item__remove"
-          onClick={() => onRemove(project.path)}
+          onClick={(e) => { e.stopPropagation(); onRemove(project.path); }}
           title="Remove project"
           aria-label="Remove project"
         >
@@ -231,19 +312,103 @@ export function Sidebar({
   onSelectSession, onNewChat,
   collapsed, onToggle, onOpenSettings, loading,
   account, onAccountChange, activeTab, onTabChange,
-  activeProjectPath, onSelectProject, onRefreshSessions,
-  kimSessionsDir, clawSessionsDir,
+  activeProjectPath, onSelectProject, onNewChatInProject, onRefreshSessions,
+  sessionRefreshNonce, kimSessionsDir, clawSessionsDir, appVersion,
 }: Props) {
   const [kimExpanded, setKimExpanded] = useState(true);
   const [clawProjects, setClawProjects] = useState<ClawProject[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(false);
   const [projectsAdding, setProjectsAdding] = useState(false);
   const [projectsErr, setProjectsErr] = useState('');
-  
+
   const [editMode, setEditMode] = useState(false);
   const [selectedSessions, setSelectedSessions] = useState<Set<string>>(new Set());
   const [deleteConfirmStep, setDeleteConfirmStep] = useState<0 | 1 | 2>(0); // 0=hidden, 1=first confirm, 2=final confirm
   const [deleting, setDeleting] = useState(false);
+  const [pinnedKeys, setPinnedKeys] = useState<Set<string>>(() => {
+    try {
+      const raw = localStorage.getItem('kim-pinned-sessions');
+      return raw ? new Set(JSON.parse(raw) as string[]) : new Set();
+    } catch { return new Set(); }
+  });
+  const togglePinned = useCallback((key: string) => {
+    setPinnedKeys(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      try { localStorage.setItem('kim-pinned-sessions', JSON.stringify([...next])); } catch {}
+      return next;
+    });
+  }, []);
+  const requestSingleDelete = useCallback((key: string) => {
+    setSelectedSessions(new Set([key]));
+    setDeleteConfirmStep(1);
+  }, []);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const accountMenuRef = useRef<HTMLDivElement | null>(null);
+
+  // Resizable sidebar width (persisted, only applied when not collapsed).
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem('kim-sidebar-width');
+      const v = raw ? parseInt(raw, 10) : NaN;
+      if (Number.isFinite(v)) return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, v));
+    } catch {}
+    return SIDEBAR_DEFAULT_WIDTH;
+  });
+  const [resizing, setResizing] = useState(false);
+  const resizingRef = useRef(false);
+  useEffect(() => {
+    if (!resizing) return;
+    function onMove(e: MouseEvent) {
+      if (!resizingRef.current) return;
+      const next = Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, e.clientX));
+      setSidebarWidth(next);
+    }
+    function onUp() {
+      resizingRef.current = false;
+      setResizing(false);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    return () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+  }, [resizing]);
+  useEffect(() => {
+    try { localStorage.setItem('kim-sidebar-width', String(sidebarWidth)); } catch {}
+  }, [sidebarWidth]);
+
+  function startResize(e: React.MouseEvent) {
+    if (collapsed) return;
+    e.preventDefault();
+    resizingRef.current = true;
+    setResizing(true);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }
+
+  useEffect(() => {
+    if (!accountMenuOpen) return;
+    function onDocClick(e: MouseEvent) {
+      if (!accountMenuRef.current) return;
+      if (!accountMenuRef.current.contains(e.target as Node)) {
+        setAccountMenuOpen(false);
+      }
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setAccountMenuOpen(false);
+    }
+    document.addEventListener('mousedown', onDocClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDocClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [accountMenuOpen]);
 
   const projectPaths = account.code_projects ?? [];
 
@@ -261,7 +426,7 @@ export function Sidebar({
 
   useEffect(() => {
     if (activeTab === 'code') loadProjects();
-  }, [activeTab, loadProjects]);
+  }, [activeTab, loadProjects, sessionRefreshNonce]);
 
   async function handleAddProject(path: string) {
     const newPaths = await invoke<string[]>('add_code_project', { path });
@@ -281,9 +446,27 @@ export function Sidebar({
   const initials = account.display_name
     .split(' ').map((w: string) => w[0]).join('').slice(0, 2).toUpperCase();
 
+  const sidebarStyle: React.CSSProperties = collapsed
+    ? {}
+    : { width: sidebarWidth, minWidth: sidebarWidth };
+
   return (
     <>
-    <aside className={`kim-sidebar${collapsed ? ' kim-sidebar--collapsed' : ''}`}>
+    <aside
+      className={`kim-sidebar${collapsed ? ' kim-sidebar--collapsed' : ''}${resizing ? ' kim-sidebar--resizing' : ''}`}
+      data-tauri-drag-region
+      style={sidebarStyle}
+    >
+      {/* Traffic-lights spacer + brand mark (no "Kim" wordmark, just the K logo + version) */}
+      <div className="kim-sidebar__brand kim-no-drag">
+        {!collapsed && (
+          <div className="kim-sidebar__brand-mark">
+            <KimLogo layout="icon" size={20} />
+            <span className="kim-sidebar__version">v{appVersion}</span>
+          </div>
+        )}
+      </div>
+
       {/* Top controls */}
       <div className="kim-sidebar__top">
         <button
@@ -379,22 +562,34 @@ export function Sidebar({
                   {kimSessions.length === 0 ? (
                     <div className="kim-empty-section">No sessions yet</div>
                   ) : (
-                    kimSessions.map(s => (
-                      <SessionItem
-                        key={s.session_id}
-                        session={s}
-                        active={s.session_id === activeSessionId}
-                        onClick={() => onSelectSession(s)}
-                        editMode={editMode}
-                        selected={selectedSessions.has(s.session_id)}
-                        onToggleSelect={() => {
-                          const next = new Set(selectedSessions);
-                          if (next.has(s.session_id)) next.delete(s.session_id);
-                          else next.add(s.session_id);
-                          setSelectedSessions(next);
-                        }}
-                      />
-                    ))
+                    [...kimSessions]
+                      .sort((a, b) => {
+                        const ap = pinnedKeys.has(sessionKey(a)) ? 1 : 0;
+                        const bp = pinnedKeys.has(sessionKey(b)) ? 1 : 0;
+                        return bp - ap;
+                      })
+                      .map(s => {
+                        const key = sessionKey(s);
+                        return (
+                          <SessionItem
+                            key={key}
+                            session={s}
+                            active={key === activeSessionId}
+                            onClick={() => onSelectSession(s)}
+                            editMode={editMode}
+                            selected={selectedSessions.has(key)}
+                            onToggleSelect={() => {
+                              const next = new Set(selectedSessions);
+                              if (next.has(key)) next.delete(key);
+                              else next.add(key);
+                              setSelectedSessions(next);
+                            }}
+                            pinned={pinnedKeys.has(key)}
+                            onTogglePin={() => togglePinned(key)}
+                            onRequestDelete={() => requestSingleDelete(key)}
+                          />
+                        );
+                      })
                   )}
                 </div>
               )}
@@ -442,6 +637,7 @@ export function Sidebar({
                         onRemove={handleRemoveProject}
                         isActive={activeProjectPath === path}
                         onSelect={() => onSelectProject(path)}
+                        onNewChat={() => onNewChatInProject(path)}
                         onSelectSession={onSelectSession}
                       />
                     );
@@ -453,11 +649,19 @@ export function Sidebar({
                       <div className="kim-project-item__header" onClick={() => onSelectProject(path)} style={{ cursor: 'pointer' }}>
                         <button className="kim-project-item__toggle" style={{ flex: 1, cursor: 'default' }}>
                           <span className="kim-project-item__icon"><FolderIcon /></span>
-                          <span className="kim-project-item__name">{name}</span>
+                          <span className="kim-project-item__name" title={path}>{name}</span>
+                        </button>
+                        <button
+                          className="kim-project-item__new-chat"
+                          onClick={(e) => { e.stopPropagation(); onNewChatInProject(path); }}
+                          title={`New chat in ${name}`}
+                          aria-label={`New chat in ${name}`}
+                        >
+                          <PlusIcon />
                         </button>
                         <button
                           className="kim-project-item__remove"
-                          onClick={() => handleRemoveProject(path)}
+                          onClick={(e) => { e.stopPropagation(); handleRemoveProject(path); }}
                           title="Remove project"
                         >
                           <XIcon />
@@ -475,31 +679,104 @@ export function Sidebar({
         </div>
       )}
 
-      {/* Bottom: account + settings */}
-      <div className="kim-sidebar__bottom">
-        {!collapsed && (
-          <div className="kim-account-chip">
-            <div className="kim-account-chip__avatar">
-              {account.github_avatar_url
-                ? <img src={account.github_avatar_url} alt={account.display_name} />
-                : initials}
+      {/* Resize handle (only when not collapsed) */}
+      {!collapsed && (
+        <div
+          className="kim-sidebar__resize-handle kim-no-drag"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          onMouseDown={startResize}
+          onDoubleClick={() => setSidebarWidth(SIDEBAR_DEFAULT_WIDTH)}
+          title="Drag to resize · double-click to reset"
+        />
+      )}
+
+      {/* Bottom: account dropdown */}
+      <div className="kim-sidebar__bottom" ref={accountMenuRef}>
+        {accountMenuOpen && !collapsed && (
+          <div className="kim-account-menu" role="menu">
+            <div className="kim-account-menu__email">
+              {account.github_username ? `@${account.github_username}` : account.display_name}
             </div>
-            <div className="kim-account-chip__info">
-              <div className="kim-account-chip__name">{account.display_name}</div>
-              {account.github_username && (
-                <div className="kim-account-chip__sub">@{account.github_username}</div>
-              )}
-            </div>
+            <button
+              type="button"
+              className="kim-account-menu__item"
+              onClick={() => { setAccountMenuOpen(false); onOpenSettings(); }}
+              role="menuitem"
+            >
+              <SettingsIcon />
+              <span>Settings</span>
+              <span className="kim-account-menu__kbd">⌘,</span>
+            </button>
+            <button
+              type="button"
+              className="kim-account-menu__item"
+              onClick={() => setAccountMenuOpen(false)}
+              role="menuitem"
+              disabled
+              title="Coming soon"
+            >
+              <span>Get help</span>
+            </button>
+            <div className="kim-account-menu__sep" />
+            <button
+              type="button"
+              className="kim-account-menu__item"
+              onClick={() => setAccountMenuOpen(false)}
+              role="menuitem"
+              disabled
+              title="Coming soon"
+            >
+              <span>Upgrade plan</span>
+            </button>
+            <button
+              type="button"
+              className="kim-account-menu__item"
+              onClick={() => setAccountMenuOpen(false)}
+              role="menuitem"
+              disabled
+              title="Coming soon"
+            >
+              <span>Learn more</span>
+            </button>
+            <div className="kim-account-menu__sep" />
+            <button
+              type="button"
+              className="kim-account-menu__item kim-account-menu__item--danger"
+              onClick={async () => {
+                setAccountMenuOpen(false);
+                await onAccountChange({ ...account, display_name: '', github_username: undefined, github_avatar_url: undefined } as KimAccount);
+              }}
+              role="menuitem"
+            >
+              <span>Log out</span>
+            </button>
           </div>
         )}
         <button
-          onClick={onOpenSettings}
-          title="Settings (Cmd+,)"
-          className="kim-sidebar__settings-btn"
-          aria-label="Settings"
+          type="button"
+          className={`kim-account-trigger${accountMenuOpen ? ' is-open' : ''} kim-no-drag`}
+          onClick={() => setAccountMenuOpen(v => !v)}
+          aria-haspopup="menu"
+          aria-expanded={accountMenuOpen}
+          title={collapsed ? account.display_name : undefined}
         >
-          <SettingsIcon />
-          {!collapsed && <span>Settings</span>}
+          <div className="kim-account-trigger__avatar">
+            {account.github_avatar_url
+              ? <img src={account.github_avatar_url} alt={account.display_name} />
+              : initials}
+          </div>
+          {!collapsed && (
+            <>
+              <div className="kim-account-trigger__info">
+                <span className="kim-account-trigger__name">{account.display_name || 'Account'}</span>
+              </div>
+              <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M4 6l4 4 4-4" />
+              </svg>
+            </>
+          )}
         </button>
       </div>
     </aside>
@@ -534,8 +811,11 @@ export function Sidebar({
                     onClick={async () => {
                       setDeleting(true);
                       try {
+                        const selectedSessionIds = kimSessions
+                          .filter(session => selectedSessions.has(sessionKey(session)))
+                          .map(session => session.session_id);
                         await invoke('delete_sessions', { 
-                          sessionIds: Array.from(selectedSessions),
+                          sessionIds: selectedSessionIds,
                           kimDir: kimSessionsDir,
                           clawDir: clawSessionsDir,
                         });

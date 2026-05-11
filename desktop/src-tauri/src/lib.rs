@@ -1,10 +1,10 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Listener, Manager, State};
@@ -50,6 +50,11 @@ struct BridgeCompleteRequest {
     attachments: Vec<BridgeAttachment>,
     #[serde(default)]
     completion_hash: Option<String>,
+    /// Optional authuser index for Google multi-account routing.
+    /// When set, the browser window navigates to gemini.google.com?authuser=N
+    /// before injecting the prompt.
+    #[serde(default)]
+    authuser: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -75,7 +80,7 @@ struct BridgeCallbackRequest {
 /// IPC event payload sent from the persistent JS bridge via Tauri emit.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct BridgeIpcEvent {
-    event: String,     // "sent" | "done" | "error"
+    event: String,     // "sent" | "done" | "error" | "progress"
     req_id: String,
     #[serde(default)]
     response: Option<String>,
@@ -83,6 +88,8 @@ struct BridgeIpcEvent {
     error: Option<String>,
     #[serde(default)]
     site: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 static IPC_LISTENER_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -91,11 +98,14 @@ static WEBVIEW_BRIDGE_CFG: OnceLock<WebviewBridgeConfig> = OnceLock::new();
 static WEBVIEW_BRIDGE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WEBVIEW_BRIDGE_REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 static WEBVIEW_BRIDGE_RESULTS: OnceLock<StdMutex<HashMap<String, BridgeCompleteResponse>>> = OnceLock::new();
+static WEBVIEW_BRIDGE_PROGRESS: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
 /// Condvar notified whenever a result is inserted into WEBVIEW_BRIDGE_RESULTS.
 /// Collectors wait on this instead of polling every 150ms.
 static WEBVIEW_BRIDGE_NOTIFY: OnceLock<(StdMutex<()>, Condvar)> = OnceLock::new();
 /// Tracks whether the browser window was hidden before a specific /v1/send request, so /v1/result knows to hide it after.
 static WEBVIEW_WAS_HIDDEN: OnceLock<StdMutex<std::collections::HashSet<String>>> = OnceLock::new();
+/// Debug/testing mode: keep the provider webview visible while sending.
+static WEBVIEW_KEEP_VISIBLE: OnceLock<StdMutex<bool>> = OnceLock::new();
 const BRIDGE_COMPLETION_TIMEOUT_S: u64 = 720;
 /// PID of the currently-running agent subprocess, accessible from both the
 /// sync bridge thread (/v1/task, /v1/cancel) and the async Tauri commands.
@@ -104,6 +114,8 @@ static BRIDGE_TASK_PID: OnceLock<StdMutex<Option<u32>>> = OnceLock::new();
 static BRIDGE_TASK_SESSION: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
 /// The site selected via /v1/provider, to be passed to the next agent spawn.
 static KIM_PREFERRED_SITE: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
+/// Last Gemini authuser index intentionally loaded in the in-app browser.
+static WEBVIEW_LAST_GEMINI_AUTHUSER: OnceLock<StdMutex<Option<u32>>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -112,12 +124,26 @@ static KIM_PREFERRED_SITE: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SessionInfo {
     pub session_id: String,
+    pub session_key: String,
     pub title: String,
     pub date: String,
     pub message_count: usize,
     pub has_summary: bool,
     pub summary: Option<String>,
     pub session_type: String, // "kim" or "claw"
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CompletedClawSession {
+    pub session_id: String,
+    pub session_key: String,
+    pub title: String,
+    pub date: String,
+    pub message_count: usize,
+    pub has_summary: bool,
+    pub summary: Option<String>,
+    pub session_type: String,
+    pub project_path: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -339,6 +365,7 @@ fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<Session
             let title = infer_session_title(&session_file, summary.as_ref(), &session_id);
 
             sessions.push(SessionInfo {
+                session_key: format!("{}:{}:{}", session_type, date_str, session_id),
                 session_id,
                 title,
                 date: date_str.clone(),
@@ -379,11 +406,66 @@ fn parse_jsonl(path: &Path) -> Result<Vec<KimMessage>, String> {
         }
         match serde_json::from_str::<KimMessage>(trimmed) {
             Ok(msg) => messages.push(msg),
-            Err(e) => eprintln!("Skipping malformed JSONL line {}: {}", i + 1, e),
+            Err(e) => {
+                match serde_json::from_str::<serde_json::Value>(trimmed)
+                    .ok()
+                    .and_then(claw_jsonl_line_to_kim_message)
+                {
+                    Some(msg) => messages.push(msg),
+                    None => eprintln!("Skipping malformed JSONL line {}: {}", i + 1, e),
+                }
+            }
         }
     }
 
     Ok(messages)
+}
+
+fn claw_jsonl_line_to_kim_message(value: serde_json::Value) -> Option<KimMessage> {
+    if value.get("type").and_then(|v| v.as_str()) != Some("message") {
+        return None;
+    }
+
+    let message = value.get("message")?;
+    let role = message.get("role")?.as_str()?.to_string();
+    let content = message
+        .get("blocks")
+        .cloned()
+        .map(normalize_claw_blocks)
+        .or_else(|| message.get("content").cloned())
+        .unwrap_or_else(|| serde_json::Value::String(String::new()));
+
+    Some(KimMessage {
+        role,
+        content,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    })
+}
+
+fn normalize_claw_blocks(blocks: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(items) = blocks else {
+        return blocks;
+    };
+
+    serde_json::Value::Array(
+        items
+            .into_iter()
+            .map(|mut block| {
+                if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                    if let Some(raw_input) = block.get("input").and_then(|v| v.as_str()) {
+                        let parsed = serde_json::from_str::<serde_json::Value>(raw_input)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": raw_input }));
+                        if let Some(obj) = block.as_object_mut() {
+                            obj.insert("input".to_string(), parsed);
+                        }
+                    }
+                }
+                block
+            })
+            .collect(),
+    )
 }
 
 fn normalize_title_text(raw: &str) -> Option<String> {
@@ -451,6 +533,16 @@ fn infer_session_title(session_file: &Path, summary: Option<&String>, session_id
                 if let Some(content) = value.get("content") {
                     if let Some(title) = extract_title_from_content(content) {
                         return title;
+                    }
+                }
+            } else if value.get("type").and_then(|v| v.as_str()) == Some("message") {
+                let message = value.get("message").unwrap_or(&serde_json::Value::Null);
+                let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                if role == "user" {
+                    if let Some(content) = message.get("blocks").or_else(|| message.get("content")) {
+                        if let Some(title) = extract_title_from_content(content) {
+                            return title;
+                        }
                     }
                 }
             }
@@ -539,12 +631,156 @@ fn normalize_site(site: &str) -> String {
 fn default_site_url(site: &str) -> &'static str {
     match normalize_site(site).as_str() {
         "chatgpt" => "https://chatgpt.com",
-        "gemini" => "https://gemini.google.com",
+        "gemini" => "https://gemini.google.com/app",
         "deepseek" => "https://chat.deepseek.com",
         "grok" => "https://grok.com",
         _ => "https://claude.ai/new",
     }
 }
+
+fn gemini_site_url(authuser: Option<u32>) -> String {
+    match authuser {
+        Some(index) => format!("https://gemini.google.com/app?authuser={index}"),
+        None => "https://gemini.google.com/app".to_string(),
+    }
+}
+
+fn is_bridge_task_running() -> bool {
+    BRIDGE_TASK_PID
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false)
+}
+
+fn should_keep_browser_visible() -> bool {
+    WEBVIEW_KEEP_VISIBLE
+        .get_or_init(|| StdMutex::new(false))
+        .lock()
+        .map(|guard| *guard)
+        .unwrap_or(false)
+}
+
+fn webview_current_href(window: &tauri::WebviewWindow) -> String {
+    if let Ok(url) = window.url() {
+        let current = url.to_string();
+        if !current.is_empty() {
+            return current;
+        }
+    }
+
+    let _ = window.eval("document.title = '__KIM_HREF__' + String(window.location.href);");
+    std::thread::sleep(Duration::from_millis(100));
+    window
+        .title()
+        .ok()
+        .and_then(|title| title.strip_prefix("__KIM_HREF__").map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn prepare_gemini_webview(window: &tauri::WebviewWindow, authuser: Option<u32>, force: bool) {
+    let current_url = webview_current_href(window);
+    let task_running = is_bridge_task_running();
+
+    if task_running {
+        // Preserve the exact provider URL during active tasks.
+        // Do not rewrite /app/<chat-id> to /app?authuser=N.
+        return;
+    }
+
+    let selected_changed = WEBVIEW_LAST_GEMINI_AUTHUSER
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .map(|guard| *guard != authuser)
+        .unwrap_or(true);
+    let missing_selected_authuser = authuser.is_some_and(|index| {
+        current_url.contains("gemini.google.com")
+            && !current_url.contains(&format!("authuser={index}"))
+    });
+    let wrong_page = current_url.is_empty()
+        || !current_url.contains("gemini.google.com")
+        || current_url.contains("accounts.google.com")
+        || current_url.contains("signin")
+        || current_url.contains("ServiceLogin")
+        || current_url.contains("SignOutOptions");
+
+    if force || selected_changed || missing_selected_authuser || wrong_page {
+        let target_url = gemini_site_url(authuser);
+        if let Ok(js_url) = serde_json::to_string(&target_url) {
+            let _ = window.eval(format!("window.location.href = {};", js_url));
+            std::thread::sleep(Duration::from_millis(3500));
+        }
+        if let Ok(mut guard) = WEBVIEW_LAST_GEMINI_AUTHUSER
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+        {
+            *guard = authuser;
+        }
+    }
+}
+
+/// Tracks the user's last known non-Kim frontmost app, so that even after
+/// the first send has already stolen focus to Kim, subsequent sends can
+/// still restore the user's actual target app.
+#[cfg(target_os = "macos")]
+static USER_FRONTMOST_APP: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
+
+/// Capture the current frontmost app. If it's Kim, fall back to the last
+/// remembered user app. Always updates the cache when a non-Kim app is
+/// observed so we keep tracking the user's actual target.
+#[cfg(target_os = "macos")]
+fn save_frontmost_app() -> Option<String> {
+    let cache = USER_FRONTMOST_APP.get_or_init(|| StdMutex::new(None));
+
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(r#"tell application "System Events" to return bundle identifier of first application process whose frontmost is true"#)
+        .output();
+
+    if let Ok(out) = output {
+        if out.status.success() {
+            let bundle_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !bundle_id.is_empty() && bundle_id != "com.kim.desktop" {
+                if let Ok(mut guard) = cache.lock() {
+                    *guard = Some(bundle_id.clone());
+                }
+                return Some(bundle_id);
+            }
+        }
+    }
+
+    // Frontmost is Kim (or query failed). Use the last user-frontmost we saw.
+    cache.lock().ok().and_then(|g| g.clone())
+}
+
+/// Reactivate the saved frontmost app, scheduled in a background thread to run
+/// after the bridge JS has had a chance to inject focus into the offscreen
+/// webview. This is what undoes Stage Manager swapping groups when the
+/// hidden Tauri webview steals key-window status during prompt injection.
+#[cfg(target_os = "macos")]
+fn schedule_frontmost_restore(bundle_id: String) {
+    std::thread::spawn(move || {
+        // Two restores: one early (catches inputEl.focus()), one late (catches
+        // the send-button click and any post-paste focus events).
+        for delay_ms in [400u64, 1500u64] {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            let script = format!(
+                r#"tell application id "{}" to activate"#,
+                bundle_id.replace('"', "")
+            );
+            let _ = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(&script)
+                .status();
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn save_frontmost_app() -> Option<String> { None }
+
+#[cfg(not(target_os = "macos"))]
+fn schedule_frontmost_restore(_bundle_id: String) {}
 
 /// Write the first PNG attachment to the macOS system clipboard via osascript.
 ///
@@ -597,6 +833,60 @@ fn write_first_png_to_clipboard(attachments: &[BridgeAttachment]) -> bool {
 
 #[cfg(not(target_os = "macos"))]
 fn write_first_png_to_clipboard(_attachments: &[BridgeAttachment]) -> bool {
+    false
+}
+
+/// Stage a text prompt through a temporary file and copy it to the macOS
+/// clipboard. The temporary file is removed immediately after pbcopy reads it.
+#[cfg(target_os = "macos")]
+fn write_text_prompt_to_clipboard(prompt: &str) -> bool {
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_path = format!("/tmp/kim_prompt_{}_{}.txt", std::process::id(), stamp);
+    if let Err(e) = std::fs::write(&temp_path, prompt.as_bytes()) {
+        eprintln!("[Kim] clipboard: prompt temp write failed: {}", e);
+        return false;
+    }
+
+    let bytes = match std::fs::read(&temp_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            eprintln!("[Kim] clipboard: prompt temp read failed: {}", e);
+            return false;
+        }
+    };
+
+    let mut child = match std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            eprintln!("[Kim] clipboard: pbcopy spawn failed: {}", e);
+            return false;
+        }
+    };
+
+    let wrote = child
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(&bytes).is_ok())
+        .unwrap_or(false);
+    let ok = wrote && child.wait().map(|s| s.success()).unwrap_or(false);
+    let _ = std::fs::remove_file(&temp_path);
+
+    if !ok {
+        eprintln!("[Kim] clipboard: pbcopy failed (non-fatal)");
+    }
+    ok
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_text_prompt_to_clipboard(_prompt: &str) -> bool {
     false
 }
 
@@ -768,6 +1058,18 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
     return normalizeText(inputEl.innerText || inputEl.textContent || '');
   };
 
+  const promptMatchesInput = (inputEl, promptText) => {
+    const expectedRaw = String(promptText || '');
+    const actual = readInputText(inputEl);
+    const expected = normalizeText(expectedRaw);
+    if (!expected) return true;
+    if (actual === expected) return true;
+    if (expected.length < 500) return false;
+    if (actual.length < Math.floor(expected.length * 0.98)) return false;
+    return actual.slice(0, 220) === expected.slice(0, 220)
+      && actual.slice(-220) === expected.slice(-220);
+  };
+
   // ── IPC emit (Tauri native) ──────────────────────────────────────────
   const ipcEmit = (payload) => {
     try {
@@ -902,6 +1204,10 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
   // ── Prompt injection ─────────────────────────────────────────────────
   const injectPromptText = async (inputEl, promptText) => {
     const target = String(promptText || '');
+    try {
+      inputEl.focus();
+      document.execCommand('selectAll', false);
+    } catch (_) {}
     if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
       const proto = Object.getPrototypeOf(inputEl);
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
@@ -920,12 +1226,14 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
     } catch (_) {}
     const currentText = readInputText(inputEl);
     if (!inserted || currentText.length < Math.min(8, target.length)) {
-      inputEl.textContent = '';
-      const lines = target.split('\n');
-      for (const line of lines) {
-        const div = document.createElement('div');
-        div.textContent = line;
-        inputEl.appendChild(div);
+      // Strategy 3: Synthetic ClipboardEvent for ProseMirror (Claude)
+      try {
+        const dt = new DataTransfer();
+        dt.setData('text/plain', target);
+        const pasteEvent = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
+        inputEl.dispatchEvent(pasteEvent);
+      } catch (e) {
+        console.warn('[KimBridge] Synthetic paste failed:', e);
       }
     }
     // Gemini rich-textarea mirror sync
@@ -943,20 +1251,11 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       }
     } catch (_) {}
     try {
-      const dt = new DataTransfer();
-      dt.setData('text/plain', target);
-      inputEl.dispatchEvent(new ClipboardEvent('paste', {
-        bubbles: true,
-        cancelable: true,
-        clipboardData: dt,
-      }));
-    } catch (_) {}
-    try {
       inputEl.dispatchEvent(new InputEvent('input', { data: target, inputType: 'insertText', bubbles: true, cancelable: true }));
     } catch (_) {}
     inputEl.dispatchEvent(new Event('input', { bubbles: true }));
     inputEl.dispatchEvent(new Event('change', { bubbles: true }));
-    return Math.max(readInputText(inputEl).length, target.length);
+    return readInputText(inputEl).length;
   };
 
   // ── Attachment injection ──────────────────────────────────────────────
@@ -1041,29 +1340,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         inputEl.focus();
         await new Promise(r => setTimeout(r, 100));
 
-        // Strategy 1: execCommand paste from real system clipboard
-        let thumbnailFound = false;
-        try {
-          document.execCommand('paste');
-          console.log('[KimBridge] execCommand paste fired');
-        } catch (_) {}
-
-        let waited = 0;
-        while (waited < 1500) {
-          await new Promise(r => setTimeout(r, 100));
-          waited += 100;
-          if (document.querySelector('img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view')) {
-            thumbnailFound = true;
-            break;
-          }
-        }
-        if (thumbnailFound) {
-          await dismissPopups();
-          console.log('[KimBridge] execCommand paste succeeded');
-          return 1;
-        }
-
-        // Strategy 2: synthetic ClipboardEvent (isTrusted: false — may be ignored)
+        // Strategy 1: synthetic ClipboardEvent (isTrusted: false — may be ignored by some editors)
         const dt = new DataTransfer();
         dt.items.add(imageFile);
         const pasteEvent = new ClipboardEvent('paste', {
@@ -1121,13 +1398,51 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
           }
         }
       }
-      
-      // 3. Fallback: Legacy store (for title polling)
-      if (payload.event !== 'sent') {
+
+      // 3. Fallback: Legacy store (for title polling). Only final payloads
+      // go here; live progress is display-only and must never satisfy Rust's
+      // completion collector.
+      if (!payload.event || payload.event === 'done' || payload.event === 'error') {
         try {
           const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
           if (typeof window.__kimBridgeStore !== 'object' || window.__kimBridgeStore === null) window.__kimBridgeStore = {};
           window.__kimBridgeStore[reqId] = { ready: true, data: encoded, err: null, ts: Date.now() };
+        } catch (_) {}
+      }
+    };
+
+    const decodeJsonString = (value) => {
+      try { return JSON.parse('"' + String(value || '').replace(/"/g, '\\"') + '"'); } catch (_) {}
+      return String(value || '').replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    };
+
+    const extractBridgeTextField = (raw) => {
+      return ''; // Disabled: let Python bridge parse JSON
+    };
+
+    const cleanProgressText = (raw) => {
+      let text = String(raw || '');
+      if (completionHash) text = text.replace(completionHash, '');
+      text = text.replace(/KIM_[a-f0-9]{8}/gi, '').trim();
+      return text;
+    };
+
+    let lastProgressText = '';
+    let lastProgressAt = 0;
+    const reportProgress = (raw) => {
+      const text = cleanProgressText(raw);
+      if (!text || text === lastProgressText) return;
+      const now = Date.now();
+      if (now - lastProgressAt < 800 && text.length <= lastProgressText.length + 12) return;
+      lastProgressText = text;
+      lastProgressAt = now;
+      const payload = { ok: true, event: 'progress', req_id: reqId, site: siteKey, text };
+      if (!ipcEmit(payload) && callbackUrl) {
+        try {
+          const pingUrl = callbackUrl.replace('/callback', '/ping');
+          const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+          const img = new Image();
+          img.src = `${pingUrl}?req_id=${encodeURIComponent(reqId)}&data=${encodeURIComponent(encoded)}`;
         } catch (_) {}
       }
     };
@@ -1156,15 +1471,15 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         ? prompt + '\n[System note: The screenshot could not be attached to this message (image upload unavailable in current interface). Please respond with what you can based on text context, or NEED_HELP if you truly cannot proceed without the image.]'
         : prompt;
       const injectedLen = await injectPromptText(inputEl, effectivePrompt);
-      if (injectedLen < Math.min(8, normalizeText(effectivePrompt).length)) {
-        throw new Error('Prompt text was not accepted by the chat input.');
+      if (injectedLen < Math.min(8, normalizeText(effectivePrompt).length) || !promptMatchesInput(inputEl, effectivePrompt)) {
+        console.warn('[KimBridge] Prompt text may not have been fully accepted by the chat input. Proceeding anyway.');
       }
 
       // Allow UI framework to sync state before sending
       await new Promise(r => setTimeout(r, 80));
 
       // 4a. Wait for the PREVIOUS request's completion hash to appear in the
-      //     DOM before pressing Enter.  This ensures we never interrupt an
+      //     DOM before clicking Send.  This ensures we never interrupt an
       //     in-progress generation.  The hash is provider-agnostic — it lives
       //     in the response text itself, so it works regardless of UI changes.
       {
@@ -1199,34 +1514,18 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         window.__kimBridge._lastHash = completionHash;
       }
 
-      // 4c. Submit via Enter key
-      inputEl.focus();
-      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-      inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-      inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-
-      // 4d. Click the send button — only click when it is actually enabled.
-      //     Using enabled:false would match a disabled button (e.g. while an
-      //     uploaded image is still processing) and silently do nothing.
-      //     15 attempts × 500 ms = up to 7.5 s, enough for image uploads.
-      let sendClicked = false;
-      if (siteKey === 'gemini') {
-        for (let attempt = 0; attempt < 15; attempt++) {
-          const sendBtn = findElement(cfg.send_selectors, { visible: true, enabled: true });
-          if (sendBtn) {
-            try { sendBtn.click(); sendClicked = true; console.log('[KimBridge] Send button clicked on attempt', attempt + 1); break; } catch (_) {}
-          }
-          await new Promise(r => setTimeout(r, 200));
-        }
-        if (!sendClicked) {
-          console.warn('[KimBridge] Could not find/click enabled send button after 15 attempts, Enter may have worked');
-          const disabledBtn = findElement(cfg.send_selectors, { visible: true });
-          if (disabledBtn) {
-            console.warn('[KimBridge] Attempting to click disabled send button as last resort...');
-            try { disabledBtn.click(); } catch (_) {}
-          }
-        }
+      if (!promptMatchesInput(inputEl, effectivePrompt)) {
+        throw new Error('Prompt changed after injection. Refusing to send a partial prompt.');
       }
+
+      // 4c. Submit via synthetic Enter event.
+      // We already wrote the prompt to the clipboard and injected it at once,
+      // so there is no risk of sending an incomplete/split prompt.
+      inputEl.focus();
+      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      console.log('[KimBridge] Synthetic Enter dispatched to send message');
 
       // 5. Emit "sent" immediately via IPC only — NOT via the legacy store,
       //    because the store is used by Rust's title-pull fallback which can't
@@ -1241,27 +1540,33 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       //    and we know exactly which text belongs to this request.
       const POLL_MS = 300;
       let responseText = '';
+      let lastTextLength = 0;
+      let idleCount = 0;
 
-      let noPostStopCount = 0;
       while (Date.now() < hardDeadlineAt) {
         await new Promise(r => setTimeout(r, POLL_MS));
         if (isSuperseded()) { console.log('[KimBridge] send superseded during response wait, bailing'); return; }
 
         const latestText = getLatestResponseText(cfg, siteKey) || '';
+        reportProgress(latestText);
         if (completionHash && latestText.includes(completionHash)) {
           responseText = latestText.replace(completionHash, '').trim();
           break;
         }
 
-        if (latestText && latestText.length > 0 && !isAnyStopVisible(cfg)) {
-          noPostStopCount++;
-          if (noPostStopCount >= 5) {
-            console.log('[KimBridge] completionHash not found, but stop button is gone. Falling back to latest text.');
+        if (latestText.length > lastTextLength) {
+          idleCount = 0;
+          lastTextLength = latestText.length;
+        } else if (latestText.length > 0) {
+          idleCount++;
+        }
+
+        if (!completionHash && latestText && latestText.length > 0 && !isAnyStopVisible(cfg)) {
+          if (idleCount >= 10) { // 3 seconds of no text growth
+            console.log('[KimBridge] stop button gone and text idle. Falling back to latest text.');
             responseText = latestText;
             break;
           }
-        } else {
-          noPostStopCount = 0;
         }
       }
 
@@ -1345,11 +1650,29 @@ fn open_browser_signin_window_impl(
 
     let label = "kim-browser-signin";
     if let Some(existing) = app_handle.get_webview_window(label) {
+        let task_running = BRIDGE_TASK_PID
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+
+        if task_running {
+            return Ok(
+                "Reused existing Kim browser window without navigation because a task is active."
+                    .to_string(),
+            );
+        }
+
         let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
         let _ = existing.eval(format!("window.location.href = {};", js_url));
-        // Don't show/focus — keep it hidden if the user previously closed it.
-        // The user can explicitly show it via show_browser_window.
         return Ok("Navigated existing Kim browser window".to_string());
+    }
+
+    if is_bridge_task_running() {
+        return Err(
+            "Cannot open the provider browser while Kim is running a task; this would lose LLM context."
+                .to_string(),
+        );
     }
 
     let title = provider_name
@@ -1391,11 +1714,12 @@ fn open_browser_signin_window_impl(
     // Listen for IPC events from the persistent JS bridge only once per app instance.
     IPC_LISTENER_REGISTERED.get_or_init(|| {
         let app_for_listener = app_handle.clone();
+        let app_for_event = app_for_listener.clone();
         app_for_listener.listen("kim-bridge-ipc", move |event| {
             let payload_str = event.payload();
             match serde_json::from_str::<BridgeIpcEvent>(payload_str) {
                 Ok(ipc_event) => {
-                    handle_bridge_ipc_event(ipc_event);
+                    handle_bridge_ipc_event(ipc_event, &app_for_event);
                 }
                 Err(e) => {
                     eprintln!(
@@ -1434,7 +1758,7 @@ async fn add_custom_provider_capability(url: String, app_handle: tauri::AppHandl
         .unwrap()
         .as_nanos();
     let cap_id = format!("kim-custom-bridge-{}", nanos);
-    
+
     let cap = CapabilityBuilder::new(cap_id)
         .remote(capability_url)
         .window("kim-browser-signin")
@@ -1447,7 +1771,70 @@ async fn add_custom_provider_capability(url: String, app_handle: tauri::AppHandl
 
 /// Handle an IPC event from the persistent JS bridge.
 /// Inserts results into the shared store and wakes up any waiting collector.
-fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent) {
+fn clean_bridge_progress_text(text: &str) -> Option<String> {
+    let mut cleaned = text
+        .replace('\u{0000}', "")
+        .replace("\r\n", "\n")
+        .trim()
+        .to_string();
+
+    while cleaned.contains("\n\n\n") {
+        cleaned = cleaned.replace("\n\n\n", "\n\n");
+    }
+    cleaned = cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let lower = cleaned.to_lowercase();
+    if cleaned.len() < 8
+        || lower.starts_with("error:")
+        || lower.starts_with("need_help:")
+        || lower.starts_with("{text")
+        || lower.starts_with("{\"text")
+        || lower.starts_with("{ \"text")
+        || lower.starts_with('{')
+        || lower.contains("\"tool_calls\"")
+        || lower.contains("\"content\"")
+        || lower.contains("<!doctype")
+        || lower.contains("<html")
+        || lower.contains("<style")
+        || lower.contains("kim_")
+    {
+        return None;
+    }
+
+    if cleaned.chars().filter(|ch| *ch == '{' || *ch == '}' || *ch == '\\').count() > 8 {
+        return None;
+    }
+
+    if cleaned.len() > 280 {
+        cleaned.truncate(277);
+        cleaned.push_str("...");
+    }
+
+    Some(cleaned)
+}
+
+fn emit_bridge_progress(app_handle: &tauri::AppHandle, req_id: &str, text: &str) {
+    let Some(cleaned) = clean_bridge_progress_text(text) else {
+        return;
+    };
+
+    let progress_store = WEBVIEW_BRIDGE_PROGRESS.get_or_init(|| StdMutex::new(HashMap::new()));
+    if let Ok(mut guard) = progress_store.lock() {
+        if guard.get(req_id).map(|last| last == &cleaned).unwrap_or(false) {
+            return;
+        }
+        guard.insert(req_id.to_string(), cleaned.clone());
+    }
+
+    let _ = app_handle.emit("kim-agent-output", format!("[STATUS] {}", cleaned));
+}
+
+fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &tauri::AppHandle) {
     agent_debug_log(
         "H1",
         "bridge IPC event received",
@@ -1456,6 +1843,7 @@ fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent) {
             "reqId": ipc_event.req_id,
             "hasResponse": ipc_event.response.is_some(),
             "hasError": ipc_event.error.is_some(),
+            "hasText": ipc_event.text.is_some(),
         }),
     );
 
@@ -1477,6 +1865,12 @@ fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent) {
             notify_bridge_result();
         }
         "done" => {
+            if let Ok(mut guard) = WEBVIEW_BRIDGE_PROGRESS
+                .get_or_init(|| StdMutex::new(HashMap::new()))
+                .lock()
+            {
+                guard.remove(&ipc_event.req_id);
+            }
             let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
             if let Ok(mut guard) = store.lock() {
                 guard.insert(ipc_event.req_id.clone(), BridgeCompleteResponse {
@@ -1488,7 +1882,18 @@ fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent) {
             }
             notify_bridge_result();
         }
+        "progress" => {
+            if let Some(text) = ipc_event.text.as_deref() {
+                emit_bridge_progress(app_handle, &ipc_event.req_id, text);
+            }
+        }
         "error" => {
+            if let Ok(mut guard) = WEBVIEW_BRIDGE_PROGRESS
+                .get_or_init(|| StdMutex::new(HashMap::new()))
+                .lock()
+            {
+                guard.remove(&ipc_event.req_id);
+            }
             let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
             if let Ok(mut guard) = store.lock() {
                 guard.insert(ipc_event.req_id.clone(), BridgeCompleteResponse {
@@ -1543,13 +1948,13 @@ fn build_bridge_complete_script(
   const __kimCompletionHash = {hash};
     let __kimFinished = false;
     let __kimWatchdog = null;
-"#, 
-        site=site_json, 
-        prompt=prompt_json, 
-        req_id=req_json, 
-        attachments=attachments_json, 
-        callback_url=callback_url_json, 
-        callback_token=callback_token_json, 
+"#,
+        site=site_json,
+        prompt=prompt_json,
+        req_id=req_json,
+        attachments=attachments_json,
+        callback_url=callback_url_json,
+        callback_token=callback_token_json,
         hash=hash_json
     );
 
@@ -1872,10 +2277,10 @@ fn build_bridge_complete_script(
                         break;
                     }
                 }
-                
+
                 // Dismiss any consent popups (like Gemini's "I agree" dialog)
                 await dismissPopups();
-                
+
                 return 1;
             } catch (e) {
                 __kimDbg('H1', 'ClipboardEvent paste fallback failed', { error: String(e) });
@@ -1933,8 +2338,28 @@ fn build_bridge_complete_script(
         return normalizeText(inputEl.innerText || inputEl.textContent || '');
     };
 
+    const promptMatchesInput = (inputEl, promptText) => {
+        const expectedRaw = String(promptText || '');
+        const actual = readInputText(inputEl);
+        const expected = normalizeText(expectedRaw);
+        if (!expected) return true;
+        if (actual === expected) return true;
+        if (expected.length < 500) return false;
+        if (actual.length < Math.floor(expected.length * 0.98)) return false;
+        return actual.slice(0, 220) === expected.slice(0, 220)
+            && actual.slice(-220) === expected.slice(-220);
+    };
+
     const injectPromptText = async (inputEl, promptText) => {
         const target = String(promptText || '');
+        try {
+            inputEl.focus();
+            document.execCommand('selectAll', false);
+            if (document.execCommand('paste')) {
+                await sleep(120);
+                if (promptMatchesInput(inputEl, target)) return readInputText(inputEl).length;
+            }
+        } catch (_) {}
         if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
             const proto = Object.getPrototypeOf(inputEl);
             const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
@@ -2224,8 +2649,8 @@ fn build_bridge_complete_script(
         const uploadedCount = await injectAttachments(cfg, inputEl);
 
         const injectedLen = await injectPromptText(inputEl, __kimPrompt);
-        if (injectedLen < Math.min(8, normalizeText(__kimPrompt).length)) {
-            throw new Error('Prompt text was not accepted by the chat input.');
+        if (injectedLen < Math.min(8, normalizeText(__kimPrompt).length) || !promptMatchesInput(inputEl, __kimPrompt)) {
+            throw new Error('Prompt text was not fully accepted by the chat input. Refusing to send an incomplete prompt.');
         }
 
     await sleep(80);
@@ -2254,40 +2679,30 @@ fn build_bridge_complete_script(
 
         const stateBeforeSend = captureResponseState(cfg, siteKey);
 
-        // Always submit via Enter key — never click the send button.
+        if (!promptMatchesInput(inputEl, __kimPrompt)) {
+            throw new Error('Prompt changed after injection. Refusing to send a partial prompt.');
+        }
+
+        // Submit by clicking the provider's enabled Send button. Do not use
+        // synthetic Enter events here: long prompts with newlines can be split
+        // into partial provider messages if the editor has not fully committed.
         inputEl.focus();
-        inputEl.dispatchEvent(new KeyboardEvent('keydown', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-        }));
-        inputEl.dispatchEvent(new KeyboardEvent('keypress', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-        }));
-        inputEl.dispatchEvent(new KeyboardEvent('keyup', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-        }));
-        let sent = true;
-        await sleep(400);
-        const postEnterState = captureResponseState(cfg, siteKey);
-        if (!hasNewResponseSince(stateBeforeSend, postEnterState)) {
-            // Enter did not produce a response — try form submission as fallback.
-            try {
-                const form = inputEl.closest('form');
-                if (form) {
-                    if (typeof form.requestSubmit === 'function') {
-                        form.requestSubmit();
-                    } else {
-                        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-                    }
-                } else {
-                    sent = false;
-                }
-            } catch (_) {
-                sent = false;
+        let sent = false;
+        for (let attempt = 0; attempt < 20; attempt++) {
+            const sendBtn = findElement(cfg.send_selectors, { visible: true, enabled: true });
+            if (sendBtn) {
+                try {
+                    sendBtn.click();
+                    sent = true;
+                    break;
+                } catch (_) {}
             }
+            await sleep(200);
         }
         if (!sent) {
-            throw new Error(`Could not submit prompt to provider UI. selectorDiag=${selectorDiagText}`);
+            throw new Error(`Could not find an enabled send button for ${siteKey}. Refusing to submit with Enter because it can split long prompts. selectorDiag=${selectorDiagText}`);
         }
+        await sleep(400);
         // #region agent log
         __kimDbg('H1', 'send stage finished', { sent, hasForm: !!(inputEl && inputEl.closest && inputEl.closest('form')), inputTextLen: readInputText(inputEl).length });
         // #endregion
@@ -2586,6 +3001,12 @@ fn run_bridge_completion_once(
     {
         guard.remove(&req_id);
     }
+    if let Ok(mut guard) = WEBVIEW_BRIDGE_PROGRESS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        guard.remove(&req_id);
+    }
 
     // Try the persistent bridge first (tiny eval call).
     let prompt_json = serde_json::to_string(prompt).map_err(|e| e.to_string())?;
@@ -2836,13 +3257,13 @@ fn handle_webview_bridge_request(
             let mut req_id = String::new();
             let mut payload_str = String::new();
             for (key, value) in url.query_pairs() {
-                if key == "req_id" { 
-                    req_id = value.into_owned(); 
-                } else if key == "data" { 
-                    payload_str = value.into_owned(); 
+                if key == "req_id" {
+                    req_id = value.into_owned();
+                } else if key == "data" {
+                    payload_str = value.into_owned();
                 }
             }
-            
+
             agent_debug_log(
                 "H2",
                 "ping received",
@@ -2851,22 +3272,26 @@ fn handle_webview_bridge_request(
                     "payloadStrLen": payload_str.len(),
                 }),
             );
-            
+
             if !req_id.is_empty() && !payload_str.is_empty() {
                 match base64::engine::general_purpose::STANDARD.decode(&payload_str) {
                     Ok(decoded) => {
                         match String::from_utf8(decoded) {
                             Ok(json_str) => {
-                                match serde_json::from_str::<BridgeCompleteResponse>(&json_str) {
-                                    Ok(payload) => {
-                                        let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
-                                        if let Ok(mut guard) = store.lock() {
-                                            guard.insert(req_id, payload);
+                                if let Ok(ipc_event) = serde_json::from_str::<BridgeIpcEvent>(&json_str) {
+                                    handle_bridge_ipc_event(ipc_event, &app_handle);
+                                } else {
+                                    match serde_json::from_str::<BridgeCompleteResponse>(&json_str) {
+                                        Ok(payload) => {
+                                            let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
+                                            if let Ok(mut guard) = store.lock() {
+                                                guard.insert(req_id, payload);
+                                            }
+                                            notify_bridge_result();
                                         }
-                                        notify_bridge_result();
-                                    }
-                                    Err(e) => {
-                                        agent_debug_log("H2", "ping json parse failed", serde_json::json!({ "error": e.to_string(), "json_str": json_str }));
+                                        Err(e) => {
+                                            agent_debug_log("H2", "ping json parse failed", serde_json::json!({ "error": e.to_string(), "json_str": json_str }));
+                                        }
                                     }
                                 }
                             }
@@ -2915,6 +3340,7 @@ fn handle_webview_bridge_request(
             }
 
             let site = normalize_site(parsed.site.as_deref().unwrap_or("claude"));
+            let gemini_authuser = if site == "gemini" { parsed.authuser } else { None };
             let bridge_lock = WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(()));
             let _guard = match bridge_lock.try_lock() {
                 Ok(g) => g,
@@ -2939,14 +3365,16 @@ fn handle_webview_bridge_request(
                 }
             };
 
+            let opened_window = false;
             let window = if let Some(w) = app_handle.get_webview_window("kim-browser-signin") {
                 w
             } else {
-                let open_result = open_browser_signin_window_impl(
-                    default_site_url(&site),
-                    Some(site.clone()),
-                    &app_handle,
-                );
+                let open_url = if site == "gemini" {
+                    gemini_site_url(gemini_authuser)
+                } else {
+                    default_site_url(&site).to_string()
+                };
+                let open_result = open_browser_signin_window_impl(&open_url, Some(site.clone()), &app_handle);
                 if let Err(e) = open_result {
                     respond_json(
                         request,
@@ -2961,14 +3389,15 @@ fn handle_webview_bridge_request(
                     409,
                     serde_json::json!({
                         "ok": false,
-                        "error": "In-app browser window opened. Sign in to the provider, then resend your task.",
+                        "error": "Provider browser window opened. Sign in to the provider, then resend your task.",
                     }),
                 );
                 return;
             };
 
-            // Window is managed permanently off-screen by show/hide_browser_window.
-            // No need to manually reposition it here.
+            if site == "gemini" {
+                prepare_gemini_webview(&window, gemini_authuser, opened_window);
+            }
 
             let callback_url = WEBVIEW_BRIDGE_CFG
                 .get()
@@ -2978,6 +3407,14 @@ fn handle_webview_bridge_request(
             // The window stays offscreen (1x1 at -10000,-10000) during
             // headless operation.  JS keeps running at 1x1 size, so we
             // do NOT need to show it to the user.
+            if should_keep_browser_visible() {
+                show_browser_window_impl(&app_handle);
+            } else if !is_browser_window_offscreen(&window) {
+                // Legacy /v1/complete fallback must follow the same rule as
+                // split /v1/send: normal provider sends should not take focus
+                // or cover the user's target app.
+                hide_browser_window_offscreen(&window);
+            }
 
             let mut completion = run_bridge_completion_once(
                 &window,
@@ -2989,8 +3426,6 @@ fn handle_webview_bridge_request(
                 parsed.completion_hash.as_deref(),
             );
 
-            // If the input selector still wasn't found (page may have navigated away
-            // from the chat view), reload the provider's root URL and try once more.
             let needs_nav_retry = match &completion {
                 Ok(payload) => {
                     let err = payload.error.clone().unwrap_or_default().to_lowercase();
@@ -3000,20 +3435,17 @@ fn handle_webview_bridge_request(
             };
 
             if needs_nav_retry {
-                let nav_url = default_site_url(&site);
-                if let Ok(js_url) = serde_json::to_string(nav_url) {
-                    let _ = window.eval(format!("window.location.href = {};", js_url));
-                    std::thread::sleep(Duration::from_millis(2000));
-                    completion = run_bridge_completion_once(
-                        &window,
-                        &site,
-                        &parsed.prompt,
-                        &parsed.attachments,
-                        &callback_url,
-                        token.as_str(),
-                        parsed.completion_hash.as_deref(),
-                    );
-                }
+                completion = Ok(BridgeCompleteResponse {
+                    ok: false,
+                    response: None,
+                    error: Some(
+                        "Could not find the provider input box in the existing chat. \
+                         Kim will not navigate to a new provider page because that would lose task context. \
+                         Show the browser window, make sure the current chat is open, then resend."
+                            .to_string(),
+                    ),
+                    site: Some(site.clone()),
+                });
             }
 
             // Window was never shown, no need to re-hide.
@@ -3073,15 +3505,18 @@ fn handle_webview_bridge_request(
             }
 
             let site = normalize_site(parsed.site.as_deref().unwrap_or("claude"));
+            let gemini_authuser = if site == "gemini" { parsed.authuser } else { None };
 
+            let opened_window = false;
             let window = if let Some(w) = app_handle.get_webview_window("kim-browser-signin") {
                 w
             } else {
-                let open_result = open_browser_signin_window_impl(
-                    default_site_url(&site),
-                    Some(site.clone()),
-                    &app_handle,
-                );
+                let open_url = if site == "gemini" {
+                    gemini_site_url(gemini_authuser)
+                } else {
+                    default_site_url(&site).to_string()
+                };
+                let open_result = open_browser_signin_window_impl(&open_url, Some(site.clone()), &app_handle);
                 if let Err(e) = open_result {
                     respond_json(
                         request,
@@ -3096,11 +3531,19 @@ fn handle_webview_bridge_request(
                     409,
                     serde_json::json!({
                         "ok": false,
-                        "error": "In-app browser window opened. Sign in to the provider, then resend your task.",
+                        "error": "Provider browser window opened. Sign in to the provider, then resend your task.",
                     }),
                 );
                 return;
             };
+
+            if site == "gemini" {
+                prepare_gemini_webview(&window, gemini_authuser, opened_window);
+            }
+
+            if should_keep_browser_visible() {
+                show_browser_window_impl(&app_handle);
+            }
 
             // Generate req_id
             let req_id = format!(
@@ -3143,13 +3586,15 @@ fn handle_webview_bridge_request(
             // The window stays offscreen (1x1 at -10000,-10000) during
             // headless operation.  JS keeps running at 1x1, no need to
             // show it to the user.
-            if is_browser_window_offscreen(&window) {
+            if should_keep_browser_visible() {
+                show_browser_window_impl(&app_handle);
+            } else if is_browser_window_offscreen(&window) {
                 if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
                     guard.insert(req_id.clone());
                 }
-            } else if let Ok(false) = window.is_focused() {
-                // If the window is on-screen but in the background, hide it offscreen
-                // so the upcoming JS `inputEl.focus()` doesn't steal focus from Kim.
+            } else {
+                // Keep the provider webview off-screen during normal sends so it
+                // does not cover the user's target app before screenshot tools run.
                 hide_browser_window_offscreen(&window);
                 if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
                     guard.insert(req_id.clone());
@@ -3171,6 +3616,13 @@ fn handle_webview_bridge_request(
             if !attachments.is_empty() {
                 let _clip_ok = write_first_png_to_clipboard(attachments);
                 agent_debug_log("H1", "clipboard write", serde_json::json!({ "ok": _clip_ok }));
+            } else {
+                // For text-only sends, stage the full prompt through a temp file
+                // and copy it to the system clipboard before the browser bridge
+                // runs. The injected JS pastes once, verifies the full text, and
+                // refuses to send if the provider editor only accepted part of it.
+                let _clip_ok = write_text_prompt_to_clipboard(&parsed.prompt);
+                agent_debug_log("H1", "prompt clipboard write", serde_json::json!({ "ok": _clip_ok, "promptLen": parsed.prompt.len() }));
             }
 
             // Acquire lock to prevent overlapping window manipulations (#34)
@@ -3194,6 +3646,13 @@ fn handle_webview_bridge_request(
                 }
             };
 
+            // Snapshot the user's frontmost app BEFORE the JS eval so we can
+            // restore it after the offscreen webview steals key-window status
+            // during inputEl.focus() / send-button click. Without this, Stage
+            // Manager swaps groups and Kim's window comes forward, breaking
+            // observe_ui on the actual target app.
+            let saved_frontmost = save_frontmost_app();
+
             if let Err(e) = window.eval(&bridge_call) {
                 respond_json(
                     request,
@@ -3201,6 +3660,10 @@ fn handle_webview_bridge_request(
                     serde_json::json!({"ok": false, "error": format!("Eval failed: {}", e)}),
                 );
                 return;
+            }
+
+            if let Some(app) = saved_frontmost {
+                schedule_frontmost_restore(app);
             }
 
             // Fallback for NO_PERSISTENT
@@ -3220,7 +3683,7 @@ fn handle_webview_bridge_request(
             let mut sent_confirmed = false;
             let start = Instant::now();
             let timeout = Duration::from_secs(5);
-            
+
             let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
             let (notify_lock, condvar) = WEBVIEW_BRIDGE_NOTIFY.get_or_init(|| {
                 (StdMutex::new(()), Condvar::new())
@@ -3465,6 +3928,16 @@ fn handle_webview_bridge_request(
                 Some(pid) if process_exists(pid) => {
                     match send_signal(pid, false) {
                         Ok(()) => {
+                            if let Some(cancel_win) = app_handle.get_webview_window("cancel-widget") {
+                                let _ = cancel_win.close();
+                            }
+                            if let Some(main_win) = app_handle.get_webview_window("main") {
+                                let _ = main_win.show();
+                                let _ = main_win.set_focus();
+                            }
+                            if let Some(flash_win) = app_handle.get_webview_window("screenshot-flash") {
+                                let _ = flash_win.close();
+                            }
                             // Background cleanup: wait 2s then force-kill if alive
                             std::thread::spawn(move || {
                                 for _ in 0..20 {
@@ -3560,6 +4033,18 @@ fn handle_webview_bridge_request(
         (Method::Post, "/v1/browser/new-chat") => {
             // Reset bridge state and start a fresh conversation in the active
             // chat UI. Uses provider-specific selectors with sensible fallbacks.
+            if is_bridge_task_running() {
+                respond_json(
+                    request,
+                    409,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "Cannot start a new provider chat while Kim is running a task; this would lose LLM context.",
+                    }),
+                );
+                return;
+            }
+
             if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
                 let js = r#"(() => {
                     try {
@@ -3630,11 +4115,35 @@ fn handle_webview_bridge_request(
             let url = default_site_url(&site);
 
             if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
+                if is_bridge_task_running() {
+                    respond_json(
+                        request,
+                        409,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": "Cannot navigate the provider browser while Kim is running a task; this would lose LLM context.",
+                        }),
+                    );
+                    return;
+                }
+
                 if let Ok(js_url) = serde_json::to_string(url) {
                     let _ = win.eval(format!("window.location.href = {};", js_url));
                 }
                 respond_json(request, 200, serde_json::json!({"ok": true, "site": site}));
             } else {
+                if is_bridge_task_running() {
+                    respond_json(
+                        request,
+                        409,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": "Cannot open the provider browser while Kim is running a task; this would lose LLM context.",
+                        }),
+                    );
+                    return;
+                }
+
                 // Open the browser window with this provider
                 match open_browser_signin_window_impl(url, Some(site.clone()), &app_handle) {
                     Ok(_) => {
@@ -3949,7 +4458,7 @@ fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Result<(), Strin
             }
         }
     }
-    
+
     if token.is_empty() {
         token = format!(
             "kim-{}-{}",
@@ -4023,9 +4532,9 @@ async fn delete_sessions(
 ) -> Result<(), String> {
     for session_id in session_ids {
         validate_session_id(&session_id)?;
-        
+
         let mut deleted = false;
-        
+
         let dirs_to_search: Vec<PathBuf> = {
             let mut v = vec![kim_dir
                 .as_deref()
@@ -4036,7 +4545,7 @@ async fn delete_sessions(
             }
             v
         };
-        
+
         // Sessions are stored as <base>/<date_dir>/<session_id>.jsonl
         // We need to search all date subdirectories
         for base in &dirs_to_search {
@@ -4067,18 +4576,188 @@ async fn delete_sessions(
                 }
             }
         }
-        
+
         if !deleted {
             eprintln!("Session {} not found for deletion.", session_id);
         }
     }
-    
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn summarize_session(
+    session_id: String,
+    session_type: String,
+    project_root: Option<String>,
+) -> Result<(), String> {
+    validate_session_id(&session_id)?;
+
+    // Build the list of directories to search, same logic as load_session_messages
+    let mut dirs_to_search: Vec<PathBuf> = vec![default_sessions_dir()];
+    if session_type == "claw" {
+        if let Some(ref pr) = project_root {
+            let claw_dir = PathBuf::from(pr).join(".claw").join("sessions");
+            if claw_dir.exists() {
+                dirs_to_search.push(claw_dir);
+            }
+        }
+    }
+
+    // Find the JSONL file
+    let mut jsonl_path: Option<PathBuf> = None;
+    for base in &dirs_to_search {
+        if !base.exists() { continue; }
+        if let Ok(entries) = fs::read_dir(base) {
+            let mut date_dirs: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .collect();
+            date_dirs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
+            for entry in date_dirs {
+                let candidate = entry.path().join(format!("{}.jsonl", session_id));
+                if candidate.exists() {
+                    jsonl_path = Some(candidate);
+                    break;
+                }
+            }
+        }
+        if jsonl_path.is_some() { break; }
+    }
+
+    let path = jsonl_path.ok_or_else(|| format!("Session file not found: {}", session_id))?;
+
+    // Read the JSONL and extract summary components
+    let file = fs::File::open(&path).map_err(|e| e.to_string())?;
+    let reader = BufReader::new(file);
+
+    let mut first_user_text: Option<String> = None;
+    let mut last_assistant_text: Option<String> = None;
+    let mut touched_files: Vec<String> = Vec::new();
+
+    for line in reader.lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Handle both Kim format (role at top level) and Claw format (type: "message")
+        let (role, content) = if let Some(r) = value.get("role").and_then(|v| v.as_str()) {
+            (r.to_string(), value.get("content").cloned())
+        } else if value.get("type").and_then(|v| v.as_str()) == Some("message") {
+            let msg = value.get("message").unwrap_or(&serde_json::Value::Null);
+            let r = msg.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let c = msg.get("blocks").or_else(|| msg.get("content")).cloned();
+            (r, c)
+        } else {
+            continue;
+        };
+
+        let text = match &content {
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(serde_json::Value::Array(items)) => {
+                let texts: Vec<String> = items.iter()
+                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .collect();
+                if texts.is_empty() { None } else { Some(texts.join("\n")) }
+            }
+            _ => None,
+        };
+
+        if role == "user" {
+            if let Some(ref t) = text {
+                let clean = t.trim();
+                // Skip tool result pseudo-user messages
+                if !clean.starts_with("[Tool result:") && !clean.is_empty() {
+                    if first_user_text.is_none() {
+                        first_user_text = Some(clean.strip_prefix("Task: ").unwrap_or(clean).to_string());
+                    }
+                }
+            }
+        } else if role == "assistant" {
+            if let Some(ref t) = text {
+                let clean = t.trim()
+                    .trim_start_matches("TASK_COMPLETE:")
+                    .trim();
+                if !clean.is_empty() {
+                    last_assistant_text = Some(clean.to_string());
+                }
+            }
+            if let Some(serde_json::Value::Array(items)) = &content {
+                for block in items {
+                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        if matches!(name, "write_file" | "edit_file" | "create_file") {
+                            // In Claw JSONL, input is often a JSON string rather than an object.
+                            let mut path_str = None;
+                            if let Some(input_val) = block.get("input") {
+                                if let Some(s) = input_val.as_str() {
+                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                                        path_str = parsed.get("path").or_else(|| parsed.get("file_path"))
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+                                    }
+                                } else if let Some(obj) = input_val.as_object() {
+                                    path_str = obj.get("path").or_else(|| obj.get("file_path"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string());
+                                }
+                            }
+                            if let Some(p) = path_str {
+                                let fname = p.rsplit('/').next().unwrap_or(&p);
+                                if !touched_files.contains(&fname.to_string()) {
+                                    touched_files.push(fname.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build summary text
+    let mut summary_parts: Vec<String> = Vec::new();
+    if let Some(ref task) = first_user_text {
+        let truncated = if task.chars().count() > 100 {
+            format!("{}…", task.chars().take(100).collect::<String>())
+        } else {
+            task.clone()
+        };
+        summary_parts.push(format!("Task: {}", truncated));
+    }
+    if let Some(ref result) = last_assistant_text {
+        let truncated = if result.chars().count() > 200 {
+            format!("{}…", result.chars().take(200).collect::<String>())
+        } else {
+            result.clone()
+        };
+        summary_parts.push(format!("Result: {}", truncated));
+    }
+    if !touched_files.is_empty() {
+        summary_parts.push(format!("Files: {}", touched_files.join(", ")));
+    }
+
+    let summary = if summary_parts.is_empty() {
+        "No summary available.".to_string()
+    } else {
+        summary_parts.join("\n")
+    };
+
+    // Write summary file next to the JSONL: abc.jsonl → abc.summary.txt
+    let summary_path = path.with_file_name(format!("{}.summary.txt", session_id));
+    fs::write(&summary_path, &summary).map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
 #[tauri::command]
 async fn load_session_messages(
     session_id: String,
+    session_date: Option<String>,
     kim_dir: Option<String>,
     claw_dir: Option<String>,
 ) -> Result<Vec<KimMessage>, String> {
@@ -4097,6 +4776,25 @@ async fn load_session_messages(
 
     for base in &dirs_to_search {
         if !base.exists() {
+            continue;
+        }
+        if let Some(date) = session_date.as_deref() {
+            validate_session_id(date)?;
+            let date_dir = base.join(date);
+            let candidate = date_dir.join(format!("{}.jsonl", session_id));
+            if candidate.exists() {
+                let (canon_candidate, canon_dir) = match (
+                    candidate.canonicalize(),
+                    date_dir.canonicalize(),
+                ) {
+                    (Ok(c), Ok(d)) => (c, d),
+                    _ => continue,
+                };
+                if !canon_candidate.starts_with(&canon_dir) {
+                    return Err("Resolved session path escapes its date directory".to_string());
+                }
+                return parse_jsonl(&canon_candidate);
+            }
             continue;
         }
         let mut date_dirs: Vec<_> = fs::read_dir(base)
@@ -4134,6 +4832,92 @@ async fn load_session_messages(
 #[tauri::command]
 async fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Worked-for run history persistence — stores the activity-feed snapshot for
+// each completed task as a sidecar `<session_id>.runs.json` next to the
+// session JSONL file. Survives chat reloads.
+// ---------------------------------------------------------------------------
+
+fn find_session_date_dir(
+    session_id: &str,
+    session_date: Option<&str>,
+    kim_dir: Option<&str>,
+    claw_dir: Option<&str>,
+) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = vec![
+        kim_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir),
+    ];
+    if let Some(p) = claw_dir { dirs.push(PathBuf::from(p)); }
+    for base in &dirs {
+        if !base.exists() { continue; }
+        if let Some(date) = session_date {
+            let dd = base.join(date);
+            if dd.join(format!("{}.jsonl", session_id)).exists() {
+                return Some(dd);
+            }
+        }
+        if let Ok(entries) = fs::read_dir(base) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let dd = entry.path();
+                if dd.is_dir() && dd.join(format!("{}.jsonl", session_id)).exists() {
+                    return Some(dd);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[tauri::command]
+async fn save_run_history(
+    session_id: String,
+    session_date: Option<String>,
+    kim_dir: Option<String>,
+    claw_dir: Option<String>,
+    runs: serde_json::Value,
+) -> Result<(), String> {
+    validate_session_id(&session_id)?;
+    if let Some(d) = session_date.as_deref() { validate_session_id(d)?; }
+
+    let dir = find_session_date_dir(&session_id, session_date.as_deref(), kim_dir.as_deref(), claw_dir.as_deref())
+        .or_else(|| {
+            // Fallback: write into today's directory under the kim sessions dir.
+            let base = kim_dir.as_deref().map(PathBuf::from).unwrap_or_else(default_sessions_dir);
+            let today = chrono_now().get(0..10).map(|s| s.to_string()).unwrap_or_default();
+            let dd = base.join(today);
+            fs::create_dir_all(&dd).ok()?;
+            Some(dd)
+        })
+        .ok_or_else(|| "Could not locate a session directory to save runs.json into".to_string())?;
+
+    let path = dir.join(format!("{}.runs.json", session_id));
+    let body = serde_json::to_string(&runs).map_err(|e| e.to_string())?;
+    fs::write(&path, body).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn load_run_history(
+    session_id: String,
+    session_date: Option<String>,
+    kim_dir: Option<String>,
+    claw_dir: Option<String>,
+) -> Result<serde_json::Value, String> {
+    validate_session_id(&session_id)?;
+    if let Some(d) = session_date.as_deref() { validate_session_id(d)?; }
+
+    let dir = match find_session_date_dir(&session_id, session_date.as_deref(), kim_dir.as_deref(), claw_dir.as_deref()) {
+        Some(d) => d,
+        None => return Ok(serde_json::json!([])),
+    };
+    let path = dir.join(format!("{}.runs.json", session_id));
+    if !path.exists() {
+        return Ok(serde_json::json!([]));
+    }
+    let body = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&body).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -4226,7 +5010,7 @@ async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
                 // Walk up to find the .app bundle and open it.
                 let mut path = exe.as_path();
                 loop {
-                    if path.extension().map_or(false, |e| e == "app") {
+                    if path.extension().is_some_and(|e| e == "app") {
                         let _ = std::process::Command::new("open").arg(path).spawn();
                         break;
                     }
@@ -4379,9 +5163,10 @@ async fn set_task_active_mode(app_handle: tauri::AppHandle, active: bool) -> Res
             }
         }
     } else {
-        // Hide cancel widget
+        // Destroy (not just hide) the cancel widget so a stale instance can
+        // never end up stacked under a new one on the next run. (issue #3 §5)
         if let Some(cancel_win) = app_handle.get_webview_window(cancel_label) {
-            let _ = cancel_win.hide();
+            let _ = cancel_win.close();
         }
 
         // Show main window
@@ -4412,6 +5197,19 @@ async fn hide_browser_window(app_handle: tauri::AppHandle) -> Result<(), String>
 }
 
 #[tauri::command]
+async fn set_browser_keep_visible(keep_visible: bool, app_handle: tauri::AppHandle) -> Result<(), String> {
+    if let Ok(mut guard) = WEBVIEW_KEEP_VISIBLE.get_or_init(|| StdMutex::new(false)).lock() {
+        *guard = keep_visible;
+    }
+
+    if keep_visible && app_handle.get_webview_window("kim-browser-signin").is_some() {
+        show_browser_window_impl(&app_handle);
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn navigate_browser_window_if_open(url: String, app_handle: tauri::AppHandle) -> Result<bool, String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
@@ -4419,6 +5217,19 @@ async fn navigate_browser_window_if_open(url: String, app_handle: tauri::AppHand
     }
 
     if let Some(existing) = app_handle.get_webview_window("kim-browser-signin") {
+        let task_running = BRIDGE_TASK_PID
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+
+        if task_running {
+            return Err(
+                "Cannot navigate the provider browser while Kim is running a task; this would lose LLM context."
+                    .to_string(),
+            );
+        }
+
         let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
         let _ = existing.eval(format!("window.location.href = {};", js_url));
         Ok(true)
@@ -4493,6 +5304,74 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
     Err("Chrome/Chromium not found. Install Google Chrome to use the browser provider.".to_string())
 }
 
+/// Read a single value from `<kim_root>/.env` (best-effort, no dependency).
+/// Real env vars take priority over file values; `claw` and `python` already
+/// inherit the parent process env, so this only acts as a fallback.
+fn read_env_file_var(kim_root: &Path, key: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(key) {
+        if !v.trim().is_empty() {
+            return Some(v);
+        }
+    }
+    let path = kim_root.join(".env");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let prefix = format!("{}=", key);
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            let mut v = rest.trim().to_string();
+            if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
+                || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+            {
+                v = v[1..v.len() - 1].to_string();
+            }
+            if !v.is_empty() { return Some(v); }
+        }
+    }
+    None
+}
+
+/// Locate the `claw` binary. Search order:
+/// 1. CLAW_BIN env var (explicit override)
+/// 2. <kim_root>/pythonExperimentTool/... (nested layout — pythonExperimentTool inside kim-pro)
+/// 3. <kim_root.parent()>/pythonExperimentTool/... (sibling layout — classic fork structure)
+/// 4. `claw` on PATH
+fn find_claw_binary(kim_root: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CLAW_BIN") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // Search both the kim_root itself and its parent so the binary is found
+    // regardless of whether pythonExperimentTool is nested inside kim-pro
+    // (e.g. kim-pro/pythonExperimentTool/...) or lives alongside it as a
+    // sibling (e.g. <fork>/kim-pro + <fork>/pythonExperimentTool/...).
+    let mut roots: Vec<PathBuf> = vec![kim_root.to_path_buf()];
+    if let Some(parent) = kim_root.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    for root in &roots {
+        for sub in &["release", "debug"] {
+            let p = root.join(format!("pythonExperimentTool/claw-code/rust/target/{}/claw", sub));
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    // Fall back to PATH
+    if let Ok(out) = std::process::Command::new("which").arg("claw").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(PathBuf::from(s));
+            }
+        }
+    }
+    None
+}
+
 #[tauri::command]
 async fn send_task(
     task: String,
@@ -4535,65 +5414,137 @@ async fn send_task(
     let is_claw = target_root.canonicalize().ok()
         != kim_root.canonicalize().ok();
 
-    let python = find_python_interpreter(&kim_root)?;
-
     let session_dir = if is_claw {
         target_root.join(".claw").join("sessions")
     } else {
         kim_root.join("kim_sessions")
     };
 
-    let mut cmd = Command::new(&python);
-    cmd.args(["-m", "orchestrator.agent"])
-        .arg("--task")
-        .arg(&task)
-        .arg("--session-dir")
-        .arg(session_dir.to_string_lossy().to_string())
-        .current_dir(&kim_root)
-        // Tell the MCP server which directory to operate on (file tools, git, etc.).
-        // For the Code tab this is the user's external project; for Chat it is
-        // the Kim repo itself.
-        .env("PROJECT_ROOT", target_root.to_str().unwrap_or(""))
-        // Ensure `import orchestrator` and `import mcp_server` always resolve
-        // from the Kim repo, regardless of the target project.
-        .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();
-    if let Some(cfg) = &bridge_cfg {
-        cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
-            .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
-            .env("KIM_WEBVIEW_WINDOW_LABEL", "kim-browser-signin");
-    }
-
     // Default to the browser provider (no API key required) when the caller
     // omits one or passes an empty string. Never silently fall through to a
-    // paid API key provider.
+    // paid API key provider. Claw does its own provider/auth handling.
     let provider_arg = provider
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "browser".to_string());
+    // Whether the user picked a browser-backed provider in the composer (e.g.
+    // "browser:gemini"). For Code-tab tasks this routes Claw through Kim's
+    // BrowserProvider via the file-bridge instead of calling Anthropic.
+    let is_browser_provider = provider_arg == "browser" || provider_arg.starts_with("browser:");
 
-    // For browser provider: ensure Chrome is running with the CDP debug port
-    // before the Python agent tries to connect. This is a best-effort launch;
-    // if Chrome is already running on :9222 this is a no-op.
-    //
-    // launch_chrome_for_cdp() uses blocking I/O (TcpStream::connect, fs::create_dir_all,
-    // std::process::Command::spawn).  We run it on the blocking thread pool so we don't
-    // stall the Tokio executor, then do the post-launch wait with tokio::time::sleep.
-    if provider_arg == "browser" || provider_arg.starts_with("browser:") {
+    // Code (Claw) sessions run the `claw` binary directly against the user's
+    // project, with Claw's own coding-agent system prompt. Chat (Kim) sessions
+    // continue to run `python -m orchestrator.agent` with the desktop-control
+    // system prompt. Routing them through different binaries is what keeps the
+    // two personas separate end-to-end.
+    let mut cmd = if is_claw {
+        let claw_bin = find_claw_binary(&kim_root)
+            .ok_or_else(|| "Claw binary not found. Build it with `cargo build --release` in pythonExperimentTool/claw-code/rust, or set CLAW_BIN to the binary path.".to_string())?;
+        let claw_key = read_env_file_var(&kim_root, "ANTHROPIC_API_KEY")
+            .or_else(|| read_env_file_var(&kim_root, "CLAUDE_API_KEY"));
+
+        if is_browser_provider {
+            // ── Browser-bridge mode ──────────────────────────────────────
+            // Spawn `python -m orchestrator.run_claw_bridge`, which spawns
+            // Claw with CLAW_FILE_BRIDGE=1 and relays each LLM request
+            // through Kim's BrowserProvider. No Anthropic key required.
+            let python = find_python_interpreter(&kim_root)?;
+            let _ = app_handle.emit(
+                "kim-agent-output",
+                format!("[STATUS] Routing to Claw via Kim's browser provider ({})", provider_arg),
+            );
+            let _ = app_handle.emit(
+                "kim-agent-output",
+                format!("[STATUS] claw binary: {}", claw_bin.display()),
+            );
+            let mut c = Command::new(&python);
+            c.args(["-m", "orchestrator.run_claw_bridge"])
+                .arg("--task").arg(&task)
+                .arg("--cwd").arg(target_root.to_string_lossy().to_string())
+                .arg("--provider").arg(&provider_arg)
+                .current_dir(&kim_root)
+                .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
+                // Tell run_claw_subtask exactly which claw binary to spawn,
+                // so it doesn't have to repeat the search dance.
+                .env("CLAW_BIN", claw_bin.to_string_lossy().to_string())
+                // Forward webview-bridge creds so BrowserProvider can drive
+                // the in-app sign-in window in headless mode if configured.
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            c
+        } else {
+            // ── Direct API mode ──────────────────────────────────────────
+            // Pre-flight: surface a readable error before invoking Claw if
+            // no Anthropic credentials are reachable. Otherwise Claw exits
+            // with a bare JSON error and the UI just shows "Agent Error".
+            if claw_key.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                return Err(
+                    "Claw needs an Anthropic API key for direct-API mode. Add `ANTHROPIC_API_KEY=sk-ant-…` to your .env (Kim repo root) or switch the provider dropdown back to 'Browser' to run Claw through your logged-in browser session.".to_string()
+                );
+            }
+            let _ = app_handle.emit(
+                "kim-agent-output",
+                format!("[STATUS] Routing to Claw (direct Anthropic API): {}", claw_bin.display()),
+            );
+            let mut c = Command::new(&claw_bin);
+            c.arg("--output-format").arg("json")
+                .arg("prompt").arg(&task)
+                .current_dir(&target_root)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(k) = claw_key { c.env("ANTHROPIC_API_KEY", k); }
+            // Forward optional helpers if present in .env or env so users can
+            // pin a model or proxy without re-launching Kim.
+            for k in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAW_MODEL", "CLAUDE_MODEL"] {
+                if let Some(v) = read_env_file_var(&kim_root, k) {
+                    c.env(k, v);
+                }
+            }
+            c
+        }
+    } else {
+        let python = find_python_interpreter(&kim_root)?;
+        let mut c = Command::new(&python);
+        c.args(["-m", "orchestrator.agent"])
+            .arg("--task")
+            .arg(&task)
+            .arg("--session-dir")
+            .arg(session_dir.to_string_lossy().to_string())
+            .current_dir(&kim_root)
+            // Tell the MCP server which directory to operate on (file tools, git, etc.).
+            // For the Chat tab this is the Kim repo itself.
+            .env("PROJECT_ROOT", target_root.to_str().unwrap_or(""))
+            // Ensure `import orchestrator` and `import mcp_server` always resolve
+            // from the Kim repo, regardless of the target project.
+            .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        c
+    };
+
+    let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();
+    // The webview-bridge creds let BrowserProvider drive the in-app sign-in
+    // window. Forward them whenever a browser provider is in play, including
+    // Claw-via-browser-bridge runs, so headless flows stay consistent.
+    if !is_claw || is_browser_provider {
+        if let Some(cfg) = &bridge_cfg {
+            cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
+                .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
+                .env("KIM_WEBVIEW_WINDOW_LABEL", "kim-browser-signin");
+        }
+    }
+
+    // Chrome CDP launch is needed whenever a browser provider is in play —
+    // both for Kim's Chat-tab tasks and for Claw running in browser-bridge
+    // mode (which calls into BrowserProvider via run_claw_bridge).
+    if is_browser_provider {
         if bridge_cfg.is_none() {
             let root_for_chrome = kim_root.clone();
             match tokio::task::spawn_blocking(move || launch_chrome_for_cdp(&root_for_chrome)).await {
                 Ok(Ok(true)) => {
-                    // Chrome was freshly spawned — give it 2 s to open the debug port.
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                Ok(Ok(false)) => {
-                    // Chrome was already running — no wait needed.
-                }
+                Ok(Ok(false)) => {}
                 Ok(Err(e)) => {
-                    // Non-fatal: the Python agent will surface a NEED_HELP if it can't connect.
                     eprintln!("[Kim] Chrome launch skipped: {}", e);
                 }
                 Err(e) => {
@@ -4605,15 +5556,22 @@ async fn send_task(
         }
     }
 
-    if let Some(resume_id) = resume_session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    let resume_arg = if is_claw {
+        None
+    } else {
+        resume_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+    if let Some(resume_id) = resume_arg {
         cmd.arg("--resume").arg(resume_id);
     }
 
-    cmd.arg("--provider").arg(&provider_arg);
+    if !is_claw {
+        cmd.arg("--provider").arg(&provider_arg);
+    }
 
     let mut child = cmd
         .spawn()
@@ -4678,6 +5636,12 @@ async fn send_task(
         *guard = None;
     }
 
+    if is_claw {
+        if let Some(session) = newest_claw_session(&target_root) {
+            let _ = app_handle.emit("kim-agent-code-session", session);
+        }
+    }
+
     let _ = app_handle.emit("kim-agent-done", status.success());
 
     // Always return Ok — the frontend learns about failure via the kim-agent-done
@@ -4690,6 +5654,16 @@ async fn send_task(
 // Cancel a running task — SIGTERM, then SIGKILL after 2s if still alive.
 // ---------------------------------------------------------------------------
 
+/// Clear the task PID from BOTH tracking stores so subsequent cancel/status
+/// calls don't see a stale PID regardless of how the task was started.
+async fn clear_task_pid(state: &TaskState) {
+    let mut guard = state.lock().await;
+    guard.pid = None;
+    if let Ok(mut bridge_guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
+        *bridge_guard = None;
+    }
+}
+
 #[tauri::command]
 async fn cancel_task(
     app_handle: tauri::AppHandle,
@@ -4700,6 +5674,17 @@ async fn cancel_task(
         guard.pid
     };
 
+    // Fall back to the bridge-registered PID. Tasks started via kimctl /v1/task
+    // register in BRIDGE_TASK_PID, not TaskState — so the GUI Stop button needs
+    // to check both stores or it silently no-ops while the task keeps running.
+    let pid = pid.or_else(|| {
+        BRIDGE_TASK_PID
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+    });
+
     let Some(pid) = pid else {
         return Err("No task is currently running.".to_string());
     };
@@ -4707,6 +5692,14 @@ async fn cancel_task(
     // Step 1 — graceful signal.
     send_signal(pid, false)
         .map_err(|e| format!("Failed to send stop signal: {}", e))?;
+
+    // Restore the UI immediately. If the agent is cancelled while a screenshot
+    // tool is blocking, Python may never reach its finally block that normally
+    // shows the main window again.
+    let _ = set_task_active_mode(app_handle.clone(), false).await;
+    if let Some(flash_win) = app_handle.get_webview_window("screenshot-flash") {
+        let _ = flash_win.close();
+    }
 
     // Step 2 — wait up to 2 seconds for the process to exit; if it's still
     // alive, force kill. We poll by re-sending signal 0 (existence check).
@@ -4719,16 +5712,14 @@ async fn cancel_task(
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if !process_exists(pid) {
-                let mut guard = state_clone.lock().await;
-                guard.pid = None;
+                clear_task_pid(&state_clone).await;
                 let _ = app.emit("kim-agent-cancelled", true);
                 return;
             }
         }
         // Still alive after 2s → SIGKILL / taskkill /F.
         let _ = send_signal(pid, true);
-        let mut guard = state_clone.lock().await;
-        guard.pid = None;
+        clear_task_pid(&state_clone).await;
         let _ = app.emit("kim-agent-cancelled", true);
     });
 
@@ -4950,6 +5941,59 @@ async fn write_voice_config(
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GoogleAccountEntry {
+    pub email: String,
+    pub authuser_index: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GoogleAccountEntryCompat {
+    Entry(GoogleAccountEntry),
+    Email(String),
+}
+
+fn deserialize_google_accounts<'de, D>(deserializer: D) -> Result<Vec<GoogleAccountEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<GoogleAccountEntryCompat>::deserialize(deserializer)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut accounts = Vec::new();
+    for (idx, item) in raw.into_iter().enumerate() {
+        let entry = match item {
+            GoogleAccountEntryCompat::Entry(entry) => {
+                if entry.email.trim().is_empty() {
+                    None
+                } else {
+                    Some(GoogleAccountEntry {
+                        email: entry.email.trim().to_lowercase(),
+                        authuser_index: entry.authuser_index,
+                    })
+                }
+            }
+            GoogleAccountEntryCompat::Email(email) => {
+                let email = email.trim().to_lowercase();
+                if email.is_empty() {
+                    None
+                } else {
+                    Some(GoogleAccountEntry {
+                        email,
+                        authuser_index: idx as u32,
+                    })
+                }
+            }
+        };
+        if let Some(entry) = entry {
+            if seen.insert(entry.email.clone()) {
+                accounts.push(entry);
+            }
+        }
+    }
+    Ok(accounts)
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct KimAccount {
     pub display_name: String,
     pub github_username: Option<String>,
@@ -4963,6 +6007,11 @@ pub struct KimAccount {
     /// Kim scans <path>/.claw/sessions/ for each — never ~/.claude/projects/.
     #[serde(default)]
     pub code_projects: Vec<String>,
+    /// Google accounts with their authuser indices for Gemini browser sign-in.
+    #[serde(default, deserialize_with = "deserialize_google_accounts")]
+    pub google_accounts: Vec<GoogleAccountEntry>,
+    /// Active Google account email for Gemini browser sessions.
+    pub google_active_account: Option<String>,
 }
 
 fn account_dir() -> PathBuf {
@@ -5630,6 +6679,70 @@ fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
     sessions
 }
 
+fn newest_claw_session(project_path: &Path) -> Option<CompletedClawSession> {
+    let sessions_dir = project_path.join(".claw").join("sessions");
+    let date_entries = fs::read_dir(&sessions_dir).ok()?;
+    let mut newest: Option<(SystemTime, PathBuf, String, String)> = None;
+
+    for date_entry in date_entries.filter_map(|e| e.ok()) {
+        let date_path = date_entry.path();
+        if !date_path.is_dir() {
+            continue;
+        }
+        let date = date_entry.file_name().to_string_lossy().to_string();
+        let Ok(file_entries) = fs::read_dir(&date_path) else { continue };
+        for file_entry in file_entries.filter_map(|e| e.ok()) {
+            let path = file_entry.path();
+            let name = file_entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".jsonl") || name.contains(".summary") {
+                continue;
+            }
+            let modified = file_entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let is_newest = newest
+                .as_ref()
+                .map(|(prev, _, _, _)| modified > *prev)
+                .unwrap_or(true);
+            if is_newest {
+                let session_id = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                newest = Some((modified, path, date.clone(), session_id));
+            }
+        }
+    }
+
+    let (_, path, date, session_id) = newest?;
+    let summary_path = sessions_dir.join(&date).join(format!("{}.summary.txt", session_id));
+    let summary = if summary_path.exists() {
+        fs::read_to_string(summary_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let message_count = count_lines(&path).unwrap_or(0);
+    let title = infer_session_title(&path, summary.as_ref(), &session_id);
+    let project_path_str = project_path.to_string_lossy().to_string();
+
+    Some(CompletedClawSession {
+        session_key: format!("claw:{}:{}", date, session_id),
+        session_id,
+        title,
+        date,
+        message_count,
+        has_summary: summary.is_some(),
+        summary,
+        session_type: "claw".to_string(),
+        project_path: project_path_str,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Feedback — POST to a private Discord webhook (URL never exposed to frontend)
 // ---------------------------------------------------------------------------
@@ -5731,6 +6844,20 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::window::{Effect, EffectState, EffectsBuilder};
+
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_effects(
+                        EffectsBuilder::new()
+                            .effect(Effect::WindowBackground)
+                            .state(EffectState::Active)
+                            .build(),
+                    );
+                }
+            }
+
             if let Err(e) = start_webview_bridge_server(app.handle().clone()) {
                 eprintln!("[Kim] Failed to start in-app browser bridge: {}", e);
             }
@@ -5742,6 +6869,9 @@ pub fn run() {
             list_sessions,
             delete_sessions,
             load_session_messages,
+            summarize_session,
+            save_run_history,
+            load_run_history,
             get_app_version,
             get_platform_info,
             run_update,
@@ -5750,6 +6880,7 @@ pub fn run() {
             navigate_browser_window_if_open,
             show_browser_window,
             hide_browser_window,
+            set_browser_keep_visible,
             hide_main_window,
             show_main_window,
             set_task_active_mode,
@@ -5790,7 +6921,7 @@ mod tests {
             "token__KIM_REQID__",
             None
         ).unwrap();
-        
+
         assert!(script.contains("const __kimSite = \"gemini\";"));
         assert!(script.contains("const __kimPrompt = \"hello __KIM_SITE__\";"));
         assert!(script.contains("const __kimReqId = \"req_123\";"));
