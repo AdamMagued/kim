@@ -2,6 +2,7 @@
 
 export interface SessionInfo {
   session_id: string;
+  session_key?: string;
   title?: string;
   date: string;
   message_count: number;
@@ -57,6 +58,11 @@ export interface KimMessage {
 
 // ── Account ──────────────────────────────────────────────────────────────────
 
+export interface GoogleAccount {
+  email: string;
+  authuser_index: number;
+}
+
 export interface KimAccount {
   display_name: string;
   github_username?: string;
@@ -66,6 +72,10 @@ export interface KimAccount {
   created_at: string;
   /** Explicit project roots shown in the Code tab — scans .claw/sessions/ inside each */
   code_projects?: string[];
+  /** Google accounts used for Gemini browser sign-in. */
+  google_accounts?: GoogleAccount[];
+  /** Active Google account email for Gemini browser sessions. */
+  google_active_account?: string;
 }
 
 // ── Claw (Code) project types ────────────────────────────────────────────────
@@ -109,6 +119,7 @@ export interface Settings {
   project_root: string;
   provider: Provider;
   allow_message_queue: boolean;
+  keep_browser_visible: boolean;
   theme: Theme;
   accent: AccentTheme;
   voice: VoiceSettings;
@@ -121,6 +132,7 @@ export const DEFAULT_SETTINGS: Settings = {
   project_root: '',
   provider: 'browser',
   allow_message_queue: false,
+  keep_browser_visible: false,
   theme: 'system',
   accent: 'indigo',
   voice: {

@@ -25,26 +25,27 @@ export function CancelWidget() {
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: '8px',
-          padding: '8px 16px',
-          background: 'var(--bg-layer-2)',
-          color: 'var(--text-1)',
-          border: '1px solid var(--border-subtle)',
-          borderRadius: '20px',
+          gap: '9px',
+          padding: '9px 20px',
+          background: 'var(--accent-gradient)',
+          color: '#fff',
+          border: 'none',
+          borderRadius: '24px',
           fontSize: '13px',
-          fontWeight: 500,
+          fontWeight: 600,
           cursor: 'pointer',
-          boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15), 0 0 0 1px rgba(255,255,255,0.05)',
-          WebkitAppRegion: 'no-drag', // Button itself should be clickable, not draggable
-          transition: 'transform 0.1s ease, background 0.2s ease',
+          letterSpacing: '0.01em',
+          animation: 'kim-cancel-breathe 2.6s ease-in-out infinite',
+          WebkitAppRegion: 'no-drag',
+          transition: 'opacity 0.15s ease',
         } as React.CSSProperties}
-        onMouseOver={(e) => (e.currentTarget.style.background = 'var(--bg-layer-3)')}
-        onMouseOut={(e) => (e.currentTarget.style.background = 'var(--bg-layer-2)')}
-        onMouseDown={(e) => (e.currentTarget.style.transform = 'scale(0.96)')}
-        onMouseUp={(e) => (e.currentTarget.style.transform = 'scale(1)')}
+        onMouseOver={(e) => (e.currentTarget.style.opacity = '0.88')}
+        onMouseOut={(e) => (e.currentTarget.style.opacity = '1')}
+        onMouseDown={(e) => (e.currentTarget.style.transform = 'scale(0.95)')}
+        onMouseUp={(e) => (e.currentTarget.style.transform = '')}
       >
-        <span className="kim-pulse-dot" style={{ background: 'var(--error)' }} />
-        Cancel Task
+        <span className="kim-pulse-dot" style={{ background: 'rgba(255,255,255,0.85)' }} />
+        Stop
       </button>
     </div>
   );

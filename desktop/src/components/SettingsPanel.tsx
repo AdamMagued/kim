@@ -316,7 +316,13 @@ function AppearanceSection({ settings, onChange }: { settings: Settings; onChang
   );
 }
 
-function AISection({ settings, onChange }: { settings: Settings; onChange: (s: Settings) => void }) {
+function AISection({
+  settings,
+  onChange,
+}: {
+  settings: Settings;
+  onChange: (s: Settings) => void;
+}) {
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
     onChange({ ...settings, [key]: value });
   }
@@ -350,6 +356,22 @@ function AISection({ settings, onChange }: { settings: Settings; onChange: (s: S
           className={`kim-switch${settings.allow_message_queue ? ' kim-switch--on' : ''}`}
         />
       </div>
+
+      <div className="kim-toggle-row">
+        <div>
+          <div className="kim-toggle-row__label">Keep browser visible while running</div>
+          <div className="kim-toggle-row__hint">
+            Testing only: leaves the provider window on-screen so you can watch what Kim sends and what Gemini/Claude/ChatGPT does.
+          </div>
+        </div>
+        <button
+          role="switch"
+          aria-checked={settings.keep_browser_visible}
+          onClick={() => update('keep_browser_visible', !settings.keep_browser_visible)}
+          className={`kim-switch${settings.keep_browser_visible ? ' kim-switch--on' : ''}`}
+        />
+      </div>
+
     </div>
   );
 }
@@ -1191,7 +1213,12 @@ export function SettingsPanel({ settings, onChange, onClose, appVersion, onCheck
           </button>
 
           {activeSection === 'appearance' && <AppearanceSection settings={settings} onChange={onChange} />}
-          {activeSection === 'ai'         && <AISection settings={settings} onChange={onChange} />}
+          {activeSection === 'ai'         && (
+            <AISection
+              settings={settings}
+              onChange={onChange}
+            />
+          )}
           {activeSection === 'voice'      && <VoiceSection settings={settings} onChange={onChange} />}
           {activeSection === 'paths'      && <PathsSection settings={settings} onChange={onChange} />}
           {activeSection === 'data'       && <DataSection account={account} />}

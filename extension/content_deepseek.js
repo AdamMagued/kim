@@ -82,8 +82,7 @@
   function clickSend() {
     const btn = getSendButton();
     if (btn) { btn.click(); return true; }
-    const el = document.querySelector(SEL.input);
-    if (el) el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, bubbles: true }));
+    console.warn("[Kim/deepseek] Send button unavailable; refusing Enter fallback to avoid split prompts.");
     return false;
   }
 

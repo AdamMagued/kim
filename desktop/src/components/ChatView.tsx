@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock } from '../types';
+import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock, ToolUseBlock, ToolResultBlock } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
-import { BrowserProviderPicker } from './BrowserProviderPicker';
 import { Bloop, type BloopState } from './Bloop';
 import { toast } from './Toast';
 
@@ -19,6 +19,13 @@ interface ActivityItem {
   text: string;
 }
 
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return s === 0 ? `${m}m` : `${m}m ${s}s`;
+}
+
 
 export function collapseMessages(msgs: KimMessage[]) {
   const res: {msg: KimMessage, retries: number}[] = [];
@@ -26,8 +33,8 @@ export function collapseMessages(msgs: KimMessage[]) {
     if (res.length > 0 && msg.role === 'assistant' && typeof msg.content === 'string') {
       const prev = res[res.length - 1];
       if (prev.msg.role === 'assistant' && typeof prev.msg.content === 'string') {
-        const c1 = msg.content.trim().replace(/^(?:Gemini said|Claude said|Assistant said):\s*/i, '');
-        const c2 = prev.msg.content.trim().replace(/^(?:Gemini said|Claude said|Assistant said):\s*/i, '');
+        const c1 = msg.content.replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said):?\s*/ig, '').trim();
+        const c2 = prev.msg.content.replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said):?\s*/ig, '').trim();
         if (c1 === c2 && c1.startsWith('{')) {
           try {
             JSON.parse(c1);
@@ -40,6 +47,211 @@ export function collapseMessages(msgs: KimMessage[]) {
     res.push({ msg, retries: 0 });
   }
   return res;
+}
+
+// ── Claw session grouping ─────────────────────────────────────────────────────
+
+export interface TouchedFile {
+  path: string;
+  added: number;
+  removed: number;
+}
+
+export interface ClawRunGroup {
+  userMessage: KimMessage;
+  intermediateMessages: KimMessage[];
+  intermediateActivity: ActivityItem[];
+  finalAssistantMessage: KimMessage | null;
+  touchedFiles: TouchedFile[];
+  durationSec: number;
+}
+
+/** A real user message has text content that isn't just tool results. */
+function isRealUserMessage(msg: KimMessage): boolean {
+  if (msg.role !== 'user') return false;
+  if (typeof msg.content === 'string') {
+    return !msg.content.trim().startsWith('[Tool result:');
+  }
+  if (Array.isArray(msg.content)) {
+    if (msg.content.every(b => b.type === 'tool_result')) return false;
+    return msg.content.some(
+      b => b.type === 'text' && !(b as TextBlock).text.trim().startsWith('[Tool result:')
+    );
+  }
+  return false;
+}
+
+/** An assistant message with text but no tool_use blocks = potential final answer. */
+function isTextOnlyAssistant(msg: KimMessage): boolean {
+  if (msg.role !== 'assistant') return false;
+  if (typeof msg.content === 'string') return true;
+  if (Array.isArray(msg.content)) {
+    return msg.content.some(b => b.type === 'text') &&
+           !msg.content.some(b => b.type === 'tool_use');
+  }
+  return false;
+}
+
+function clawBridgeFiller(text: string): boolean {
+  return /^Calling\s+[A-Za-z_][\w-]*\.$/.test(text.trim());
+}
+
+function parseMaybeNestedJson(raw: string): Record<string, unknown> | null {
+  try {
+    let parsed = JSON.parse(raw);
+    if (typeof parsed?.output === 'string') {
+      try { parsed = JSON.parse(parsed.output); } catch { /* keep outer */ }
+    }
+    return (parsed && typeof parsed === 'object') ? parsed : null;
+  } catch { return null; }
+}
+
+function extractTouchedFiles(messages: KimMessage[]): TouchedFile[] {
+  const fileMap = new Map<string, TouchedFile>();
+  const touch = (path: string, added: number, removed: number) => {
+    const existing = fileMap.get(path);
+    if (existing) { existing.added += added; existing.removed += removed; }
+    else fileMap.set(path, { path, added, removed });
+  };
+
+  for (const msg of messages) {
+    if (!Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block.type === 'tool_use') {
+        const tb = block as ToolUseBlock;
+        if (['write_file', 'edit_file', 'create_file'].includes(tb.name)) {
+          const p = String(tb.input?.path ?? tb.input?.file_path ?? '');
+          if (p) touch(p, 0, 0);
+        }
+      }
+      if (block.type === 'tool_result') {
+        const trb = block as ToolResultBlock;
+        const raw = typeof trb.content === 'string' ? trb.content
+          : (trb as unknown as { output?: string }).output
+            ? String((trb as unknown as { output: string }).output) : '';
+        if (!raw.trim()) continue;
+        const parsed = parseMaybeNestedJson(raw);
+        if (!parsed) continue;
+        const filePath = String(parsed.filePath ?? (parsed.file as Record<string, unknown>)?.filePath ?? '');
+        const patch = parsed.structuredPatch;
+        if (filePath && Array.isArray(patch)) {
+          let a = 0, r = 0;
+          for (const hunk of patch) {
+            if (Array.isArray((hunk as Record<string, unknown>)?.lines)) {
+              for (const l of (hunk as { lines: string[] }).lines) {
+                if (typeof l === 'string') { if (l.startsWith('+')) a++; else if (l.startsWith('-')) r++; }
+              }
+            }
+          }
+          touch(filePath, a, r);
+        } else if (filePath) {
+          const content = parsed.content;
+          const lines = typeof content === 'string' ? Math.max(1, content.split(/\r?\n/).length) : 0;
+          touch(filePath, lines, 0);
+        }
+      }
+    }
+  }
+  return Array.from(fileMap.values());
+}
+
+function cleanActivityText(t: string): string {
+  let cleaned = t.replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said):?\s*/ig, '').trim();
+  try {
+    if (cleaned.startsWith('{') && cleaned.endsWith('}')) {
+      const parsed = JSON.parse(cleaned);
+      if (typeof parsed.text === 'string') {
+        cleaned = parsed.text;
+      }
+    }
+  } catch {}
+  return cleaned;
+}
+
+function synthesizeActivityFromMessages(messages: KimMessage[], toolMap: typeof TOOL_MAP): ActivityItem[] {
+  const items: ActivityItem[] = [];
+  let id = 0;
+  for (const msg of messages) {
+    if (typeof msg.content === 'string') {
+      if (msg.role === 'assistant') {
+        const rawT = msg.content.trim().replace(/^TASK_COMPLETE:\s*/i, '');
+        if (rawT) {
+          const t = cleanActivityText(rawT);
+          items.push({ id: ++id, kind: 'status', icon: '›', text: t.length > 120 ? t.slice(0, 120) + '…' : t });
+        }
+      }
+      continue;
+    }
+    if (!Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block.type === 'text') {
+        const rawT = (block as TextBlock).text.trim();
+        if (!rawT || rawT.startsWith('[Tool result:') || clawBridgeFiller(rawT)) continue;
+        if (msg.role === 'assistant') {
+          const t = cleanActivityText(rawT);
+          items.push({ id: ++id, kind: 'status', icon: '›', text: t.length > 120 ? t.slice(0, 120) + '…' : t });
+        }
+      } else if (block.type === 'tool_use') {
+        const tb = block as ToolUseBlock;
+        const def = toolMap[tb.name];
+        const args = (tb.input && typeof tb.input === 'object') ? tb.input as Record<string, unknown> : {};
+        items.push({ id: ++id, kind: 'tool', icon: def?.icon ?? '›', text: def ? def.label(args) : `Using tool: \`${tb.name}\`` });
+      } else if (block.type === 'tool_result') {
+        const raw = typeof (block as ToolResultBlock).content === 'string' ? (block as ToolResultBlock).content as string
+          : String((block as unknown as { output?: string }).output ?? '');
+        if (!raw.trim()) continue;
+        const parsed = parseMaybeNestedJson(raw);
+        if (parsed?.filePath) {
+          const fp = basename(String(parsed.filePath));
+          const patch = parsed.structuredPatch;
+          if (Array.isArray(patch)) {
+            let a = 0, r = 0;
+            for (const h of patch) { if (Array.isArray((h as Record<string, unknown>)?.lines)) { for (const l of (h as { lines: string[] }).lines) { if (typeof l === 'string') { if (l.startsWith('+')) a++; else if (l.startsWith('-')) r++; } } } }
+            items.push({ id: ++id, kind: 'tool', icon: '›', text: `Updated \`${fp}\` +${a} -${r}` });
+          } else {
+            items.push({ id: ++id, kind: 'tool', icon: '›', text: `Updated \`${fp}\`` });
+          }
+        }
+      }
+    }
+  }
+  return items;
+}
+
+function finalizeClawRun(userMessage: KimMessage, intermediates: KimMessage[]): ClawRunGroup {
+  let finalIdx = -1;
+  for (let i = intermediates.length - 1; i >= 0; i--) {
+    if (isTextOnlyAssistant(intermediates[i])) { finalIdx = i; break; }
+  }
+  const finalAssistantMessage = finalIdx >= 0 ? intermediates[finalIdx] : null;
+  const activityMessages = finalIdx >= 0
+    ? [...intermediates.slice(0, finalIdx), ...intermediates.slice(finalIdx + 1)]
+    : intermediates;
+  return {
+    userMessage,
+    intermediateMessages: activityMessages,
+    intermediateActivity: synthesizeActivityFromMessages(activityMessages, TOOL_MAP),
+    finalAssistantMessage,
+    touchedFiles: extractTouchedFiles(activityMessages),
+    durationSec: 0,
+  };
+}
+
+export function groupClawMessages(messages: KimMessage[]): ClawRunGroup[] {
+  const runs: ClawRunGroup[] = [];
+  let currentUser: KimMessage | null = null;
+  let currentIntermediate: KimMessage[] = [];
+  for (const msg of messages) {
+    if (isRealUserMessage(msg)) {
+      if (currentUser) runs.push(finalizeClawRun(currentUser, currentIntermediate));
+      currentUser = msg;
+      currentIntermediate = [];
+    } else if (currentUser) {
+      currentIntermediate.push(msg);
+    }
+  }
+  if (currentUser) runs.push(finalizeClawRun(currentUser, currentIntermediate));
+  return runs;
 }
 
 // ── Aggressive log suppression ───────────────────────────────────────────────
@@ -85,6 +297,13 @@ const HIDDEN_SUBSTRINGS = [
   'unhandled errors in a TaskGroup',
   'return future.result()',
   'File "<frozen runpy>"',
+  // Claw bridge internal output
+  'Claw completed', 'Claw failed', 'LLM calls,', 'bridge_request', 'bridge_response',
+  'relay #', 'sending to browser LLM', 'browser LLM',
+  'CLAW_FILE_BRIDGE', 'CLAW_BRIDGE_DIR', 'claw binary:',
+  // Provider internal noise
+  'sending to gemini', 'sending to claude', 'sending to chatgpt',
+  'Routing to Claw', 'Routing Claw',
   'getattr(logger, level.lower(), logger.info)(message)',
 ];
 
@@ -108,8 +327,9 @@ const HIDDEN_REGEX: RegExp[] = [
 ];
 
 function isNoiseLine(raw: string): boolean {
-  // Never suppress explicit status lines from the agent
-  if (raw.startsWith('[STATUS]')) return false;
+  // Never suppress status lines — from stdout ("[STATUS] …") or embedded in
+  // a stderr log record ("[err] … [STATUS] …"). These are user-facing signals.
+  if (raw.startsWith('[STATUS]') || raw.includes('[STATUS]')) return false;
   // Strip the [err] prefix that appendRaw prepends before pattern-matching,
   // otherwise regex anchors like /^\s*\|/ never fire.
   const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
@@ -130,7 +350,10 @@ function isNoiseLine(raw: string): boolean {
 const TOOL_MAP: Record<string, { icon: string; label: (args: Record<string, unknown>) => string }> = {
   // File operations (actual MCP tool names)
   read_file:          { icon: '›', label: a => `Reading \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
-  write_file:         { icon: '›', label: a => `Writing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
+  write_file:         { icon: '›', label: a => {
+    const lines = Number(a.lines ?? 0);
+    return `Writing \`${basename(String(a.path ?? a.file_path ?? ''))}\`${lines > 0 ? ` +${lines}` : ''}`;
+  } },
   create_file:        { icon: '›', label: a => `Creating \`${basename(String(a.path ?? ''))}\`` },
   edit_file:          { icon: '›', label: a => `Editing \`${basename(String(a.path ?? a.file_path ?? ''))}\`` },
   append_file:        { icon: '›', label: a => `Appending to \`${basename(String(a.path ?? ''))}\`` },
@@ -172,6 +395,16 @@ const TOOL_MAP: Record<string, { icon: string; label: (args: Record<string, unkn
   git_diff:           { icon: '›', label: _a => 'Viewing git diff' },
   // User interaction
   ask_user:           { icon: '›', label: a => `Asking: "${String(a.question ?? '')}"` },
+  // Claw tool names
+  bash:               { icon: '›', label: a => {
+    const cmd = String(a.command ?? a.cmd ?? '');
+    return cmd.trim().startsWith('open ')
+      ? `Opening \`${basename(cmd.trim().slice(5))}\``
+      : `Running \`${shorten(cmd, 60)}\``;
+  } },
+  grep_search:        { icon: '›', label: a => `Searching for \`${String(a.pattern ?? a.query ?? '')}\`` },
+  glob_search:        { icon: '›', label: a => `Searching for \`${String(a.pattern ?? a.glob ?? '')}\`` },
+  list_files:         { icon: '›', label: a => `Listing \`${basename(String(a.path ?? a.directory ?? ''))}\`` },
 };
 
 function basename(p: string): string {
@@ -229,7 +462,11 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
 
   // SUCCESS from stdout
   if (raw.includes('[SUCCESS]')) {
-    const text = raw.replace(/.*\[SUCCESS\]\s*/, '').trim();
+    let text = raw.replace(/.*\[SUCCESS\]\s*/, '').trim();
+    // Strip Claw-internal completion messages — replace with a clean summary.
+    if (/^Claw (?:completed|finished)/i.test(text) || /\bLLM calls\b/i.test(text)) {
+      text = 'Task completed';
+    }
     return { id, kind: 'success', icon: '✓', text: text || 'Task completed successfully' };
   }
 
@@ -263,12 +500,19 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
     };
   }
 
-  // [STATUS] lines — emitted by browser_provider for live Gemini/Claude feedback
+  // [STATUS] lines — emitted by agent/browser_provider for live feedback.
+  // May arrive on stdout (raw starts with [STATUS]) or embedded inside a
+  // stderr log line like "[INFO] orchestrator.providers.browser_provider: [STATUS] …"
   if (stripped.startsWith('[STATUS]') || raw.startsWith('[STATUS]')) {
     const text = (stripped.startsWith('[STATUS]') ? stripped : raw)
       .replace(/^\[STATUS\]\s*/, '').trim();
     if (text) return { id, kind: 'status', icon: '›', text };
     return null;
+  }
+  const embeddedStatusIdx = stripped.indexOf('[STATUS]');
+  if (isErr && embeddedStatusIdx !== -1) {
+    const text = stripped.slice(embeddedStatusIdx + '[STATUS]'.length).trim();
+    if (text) return { id, kind: 'status', icon: '›', text };
   }
 
   // [TOOL] lines — 'module:' prefix is optional in newer agent log format
@@ -323,29 +567,6 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
 
 // ── Greeting ──────────────────────────────────────────────────────────────────
 
-const EXAMPLE_PROMPTS: { title: string; hint: string }[] = [
-  { title: 'Summarize the PDF on my desktop', hint: 'Read and extract key insights' },
-  { title: 'Find all TODOs in my project', hint: 'Search files and list them' },
-  { title: 'Stage, commit, and push my changes', hint: 'Full git workflow' },
-  { title: 'Search the web and write a report', hint: 'Browse and summarize' },
-];
-
-const KIM_CAPABILITIES = [
-  { label: 'See your screen', desc: 'Kim takes screenshots to understand what\'s happening' },
-  { label: 'Control your mouse', desc: 'Click buttons, drag files, navigate any app' },
-  { label: 'Type and edit', desc: 'Write code, fill forms, compose emails' },
-  { label: 'Manage files', desc: 'Read, write, move, search files on your computer' },
-  { label: 'Browse the web', desc: 'Search, visit websites, extract information' },
-  { label: 'Run commands', desc: 'Terminal commands, scripts, git operations' },
-];
-
-const KIM_SHORTCUTS = [
-  { keys: ['⌘', 'N'], label: 'New chat' },
-  { keys: ['⌘', 'B'], label: 'Toggle sidebar' },
-  { keys: ['⌘', ','], label: 'Settings' },
-  { keys: ['⇧', '↵'], label: 'New line in message' },
-];
-
 const PROVIDER_LABELS: Record<string, string> = {
   claude: 'Claude',
   openai: 'OpenAI',
@@ -365,6 +586,21 @@ interface PendingTask {
   text: string;
   provider: string;
 }
+
+const CONNECTORS = [
+  {
+    id: 'guc-cms',
+    name: 'GUC CMS',
+    description: 'Course content, announcements, enrollment, and CMS actions.',
+    icon: 'CMS',
+  },
+  {
+    id: 'guc-mail',
+    name: 'GUC Mail',
+    description: 'GUC inbox, sent mail, search, drafts, and email actions.',
+    icon: '@',
+  },
+];
 
 function makeConversationId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -449,8 +685,9 @@ interface Props {
   session: SessionInfo | null;
   newChatMode: boolean;
   settings: Settings;
-  onTaskDone: (sessionId?: string) => void;
+  onTaskDone: (sessionId?: string, completedSession?: SessionInfo) => void;
   account: KimAccount;
+  onAccountChange: (account: KimAccount) => Promise<void>;
   activeTab: 'chat' | 'code';
   activeProjectPath?: string | null;
 }
@@ -469,6 +706,12 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [isRunning, setIsRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [activity, setActivity] = useState<ActivityItem[]>([]);
+  // Snapshots of completed runs, in order. Each successful task completion pushes
+  // one entry; rendered as a collapsible "Worked for Xm Ys" badge before the
+  // corresponding assistant turn in liveHistory.
+  const [runHistory, setRunHistory] = useState<{ activity: ActivityItem[]; durationSec: number }[]>([]);
+  const [expandedRunIdx, setExpandedRunIdx] = useState<number | null>(null);
+  const [clawRuns, setClawRuns] = useState<ClawRunGroup[]>([]);
   const [taskError, setTaskError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
@@ -476,6 +719,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [interruptTask, setInterruptTask] = useState<PendingTask | null>(null);
   const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
   const [autoFollowOutput, setAutoFollowOutput] = useState(true);
+  const [connectorsOpen, setConnectorsOpen] = useState(false);
+  const [connectorsClosing, setConnectorsClosing] = useState(false);
+  const [connectorSearch, setConnectorSearch] = useState('');
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
   const [conversationId] = useState(() => makeConversationId());
@@ -490,6 +736,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const bottomRef = useRef<HTMLDivElement>(null);
   const outputRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const connectorsCloseTimerRef = useRef<number | null>(null);
   const startTimeRef = useRef<number | null>(null);
   const currentTaskRef = useRef<PendingTask | null>(null);
   // Tracks the most recently submitted task — never cleared, so retry always works
@@ -506,6 +753,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // the cancel poller emits cancelled), so a closure variable would still be false.
   const cancelFlagRef = useRef(false);
   const needHelpFlagRef = useRef(false);
+  const completedCodeSessionRef = useRef<SessionInfo | null>(null);
   // Once the user sends their first message in a new-chat session, this stays
   // true for the lifetime of that session — even after the task completes and
   // isRunning/activity reset. This prevents the welcome section from
@@ -545,6 +793,135 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     return () => clearInterval(id);
   }, [isRunning]);
 
+  // Defensive: whenever isRunning flips to false from any source (done,
+  // cancelled, error), also tear down the floating cancel widget. The Rust
+  // side already does this on `kim-agent-done`, but if that event is missed
+  // (e.g. a previous run left isRunning stuck), this guard prevents the
+  // overlay from getting orphaned. (issue #3 §5)
+  useEffect(() => {
+    if (!isRunning) {
+      invoke('set_task_active_mode', { active: false }).catch(() => {});
+    }
+  }, [isRunning]);
+
+  const filteredConnectors = CONNECTORS.filter(connector => {
+    const q = connectorSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      connector.name.toLowerCase().includes(q) ||
+      connector.description.toLowerCase().includes(q)
+    );
+  });
+
+  useEffect(() => {
+    return () => {
+      if (connectorsCloseTimerRef.current !== null) {
+        window.clearTimeout(connectorsCloseTimerRef.current);
+      }
+    };
+  }, []);
+
+  const openConnectors = useCallback(() => {
+    if (connectorsCloseTimerRef.current !== null) {
+      window.clearTimeout(connectorsCloseTimerRef.current);
+      connectorsCloseTimerRef.current = null;
+    }
+    setConnectorsClosing(false);
+    setConnectorsOpen(true);
+  }, []);
+
+  const closeConnectors = useCallback(() => {
+    if (!connectorsOpen || connectorsClosing) return;
+    setConnectorsClosing(true);
+    connectorsCloseTimerRef.current = window.setTimeout(() => {
+      setConnectorsOpen(false);
+      setConnectorsClosing(false);
+      connectorsCloseTimerRef.current = null;
+    }, 260);
+  }, [connectorsClosing, connectorsOpen]);
+
+  // Topbar's connectors button dispatches `kim-open-connectors`. Listen here
+  // so the trigger lives in the topbar but the panel still renders from this
+  // component. The panel itself is portaled to <body> so it overlays the
+  // topbar and sidebar (instead of being clipped to .kim-chat).
+  useEffect(() => {
+    function onOpen() { openConnectors(); }
+    window.addEventListener('kim-open-connectors', onOpen);
+    return () => window.removeEventListener('kim-open-connectors', onOpen);
+  }, [openConnectors]);
+
+  function renderConnectorsChrome() {
+    if (!connectorsOpen) return null;
+    return createPortal(
+      <div
+        className={`kim-connectors-layer${connectorsClosing ? ' is-closing' : ''}`}
+        aria-hidden={connectorsClosing}
+      >
+        <button
+          type="button"
+          className="kim-connectors-scrim"
+          aria-label="Close connectors"
+          onClick={closeConnectors}
+        />
+        <aside className="kim-connectors-panel" aria-label="Connectors">
+              <div className="kim-connectors-panel__header">
+                <div>
+                  <div className="kim-connectors-panel__title">Connectors</div>
+                  <div className="kim-connectors-panel__subtitle">Turn on tool packs for Kim</div>
+                </div>
+                <button
+                  type="button"
+                  className="kim-connectors-panel__close"
+                  aria-label="Close connectors"
+                  onClick={closeConnectors}
+                >
+                  ×
+                </button>
+              </div>
+
+              <label className="kim-connectors-search">
+                <span className="sr-only">Search connectors</span>
+                <input
+                  value={connectorSearch}
+                  onChange={e => setConnectorSearch(e.target.value)}
+                  placeholder="Search for connector..."
+                  autoFocus
+                />
+              </label>
+
+              <div className="kim-connectors-list">
+                {filteredConnectors.map(connector => (
+                  <div className="kim-connector-row" key={connector.id}>
+                    <div className="kim-connector-row__icon" aria-hidden="true">
+                      {connector.icon}
+                    </div>
+                    <div className="kim-connector-row__body">
+                      <div className="kim-connector-row__name">{connector.name}</div>
+                      <div className="kim-connector-row__desc">{connector.description}</div>
+                    </div>
+                    <div className="kim-connector-row__action">
+                      <button type="button" className="kim-connector-connect" disabled>
+                        <span>Connect</span>
+                        <span className="kim-connector-connect__divider" />
+                        <span className="kim-connector-connect__chevron" aria-hidden="true">⌄</span>
+                      </button>
+                      <div className="kim-connector-item__actions">
+                        <span>Coming soon</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+
+                {filteredConnectors.length === 0 && (
+                  <div className="kim-connectors-empty">No connectors found</div>
+                )}
+              </div>
+        </aside>
+      </div>,
+      document.body,
+    );
+  }
+
   // ── Load messages ───────────────────────────────────────────────────────────
   // Two trigger paths:
   //   1. Session change (user picked a different chat)  → full reload + spinner.
@@ -558,15 +935,67 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       lastLoadedSessionIdRef.current = null;
       return;
     }
-    const isSessionChange = lastLoadedSessionIdRef.current !== session.session_id;
+    const prevId = lastLoadedSessionIdRef.current;
+    const isSessionChange = prevId !== session.session_id;
+    // "Self transition": we were in newChatMode (no prior session) and the
+    // newly-selected session is the conversation we just ran (its id matches
+    // our in-flight conversationId). Treat this like a silent refresh — keep
+    // liveHistory and skip the spinner so the chat doesn't appear to vanish
+    // and then reappear (issue #3 §4).
+    //
+    // "Claw continuation": In Code tab, each follow-up task creates a new
+    // Claw session (Claw doesn't support --resume). When the task completes,
+    // handleTaskDone navigates to the new session, causing a session change.
+    // Without this guard the UI would wipe liveHistory and show a spinner,
+    // making it look like a "chat reset". We detect this by checking that
+    // hasSentMessageRef is true (we were actively chatting, not clicking a
+    // sidebar item) and the session is a claw session.
+    const isClawContinuation =
+      isSessionChange &&
+      prevId !== null &&
+      session.session_type === 'claw' &&
+      hasSentMessageRef.current;
+    const isSelfTransition =
+      isSessionChange &&
+      prevId === null &&
+      session.session_id === activeResumeSessionIdRef.current;
+    const isSeamlessTransition = isSelfTransition || isClawContinuation;
     lastLoadedSessionIdRef.current = session.session_id;
 
-    if (isSessionChange) {
+    if (isSessionChange && !isSeamlessTransition) {
       setLoadingMessages(true);
       setLiveHistory([]);
+      // Reset run history and re-hydrate from the sidecar `<id>.runs.json` file.
+      setRunHistory([]);
+      setExpandedRunIdx(null);
+      setClawRuns([]); 
+      invoke<{ activity: ActivityItem[]; durationSec: number }[]>('load_run_history', {
+        sessionId: session.session_id,
+        sessionDate: session.date || null,
+        kimDir: settings.kim_sessions_dir || null,
+        clawDir: session.session_type === 'claw' && session.project_path
+          ? `${session.project_path}/.claw/sessions`
+          : settings.claw_sessions_dir || null,
+      })
+        .then(runs => {
+          if (Array.isArray(runs)) {
+            setRunHistory(runs);
+            // Merge saved durations into clawRuns so the "Worked for X"
+            // badge shows the correct time on old Claw sessions.
+            if (runs.length > 0) {
+              setClawRuns(prev => prev.map((run, i) =>
+                i < runs.length && runs[i].durationSec > 0
+                  ? { ...run, durationSec: runs[i].durationSec }
+                  : run
+              ));
+            }
+          }
+        })
+        .catch(() => { /* non-fatal */ });
     }
     invoke<KimMessage[]>('load_session_messages', {
       sessionId: session.session_id,
+      sessionDate: session.date || null,
       kimDir: settings.kim_sessions_dir || null,
       clawDir: session.session_type === 'claw' && session.project_path
         ? `${session.project_path}/.claw/sessions`
@@ -579,22 +1008,36 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         // Animate only on session change. On silent refresh the bubble was
         // already shown (and animated) via liveHistory — re-animating it
         // looks like the chat is "refreshing".
-        if (isSessionChange && prev > 0 && msgs.length > prev && lastAssistantIdx >= prev) {
+        if (isSessionChange && !isSeamlessTransition && prev > 0 && msgs.length > prev && lastAssistantIdx >= prev) {
           setNewestMsgIdx(lastAssistantIdx);
         } else {
           setNewestMsgIdx(null);
         }
         prevMsgCountRef.current = msgs.length;
         setMessages(msgs);
-        // Silent refresh: now that disk messages include the new turns,
-        // it's safe to clear liveHistory without leaving a visible gap.
-        if (!isSessionChange) {
-          setLiveHistory([]);
+        // Group Claw session messages into per-run structures so intermediate
+        // tool calls are hidden behind "Worked on this" disclosures.
+        if (session.session_type === 'claw') {
+          setClawRuns(groupClawMessages(msgs));
+        } else {
+          setClawRuns([]);
+        }
+        // Silent refresh AND self-transition: clear liveHistory only after
+        // disk messages are loaded so the chat doesn't blink empty.
+        // BUT: when staying on an old Claw session after a task completes
+        // (the new turn lives in a different session file), the disk
+        // messages for this session haven't changed. Clearing liveHistory
+        // would wipe the new response. Only clear when the disk data
+        // actually absorbed the new content (msg count grew).
+        if (!isSessionChange || isSeamlessTransition) {
+          if (msgs.length > prev) {
+            setLiveHistory([]);
+          }
         }
       })
       .catch(err => console.error('Failed to load messages:', err))
       .finally(() => {
-        if (isSessionChange) setLoadingMessages(false);
+        if (isSessionChange && !isSeamlessTransition) setLoadingMessages(false);
       });
   }, [session, settings.kim_sessions_dir, settings.claw_sessions_dir, messageReloadNonce]);
 
@@ -635,6 +1078,9 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   useEffect(() => {
     if (newChatMode) {
       setActivity([]);
+      setRunHistory([]);
+      setExpandedRunIdx(null);
+      setClawRuns([]);
       setTaskError(null);
       setTokenStats(null);
       setElapsed(0);
@@ -677,6 +1123,31 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       return;
     }
 
+    // Surface Claw's structured JSON error output as a real error banner
+    // instead of silently dropping the line and showing only "Agent Error".
+    // Claw emits e.g. {"error":"missing Anthropic credentials …","type":"error"}
+    // on stdout right before exiting non-zero.
+    const stdoutLine = line.startsWith('[err]') ? line.slice(5).trimStart() : line;
+    if (stdoutLine.startsWith('{') && stdoutLine.includes('"error"')) {
+      try {
+        const parsed = JSON.parse(stdoutLine) as { error?: string; type?: string; message?: string };
+        const msg = (parsed.error ?? parsed.message ?? '').trim();
+        if (msg && (parsed.type === 'error' || /credential|api[_ ]?key|unauthorized/i.test(msg))) {
+          setTaskError(friendlyError(msg));
+          if (lastRunTaskRef.current) setLastFailedTask(lastRunTaskRef.current);
+          needHelpFlagRef.current = true; // reuse the flag so kim-agent-done suppresses the generic banner
+          setActivity(prev => {
+            const next = [...prev, { id, kind: 'error' as const, icon: '⚠', text: friendlyError(msg) }];
+            if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
+            return next;
+          });
+          return;
+        }
+      } catch {
+        /* not JSON, fall through */
+      }
+    }
+
     // Handle [DIFF] lines — annotate the previous file-write activity item
     const diffMatch = line.match(/\[DIFF\]\s+path=(\S+)\s+\+(\d+)\s+-(\d+)/);
     if (diffMatch) {
@@ -704,6 +1175,29 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       }
       return;
     }
+    if (item.kind === 'status' && /\b(?:gemini|claude|chatgpt|grok|deepseek)\s+(?:is\s+)?(?:still\s+)?thinking/i.test(item.text)) {
+      item.text = item.text.replace(/\b(?:gemini|claude|chatgpt|grok|deepseek)\s+(?:is\s+)?(?:still\s+)?thinking(?:…|\.\.\.)?(?:\s+\(\d+s\))?/ig, 'Kim is thinking…');
+    }
+    // Replace any remaining provider brand mentions in status lines
+    if (item.kind === 'status') {
+      item.text = item.text
+        .replace(/\b(?:Gemini|Claude|ChatGPT|Grok|DeepSeek)\s+(?:is|says?|returned?|respond(?:s|ed)?)/gi, 'Kim')
+        .replace(/\bsending to (?:Gemini|Claude|ChatGPT|Grok|DeepSeek)\b/gi, 'Kim is working')
+        .replace(/\b(?:Gemini|Claude|ChatGPT|Grok|DeepSeek) responded?\b/gi, 'Response received');
+      // Strip JSON fragment leaks: lines that start with { or contain "text":
+      if (/^\s*[{"\[]/.test(item.text) || /"text"\s*:/.test(item.text)) {
+        // Try to extract readable text from JSON
+        try {
+          const parsed = JSON.parse(item.text);
+          if (typeof parsed === 'object' && parsed !== null && typeof parsed.text === 'string') {
+            item.text = parsed.text;
+          }
+        } catch {
+          // Not valid JSON — drop lines that look like raw JSON artifacts
+          if (/^\s*\{.*\}\s*$/.test(item.text)) return;
+        }
+      }
+    }
 
     const needHelpMatch = line.match(/(?:^|\b)NEED_HELP:\s*(.+)$/i);
     if (needHelpMatch) {
@@ -717,12 +1211,20 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
     setActivity(prev => {
       if (item.kind === 'success') return prev; // Skip adding to activity feed to avoid duplicating the assistant bubble
+      // Collapse consecutive status items: replace the previous one so repeated
+      // "gemini is thinking…" lines don't flood the feed.
+      if (item.kind === 'status' && prev.length > 0 && prev[prev.length - 1].kind === 'status') {
+        return [...prev.slice(0, -1), item];
+      }
       const next = [...prev, item];
       if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
       return next;
     });
 
-    // Capture success results as assistant bubbles in liveHistory
+    // Capture success results as assistant bubbles in liveHistory.
+    // This must also happen in Claw (Code-tab) mode: when the user sends a
+    // follow-up from an old Claw session, we stay on that session to
+    // preserve history. The new task's response appears via liveHistory.
     if (item.kind === 'success') {
       setLiveHistory(prev => [...prev, { role: 'assistant', content: item.text }]);
     }
@@ -733,6 +1235,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     let unlistenOutput: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
     let unlistenDone: (() => void) | undefined;
+    let unlistenCodeSession: (() => void) | undefined;
     let unlistenCancelled: (() => void) | undefined;
 
     listen<string>('kim-agent-output', event => {
@@ -752,13 +1255,41 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       needHelpFlagRef.current = false; // reset
       setIsRunning(false);
       setCancelling(false);
-      setActivity([]);
+      // Snapshot the activity into run history before clearing so the
+      // "Worked for X" disclosure can replay it. Persist to disk so the
+      // disclosure survives a chat reload.
+      const startedAt = startTimeRef.current;
+      const durationSec = startedAt ? Math.max(1, Math.round((Date.now() - startedAt) / 1000)) : 0;
+      setActivity(currentActivity => {
+        if (event.payload && !wasCancelled && currentActivity.length > 0) {
+          setRunHistory(prev => {
+            const next = [...prev, { activity: currentActivity, durationSec }];
+            const completedCodeSession = completedCodeSessionRef.current;
+            const sid = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
+            if (sid) {
+              invoke('save_run_history', {
+                sessionId: sid,
+                sessionDate: completedCodeSession?.date ?? session?.date ?? null,
+                kimDir: settings.kim_sessions_dir || null,
+                clawDir: completedCodeSession?.project_path
+                  ? `${completedCodeSession.project_path}/.claw/sessions`
+                  : settings.claw_sessions_dir || null,
+                runs: next,
+              }).catch(() => { /* non-fatal */ });
+            }
+            return next;
+          });
+        }
+        return [];
+      });
       // Existing session view is now interactive, so reload message history
       // after every run completion to reflect newly appended turns.
       setMessageReloadNonce(v => v + 1);
       // Always refresh sessions — failed runs still create session files.
       // Pass the session ID so App.tsx can auto-navigate to the completed session.
-      onTaskDoneRef.current(activeResumeSessionIdRef.current);
+      const completedCodeSession = completedCodeSessionRef.current ?? undefined;
+      onTaskDoneRef.current(completedCodeSession?.session_id ?? activeResumeSessionIdRef.current, completedCodeSession);
+      completedCodeSessionRef.current = null;
       if (!event.payload && !wasCancelled) {
         if (!hadNeedHelp) {
           setTaskError('agent-error');
@@ -771,6 +1302,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       }
       currentTaskRef.current = null;
     }).then(fn => { unlistenDone = fn; });
+
+    listen<SessionInfo>('kim-agent-code-session', event => {
+      completedCodeSessionRef.current = event.payload;
+    }).then(fn => { unlistenCodeSession = fn; });
 
     listen<boolean>('kim-agent-cancelled', () => {
       invoke('set_task_active_mode', { active: false }).catch(() => {});
@@ -785,6 +1320,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       unlistenOutput?.();
       unlistenError?.();
       unlistenDone?.();
+      unlistenCodeSession?.();
       unlistenCancelled?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -793,6 +1329,11 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // ── Actions ─────────────────────────────────────────────────────────────────
 
   const queueEnabled = Boolean(settings.allow_message_queue);
+  const keepBrowserVisible = Boolean(settings.keep_browser_visible);
+
+  useEffect(() => {
+    void invoke('set_browser_keep_visible', { keepVisible: keepBrowserVisible });
+  }, [keepBrowserVisible]);
 
   const resolveProvider = useCallback((): string => {
     const p = localProvider ?? settings.provider;
@@ -832,11 +1373,16 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     setLiveHistory(prev => [...prev, { role: 'user', content: pending.text }]);
 
     try {
+      // Resolve the session ID dynamically from refs to prevent race conditions
+      // where a queued task starts before React has finished prop-drilling
+      // the new session state from the previous task's completion.
+      const resolvedSessionId = completedCodeSessionRef.current?.session_id ?? activeResumeSessionIdRef.current;
+      
       await invoke('send_task', {
         task: pending.text,
         provider: pending.provider,
         projectRoot: (activeTab === 'code' && activeProjectPath) ? activeProjectPath : (settings.project_root || null),
-        resumeSessionId: activeResumeSessionId,
+        resumeSessionId: resolvedSessionId,
       });
     } catch (err) {
       // kim-agent-done fires BEFORE invoke() rejects on process failure.
@@ -847,10 +1393,12 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         setIsRunning(false);
         setTaskError(friendlyError(String(err)));
         setLastFailedTask(pending);
-        onTaskDoneRef.current(activeResumeSessionId); // refresh sidebar even on invoke-level failures
+        
+        const resolvedSessionId = completedCodeSessionRef.current?.session_id ?? activeResumeSessionIdRef.current;
+        onTaskDoneRef.current(resolvedSessionId); // refresh sidebar even on invoke-level failures
       }
     }
-  }, [activeResumeSessionId, settings.project_root, activeTab, activeProjectPath]);
+  }, [settings.project_root, activeTab, activeProjectPath]);
 
   useEffect(() => {
     if (isRunning) return;
@@ -885,6 +1433,24 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     }
   }
 
+  // Edit a previously-sent live-history user message and resend. The edited
+  // message replaces the original (and drops everything after it). If a task
+  // is currently running we cancel it first; the new task then runs.
+  function handleEditLiveMessage(idx: number, newText: string) {
+    const trimmed = newText.trim();
+    if (!trimmed) return;
+    setLiveHistory(prev => prev.slice(0, idx)); // truncate; runPendingTask re-appends
+    const pending = makePendingTask(trimmed);
+    setTaskError(null);
+    if (isRunning) {
+      setQueuedTasks([]);
+      setInterruptTask(pending);
+      if (!cancelling) void handleCancel();
+    } else {
+      void runPendingTask(pending);
+    }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const task = taskInput.trim();
@@ -916,7 +1482,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
   async function handleRetryLast() {
     let taskToRetry = lastFailedTask ?? lastRunTaskRef.current;
-    
+
     // If not in current lifecycle, find the last user message from the loaded history
     if (!taskToRetry && messages.length > 0) {
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -925,7 +1491,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           let text = typeof msg.content === 'string'
             ? msg.content
             : msg.content.filter(b => b.type === 'text').map(b => (b as TextBlock).text).join('\n');
-            
+
           if (text.startsWith('Task: ')) {
             text = text.substring(6).trim();
           }
@@ -934,7 +1500,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         }
       }
     }
-    
+
     if (!taskToRetry) return;
     const retryTask = makePendingTask(taskToRetry.text, resolveProvider());
     setTaskError(null);
@@ -957,39 +1523,11 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     await runPendingTask(retryTask);
   }
 
-  function handleBrowserProviderSelect(nextProvider: string) {
-    if (nextProvider === browserProvider) return;
-    const previous = browserProvider;
-    setBrowserProvider(nextProvider);
-    setLocalProvider(`browser:${nextProvider}`);
-
-    if (activity.length > 0 || isRunning || queuedTasks.length > 0 || interruptTask) {
-      toast(
-        `Switched from ${providerLabel(`browser:${previous}`)} to ${providerLabel(`browser:${nextProvider}`)}. ` +
-          'Next message keeps this chat memory and uses the new provider.',
-        'info',
-        7500,
-      );
-    }
-  }
-
   function handleTextareaInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
     setTaskInput(e.target.value);
     const el = e.target;
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
-  }
-
-  function pickExample(p: string) {
-    setTaskInput(p);
-    setTimeout(() => {
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-        textareaRef.current.style.height =
-          Math.min(textareaRef.current.scrollHeight, 200) + 'px';
-        textareaRef.current.focus();
-      }
-    }, 0);
   }
 
   // ── Activity feed render ─────────────────────────────────────────────────────
@@ -1016,6 +1554,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     return (
       <div className="kim-msg-row kim-msg-row--assistant kim-msg-row--live">
         <div className="kim-bubble kim-bubble--assistant kim-bubble--live">
+          <div className="kim-thinking-header">
+            <span className="kim-thinking-header__dot" aria-hidden="true" />
+            <span className="kim-thinking-header__label">Thinking…</span>
+            {elapsed > 0 && (
+              <span className="kim-thinking-header__timer">{formatDuration(elapsed)}</span>
+            )}
+          </div>
           <div className="kim-activity-feed">
             {activity.map(item => (
               <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
@@ -1029,9 +1574,68 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     );
   }
 
+  function renderWorkedFor(idx: number, run: { activity: ActivityItem[]; durationSec: number }) {
+    const expanded = expandedRunIdx === idx;
+    const durationLabel = run.durationSec > 0
+      ? `Worked for ${formatDuration(run.durationSec)}`
+      : 'Worked on this';
+    return (
+      <div className="kim-msg-row kim-msg-row--assistant">
+        <div className="kim-worked-for">
+          <button
+            type="button"
+            className={`kim-worked-for__chip${expanded ? ' is-expanded' : ''}`}
+            onClick={() => setExpandedRunIdx(expanded ? null : idx)}
+            aria-expanded={expanded}
+          >
+            <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="kim-worked-for__chevron">
+              <path d="M5 3l5 5-5 5" />
+            </svg>
+            <span>{durationLabel}</span>
+          </button>
+          {expanded && (
+            <div className="kim-worked-for__panel">
+              <div className="kim-activity-feed kim-activity-feed--archive">
+                {run.activity.map(item => (
+                  <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
+                    <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
+                    <span className="kim-activity-item__text">{renderActivityText(item.text)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  function renderFilePills(files: TouchedFile[]) {
+    if (files.length === 0) return null;
+    return (
+      <div className="kim-msg-row kim-msg-row--assistant">
+        <div className="kim-file-pills">
+          {files.map((f, i) => (
+            <span key={i} className="kim-file-pill">
+              <span className="kim-file-pill__name">{basename(f.path)}</span>
+              {(f.added > 0 || f.removed > 0) && (
+                <span className="kim-file-pill__stats">
+                  {f.added > 0 && <span className="kim-file-pill__stat-add">+{f.added}</span>}
+                  {f.removed > 0 && <span className="kim-file-pill__stat-del">-{f.removed}</span>}
+                </span>
+              )}
+            </span>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   // ── Composer ─────────────────────────────────────────────────────────────────
 
   function renderComposer() {
+    const resolvedProvider = resolveProvider();
+    const browserProviderId = resolvedProvider.startsWith('browser:') ? resolvedProvider.split(':')[1] : '';
     return (
       <form className="kim-composer" onSubmit={handleSubmit}>
         <div className="kim-composer__row">
@@ -1054,13 +1658,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           />
 
           <div className="kim-composer__actions">
-            {isRunning && (
+            {isRunning && !cancelling && (
               <button
                 type="button"
                 onClick={handleCancel}
                 disabled={cancelling}
-                title={cancelling ? 'Stopping…' : 'Stop task'}
-                className={'kim-btn kim-btn--stop' + (cancelling ? ' kim-btn--stop-pending' : '')}
+                title="Stop task"
+                className="kim-btn kim-btn--stop"
                 aria-label="Stop task"
               >
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
@@ -1104,8 +1708,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           <span><kbd>⇧</kbd>+<kbd>↵</kbd> for new line</span>
           <span className="kim-composer__hint-sep">·</span>
           <span className="kim-composer__provider-pill">
-            <select 
-              value={resolveProvider()} 
+            <select
+              value={resolveProvider()}
               onChange={async (e) => {
                 const val = e.target.value;
                 if (val.startsWith('browser:')) {
@@ -1117,7 +1721,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                   const urlMap: Record<string, string> = {
                     claude: 'https://claude.ai',
                     chatgpt: 'https://chatgpt.com',
-                    gemini: 'https://gemini.google.com',
+                    gemini: 'https://gemini.google.com/app',
                     grok: 'https://grok.com',
                     deepseek: 'https://chat.deepseek.com',
                   };
@@ -1151,22 +1755,22 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               <path d="M2 4l3 3 3-3" />
             </svg>
           </span>
-          {resolveProvider().startsWith('browser:') && resolveProvider().split(':')[1] !== 'custom' && (
+          {browserProviderId && browserProviderId !== 'custom' && (
             <>
               <span className="kim-composer__hint-sep">·</span>
               <button
                 type="button"
                 className="kim-composer__signin-btn"
                 onClick={async () => {
-                  const p = resolveProvider().split(':')[1];
+                  const p = browserProviderId;
                   const providerName = p.charAt(0).toUpperCase() + p.slice(1);
                   let url = '';
                   if (p === 'claude') url = 'https://claude.ai';
                   else if (p === 'chatgpt') url = 'https://chatgpt.com';
-                  else if (p === 'gemini') url = 'https://gemini.google.com';
+                  else if (p === 'gemini') url = 'https://gemini.google.com/app';
                   else if (p === 'grok') url = 'https://grok.com';
                   else if (p === 'deepseek') url = 'https://chat.deepseek.com';
-                  
+
                   if (url) {
                     try {
                       await invoke<string>('open_browser_signin_window', { url, providerName });
@@ -1178,7 +1782,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                   }
                 }}
               >
-                Sign into {resolveProvider().split(':')[1].charAt(0).toUpperCase() + resolveProvider().split(':')[1].slice(1)}
+                Sign into {browserProviderId.charAt(0).toUpperCase() + browserProviderId.slice(1)}
               </button>
             </>
           )}
@@ -1201,6 +1805,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   if (!newChatMode && !session) {
     return (
       <div className="kim-chat">
+        {renderConnectorsChrome()}
 
         <div className="kim-empty-welcome">
           <div className="kim-greeting__text">
@@ -1221,6 +1826,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   if (newChatMode) {
     return (
       <div className="kim-chat">
+        {renderConnectorsChrome()}
 
         <div className="kim-chat__output" ref={outputRef}>
 
@@ -1236,82 +1842,36 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               </div>
               <div className="kim-new-chat-empty__subtitle">
                 {activeTab === 'code'
-                  ? 'Select a codebase from the sidebar, or just ask Kim to analyze a specific path.'
-                  : 'Describe any task in plain English below — Kim will figure out how to do it.'}
-              </div>
-
-              {(localProvider?.startsWith('browser') || (!localProvider && settings.provider === 'browser')) && (
-                <BrowserProviderPicker
-                  selected={browserProvider}
-                  onSelect={handleBrowserProviderSelect}
-                />
-              )}
-
-              {/* Example prompts */}
-              <div className="kim-examples" style={{ marginTop: (localProvider?.startsWith('browser') || (!localProvider && settings.provider === 'browser')) ? 24 : 0 }}>
-                {EXAMPLE_PROMPTS.map((ex, i) => (
-                  <button
-                    key={i}
-                    className="kim-example-card"
-                    onClick={() => pickExample(ex.title)}
-                  >
-                    <div className="kim-example-card__body">
-                      <div className="kim-example-card__title">{ex.title}</div>
-                      <div className="kim-example-card__hint">{ex.hint}</div>
-                    </div>
-                    <div className="kim-example-card__arrow">↗</div>
-                  </button>
-                ))}
-              </div>
-
-              {/* What Kim can do */}
-              <div className="kim-capabilities">
-                <div className="kim-capabilities__label">What Kim can do</div>
-                <div className="kim-capabilities__grid">
-                  {KIM_CAPABILITIES.map((cap, i) => (
-                    <div key={i} className="kim-capability-item">
-                      <div>
-                        <div className="kim-capability-item__label">{cap.label}</div>
-                        <div className="kim-capability-item__desc">{cap.desc}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* Keyboard shortcuts */}
-              <div className="kim-shortcuts">
-                <div className="kim-shortcuts__label">Keyboard shortcuts</div>
-
-                <div className="kim-shortcuts__row">
-                  {KIM_SHORTCUTS.map((s, i) => (
-                    <span key={i} className="kim-shortcut">
-                      {s.keys.map((k, ki) => <kbd key={ki}>{k}</kbd>)}
-                      <span className="kim-shortcut__label">{s.label}</span>
-                    </span>
-                  ))}
-                </div>
+                  ? 'Tell Kim what to inspect, fix, or build.'
+                  : 'Tell Kim what you want done. Short, messy, or half-formed is fine.'}
               </div>
             </div>
           )}
 
           {/* Live conversation history */}
-          {collapseMessages(liveHistory).map(({msg, retries}, i) => {
-            // Show activity feed right after the last user message (current task)
-            const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
-            return (
-              <div key={`live-${i}`}>
-                <MessageBubble
-                  message={msg}
-                  animate={i === liveHistory.length - 1}
-                  typingAnimation={settings.typing_animation ?? 'none'}
-                  onRetry={handleRetryLast}
-                  retries={retries}
-                />
-                {showActivityAfter && renderActivityFeed()}
-              </div>
-            );
-          })}
+          {(() => {
+            const collapsed = collapseMessages(liveHistory);
+            let assistantIdx = -1;
+            return collapsed.map(({msg, retries}, i) => {
+              if (msg.role === 'assistant') assistantIdx += 1;
+              const workedRun = msg.role === 'assistant' ? runHistory[assistantIdx] : null;
+              const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
+              return (
+                <div key={`live-${i}`}>
+                  {workedRun && renderWorkedFor(assistantIdx, workedRun)}
+                  <MessageBubble
+                    message={msg}
+                    animate={i === liveHistory.length - 1}
+                    typingAnimation={settings.typing_animation ?? 'none'}
+                    onRetry={handleRetryLast}
+                    retries={retries}
+                    onEdit={msg.role === 'user' ? (newText) => handleEditLiveMessage(i, newText) : undefined}
+                  />
+                  {showActivityAfter && renderActivityFeed()}
+                </div>
+              );
+            });
+          })()}
 
           {/* Error / retry — inside an assistant-aligned row */}
           {taskError && taskError !== 'agent-error' && (
@@ -1403,36 +1963,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // ── Existing session view ─────────────────────────────────────────────────────
   return (
     <div className="kim-chat">
-      {/* Session header */}
-      <div className="kim-session-header">
-        <div className="kim-session-header__main">
-          <div className="kim-session-header__row">
-            <span className={`kim-session-badge kim-session-badge--${session!.session_type}`}>
-              {session!.session_type === 'kim' ? 'Kim' : 'Claw Code'}
-            </span>
-            <span className="kim-session-header__id">{session!.session_id}</span>
-          </div>
-          <div className="kim-session-header__meta">
-            <span>{session!.date}</span>
-            <span className="kim-session-header__dot">·</span>
-            <span>{session!.message_count} message{session!.message_count !== 1 ? 's' : ''}</span>
-            {session!.has_summary && (
-              <>
-                <span className="kim-session-header__dot">·</span>
-                <span className="kim-session-header__summary-tag">summarized</span>
-              </>
-            )}
-          </div>
-          {session!.summary && (
-            <div className="kim-session-header__summary">
-              {(() => {
-                const match = session!.summary!.match(/^Task:.*?(?:\.\s*Result:\s*|\nResult:\s*)([\s\S]*)$/i);
-                return match ? match[1].trim() : session!.summary;
-              })()}
-            </div>
-          )}
-        </div>
-      </div>
+      {renderConnectorsChrome()}
 
       {/* Messages */}
       <div className="kim-messages">
@@ -1456,33 +1987,78 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           </div>
         ) : (
           <>
-            {collapseMessages(messages).map(({msg, retries}, i) => (
-              <MessageBubble
-                key={i}
-                message={msg}
-                animate={i === newestMsgIdx}
-                typingAnimation={settings.typing_animation ?? 'none'}
-                onRetry={handleRetryLast}
-                retries={retries}
-              />
-            ))}
-
-            {/* Newly added messages in this session */}
-            {collapseMessages(liveHistory).map(({msg, retries}, i) => {
-              const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
-              return (
-                <div key={`live-${i}`}>
+            {clawRuns.length > 0 ? (
+              /* ── Claw grouped view: per-run user→disclosure→answer→pills ── */
+              clawRuns.map((run, runIdx) => (
+                <div key={`claw-run-${runIdx}`}>
                   <MessageBubble
-                    message={msg}
-                    animate={i === liveHistory.length - 1}
+                    message={run.userMessage}
                     typingAnimation={settings.typing_animation ?? 'none'}
                     onRetry={handleRetryLast}
-                    retries={retries}
                   />
-                  {showActivityAfter && renderActivityFeed()}
+                  {run.intermediateActivity.length > 0 && renderWorkedFor(runIdx, {
+                    activity: run.intermediateActivity,
+                    durationSec: run.durationSec,
+                  })}
+                  {run.finalAssistantMessage && (
+                    <MessageBubble
+                      message={run.finalAssistantMessage}
+                      animate={runIdx === clawRuns.length - 1}
+                      typingAnimation={settings.typing_animation ?? 'none'}
+                      onRetry={handleRetryLast}
+                    />
+                  )}
+                  {renderFilePills(run.touchedFiles)}
                 </div>
-              );
-            })}
+              ))
+            ) : (
+              /* ── Normal (Kim) message view ── */
+              (() => {
+                const collapsed = collapseMessages(messages);
+                let assistantIdx = -1;
+                return collapsed.map(({msg, retries}, i) => {
+                  if (msg.role === 'assistant') assistantIdx += 1;
+                  const workedRun = msg.role === 'assistant' ? runHistory[assistantIdx] : null;
+                  return (
+                    <div key={i}>
+                      {workedRun && renderWorkedFor(assistantIdx, workedRun)}
+                      <MessageBubble
+                        message={msg}
+                        animate={i === newestMsgIdx}
+                        typingAnimation={settings.typing_animation ?? 'none'}
+                        onRetry={handleRetryLast}
+                        retries={retries}
+                      />
+                    </div>
+                  );
+                });
+              })()
+            )}
+
+            {/* Newly added messages in this session */}
+            {(() => {
+              const collapsed = collapseMessages(liveHistory);
+              let assistantIdx = -1;
+              return collapsed.map(({msg, retries}, i) => {
+                if (msg.role === 'assistant') assistantIdx += 1;
+                const workedRun = msg.role === 'assistant' ? runHistory[assistantIdx] : null;
+                const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
+                return (
+                  <div key={`live-${i}`}>
+                    {workedRun && renderWorkedFor(assistantIdx, workedRun)}
+                    <MessageBubble
+                      message={msg}
+                      animate={i === liveHistory.length - 1}
+                      typingAnimation={settings.typing_animation ?? 'none'}
+                      onRetry={handleRetryLast}
+                      retries={retries}
+                      onEdit={msg.role === 'user' ? (newText) => handleEditLiveMessage(i, newText) : undefined}
+                    />
+                    {showActivityAfter && renderActivityFeed()}
+                  </div>
+                );
+              });
+            })()}
 
             {/* Working indicator with blobby loader */}
             {isRunning && (

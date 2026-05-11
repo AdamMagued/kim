@@ -5,6 +5,7 @@
   "windows": ["main", "screenshot-flash", "cancel-widget"],
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
     "opener:default",
     "dialog:default"
   ]

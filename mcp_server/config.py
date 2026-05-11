@@ -64,6 +64,9 @@ LOG_LEVEL: str = _cfg.get("logging", {}).get("level", "INFO")
 BROWSER_HEADLESS: bool = bool(
     _cfg.get("browser_provider", {}).get("browser_headless", False)
 )
+USE_REAL_BROWSER: bool = bool(
+    _cfg.get("use_real_browser", True)
+)
 VOICE_ENABLED: bool = bool(_cfg.get("voice_enabled", False))
 
 # ── Sensitive path deny list (#3) ─────────────────────────────────────────────
