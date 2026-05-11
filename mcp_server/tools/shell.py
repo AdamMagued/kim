@@ -8,8 +8,6 @@ Provides run_command and run_powershell tools with:
   - Platform-aware PowerShell / bash fallback
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import re
