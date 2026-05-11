@@ -2,6 +2,15 @@
 
 Changes on `fix/observe-ui-and-cancel` compared with `origin/main` as of 2026-05-11.
 
+## Browser Bridge Stability & Game Implementation (2026-05-11)
+
+- **Typography Normalization** (`browser_provider.py`, `lib.rs`): Fixed the "Prompt changed after injection" error. Rich-text editors (like Gemini) automatically format pasted text (converting straight quotes to smart quotes, double-dashes to em-dashes, and ellipses). Both the Python and Rust layers now normalize these typographic characters before verification.
+- **Fuzzy Boundary Matching** (`browser_provider.py`, `lib.rs`): Added a fuzzy match fallback for prefix and suffix comparisons that strips non-word characters, ensuring that minor typography discrepancies do not break the injection loop.
+- **Reasoning JSON Extraction** (`claw_bridge.py`): Fixed a bug where truncated or malformed JSON payloads leaked into the Activity Feed. Added aggressive regex to strip structural JSON brackets (`{"text": "`), ensuring only natural language reasoning reaches the user.
+- **Technical Log Suppression** (`claw_bridge.py`): Changed the default completion message in `run_claw_subtask` from exposing internal loop counts and exit codes to a clean, user-friendly "Task completed successfully."
+- **Game Features** (`pong.html`, `tower_sim.html`): Implemented a neon-styled CPU version of Pong with Easy/Medium/Hard difficulties, and a new physics simulation featuring dropping balls navigating through rotating platforms.
+
+
 ## Chat Persistence & Display Polish (2026-05-11)
 
 - **Chat Reset Fix** (`App.tsx`): Fixed a critical bug where completing a task in the Code tab caused the UI to navigate away from the current session and wipe the `liveHistory`, resulting in a blank screen and lost conversation history. The old session now correctly stays active.

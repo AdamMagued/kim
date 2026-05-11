@@ -1256,8 +1256,19 @@ class BrowserProvider(BaseProvider):
         prompt as multiple broken messages.
         """
         actual = await self._read_editor_text(page, selector)
-        expected_norm = " ".join(expected.split())
-        actual_norm = " ".join(actual.split())
+        
+        def normalize_typo(s: str) -> str:
+            return (
+                " ".join(s.split())
+                .replace("“", '"').replace("”", '"')
+                .replace("‘", "'").replace("’", "'")
+                .replace("—", "--").replace("–", "--")
+                .replace("…", "...")
+            )
+            
+        expected_norm = normalize_typo(expected)
+        actual_norm = normalize_typo(actual)
+
         logger.debug(
             f"Injection verify: editor has {len(actual)} chars; "
             f"expected {len(expected)} chars"
@@ -1267,11 +1278,25 @@ class BrowserProvider(BaseProvider):
             return actual_norm == expected_norm
 
         if len(actual_norm) < max(_VERIFY_MIN_CHARS, int(len(expected_norm) * 0.98)):
+            logger.warning(f"Injection failed: actual length {len(actual_norm)} is < 98% of expected {len(expected_norm)}")
             return False
-        return (
-            actual_norm[:200] == expected_norm[:200]
-            and actual_norm[-200:] == expected_norm[-200:]
-        )
+            
+        # We only need the first/last few chars to match to ensure it wasn't truncated.
+        # But we use a fuzzy check in case of stray punctuation that wasn't normalized.
+        def fuzzy_match(a: str, b: str) -> bool:
+            # Strip all non-alphanumeric chars for the boundary check
+            import re
+            return re.sub(r'\W+', '', a) == re.sub(r'\W+', '', b)
+
+        if not fuzzy_match(actual_norm[:200], expected_norm[:200]):
+            logger.warning(f"Injection failed: Prefix mismatch. Actual: {actual_norm[:50]}... Expected: {expected_norm[:50]}...")
+            return False
+            
+        if not fuzzy_match(actual_norm[-200:], expected_norm[-200:]):
+            logger.warning(f"Injection failed: Suffix mismatch. Actual: ...{actual_norm[-50:]} Expected: ...{expected_norm[-50:]}")
+            return False
+
+        return True
 
     # ==================================================================
     # Send + wait + scrape
