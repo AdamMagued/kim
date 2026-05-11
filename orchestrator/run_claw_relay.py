@@ -41,7 +41,7 @@ from mcp_server.tools.claw_bridge import (  # noqa: E402
     _restore_browser_state,
     _save_browser_state,
 )
-from orchestrator.providers.base import create_provider  # noqa: E402
+from orchestrator.providers.base import BaseProvider, create_provider  # noqa: E402
 
 logger = logging.getLogger("kim.run_claw_relay")
 
@@ -59,6 +59,45 @@ def _load_config(path: str | None) -> dict:
         return loaded if isinstance(loaded, dict) else {}
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _setup_signals(stop_event: asyncio.Event) -> None:
+    def _request_stop(*_: object) -> None:
+        logger.info("Stop signal received — exiting relay loop")
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except NotImplementedError:
+            # Windows: signal.add_signal_handler is unsupported; fall back to
+            # the default behaviour (KeyboardInterrupt for SIGINT).
+            pass
+
+
+async def _relay_loop(
+    provider: BaseProvider,
+    bridge_dir: Path,
+    request_file: Path,
+    stop_event: asyncio.Event,
+) -> int:
+    relay_count = 0
+    while not stop_event.is_set():
+        if request_file.exists():
+            relay_count += 1
+            logger.info(f"[relay #{relay_count}] Picked up bridge_request.json")
+            try:
+                await _relay_one_request(provider, relay_count, bridge_dir)
+            except Exception as e:  # noqa: BLE001
+                logger.exception(f"[relay #{relay_count}] Failed: {e}")
+        else:
+            # Sleep briefly, but break out fast on stop.
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+    return relay_count
 
 
 def _parse_args() -> argparse.Namespace:
@@ -120,36 +159,11 @@ async def _run_relay(args: argparse.Namespace) -> int:
             logger.warning(f"Could not write ready file {args.ready_file}: {e}")
 
     stop_event = asyncio.Event()
-
-    def _request_stop(*_: object) -> None:
-        logger.info("Stop signal received — exiting relay loop")
-        stop_event.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _request_stop)
-        except NotImplementedError:
-            # Windows: signal.add_signal_handler is unsupported; fall back to
-            # the default behaviour (KeyboardInterrupt for SIGINT).
-            pass
+    _setup_signals(stop_event)
 
     relay_count = 0
     try:
-        while not stop_event.is_set():
-            if request_file.exists():
-                relay_count += 1
-                logger.info(f"[relay #{relay_count}] Picked up bridge_request.json")
-                try:
-                    await _relay_one_request(provider, relay_count, bridge_dir)
-                except Exception as e:  # noqa: BLE001
-                    logger.exception(f"[relay #{relay_count}] Failed: {e}")
-            else:
-                # Sleep briefly, but break out fast on stop.
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL)
-                except asyncio.TimeoutError:
-                    pass
+        relay_count = await _relay_loop(provider, bridge_dir, request_file, stop_event)
     finally:
         await _restore_browser_state(provider, saved_url)
 
