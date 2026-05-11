@@ -80,7 +80,6 @@ from mcp_server.tools.web import (
 from mcp_server.tools.windows import (
     handle_focus_window,
     handle_get_windows,
-    handle_open_url,
     handle_resize_window,
 )
 from mcp_server.tools.git import (
