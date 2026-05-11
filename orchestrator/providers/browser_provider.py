@@ -61,7 +61,6 @@ import logging
 import os
 import platform
 import re
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -407,13 +406,13 @@ class BrowserProvider(BaseProvider):
                             "Please reopen the existing provider chat window and resend."
                         ),
                     }
-                
+
                 if clear_chat:
                     logger.info(f"Clearing chat context by reloading {page.url}...")
                     await page.goto(page.url, wait_until="domcontentloaded")
                     await asyncio.sleep(2.0)
                     self._sent_system_prompt = False
-                    
+
                 cfg = self._site_configs[site]
 
                 image_attachments = [
@@ -577,7 +576,8 @@ class BrowserProvider(BaseProvider):
             logger.warning("Bridge /v1/send timed out (prompt may already be injected)")
             return {
                 "type": "text",
-                "content": "NEED_HELP: Bridge /v1/send timed out. The prompt may have been partially sent. Please check the browser window and retry if needed.",
+                "content": "NEED_HELP: Bridge /v1/send timed out. "
+                "The prompt may have been partially sent. Please check the browser window and retry if needed.",
             }
         except Exception as e:
             logger.warning(f"Bridge /v1/send failed ({e})")
@@ -952,7 +952,7 @@ class BrowserProvider(BaseProvider):
     @staticmethod
     def _extract_conversation_id(url: str) -> str:
         """Extract a conversation-identifying path from a provider URL.
-        
+
         Examples:
             claude.ai/chat/abc-123  → /chat/abc-123
             chatgpt.com/c/xyz       → /c/xyz
@@ -969,7 +969,7 @@ class BrowserProvider(BaseProvider):
         Resets when:
         1. The site/domain changed (e.g. claude.ai → gemini.google.com)
         2. The conversation ID changed within the same site (e.g. /chat/123 → /chat/456)
-        
+
         Does NOT reset for trivial URL changes like query param updates.
         """
         if not self._last_chat_page_url:
@@ -1227,7 +1227,8 @@ class BrowserProvider(BaseProvider):
                     if (!el) return false;
                     el.focus();
                     if ('value' in el) {
-                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+                        const proto = window.HTMLTextAreaElement.prototype;
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
                         if (nativeInputValueSetter) {
                             nativeInputValueSetter.call(el, text);
                         } else {
@@ -1287,7 +1288,7 @@ class BrowserProvider(BaseProvider):
         prompt as multiple broken messages.
         """
         actual = await self._read_editor_text(page, selector)
-        
+
         def normalize_typo(s: str) -> str:
             return (
                 " ".join(s.split())
@@ -1296,7 +1297,7 @@ class BrowserProvider(BaseProvider):
                 .replace("—", "--").replace("–", "--")
                 .replace("…", "...")
             )
-            
+
         expected_norm = normalize_typo(expected)
         actual_norm = normalize_typo(actual)
 
@@ -1309,22 +1310,24 @@ class BrowserProvider(BaseProvider):
             return actual_norm == expected_norm
 
         if len(actual_norm) < max(_VERIFY_MIN_CHARS, int(len(expected_norm) * 0.98)):
-            logger.warning(f"Injection failed: actual length {len(actual_norm)} is < 98% of expected {len(expected_norm)}")
+            logger.warning(f"Injection failed: actual length {len(actual_norm)} is "
+                           f"< 98% of expected {len(expected_norm)}")
             return False
-            
+
         # We only need the first/last few chars to match to ensure it wasn't truncated.
         # But we use a fuzzy check in case of stray punctuation that wasn't normalized.
         def fuzzy_match(a: str, b: str) -> bool:
             # Strip all non-alphanumeric chars for the boundary check
-            import re
             return re.sub(r'\W+', '', a) == re.sub(r'\W+', '', b)
 
         if not fuzzy_match(actual_norm[:200], expected_norm[:200]):
-            logger.warning(f"Injection failed: Prefix mismatch. Actual: {actual_norm[:50]}... Expected: {expected_norm[:50]}...")
+            logger.warning(f"Injection failed: Prefix mismatch. Actual: {actual_norm[:50]}... "
+                           f"Expected: {expected_norm[:50]}...")
             return False
-            
+
         if not fuzzy_match(actual_norm[-200:], expected_norm[-200:]):
-            logger.warning(f"Injection failed: Suffix mismatch. Actual: ...{actual_norm[-50:]} Expected: ...{expected_norm[-50:]}")
+            logger.warning(f"Injection failed: Suffix mismatch. Actual: ...{actual_norm[-50:]} "
+                           f"Expected: ...{expected_norm[-50:]}")
             return False
 
         return True
@@ -1333,7 +1336,9 @@ class BrowserProvider(BaseProvider):
     # Send + wait + scrape
     # ==================================================================
 
-    async def _send_and_wait(self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = "") -> str:
+    async def _send_and_wait(
+        self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = ""
+    ) -> str:
         """Inject the prompt, click Send, and wait for the full response."""
         # Find the best response selector and count current responses before sending
         response_sel = await self._find_selector(page, cfg["response_selectors"])
@@ -1395,10 +1400,10 @@ class BrowserProvider(BaseProvider):
 
         # Wait for generation to finish (stop button disappears or completion hash found)
         await self._wait_for_generation_complete(
-            page, 
-            cfg["stop_selectors"], 
-            cfg["response_selectors"], 
-            completion_hash, 
+            page,
+            cfg["stop_selectors"],
+            cfg["response_selectors"],
+            completion_hash,
             site,
             min_index=new_element_index
         )
@@ -1428,8 +1433,6 @@ class BrowserProvider(BaseProvider):
                 continue
         return None
 
-
-
     async def _wait_for_new_response(
         self, page: Page, response_sel: str, initial_count: int
     ) -> bool:
@@ -1446,7 +1449,13 @@ class BrowserProvider(BaseProvider):
         return False
 
     async def _wait_for_generation_complete(
-        self, page: Page, stop_selectors: list[str], response_selectors: list[str], completion_hash: str | None, site: str = "AI", min_index: int = 0
+        self,
+        page: Page,
+        stop_selectors: list[str],
+        response_selectors: list[str],
+        completion_hash: str | None,
+        site: str = "AI",
+        min_index: int = 0
     ) -> None:
         """
         Wait until all known stop-button selectors are invisible (generation
@@ -1461,16 +1470,18 @@ class BrowserProvider(BaseProvider):
         # returning old responses when TTFT is slow (#21)
         min_generation_time = loop.time() + 5.0
         elapsed = 0
-        
+
         last_text_len = 0
         idle_count = 0
-        
+
         while loop.time() < deadline:
             # Check for completion hash first to short-circuit
             current_text = ""
             try:
                 current_text = await self._scrape_last_response(page, response_selectors, min_index=min_index)
-                logger.debug(f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}")
+                logger.debug(
+                    f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}"
+                )
                 if completion_hash and completion_hash in current_text:
                     logger.debug("Generation complete (completion hash found)")
                     return
