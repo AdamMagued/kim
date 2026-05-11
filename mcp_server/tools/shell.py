@@ -87,7 +87,9 @@ async def handle_run_command(args: dict) -> str:
     cmd = args["cmd"]
     cwd = str(args.get("cwd", str(PROJECT_ROOT)))
     timeout = int(args.get("timeout", SHELL_TIMEOUT))
-    allow_chaining = bool(args.get("allow_chaining", False))
+    # allow_chaining is deprecated since we now force subprocess.exec which doesn't support it,
+    # but we still parse it if provided, while preventing command chaining at the check_blocked layer
+    allow_chaining = False
 
     block_msg = _check_blocked(cmd, allow_chaining=allow_chaining)
     if block_msg:
@@ -107,12 +109,21 @@ async def handle_run_command(args: dict) -> str:
 
     logger.info(f"run_command: {cmd!r} cwd={cwd}")
     try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
+        try:
+            args_list = shlex.split(cmd, posix=not IS_WINDOWS)
+        except ValueError:
+            return "BLOCKED: Command has malformed shell quoting"
+
+        if not args_list:
+            return "ERROR: Empty command"
+
+        proc = await asyncio.create_subprocess_exec(
+            *args_list,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
         )
+
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
