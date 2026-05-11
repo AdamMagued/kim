@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4718,11 +4718,10 @@ async fn summarize_session(
             if let Some(ref t) = text {
                 let clean = t.trim();
                 // Skip tool result pseudo-user messages
-                if !clean.starts_with("[Tool result:") && !clean.is_empty() {
-                    if first_user_text.is_none() {
+                if !clean.starts_with("[Tool result:") && !clean.is_empty()
+                    && first_user_text.is_none() {
                         first_user_text = Some(clean.strip_prefix("Task: ").unwrap_or(clean).to_string());
                     }
-                }
             }
         } else if role == "assistant" {
             if let Some(ref t) = text {
