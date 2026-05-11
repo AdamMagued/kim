@@ -691,9 +691,14 @@ class KimAgent:
             _file_path = args.get("path") or args.get("file_path")
             if _file_path:
                 try:
-                    with open(_file_path, "r", encoding="utf-8", errors="ignore") as _f:
-                        _before_lines = sum(1 for _ in _f)
-                except (OSError, IOError):
+                    def _count_lines():
+                        try:
+                            with open(_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                return sum(1 for _ in f)
+                        except (OSError, IOError):
+                            return 0
+                    _before_lines = await asyncio.to_thread(_count_lines)
+                except Exception:
                     _before_lines = 0
 
         # ── Pre-screenshot: show flash overlay then hide main window ──
