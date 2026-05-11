@@ -945,10 +945,10 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
     },
     deepseek: {
       input_selectors: ["textarea#chat-input", "textarea"],
-      send_selectors: ["button[aria-label*='Send']", "button[type='submit']", "div[role='button']"],
+      send_selectors: ["button[aria-label*='Send']", "button[type='submit']"],
       stop_selectors: ["button[aria-label*='Stop']", "div[role='button'][class*='stop']"],
       response_selectors: ["div.ds-markdown"],
-      upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']", "div[role='button']"],
+      upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']"],
       file_input_selectors: ["input[type='file']"],
     },
     grok: {
@@ -2007,10 +2007,10 @@ fn build_bridge_complete_script(
     },
     deepseek: {
       input_selectors: ["textarea#chat-input", "textarea"],
-      send_selectors: ["button[aria-label*='Send']", "button[type='submit']", "div[role='button']"],
+      send_selectors: ["button[aria-label*='Send']", "button[type='submit']"],
       stop_selectors: ["button[aria-label*='Stop']", "div[role='button'][class*='stop']"],
       response_selectors: ["div.ds-markdown"],
-            upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']", "div[role='button']"],
+            upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']"],
             file_input_selectors: ["input[type='file']"],
     },
     grok: {

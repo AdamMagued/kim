@@ -508,7 +508,7 @@ kim_sessions/
 | `DEEPSEEK_API_KEY` | For DeepSeek API provider |
 
 ---
-
+w
 ## 5. SESSION DATA FORMAT
 
 **JSONL messages** (one per line):
