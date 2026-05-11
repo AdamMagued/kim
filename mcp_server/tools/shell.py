@@ -107,8 +107,15 @@ async def handle_run_command(args: dict) -> str:
 
     logger.info(f"run_command: {cmd!r} cwd={cwd}")
     try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
+        # Use shlex to safely split the command string into an argument list.
+        # Use posix=not IS_WINDOWS to correctly handle backslashes on Windows.
+        cmd_args = shlex.split(cmd, posix=not IS_WINDOWS)
+
+        if not cmd_args:
+            return "ERROR: empty command provided"
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
