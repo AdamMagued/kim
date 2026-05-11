@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2919,26 +2919,28 @@ fn collect_bridge_payload(
             let _ = condvar.wait_timeout(guard, wait_duration);
         }
 
-        // Always try legacy title-pull on every iteration.
+        // Try legacy title-pull if IPC hasn't delivered after 3 seconds.
         // Tauri IPC (emit) does NOT work on external pages — __TAURI_INTERNALS__
         // is not injected even with remote IPC capabilities. The JS bridge stores
         // results in window.__kimBridgeStore which we poll via title-pull.
-        match pull_payload_from_js_store_legacy(window, &req_id_json) {
-            Ok(Some(payload)) => {
-                agent_debug_log(
-                    "H2",
-                    "collect: result found via title-pull",
-                    serde_json::json!({ "reqId": req_id, "loops": ipc_wait_loops }),
-                );
-                return Ok(payload);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                agent_debug_log(
-                    "H3",
-                    "collect title-pull failed",
-                    serde_json::json!({ "reqId": req_id, "error": e }),
-                );
+        if started.elapsed() > Duration::from_secs(3) {
+            match pull_payload_from_js_store_legacy(window, &req_id_json) {
+                Ok(Some(payload)) => {
+                    agent_debug_log(
+                        "H2",
+                        "collect: result found via title-pull",
+                        serde_json::json!({ "reqId": req_id, "loops": ipc_wait_loops }),
+                    );
+                    return Ok(payload);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    agent_debug_log(
+                        "H3",
+                        "collect title-pull failed",
+                        serde_json::json!({ "reqId": req_id, "error": e }),
+                    );
+                }
             }
         }
     }
@@ -4718,11 +4720,10 @@ async fn summarize_session(
             if let Some(ref t) = text {
                 let clean = t.trim();
                 // Skip tool result pseudo-user messages
-                if !clean.starts_with("[Tool result:") && !clean.is_empty() {
-                    if first_user_text.is_none() {
+                if !clean.starts_with("[Tool result:") && !clean.is_empty()
+                    && first_user_text.is_none() {
                         first_user_text = Some(clean.strip_prefix("Task: ").unwrap_or(clean).to_string());
                     }
-                }
             }
         } else if role == "assistant" {
             if let Some(ref t) = text {
