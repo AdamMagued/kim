@@ -175,6 +175,8 @@ pub struct BrowserRestoreResult {
     pub site: String,
     pub url: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -362,8 +364,35 @@ fn write_browser_session_meta_to_dir(
 ) -> Result<(), String> {
     fs::create_dir_all(date_dir).map_err(|e| e.to_string())?;
     let path = date_dir.join(browser_session_meta_filename(session_id));
+    let tmp_path = date_dir.join(format!("{}.browser.json.tmp", session_id));
     let text = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
-    fs::write(path, text).map_err(|e| e.to_string())
+
+    // Atomic write: write to a same-directory temp file, then rename over the
+    // target. This prevents partially-written .browser.json files when the UI
+    // and kimctl/bridge both commit URL metadata around the same time. The last
+    // successful writer wins; callers always merge against the current file
+    // before writing.
+    fs::write(&tmp_path, text).map_err(|e| e.to_string())?;
+    match fs::rename(&tmp_path, &path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            #[cfg(target_os = "windows")]
+            {
+                // Windows rename does not overwrite existing files. Fall back to
+                // remove+rename; this is not perfectly atomic, but still avoids
+                // exposing a partially-written JSON file.
+                if path.exists() {
+                    fs::remove_file(&path).map_err(|remove_err| remove_err.to_string())?;
+                }
+                fs::rename(&tmp_path, &path).map_err(|rename_err| rename_err.to_string())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = fs::remove_file(&tmp_path);
+                Err(e.to_string())
+            }
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -506,11 +535,63 @@ fn browser_url_is_bad_for_commit(url: &str, site: &str) -> bool {
 }
 
 fn browser_url_allowed_for_restore(url: &str, site: &str) -> bool {
-    let Ok(parsed) = tauri::Url::parse(url.trim()) else { return false; };
-    if !matches!(parsed.scheme(), "https" | "http") {
-        return false;
+    // Restore is deliberately stricter than "same host": do not navigate to
+    // arbitrary URLs, login/auth pages, or provider home/new-chat pages stored
+    // by mistake. Fallback home navigation is controlled separately.
+    !browser_url_is_bad_for_commit(url, site)
+}
+
+fn query_param(raw_url: &str, wanted: &str) -> Option<String> {
+    let url = tauri::Url::parse(&format!("http://localhost{}", raw_url)).ok()?;
+    for (key, value) in url.query_pairs() {
+        if key == wanted {
+            let owned = value.into_owned();
+            if !owned.trim().is_empty() {
+                return Some(owned);
+            }
+        }
     }
-    parsed.host_str().is_some_and(|host| host_matches_site(host, site))
+    None
+}
+
+fn browser_restore_status_for_session(
+    session_dir: &Path,
+    session_id: Option<&str>,
+    provider_arg: &str,
+) -> String {
+    let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "new_or_unknown".to_string();
+    };
+    if validate_session_id(session_id).is_err() {
+        return "new_or_unknown".to_string();
+    }
+
+    let site = if provider_arg.starts_with("browser:") {
+        normalize_site(provider_arg.trim_start_matches("browser:"))
+    } else if provider_arg == "browser" {
+        // The UI stores browser_last_site in the sidecar before send. If the
+        // provider is the generic "browser", read that hint below.
+        "".to_string()
+    } else {
+        return "not_browser".to_string();
+    };
+
+    let date_dir = match resolve_session_date_dir(session_dir, session_id, None) {
+        Ok(v) => v,
+        Err(_) => return "new_or_unknown".to_string(),
+    };
+    let meta = read_browser_session_meta_from_dir(&date_dir, session_id).unwrap_or_default();
+    let resolved_site = if site.is_empty() {
+        meta.browser_last_site.clone().unwrap_or_else(|| "claude".to_string())
+    } else {
+        site
+    };
+
+    match meta.browser_threads.get(&resolved_site) {
+        Some(url) if browser_url_allowed_for_restore(url, &resolved_site) => "stored_thread".to_string(),
+        Some(_) => "stored_url_rejected".to_string(),
+        None => "no_stored_url".to_string(),
+    }
 }
 
 fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<SessionInfo>, String> {
@@ -4106,6 +4187,287 @@ fn handle_webview_bridge_request(
                 "browser_visible": browser_visible,
             }));
         }
+        (Method::Get, "/v1/browser/current-url") => {
+            let current_url = app_handle
+                .get_webview_window("kim-browser-signin")
+                .map(|w| webview_current_href(&w))
+                .filter(|u| !u.trim().is_empty());
+            respond_json(request, 200, serde_json::json!({
+                "ok": true,
+                "url": current_url,
+            }));
+        }
+        (Method::Get, "/v1/browser/meta") => {
+            let raw_url = request.url().to_string();
+            let Some(session_id) = query_param(&raw_url, "session_id") else {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": "session_id is required."}));
+                return;
+            };
+            if let Err(e) = validate_session_id(&session_id) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                return;
+            }
+            let session_type = query_param(&raw_url, "session_type").unwrap_or_else(|| "kim".to_string());
+            let session_date = query_param(&raw_url, "session_date");
+            let kim_dir = query_param(&raw_url, "kim_dir");
+            let claw_dir = query_param(&raw_url, "claw_dir");
+            let base = session_base_dir(&session_type, kim_dir, claw_dir);
+            match resolve_session_date_dir(&base, &session_id, session_date.as_deref()) {
+                Ok(date_dir) => {
+                    let meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
+                    respond_json(request, 200, serde_json::json!({"ok": true, "meta": meta}));
+                }
+                Err(e) => respond_json(request, 400, serde_json::json!({"ok": false, "error": e})),
+            }
+        }
+        (Method::Post, "/v1/browser/meta") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                return;
+            }
+
+            #[derive(Deserialize)]
+            struct BrowserMetaWriteRequest {
+                session_id: String,
+                #[serde(default)]
+                session_date: Option<String>,
+                #[serde(default)]
+                session_type: Option<String>,
+                #[serde(default)]
+                site: Option<String>,
+                #[serde(default)]
+                url: Option<String>,
+                #[serde(default)]
+                browser_last_site: Option<String>,
+                #[serde(default)]
+                kim_dir: Option<String>,
+                #[serde(default)]
+                claw_dir: Option<String>,
+            }
+
+            let parsed: BrowserMetaWriteRequest = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    return;
+                }
+            };
+            if let Err(e) = validate_session_id(&parsed.session_id) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                return;
+            }
+
+            let stype = parsed.session_type.unwrap_or_else(|| "kim".to_string());
+            let base = session_base_dir(&stype, parsed.kim_dir, parsed.claw_dir);
+            let date_dir = match resolve_session_date_dir(&base, &parsed.session_id, parsed.session_date.as_deref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
+            let mut meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id).unwrap_or_default();
+
+            if let Some(last) = parsed.browser_last_site.as_deref().map(normalize_site).filter(|s| !s.is_empty()) {
+                meta.browser_last_site = Some(last);
+            }
+
+            if let (Some(site_raw), Some(url_raw)) = (parsed.site.as_deref(), parsed.url.as_deref()) {
+                let site_norm = normalize_site(site_raw);
+                if browser_url_is_bad_for_commit(url_raw, &site_norm) {
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("Refusing to store non-conversation/login URL for {}.", site_norm),
+                        }),
+                    );
+                    return;
+                }
+                meta.browser_threads.insert(site_norm.clone(), url_raw.trim().to_string());
+                meta.browser_last_site = Some(site_norm);
+            }
+
+            meta.browser_threads_updated_at_ms = Some(now_ms());
+            match write_browser_session_meta_to_dir(&date_dir, &parsed.session_id, &meta) {
+                Ok(()) => respond_json(request, 200, serde_json::json!({"ok": true, "meta": meta})),
+                Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": e})),
+            }
+        }
+        (Method::Post, "/v1/browser/commit-url") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                return;
+            }
+
+            #[derive(Deserialize)]
+            struct BrowserCommitRequest {
+                session_id: String,
+                #[serde(default)]
+                session_date: Option<String>,
+                #[serde(default)]
+                session_type: Option<String>,
+                #[serde(default)]
+                preferred_site: Option<String>,
+                #[serde(default)]
+                kim_dir: Option<String>,
+                #[serde(default)]
+                claw_dir: Option<String>,
+            }
+
+            let parsed: BrowserCommitRequest = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    return;
+                }
+            };
+            if let Err(e) = validate_session_id(&parsed.session_id) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                return;
+            }
+
+            let Some(win) = app_handle.get_webview_window("kim-browser-signin") else {
+                respond_json(request, 200, serde_json::json!({"ok": true, "committed": false, "reason": "no_browser_window"}));
+                return;
+            };
+            let current_url = webview_current_href(&win);
+            let site = parsed.preferred_site
+                .as_deref()
+                .map(normalize_site)
+                .filter(|s| !s.is_empty())
+                .or_else(|| browser_url_site(&current_url))
+                .unwrap_or_else(|| "claude".to_string());
+
+            let stype = parsed.session_type.unwrap_or_else(|| "kim".to_string());
+            let base = session_base_dir(&stype, parsed.kim_dir, parsed.claw_dir);
+            let date_dir = match resolve_session_date_dir(&base, &parsed.session_id, parsed.session_date.as_deref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
+            let mut meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id).unwrap_or_default();
+
+            if browser_url_is_bad_for_commit(&current_url, &site) {
+                // Preserve any useful previous URL; only update the last-site hint.
+                meta.browser_last_site = Some(site);
+                meta.browser_threads_updated_at_ms = Some(now_ms());
+                let _ = write_browser_session_meta_to_dir(&date_dir, &parsed.session_id, &meta);
+                respond_json(request, 200, serde_json::json!({"ok": true, "committed": false, "reason": "ignored_bad_url", "meta": meta}));
+                return;
+            }
+
+            meta.browser_threads.insert(site.clone(), current_url);
+            meta.browser_last_site = Some(site);
+            meta.browser_threads_updated_at_ms = Some(now_ms());
+            match write_browser_session_meta_to_dir(&date_dir, &parsed.session_id, &meta) {
+                Ok(()) => respond_json(request, 200, serde_json::json!({"ok": true, "committed": true, "meta": meta})),
+                Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": e})),
+            }
+        }
+        (Method::Post, "/v1/browser/restore") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                return;
+            }
+
+            #[derive(Deserialize)]
+            struct BrowserRestoreRequest {
+                session_id: String,
+                #[serde(default)]
+                session_date: Option<String>,
+                #[serde(default)]
+                session_type: Option<String>,
+                #[serde(default)]
+                preferred_site: Option<String>,
+                #[serde(default)]
+                kim_dir: Option<String>,
+                #[serde(default)]
+                claw_dir: Option<String>,
+            }
+
+            let parsed: BrowserRestoreRequest = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    return;
+                }
+            };
+            if let Err(e) = validate_session_id(&parsed.session_id) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                return;
+            }
+            if is_bridge_task_running() {
+                respond_json(request, 409, serde_json::json!({
+                    "ok": false,
+                    "error": "Cannot restore provider browser while Kim is running a task.",
+                }));
+                return;
+            }
+
+            let stype = parsed.session_type.unwrap_or_else(|| "kim".to_string());
+            let base = session_base_dir(&stype, parsed.kim_dir, parsed.claw_dir);
+            let date_dir = match resolve_session_date_dir(&base, &parsed.session_id, parsed.session_date.as_deref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
+            let meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id).unwrap_or_default();
+            let site = parsed.preferred_site
+                .as_deref()
+                .map(normalize_site)
+                .filter(|s| !s.is_empty())
+                .or(meta.browser_last_site.clone())
+                .unwrap_or_else(|| "claude".to_string());
+
+            let mut restored = false;
+            let mut reason = "fallback_home".to_string();
+            let target = if let Some(saved) = meta.browser_threads.get(&site) {
+                if browser_url_allowed_for_restore(saved, &site) {
+                    restored = true;
+                    reason = "stored_thread".to_string();
+                    saved.clone()
+                } else {
+                    reason = "stored_url_rejected".to_string();
+                    fresh_site_url(&site, None)
+                }
+            } else {
+                reason = "no_stored_url".to_string();
+                fresh_site_url(&site, None)
+            };
+
+            let provider_name = Some(format!("{} (session)", capitalize(&site)));
+            match open_browser_signin_window_impl(&target, provider_name, &app_handle) {
+                Ok(_) => {
+                    let message = if restored {
+                        "Restored the saved browser conversation for this session."
+                    } else if reason == "stored_url_rejected" {
+                        "Saved browser URL was not safe/valid; opened a fresh provider page."
+                    } else {
+                        "No saved browser conversation for this provider; opened the provider start page."
+                    };
+                    respond_json(request, 200, serde_json::json!({
+                        "ok": true,
+                        "result": BrowserRestoreResult {
+                            restored,
+                            site,
+                            url: target,
+                            reason,
+                            message: Some(message.to_string()),
+                        },
+                    }));
+                }
+                Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": format!("{}", e)})),
+            }
+        }
         (Method::Post, "/v1/task") => {
             let mut body = String::new();
             if let Err(e) = request.as_reader().read_to_string(&mut body) {
@@ -4203,6 +4565,15 @@ fn handle_webview_bridge_request(
                 cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
                     .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
                     .env("KIM_WEBVIEW_WINDOW_LABEL", "kim-browser-signin");
+            }
+
+            if provider == "browser" || provider.starts_with("browser:") {
+                let restore_status = browser_restore_status_for_session(
+                    &session_dir,
+                    Some(&session_id),
+                    &provider,
+                );
+                cmd.env("KIM_BROWSER_RESTORE_STATUS", restore_status);
             }
 
             match cmd.spawn() {
@@ -5574,6 +5945,9 @@ async fn navigate_browser_window_if_open(url: String, app_handle: tauri::AppHand
     if trimmed.is_empty() {
         return Err("URL cannot be empty.".to_string());
     }
+    if browser_url_site(trimmed).is_none() {
+        return Err("Refusing to navigate the provider browser to a non-provider URL.".to_string());
+    }
 
     if let Some(existing) = app_handle.get_webview_window("kim-browser-signin") {
         let task_running = is_bridge_task_running();
@@ -5751,11 +6125,20 @@ async fn restore_browser_for_session(
     let provider_name = Some(format!("{} (session)", capitalize(&site)));
     open_browser_signin_window_impl(&target, provider_name, &app_handle)?;
 
+    let message = if restored {
+        Some("Restored the saved browser conversation for this session.".to_string())
+    } else if meta.browser_threads.get(&site).is_some() {
+        Some("Saved browser URL was no longer safe/valid, so Kim opened a fresh provider page.".to_string())
+    } else {
+        Some("No saved browser conversation for this provider; opened the provider start page.".to_string())
+    };
+
     Ok(BrowserRestoreResult {
         restored,
         site,
         url: target,
         reason,
+        message,
     })
 }
 
@@ -6052,6 +6435,15 @@ async fn send_task(
                 .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
                 .env("KIM_WEBVIEW_WINDOW_LABEL", "kim-browser-signin");
         }
+    }
+
+    if is_browser_provider {
+        let restore_status = browser_restore_status_for_session(
+            &session_dir,
+            resume_session_id.as_deref(),
+            &provider_arg,
+        );
+        cmd.env("KIM_BROWSER_RESTORE_STATUS", restore_status);
     }
 
     // Chrome CDP launch is needed whenever a browser provider is in play —

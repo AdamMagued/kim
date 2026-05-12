@@ -31,3 +31,7 @@ node TypeScript transpile syntax check for desktop/src/components/ChatView.tsx a
 ```
 
 Rust could not be compiled in this environment because `rustc` is not installed here.
+
+## Follow-up: second patch (bridge + kimctl + UX)
+
+See **`SECOND_PATCH_NOTES.md`** in the repo for HTTP `/v1/browser/*` routes, `kimctl browser …` commands, restore UX, race guards, lighter recap when `KIM_BROWSER_RESTORE_STATUS=stored_thread`, and expanded protocol tests (BrowserProvider tests skip without Playwright).

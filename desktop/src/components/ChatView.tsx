@@ -948,6 +948,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // even when the task "succeeded" with a NEED_HELP (e.g., 409 sign-in required).
   const lastRunTaskRef = useRef<PendingTask | null>(null);
   const previousProviderRef = useRef(settings.provider);
+  const restoreSeqRef = useRef(0);
+  const lastRestoreKeyRef = useRef<string | null>(null);
+  const isRunningRef = useRef(isRunning);
+  useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
   // Set to true when the kim-agent-done event fires; prevents the invoke()
   // rejection from double-reporting errors.
   const doneHandledRef = useRef(false);
@@ -1636,30 +1640,69 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   }, [browserCommandArgs, resolveProvider]);
 
   const restoreBrowserForSession = useCallback(async (targetSession: SessionInfo, preferredSite?: string | null) => {
-    const site = normalizeBrowserSite(preferredSite) ?? browserProviderFromSession(targetSession) ?? browserSiteFromProvider(resolveProvider());
+    const site = normalizeBrowserSite(preferredSite)
+      ?? browserProviderFromSession(targetSession)
+      ?? browserSiteFromProvider(resolveProvider())
+      ?? browserProvider;
     if (!site) return null;
     try {
       return await invoke<BrowserRestoreResult>('restore_browser_for_session', {
         ...browserCommandArgs(targetSession),
         preferredSite: site,
       });
-    } catch {
+    } catch (err) {
+      toast(`Could not restore the provider browser: ${friendlyError(String(err))}`, 'warning', 5000);
       return null;
     }
-  }, [browserCommandArgs, resolveProvider]);
+  }, [browserCommandArgs, resolveProvider, browserProvider]);
 
-  // Restore the provider browser to this Kim session's remembered provider/thread.
-  // Old sessions with no browser metadata do nothing, so a new chat never
-  // inherits another session's provider URL.
+  // Restore the provider browser for every concrete session entry path
+  // (sidebar select, auto-select after task, tab/session remount). A monotonically
+  // increasing sequence number prevents stale restores from showing toasts after
+  // the user has already switched to another session/provider.
   useEffect(() => {
     if (!session || newChatMode) return;
-    const savedSite = browserProviderFromSession(session);
-    if (!savedSite) return;
 
-    setBrowserProvider(savedSite);
-    setLocalProvider(`browser:${savedSite}`);
-    void restoreBrowserForSession(session, savedSite);
-  }, [session?.session_key, session?.session_id, newChatMode, restoreBrowserForSession]);
+    const savedSite = browserProviderFromSession(session);
+    const fallbackSite = browserSiteFromProvider(resolveProvider()) ?? browserProvider;
+    const site = savedSite ?? fallbackSite;
+    if (!site) return;
+
+    if (savedSite) {
+      setBrowserProvider(savedSite);
+      setLocalProvider(`browser:${savedSite}`);
+    }
+
+    const restoreKey = `${session.session_type}:${session.date}:${session.session_id}:${site}`;
+    if (lastRestoreKeyRef.current === restoreKey) return;
+    lastRestoreKeyRef.current = restoreKey;
+
+    const seq = restoreSeqRef.current + 1;
+    restoreSeqRef.current = seq;
+
+    void (async () => {
+      const result = await restoreBrowserForSession(session, site);
+      if (restoreSeqRef.current !== seq) return;
+      if (!result) return;
+
+      if (result.restored) {
+        toast(`Restored ${providerLabel('browser:' + result.site)} for this session.`, 'info', 2500);
+      } else if (result.reason === 'stored_url_rejected') {
+        toast(result.message ?? 'Saved browser URL was invalid, so Kim opened a fresh provider page.', 'warning', 5000);
+      }
+    })();
+  }, [
+    session?.session_key,
+    session?.session_id,
+    session?.date,
+    session?.session_type,
+    session?.browser_last_site,
+    session?.browser_threads_updated_at_ms,
+    newChatMode,
+    browserProvider,
+    resolveProvider,
+    restoreBrowserForSession,
+  ]);
 
   const makePendingTask = useCallback((text: string, providerOverride?: string): PendingTask => {
     return {
@@ -2102,13 +2145,22 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                 const val = e.target.value;
                 const previousSite = browserSiteFromProvider(resolveProvider());
 
+                if (isRunningRef.current) {
+                  toast('Finish or cancel the current task before switching providers.', 'warning', 3500);
+                  return;
+                }
+
                 if (val.startsWith('browser:')) {
                   const sub = normalizeBrowserSite(val.split(':')[1]);
                   if (!sub) return;
 
-                  // Save the old thread before switching away from it.
+                  // Save the old thread before switching away from it. Rust
+                  // filters generic home/login pages so this cannot corrupt a
+                  // previously useful URL.
                   await commitCurrentBrowserUrl(previousSite);
 
+                  restoreSeqRef.current += 1;
+                  lastRestoreKeyRef.current = null;
                   setLocalProvider(`browser:${sub}`);
                   setBrowserProvider(sub);
 
@@ -2124,9 +2176,15 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                     } catch {
                       // Non-fatal.
                     }
+                    const seq = restoreSeqRef.current + 1;
+                    restoreSeqRef.current = seq;
                     const result = await restoreBrowserForSession(targetSession, sub);
-                    if (result?.restored) {
-                      toast(`Restored ${providerLabel('browser:' + sub)} for this session.`, 'info', 3000);
+                    if (restoreSeqRef.current === seq && result) {
+                      if (result.restored) {
+                        toast(`Restored ${providerLabel('browser:' + sub)} for this session.`, 'info', 3000);
+                      } else if (result.reason === 'stored_url_rejected') {
+                        toast(result.message ?? 'Saved browser URL was invalid, so Kim opened a fresh provider page.', 'warning', 5000);
+                      }
                     }
                   } else {
                     const newUrl = BROWSER_PROVIDER_URLS[sub];
@@ -2139,13 +2197,14 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                             providerName: sub.charAt(0).toUpperCase() + sub.slice(1),
                           });
                         }
-                      } catch {
-                        // Provider switch should not block composer use.
+                      } catch (err) {
+                        toast(`Could not switch browser provider: ${friendlyError(String(err))}`, 'warning', 5000);
                       }
                     }
                   }
                 } else {
                   await commitCurrentBrowserUrl(previousSite);
+                  restoreSeqRef.current += 1;
                   setLocalProvider(val);
                 }
               }}
