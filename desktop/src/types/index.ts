@@ -10,6 +10,22 @@ export interface SessionInfo {
   summary?: string;
   session_type: 'kim' | 'claw';
   project_path?: string;
+  browser_threads?: Record<string, string>;
+  browser_last_site?: string;
+  browser_threads_updated_at_ms?: number;
+}
+
+export interface BrowserSessionMeta {
+  browser_threads: Record<string, string>;
+  browser_last_site?: string;
+  browser_threads_updated_at_ms?: number;
+}
+
+export interface BrowserRestoreResult {
+  restored: boolean;
+  site: string;
+  url: string;
+  reason: string;
 }
 
 // ── Message / content types ──────────────────────────────────────────────────

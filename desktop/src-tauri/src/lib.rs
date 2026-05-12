@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,6 +50,12 @@ struct BridgeCompleteRequest {
     attachments: Vec<BridgeAttachment>,
     #[serde(default)]
     completion_hash: Option<String>,
+    /// When true, navigate the provider webview to a fresh chat page before
+    /// injecting the prompt. BrowserProvider uses this for Claw bridge relays
+    /// because each relay prompt already contains the full Claw conversation;
+    /// keeping the provider page history can make the scraper read stale bubbles.
+    #[serde(default)]
+    clear_chat: bool,
     /// Optional authuser index for Google multi-account routing.
     /// When set, the browser window navigates to gemini.google.com?authuser=N
     /// before injecting the prompt.
@@ -131,6 +137,12 @@ pub struct SessionInfo {
     pub has_summary: bool,
     pub summary: Option<String>,
     pub session_type: String, // "kim" or "claw"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_threads: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_last_site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_threads_updated_at_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -144,6 +156,25 @@ pub struct CompletedClawSession {
     pub summary: Option<String>,
     pub session_type: String,
     pub project_path: String,
+}
+
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct BrowserSessionMeta {
+    #[serde(default)]
+    pub browser_threads: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_last_site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_threads_updated_at_ms: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BrowserRestoreResult {
+    pub restored: bool,
+    pub site: String,
+    pub url: String,
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -313,6 +344,175 @@ fn validate_session_id(session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+
+fn browser_session_meta_filename(session_id: &str) -> String {
+    format!("{}.browser.json", session_id)
+}
+
+fn read_browser_session_meta_from_dir(date_dir: &Path, session_id: &str) -> Option<BrowserSessionMeta> {
+    let path = date_dir.join(browser_session_meta_filename(session_id));
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<BrowserSessionMeta>(&raw).ok()
+}
+
+fn write_browser_session_meta_to_dir(
+    date_dir: &Path,
+    session_id: &str,
+    meta: &BrowserSessionMeta,
+) -> Result<(), String> {
+    fs::create_dir_all(date_dir).map_err(|e| e.to_string())?;
+    let path = date_dir.join(browser_session_meta_filename(session_id));
+    let text = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
+    fs::write(path, text).map_err(|e| e.to_string())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn session_base_dir(session_type: &str, kim_dir: Option<String>, claw_dir: Option<String>) -> PathBuf {
+    if session_type == "claw" {
+        claw_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir)
+    } else {
+        kim_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir)
+    }
+}
+
+fn resolve_session_date_dir(
+    base: &Path,
+    session_id: &str,
+    session_date: Option<&str>,
+) -> Result<PathBuf, String> {
+    validate_session_id(session_id)?;
+
+    if let Some(date) = session_date.map(str::trim).filter(|d| !d.is_empty()) {
+        let dir = base.join(date);
+        if dir.join(format!("{}.jsonl", session_id)).exists()
+            || dir.join(browser_session_meta_filename(session_id)).exists()
+            || dir.exists()
+        {
+            return Ok(dir);
+        }
+    }
+
+    if base.exists() {
+        let mut date_dirs: Vec<PathBuf> = fs::read_dir(base)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        date_dirs.sort_by_key(|p| std::cmp::Reverse(p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()));
+        for dir in date_dirs {
+            if dir.join(format!("{}.jsonl", session_id)).exists()
+                || dir.join(browser_session_meta_filename(session_id)).exists()
+            {
+                return Ok(dir);
+            }
+        }
+    }
+
+    // New chat fallback: create today's date bucket. This keeps metadata next to
+    // the session file once the first run creates it.
+    let today = chrono_like_today();
+    Ok(base.join(today))
+}
+
+fn chrono_like_today() -> String {
+    // Avoid adding a new dependency. Good enough for naming a fallback date dir;
+    // most existing call sites pass the real session date.
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    // Civil date conversion from days since Unix epoch.
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}", year, m, d)
+}
+
+fn host_matches_site(host: &str, site: &str) -> bool {
+    let host = host.trim().trim_start_matches("www.").to_ascii_lowercase();
+    match normalize_site(site).as_str() {
+        "claude" => host == "claude.ai" || host.ends_with(".claude.ai"),
+        "chatgpt" => host == "chatgpt.com" || host == "chat.openai.com" || host.ends_with(".chatgpt.com"),
+        "gemini" => host == "gemini.google.com",
+        "deepseek" => host == "chat.deepseek.com" || host.ends_with(".deepseek.com"),
+        "grok" => host == "grok.com" || host == "grok.x.com" || host == "x.com",
+        _ => false,
+    }
+}
+
+fn browser_url_site(url: &str) -> Option<String> {
+    let parsed = tauri::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    for site in ["claude", "chatgpt", "gemini", "deepseek", "grok"] {
+        if host_matches_site(&host, site) {
+            return Some(site.to_string());
+        }
+    }
+    None
+}
+
+fn browser_url_is_bad_for_commit(url: &str, site: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Ok(parsed) = tauri::Url::parse(trimmed) else { return true; };
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return true;
+    }
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    if !host_matches_site(&host, site) {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("accounts.google.com")
+        || lower.contains("/login")
+        || lower.contains("signin")
+        || lower.contains("sign-in")
+        || lower.contains("servicelogin")
+        || lower.contains("signoutoptions")
+        || lower.contains("/auth")
+        || lower.contains("oauth")
+    {
+        return true;
+    }
+
+    let normalized = lower.trim_end_matches('/');
+    let site_norm = normalize_site(site);
+    match site_norm.as_str() {
+        "claude" => normalized == "https://claude.ai" || normalized == "https://claude.ai/new",
+        "chatgpt" => normalized == "https://chatgpt.com" || normalized == "https://chat.openai.com",
+        "gemini" => normalized == "https://gemini.google.com" || normalized == "https://gemini.google.com/app",
+        "deepseek" => normalized == "https://chat.deepseek.com",
+        "grok" => normalized == "https://grok.com" || normalized == "https://grok.x.com",
+        _ => true,
+    }
+}
+
+fn browser_url_allowed_for_restore(url: &str, site: &str) -> bool {
+    let Ok(parsed) = tauri::Url::parse(url.trim()) else { return false; };
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return false;
+    }
+    parsed.host_str().is_some_and(|host| host_matches_site(host, site))
+}
+
 fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<SessionInfo>, String> {
     if !base.exists() {
         return Ok(vec![]);
@@ -364,6 +564,7 @@ fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<Session
             let message_count = count_lines(&session_file).unwrap_or(0);
             let title = infer_session_title(&session_file, summary.as_ref(), &session_id);
 
+            let browser_meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
             sessions.push(SessionInfo {
                 session_key: format!("{}:{}:{}", session_type, date_str, session_id),
                 session_id,
@@ -373,6 +574,9 @@ fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<Session
                 has_summary,
                 summary,
                 session_type: session_type.to_string(),
+                browser_threads: if browser_meta.browser_threads.is_empty() { None } else { Some(browser_meta.browser_threads) },
+                browser_last_site: browser_meta.browser_last_site,
+                browser_threads_updated_at_ms: browser_meta.browser_threads_updated_at_ms,
             });
         }
     }
@@ -643,6 +847,41 @@ fn gemini_site_url(authuser: Option<u32>) -> String {
         Some(index) => format!("https://gemini.google.com/app?authuser={index}"),
         None => "https://gemini.google.com/app".to_string(),
     }
+}
+
+fn fresh_site_url(site: &str, authuser: Option<u32>) -> String {
+    if normalize_site(site) == "gemini" {
+        gemini_site_url(authuser)
+    } else {
+        default_site_url(site).to_string()
+    }
+}
+
+fn clear_provider_webview_chat(
+    window: &tauri::WebviewWindow,
+    site: &str,
+    authuser: Option<u32>,
+) -> Result<(), String> {
+    let target_url = fresh_site_url(site, authuser);
+    let js_url = serde_json::to_string(&target_url).map_err(|e| e.to_string())?;
+    window
+        .eval(format!("window.location.href = {};", js_url))
+        .map_err(|e| e.to_string())?;
+
+    // Give the provider SPA and the initialization_script-backed Kim bridge time
+    // to install before the next eval calls window.__kimBridge.send(...).
+    std::thread::sleep(Duration::from_millis(3500));
+
+    if normalize_site(site) == "gemini" {
+        if let Ok(mut guard) = WEBVIEW_LAST_GEMINI_AUTHUSER
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+        {
+            *guard = authuser;
+        }
+    }
+
+    Ok(())
 }
 
 fn is_bridge_task_running() -> bool {
@@ -962,7 +1201,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
   };
 
   // ── Helpers ──────────────────────────────────────────────────────────
-  const normalizeText = (v) => String(v || '').replace(/\s+/g, ' ').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/[—–]/g, '--').replace(/…/g, '...').trim();
+  const normalizeText = (v) => String(v || '').replace(/\u00a0/g, ' ').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/[—–]/g, '--').replace(/…/g, '...').trim();
 
   const isVisible = (el) => {
     if (!el) return false;
@@ -1176,18 +1415,19 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
     }
 
     // Generic: find last visible non-user response node
-    let bestText = '';
     for (const sel of cfg.response_selectors || []) {
       try {
         const nodes = Array.from(document.querySelectorAll(sel));
-        for (const node of nodes) {
+        // Iterate backwards to get the most recent message bubble
+        for (let i = nodes.length - 1; i >= 0; i--) {
+          const node = nodes[i];
           if (!node || !isVisible(node) || isLikelyUserNode(node)) continue;
           const text = normalizeText(node.innerText || node.textContent || '');
-          if (text.length > bestText.length) bestText = text;
+          if (text) return text;
         }
       } catch (_) {}
     }
-    return bestText;
+    return '';
   };
 
   const countResponseNodes = (cfg, siteKey) => {
@@ -1454,6 +1694,45 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
     const isSuperseded = () => window.__kimBridge._currentReqId !== reqId;
 
     try {
+      // 0. Auto-enable DeepThink (R1) expert mode for DeepSeek
+      if (siteKey === 'deepseek') {
+        try {
+          if (!window.__kimBridge._expertToggled) {
+            const allEls = Array.from(document.querySelectorAll('*'));
+            const expertText = allEls.find(el => {
+              // Ensure we get the actual leaf element (like the span), not a giant wrapper div
+              if (el.children.length > 0) return false;
+              const text = el.textContent ? el.textContent.trim().toLowerCase() : '';
+              return text === 'expert' || text === 'deepthink' || text === 'deepthink (r1)';
+            });
+            
+            if (expertText) {
+              console.log('[KimBridge] Enabling Expert Mode (first turn)...');
+              
+              // Many React/Vue apps ignore raw .click() in favor of pointer events
+              const rect = expertText.getBoundingClientRect();
+              const evOpts = { 
+                bubbles: true, cancelable: true, 
+                clientX: rect.x + rect.width/2, 
+                clientY: rect.y + rect.height/2 
+              };
+              
+              expertText.dispatchEvent(new PointerEvent('pointerdown', evOpts));
+              expertText.dispatchEvent(new MouseEvent('mousedown', evOpts));
+              expertText.dispatchEvent(new PointerEvent('pointerup', evOpts));
+              expertText.dispatchEvent(new MouseEvent('mouseup', evOpts));
+              expertText.click();
+              
+              window.__kimBridge._expertToggled = true;
+              // Brief pause to let UI react
+              await new Promise(r => setTimeout(r, 300));
+            }
+          }
+        } catch (e) {
+          console.warn('[KimBridge] Error toggling Expert mode:', e);
+        }
+      }
+
       // 1. Find input (use shadow-DOM-aware finder for Gemini)
       const inputEl = (siteKey === 'gemini' ? findGeminiInput() : null) || findElement(cfg.input_selectors, { visible: true });
       if (!inputEl) {
@@ -1572,7 +1851,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
           idleCount++;
         }
 
-        if (!completionHash && latestText && latestText.length > 0 && !isAnyStopVisible(cfg)) {
+        if (latestText && latestText.length > 0 && !isAnyStopVisible(cfg)) {
           if (idleCount >= 10) { // 3 seconds of no text growth
             console.log('[KimBridge] stop button gone and text idle. Falling back to latest text.');
             responseText = latestText;
@@ -2311,7 +2590,7 @@ fn build_bridge_complete_script(
         return 0;
     };
 
-    const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/[—–]/g, '--').replace(/…/g, '...').trim();
+    const normalizeText = (value) => String(value || '').replace(/\u00a0/g, ' ').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/[—–]/g, '--').replace(/…/g, '...').trim();
 
     const selectorCounts = (selectors) => {
         const out = {};
@@ -3443,6 +3722,20 @@ fn handle_webview_bridge_request(
                 prepare_gemini_webview(&window, gemini_authuser, opened_window);
             }
 
+            if parsed.clear_chat {
+                agent_debug_log("H1", "clear_chat requested for /v1/complete", serde_json::json!({
+                    "site": site.clone(),
+                }));
+                if let Err(e) = clear_provider_webview_chat(&window, &site, gemini_authuser) {
+                    respond_json(
+                        request,
+                        500,
+                        serde_json::json!({"ok": false, "error": format!("Could not clear provider chat: {}", e)}),
+                    );
+                    return;
+                }
+            }
+
             let callback_url = WEBVIEW_BRIDGE_CFG
                 .get()
                 .map(|cfg| format!("{}/v1/callback", cfg.base_url))
@@ -3607,6 +3900,20 @@ fn handle_webview_bridge_request(
                 prepare_gemini_webview(&window, gemini_authuser, opened_window);
             }
 
+            if parsed.clear_chat {
+                agent_debug_log("H1", "clear_chat requested for /v1/send", serde_json::json!({
+                    "site": site.clone(),
+                }));
+                if let Err(e) = clear_provider_webview_chat(&window, &site, gemini_authuser) {
+                    respond_json(
+                        request,
+                        500,
+                        serde_json::json!({"ok": false, "error": format!("Could not clear provider chat: {}", e)}),
+                    );
+                    return;
+                }
+            }
+
             if should_keep_browser_visible() {
                 show_browser_window_impl(&app_handle);
             }
@@ -3669,7 +3976,7 @@ fn handle_webview_bridge_request(
 
             agent_debug_log("H1", "send via persistent bridge", serde_json::json!({
                 "reqId": req_id,
-                "site": site,
+                "site": site.clone(),
                 "promptLen": parsed.prompt.len(),
                 "attachments": attachments.len(),
             }));
@@ -3764,7 +4071,7 @@ fn handle_webview_bridge_request(
                     "ok": true,
                     "req_id": req_id,
                     "sent_confirmed": sent_confirmed,
-                    "site": site,
+                    "site": site.clone(),
                 }),
             );
         }
@@ -4195,7 +4502,7 @@ fn handle_webview_bridge_request(
                 match open_browser_signin_window_impl(url, Some(site.clone()), &app_handle) {
                     Ok(_) => {
                         show_browser_window_impl(&app_handle);
-                        respond_json(request, 200, serde_json::json!({"ok": true, "site": site, "opened": true}));
+                        respond_json(request, 200, serde_json::json!({"ok": true, "site": site.clone(), "opened": true}));
                     }
                     Err(e) => {
                         respond_json(request, 500, serde_json::json!({"ok": false, "error": format!("{}", e)}));
@@ -4443,7 +4750,7 @@ fn site_to_url(site: &str) -> String {
         "chatgpt" => "https://chatgpt.com/".to_string(),
         "gemini" => "https://gemini.google.com/app".to_string(),
         "deepseek" => "https://chat.deepseek.com/".to_string(),
-        "grok" => "https://grok.x.com/".to_string(),
+        "grok" => "https://grok.com/".to_string(),
         _ => "https://claude.ai/new".to_string(),
     }
 }
@@ -4617,6 +4924,10 @@ async fn delete_sessions(
                             let summary_path = date_dir.join(format!("{}.summary.txt", session_id));
                             if summary_path.exists() {
                                 let _ = std::fs::remove_file(&summary_path);
+                            }
+                            let browser_meta_path = date_dir.join(browser_session_meta_filename(&session_id));
+                            if browser_meta_path.exists() {
+                                let _ = std::fs::remove_file(&browser_meta_path);
                             }
                         }
                     }
@@ -5280,6 +5591,172 @@ async fn navigate_browser_window_if_open(url: String, app_handle: tauri::AppHand
     } else {
         Ok(false)
     }
+}
+
+
+#[tauri::command]
+async fn get_browser_current_url(app_handle: tauri::AppHandle) -> Result<Option<String>, String> {
+    if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
+        let url = webview_current_href(&win);
+        if url.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(url))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn session_browser_meta_read(
+    session_id: String,
+    session_date: Option<String>,
+    session_type: Option<String>,
+    kim_dir: Option<String>,
+    claw_dir: Option<String>,
+) -> Result<BrowserSessionMeta, String> {
+    validate_session_id(&session_id)?;
+    let stype = session_type.unwrap_or_else(|| "kim".to_string());
+    let base = session_base_dir(&stype, kim_dir, claw_dir);
+    let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
+    Ok(read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default())
+}
+
+#[tauri::command]
+async fn session_browser_meta_write(
+    session_id: String,
+    session_date: Option<String>,
+    session_type: Option<String>,
+    site: Option<String>,
+    url: Option<String>,
+    browser_last_site: Option<String>,
+    kim_dir: Option<String>,
+    claw_dir: Option<String>,
+) -> Result<BrowserSessionMeta, String> {
+    validate_session_id(&session_id)?;
+    let stype = session_type.unwrap_or_else(|| "kim".to_string());
+    let base = session_base_dir(&stype, kim_dir, claw_dir);
+    let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
+    let mut meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
+
+    if let Some(last) = browser_last_site.as_deref().map(normalize_site).filter(|s| !s.is_empty()) {
+        meta.browser_last_site = Some(last);
+    }
+
+    if let (Some(site_raw), Some(url_raw)) = (site.as_deref(), url.as_deref()) {
+        let site_norm = normalize_site(site_raw);
+        if browser_url_is_bad_for_commit(url_raw, &site_norm) {
+            return Err(format!("Refusing to store non-conversation/login URL for {}: {}", site_norm, url_raw));
+        }
+        meta.browser_threads.insert(site_norm.clone(), url_raw.trim().to_string());
+        meta.browser_last_site = Some(site_norm);
+    }
+
+    meta.browser_threads_updated_at_ms = Some(now_ms());
+    write_browser_session_meta_to_dir(&date_dir, &session_id, &meta)?;
+    Ok(meta)
+}
+
+#[tauri::command]
+async fn session_browser_url_commit(
+    session_id: String,
+    session_date: Option<String>,
+    session_type: Option<String>,
+    preferred_site: Option<String>,
+    kim_dir: Option<String>,
+    claw_dir: Option<String>,
+    app_handle: tauri::AppHandle,
+) -> Result<BrowserSessionMeta, String> {
+    validate_session_id(&session_id)?;
+    let Some(win) = app_handle.get_webview_window("kim-browser-signin") else {
+        return session_browser_meta_read(session_id, session_date, session_type, kim_dir, claw_dir).await;
+    };
+    let current_url = webview_current_href(&win);
+    let site = preferred_site
+        .as_deref()
+        .map(normalize_site)
+        .filter(|s| !s.is_empty())
+        .or_else(|| browser_url_site(&current_url))
+        .unwrap_or_else(|| "claude".to_string());
+
+    if browser_url_is_bad_for_commit(&current_url, &site) {
+        // Preserve good previous metadata. Generic homes, login pages, and
+        // provider auth redirects must never overwrite the last useful thread.
+        let stype = session_type.clone().unwrap_or_else(|| "kim".to_string());
+        let base = session_base_dir(&stype, kim_dir, claw_dir);
+        let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
+        let mut meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
+        if meta.browser_last_site.as_deref() != Some(site.as_str()) {
+            meta.browser_last_site = Some(site);
+            meta.browser_threads_updated_at_ms = Some(now_ms());
+            let _ = write_browser_session_meta_to_dir(&date_dir, &session_id, &meta);
+        }
+        return Ok(meta);
+    }
+
+    session_browser_meta_write(
+        session_id,
+        session_date,
+        session_type,
+        Some(site),
+        Some(current_url),
+        None,
+        kim_dir,
+        claw_dir,
+    ).await
+}
+
+#[tauri::command]
+async fn restore_browser_for_session(
+    session_id: String,
+    session_date: Option<String>,
+    session_type: Option<String>,
+    preferred_site: Option<String>,
+    kim_dir: Option<String>,
+    claw_dir: Option<String>,
+    app_handle: tauri::AppHandle,
+) -> Result<BrowserRestoreResult, String> {
+    validate_session_id(&session_id)?;
+    if is_bridge_task_running() {
+        return Err("Cannot restore provider browser while Kim is running a task.".to_string());
+    }
+
+    let stype = session_type.unwrap_or_else(|| "kim".to_string());
+    let base = session_base_dir(&stype, kim_dir, claw_dir);
+    let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
+    let meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
+
+    let site = preferred_site
+        .as_deref()
+        .map(normalize_site)
+        .filter(|s| !s.is_empty())
+        .or(meta.browser_last_site.clone())
+        .unwrap_or_else(|| "claude".to_string());
+
+    let mut restored = false;
+    let mut reason = "fallback_home".to_string();
+    let target = if let Some(saved) = meta.browser_threads.get(&site) {
+        if browser_url_allowed_for_restore(saved, &site) {
+            restored = true;
+            reason = "stored_thread".to_string();
+            saved.clone()
+        } else {
+            fresh_site_url(&site, None)
+        }
+    } else {
+        fresh_site_url(&site, None)
+    };
+
+    let provider_name = Some(format!("{} (session)", capitalize(&site)));
+    open_browser_signin_window_impl(&target, provider_name, &app_handle)?;
+
+    Ok(BrowserRestoreResult {
+        restored,
+        site,
+        url: target,
+        reason,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -6935,6 +7412,11 @@ pub fn run() {
             add_custom_provider_capability,
             open_browser_signin_window,
             navigate_browser_window_if_open,
+            get_browser_current_url,
+            session_browser_meta_read,
+            session_browser_meta_write,
+            session_browser_url_commit,
+            restore_browser_for_session,
             show_browser_window,
             hide_browser_window,
             set_browser_keep_visible,

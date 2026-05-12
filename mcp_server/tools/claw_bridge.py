@@ -124,6 +124,7 @@ async def run_claw_subtask(
     )
 
     relay_count = 0
+    final_answer: Optional[str] = None
     try:
         # Relay loop — runs until claw exits
         while process.returncode is None:
@@ -137,7 +138,9 @@ async def run_claw_subtask(
                     except asyncio.TimeoutError:
                         logger.warning("Claw process did not exit after kill (MAX_RELAYS)")
                     break
-                await _relay_one_request(browser_provider, relay_count, bridge_dir)
+                maybe_answer = await _relay_one_request(browser_provider, relay_count, bridge_dir)
+                if maybe_answer:
+                    final_answer = maybe_answer
             else:
                 await asyncio.sleep(POLL_INTERVAL)
             # Check if process has exited
@@ -150,7 +153,9 @@ async def run_claw_subtask(
         # written just before exit (race condition)
         if request_file.exists():
             relay_count += 1
-            await _relay_one_request(browser_provider, relay_count, bridge_dir)
+            maybe_answer = await _relay_one_request(browser_provider, relay_count, bridge_dir)
+            if maybe_answer:
+                final_answer = maybe_answer
 
     except Exception as e:
         logger.error(f"Claw bridge relay error: {e}", exc_info=True)
@@ -182,7 +187,9 @@ async def run_claw_subtask(
         pass
 
     result_msg = (
-        "Task completed successfully."
+        final_answer.strip()
+        if success and final_answer and final_answer.strip()
+        else "Task completed successfully."
         if success
         else f"Kim encountered an error: {stderr_output[:200]}"
     )
@@ -192,6 +199,8 @@ async def run_claw_subtask(
         "success": success,
         "exit_code": exit_code,
         "message": result_msg,
+        "final_answer": final_answer,
+        "answer_emitted": bool(final_answer),
     }
 
 
@@ -202,8 +211,11 @@ async def _relay_one_request(
     browser_provider: "BrowserProvider",
     relay_number: int,
     bridge_dir: Path,
-) -> None:
-    """Read a bridge request, route through the browser LLM, write response."""
+) -> Optional[str]:
+    """Read a bridge request, route through the browser LLM, write response.
+
+    Returns the final text answer when the bridge response has no tool calls.
+    """
 
     # Brief delay to ensure claw has finished writing
     await asyncio.sleep(0.15)
@@ -213,7 +225,7 @@ async def _relay_one_request(
         raw_request = request_file.read_text(encoding="utf-8")
     except Exception as e:
         logger.warning(f"[relay #{relay_number}] Failed to read request: {e}")
-        return
+        return None
 
     # Remove request file immediately to signal claw we've picked it up
     # (not strictly necessary, but prevents re-reading on the next poll)
@@ -225,7 +237,7 @@ async def _relay_one_request(
     )
 
     # Build a prompt for the browser LLM from the bridge request
-    prompt = _build_browser_prompt(raw_request)
+    prompt, attachments = _build_browser_prompt(raw_request)
 
     bridge_response = {"text": "ERROR: Browser LLM did not return a valid Claw bridge response."}
     correction = ""
@@ -236,19 +248,26 @@ async def _relay_one_request(
             # Route through the browser provider
             response = await browser_provider.complete(
                 messages=[{"role": "user", "content": prompt + correction}],
+                attachments=attachments,
                 tools=[],
                 system=_claw_browser_system_prompt(),
-                clear_chat=(relay_number == 1 and attempt == 0),
+                # Each bridge request already contains the full Claw conversation.
+                # Do not rely on the browser chat's previous turns: DeepSeek-style
+                # UIs can otherwise let the scraper read the previous assistant
+                # bubble before the new answer finishes, which makes Kim replay
+                # stale JSON/thoughts as if they were the current response.
+                clear_chat=True,
             )
         except Exception as e:
             logger.error(f"[relay #{relay_number}] Browser LLM call failed: {e}")
             # Write an error response so claw doesn't hang
             _write_bridge_response(json.dumps({"text": f"Error: {e}"}), bridge_dir)
-            return
+            return None
 
-        # Convert BrowserProvider response to bridge format
+        # Convert BrowserProvider response to bridge format. Do not surface its text
+        # yet: invalid retries are a common source of duplicate activity items and
+        # raw JSON leaks. Surface only after the response has passed validation.
         bridge_response = _provider_response_to_bridge(response, prompt)
-        surfaced_reasoning = _surface_bridge_reasoning(bridge_response, surfaced_reasoning)
         validation_error = _bridge_response_validation_error(bridge_response, prompt)
         if not validation_error:
             break
@@ -267,33 +286,40 @@ async def _relay_one_request(
             "Example:\n"
             '{"text":"brief reasoning","tool_calls":[{"name":"write_file","input":{"path":"index.html","content":"\\u003c!doctype html\\u003e\\u003chtml lang=\'en\'\\u003e\\u003chead\\u003e\\u003c/head\\u003e\\u003cbody\\u003e\\u003c/body\\u003e\\u003c/html\\u003e"}}]}\n'
             "Do not use Kim's JSON format with top-level 'tool'/'args'. "
-            "Do not invent KIM tokens; if Kim's transport instruction asks for one exact "
-            "[END_OF_RESPONSE] marker at the very end, append only that exact marker."
+            "Do not invent KIM tokens or completion markers; if Kim's transport instruction asks for one exact dynamic marker at the very end, append only that exact marker."
         )
     else:
         repaired = _repair_invalid_html_tool_call(bridge_response)
         if repaired:
             bridge_response = repaired
-            surfaced_reasoning = _surface_bridge_reasoning(bridge_response, surfaced_reasoning)
         else:
-            bridge_response = {
-                "text": (
-                    "I could not safely complete that file write because the browser model kept "
-                    "returning malformed file content. No changes were written."
-                )
-            }
+            raise RuntimeError(
+                "Browser model could not produce a valid Claw bridge response: "
+                f"{validation_error or 'unknown validation error'}"
+            )
 
     logger.info(
         f"[relay #{relay_number}] Got browser response — writing bridge_response.json"
     )
 
-    # Surface the reasoning text first, so it appears in the activity feed before tool calls.
-    # This shows Gemini's thinking/context before its action.
-    _surface_bridge_reasoning(bridge_response, surfaced_reasoning)
+    tool_calls = bridge_response.get("tool_calls", [])
+    if not isinstance(tool_calls, list):
+        tool_calls = []
+
+    final_answer = _clean_bridge_text(bridge_response.get("text", "")) if not tool_calls else ""
+    if final_answer:
+        # Text-only bridge responses are Claw's final answer. Emit the full text
+        # on a dedicated line so the frontend renders it as an assistant bubble,
+        # not as a truncated activity/status item. JSON-string encoding keeps
+        # multi-line answers on one stdout line.
+        _emit_bridge_answer(final_answer)
+    else:
+        # Surface non-final reasoning once, after validation, before tool calls.
+        surfaced_reasoning = _surface_bridge_reasoning(bridge_response, surfaced_reasoning)
 
     # Surface Claw's tool calls in Kim's activity feed as [TOOL] lines.
     # ChatView.tsx parses these and renders them via TOOL_MAP.
-    for tc in bridge_response.get("tool_calls", []):
+    for tc in tool_calls:
         name = tc.get("name", "?")
         inp = tc.get("input", {}) if isinstance(tc.get("input"), dict) else {}
         # Build a compact args dict — only path/command, never file content.
@@ -313,19 +339,21 @@ async def _relay_one_request(
         print(f"[TOOL] {name}({json.dumps(display)})", flush=True)
 
     _write_bridge_response(json.dumps(bridge_response, ensure_ascii=False), bridge_dir)
+    return final_answer or None
 
 
-def _build_browser_prompt(raw_request: str) -> str:
+def _build_browser_prompt(raw_request: str) -> tuple[str, list[dict]]:
     """
     Convert the bridge request JSON into a human-readable prompt for the
-    browser LLM.
+    browser LLM, and extract any base64 image attachments.
     """
     try:
         data = json.loads(raw_request)
     except json.JSONDecodeError:
-        return raw_request  # Fall back to raw text
+        return raw_request, []  # Fall back to raw text
 
     parts = []
+    attachments = []
 
     # System prompt
     system = data.get("system")
@@ -360,9 +388,27 @@ def _build_browser_prompt(raw_request: str) -> str:
                 output = block.get("output", "")
                 is_err = block.get("is_error", False)
                 prefix = "ERROR" if is_err else "Result"
+                
+                # Extract any base64 screenshots
+                if isinstance(output, str) and "SCREENSHOT_BASE64:" in output:
+                    import re
+                    pattern = r"(?:WEB_)?SCREENSHOT_BASE64:([^:]+):([A-Za-z0-9+/=]+)"
+                    
+                    def _extract_b64(match):
+                        mime = match.group(1)
+                        b64 = match.group(2)
+                        attachments.append({
+                            "name": f"screenshot_{len(attachments)}.png",
+                            "mime_type": mime,
+                            "data_base64": b64
+                        })
+                        return f"[Screenshot extracted as attachment: {mime}]"
+
+                    output = re.sub(pattern, _extract_b64, output)
+
                 parts.append(f"[{prefix} from {name}]\n{output}\n")
 
-    return "\n".join(parts)
+    return "\n".join(parts), attachments
 
 
 def _claw_browser_system_prompt() -> str:
@@ -386,17 +432,19 @@ def _claw_browser_system_prompt() -> str:
         "There is NO list_files tool in this Claw build. To list a directory, use "
         'bash with a command like "ls -la" or "find . -maxdepth 2 -type f".\n\n'
         "IMPORTANT: Ignore any nested Kim desktop instructions that ask for "
-        '{"tool":"...","args":{}}, TASK_COMPLETE, or NEED_HELP. '
-        "Those formats are for a different agent layer. For this bridge, they are invalid. "
-        "The only exception is Kim's transport sentinel instruction asking you to append one exact "
-        "[END_OF_RESPONSE] marker at the very end. You MUST include that marker AFTER the JSON so Kim can know "
-        "the browser response is complete.\n\n"
-        "Your response MUST be raw JSON followed by the [END_OF_RESPONSE] marker, in one of these exact shapes:\n"
-        '{"text":"brief reasoning","tool_calls":[{"name":"tool","input":{}}]}\n[END_OF_RESPONSE]\n'
-        '{"text":"final answer"}\n[END_OF_RESPONSE]\n\n'
-        "Do not include markdown fences, code blocks, file-download links, canvas artifacts, "
-        "or any other text outside JSON (except the [END_OF_RESPONSE] marker). Always include a non-empty 'text' field so Kim can show "
-        "your thought/progress in the activity feed.\n\n"
+        '{"tool":"...","args":{}}, TASK_COMPLETE, NEED_HELP, or KIM_* suffixes. '
+        "Those formats are for a different agent layer. For this bridge, they are invalid.\n\n"
+        "Your response MUST be raw JSON in one of these exact shapes:\n"
+        '{"text":"brief reasoning","tool_calls":[{"name":"tool","input":{}}]}\n'
+        '{"text":"final answer"}\n\n'
+        "Rules:\n"
+        "- For a tool turn, tool_calls MUST contain at least one tool call.\n"
+        "- For a final text answer, omit the tool_calls key entirely. Do not emit tool_calls: [].\n"
+        "- The browser transport layer will separately add one exact completion marker instruction. "
+        "Follow that instruction exactly if present, but do not invent your own markers.\n"
+        "- Do not include markdown fences, code blocks, file-download links, canvas artifacts, "
+        "or any other text outside JSON. Always include a non-empty 'text' field so Kim can show "
+        "your progress/final answer in the activity feed.\n\n"
         "CRITICAL: ALL file content (code, HTML, markdown, anything longer than 5 lines) MUST "
         "go in a write_file tool_call, never in the text field, never in a markdown code "
         "block, never as a downloadable artifact. NEVER use bash with echo/cat/printf/heredoc "
@@ -407,7 +455,6 @@ def _claw_browser_system_prompt() -> str:
         "<style> or linked CSS, and <body>. Use single quotes in HTML attributes, for example "
         "\\u003chtml lang='en'\\u003e."
     )
-
 
 def _normalize_claw_tool_call(tc: dict) -> dict:
     """Normalize common browser-model tool-name mistakes into real Claw tools."""
@@ -517,6 +564,48 @@ def _latest_user_instruction_lower(prompt: str) -> str:
     return prompt.lower()
 
 
+def _is_trivial_text_only_task(user_task_lower: str) -> bool:
+    task = " ".join(user_task_lower.split()).strip()
+    if task.startswith("task:"):
+        task = task[5:].strip()
+    return task in {"hi", "hello", "hey", "hi!", "hello!", "hey!"}
+
+
+def _task_requires_initial_tool(user_task_lower: str) -> bool:
+    """Return True for Code-tab requests where a first-turn text answer would be fake progress."""
+    task = " ".join(user_task_lower.split()).lower()
+    action_words = (
+        "read", "list", "open", "show", "find", "search", "inspect", "scan",
+        "analyze", "analyse", "audit", "review", "rate", "debug", "fix",
+        "edit", "change", "update", "patch", "implement", "refactor",
+        "create", "write", "generate", "make", "build", "add", "remove",
+        "run", "test", "check", "grep", "ls", "dir",
+    )
+    file_or_project_words = (
+        "file", "files", "folder", "directory", "repo", "repository", "project",
+        "code", "codebase", "app", "component", "python", "react", "rust",
+        "typescript", "javascript", ".py", ".tsx", ".ts", ".js", ".rs",
+        "package.json", "src/", "./",
+    )
+    return any(word in task for word in action_words) and (
+        any(word in task for word in file_or_project_words)
+        or any(word in task for word in ("task", "bug", "issue", "error"))
+    )
+
+
+def _looks_like_acknowledgement_only(text: str) -> bool:
+    t = " ".join(text.lower().split()).strip()
+    if not t:
+        return False
+    prefixes = (
+        "acknowledging", "acknowledged", "understood", "got it", "okay", "ok",
+        "sure", "sounds good", "i'll", "i will", "let me", "checking",
+        "running", "executing", "looking", "searching", "starting",
+        "i'm going to", "i am going to", "i can",
+    )
+    return any(t.startswith(prefix) for prefix in prefixes)
+
+
 def _bridge_response_validation_error(response: dict, prompt: str = "") -> Optional[str]:
     if not isinstance(response, dict):
         return "Response must be a JSON object."
@@ -583,10 +672,10 @@ def _bridge_response_validation_error(response: dict, prompt: str = "") -> Optio
     has_tool_result = "[result from" in prompt_lower or "[error from" in prompt_lower
     if likely_file_task and isinstance(text, str) and len(text.splitlines()) > 5 and not tool_calls:
         return "Large generated file content must be sent via write_file, not in text."
-        
+
     if not tool_calls and isinstance(text, str) and text.strip().startswith("ERROR:"):
         return text.strip()
-        
+
     if not tool_calls and isinstance(text, str) and text.strip():
         lowered_text = text.lower()
         hallucinated_patterns = (
@@ -594,32 +683,29 @@ def _bridge_response_validation_error(response: dict, prompt: str = "") -> Optio
             "```json", "```python", "```bash",
         )
         if any(p in lowered_text for p in hallucinated_patterns) and any(t in lowered_text for t in ALLOWED_CLAW_TOOLS):
-            return "You attempted to output a tool call, but your format was invalid. You MUST use the exact JSON schema provided in the instructions, ending with the [END_OF_RESPONSE] marker."
+            return "You attempted to output a tool call, but your format was invalid. You MUST use the exact Claw bridge JSON schema from the instructions."
 
+    # Critical bridge invariant: before Claw has received any tool result, a
+    # text-only response is usually interpreted by Claw as the final answer.
+    # Browser models sometimes emit an acknowledgement like
+    # {"text":"Acknowledging user request...","tool_calls":[]} first; do
+    # not pass that through or the subprocess exits successfully without doing
+    # the task. Force the browser model to emit an actual Claw tool call.
     if (
         not tool_calls
         and not has_tool_result
         and isinstance(text, str)
         and text.strip()
+        and not _is_trivial_text_only_task(user_task_lower)
+        and (_looks_like_acknowledgement_only(text) or _task_requires_initial_tool(user_task_lower))
     ):
-        ai_intends_action = any(
-            text.strip().lower().startswith(prefix)
-            for prefix in ("i'll", "i will", "let me", "checking", "running", "executing", "looking", "searching", "sure")
+        return (
+            "You must emit a tool call. This is the first Claw bridge turn for an "
+            "actionable local task; a conversational acknowledgement with no "
+            "tool_calls makes Claw exit as if the task is complete. Use bash, "
+            "read_file, write_file, edit_file, grep_search, glob_search, WebFetch, "
+            "WebSearch, or TodoWrite now."
         )
-        task_needs_action = any(
-            word in user_task_lower
-            for word in (
-                "read", "list", "open", "show", "find", "search", "edit", 
-                "create", "write", "generate", "make", "ls", "dir", "check", "inside", "explain"
-            )
-        )
-        
-        if (ai_intends_action or task_needs_action) and user_task_lower.strip() not in {"hi", "hello", "hey", "hi!", "hello!", "hey!"}:
-            return (
-                "This request needs local action. Do not answer conversationally; emit a Claw "
-                "tool_call now. Use bash for directory listings, read_file for file reads, "
-                "write_file/edit_file for changes, and grep_search/glob_search for search."
-            )
 
     # Catch the "I can't access your files / upload the project" refusal that
     # ChatGPT (and occasionally other browser models) emit when they break
@@ -662,46 +748,85 @@ def _bridge_response_validation_error(response: dict, prompt: str = "") -> Optio
     return None
 
 
+def _clean_bridge_text(raw: object) -> str:
+    """Return user-facing text with bridge JSON/sentinel noise removed."""
+    import re
+
+    if raw is None:
+        return ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r"\s*\[END_OF_RESPONSE(?:_[A-Za-z0-9-]+)?\]\s*$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s*```$", "", text).strip()
+
+    # The browser scraper/model sometimes nests bridge JSON inside the text
+    # field, e.g. text='{"text":"Let me check","tool_calls":[...]}'.
+    # Peel a few layers without exposing raw JSON to the UI.
+    for _ in range(3):
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            break
+        if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+            text = parsed["text"].strip()
+            continue
+        if isinstance(parsed, str):
+            text = parsed.strip()
+            continue
+        break
+
+    if text.startswith("{") and '"text"' in text[:80]:
+        match = re.search(r'"text"\s*:\s*"((?:\\.|[^"\\])*)"', text, re.DOTALL)
+        if match:
+            try:
+                text = json.loads(f'"{match.group(1)}"').strip()
+            except Exception:
+                text = match.group(1).strip()
+
+    # If a model returned an object/array fragment that still looks like bridge
+    # JSON, suppress it rather than showing braces/tool_calls to the user.
+    stripped = text.strip()
+    if (stripped.startswith("{") or stripped.startswith("[")) and (
+        '"tool_calls"' in stripped or '"text"' in stripped or "tool_calls" in stripped
+    ):
+        return ""
+
+    return stripped
+
+
+def _emit_bridge_answer(answer: str) -> None:
+    """Emit a full final answer for the React UI as a single parseable line."""
+    cleaned = _clean_bridge_text(answer)
+    if cleaned:
+        print(f"[ANSWER] {json.dumps(cleaned, ensure_ascii=False)}", flush=True)
+
+
 def _surface_bridge_reasoning(response: dict, previous: str = "") -> str:
     import re
-    reasoning = response.get("text", "").strip() if isinstance(response, dict) else ""
+
+    reasoning = _clean_bridge_text(response.get("text", "") if isinstance(response, dict) else "")
     if not reasoning or reasoning.startswith("ERROR:") or reasoning == previous:
         return previous
-    # Strip JSON wrapping that sometimes leaks into the text field
-    if reasoning.startswith("{") and reasoning.endswith("}"):
-        try:
-            parsed = json.loads(reasoning)
-            if isinstance(parsed, dict) and "text" in parsed:
-                reasoning = str(parsed["text"]).strip()
-        except (json.JSONDecodeError, TypeError):
-            pass
-            
-    # Aggressively strip `{"text": "` prefix if it got truncated and couldn't be parsed
-    if reasoning.startswith("{") and '"text"' in reasoning[:20]:
-        match = re.search(r'^\{\s*"text"\s*:\s*["\']?(.*)', reasoning, re.DOTALL)
-        if match:
-            reasoning = match.group(1).strip()
-            
-    # Drop trailing quotes or braces if they were left over
-    reasoning = re.sub(r'["\']?\s*\}?\s*$', '', reasoning)
 
-    # Drop lines that are pure JSON fragments (if the above still left an array or object)
-    if reasoning.startswith("{") or reasoning.startswith("["):
-        return previous
     # Replace provider brand names with "Kim"
-    reasoning = re.sub(
+    display = re.sub(
         r"\b(Gemini|Claude|ChatGPT|Grok|DeepSeek)\b",
         "Kim",
         reasoning,
         flags=re.IGNORECASE,
     )
-    # Strip technical prefixes
-    reasoning = re.sub(r"^(?:Calling\s+\w+\.?\s*)", "", reasoning).strip()
-    if not reasoning:
+    # Strip technical prefixes and bridge-ish fragments that should never appear
+    # in the activity feed.
+    display = re.sub(r"^(?:Calling\s+\w+\.?\s*)", "", display).strip()
+    if not display or display.startswith("{") or display.startswith("[") or '"tool_calls"' in display:
         return previous
-    if len(reasoning) > 150:
-        reasoning = reasoning[:147] + "…"
-    print(f"[STATUS] {reasoning}", flush=True)
+    if len(display) > 150:
+        display = display[:147] + "…"
+    print(f"[STATUS] {display}", flush=True)
     return reasoning
 
 
@@ -782,21 +907,72 @@ def _fallback_html_from_stripped_content(content: str) -> str:
 """
 
 
+def _latest_bridge_response_fragment(text: object) -> str:
+    """Return the newest-looking assistant fragment from a scraped browser response.
+
+    Browser UIs sometimes leave old assistant bubbles in the scraped text. If the
+    scraper returns multiple bridge responses, prefer the newest fragment instead
+    of parsing the first stale JSON object.
+    """
+    import re
+
+    raw = "" if text is None else str(text)
+    if not raw:
+        return ""
+
+    # Prefer the fragment after the last completed bridge sentinel. This handles
+    # concatenated content like: old-json [END_OF_RESPONSE] new-json.
+    if re.search(r"\[END_OF_RESPONSE(?:_[A-Za-z0-9-]+)?\]", raw, flags=re.IGNORECASE):
+        parts = re.split(r"\[END_OF_RESPONSE(?:_[A-Za-z0-9-]+)?\]", raw, flags=re.IGNORECASE)
+        non_empty = [part.strip() for part in parts if part.strip()]
+        if non_empty:
+            return non_empty[-1]
+
+    return raw.strip()
+
+
 def _extract_first_bridge_json(text: str) -> Optional[dict]:
-    """Scan text for the first balanced JSON object that has 'text' or 'tool_calls' keys.
+    """Scan text for the newest balanced bridge JSON object.
 
     DeepSeek frequently prefixes conversational text before the JSON, e.g.:
         I'll check that now
         {"text":"checking","tool_calls":[...]}
         [END_OF_RESPONSE]
 
-    This function finds and extracts that embedded JSON.
-    String-aware: braces inside JSON strings are not counted (#11).
+    If a browser scrape accidentally includes older assistant bubbles too, the
+    newest valid bridge object is the safest candidate. String-aware: braces
+    inside JSON strings are not counted.
     """
     depth = 0
     start = -1
     in_str = False
     escape = False
+    latest: Optional[dict] = None
+
+    def parse_candidate(candidate: str) -> Optional[dict]:
+        for loader in (json.loads,):
+            try:
+                parsed = loader(candidate)
+                if isinstance(parsed, dict) and ("text" in parsed or "tool_calls" in parsed):
+                    return parsed
+            except Exception:
+                pass
+        try:
+            import json5
+            parsed = json5.loads(candidate)
+            if isinstance(parsed, dict) and ("text" in parsed or "tool_calls" in parsed):
+                return parsed
+        except Exception:
+            pass
+        try:
+            import json_repair
+            parsed = json_repair.loads(candidate)
+            if isinstance(parsed, dict) and ("text" in parsed or "tool_calls" in parsed):
+                return parsed
+        except Exception:
+            pass
+        return None
+
     for i, ch in enumerate(text):
         if in_str:
             if escape:
@@ -817,27 +993,11 @@ def _extract_first_bridge_json(text: str) -> Optional[dict]:
                 depth -= 1
                 if depth == 0 and start >= 0:
                     candidate = text[start: i + 1]
-                    try:
-                        parsed = json.loads(candidate)
-                        if isinstance(parsed, dict) and ("text" in parsed or "tool_calls" in parsed):
-                            return parsed
-                    except json.JSONDecodeError:
-                        try:
-                            import json5
-                            parsed = json5.loads(candidate)
-                            if isinstance(parsed, dict) and ("text" in parsed or "tool_calls" in parsed):
-                                return parsed
-                        except Exception:
-                            try:
-                                import json_repair
-                                parsed = json_repair.loads(candidate)
-                                if isinstance(parsed, dict) and ("text" in parsed or "tool_calls" in parsed):
-                                    return parsed
-                            except Exception:
-                                pass
+                    parsed = parse_candidate(candidate)
+                    if parsed is not None:
+                        latest = parsed
                     start = -1
-    return None
-
+    return latest
 
 def _provider_response_to_bridge(response: dict, prompt: str = "") -> dict:
     """
@@ -863,7 +1023,7 @@ def _provider_response_to_bridge(response: dict, prompt: str = "") -> dict:
             ],
         })
 
-    content = response.get("content", "")
+    content = _latest_bridge_response_fragment(response.get("content", ""))
 
     # Cleanup scraper duplication: The Claude UI sometimes renders the "text" field outside 
     # the code block and again inside it, causing the scraper to concatenate them without a quote.
@@ -933,8 +1093,9 @@ def _provider_response_to_bridge(response: dict, prompt: str = "") -> dict:
                     pass
         
         if tool_calls:
-            # Reconstruct the text prior to the first tool call as the thought reasoning
-            reasoning = content[:ds_matches[0].start()].strip()
+            # Reconstruct the text prior to the first tool call as the visible progress
+            # line, but never expose DeepSeek/Qwen <think> blocks or bridge JSON.
+            reasoning = _clean_bridge_text(content[:ds_matches[0].start()].strip())
             if not reasoning:
                 reasoning = f"Calling {tool_calls[0]['name']}..."
             return {
