@@ -1605,6 +1605,125 @@ kbd {
   color: var(--text-subtle);
 }
 
+/* V7 hybrid stream — thinking row + live panel */
+.kim-thinking-header--stream {
+  width: 100%;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.kim-thinking-header__lead {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.kim-thinking-header__trail {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--text-subtle);
+}
+.kim-thinking-header--stream .kim-thinking-header__timer {
+  margin-left: 0;
+}
+.kim-thinking-header__sep {
+  opacity: 0.55;
+  user-select: none;
+}
+.kim-thinking-header__steps {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.kim-bubble--live-stream {
+  max-width: 100%;
+  width: 100%;
+  background: color-mix(in srgb, var(--bg-elevated) 88%, var(--accent-muted));
+  border: 1px solid color-mix(in srgb, var(--border) 80%, var(--accent) 12%);
+  box-shadow: var(--shadow-xs);
+}
+
+/* Inline plan card (Chat · collapsible plan mock) */
+.kim-plan-live {
+  margin: 0 0 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-card) 70%, transparent);
+  overflow: hidden;
+}
+.kim-plan-live__toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: color-mix(in srgb, var(--bg-card) 50%, transparent);
+  padding: 8px 10px 8px 8px;
+  font: inherit;
+  cursor: pointer;
+  color: var(--text);
+  transition: background 0.12s ease;
+}
+.kim-plan-live__toggle:hover {
+  background: var(--bg-card-hover);
+}
+.kim-plan-live__chev {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  transform: rotate(0deg);
+  transition: transform 0.16s ease;
+}
+.kim-plan-live__toggle.is-expanded .kim-plan-live__chev {
+  transform: rotate(90deg);
+}
+.kim-plan-live__title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-strong);
+}
+.kim-plan-live__progress {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.kim-plan-live__list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 10px 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.kim-plan-live__step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text);
+}
+.kim-plan-live__idx {
+  flex-shrink: 0;
+  min-width: 1.25rem;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-subtle);
+  padding-top: 1px;
+}
+.kim-plan-live__text {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-muted);
+}
+
 /* Worked-for chip — collapsible disclosure showing a completed run's activity */
 .kim-worked-for {
   margin: 6px 0 8px;
@@ -2373,6 +2492,27 @@ kbd {
   border-radius: 18px 18px 4px 18px;
   white-space: pre-wrap;
   max-width: 75%;
+}
+/* V7 hybrid stream — user message */
+.kim-bubble--user-stream.kim-bubble--user {
+  background: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--bubble-user-bg) 78%, #ffffff) 0%,
+    var(--bubble-user-bg) 100%
+  );
+  color: var(--bubble-user-text, #fff);
+  border: 1px solid color-mix(in srgb, var(--bubble-user-bg) 42%, #ffffff 58%);
+  border-radius: 16px 16px 4px 16px;
+  box-shadow: var(--shadow-sm);
+}
+.dark .kim-bubble--user-stream.kim-bubble--user {
+  background: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--bubble-user-bg) 70%, #0a0a0a) 0%,
+    var(--bubble-user-bg) 100%
+  );
+  border-color: color-mix(in srgb, var(--bubble-user-bg) 50%, #000000 50%);
+  box-shadow: 0 1px 0 color-mix(in srgb, #fff 6%, transparent);
 }
 .kim-bubble--assistant {
   background: var(--bubble-ai-bg);

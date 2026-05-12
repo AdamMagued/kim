@@ -26,6 +26,76 @@ function formatDuration(seconds: number): string {
   return s === 0 ? `${m}m` : `${m}m ${s}s`;
 }
 
+interface LivePlanParsed {
+  steps: string[];
+}
+
+/**
+ * Extract a checklist-style plan from streamed status lines (matches the
+ * collapsible “Plan · N of M done” mockups).
+ */
+function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | null {
+  const steps: string[] = [];
+  let collecting = false;
+
+  for (const it of items) {
+    const t = it.text;
+    if (!collecting) {
+      if (/here'?s my plan before|my plan before I start|plan before I start editing/i.test(t)) {
+        collecting = true;
+      }
+      continue;
+    }
+
+    if (it.kind === 'tool') break;
+
+    const trimmed = t.trim();
+    if (/^Kim is thinking/i.test(trimmed)) continue;
+
+    const bullet = trimmed.match(/^(?:[-•*]|\[[ xX]\])\s*(.+)$/);
+    if (bullet) {
+      steps.push(bullet[1].trim());
+      continue;
+    }
+    const num = trimmed.match(/^\d+\.\s*(.+)$/);
+    if (num) {
+      steps.push(num[1].trim());
+      continue;
+    }
+
+    if (it.kind === 'status' && trimmed.length >= 12 && trimmed.length < 260) {
+      steps.push(trimmed);
+    }
+
+    if (steps.length >= 14) break;
+  }
+
+  if (steps.length >= 2) {
+    return { steps: steps.slice(0, 12) };
+  }
+
+  const numbered: string[] = [];
+  for (const it of items) {
+    if (it.kind !== 'status') {
+      if (numbered.length > 0) break;
+      continue;
+    }
+    const m = it.text.match(/^\s*\d+\.\s*(.+)$/);
+    if (m) numbered.push(m[1].trim());
+    else if (numbered.length > 0) break;
+  }
+  return numbered.length >= 2 ? { steps: numbered.slice(0, 12) } : null;
+}
+
+function livePlanProgressLabel(stepCount: number, items: ActivityItem[], running: boolean): string | undefined {
+  if (stepCount < 2) return undefined;
+  const nTools = items.filter(i => i.kind === 'tool').length;
+  const done = Math.min(nTools, stepCount);
+  let s = `${done} of ${stepCount} done`;
+  if (running && done < stepCount) s += ' · 1 in flight';
+  return s;
+}
+
 
 export function collapseMessages(msgs: KimMessage[]) {
   const res: {msg: KimMessage, retries: number}[] = [];
@@ -156,7 +226,10 @@ function extractTouchedFiles(messages: KimMessage[]): TouchedFile[] {
 }
 
 function cleanActivityText(t: string): string {
-  let cleaned = t.replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said):?\s*/ig, '').trim();
+  let cleaned = t
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said|DeepSeek said):?\s*/ig, '')
+    .trim();
   try {
     if (cleaned.startsWith('{') && cleaned.endsWith('}')) {
       const parsed = JSON.parse(cleaned);
@@ -166,6 +239,58 @@ function cleanActivityText(t: string): string {
     }
   } catch {}
   return cleaned;
+}
+
+function cleanAssistantAnswerText(t: string): string {
+  let cleaned = t
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/\s*\[END_OF_RESPONSE\]\s*$/i, '')
+    .replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said|DeepSeek said):?\s*/ig, '')
+    .trim();
+
+  for (let i = 0; i < 3; i++) {
+    try {
+      const parsed: unknown = JSON.parse(cleaned);
+      if (typeof parsed === 'string') {
+        cleaned = parsed.trim();
+        continue;
+      }
+      if (parsed && typeof parsed === 'object' && typeof (parsed as { text?: unknown }).text === 'string') {
+        cleaned = String((parsed as { text: string }).text).trim();
+        continue;
+      }
+    } catch {
+      break;
+    }
+    break;
+  }
+
+  if (/^\s*[\[{]/.test(cleaned) && /"(?:text|tool_calls)"\s*:/.test(cleaned)) {
+    return '';
+  }
+  return cleaned;
+}
+
+function parseAnswerLine(raw: string): string | null {
+  const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
+  const stripped = line.replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.,]?\d*\s+/, '');
+  const markerIdx = stripped.indexOf('[ANSWER]');
+  if (markerIdx === -1) return null;
+
+  const payload = stripped.slice(markerIdx + '[ANSWER]'.length).trim();
+  if (!payload) return '';
+
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    if (typeof parsed === 'string') return cleanAssistantAnswerText(parsed);
+    if (parsed && typeof parsed === 'object' && typeof (parsed as { text?: unknown }).text === 'string') {
+      return cleanAssistantAnswerText(String((parsed as { text: string }).text));
+    }
+  } catch {
+    // Plain text fallback for older bridge output.
+  }
+
+  return cleanAssistantAnswerText(payload);
 }
 
 function synthesizeActivityFromMessages(messages: KimMessage[], toolMap: typeof TOOL_MAP): ActivityItem[] {
@@ -329,7 +454,7 @@ const HIDDEN_REGEX: RegExp[] = [
 function isNoiseLine(raw: string): boolean {
   // Never suppress status lines — from stdout ("[STATUS] …") or embedded in
   // a stderr log record ("[err] … [STATUS] …"). These are user-facing signals.
-  if (raw.startsWith('[STATUS]') || raw.includes('[STATUS]')) return false;
+  if (raw.startsWith('[STATUS]') || raw.includes('[STATUS]') || raw.startsWith('[ANSWER]') || raw.includes('[ANSWER]')) return false;
   // Strip the [err] prefix that appendRaw prepends before pattern-matching,
   // otherwise regex anchors like /^\s*\|/ never fire.
   const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
@@ -618,8 +743,8 @@ function getGreeting(name: string): string {
   if (hour < 5) return `Late night, ${name}`;
   if (hour < 12) return `Good morning, ${name}`;
   if (hour < 17) return `Good afternoon, ${name}`;
-  if (hour < 21) return `Good evening, ${name} (test)`;
-  return `Evening, ${name} (test)`;
+  if (hour < 21) return `Good evening, ${name}`;
+  return `Evening, ${name}`;
 }
 
 // ── Blobby Loaders (3, 6, 12, 15, 20) ────────────────────────────────────────
@@ -706,6 +831,55 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [isRunning, setIsRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [activity, setActivity] = useState<ActivityItem[]>([]);
+
+  // stdout/stderr can arrive in bursts. Keep the authoritative activity feed in
+  // a ref and commit it to React state at most every ~50ms, so the sidebar and
+  // the rest of the app do not re-render once per streamed log line.
+  const activityRef = useRef<ActivityItem[]>([]);
+  const activityFlushTimerRef = useRef<number | null>(null);
+
+  const scheduleActivityFlush = useCallback(() => {
+    if (activityFlushTimerRef.current !== null) return;
+    activityFlushTimerRef.current = window.setTimeout(() => {
+      activityFlushTimerRef.current = null;
+      setActivity(activityRef.current);
+    }, 50);
+  }, []);
+
+  const flushActivityNow = useCallback(() => {
+    if (activityFlushTimerRef.current !== null) {
+      window.clearTimeout(activityFlushTimerRef.current);
+      activityFlushTimerRef.current = null;
+    }
+    setActivity(activityRef.current);
+  }, []);
+
+  const enqueueActivityUpdate = useCallback((updater: (prev: ActivityItem[]) => ActivityItem[]) => {
+    activityRef.current = updater(activityRef.current);
+    scheduleActivityFlush();
+  }, [scheduleActivityFlush]);
+
+  const clearActivityNow = useCallback(() => {
+    if (activityFlushTimerRef.current !== null) {
+      window.clearTimeout(activityFlushTimerRef.current);
+      activityFlushTimerRef.current = null;
+    }
+    activityRef.current = [];
+    setActivity([]);
+  }, []);
+
+  useEffect(() => {
+    activityRef.current = activity;
+  }, [activity]);
+
+  useEffect(() => {
+    return () => {
+      if (activityFlushTimerRef.current !== null) {
+        window.clearTimeout(activityFlushTimerRef.current);
+      }
+    };
+  }, []);
+
   // Snapshots of completed runs, in order. Each successful task completion pushes
   // one entry; rendered as a collapsible "Worked for Xm Ys" badge before the
   // corresponding assistant turn in liveHistory.
@@ -722,6 +896,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [connectorsOpen, setConnectorsOpen] = useState(false);
   const [connectorsClosing, setConnectorsClosing] = useState(false);
   const [connectorSearch, setConnectorSearch] = useState('');
+  const [livePlanExpanded, setLivePlanExpanded] = useState(true);
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
   const [conversationId] = useState(() => makeConversationId());
@@ -762,17 +937,34 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
   // ── Deduplication (per-session, not module-global) ───────────────────────
   // Python writes many lines to both stdout AND stderr, causing duplicates.
-  // We track exact duplicates seen within 800 ms and drop them.
+  // Normalize stderr prefixes before deduping so `[err] [STATUS] x` and
+  // `[STATUS] x` do not render twice.
   const recentRawRef = useRef<Map<string, number>>(new Map());
+  const recentActivityItemRef = useRef<Map<string, number>>(new Map());
+  const answerReceivedThisRunRef = useRef(false);
   const isDuplicate = (raw: string): boolean => {
     const map = recentRawRef.current;
     const now = Date.now();
-    const last = map.get(raw);
+    const canonical = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
+    const last = map.get(canonical);
     if (last !== undefined && now - last < 800) return true;
-    map.set(raw, now);
+    map.set(canonical, now);
     // Prune stale entries to prevent unbounded memory growth
     if (map.size > 200) {
       const cutoff = now - 1600;
+      for (const [k, v] of map) if (v < cutoff) map.delete(k);
+    }
+    return false;
+  };
+  const isDuplicateActivityItem = (item: ActivityItem): boolean => {
+    const map = recentActivityItemRef.current;
+    const now = Date.now();
+    const key = `${item.kind}:${item.text}`;
+    const last = map.get(key);
+    if (last !== undefined && now - last < 2000) return true;
+    map.set(key, now);
+    if (map.size > 200) {
+      const cutoff = now - 4000;
       for (const [k, v] of map) if (v < cutoff) map.delete(k);
     }
     return false;
@@ -1077,7 +1269,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // entering new-chat mode always shows a clean slate.
   useEffect(() => {
     if (newChatMode) {
-      setActivity([]);
+      clearActivityNow();
       setRunHistory([]);
       setExpandedRunIdx(null);
       setClawRuns([]);
@@ -1088,7 +1280,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       // Note: do NOT set isRunning=false here — if a task is actually still
       // running we should show that state. But if not running, we want clean UI.
     }
-  }, [newChatMode]);
+  }, [newChatMode, clearActivityNow]);
 
   // ── Focus on new chat ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -1123,6 +1315,21 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       return;
     }
 
+    // [ANSWER] is a final assistant message from the Claw browser bridge. It
+    // should render as a chat bubble, never as an activity feed/status item.
+    const answerText = parseAnswerLine(line);
+    if (answerText !== null) {
+      if (answerText) {
+        answerReceivedThisRunRef.current = true;
+        setLiveHistory(prev => {
+          const last = prev[prev.length - 1];
+          if (last?.role === 'assistant' && last.content.trim() === answerText.trim()) return prev;
+          return [...prev, { role: 'assistant', content: answerText }];
+        });
+      }
+      return;
+    }
+
     // Surface Claw's structured JSON error output as a real error banner
     // instead of silently dropping the line and showing only "Agent Error".
     // Claw emits e.g. {"error":"missing Anthropic credentials …","type":"error"}
@@ -1136,7 +1343,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           setTaskError(friendlyError(msg));
           if (lastRunTaskRef.current) setLastFailedTask(lastRunTaskRef.current);
           needHelpFlagRef.current = true; // reuse the flag so kim-agent-done suppresses the generic banner
-          setActivity(prev => {
+          enqueueActivityUpdate(prev => {
             const next = [...prev, { id, kind: 'error' as const, icon: '⚠', text: friendlyError(msg) }];
             if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
             return next;
@@ -1152,7 +1359,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     const diffMatch = line.match(/\[DIFF\]\s+path=(\S+)\s+\+(\d+)\s+-(\d+)/);
     if (diffMatch) {
       const [, _path, added, removed] = diffMatch;
-      setActivity(prev => {
+      enqueueActivityUpdate(prev => {
         if (prev.length === 0) return prev;
         const last = prev[prev.length - 1];
         if (last.kind === 'tool' && (last.text.includes('Editing') || last.text.includes('Writing') || last.text.includes('Creating'))) {
@@ -1199,6 +1406,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       }
     }
 
+    if (isDuplicateActivityItem(item)) {
+      return;
+    }
+
     const needHelpMatch = line.match(/(?:^|\b)NEED_HELP:\s*(.+)$/i);
     if (needHelpMatch) {
       needHelpFlagRef.current = true;
@@ -1209,7 +1420,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       return; // Skip adding to activity feed to avoid duplicate error messages
     }
 
-    setActivity(prev => {
+    enqueueActivityUpdate(prev => {
       if (item.kind === 'success') return prev; // Skip adding to activity feed to avoid duplicating the assistant bubble
       // Collapse consecutive status items: replace the previous one so repeated
       // "gemini is thinking…" lines don't flood the feed.
@@ -1226,7 +1437,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     // follow-up from an old Claw session, we stay on that session to
     // preserve history. The new task's response appears via liveHistory.
     if (item.kind === 'success') {
-      setLiveHistory(prev => [...prev, { role: 'assistant', content: item.text }]);
+      const genericSuccess = /^Task completed(?: successfully)?$/i.test(item.text.trim());
+      if (!answerReceivedThisRunRef.current && !genericSuccess) {
+        setLiveHistory(prev => [...prev, { role: 'assistant', content: item.text }]);
+      }
     }
   }
 
@@ -1260,28 +1474,28 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       // disclosure survives a chat reload.
       const startedAt = startTimeRef.current;
       const durationSec = startedAt ? Math.max(1, Math.round((Date.now() - startedAt) / 1000)) : 0;
-      setActivity(currentActivity => {
-        if (event.payload && !wasCancelled && currentActivity.length > 0) {
-          setRunHistory(prev => {
-            const next = [...prev, { activity: currentActivity, durationSec }];
-            const completedCodeSession = completedCodeSessionRef.current;
-            const sid = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
-            if (sid) {
-              invoke('save_run_history', {
-                sessionId: sid,
-                sessionDate: completedCodeSession?.date ?? session?.date ?? null,
-                kimDir: settings.kim_sessions_dir || null,
-                clawDir: completedCodeSession?.project_path
-                  ? `${completedCodeSession.project_path}/.claw/sessions`
-                  : settings.claw_sessions_dir || null,
-                runs: next,
-              }).catch(() => { /* non-fatal */ });
-            }
-            return next;
-          });
-        }
-        return [];
-      });
+      flushActivityNow();
+      const activitySnapshot = activityRef.current;
+      if (event.payload && !wasCancelled && activitySnapshot.length > 0) {
+        setRunHistory(prev => {
+          const next = [...prev, { activity: activitySnapshot, durationSec }];
+          const completedCodeSession = completedCodeSessionRef.current;
+          const sid = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
+          if (sid) {
+            invoke('save_run_history', {
+              sessionId: sid,
+              sessionDate: completedCodeSession?.date ?? session?.date ?? null,
+              kimDir: settings.kim_sessions_dir || null,
+              clawDir: completedCodeSession?.project_path
+                ? `${completedCodeSession.project_path}/.claw/sessions`
+                : settings.claw_sessions_dir || null,
+              runs: next,
+            }).catch(() => { /* non-fatal */ });
+          }
+          return next;
+        });
+      }
+      clearActivityNow();
       // Existing session view is now interactive, so reload message history
       // after every run completion to reflect newly appended turns.
       setMessageReloadNonce(v => v + 1);
@@ -1359,11 +1573,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     // next task if it failed for a real (non-cancel) reason.
     cancelFlagRef.current = false;
     needHelpFlagRef.current = false;
+    answerReceivedThisRunRef.current = false;
+    recentActivityItemRef.current.clear();
     hasSentMessageRef.current = true; // Hide welcome section permanently for this session
     currentTaskRef.current = pending;
     lastRunTaskRef.current = pending;
     setIsRunning(true);
-    setActivity([]);
+    clearActivityNow();
     setTaskError(null);
     setTokenStats(null);
     setCancelling(false);
@@ -1398,7 +1614,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         onTaskDoneRef.current(resolvedSessionId); // refresh sidebar even on invoke-level failures
       }
     }
-  }, [settings.project_root, activeTab, activeProjectPath]);
+  }, [settings.project_root, activeTab, activeProjectPath, clearActivityNow]);
 
   useEffect(() => {
     if (isRunning) return;
@@ -1551,16 +1767,73 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
   function renderActivityFeed() {
     if (activity.length === 0) return null;
+    const livePlan = parsePlanFromActivity(activity);
+    const toolCalls = activity.filter(a => a.kind === 'tool').length;
+    const streamStepCount = Math.max(toolCalls, activity.length);
+    const planProgress =
+      livePlan ? livePlanProgressLabel(livePlan.steps.length, activity, isRunning) : undefined;
+
     return (
       <div className="kim-msg-row kim-msg-row--assistant kim-msg-row--live">
-        <div className="kim-bubble kim-bubble--assistant kim-bubble--live">
-          <div className="kim-thinking-header">
-            <span className="kim-thinking-header__dot" aria-hidden="true" />
-            <span className="kim-thinking-header__label">Thinking…</span>
-            {elapsed > 0 && (
-              <span className="kim-thinking-header__timer">{formatDuration(elapsed)}</span>
-            )}
+        <div className="kim-bubble kim-bubble--assistant kim-bubble--live kim-bubble--live-stream">
+          <div className="kim-thinking-header kim-thinking-header--stream">
+            <span className="kim-thinking-header__lead">
+              <span className="kim-thinking-header__dot" aria-hidden="true" />
+              <span className="kim-thinking-header__label">Thinking</span>
+            </span>
+            <span className="kim-thinking-header__trail">
+              {elapsed > 0 && (
+                <span className="kim-thinking-header__timer">{formatDuration(elapsed)}</span>
+              )}
+              {elapsed > 0 && (
+                <span className="kim-thinking-header__sep" aria-hidden="true">
+                  ·
+                </span>
+              )}
+              <span className="kim-thinking-header__steps">
+                {streamStepCount} {streamStepCount === 1 ? 'step' : 'steps'}
+              </span>
+            </span>
           </div>
+          {livePlan && (
+            <div className="kim-plan-live">
+              <button
+                type="button"
+                className={'kim-plan-live__toggle' + (livePlanExpanded ? ' is-expanded' : '')}
+                onClick={() => setLivePlanExpanded(e => !e)}
+                aria-expanded={livePlanExpanded}
+              >
+                <svg
+                  className="kim-plan-live__chev"
+                  viewBox="0 0 16 16"
+                  width="12"
+                  height="12"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M5 3l5 5-5 5" />
+                </svg>
+                <span className="kim-plan-live__title">Plan</span>
+                {planProgress && (
+                  <span className="kim-plan-live__progress">{planProgress}</span>
+                )}
+              </button>
+              {livePlanExpanded && (
+                <ol className="kim-plan-live__list">
+                  {livePlan.steps.map((s, i) => (
+                    <li key={i} className="kim-plan-live__step">
+                      <span className="kim-plan-live__idx">{i + 1}</span>
+                      <span className="kim-plan-live__text">{s}</span>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          )}
           <div className="kim-activity-feed">
             {activity.map(item => (
               <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
@@ -1683,20 +1956,22 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               </svg>
             </button>
           </div>
-        </div>
-          <div className="kim-composer__bloop" aria-hidden="true">
-            <div className="kim-composer__bloop-inner">
-              <Bloop
-                state={(taskError || cancelling
-                  ? 'error'
-                  : isRunning
-                    ? 'processing'
-                    : taskInput.trim()
-                      ? 'thinking'
-                      : 'idle') as BloopState}
-              />
-            </div>
           </div>
+          {!(newChatMode && !hasSentMessageRef.current) && (
+            <div className="kim-composer__bloop" aria-hidden="true">
+              <div className="kim-composer__bloop-inner">
+                <Bloop
+                  state={(taskError || cancelling
+                    ? 'error'
+                    : isRunning
+                      ? 'processing'
+                      : taskInput.trim()
+                        ? 'thinking'
+                        : 'idle') as BloopState}
+                />
+              </div>
+            </div>
+          )}
         </div>
         <div className="kim-composer__hint">
           <span>
