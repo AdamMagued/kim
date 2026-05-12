@@ -74,7 +74,7 @@ function UserBubble({ text, onEdit }: { text: string; onEdit?: (newText: string)
   if (editing) {
     return (
       <div className="kim-msg-row kim-msg-row--user">
-        <div className="kim-bubble kim-bubble--user kim-bubble--editing">
+        <div className="kim-bubble kim-bubble--user kim-bubble--user-stream kim-bubble--editing">
           <textarea
             ref={taRef}
             className="kim-bubble__edit-textarea"
@@ -104,7 +104,7 @@ function UserBubble({ text, onEdit }: { text: string; onEdit?: (newText: string)
   return (
     <div className="kim-msg-row kim-msg-row--user">
       <div className="kim-bubble-wrap kim-bubble-wrap--user">
-        <div className="kim-bubble kim-bubble--user">{text}</div>
+        <div className="kim-bubble kim-bubble--user kim-bubble--user-stream">{text}</div>
         <div className="kim-bubble-actions kim-bubble-actions--user">
           <button type="button" className="kim-bubble-action" title="Copy" aria-label="Copy" onClick={() => void copyText(text)}>
             <CopyIcon />
