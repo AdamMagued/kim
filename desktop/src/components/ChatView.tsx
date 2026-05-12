@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock, ToolUseBlock, ToolResultBlock } from '../types';
+import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock, ToolUseBlock, ToolResultBlock, BrowserRestoreResult } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
 import { Bloop, type BloopState } from './Bloop';
@@ -738,6 +738,36 @@ function providerLabel(provider: string): string {
   return PROVIDER_LABELS[provider] ?? provider;
 }
 
+const BROWSER_PROVIDER_URLS: Record<string, string> = {
+  claude: 'https://claude.ai/new',
+  chatgpt: 'https://chatgpt.com',
+  gemini: 'https://gemini.google.com/app',
+  grok: 'https://grok.com',
+  deepseek: 'https://chat.deepseek.com',
+};
+
+function normalizeBrowserSite(site?: string | null): string | null {
+  const s = String(site ?? '').trim().toLowerCase();
+  if (s === 'claude' || s === 'claude.ai') return 'claude';
+  if (s === 'chatgpt' || s === 'openai' || s === 'gpt') return 'chatgpt';
+  if (s === 'gemini' || s === 'google') return 'gemini';
+  if (s === 'deepseek') return 'deepseek';
+  if (s === 'grok') return 'grok';
+  return null;
+}
+
+function browserSiteFromProvider(provider?: string | null): string | null {
+  const p = String(provider ?? '').trim().toLowerCase();
+  if (p.startsWith('browser:')) return normalizeBrowserSite(p.split(':')[1]);
+  if (p === 'browser') return null;
+  return null;
+}
+
+function browserProviderFromSession(session?: SessionInfo | null): string | null {
+  return normalizeBrowserSite(session?.browser_last_site)
+    ?? normalizeBrowserSite(Object.keys(session?.browser_threads ?? {})[0]);
+}
+
 function getGreeting(name: string): string {
   const hour = new Date().getHours();
   if (hour < 5) return `Late night, ${name}`;
@@ -970,9 +1000,18 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     return false;
   };
 
-  // Keep a stable ref to the onTaskDone callback
+  // Keep stable refs for long-lived event listeners.
   const onTaskDoneRef = useRef(onTaskDone);
   useEffect(() => { onTaskDoneRef.current = onTaskDone; }, [onTaskDone]);
+
+  const sessionRef = useRef<SessionInfo | null>(session);
+  useEffect(() => { sessionRef.current = session; }, [session]);
+
+  const settingsRef = useRef(settings);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+
+  const activeTabRef = useRef(activeTab);
+  useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
 
   // ── Timer ───────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -1499,10 +1538,17 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       // Existing session view is now interactive, so reload message history
       // after every run completion to reflect newly appended turns.
       setMessageReloadNonce(v => v + 1);
+      // Persist the provider browser's current thread URL before refreshing
+      // sessions. Bad/login/home URLs are filtered on the Rust side so this is
+      // safe to call after every browser-backed run.
+      const completedCodeSession = completedCodeSessionRef.current ?? undefined;
+      const completedSessionId = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
+      const runProviderSite = browserSiteFromProvider(currentTaskRef.current?.provider);
+      void commitCurrentBrowserUrl(runProviderSite, completedCodeSession ?? sessionRef.current, completedSessionId);
+
       // Always refresh sessions — failed runs still create session files.
       // Pass the session ID so App.tsx can auto-navigate to the completed session.
-      const completedCodeSession = completedCodeSessionRef.current ?? undefined;
-      onTaskDoneRef.current(completedCodeSession?.session_id ?? activeResumeSessionIdRef.current, completedCodeSession);
+      onTaskDoneRef.current(completedSessionId, completedCodeSession);
       completedCodeSessionRef.current = null;
       if (!event.payload && !wasCancelled) {
         if (!hadNeedHelp) {
@@ -1557,6 +1603,64 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     return p || 'browser';
   }, [localProvider, settings.provider, browserProvider]);
 
+  const browserCommandArgs = useCallback((
+    targetSession?: SessionInfo | null,
+    overrideSessionId?: string | null,
+  ) => {
+    const s = targetSession ?? sessionRef.current;
+    const st = settingsRef.current;
+    const sessionType = s?.session_type ?? (activeTabRef.current === 'code' ? 'claw' : 'kim');
+    return {
+      sessionId: overrideSessionId ?? s?.session_id ?? activeResumeSessionIdRef.current,
+      sessionDate: s?.date ?? null,
+      sessionType,
+      kimDir: st.kim_sessions_dir || null,
+      clawDir: sessionType === 'claw' && s?.project_path
+        ? `${s.project_path}/.claw/sessions`
+        : st.claw_sessions_dir || null,
+    };
+  }, []);
+
+  const commitCurrentBrowserUrl = useCallback(async (preferredSite?: string | null, targetSession?: SessionInfo | null, overrideSessionId?: string | null) => {
+    const site = normalizeBrowserSite(preferredSite) ?? browserSiteFromProvider(currentTaskRef.current?.provider) ?? browserSiteFromProvider(resolveProvider());
+    const args = browserCommandArgs(targetSession, overrideSessionId);
+    if (!args.sessionId) return;
+    try {
+      await invoke('session_browser_url_commit', {
+        ...args,
+        preferredSite: site,
+      });
+    } catch {
+      // Non-fatal: URL persistence must never break task completion.
+    }
+  }, [browserCommandArgs, resolveProvider]);
+
+  const restoreBrowserForSession = useCallback(async (targetSession: SessionInfo, preferredSite?: string | null) => {
+    const site = normalizeBrowserSite(preferredSite) ?? browserProviderFromSession(targetSession) ?? browserSiteFromProvider(resolveProvider());
+    if (!site) return null;
+    try {
+      return await invoke<BrowserRestoreResult>('restore_browser_for_session', {
+        ...browserCommandArgs(targetSession),
+        preferredSite: site,
+      });
+    } catch {
+      return null;
+    }
+  }, [browserCommandArgs, resolveProvider]);
+
+  // Restore the provider browser to this Kim session's remembered provider/thread.
+  // Old sessions with no browser metadata do nothing, so a new chat never
+  // inherits another session's provider URL.
+  useEffect(() => {
+    if (!session || newChatMode) return;
+    const savedSite = browserProviderFromSession(session);
+    if (!savedSite) return;
+
+    setBrowserProvider(savedSite);
+    setLocalProvider(`browser:${savedSite}`);
+    void restoreBrowserForSession(session, savedSite);
+  }, [session?.session_key, session?.session_id, newChatMode, restoreBrowserForSession]);
+
   const makePendingTask = useCallback((text: string, providerOverride?: string): PendingTask => {
     return {
       id: Date.now() + Math.floor(Math.random() * 1000),
@@ -1593,6 +1697,15 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       // where a queued task starts before React has finished prop-drilling
       // the new session state from the previous task's completion.
       const resolvedSessionId = completedCodeSessionRef.current?.session_id ?? activeResumeSessionIdRef.current;
+      const pendingBrowserSite = browserSiteFromProvider(pending.provider);
+      if (pendingBrowserSite) {
+        invoke('session_browser_meta_write', {
+          ...browserCommandArgs(sessionRef.current, resolvedSessionId),
+          browserLastSite: pendingBrowserSite,
+          site: null,
+          url: null,
+        }).catch(() => {});
+      }
       
       await invoke('send_task', {
         task: pending.text,
@@ -1614,7 +1727,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         onTaskDoneRef.current(resolvedSessionId); // refresh sidebar even on invoke-level failures
       }
     }
-  }, [settings.project_root, activeTab, activeProjectPath, clearActivityNow]);
+  }, [settings.project_root, activeTab, activeProjectPath, clearActivityNow, browserCommandArgs]);
 
   useEffect(() => {
     if (isRunning) return;
@@ -1987,26 +2100,52 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               value={resolveProvider()}
               onChange={async (e) => {
                 const val = e.target.value;
+                const previousSite = browserSiteFromProvider(resolveProvider());
+
                 if (val.startsWith('browser:')) {
-                  // Browser sub-provider: set both localProvider and browserProvider
-                  setLocalProvider(val);
-                  const sub = val.split(':')[1];
+                  const sub = normalizeBrowserSite(val.split(':')[1]);
+                  if (!sub) return;
+
+                  // Save the old thread before switching away from it.
+                  await commitCurrentBrowserUrl(previousSite);
+
+                  setLocalProvider(`browser:${sub}`);
                   setBrowserProvider(sub);
-                  // Navigate the existing browser window (if open) to the new provider
-                  const urlMap: Record<string, string> = {
-                    claude: 'https://claude.ai',
-                    chatgpt: 'https://chatgpt.com',
-                    gemini: 'https://gemini.google.com/app',
-                    grok: 'https://grok.com',
-                    deepseek: 'https://chat.deepseek.com',
-                  };
-                  const newUrl = urlMap[sub];
-                  if (newUrl) {
+
+                  const targetSession = sessionRef.current;
+                  if (targetSession) {
                     try {
-                      await invoke<boolean>('navigate_browser_window_if_open', { url: newUrl });
-                    } catch (_) {}
+                      await invoke('session_browser_meta_write', {
+                        ...browserCommandArgs(targetSession),
+                        browserLastSite: sub,
+                        site: null,
+                        url: null,
+                      });
+                    } catch {
+                      // Non-fatal.
+                    }
+                    const result = await restoreBrowserForSession(targetSession, sub);
+                    if (result?.restored) {
+                      toast(`Restored ${providerLabel('browser:' + sub)} for this session.`, 'info', 3000);
+                    }
+                  } else {
+                    const newUrl = BROWSER_PROVIDER_URLS[sub];
+                    if (newUrl) {
+                      try {
+                        const navigated = await invoke<boolean>('navigate_browser_window_if_open', { url: newUrl });
+                        if (!navigated) {
+                          await invoke<string>('open_browser_signin_window', {
+                            url: newUrl,
+                            providerName: sub.charAt(0).toUpperCase() + sub.slice(1),
+                          });
+                        }
+                      } catch {
+                        // Provider switch should not block composer use.
+                      }
+                    }
                   }
                 } else {
+                  await commitCurrentBrowserUrl(previousSite);
                   setLocalProvider(val);
                 }
               }}

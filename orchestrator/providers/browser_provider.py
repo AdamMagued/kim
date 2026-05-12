@@ -383,7 +383,12 @@ class BrowserProvider(BaseProvider):
         )
 
         if self._use_webview_bridge:
-            return await self._complete_via_webview_bridge(prompt, attachments, completion_hash)
+            return await self._complete_via_webview_bridge(
+                prompt,
+                attachments,
+                completion_hash,
+                clear_chat=clear_chat,
+            )
 
         try:
             async with async_playwright() as pw:
@@ -454,6 +459,7 @@ class BrowserProvider(BaseProvider):
         prompt: str,
         attachments: list[dict],
         completion_hash: str,
+        clear_chat: bool = False,
     ) -> dict:
         """Run completion through Kim desktop's in-app webview bridge.
 
@@ -510,6 +516,7 @@ class BrowserProvider(BaseProvider):
             "prompt": prompt,
             "attachments": bridge_attachments,
             "completion_hash": completion_hash,
+            "clear_chat": bool(clear_chat),
         }
 
         # ── Try split send/result API first ──────────────────────────────
@@ -1710,6 +1717,33 @@ class BrowserProvider(BaseProvider):
             recap = "…\n" + recap[-max_recap:]
         return recap
 
+    def _transport_marker_instruction(self, completion_hash: str) -> str:
+        return (
+            f"IMPORTANT: Always append the exact string {completion_hash} "
+            "at the very end of your entire response. Do not append any other "
+            "END_OF_RESPONSE marker or KIM_* token."
+        )
+
+    def _strip_transport_markers(self, text: str, completion_hash: str) -> str:
+        """Keep the newest response fragment and remove dynamic/legacy markers."""
+        if not text:
+            return ""
+
+        # If the current completion hash appears, ignore anything after it and
+        # then discard older completed responses before it. This protects the
+        # parser from browser DOMs that include several assistant bubbles.
+        if completion_hash and completion_hash in text:
+            text = text.split(completion_hash, 1)[0]
+
+        marker_re = r"\[END_OF_RESPONSE(?:_[A-Za-z0-9-]+)?\]"
+        if re.search(marker_re, text, flags=re.IGNORECASE):
+            parts = [part.strip() for part in re.split(marker_re, text, flags=re.IGNORECASE) if part.strip()]
+            if parts:
+                text = parts[-1]
+
+        text = re.sub(marker_re, "", text, flags=re.IGNORECASE).strip()
+        return text
+
     def _format_prompt(
         self, messages: list[dict], tools: list[dict], system: str
     ) -> tuple[str, list[dict], str]:
@@ -1787,10 +1821,12 @@ class BrowserProvider(BaseProvider):
 
         last_text = last_text.strip()
 
-        # Use a static, memorable sentinel instead of a random hash.
-        # The scraper is pinned to the newest response element (min_index),
-        # so it will never accidentally match the previous turn's marker.
-        completion_hash = "[END_OF_RESPONSE]"
+        import uuid
+        # Use a unique, memorable sentinel instead of a static hash.
+        # This guarantees the scraper will NEVER accidentally match the previous 
+        # turn's marker if the DOM is slow to update.
+        unique_id = uuid.uuid4().hex[:8]
+        completion_hash = f"[END_OF_RESPONSE_{unique_id}]"
 
         # ── Resumed-session recap ────────────────────────────────────────
         # The browser UI normally retains its own history, but after a Kim
@@ -1850,8 +1886,7 @@ class BrowserProvider(BaseProvider):
                 prompt = (
                     f"[SYSTEM]\n{system}\n"
                     f"{_os_hint}\n\n"
-                    f"IMPORTANT: Always append the exact string {completion_hash} "
-                    "at the very end of your entire response.\n\n"
+                    + self._transport_marker_instruction(completion_hash) + "\n\n"
                     f"{history_block}"
                     f"{last_text}"
                 )
@@ -1880,15 +1915,14 @@ class BrowserProvider(BaseProvider):
                     "CRITICAL: If your JSON arguments contain double quotes (e.g., "
                     "HTML attributes or code), you MUST escape them (\\\") so the "
                     "JSON is valid.\n"
-                    f"IMPORTANT: Always append the exact string {completion_hash} "
-                    "at the very end of your entire response.\n\n"
+                    + self._transport_marker_instruction(completion_hash) + "\n\n"
                     f"{history_block}"
                     f"{last_text}"
                 )
             self._sent_system_prompt = True
         else:
             # ── Subsequent calls: delta only ─────────────────────────────
-            prompt = last_text + f"\n\nRemember: append {completion_hash} at the very end of your response."
+            prompt = last_text + "\n\n" + self._transport_marker_instruction(completion_hash)
 
         # Trim if too long
         if len(prompt) > self._max_inject_chars:
@@ -1913,8 +1947,9 @@ class BrowserProvider(BaseProvider):
             - fenced ``json`` code blocks           → ``{"type": "tool_call", …}``
             - bare JSON ``{"tool": …}``             → ``{"type": "tool_call", …}``
         """
-        # Strip the bridge sentinel before any parsing.
-        text = text.replace('[END_OF_RESPONSE]', '').strip()
+        # Strip dynamic/legacy bridge sentinels before any parsing, preferring
+        # the newest fragment when the browser DOM includes older bubbles.
+        text = self._strip_transport_markers(text, completion_hash)
         # Also strip any old-style KIM_ hashes from previous sessions.
         text = re.sub(r'\bKIM_[a-f0-9]{8}\b', '', text).strip()
         # Strip <tool_call> / </tool_call> wrappers DeepSeek sometimes emits.
