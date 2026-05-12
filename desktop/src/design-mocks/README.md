@@ -11,25 +11,15 @@ cd kim-pro/desktop
 npm run tauri dev
 ```
 
-## Dev default: you should see the mock shell
+## Real Kim app vs these files
 
-In **development**, the entry (`main.tsx`) renders **`FullWindowShell`** (the `dm-*` mock) **by default**, so the converter output is visible.
+**`main.tsx` always renders the real `<App />`** (except the cancel helper window). These TSX files are **reference implementations** only — they are **not** mounted at the root, so Kim stays fully interactive.
 
-## Run normal Kim instead
+Use them while **merging** `dm-*` markup and tokens into real components (`ChatView`, `Sidebar`, `SettingsPanel`, etc.). Replacing `<App />` with `FullWindowShell` was tried earlier and **breaks** the product (static demo, no backend).
 
-Create **`kim-pro/desktop/.env.development.local`**:
+## CSS in `main.tsx`
 
-```bash
-VITE_KIM_REAL_UI=true
-```
-
-Restart `npm run tauri dev`. Or open **`http://localhost:1420/?kim=1`** (adds query without editing env).
-
-Production builds always ship the real **`App`** (mock shell is dev-only).
-
-## Why importing CSS alone didn’t change Kim
-
-Kim’s UI uses **`kim-*`** classes; mocks use **`dm-*`**. Importing `tokens.css` / `styles.css` without rendering **`dm-*`** markup leaves Kim looking unchanged — that’s expected until components are merged.
+`tokens.css` and `styles.css` are imported so `--dm-*` variables and `.dm-*` rules load when you start using mock markup inside Kim. They should not style existing **`kim-*`** UI (different class names). If anything ever looks wrong, Temporarily comment out **`styles.css`** in `main.tsx` and keep **`tokens.css`** only.
 
 ```ts
 import "./design-mocks/tokens.css";
