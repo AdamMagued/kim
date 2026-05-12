@@ -2082,15 +2082,19 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       <div className="kim-chat">
         {renderConnectorsChrome()}
 
-        <div className="kim-empty-welcome">
+        <div className="kim-empty-welcome kim-empty-welcome--launch">
           <div className="kim-greeting__text">
             {activeTab === 'code' ? 'Start a new Code session' : getGreeting(account.display_name.split(' ')[0])}
           </div>
           <div className="kim-empty-welcome__subtitle">
-            Pick a session from the sidebar or start a new chat
+            {activeTab === 'code'
+              ? 'Pick a project in the sidebar, or open a saved Code session.'
+              : 'Pick up where you left off, or start fresh.'}
           </div>
-          <div className="kim-empty-welcome__kbd-hint">
-            Press <kbd>⌘</kbd> <kbd>N</kbd> for a new chat
+          <div className="kim-launch-shortcuts" aria-label="Keyboard shortcuts">
+            <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">N</kbd> new chat</span>
+            <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">B</kbd> sidebar</span>
+            <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">,</kbd> settings</span>
           </div>
         </div>
       </div>
@@ -2107,7 +2111,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
 
           {!hasSentMessageRef.current && (
-            <div className="kim-new-chat-empty">
+            <div className="kim-new-chat-empty kim-new-chat-empty--launch">
               <div className="kim-new-chat-empty__badge">
                 <span className="kim-pulse-dot kim-pulse-dot--accent" />
                 Ready
@@ -2118,7 +2122,12 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               <div className="kim-new-chat-empty__subtitle">
                 {activeTab === 'code'
                   ? 'Tell Kim what to inspect, fix, or build.'
-                  : 'Tell Kim what you want done. Short, messy, or half-formed is fine.'}
+                  : 'Pick up where you left off, or start fresh.'}
+              </div>
+              <div className="kim-launch-shortcuts kim-launch-shortcuts--center" aria-label="Keyboard shortcuts">
+                <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">N</kbd> new chat</span>
+                <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">B</kbd> sidebar</span>
+                <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">,</kbd> settings</span>
               </div>
             </div>
           )}

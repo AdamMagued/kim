@@ -1544,6 +1544,43 @@ kbd {
   max-width: 460px;
 }
 
+/* App launch mock — shortcut chips under greeting */
+.kim-new-chat-empty--launch .kim-new-chat-empty__subtitle {
+  margin-bottom: 22px;
+}
+.kim-launch-shortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px 18px;
+  font-size: 12px;
+  color: var(--text-subtle);
+}
+.kim-launch-shortcuts--center {
+  justify-content: center;
+  margin-top: 6px;
+}
+.kim-launch-shortcuts .kim-kbd {
+  display: inline-block;
+  margin-right: 3px;
+}
+.kim-empty-welcome--launch .kim-launch-shortcuts {
+  margin-top: 16px;
+  justify-content: center;
+}
+.kim-kbd {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-card);
+  color: var(--text-muted);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+}
+
 /* Working indicator */
 .kim-working-indicator {
   max-width: 720px;
