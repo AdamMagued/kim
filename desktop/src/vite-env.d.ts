@@ -1,5 +1,6 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
-  readonly VITE_DESIGN_PREVIEW?: string;
+  /** When `"true"`, dev runs real Kim (`App`). Otherwise dev defaults to design mock shell. */
+  readonly VITE_KIM_REAL_UI?: string;
 }
