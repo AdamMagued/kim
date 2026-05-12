@@ -2,6 +2,33 @@
 
 Standalone React 19 + TypeScript presentational components converted from the uploaded HTML mocks. Import `tokens.css` and `styles.css` once in your app entry before rendering any component.
 
+## Run the real Kim app (npm must find `package.json`)
+
+From the repo root, use the **`desktop`** folder — there is **no** `package.json` directly under `kim-pro/`:
+
+```bash
+cd kim-pro/desktop
+npm run tauri dev
+```
+
+## Why the main app “looks the same”
+
+Kim’s UI uses **`kim-*`** classes and variables; these mocks use **`dm-*`**. Importing `tokens.css` / `styles.css` alone does **not** replace sidebar, chat, or settings — it only loads design tokens and styles that apply when **`dm-*`** markup is rendered.
+
+## Preview the full-window mock in dev
+
+Either:
+
+1. **Environment variable** — create `kim-pro/desktop/.env.development.local`:
+
+   ```bash
+   VITE_DESIGN_PREVIEW=true
+   ```
+
+   Restart `npm run tauri dev`. The app will render **`FullWindowShell`** instead of **`App`** (mock shell only).
+
+2. **Query string** — open the dev URL with `?design=1`, e.g. `http://localhost:1420/?design=1` (browser or webview if you can set the URL).
+
 ```ts
 import "./design-mocks/tokens.css";
 import "./design-mocks/styles.css";
