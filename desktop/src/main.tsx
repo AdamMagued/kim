@@ -8,10 +8,19 @@ import { FullWindowShell } from "./design-mocks/FullWindowShell";
 
 const params = new URLSearchParams(window.location.search);
 const isCancelWindow = params.get("window") === "cancel";
-/** Dev-only: full mock shell — Kim UI uses `kim-*`; mocks use `dm-*`, so normal app looks unchanged until we merge styles or enable preview. */
-const designPreview =
-  import.meta.env.DEV &&
-  (import.meta.env.VITE_DESIGN_PREVIEW === "true" || params.get("design") === "1");
+
+/**
+ * Kim uses `kim-*` CSS; design mocks use `dm-*`. Importing tokens alone does not change the real UI.
+ *
+ * In **development**, we show the converter’s `FullWindowShell` by default so you actually see the mocks.
+ * To run the real Kim app: `VITE_KIM_REAL_UI=true` in `.env.development.local`, or open `?kim=1`.
+ */
+const realKimUi =
+  import.meta.env.PROD ||
+  import.meta.env.VITE_KIM_REAL_UI === "true" ||
+  params.get("kim") === "1";
+
+const designPreview = import.meta.env.DEV && !realKimUi;
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
