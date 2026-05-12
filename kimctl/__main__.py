@@ -11,6 +11,10 @@ Usage:
     python -m kimctl browser show
     python -m kimctl browser hide
     python -m kimctl browser click "<selector>"
+    python -m kimctl browser current-url
+    python -m kimctl browser meta <session_id> [--site gemini]
+    python -m kimctl browser commit-url <session_id> [--site gemini]
+    python -m kimctl browser restore <session_id> [--site gemini]
 """
 
 from __future__ import annotations
@@ -446,6 +450,19 @@ def cmd_cancel(args):
         print(f"{'✅' if data.get('ok') else '❌'} {msg}")
 
 
+def _browser_session_payload(args) -> dict:
+    payload = {
+        "session_id": args.browser_arg,
+        "session_type": args.session_type,
+    }
+    if args.session_date:
+        payload["session_date"] = args.session_date
+    if args.site:
+        payload["preferred_site"] = args.site
+        payload["site"] = args.site
+    return payload
+
+
 def cmd_browser(args):
     if args.browser_action == "show":
         resp = _bridge_request("POST", "/v1/browser/show", json={})
@@ -453,11 +470,41 @@ def cmd_browser(args):
         resp = _bridge_request("POST", "/v1/browser/hide", json={})
     elif args.browser_action == "new-chat":
         resp = _bridge_request("POST", "/v1/browser/new-chat", json={})
+    elif args.browser_action == "current-url":
+        resp = _bridge_request("GET", "/v1/browser/current-url")
     elif args.browser_action == "click":
-        if not args.selector:
-            print("Error: --selector is required for 'click'", file=sys.stderr)
+        if not args.browser_arg:
+            print("Error: selector is required for 'click'", file=sys.stderr)
             sys.exit(1)
-        resp = _bridge_request("POST", "/v1/browser/click", json={"selector": args.selector})
+        resp = _bridge_request("POST", "/v1/browser/click", json={"selector": args.browser_arg})
+    elif args.browser_action == "meta":
+        if not args.browser_arg:
+            print("Error: session_id is required for 'meta'", file=sys.stderr)
+            sys.exit(1)
+        from urllib.parse import urlencode
+        query = {
+            "session_id": args.browser_arg,
+            "session_type": args.session_type,
+        }
+        if args.session_date:
+            query["session_date"] = args.session_date
+        resp = _bridge_request("GET", f"/v1/browser/meta?{urlencode(query)}")
+    elif args.browser_action == "commit-url":
+        if not args.browser_arg:
+            print("Error: session_id is required for 'commit-url'", file=sys.stderr)
+            sys.exit(1)
+        payload = _browser_session_payload(args)
+        if "site" in payload:
+            payload["preferred_site"] = payload.pop("site")
+        resp = _bridge_request("POST", "/v1/browser/commit-url", json=payload)
+    elif args.browser_action == "restore":
+        if not args.browser_arg:
+            print("Error: session_id is required for 'restore'", file=sys.stderr)
+            sys.exit(1)
+        payload = _browser_session_payload(args)
+        if "site" in payload:
+            payload["preferred_site"] = payload.pop("site")
+        resp = _bridge_request("POST", "/v1/browser/restore", json=payload)
     else:
         print(f"Unknown browser action: {args.browser_action}", file=sys.stderr)
         sys.exit(1)
@@ -470,10 +517,27 @@ def cmd_browser(args):
     if hasattr(args, "json") and args.json:
         _print_json(data)
     else:
-        if data.get("ok"):
-            print("✅ Done")
-        else:
+        if not data.get("ok"):
             print(f"❌ {data.get('error', 'Failed')}")
+            return
+
+        if args.browser_action == "current-url":
+            print(data.get("url") or "(no browser URL)")
+        elif args.browser_action == "meta":
+            meta = data.get("meta", {})
+            if args.site:
+                threads = meta.get("browser_threads", {}) if isinstance(meta, dict) else {}
+                print(threads.get(args.site, "(no saved URL for site)"))
+            else:
+                _print_json(meta)
+        elif args.browser_action == "restore":
+            result = data.get("result", {})
+            status = "restored" if result.get("restored") else f"fallback ({result.get('reason', 'unknown')})"
+            print(f"✅ Browser {status}: {result.get('site', 'unknown')}")
+        elif args.browser_action == "commit-url":
+            print("✅ URL committed" if data.get("committed") else f"✅ URL ignored ({data.get('reason', 'no reason')})")
+        else:
+            print("✅ Done")
 
 
 # ---------------------------------------------------------------------------
@@ -516,9 +580,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     # browser
     sp = sub.add_parser("browser", help="Control the in-app browser")
-    sp.add_argument("browser_action", choices=["show", "hide", "click", "new-chat"],
-                     help="Browser action")
-    sp.add_argument("selector", nargs="?", help="CSS selector (for click)")
+    sp.add_argument(
+        "browser_action",
+        choices=["show", "hide", "click", "new-chat", "current-url", "meta", "commit-url", "restore"],
+        help="Browser action",
+    )
+    sp.add_argument("browser_arg", nargs="?", help="Selector for click, or session ID for meta/commit-url/restore")
+    sp.add_argument("--site", help="Browser site key for session operations (claude, chatgpt, gemini, grok, deepseek)")
+    sp.add_argument("--session-date", help="YYYY-MM-DD date bucket for the session file")
+    sp.add_argument("--session-type", default="kim", choices=["kim", "claw"], help="Session type for browser metadata")
     sp.add_argument("--json", action="store_true", help="Machine-readable output")
 
     return p

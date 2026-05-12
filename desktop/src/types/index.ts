@@ -26,6 +26,7 @@ export interface BrowserRestoreResult {
   site: string;
   url: string;
   reason: string;
+  message?: string;
 }
 
 // ── Message / content types ──────────────────────────────────────────────────

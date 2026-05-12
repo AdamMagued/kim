@@ -1662,12 +1662,20 @@ class BrowserProvider(BaseProvider):
 
         return "".join(out_parts)
 
-    def _build_history_recap(self, prior_messages: list[dict]) -> str:
+    def _build_history_recap(
+        self,
+        prior_messages: list[dict],
+        *,
+        max_recap: int = 2000,
+        max_item_chars: int = 400,
+    ) -> str:
         """Compact recap of prior turns, used on first send of a resumed session.
 
         Filters out tool-result noise and tool-call JSON to keep the recap
         readable for the LLM. Caps total length so it fits inside the prompt
-        budget even for long sessions.
+        budget even for long sessions. When the desktop restored a provider
+        thread from .browser.json, callers pass a much smaller cap because the
+        web UI already has the real thread context and only needs a refresher.
         """
         lines: list[str] = []
         for msg in prior_messages:
@@ -1693,8 +1701,8 @@ class BrowserProvider(BaseProvider):
                     content = content[6:].strip()
                 if not content:
                     continue
-                if len(content) > 400:
-                    content = content[:400] + "…"
+                if len(content) > max_item_chars:
+                    content = content[:max_item_chars] + "…"
                 lines.append(f"User: {content}")
             elif role == "assistant":
                 stripped = content.lstrip()
@@ -1704,15 +1712,14 @@ class BrowserProvider(BaseProvider):
                             continue
                     except Exception:
                         pass
-                if len(content) > 400:
-                    content = content[:400] + "…"
+                if len(content) > max_item_chars:
+                    content = content[:max_item_chars] + "…"
                 lines.append(f"Kim: {content}")
 
         if not lines:
             return ""
 
         recap = "\n".join(lines)
-        max_recap = 2000
         if len(recap) > max_recap:
             recap = "…\n" + recap[-max_recap:]
         return recap
@@ -1838,15 +1845,29 @@ class BrowserProvider(BaseProvider):
         # can pick up where the previous session left off.
         history_block = ""
         if not self._sent_system_prompt and len(messages) > 1:
-            recap = self._build_history_recap(messages[:-1])
+            restored_thread = os.environ.get("KIM_BROWSER_RESTORE_STATUS", "").strip().lower() == "stored_thread"
+            recap = self._build_history_recap(
+                messages[:-1],
+                max_recap=700 if restored_thread else 2000,
+                max_item_chars=220 if restored_thread else 400,
+            )
             if recap:
-                history_block = (
-                    "[PRIOR CONVERSATION — for context only; do not re-execute, "
-                    "just use as background.]\n"
-                    f"{recap}\n"
-                    "[END PRIOR CONVERSATION]\n\n"
-                    "Now respond to the next user message:\n\n"
-                )
+                if restored_thread:
+                    history_block = (
+                        "[BRIEF PRIOR CONTEXT — browser thread was restored; this is only a refresher. "
+                        "Do not re-execute previous actions.]\n"
+                        f"{recap}\n"
+                        "[END BRIEF PRIOR CONTEXT]\n\n"
+                        "Now respond to the next user message:\n\n"
+                    )
+                else:
+                    history_block = (
+                        "[PRIOR CONVERSATION — for context only; do not re-execute, "
+                        "just use as background.]\n"
+                        f"{recap}\n"
+                        "[END PRIOR CONVERSATION]\n\n"
+                        "Now respond to the next user message:\n\n"
+                    )
 
         # ── First message: include system prompt + tools ─────────────────
         if not self._sent_system_prompt:
