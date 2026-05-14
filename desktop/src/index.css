@@ -943,13 +943,21 @@ kbd {
   animation: kim-shimmer 1.5s ease-in-out infinite;
 }
 
-/* Sidebar brand row: reserves space for the macOS traffic lights and shows the K logo + version. */
+/* Sidebar brand row: reserves space for the macOS traffic lights and shows the K logo + version.
+ *
+ * The traffic-light cluster on macOS sits at roughly x:20–72, y:14–26 (12pt circles, 8pt gaps).
+ * We need (a) enough left padding so the K logo never collides horizontally with them, and
+ * (b) enough vertical room so the logo lives BELOW the traffic-light row, not adjacent to it.
+ *
+ * Previous: height 60px + flex-end + padding-bottom 8px placed the logo top at ~y32,
+ * which is only ~6px below the traffic-light bottom — looks overlapped. Bumping to 76px tall
+ * and pushing the left padding to 88px gives a clear ~24px vertical gap. */
 .kim-sidebar__brand {
-  height: 60px;
+  height: 76px;
   flex-shrink: 0;
   display: flex;
   align-items: flex-end;
-  padding: 0 12px 8px 78px; /* 78px clears the traffic-lights cluster */
+  padding: 0 12px 10px 88px;
   -webkit-app-region: drag;
 }
 .kim-sidebar--collapsed .kim-sidebar__brand {
@@ -1780,20 +1788,71 @@ kbd {
   font-size: 12.5px;
   line-height: 1.45;
   color: var(--text);
+  transition: color 0.18s ease;
 }
 .kim-plan-live__idx {
   flex-shrink: 0;
   min-width: 1.25rem;
+  width: 1.25rem;
+  height: 1.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
   font-size: 10.5px;
   font-weight: 600;
   color: var(--text-subtle);
-  padding-top: 1px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-card);
+  box-sizing: border-box;
+  transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
 }
 .kim-plan-live__text {
   flex: 1;
   min-width: 0;
   color: var(--text-muted);
+  transition: color 0.18s ease;
+}
+
+/* ── Step states (structured plans only) ──────────────────────────────── */
+/* Completed steps: filled accent circle with a check glyph, faded text. */
+.kim-plan-live__step--done .kim-plan-live__idx {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-foreground, #fff);
+}
+.kim-plan-live__step--done .kim-plan-live__text {
+  color: var(--text-subtle);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--text-subtle) 60%, transparent);
+}
+
+/* Active step: hollow ring with a pulsing dot inside, primary text colour. */
+.kim-plan-live__step--active .kim-plan-live__idx {
+  background: transparent;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.kim-plan-live__step--active .kim-plan-live__text {
+  color: var(--text-strong, var(--text));
+  font-weight: 500;
+}
+.kim-plan-live__active-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: kim-plan-pulse 1.2s ease-in-out infinite;
+}
+@keyframes kim-plan-pulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.85); }
+  50%      { opacity: 1.0; transform: scale(1.0); }
+}
+
+/* Pending steps inherit the base muted look. */
+.kim-plan-live__step--pending .kim-plan-live__idx {
+  color: var(--text-subtle);
 }
 
 /* Worked-for chip — collapsible disclosure showing a completed run's activity */
@@ -2125,6 +2184,300 @@ kbd {
   padding: 0 4px;
 }
 .kim-composer__hint-sep { opacity: 0.6; }
+
+/* ── Unified Provider Picker (below chat composer, replaces auth chip) ── */
+.kim-provider-picker {
+  position: relative;
+  max-width: 680px;
+  margin: 10px auto 0;
+  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.kim-provider-picker__pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--kim-surface, var(--bg-secondary));
+  border: 1px solid var(--kim-border, var(--border));
+  color: var(--kim-text-2, var(--text-secondary));
+  padding: 6px 10px 6px 11px;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.kim-provider-picker__pill:hover:not(:disabled) {
+  border-color: var(--kim-accent-line, var(--accent));
+  color: var(--kim-text, var(--text));
+}
+.kim-provider-picker__pill:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.kim-provider-picker__pill--ok    { border-color: rgba(34, 197, 94, 0.35); }
+.kim-provider-picker__pill--warn  { border-color: rgba(234, 179, 8, 0.45); }
+.kim-provider-picker__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+.kim-provider-picker__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.kim-provider-picker__chev {
+  flex-shrink: 0;
+  color: var(--kim-text-3);
+  margin-left: 2px;
+}
+
+/* Inline sign-in button next to the pill, for browser providers that are
+ * confirmed signed-out. Saves a click compared to opening the dropdown. */
+.kim-provider-picker__signin-btn {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  background: var(--kim-accent);
+  color: #1a0e08;
+  border: none;
+  border-radius: 999px;
+  padding: 5px 11px;
+  cursor: pointer;
+  transition: filter 0.12s ease, transform 0.08s ease;
+}
+.kim-provider-picker__signin-btn:hover { filter: brightness(1.08); }
+.kim-provider-picker__signin-btn:active { transform: scale(0.97); }
+
+/* Inline sign-out — quieter than sign-in (it's a destructive flip), so we
+ * use an outlined-danger style rather than the accent fill. */
+.kim-provider-picker__signout-btn {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  background: transparent;
+  color: var(--kim-text-2);
+  border: 1px solid var(--kim-border);
+  border-radius: 999px;
+  padding: 5px 11px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.kim-provider-picker__signout-btn:hover {
+  border-color: var(--kim-red, #ef4444);
+  color: var(--kim-red, #ef4444);
+  background: rgba(239, 68, 68, 0.06);
+}
+
+/* Dropdown panel — anchored under the pill. */
+.kim-provider-picker__panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 60;
+  background: var(--kim-surface, var(--bg-secondary, #1a1a1a));
+  border: 1px solid var(--kim-border, var(--border));
+  border-radius: 12px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+.kim-provider-picker__section-label {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px 4px;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--kim-text-3);
+}
+.kim-provider-picker__section-label span {
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--kim-text-4);
+}
+
+.kim-provider-picker__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--kim-text);
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 13px;
+  border-radius: 7px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.1s ease;
+}
+.kim-provider-picker__item:hover {
+  background: var(--kim-surface-2, var(--bg-card-hover, rgba(255, 255, 255, 0.04)));
+}
+.kim-provider-picker__item.is-active {
+  background: var(--kim-accent-soft);
+  color: var(--kim-text);
+}
+.kim-provider-picker__item-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kim-provider-picker__badge {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 10px;
+  color: var(--kim-text-3);
+  background: var(--kim-bg-2);
+  border: 1px solid var(--kim-border);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+.kim-provider-picker__badge--ok   { color: #22c55e; border-color: rgba(34, 197, 94, 0.3); }
+.kim-provider-picker__badge--warn { color: #eab308; border-color: rgba(234, 179, 8, 0.4); }
+
+/* Row wrapper for browser-provider entries — lets us put the main "switch to
+ * this provider" button + a secondary "Sign in / Sign out" action on the same
+ * line without the action being part of the switch-target hit area. */
+.kim-provider-picker__row {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  border-radius: 7px;
+}
+.kim-provider-picker__row .kim-provider-picker__item { flex: 1; }
+.kim-provider-picker__row-action {
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  background: var(--kim-bg-2);
+  color: var(--kim-text-2);
+  border: 1px solid var(--kim-border);
+  border-radius: 7px;
+  padding: 0 10px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.kim-provider-picker__row-action:hover {
+  border-color: var(--kim-accent-line);
+  color: var(--kim-text);
+}
+.kim-provider-picker__row-action--danger {
+  color: var(--kim-text-2);
+}
+.kim-provider-picker__row-action--danger:hover {
+  border-color: var(--kim-red, #ef4444);
+  color: var(--kim-red, #ef4444);
+  background: rgba(239, 68, 68, 0.06);
+}
+
+/* Status rows (Ollama connection state). */
+.kim-provider-picker__status {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--kim-text-3);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.kim-provider-picker__status--ok   { color: var(--kim-green, #22c55e); }
+.kim-provider-picker__status--warn { color: #eab308; }
+.kim-provider-picker__status a {
+  color: var(--kim-accent);
+  text-decoration: none;
+  font-size: 11.5px;
+}
+.kim-provider-picker__status a:hover { text-decoration: underline; }
+
+/* Ollama Local/Cloud mode tabs — segmented control inside the Local section,
+ * lets the user pick the bucket before drilling into individual models. */
+.kim-provider-picker__ollama-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin: 6px 6px 4px;
+  padding: 3px;
+  background: var(--kim-bg-2);
+  border: 1px solid var(--kim-border);
+  border-radius: 8px;
+}
+.kim-provider-picker__ollama-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  color: var(--kim-text-3);
+  padding: 5px 0;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.kim-provider-picker__ollama-tab:hover { color: var(--kim-text-2); }
+.kim-provider-picker__ollama-tab.is-active {
+  background: var(--kim-surface);
+  color: var(--kim-text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.kim-provider-picker__ollama-tab-count {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 10px;
+  color: var(--kim-text-4);
+  background: var(--kim-bg-2);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.kim-provider-picker__ollama-tab.is-active .kim-provider-picker__ollama-tab-count {
+  background: var(--kim-bg);
+  color: var(--kim-text-3);
+}
+
+/* Ollama model search + scrollable list. */
+.kim-provider-picker__search {
+  margin: 4px 6px 6px;
+  padding: 6px 9px;
+  font: inherit;
+  font-size: 12.5px;
+  border: 1px solid var(--kim-border);
+  background: var(--kim-bg-2);
+  border-radius: 7px;
+  color: var(--kim-text);
+  outline: none;
+}
+.kim-provider-picker__search:focus {
+  border-color: var(--kim-accent);
+}
+.kim-provider-picker__model-list {
+  max-height: 240px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
 
 /* ── Auth indicator (below chat composer) ──────────────────────────────── */
 .kim-auth-indicator {
@@ -5837,17 +6190,127 @@ kbd {
 .kim-chat--empty-hero .kim-composer__row {
   max-width: 680px;
 }
-.kim-chat--empty-hero .kim-composer__box {
+
+/* ── Hero composer: two-row layout (textarea on top, controls below) ──── */
+.kim-composer__box--hero {
   max-width: 680px;
-  border-radius: 14px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "textarea textarea"
+    "tools    actions";
+  align-items: center;
+  gap: 6px 8px;
+  padding: 14px 14px 10px;
+  border-radius: 16px;
   border: 1px solid var(--kim-accent-line);
   background: var(--kim-surface);
-  box-shadow: 0 0 0 4px var(--kim-accent-soft);
+  box-shadow:
+    0 0 0 4px var(--kim-accent-soft),
+    0 12px 32px -16px rgba(0, 0, 0, 0.4);
+  position: relative;
 }
-.kim-chat--empty-hero .kim-composer__box:focus-within {
+.kim-composer__box--hero:focus-within {
   border-color: var(--kim-accent);
-  box-shadow: 0 0 0 4px var(--kim-accent-soft), 0 0 0 6px rgba(232, 184, 154, 0.08);
+  box-shadow:
+    0 0 0 4px var(--kim-accent-soft),
+    0 0 0 6px rgba(232, 184, 154, 0.08),
+    0 12px 32px -14px rgba(0, 0, 0, 0.5);
 }
+.kim-composer__box--hero .kim-composer__textarea {
+  grid-area: textarea;
+  padding: 4px 4px 12px;
+  font-size: 14.5px;
+}
+/* Single continuous separator between textarea and the bottom row.
+ * Using a ::before pseudo on the box (rather than border-top on each grid
+ * cell) so there is no visible gap where the column-gap sits.
+ * Anchored from the BOTTOM so it's stable as the textarea grows. The bottom
+ * row is ~34px tall (send button) + 10px box padding-bottom = 44px from the
+ * box bottom — the line sits 4px above that. */
+.kim-composer__box--hero::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 48px;
+  height: 1px;
+  background: var(--kim-border);
+  pointer-events: none;
+  opacity: 0.6;
+}
+.kim-composer__box--hero .kim-composer__left-tools {
+  grid-area: tools;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.kim-composer__box--hero .kim-composer__actions {
+  grid-area: actions;
+  gap: 8px;
+}
+.kim-composer__box--hero .kim-btn--stop  { order: 1; }
+.kim-composer__box--hero .kim-context-ring-wrap { order: 2; }
+.kim-composer__box--hero .kim-composer__shortcut-hint { order: 3; }
+.kim-composer__box--hero .kim-btn--send-hero { order: 4; }
+
+/* Decorative left-tool buttons (bell / list / paperclip) */
+.kim-composer__left-tools {
+  display: none; /* hidden when not in hero mode */
+}
+.kim-composer__tool-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--kim-text-3);
+  cursor: default;
+  opacity: 0.7;
+  transition: background 0.12s, color 0.12s, opacity 0.12s;
+}
+.kim-composer__tool-btn:not(:disabled) { cursor: pointer; }
+.kim-composer__tool-btn:not(:disabled):hover {
+  background: var(--kim-surface-2);
+  color: var(--kim-text-2);
+  opacity: 1;
+}
+
+/* Inline keyboard-shortcut hint next to the send button */
+.kim-composer__shortcut-hint {
+  font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+  font-size: 10.5px;
+  color: var(--kim-text-3);
+  background: var(--kim-bg-2);
+  border: 1px solid var(--kim-border);
+  border-radius: 5px;
+  padding: 3px 6px;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+
+/* Hero send button: circular, warm-accent fill, up-arrow inside */
+.kim-btn--send-hero {
+  width: 34px;
+  height: 34px;
+  min-width: 34px;
+  border-radius: 999px;
+  padding: 0;
+  background: var(--kim-accent);
+  color: #1a0e08;
+}
+.kim-btn--send-hero:disabled {
+  background: var(--kim-surface-2);
+  color: var(--kim-text-4);
+}
+.kim-btn--send-hero:hover:not(:disabled) {
+  filter: brightness(1.06);
+  transform: translateY(-1px);
+}
+
 .kim-chat--empty-hero .kim-composer__hint {
   display: none;
 }

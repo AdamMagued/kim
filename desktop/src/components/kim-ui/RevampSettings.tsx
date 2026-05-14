@@ -1141,7 +1141,13 @@ function PanePaths({ settings, onChange }: { settings: Settings; onChange: (s: S
   );
 }
 
-function PaneData({ account }: { account: KimAccount }) {
+function PaneData({
+  account,
+  onAccountChange,
+}: {
+  account: KimAccount;
+  onAccountChange: (a: KimAccount) => Promise<void>;
+}) {
   const [exportState, setExportState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
   const [gistState, setGistState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
   const [statusMsg, setStatusMsg] = useState('');
@@ -1170,8 +1176,8 @@ function PaneData({ account }: { account: KimAccount }) {
     if (!file) return;
     const filePath = (file as File & { path?: string }).path ?? file.name;
     try {
-      const count = await invoke<number>('import_data', { path: filePath });
-      setStatusMsg(`Imported ${count} session${count !== 1 ? 's' : ''}`);
+      const result = await invoke<string>('import_data', { filePath });
+      setStatusMsg(result);
       setTimeout(() => setStatusMsg(''), 3000);
     } catch (err) {
       setStatusMsg(`Import failed: ${String(err)}`);
@@ -1183,7 +1189,13 @@ function PaneData({ account }: { account: KimAccount }) {
     if (!account.github_token) return;
     setGistState('working');
     try {
-      await invoke('backup_to_gist', { token: account.github_token, gistId: account.gist_id ?? null });
+      const gistId = await invoke<string>('backup_to_gist', {
+        token: account.github_token,
+        existingGistId: account.gist_id ?? null,
+      });
+      if (gistId && gistId !== account.gist_id) {
+        await onAccountChange({ ...account, gist_id: gistId });
+      }
       setGistState('done');
       setTimeout(() => setGistState('idle'), 2000);
     } catch (err) {
@@ -1196,7 +1208,8 @@ function PaneData({ account }: { account: KimAccount }) {
     if (!account.github_token || !account.gist_id) return;
     setGistState('working');
     try {
-      await invoke('restore_from_gist', { token: account.github_token, gistId: account.gist_id });
+      const restored = await invoke<KimAccount>('restore_from_gist', { token: account.github_token, gistId: account.gist_id });
+      await onAccountChange({ ...restored, github_token: account.github_token });
       setGistState('done');
       setTimeout(() => setGistState('idle'), 2000);
     } catch (err) {
@@ -1349,7 +1362,7 @@ function PaneAccount({
     setVerifying(true);
     setTokenError('');
     try {
-      const user = await invoke<{ login: string; name: string | null; avatar_url: string }>('verify_github_token', {
+      const user = await invoke<{ login: string; name: string | null; avatar_url: string }>('verify_github_pat', {
         token: token.trim(),
       });
       await onAccountChange({
@@ -1642,7 +1655,13 @@ function PaneFeedback() {
     if (!message.trim()) return;
     setSending(true);
     try {
-      await invoke('submit_feedback', { kind, message: message.trim(), contact: contact.trim() || null });
+      await invoke('send_feedback', {
+        payload: {
+          category: kind,
+          message: message.trim(),
+          contact: contact.trim() || null,
+        },
+      });
       toast('Feedback sent. Thank you!', 'success', 3000);
       setMessage('');
       setContact('');
@@ -1961,7 +1980,7 @@ export function RevampSettings(props: Props) {
           {active === 'ai' && <PaneAI settings={settings} onChange={onChange} />}
           {active === 'voice' && <PaneVoice settings={settings} onChange={onChange} />}
           {active === 'paths' && <PanePaths settings={settings} onChange={onChange} />}
-          {active === 'data' && <PaneData account={account} />}
+          {active === 'data' && <PaneData account={account} onAccountChange={onAccountChange} />}
           {active === 'account' && <PaneAccount account={account} onAccountChange={onAccountChange} />}
           {active === 'mcp' && <PaneMCP />}
           {active === 'feedback' && <PaneFeedback />}

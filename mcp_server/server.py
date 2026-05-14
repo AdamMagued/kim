@@ -39,7 +39,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from mcp_server.config import LOG_LEVEL
+from mcp_server.config import LOG_LEVEL, ENABLED_CONNECTOR_IDS
+from mcp_server.sites import enabled_connectors, load_builtin_connectors
 from mcp_server.tools.files import (
     handle_delete_file,
     handle_list_dir,
@@ -752,6 +753,30 @@ _DISPATCH = {
     "search_in_files": handle_search_in_files,
     "find_files": handle_find_files,
 }
+
+
+# ---------------------------------------------------------------------------
+# Site connectors — auto-discover + merge into _TOOLS / _DISPATCH for the
+# connectors the user has enabled in config.yaml.
+# ---------------------------------------------------------------------------
+load_builtin_connectors()
+_ACTIVE_CONNECTORS = enabled_connectors(ENABLED_CONNECTOR_IDS)
+for _c in _ACTIVE_CONNECTORS:
+    for _tool in _c.tools:
+        _TOOLS.append(_tool)
+    for _name, _handler in _c.handlers.items():
+        if _name in _DISPATCH:
+            logger.warning(
+                "Connector %s tool %s collides with existing dispatch entry; "
+                "overriding.",
+                _c.id, _name,
+            )
+        _DISPATCH[_name] = _handler
+if _ACTIVE_CONNECTORS:
+    logger.info(
+        "Active site connectors: %s",
+        [c.id for c in _ACTIVE_CONNECTORS],
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ import { SignalCard } from './ToolCallCard';
 import { toast } from './Toast';
 import { ConnectorsPanel } from './kim-ui';
 import type { Connector } from './kim-ui';
-import { AuthIndicator } from './AuthIndicator';
+import { ProviderPicker } from './ProviderPicker';
 
 const MAX_ACTIVITY_ITEMS = 300;
 
@@ -30,13 +30,70 @@ function formatDuration(seconds: number): string {
 
 interface LivePlanParsed {
   steps: string[];
+  /** 1-based index of the step currently in progress (0 = no step started yet,
+   *  but the plan is known). Derived from the most recent `STEP n:` marker.
+   *  Steps with index < activeStep are complete; step at activeStep is in
+   *  flight; steps > activeStep are pending. */
+  activeStep: number;
+  /** True when the plan came from the new structured `[PLAN]{json}` event
+   *  emitted by the agent (vs the older heuristic phrase-detection). When
+   *  structured, we trust the step count exactly; otherwise we treat it as
+   *  best-effort. */
+  structured: boolean;
 }
 
 /**
- * Extract a checklist-style plan from streamed status lines (matches the
- * collapsible “Plan · N of M done” mockups).
+ * Extract a checklist-style plan from streamed status lines.
+ *
+ * Preferred path: the agent emits `[STATUS] [PLAN]{"steps":[...]}` and
+ * `[STATUS] [STEP]{"index":n,"name":"..."}` envelopes when the model follows
+ * the planning protocol in the system prompt. We pick the LAST such envelope
+ * (so plan updates / step transitions supersede earlier ones).
+ *
+ * Fallback path: heuristic detection of "here's my plan" + numbered bullets
+ * for older sessions or models that ignore the protocol.
  */
 function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | null {
+  // ── Preferred: structured [PLAN]{json} / [STEP]{json} envelopes ────────
+  let structuredSteps: string[] | null = null;
+  let structuredActive = 0;
+  for (const it of items) {
+    const t = it.text;
+    const planTag = t.indexOf('[PLAN]{');
+    if (planTag !== -1) {
+      try {
+        const json = t.slice(planTag + '[PLAN]'.length);
+        const parsed = JSON.parse(json) as { steps?: unknown };
+        if (Array.isArray(parsed.steps)) {
+          const arr = parsed.steps.filter(s => typeof s === 'string') as string[];
+          if (arr.length >= 2) {
+            structuredSteps = arr.slice(0, 12);
+            structuredActive = 0;
+          }
+        }
+      } catch {
+        // ignore malformed
+      }
+      continue;
+    }
+    const stepTag = t.indexOf('[STEP]{');
+    if (stepTag !== -1 && structuredSteps) {
+      try {
+        const json = t.slice(stepTag + '[STEP]'.length);
+        const parsed = JSON.parse(json) as { index?: number };
+        if (typeof parsed.index === 'number' && parsed.index > 0) {
+          structuredActive = Math.min(parsed.index, structuredSteps.length);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+  if (structuredSteps) {
+    return { steps: structuredSteps, activeStep: structuredActive, structured: true };
+  }
+
+  // ── Heuristic fallback (older sessions / non-compliant models) ─────────
   const steps: string[] = [];
   let collecting = false;
 
@@ -73,7 +130,7 @@ function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | null {
   }
 
   if (steps.length >= 2) {
-    return { steps: steps.slice(0, 12) };
+    return { steps: steps.slice(0, 12), activeStep: 0, structured: false };
   }
 
   const numbered: string[] = [];
@@ -86,13 +143,23 @@ function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | null {
     if (m) numbered.push(m[1].trim());
     else if (numbered.length > 0) break;
   }
-  return numbered.length >= 2 ? { steps: numbered.slice(0, 12) } : null;
+  return numbered.length >= 2
+    ? { steps: numbered.slice(0, 12), activeStep: 0, structured: false }
+    : null;
 }
 
-function livePlanProgressLabel(stepCount: number, items: ActivityItem[], running: boolean): string | undefined {
+function livePlanProgressLabel(plan: LivePlanParsed, items: ActivityItem[], running: boolean): string | undefined {
+  const stepCount = plan.steps.length;
   if (stepCount < 2) return undefined;
-  const nTools = items.filter(i => i.kind === 'tool').length;
-  const done = Math.min(nTools, stepCount);
+  // When we have a structured plan, trust the active-step marker exactly.
+  // Otherwise fall back to counting tool calls as a rough completion proxy.
+  let done: number;
+  if (plan.structured) {
+    done = Math.max(0, plan.activeStep - 1);
+  } else {
+    const nTools = items.filter(i => i.kind === 'tool').length;
+    done = Math.min(nTools, stepCount);
+  }
   let s = `${done} of ${stepCount} done`;
   if (running && done < stepCount) s += ' · 1 in flight';
   return s;
@@ -248,6 +315,10 @@ function cleanAssistantAnswerText(t: string): string {
     .replace(/<think>[\s\S]*?<\/think>/gi, '')
     .replace(/\s*\[END_OF_RESPONSE\]\s*$/i, '')
     .replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said|DeepSeek said):?\s*/ig, '')
+    // Strip the protocol PLAN: / STEP n: markers from the visible assistant
+    // text — they drive the live plan checklist, not the conversation bubble.
+    .replace(/^\s*PLAN:\s*\d+\s*steps?\s*\n(?:\s*\d+[.)]\s+.+\n?)+/gim, '')
+    .replace(/^\s*STEP\s*\d+\s*:\s*.+$/gim, '')
     .trim();
 
   for (let i = 0; i < 3; i++) {
@@ -943,6 +1014,10 @@ interface Props {
   session: SessionInfo | null;
   newChatMode: boolean;
   settings: Settings;
+  /** Optional settings updater so in-chat controls (e.g. the provider picker's
+   *  Ollama model selector) can persist user choices without forcing the user
+   *  into the Settings panel. App.tsx passes its `handleSettingsChange`. */
+  onSettingsChange?: (next: Settings) => void;
   onTaskDone: (sessionId?: string, completedSession?: SessionInfo) => void;
   account: KimAccount;
   onAccountChange: (account: KimAccount) => Promise<void>;
@@ -958,7 +1033,7 @@ interface Props {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function ChatView({ session, newChatMode, settings, onTaskDone, account, activeTab, activeProjectPath, onNewChat, onNewCodeSession, recentSessions, onSelectSession }: Props) {
+export function ChatView({ session, newChatMode, settings, onSettingsChange, onTaskDone, account, activeTab, activeProjectPath, onNewChat, onNewCodeSession, recentSessions, onSelectSession }: Props) {
   const activityCounterRef = useRef(0);
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
@@ -1524,11 +1599,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     const item = parseLogLine(line, id);
     if (!item) {
       if (line.includes('[UI] SCREENSHOT_FLASH')) {
-        invoke('show_screenshot_flash').catch(() => {});
-        // Only now hide the main window and show the cancel widget — the agent
-        // is actually going to look at the screen. Simple tasks ("hi", etc.)
-        // never emit this so they run with the window visible the whole time.
-        invoke('set_task_active_mode', { active: true }).catch(() => {});
+        if (isRunningRef.current) {
+          invoke('show_screenshot_flash').catch(() => {});
+          // Only now hide the main window and show the cancel widget — the agent
+          // is actually going to look at the screen. Simple tasks ("hi", etc.)
+          // never emit this so they run with the window visible the whole time.
+          invoke('set_task_active_mode', { active: true }).catch(() => {});
+        }
       }
       return;
     }
@@ -1935,7 +2012,8 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
   const handleCompactConversation = useCallback(() => {
     setShowContextPopup(false);
-    const pending = makePendingTask('__KIM_COMPACT_CONTEXT__');
+    const compactProvider = settings.provider === 'ollama' ? 'ollama' : resolveProvider();
+    const pending = makePendingTask('__KIM_COMPACT_CONTEXT__', compactProvider);
     if (isRunning) {
       if (queueEnabled) {
         setQueuedTasks(prev => [...prev, pending]);
@@ -1949,7 +2027,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       return;
     }
     void runPendingTask(pending);
-  }, [cancelling, handleCancel, isRunning, makePendingTask, queueEnabled, runPendingTask]);
+  }, [cancelling, handleCancel, isRunning, makePendingTask, queueEnabled, resolveProvider, runPendingTask, settings.provider]);
 
   useEffect(() => {
     if (isRunning) return;
@@ -2106,7 +2184,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     const toolCalls = activity.filter(a => a.kind === 'tool').length;
     const streamStepCount = Math.max(toolCalls, activity.length);
     const planProgress =
-      livePlan ? livePlanProgressLabel(livePlan.steps.length, activity, isRunning) : undefined;
+      livePlan ? livePlanProgressLabel(livePlan, activity, isRunning) : undefined;
 
     return (
       <div className="kim-msg-row kim-msg-row--assistant kim-msg-row--live">
@@ -2159,23 +2237,51 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               </button>
               {livePlanExpanded && (
                 <ol className="kim-plan-live__list">
-                  {livePlan.steps.map((s, i) => (
-                    <li key={i} className="kim-plan-live__step">
-                      <span className="kim-plan-live__idx">{i + 1}</span>
-                      <span className="kim-plan-live__text">{s}</span>
-                    </li>
-                  ))}
+                  {livePlan.steps.map((s, i) => {
+                    // Step state derives from the most recent STEP marker.
+                    // For non-structured plans we don't claim per-step state.
+                    const oneBased = i + 1;
+                    let state: 'done' | 'active' | 'pending' = 'pending';
+                    if (livePlan.structured) {
+                      if (oneBased < livePlan.activeStep) state = 'done';
+                      else if (oneBased === livePlan.activeStep) state = 'active';
+                    }
+                    return (
+                      <li
+                        key={i}
+                        className={`kim-plan-live__step kim-plan-live__step--${state}`}
+                      >
+                        <span className="kim-plan-live__idx" aria-hidden="true">
+                          {state === 'done' ? (
+                            <svg viewBox="0 0 12 12" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M2.5 6.5L5 9l4.5-5.5" />
+                            </svg>
+                          ) : state === 'active' ? (
+                            <span className="kim-plan-live__active-dot" />
+                          ) : (
+                            oneBased
+                          )}
+                        </span>
+                        <span className="kim-plan-live__text">{s}</span>
+                      </li>
+                    );
+                  })}
                 </ol>
               )}
             </div>
           )}
           <div className="kim-activity-feed">
-            {activity.map(item => (
-              <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
-                <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
-                <span className="kim-activity-item__text">{renderActivityText(item.text)}</span>
-              </div>
-            ))}
+            {activity
+              // Hide the raw [PLAN]{json} / [STEP]{json} envelopes from the
+              // visible feed — they drive the plan checklist above, the user
+              // doesn't need to see them as duplicate status lines.
+              .filter(item => !/^\s*\[(?:PLAN|STEP)\]\{/.test(item.text))
+              .map(item => (
+                <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
+                  <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
+                  <span className="kim-activity-item__text">{renderActivityText(item.text)}</span>
+                </div>
+              ))}
           </div>
         </div>
       </div>
@@ -2204,12 +2310,14 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           {expanded && (
             <div className="kim-worked-for__panel">
               <div className="kim-activity-feed kim-activity-feed--archive">
-                {run.activity.map(item => (
-                  <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
-                    <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
-                    <span className="kim-activity-item__text">{renderActivityText(item.text)}</span>
-                  </div>
-                ))}
+                {run.activity
+                  .filter(item => !/^\s*\[(?:PLAN|STEP)\]\{/.test(item.text))
+                  .map(item => (
+                    <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
+                      <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
+                      <span className="kim-activity-item__text">{renderActivityText(item.text)}</span>
+                    </div>
+                  ))}
               </div>
             </div>
           )}
@@ -2241,13 +2349,95 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
   // ── Composer ─────────────────────────────────────────────────────────────────
 
-  function renderComposer() {
+  // Provider-switch logic, extracted from the inline <select> onChange so the
+  // new <ProviderPicker> can reuse it. Handles browser ↔ API ↔ Ollama
+  // transitions, restoring per-session browser threads, and persisting the
+  // last-used browser provider in session meta.
+  const handleProviderChange = useCallback(async (val: string) => {
+    if (isRunningRef.current) {
+      toast('Finish or cancel the current task before switching providers.', 'warning', 3500);
+      return;
+    }
+    const previousSite = browserSiteFromProvider(resolveProvider());
+
+    if (val.startsWith('browser:')) {
+      const sub = normalizeBrowserSite(val.split(':')[1]);
+      if (!sub) return;
+      setLocalProvider(`browser:${sub}`);
+      setBrowserProvider(sub);
+      await commitCurrentBrowserUrl(previousSite);
+      restoreSeqRef.current += 1;
+      lastRestoreKeyRef.current = null;
+
+      const targetSession = sessionRef.current;
+      if (targetSession) {
+        try {
+          await invoke('session_browser_meta_write', {
+            ...browserCommandArgs(targetSession),
+            browserLastSite: sub,
+            lastLlmProvider: `browser:${sub}`,
+            site: null,
+            url: null,
+          });
+        } catch {
+          // Non-fatal.
+        }
+        const seq = restoreSeqRef.current + 1;
+        restoreSeqRef.current = seq;
+        const result = await restoreBrowserForSession(targetSession, sub);
+        if (restoreSeqRef.current === seq && result) {
+          if (result.restored) {
+            toast(`Restored ${providerLabel('browser:' + sub)} for this session.`, 'info', 3000);
+          } else if (result.reason === 'stored_url_rejected') {
+            toast(result.message ?? 'Saved browser URL was invalid, so Kim opened a fresh provider page.', 'warning', 5000);
+          }
+        }
+      } else {
+        const newUrl = BROWSER_PROVIDER_URLS[sub];
+        if (newUrl) {
+          try {
+            const navigated = await invoke<boolean>('navigate_browser_window_if_open', { url: newUrl });
+            if (!navigated) {
+              await invoke<string>('open_browser_signin_window', {
+                url: newUrl,
+                providerName: sub.charAt(0).toUpperCase() + sub.slice(1),
+              });
+            }
+          } catch (err) {
+            toast(`Could not switch browser provider: ${friendlyError(String(err))}`, 'warning', 5000);
+          }
+        }
+      }
+    } else {
+      await commitCurrentBrowserUrl(previousSite);
+      restoreSeqRef.current += 1;
+      setLocalProvider(val);
+    }
+  }, [resolveProvider, commitCurrentBrowserUrl, browserCommandArgs, restoreBrowserForSession]);
+
+  // Persist the user's Ollama model choice through the parent's settings
+  // updater. Picker shows both local and cloud models; we patch the matching
+  // slot and flip `mode` so the next run actually uses it.
+  const handleOllamaModelChange = useCallback((mode: 'local' | 'cloud', model: string) => {
+    if (!onSettingsChange) return;
+    onSettingsChange({
+      ...settings,
+      ollama: {
+        ...settings.ollama,
+        mode,
+        local_model: mode === 'local' ? model : settings.ollama.local_model,
+        cloud_model: mode === 'cloud' ? model : settings.ollama.cloud_model,
+      },
+    });
+  }, [onSettingsChange, settings]);
+
+  function renderComposer(heroMode = false) {
     const resolvedProvider = resolveProvider();
     const browserProviderId = resolvedProvider.startsWith('browser:') ? resolvedProvider.split(':')[1] : '';
     return (
       <form className="kim-composer" onSubmit={handleSubmit}>
         <div className="kim-composer__row">
-        <div className={'kim-composer__box' + (isRunning ? ' kim-composer__box--running' : '')}>
+        <div className={'kim-composer__box' + (isRunning ? ' kim-composer__box--running' : '') + (heroMode ? ' kim-composer__box--hero' : '')}>
           <textarea
             ref={textareaRef}
             value={taskInput}
@@ -2265,6 +2455,27 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
             className="kim-composer__textarea"
           />
 
+          {heroMode && (
+            <div className="kim-composer__left-tools" aria-hidden="true">
+              <button type="button" className="kim-composer__tool-btn" disabled tabIndex={-1} aria-label="Notifications">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M4 12V7a4 4 0 018 0v5l1 2H3l1-2z" />
+                  <path d="M6.5 14a1.5 1.5 0 003 0" />
+                </svg>
+              </button>
+              <button type="button" className="kim-composer__tool-btn" disabled tabIndex={-1} aria-label="System prompt">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                  <path d="M2 4.5h12M2 8h12M2 11.5h8" />
+                </svg>
+              </button>
+              <button type="button" className="kim-composer__tool-btn" disabled tabIndex={-1} aria-label="Attach file">
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M11.5 5.5L6 11a2.5 2.5 0 01-3.5-3.5L8 2a1.5 1.5 0 012 2L4.5 9.5a.5.5 0 00.7.7L10 5.5" />
+                </svg>
+              </button>
+            </div>
+          )}
+
           <div className="kim-composer__actions">
             {isRunning && !cancelling && (
               <button
@@ -2280,14 +2491,17 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                 </svg>
               </button>
             )}
+            {heroMode && !isRunning && (
+              <kbd className="kim-composer__shortcut-hint" aria-hidden="true">⌘↵</kbd>
+            )}
             <button
               type="submit"
               disabled={!taskInput.trim()}
-              className="kim-btn kim-btn--send"
+              className={'kim-btn kim-btn--send' + (heroMode ? ' kim-btn--send-hero' : '')}
               aria-label="Send"
             >
-              <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M5 12h14M13 5l7 7-7 7" />
+              <svg viewBox="0 0 24 24" width={heroMode ? 15 : 17} height={heroMode ? 15 : 17} fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d={heroMode ? 'M12 19V5M5 12l7-7 7 7' : 'M5 12h14M13 5l7 7-7 7'} />
               </svg>
             </button>
             {(() => {
@@ -2496,7 +2710,13 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
             );
           })()
         )}
-        <AuthIndicator provider={resolvedProvider} />
+        <ProviderPicker
+          resolvedProvider={resolvedProvider}
+          ollama={settings.ollama}
+          onChangeProvider={handleProviderChange}
+          onChangeOllamaModel={handleOllamaModelChange}
+          disabled={isRunning}
+        />
         <div className="kim-composer__hint">
           <span>
             {isRunning
@@ -2509,76 +2729,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           <span className="kim-composer__provider-pill">
             <select
               value={resolveProvider()}
-              onChange={async (e) => {
-                const val = e.target.value;
-                const previousSite = browserSiteFromProvider(resolveProvider());
-
-                if (isRunningRef.current) {
-                  toast('Finish or cancel the current task before switching providers.', 'warning', 3500);
-                  return;
-                }
-
-                if (val.startsWith('browser:')) {
-                  const sub = normalizeBrowserSite(val.split(':')[1]);
-                  if (!sub) return;
-
-                  // Update UI state immediately for responsiveness (Issue #1 Sync bug)
-                  setLocalProvider(`browser:${sub}`);
-                  setBrowserProvider(sub);
-
-                  // Save the old thread before switching away from it. Rust
-                  // filters generic home/login pages so this cannot corrupt a
-                  // previously useful URL.
-                  await commitCurrentBrowserUrl(previousSite);
-
-                  restoreSeqRef.current += 1;
-                  lastRestoreKeyRef.current = null;
-
-                  const targetSession = sessionRef.current;
-                  if (targetSession) {
-                    try {
-                      await invoke('session_browser_meta_write', {
-                        ...browserCommandArgs(targetSession),
-                        browserLastSite: sub,
-                        lastLlmProvider: `browser:${sub}`,
-                        site: null,
-                        url: null,
-                      });
-                    } catch {
-                      // Non-fatal.
-                    }
-                    const seq = restoreSeqRef.current + 1;
-                    restoreSeqRef.current = seq;
-                    const result = await restoreBrowserForSession(targetSession, sub);
-                    if (restoreSeqRef.current === seq && result) {
-                      if (result.restored) {
-                        toast(`Restored ${providerLabel('browser:' + sub)} for this session.`, 'info', 3000);
-                      } else if (result.reason === 'stored_url_rejected') {
-                        toast(result.message ?? 'Saved browser URL was invalid, so Kim opened a fresh provider page.', 'warning', 5000);
-                      }
-                    }
-                  } else {
-                    const newUrl = BROWSER_PROVIDER_URLS[sub];
-                    if (newUrl) {
-                      try {
-                        const navigated = await invoke<boolean>('navigate_browser_window_if_open', { url: newUrl });
-                        if (!navigated) {
-                          await invoke<string>('open_browser_signin_window', {
-                            url: newUrl,
-                            providerName: sub.charAt(0).toUpperCase() + sub.slice(1),
-                          });
-                        }
-                      } catch (err) {
-                        toast(`Could not switch browser provider: ${friendlyError(String(err))}`, 'warning', 5000);
-                      }
-                    }
-                  }
-                } else {
-                  await commitCurrentBrowserUrl(previousSite);
-                  restoreSeqRef.current += 1;
-                  setLocalProvider(val);
-                }
-              }}
+              onChange={e => void handleProviderChange(e.target.value)}
               className="kim-composer__provider-select"
             >
               <optgroup label="Ollama">
@@ -2816,16 +2967,16 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     }
     const starters = activeTab === 'code'
       ? [
-          ['⌥', 'Plan first, then execute'],
-          ['⇧', 'Read-only review'],
-          ['⌃', 'Edit + run tests'],
-          ['✦', 'Pick up last task'],
+          ['↳', 'Plan first, then execute'],
+          ['◇', 'Read-only review'],
+          ['↑', 'Edit + run tests'],
+          ['→', 'Pick up last task'],
         ]
       : [
           ['✦', 'Catch me up on yesterday'],
-          ['⌥', 'Open my email'],
-          ['⇧', "What's on screen?"],
-          ['⌃', 'Draft a quick reply'],
+          ['↳', 'Open my email'],
+          ['◇', "What's on screen?"],
+          ['→', 'Draft a quick reply'],
         ];
     return (
       <div className={`kim-chat${empty ? ' kim-chat--empty-hero' : ''}`}>
@@ -2864,11 +3015,12 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
               <h1
                 style={{
-                  fontWeight: 500,
-                  fontSize: 30,
+                  fontWeight: 700,
+                  fontSize: 38,
                   color: 'var(--kim-text)',
-                  margin: '0 0 10px',
-                  letterSpacing: '-0.015em',
+                  margin: '0 0 12px',
+                  letterSpacing: '-0.02em',
+                  lineHeight: 1.1,
                 }}
               >
                 {activeTab === 'code' ? 'What are we building?' : getGreeting(account.display_name.split(' ')[0])}
@@ -2888,7 +3040,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                   : 'Pick up where you left off, or start fresh.'}
               </p>
 
-              {renderComposer()}
+              {renderComposer(true)}
 
               <div
                 style={{

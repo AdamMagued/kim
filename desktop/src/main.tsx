@@ -1,7 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import "./design-mocks/tokens.css";
-import "./design-mocks/styles.css";
 import App from "./App";
 import { CancelWidget } from "./components/CancelWidget";
 

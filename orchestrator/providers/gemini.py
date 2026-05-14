@@ -132,14 +132,14 @@ class GeminiProvider(BaseProvider):
 
         wants_api_key = explicit_mode == "api_key" or (explicit_mode == "auto" and has_api_key)
         wants_oauth_user_project = explicit_mode == "oauth_user_project"
-        wants_oauth = explicit_mode == "oauth" or (explicit_mode == "auto" and has_oauth and not has_user_project)
+        wants_oauth = explicit_mode == "oauth" or (explicit_mode == "auto" and has_oauth)
 
         # Validate oauth_user_project mode requirements
         if wants_oauth_user_project:
             if not has_oauth:
                 raise EnvironmentError(
                     "oauth_user_project mode requires a valid OAuth access token. "
-                    "Sign in with Google in Settings → Gemini → Use Google free tier."
+                    f"Set {OAUTH_TOKEN_ENV} or sign in with Google in Settings → Gemini → Use Google free tier."
                 )
             if not has_user_project:
                 raise EnvironmentError(

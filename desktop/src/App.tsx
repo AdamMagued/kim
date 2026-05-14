@@ -448,6 +448,7 @@ export default function App() {
           session={activeSession}
           newChatMode={newChatMode}
           settings={settings}
+          onSettingsChange={handleSettingsChange}
           onTaskDone={handleTaskDone}
           account={account}
           onAccountChange={setAccount}

@@ -44,6 +44,22 @@ _DENY_PATTERNS = [
 _CHAIN_METACHAR_RE = re.compile(r"[;|&`]|\$\(")
 
 
+def _basename(token: str) -> str:
+    return token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+
+
+def _first_non_option(tokens: list[str], start: int = 0) -> str | None:
+    for token in tokens[start:]:
+        if token == "--":
+            continue
+        if token.startswith("-"):
+            continue
+        if "=" in token and not token.startswith(("/", "\\")):
+            continue
+        return token
+    return None
+
+
 def _check_blocked(cmd: str, allow_chaining: bool = False) -> str | None:
     """Check if a command should be blocked. Returns an error message or None."""
     cmd_stripped = cmd.strip()
@@ -70,15 +86,33 @@ def _check_blocked(cmd: str, allow_chaining: bool = False) -> str | None:
     if not tokens:
         return None
 
-    first_cmd = tokens[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()  # basename
+    first_cmd = _basename(tokens[0])
     if first_cmd in _DENY_COMMANDS:
         return f"BLOCKED: '{first_cmd}' is a blocked command"
 
-    # 4. Special case: rm with -r/-rf and a path that looks like root or parent traversal
-    if first_cmd == "rm" or (len(tokens) > 1 and tokens[0] in ("sudo",) and tokens[1] == "rm"):
-        flags = " ".join(tokens)
-        if re.search(r"-\w*r\w*", flags) and re.search(r"\s+/\s*$|\s+\.\.\s*$", " " + flags):
-            return "BLOCKED: recursive rm targeting root or parent directory"
+    # 4. Wrapper commands can otherwise hide a blocked command as the next token.
+    if first_cmd in {"sudo", "doas", "command", "env", "nohup", "nice", "time"}:
+        wrapped = _first_non_option(tokens, 1)
+        if wrapped:
+            wrapped_name = _basename(wrapped)
+            if wrapped_name in _DENY_COMMANDS:
+                return f"BLOCKED: '{wrapped_name}' is a blocked command"
+            wrapped_index = tokens.index(wrapped)
+            if wrapped_name in {"sudo", "doas", "command", "env", "nohup", "nice", "time", "sh", "bash", "zsh", "fish"}:
+                nested_msg = _check_blocked(" ".join(tokens[wrapped_index:]), allow_chaining=allow_chaining)
+                if nested_msg:
+                    return f"BLOCKED: wrapper contains blocked command. {nested_msg}"
+
+    # 5. Shell wrappers (`bash -c`, `sh -c`, etc.) must recursively vet the script.
+    if first_cmd in {"sh", "bash", "zsh", "fish"}:
+        try:
+            c_index = tokens.index("-c")
+        except ValueError:
+            c_index = -1
+        if c_index >= 0 and c_index + 1 < len(tokens):
+            nested_msg = _check_blocked(tokens[c_index + 1], allow_chaining=allow_chaining)
+            if nested_msg:
+                return f"BLOCKED: shell wrapper contains blocked command. {nested_msg}"
 
     return None
 
