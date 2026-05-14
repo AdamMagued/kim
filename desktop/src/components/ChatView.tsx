@@ -5,8 +5,10 @@ import { listen } from '@tauri-apps/api/event';
 import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock, ToolUseBlock, ToolResultBlock, BrowserRestoreResult } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
-import { Bloop, type BloopState } from './Bloop';
 import { toast } from './Toast';
+import { ConnectorsPanel } from './kim-ui';
+import type { Connector } from './kim-ui';
+import { AuthIndicator } from './AuthIndicator';
 
 const MAX_ACTIVITY_ITEMS = 300;
 
@@ -697,6 +699,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   openai: 'OpenAI',
   gemini: 'Gemini',
   deepseek: 'DeepSeek',
+  ollama: 'Ollama',
   browser: 'Browser',
   'browser:claude': 'Browser Claude',
   'browser:chatgpt': 'Browser ChatGPT',
@@ -712,18 +715,105 @@ interface PendingTask {
   provider: string;
 }
 
-const CONNECTORS = [
+interface ProviderUsageState {
+  provider: string;
+  model?: string;
+  mode?: string;
+  input?: number;
+  output?: number;
+  total?: number;
+  usage_available?: boolean;
+  tokens_per_second?: number;
+  context_limit?: number;
+  context_limit_source?: string;
+  billing?: string;
+  total_duration?: number;
+  load_duration?: number;
+  prompt_eval_duration?: number;
+  eval_duration?: number;
+}
+
+const CONNECTORS: Connector[] = [
+  {
+    id: 'linear',
+    name: 'Linear',
+    brand: '#5e6ad2',
+    initials: 'L',
+    category: 'Productivity',
+    desc: 'Read and update tickets, projects, and cycles.',
+    tools: 14,
+    scopes: ['read:issues', 'write:issues', 'read:projects'],
+    lastUsed: '12 min ago',
+    state: 'connected',
+    activity: [
+      { text: 'Updated KIM-218 → In Review', time: '12m' },
+      { text: 'Created KIM-241', time: '1h' },
+      { text: 'Fetched current cycle', time: '3h' },
+    ],
+  },
+  {
+    id: 'github',
+    name: 'GitHub',
+    brand: '#8b949e',
+    initials: 'GH',
+    category: 'Dev',
+    desc: 'Issues, PRs, code review, file edits across your repos.',
+    tools: 22,
+    scopes: ['repo', 'gist', 'read:user'],
+    state: 'available',
+  },
+  {
+    id: 'notion',
+    name: 'Notion',
+    brand: '#e8e0d2',
+    initials: 'N',
+    category: 'Productivity',
+    desc: 'Search pages, append blocks, and pull databases.',
+    tools: 9,
+    scopes: ['pages:read', 'pages:write'],
+    state: 'available',
+  },
   {
     id: 'guc-cms',
     name: 'GUC CMS',
-    description: 'Course content, announcements, enrollment, and CMS actions.',
-    icon: 'CMS',
+    brand: '#c8a165',
+    initials: 'U',
+    category: 'School',
+    desc: 'Course content, announcements, enrollment, and CMS actions.',
+    tools: 8,
+    scopes: ['session cookie'],
+    state: 'available',
   },
   {
     id: 'guc-mail',
     name: 'GUC Mail',
-    description: 'GUC inbox, sent mail, search, drafts, and email actions.',
-    icon: '@',
+    brand: '#9bb8d4',
+    initials: '@',
+    category: 'School',
+    desc: 'Inbox, sent mail, search, drafts, and email actions.',
+    tools: 11,
+    scopes: ['imap.read', 'smtp.send'],
+    state: 'available',
+  },
+  {
+    id: 'slack',
+    name: 'Slack',
+    brand: '#b48ad1',
+    initials: 'S',
+    category: 'Productivity',
+    desc: 'Send DMs, post in channels, and react to messages.',
+    tools: 12,
+    state: 'soon',
+  },
+  {
+    id: 'gcal',
+    name: 'Google Calendar',
+    brand: '#a9c8e8',
+    initials: 'G',
+    category: 'Productivity',
+    desc: 'List events, schedule, and reschedule meetings.',
+    tools: 7,
+    state: 'soon',
   },
 ];
 
@@ -748,11 +838,12 @@ const BROWSER_PROVIDER_URLS: Record<string, string> = {
 
 function normalizeBrowserSite(site?: string | null): string | null {
   const s = String(site ?? '').trim().toLowerCase();
-  if (s === 'claude' || s === 'claude.ai') return 'claude';
-  if (s === 'chatgpt' || s === 'openai' || s === 'gpt') return 'chatgpt';
-  if (s === 'gemini' || s === 'google') return 'gemini';
-  if (s === 'deepseek') return 'deepseek';
-  if (s === 'grok') return 'grok';
+  if (s === 'claude' || s === 'claude.ai' || s.includes('claude.ai')) return 'claude';
+  if (s === 'chatgpt' || s === 'openai' || s === 'gpt' || s.includes('chatgpt.com') || s.includes('openai.com')) return 'chatgpt';
+  if (s === 'gemini' || s === 'google' || s.includes('gemini.google.com')) return 'gemini';
+  if (s === 'deepseek' || s.includes('deepseek.com')) return 'deepseek';
+  if (s === 'grok' || s.includes('grok.com')) return 'grok';
+  if (s === 'custom') return 'custom';
   return null;
 }
 
@@ -764,7 +855,8 @@ function browserSiteFromProvider(provider?: string | null): string | null {
 }
 
 function browserProviderFromSession(session?: SessionInfo | null): string | null {
-  return normalizeBrowserSite(session?.browser_last_site)
+  return browserSiteFromProvider(session?.last_llm_provider)
+    ?? normalizeBrowserSite(session?.browser_last_site)
     ?? normalizeBrowserSite(Object.keys(session?.browser_threads ?? {})[0]);
 }
 
@@ -834,6 +926,17 @@ function formatElapsed(s: number): string {
   return `${m}m ${sec}s`;
 }
 
+function formatNsDuration(ns?: number): string | null {
+  if (!ns || ns <= 0) return null;
+  const ms = ns / 1_000_000;
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds >= 10 ? 0 : 1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rem = Math.round(seconds % 60);
+  return `${minutes}m ${rem}s`;
+}
+
 // ── Props ─────────────────────────────────────────────────────────────────────
 
 interface Props {
@@ -845,11 +948,17 @@ interface Props {
   onAccountChange: (account: KimAccount) => Promise<void>;
   activeTab: 'chat' | 'code';
   activeProjectPath?: string | null;
+  reloadSessions: () => void;
+  onNewChat?: () => void;
+  onNewCodeSession?: () => void;
+  /** Recent sessions for the launch screen's "pick up where you left off" list. */
+  recentSessions?: SessionInfo[];
+  onSelectSession?: (s: SessionInfo) => void;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function ChatView({ session, newChatMode, settings, onTaskDone, account, activeTab, activeProjectPath }: Props) {
+export function ChatView({ session, newChatMode, settings, onTaskDone, account, activeTab, activeProjectPath, onNewChat, onNewCodeSession, recentSessions, onSelectSession }: Props) {
   const activityCounterRef = useRef(0);
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
@@ -919,13 +1028,15 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   const [taskError, setTaskError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
+  const [providerUsage, setProviderUsage] = useState<ProviderUsageState | null>(null);
+  const [contextState, setContextState] = useState<{ cumulative_input: number; budget: number; phase: string; percent: number; last_input: number; last_output: number; source: string; estimate: boolean } | null>(null);
+  const [showContextPopup, setShowContextPopup] = useState(false);
   const [queuedTasks, setQueuedTasks] = useState<PendingTask[]>([]);
   const [interruptTask, setInterruptTask] = useState<PendingTask | null>(null);
   const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
   const [autoFollowOutput, setAutoFollowOutput] = useState(true);
   const [connectorsOpen, setConnectorsOpen] = useState(false);
   const [connectorsClosing, setConnectorsClosing] = useState(false);
-  const [connectorSearch, setConnectorSearch] = useState('');
   const [livePlanExpanded, setLivePlanExpanded] = useState(true);
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
@@ -1039,14 +1150,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     }
   }, [isRunning]);
 
-  const filteredConnectors = CONNECTORS.filter(connector => {
-    const q = connectorSearch.trim().toLowerCase();
-    if (!q) return true;
-    return (
-      connector.name.toLowerCase().includes(q) ||
-      connector.description.toLowerCase().includes(q)
-    );
-  });
 
   useEffect(() => {
     return () => {
@@ -1098,60 +1201,20 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           aria-label="Close connectors"
           onClick={closeConnectors}
         />
-        <aside className="kim-connectors-panel" aria-label="Connectors">
-              <div className="kim-connectors-panel__header">
-                <div>
-                  <div className="kim-connectors-panel__title">Connectors</div>
-                  <div className="kim-connectors-panel__subtitle">Turn on tool packs for Kim</div>
-                </div>
-                <button
-                  type="button"
-                  className="kim-connectors-panel__close"
-                  aria-label="Close connectors"
-                  onClick={closeConnectors}
-                >
-                  ×
-                </button>
-              </div>
-
-              <label className="kim-connectors-search">
-                <span className="sr-only">Search connectors</span>
-                <input
-                  value={connectorSearch}
-                  onChange={e => setConnectorSearch(e.target.value)}
-                  placeholder="Search for connector..."
-                  autoFocus
-                />
-              </label>
-
-              <div className="kim-connectors-list">
-                {filteredConnectors.map(connector => (
-                  <div className="kim-connector-row" key={connector.id}>
-                    <div className="kim-connector-row__icon" aria-hidden="true">
-                      {connector.icon}
-                    </div>
-                    <div className="kim-connector-row__body">
-                      <div className="kim-connector-row__name">{connector.name}</div>
-                      <div className="kim-connector-row__desc">{connector.description}</div>
-                    </div>
-                    <div className="kim-connector-row__action">
-                      <button type="button" className="kim-connector-connect" disabled>
-                        <span>Connect</span>
-                        <span className="kim-connector-connect__divider" />
-                        <span className="kim-connector-connect__chevron" aria-hidden="true">⌄</span>
-                      </button>
-                      <div className="kim-connector-item__actions">
-                        <span>Coming soon</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-
-                {filteredConnectors.length === 0 && (
-                  <div className="kim-connectors-empty">No connectors found</div>
-                )}
-              </div>
-        </aside>
+        <div
+          className="kim-connectors-panel"
+          aria-label="Connectors"
+          style={{
+            width: 'min(460px, calc(100vw - 44px))',
+            background: 'transparent',
+            border: 0,
+            boxShadow: '-16px 0 42px rgba(0,0,0,0.5)',
+            backdropFilter: 'none',
+            padding: 0,
+          }}
+        >
+          <ConnectorsPanel connectors={CONNECTORS} onClose={closeConnectors} />
+        </div>
       </div>,
       document.body,
     );
@@ -1318,6 +1381,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       setClawRuns([]);
       setTaskError(null);
       setTokenStats(null);
+      setContextState(null);
       setElapsed(0);
       hasSentMessageRef.current = false;
       // Note: do NOT set isRunning=false here — if a task is actually still
@@ -1355,6 +1419,49 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     const statsMatch = line.match(/\[STATS\]\s+input_tokens=(\d+)\s+output_tokens=(\d+)\s+total_tokens=(\d+)/);
     if (statsMatch) {
       setTokenStats({ input: parseInt(statsMatch[1]), output: parseInt(statsMatch[2]), total: parseInt(statsMatch[3]) });
+      return;
+    }
+
+    const ctxMatch = line.match(/\[CONTEXT\]\s+cumulative_input=(\d+)\s+budget=(\d+)\s+phase=(\w+)\s+percent=(\d+)\s+last_input=(\d+)\s+last_output=(\d+)\s+source=([a-zA-Z0-9_\-]+)\s+estimate=(\d)/);
+    if (ctxMatch) {
+      setContextState({
+        cumulative_input: parseInt(ctxMatch[1]),
+        budget: parseInt(ctxMatch[2]),
+        phase: ctxMatch[3],
+        percent: parseInt(ctxMatch[4]),
+        last_input: parseInt(ctxMatch[5]),
+        last_output: parseInt(ctxMatch[6]),
+        source: ctxMatch[7],
+        estimate: ctxMatch[8] === '1'
+      });
+      return;
+    }
+
+    if (line.startsWith('[USAGE] ')) {
+      try {
+        const parsed = JSON.parse(line.slice(8)) as Record<string, unknown>;
+        const input = typeof parsed.input === 'number' ? parsed.input : undefined;
+        const output = typeof parsed.output === 'number' ? parsed.output : undefined;
+        setProviderUsage({
+          provider: String(parsed.provider ?? parsed.source ?? 'unknown'),
+          model: typeof parsed.model === 'string' ? parsed.model : undefined,
+          mode: typeof parsed.mode === 'string' ? parsed.mode : undefined,
+          input,
+          output,
+          total: typeof input === 'number' && typeof output === 'number' ? input + output : undefined,
+          usage_available: Boolean(parsed.usage_available),
+          tokens_per_second: typeof parsed.tokens_per_second === 'number' ? parsed.tokens_per_second : undefined,
+          context_limit: typeof parsed.context_limit === 'number' ? parsed.context_limit : undefined,
+          context_limit_source: typeof parsed.context_limit_source === 'string' ? parsed.context_limit_source : undefined,
+          billing: typeof parsed.billing === 'string' ? parsed.billing : undefined,
+          total_duration: typeof parsed.total_duration === 'number' ? parsed.total_duration : undefined,
+          load_duration: typeof parsed.load_duration === 'number' ? parsed.load_duration : undefined,
+          prompt_eval_duration: typeof parsed.prompt_eval_duration === 'number' ? parsed.prompt_eval_duration : undefined,
+          eval_duration: typeof parsed.eval_duration === 'number' ? parsed.eval_duration : undefined,
+        });
+      } catch {
+        // Ignore malformed usage lines.
+      }
       return;
     }
 
@@ -1604,7 +1711,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     // If localProvider is already "browser:claude" etc., pass it through
     if (p.startsWith('browser:')) return p;
     if (p === 'browser') return `browser:${browserProvider}`;
-    return p || 'browser';
+    return p || 'browser:claude';
   }, [localProvider, settings.provider, browserProvider]);
 
   const browserCommandArgs = useCallback((
@@ -1662,16 +1769,21 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
   // the user has already switched to another session/provider.
   useEffect(() => {
     if (!session || newChatMode) return;
-
+    const currentSite = localProvider
+      ? browserSiteFromProvider(localProvider)
+      : browserSiteFromProvider(settings.provider);
     const savedSite = browserProviderFromSession(session);
-    const fallbackSite = browserSiteFromProvider(resolveProvider()) ?? browserProvider;
-    const site = savedSite ?? fallbackSite;
-    if (!site) return;
 
-    if (savedSite) {
+    // Only auto-apply the saved site if we don't have a manual override in this 
+    // component's lifecycle yet (localProvider is null).
+    const shouldAdoptSavedSite = !localProvider && settings.provider === 'browser' && Boolean(savedSite);
+    if (shouldAdoptSavedSite && savedSite) {
       setBrowserProvider(savedSite);
       setLocalProvider(`browser:${savedSite}`);
     }
+
+    const site = shouldAdoptSavedSite ? savedSite : currentSite;
+    if (!site) return;
 
     const restoreKey = `${session.session_type}:${session.date}:${session.session_id}:${site}`;
     if (lastRestoreKeyRef.current === restoreKey) return;
@@ -1696,11 +1808,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     session?.session_id,
     session?.date,
     session?.session_type,
-    session?.browser_last_site,
-    session?.browser_threads_updated_at_ms,
     newChatMode,
+    localProvider,
+    settings.provider,
     browserProvider,
-    resolveProvider,
     restoreBrowserForSession,
   ]);
 
@@ -1732,8 +1843,20 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
     setCancelling(false);
     setAutoFollowOutput(true);
 
-    // Add user message to live history for chat bubble display
-    setLiveHistory(prev => [...prev, { role: 'user', content: pending.text }]);
+    const isCompactTask = ['__kim_compact_context__', '/compact', 'compact'].includes(pending.text.trim().toLowerCase());
+
+    // Add user message to live history for chat bubble display. Compact is an
+    // internal control task, so keep it out of the visible conversation.
+    if (!isCompactTask) {
+      setLiveHistory(prev => [...prev, { role: 'user', content: pending.text }]);
+    } else {
+      enqueueActivityUpdate(prev => [...prev, {
+        id: ++activityCounterRef.current,
+        kind: 'status',
+        icon: '›',
+        text: 'Compacting this chat…',
+      }]);
+    }
 
     try {
       // Resolve the session ID dynamically from refs to prevent race conditions
@@ -1741,13 +1864,46 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
       // the new session state from the previous task's completion.
       const resolvedSessionId = completedCodeSessionRef.current?.session_id ?? activeResumeSessionIdRef.current;
       const pendingBrowserSite = browserSiteFromProvider(pending.provider);
-      if (pendingBrowserSite) {
+      const pendingProvider = pending.provider.trim().toLowerCase();
+      if (pendingProvider === 'browser' || pendingProvider.startsWith('browser:')) {
         invoke('session_browser_meta_write', {
           ...browserCommandArgs(sessionRef.current, resolvedSessionId),
-          browserLastSite: pendingBrowserSite,
+          browserLastSite: pendingBrowserSite ?? null,
+          lastLlmProvider: pending.provider,
           site: null,
           url: null,
         }).catch(() => {});
+      }
+
+      if (pendingProvider === 'ollama') {
+        const selectedModel = settings.ollama.mode === 'cloud' ? settings.ollama.cloud_model : settings.ollama.local_model;
+        const status = await invoke<{
+          installed: boolean;
+          running: boolean;
+          selected_mode: string;
+          selected_model_available: boolean;
+          cloud_connected: boolean;
+          message: string;
+          cloud_message?: string | null;
+        }>('ollama_get_status', {
+          baseUrl: settings.ollama.base_url || null,
+          selectedModel: selectedModel || null,
+          mode: settings.ollama.mode,
+          contextLimitOverride: settings.ollama.context_limit_override ?? null,
+        });
+        if (!status.installed || !status.running) {
+          throw new Error(status.message || 'Ollama is not available.');
+        }
+        if (!status.selected_model_available) {
+          throw new Error(
+            settings.ollama.mode === 'cloud'
+              ? 'The selected Ollama cloud model is unavailable. Pull it in Settings → AI → Ollama or pick another model.'
+              : 'The selected Ollama local model is not installed. Pull it in Settings → AI → Ollama or pick another model.'
+          );
+        }
+        if (settings.ollama.mode === 'cloud' && !status.cloud_connected) {
+          throw new Error(status.cloud_message || 'Sign in to Ollama to use cloud models.');
+        }
       }
       
       await invoke('send_task', {
@@ -1755,6 +1911,11 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         provider: pending.provider,
         projectRoot: (activeTab === 'code' && activeProjectPath) ? activeProjectPath : (settings.project_root || null),
         resumeSessionId: resolvedSessionId,
+        ollamaBaseUrl: settings.ollama.base_url || null,
+        ollamaMode: settings.ollama.mode,
+        ollamaLocalModel: settings.ollama.local_model || null,
+        ollamaCloudModel: settings.ollama.cloud_model || null,
+        ollamaContextLimitOverride: settings.ollama.context_limit_override ?? null,
       });
     } catch (err) {
       // kim-agent-done fires BEFORE invoke() rejects on process failure.
@@ -1770,7 +1931,25 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
         onTaskDoneRef.current(resolvedSessionId); // refresh sidebar even on invoke-level failures
       }
     }
-  }, [settings.project_root, activeTab, activeProjectPath, clearActivityNow, browserCommandArgs]);
+  }, [settings.project_root, activeTab, activeProjectPath, clearActivityNow, browserCommandArgs, enqueueActivityUpdate]);
+
+  const handleCompactConversation = useCallback(() => {
+    setShowContextPopup(false);
+    const pending = makePendingTask('__KIM_COMPACT_CONTEXT__');
+    if (isRunning) {
+      if (queueEnabled) {
+        setQueuedTasks(prev => [...prev, pending]);
+        toast('Compact queued. Kim will compact after the current task finishes.', 'info', 3000);
+      } else {
+        setQueuedTasks([]);
+        setInterruptTask(pending);
+        toast('Compacting after the current task stops.', 'warning', 3500);
+        if (!cancelling) void handleCancel();
+      }
+      return;
+    }
+    void runPendingTask(pending);
+  }, [cancelling, handleCancel, isRunning, makePendingTask, queueEnabled, runPendingTask]);
 
   useEffect(() => {
     if (isRunning) return;
@@ -2111,24 +2290,213 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                 <path d="M5 12h14M13 5l7 7-7 7" />
               </svg>
             </button>
-          </div>
-          </div>
-          {!(newChatMode && !hasSentMessageRef.current) && (
-            <div className="kim-composer__bloop" aria-hidden="true">
-              <div className="kim-composer__bloop-inner">
-                <Bloop
-                  state={(taskError || cancelling
-                    ? 'error'
-                    : isRunning
-                      ? 'processing'
-                      : taskInput.trim()
-                        ? 'thinking'
-                        : 'idle') as BloopState}
-                />
+            {(() => {
+              const ollamaUsageActive =
+                providerUsage?.provider === 'ollama' &&
+                providerUsage.usage_available &&
+                typeof providerUsage.input === 'number' &&
+                typeof providerUsage.context_limit === 'number' &&
+                providerUsage.context_limit > 0;
+              const budget = ollamaUsageActive
+                ? (providerUsage.context_limit as number)
+                : (contextState ? contextState.budget : 200000);
+              const used = ollamaUsageActive
+                ? (providerUsage.input as number)
+                : (contextState ? contextState.cumulative_input : (tokenStats ? tokenStats.total : 0));
+              const ratio = Math.min(Math.max(used / budget, 0), 1);
+              const status = ollamaUsageActive
+                ? (ratio > 0.95 ? 'critical' : ratio > 0.8 ? 'warn' : 'ok')
+                : (contextState ? contextState.phase : (ratio > 0.9 ? 'critical' : ratio > 0.75 ? 'warn' : 'normal'));
+              const offset = (2 * Math.PI * 12) - (ratio * (2 * Math.PI * 12));
+              
+              const pctUsed = Math.round(ratio * 100);
+              
+              return (
+              <div className={`kim-context-ring-wrap kim-context-ring-wrap--${status}`} title={`Context Used: ${used.toLocaleString()} / ${budget.toLocaleString()}`}>
+                <div className="kim-context-ring-container">
+                  <button type="button" className="kim-context-ring__btn" aria-label="Context Meter" onClick={() => setShowContextPopup(!showContextPopup)}>
+                    <svg viewBox="0 0 32 32" width="32" height="32" fill="none">
+                      <circle className="kim-context-ring__bg" cx="16" cy="16" r="12" strokeWidth="2.5" />
+                      <circle
+                        className="kim-context-ring__fill"
+                        cx="16" cy="16" r="12"
+                        strokeDasharray={2 * Math.PI * 12}
+                        strokeDashoffset={offset}
+                        strokeLinecap="round"
+                        transform="rotate(-90 16 16)"
+                      />
+                    </svg>
+                  </button>
+                  {showContextPopup && (() => {
+                    const warn = ratio > 0.85;
+                    const fmt = (n: number) => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n);
+                    return (
+                      <>
+                        <div
+                          onClick={() => setShowContextPopup(false)}
+                          style={{ position: 'fixed', inset: 0, zIndex: 40 }}
+                        />
+                        <div
+                          style={{
+                            position: 'absolute',
+                            bottom: 'calc(100% + 10px)',
+                            right: 0,
+                            background: 'var(--kim-surface)',
+                            border: '1px solid var(--kim-border)',
+                            borderRadius: 12,
+                            padding: 14,
+                            boxShadow: '0 18px 40px rgba(0,0,0,0.5)',
+                            width: 280,
+                            zIndex: 50,
+                            fontFamily: 'Inter, system-ui, sans-serif',
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 10 }}>
+                            <span
+                              style={{
+                                fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
+                                fontSize: 16,
+                                color: warn ? 'var(--kim-red)' : 'var(--kim-text)',
+                              }}
+                            >
+                              {fmt(used)}
+                              <span style={{ color: 'var(--kim-text-3)' }}>/{fmt(budget)}</span>
+                            </span>
+                            <span style={{ fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace', fontSize: 12, color: 'var(--kim-text-3)' }}>
+                              tokens
+                            </span>
+                            <span
+                              style={{
+                                marginLeft: 'auto',
+                                fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
+                                fontSize: 12,
+                                color: warn ? 'var(--kim-red)' : 'var(--kim-accent)',
+                              }}
+                            >
+                              {pctUsed}%
+                            </span>
+                          </div>
+
+                          {providerUsage?.provider === 'ollama' && (
+                            <div style={{ fontSize: 11.5, color: 'var(--kim-text-3)', lineHeight: 1.55, marginBottom: 10 }}>
+                              <div>{providerUsage.model ?? 'Ollama'} · {(providerUsage.mode ?? 'local').toUpperCase()}</div>
+                              <div>
+                                {providerUsage.usage_available
+                                  ? `Prompt ${providerUsage.input?.toLocaleString() ?? '0'} · Output ${providerUsage.output?.toLocaleString() ?? '0'}`
+                                  : 'Usage unavailable'}
+                              </div>
+                              <div>
+                                {providerUsage.context_limit
+                                  ? `Context limit ${providerUsage.context_limit.toLocaleString()} (${providerUsage.context_limit_source ?? 'detected'})`
+                                  : 'Context limit unknown'}
+                              </div>
+                            </div>
+                          )}
+
+                          <div
+                            style={{
+                              width: '100%',
+                              height: 6,
+                              borderRadius: 999,
+                              background: 'var(--kim-bg-2)',
+                              border: '1px solid var(--kim-border)',
+                              overflow: 'hidden',
+                              marginBottom: 12,
+                              position: 'relative',
+                            }}
+                          >
+                            <div
+                              style={{
+                                width: `${ratio * 100}%`,
+                                height: '100%',
+                                background: warn
+                                  ? 'linear-gradient(90deg, var(--kim-accent), var(--kim-red))'
+                                  : 'linear-gradient(90deg, var(--kim-accent-line), var(--kim-accent))',
+                                borderRadius: 999,
+                                transition: 'width .3s',
+                              }}
+                            />
+                          </div>
+
+                          <button
+                            type="button"
+                            className="kr-btn"
+                            onClick={handleCompactConversation}
+                            style={{ width: '100%', justifyContent: 'center', padding: '9px 12px' }}
+                          >
+                            <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
+                              <path d="M2 7h10M4 4l-2 3 2 3M10 4l2 3-2 3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                            Compact conversation
+                          </button>
+
+                          <div style={{ fontSize: 11.5, color: 'var(--kim-text-3)', marginTop: 10, lineHeight: 1.55 }}>
+                            More context means slower, less accurate replies. Compacting summarises older turns so Kim can keep up.
+                          </div>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
               </div>
-            </div>
-          )}
+              );
+            })()}
+          </div>
+          </div>
+
         </div>
+        {providerUsage?.provider === 'ollama' && (
+          (() => {
+            const nearLimit =
+              providerUsage.usage_available &&
+              typeof providerUsage.input === 'number' &&
+              typeof providerUsage.context_limit === 'number' &&
+              providerUsage.context_limit > 0 &&
+              providerUsage.input / providerUsage.context_limit >= 0.85;
+            return (
+              <div
+                style={{
+                  marginTop: 10,
+                  padding: '10px 12px',
+                  borderRadius: 10,
+                  border: `1px solid ${nearLimit ? 'var(--kim-red)' : 'var(--kim-border)'}`,
+                  background: 'var(--kim-surface)',
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: 10,
+                  fontSize: 12,
+                  color: 'var(--kim-text-2)',
+                }}
+              >
+                <span style={{ color: 'var(--kim-text)' }}>{providerUsage.model ?? 'Ollama'}</span>
+                <span>{(providerUsage.mode ?? 'local').toUpperCase()}</span>
+                {providerUsage.usage_available ? (
+                  <>
+                    <span>input {providerUsage.input?.toLocaleString() ?? '0'}</span>
+                    <span>output {providerUsage.output?.toLocaleString() ?? '0'}</span>
+                    <span>total {providerUsage.total?.toLocaleString() ?? '0'}</span>
+                    <span>{providerUsage.tokens_per_second ? `${providerUsage.tokens_per_second.toLocaleString()} tok/s` : 'tok/s unavailable'}</span>
+                    <span>{formatNsDuration(providerUsage.total_duration) ? `total ${formatNsDuration(providerUsage.total_duration)}` : 'total duration unavailable'}</span>
+                  </>
+                ) : (
+                  <span>usage unavailable</span>
+                )}
+                <span>
+                  {providerUsage.context_limit
+                    ? `${providerUsage.input?.toLocaleString() ?? '0'} / ${providerUsage.context_limit.toLocaleString()} context`
+                    : 'context limit unknown'}
+                </span>
+                <span>{providerUsage.billing ?? 'Local: no API billing'}</span>
+                {nearLimit && (
+                  <span style={{ color: 'var(--kim-red)' }}>
+                    This request is near the model&apos;s context limit. Kim may need to compact or start a fresh chat.
+                  </span>
+                )}
+              </div>
+            );
+          })()
+        )}
+        <AuthIndicator provider={resolvedProvider} />
         <div className="kim-composer__hint">
           <span>
             {isRunning
@@ -2154,6 +2522,10 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                   const sub = normalizeBrowserSite(val.split(':')[1]);
                   if (!sub) return;
 
+                  // Update UI state immediately for responsiveness (Issue #1 Sync bug)
+                  setLocalProvider(`browser:${sub}`);
+                  setBrowserProvider(sub);
+
                   // Save the old thread before switching away from it. Rust
                   // filters generic home/login pages so this cannot corrupt a
                   // previously useful URL.
@@ -2161,8 +2533,6 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
                   restoreSeqRef.current += 1;
                   lastRestoreKeyRef.current = null;
-                  setLocalProvider(`browser:${sub}`);
-                  setBrowserProvider(sub);
 
                   const targetSession = sessionRef.current;
                   if (targetSession) {
@@ -2170,6 +2540,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
                       await invoke('session_browser_meta_write', {
                         ...browserCommandArgs(targetSession),
                         browserLastSite: sub,
+                        lastLlmProvider: `browser:${sub}`,
                         site: null,
                         url: null,
                       });
@@ -2210,12 +2581,16 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
               }}
               className="kim-composer__provider-select"
             >
+              <optgroup label="Ollama">
+                <option value="ollama">Ollama</option>
+              </optgroup>
               <optgroup label="Browser (free — uses your sign-in)">
                 <option value="browser:claude">Browser: Claude</option>
                 <option value="browser:chatgpt">Browser: ChatGPT</option>
                 <option value="browser:gemini">Browser: Gemini</option>
                 <option value="browser:grok">Browser: Grok</option>
                 <option value="browser:deepseek">Browser: DeepSeek</option>
+                <option value="browser:custom">Browser: Custom</option>
               </optgroup>
               <optgroup label="API (requires API key)">
                 <option value="claude">Claude API</option>
@@ -2276,23 +2651,151 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
   // ── Empty welcome state ──────────────────────────────────────────────────────
   if (!newChatMode && !session) {
+    const firstName = account.display_name.split(' ')[0] || 'there';
+    const greeting = activeTab === 'code' ? 'What are we building?' : getGreeting(firstName);
+    const subtitle =
+      activeTab === 'code'
+        ? "Pick a project, or describe what you'd like to build."
+        : 'Pick up where you left off, or start fresh.';
     return (
       <div className="kim-chat">
         {renderConnectorsChrome()}
 
-        <div className="kim-empty-welcome kim-empty-welcome--launch">
-          <div className="kim-greeting__text">
-            {activeTab === 'code' ? 'Start a new Code session' : getGreeting(account.display_name.split(' ')[0])}
+        <div
+          style={{
+            flex: 1,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 40,
+          }}
+        >
+          <h1
+            style={{
+              fontWeight: 500,
+              fontSize: 28,
+              color: 'var(--kim-text)',
+              margin: '0 0 6px',
+              letterSpacing: '-0.01em',
+              textAlign: 'center',
+            }}
+          >
+            {greeting}
+          </h1>
+          <p
+            style={{
+              color: 'var(--kim-text-3)',
+              fontSize: 14,
+              margin: 0,
+              marginBottom: 28,
+              fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
+              textAlign: 'center',
+            }}
+          >
+            {subtitle}
+          </p>
+
+          <div style={{ display: 'flex', gap: 10, marginBottom: 36 }}>
+            <button
+              type="button"
+              className="kr-btn kr-btn-primary"
+              onClick={() => onNewChat?.()}
+              style={{ padding: '10px 18px' }}
+            >
+              <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
+                <path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+              </svg>
+              New chat
+              <span
+                className="kr-kbd"
+                style={{ background: 'rgba(0,0,0,0.15)', borderColor: 'rgba(0,0,0,0.2)', color: 'var(--kim-on-accent)' }}
+              >
+                ⌘N
+              </span>
+            </button>
+            <button
+              type="button"
+              className="kr-btn"
+              onClick={() => onNewCodeSession?.()}
+              style={{ padding: '10px 16px' }}
+            >
+              <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
+                <path d="M4 3l-3 3 3 3m4-6l3 3-3 3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              New code session
+            </button>
           </div>
-          <div className="kim-empty-welcome__subtitle">
-            {activeTab === 'code'
-              ? 'Pick a project in the sidebar, or open a saved Code session.'
-              : 'Pick up where you left off, or start fresh.'}
-          </div>
-          <div className="kim-launch-shortcuts" aria-label="Keyboard shortcuts">
-            <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">N</kbd> new chat</span>
-            <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">B</kbd> sidebar</span>
-            <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">,</kbd> settings</span>
+
+          {(recentSessions ?? []).length > 0 && (
+            <div style={{ width: 'min(560px, 90%)', display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 36 }}>
+              <span className="kr-eyebrow" style={{ marginBottom: 4, paddingLeft: 4 }}>
+                pick up where you left off
+              </span>
+              {(recentSessions ?? []).slice(0, 3).map((s, i) => {
+                const t = s.title?.trim() || s.session_id;
+                return (
+                  <div
+                    key={i}
+                    className="kr-row-hover"
+                    onClick={() => onSelectSession?.(s)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 12,
+                      padding: '12px 16px',
+                      background: 'var(--kim-surface)',
+                      border: '1px solid var(--kim-border)',
+                      borderRadius: 11,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style={{ color: 'var(--kim-text-3)' }}>
+                      <path
+                        d="M2 3.5h10a1 1 0 011 1V10a1 1 0 01-1 1H5l-2.5 2v-2H2a1 1 0 01-1-1V4.5a1 1 0 011-1z"
+                        stroke="currentColor"
+                        strokeWidth="1.2"
+                      />
+                    </svg>
+                    <span
+                      style={{
+                        flex: 1,
+                        fontSize: 13.5,
+                        color: 'var(--kim-text)',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {t}
+                    </span>
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" style={{ color: 'var(--kim-text-4)' }}>
+                      <path
+                        d="M4 2.5L7.5 6L4 9.5"
+                        stroke="currentColor"
+                        strokeWidth="1.4"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div
+            style={{
+              display: 'flex',
+              gap: 18,
+              fontSize: 11.5,
+              color: 'var(--kim-text-3)',
+              fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
+            }}
+          >
+            <span>⌘N new chat</span>
+            <span>⌘K search</span>
+            <span>⌘, settings</span>
           </div>
         </div>
       </div>
@@ -2301,31 +2804,122 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
 
   // ── New chat mode ─────────────────────────────────────────────────────────────
   if (newChatMode) {
+    const empty = !hasSentMessageRef.current && liveHistory.length === 0;
+    const provider = resolveProvider();
+    let providerPillLabel: string;
+    if (provider.startsWith('browser:')) {
+      const sub = provider.split(':')[1] ?? '';
+      const subLabel = sub.charAt(0).toUpperCase() + sub.slice(1);
+      providerPillLabel = `Browser: ${subLabel} · ready`;
+    } else {
+      providerPillLabel = `${providerLabel(provider)} · ready`;
+    }
+    const starters = activeTab === 'code'
+      ? [
+          ['⌥', 'Plan first, then execute'],
+          ['⇧', 'Read-only review'],
+          ['⌃', 'Edit + run tests'],
+          ['✦', 'Pick up last task'],
+        ]
+      : [
+          ['✦', 'Catch me up on yesterday'],
+          ['⌥', 'Open my email'],
+          ['⇧', "What's on screen?"],
+          ['⌃', 'Draft a quick reply'],
+        ];
     return (
-      <div className="kim-chat">
+      <div className={`kim-chat${empty ? ' kim-chat--empty-hero' : ''}`}>
         {renderConnectorsChrome()}
 
         <div className="kim-chat__output" ref={outputRef}>
-
-
-          {!hasSentMessageRef.current && (
-            <div className="kim-new-chat-empty kim-new-chat-empty--launch">
-              <div className="kim-new-chat-empty__badge">
-                <span className="kim-pulse-dot kim-pulse-dot--accent" />
-                Ready
+          {empty && (
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                width: '100%',
+                maxWidth: 680,
+                textAlign: 'center',
+              }}
+            >
+              <div
+                style={{
+                  fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
+                  fontSize: 11,
+                  color: 'var(--kim-text-3)',
+                  marginBottom: 18,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  padding: '6px 12px',
+                  border: '1px solid var(--kim-border)',
+                  borderRadius: 999,
+                  background: 'var(--kim-surface)',
+                }}
+              >
+                <span className="kr-pulse-dot" style={{ background: 'var(--kim-green)' }} />
+                <span>{providerPillLabel}</span>
               </div>
-              <div className="kim-new-chat-empty__title kim-greeting">
-                {activeTab === 'code' ? 'Start a new Code session' : getGreeting(account.display_name)}
-              </div>
-              <div className="kim-new-chat-empty__subtitle">
+
+              <h1
+                style={{
+                  fontWeight: 500,
+                  fontSize: 30,
+                  color: 'var(--kim-text)',
+                  margin: '0 0 10px',
+                  letterSpacing: '-0.015em',
+                }}
+              >
+                {activeTab === 'code' ? 'What are we building?' : getGreeting(account.display_name.split(' ')[0])}
+              </h1>
+              <p
+                style={{
+                  color: 'var(--kim-text-3)',
+                  fontSize: 14,
+                  margin: 0,
+                  marginBottom: 28,
+                  maxWidth: 480,
+                  lineHeight: 1.5,
+                }}
+              >
                 {activeTab === 'code'
-                  ? 'Tell Kim what to inspect, fix, or build.'
+                  ? "Describe a feature, hand me a bug, or point me at a file. I'll read first, plan, then write."
                   : 'Pick up where you left off, or start fresh.'}
-              </div>
-              <div className="kim-launch-shortcuts kim-launch-shortcuts--center" aria-label="Keyboard shortcuts">
-                <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">N</kbd> new chat</span>
-                <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">B</kbd> sidebar</span>
-                <span><kbd className="kim-kbd">⌘</kbd><kbd className="kim-kbd">,</kbd> settings</span>
+              </p>
+
+              {renderComposer()}
+
+              <div
+                style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: 8,
+                  marginTop: 18,
+                  justifyContent: 'center',
+                  maxWidth: 680,
+                }}
+              >
+                {starters.map(([k, t]) => (
+                  <button
+                    key={t}
+                    type="button"
+                    className="kr-btn"
+                    onClick={() => {
+                      setTaskInput(t);
+                      textareaRef.current?.focus();
+                    }}
+                    style={{
+                      background: 'transparent',
+                      padding: '7px 12px',
+                      fontSize: 12.5,
+                      color: 'var(--kim-text-2)',
+                    }}
+                  >
+                    <span style={{ color: 'var(--kim-accent)', fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace' }}>{k}</span>
+                    <span>{t}</span>
+                  </button>
+                ))}
               </div>
             </div>
           )}
@@ -2437,7 +3031,7 @@ export function ChatView({ session, newChatMode, settings, onTaskDone, account, 
           <div ref={bottomRef} />
         </div>
 
-        {renderComposer()}
+        {!empty && renderComposer()}
       </div>
     );
   }

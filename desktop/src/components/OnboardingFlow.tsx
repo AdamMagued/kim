@@ -60,6 +60,8 @@ export function OnboardingFlow({ onComplete }: Props) {
   const [githubUser, setGithubUser] = useState<{ login: string; name: string | null; avatar_url: string } | null>(null);
   const [tokenError, setTokenError] = useState('');
   const [saving, setSaving] = useState(false);
+  const [ollamaSigning, setOllamaSigning] = useState(false);
+  const [ollamaMessage, setOllamaMessage] = useState('');
 
   const nameInputRef = useRef<HTMLInputElement>(null);
 
@@ -121,6 +123,19 @@ export function OnboardingFlow({ onComplete }: Props) {
     handleFinish();
   }
 
+  async function signInWithOllama() {
+    setOllamaSigning(true);
+    setOllamaMessage('');
+    try {
+      await invoke('ollama_signin');
+      setOllamaMessage('Ollama sign-in opened. Finish it there, then come back to Kim.');
+    } catch (err) {
+      setOllamaMessage(typeof err === 'string' ? err : 'Could not open Ollama sign-in.');
+    } finally {
+      setOllamaSigning(false);
+    }
+  }
+
   const screenClass = `kim-ob__screen${leaving ? ' kim-ob__screen--out' : ' kim-ob__screen--in'}`;
 
   return (
@@ -175,6 +190,36 @@ export function OnboardingFlow({ onComplete }: Props) {
               Link a personal access token to back up your Kim account to a private Gist.
               Create one at <strong>github.com/settings/tokens</strong> with{' '}
               <code>gist</code> + <code>read:user</code> scopes.
+            </div>
+
+            <div
+              style={{
+                width: '100%',
+                maxWidth: 520,
+                margin: '18px auto 16px',
+                padding: '14px 16px',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 14,
+                background: 'rgba(255,255,255,0.04)',
+                textAlign: 'left',
+              }}
+            >
+              <div style={{ fontSize: 13, fontWeight: 650, marginBottom: 5 }}>Ollama for Kim</div>
+              <div style={{ fontSize: 12, opacity: 0.68, lineHeight: 1.45, marginBottom: 11 }}>
+                Use local or cloud Ollama models through the signed-in local daemon. No API key needed in Kim.
+              </div>
+              <button
+                className="kim-ob__verify-btn"
+                onClick={signInWithOllama}
+                disabled={ollamaSigning}
+              >
+                {ollamaSigning ? 'Opening…' : 'Sign in with Ollama'}
+              </button>
+              {ollamaMessage && (
+                <div style={{ fontSize: 11.5, opacity: 0.7, marginTop: 9, lineHeight: 1.4 }}>
+                  {ollamaMessage}
+                </div>
+              )}
             </div>
 
             <div className="kim-ob__token-row">

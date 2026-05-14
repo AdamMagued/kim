@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 
 class BaseProvider(ABC):
+    native_tool_calling: bool = False
+    lean_system_prompt: bool = False
+
     @abstractmethod
     async def complete(
         self,
@@ -46,8 +49,13 @@ class BaseProvider(ABC):
 def create_provider(name: str, config: dict) -> BaseProvider:
     """
     Factory — returns a provider instance for the given name.
-    Names: "claude", "openai", "gemini", "deepseek", "browser"
+    Names: "claude", "openai", "gemini", "deepseek", "browser", "ollama"
     Also: "browser:claude", "browser:chatgpt", … (sets browser_provider.preferred_site).
+
+    Gemini auth contract:
+      - legacy/dev: GOOGLE_API_KEY or config["api_key"]
+      - Kim OAuth: Tauri injects KIM_GOOGLE_ACCESS_TOKEN (+ optional expiry/project)
+        after refreshing the OS-keychain refresh token. Python never sees refresh tokens.
     """
     name = name.lower().strip()
     if name.startswith("browser:"):
@@ -68,12 +76,18 @@ def create_provider(name: str, config: dict) -> BaseProvider:
         from orchestrator.providers.openai_provider import OpenAIProvider
         return OpenAIProvider(config)
     if name == "gemini":
+        # GeminiProvider chooses exactly one auth path: API key for legacy/dev,
+        # or Kim Google OAuth via short-lived bearer env/config. Keep this branch
+        # API-first; Browser: Gemini remains `browser:gemini`.
         from orchestrator.providers.gemini import GeminiProvider
         return GeminiProvider(config)
     if name == "deepseek":
         from orchestrator.providers.deepseek import DeepSeekProvider
         return DeepSeekProvider(config)
+    if name == "ollama":
+        from orchestrator.providers.ollama import OllamaProvider
+        return OllamaProvider(config)
     if name == "browser":
         from orchestrator.providers.browser_provider import BrowserProvider
         return BrowserProvider(config)
-    raise ValueError(f"Unknown provider: {name!r}. Choose from: claude, openai, gemini, deepseek, browser")
+    raise ValueError(f"Unknown provider: {name!r}. Choose from: claude, openai, gemini, deepseek, browser, ollama")

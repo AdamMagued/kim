@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -126,9 +127,14 @@ async def _main_async(args: argparse.Namespace) -> int:
         return 1
 
     msg = result.get("message", "")
+    final_answer = str(result.get("final_answer") or "").strip()
     if result.get("success"):
-        # Log the technical detail to stderr; surface a clean message for the UI.
+        # The relay emits final text-only model responses as [ANSWER] before the
+        # success marker. Keep this fallback for older relay implementations or
+        # unusual paths where a final answer was returned but not emitted.
         logger.info(msg)
+        if final_answer and not result.get("answer_emitted"):
+            print(f"[ANSWER] {json.dumps(final_answer, ensure_ascii=False)}", flush=True)
         print("[SUCCESS] Task completed", flush=True)
         return 0
 
