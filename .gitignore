@@ -51,3 +51,9 @@ config.yaml
 
 # Relay database
 relay_server/relay.db
+
+# Local agent scratch/worktree artifacts
+.claude/worktrees/
+scratch/
+debug_playwright.py
+scratch_test_json.py

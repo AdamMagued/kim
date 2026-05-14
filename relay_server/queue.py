@@ -108,40 +108,42 @@ class TaskDB:
         Atomically fetch and mark as 'running' the highest-priority pending task.
         Expires stale tasks first.  Returns None if queue is empty.
         """
-        await self._expire_stale()
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            await self._expire_stale(commit=False)
 
-        async with self._db.execute(
-            """
-            SELECT id, task FROM tasks
-            WHERE status = 'pending'
-            ORDER BY priority DESC, created_at ASC
-            LIMIT 1
-            """
-        ) as cur:
-            row = await cur.fetchone()
+            async with self._db.execute(
+                """
+                SELECT id, task FROM tasks
+                WHERE status = 'pending'
+                ORDER BY priority DESC, created_at ASC
+                LIMIT 1
+                """
+            ) as cur:
+                row = await cur.fetchone()
 
-        if row is None:
-            return None
+            if row is None:
+                await self._db.commit()
+                return None
 
-        task_id = row["id"]
-        now = _utcnow()
-        await self._db.execute(
-            "UPDATE tasks SET status='running', picked_up_at=? WHERE id=? AND status='pending'",
-            (now, task_id),
-        )
-        await self._db.commit()
+            task_id = row["id"]
+            task_text = row["task"]
+            now = _utcnow()
+            cur = await self._db.execute(
+                "UPDATE tasks SET status='running', picked_up_at=? WHERE id=? AND status='pending'",
+                (now, task_id),
+            )
+            if cur.rowcount != 1:
+                await self._db.rollback()
+                return None
 
-        # Verify we won the race (another process might have dequeued it)
-        async with self._db.execute(
-            "SELECT id, task FROM tasks WHERE id=? AND status='running'", (task_id,)
-        ) as cur:
-            row = await cur.fetchone()
-
-        if row is None:
-            return None  # lost the race — caller should retry
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
 
         logger.info(f"Dequeued task {task_id!r}")
-        return {"task_id": task_id, "task": row["task"]}
+        return {"task_id": task_id, "task": task_text}
 
     async def complete(
         self,
@@ -187,7 +189,7 @@ class TaskDB:
 
     # ── Stale-task expiry ──────────────────────────────────────────────────
 
-    async def _expire_stale(self) -> None:
+    async def _expire_stale(self, *, commit: bool = True) -> None:
         now = _utcnow()
         await self._db.execute(
             """
@@ -205,7 +207,8 @@ class TaskDB:
             """,
             (now, STALE_RUNNING_S),
         )
-        await self._db.commit()
+        if commit:
+            await self._db.commit()
 
 
 # ── Module-level singleton ─────────────────────────────────────────────────

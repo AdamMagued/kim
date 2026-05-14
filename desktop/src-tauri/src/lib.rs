@@ -21,6 +21,8 @@ mod google_oauth;
 pub struct RunningTask {
     /// PID of the running agent subprocess, if any.
     pid: Option<u32>,
+    /// True while a task has reserved the runner slot but has not spawned yet.
+    starting: bool,
 }
 
 pub type TaskState = Arc<Mutex<RunningTask>>;
@@ -951,6 +953,7 @@ fn last_llm_provider_allowed(p: &str) -> bool {
             | "openai"
             | "gemini"
             | "deepseek"
+            | "ollama"
     )
 }
 
@@ -6970,18 +6973,28 @@ fn ollama_openai_base_url(base_url: Option<&str>) -> String {
     }
 }
 
-fn selected_ollama_claw_model(
+async fn selected_ollama_claw_model(
     mode: Option<&str>,
+    base_url: Option<&str>,
     local_model: Option<&str>,
     cloud_model: Option<&str>,
 ) -> Result<String, String> {
     let mode = mode.unwrap_or("cloud").trim().to_ascii_lowercase();
     if mode == "local" {
         let model = local_model.unwrap_or("").trim();
-        if model.is_empty() {
-            return Err("Pick an Ollama local model before running Claw with Ollama Local.".to_string());
+        if !model.is_empty() {
+            return Ok(model.to_string());
         }
-        return Ok(model.to_string());
+        let base = base_url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("http://localhost:11434");
+        if let Ok(models) = ollama_tags(base).await {
+            if let Some(first) = models.first().map(|m| m.name.trim()).filter(|m| !m.is_empty()) {
+                return Ok(first.to_string());
+            }
+        }
+        return Err("Pick or pull an Ollama local model before running Claw with Ollama Local.".to_string());
     }
     Ok(cloud_model
         .map(str::trim)
@@ -6990,7 +7003,7 @@ fn selected_ollama_claw_model(
         .to_string())
 }
 
-fn configure_claw_direct_provider(
+async fn configure_claw_direct_provider(
     cmd: &mut tokio::process::Command,
     provider_arg: &str,
     kim_root: &Path,
@@ -7002,7 +7015,12 @@ fn configure_claw_direct_provider(
     let provider = provider_arg.trim().to_ascii_lowercase();
     match provider.as_str() {
         "ollama" => {
-            let model = selected_ollama_claw_model(ollama_mode, ollama_local_model, ollama_cloud_model)?;
+            let model = selected_ollama_claw_model(
+                ollama_mode,
+                ollama_base_url,
+                ollama_local_model,
+                ollama_cloud_model,
+            ).await?;
             cmd.arg("--model").arg(&model)
                 .env("OPENAI_BASE_URL", ollama_openai_base_url(ollama_base_url))
                 // Required by OpenAI-compatible clients; ignored by Ollama.
@@ -7120,10 +7138,10 @@ async fn send_task(
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
 
-    // Refuse to start a second task if one is already running.
+    // Refuse to start a second task if one is already running or spawning.
     {
         let guard = state.lock().await;
-        if guard.pid.is_some() {
+        if guard.pid.is_some() || guard.starting {
             return Err("A task is already running. Stop it before starting a new one.".to_string());
         }
     }
@@ -7219,7 +7237,7 @@ async fn send_task(
                 ollama_mode.as_deref(),
                 ollama_local_model.as_deref(),
                 ollama_cloud_model.as_deref(),
-            )?;
+            ).await?;
             let _ = app_handle.emit(
                 "kim-agent-output",
                 format!("[STATUS] Routing unchanged task to Claw via {}: {}", route, claw_bin.display()),
@@ -7353,15 +7371,32 @@ async fn send_task(
         cmd.process_group(0);
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to start Kim: {}", e))?;
+    // Reserve the runner slot immediately before spawning. Command setup can be
+    // slow, and two frontend invocations can otherwise both pass the initial
+    // pid check and spawn separate agents.
+    {
+        let mut guard = state.lock().await;
+        if guard.pid.is_some() || guard.starting {
+            return Err("A task is already running. Stop it before starting a new one.".to_string());
+        }
+        guard.starting = true;
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let mut guard = state.lock().await;
+            guard.starting = false;
+            return Err(format!("Failed to start Kim: {}", e));
+        }
+    };
 
     // Record the PID so cancel_task can signal it.
     let child_pid = child.id();
     {
         let mut guard = state.lock().await;
         guard.pid = child_pid;
+        guard.starting = false;
     }
     // Also sync to the bridge-accessible static so kimctl cancel works.
     if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
@@ -7407,6 +7442,7 @@ async fn send_task(
     {
         let mut guard = state.lock().await;
         guard.pid = None;
+        guard.starting = false;
     }
     // Clear bridge-accessible PID too.
     if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
@@ -7444,6 +7480,7 @@ async fn send_task(
 async fn clear_task_pid(state: &TaskState) {
     let mut guard = state.lock().await;
     guard.pid = None;
+    guard.starting = false;
     if let Ok(mut bridge_guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
         *bridge_guard = None;
     }
@@ -7454,9 +7491,9 @@ async fn cancel_task(
     app_handle: tauri::AppHandle,
     state: State<'_, TaskState>,
 ) -> Result<String, String> {
-    let pid = {
+    let (pid, starting) = {
         let guard = state.lock().await;
-        guard.pid
+        (guard.pid, guard.starting)
     };
 
     // Fall back to the bridge-registered PID. Tasks started via kimctl /v1/task
@@ -7471,6 +7508,9 @@ async fn cancel_task(
     });
 
     let Some(pid) = pid else {
+        if starting {
+            return Err("Task is still starting. Try stopping again in a moment.".to_string());
+        }
         return Err("No task is currently running.".to_string());
     };
 
@@ -7869,6 +7909,31 @@ async fn clear_account() -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn reset_onboarding() -> Result<(), String> {
+    clear_account().await
+}
+
+#[tauri::command]
+async fn delete_all_sessions() -> Result<(), String> {
+    let base = default_sessions_dir();
+    fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(&base).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            fs::remove_dir_all(path).map_err(|e| e.to_string())?;
+        } else if path.extension().and_then(|e| e.to_str()).is_some_and(|ext| matches!(ext, "jsonl" | "json" | "md" | "zip")) {
+            fs::remove_file(path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Ollama — local daemon status, sign-in launcher, model management
 // ---------------------------------------------------------------------------
@@ -8034,11 +8099,14 @@ fn parse_ollama_ps_context(stdout: &str, model: &str) -> Option<u32> {
     None
 }
 
-fn ollama_context_from_ps(model: &str) -> Option<u32> {
-    let out = std::process::Command::new("ollama")
-        .arg("ps")
-        .output()
-        .ok()?;
+async fn ollama_context_from_ps(model: &str) -> Option<u32> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("ollama").arg("ps").output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -8270,17 +8338,21 @@ async fn ollama_get_status(
         })
         .unwrap_or(false);
 
-    let probe_model = selected
-        .clone()
-        .filter(|m| selected_mode == "cloud" || m.ends_with("-cloud"))
-        .unwrap_or_else(|| "gpt-oss:120b-cloud".to_string());
-    let (cloud_connected, cloud_message) = match ollama_chat_probe(&base_url, &probe_model).await {
-        Ok(()) => (true, Some("Connected to Ollama".to_string())),
-        Err(detail) => (false, Some(friendly_ollama_cloud_message(&detail))),
+    let (cloud_connected, cloud_message) = if selected_mode == "cloud" {
+        let probe_model = selected
+            .clone()
+            .filter(|m| m.ends_with("-cloud"))
+            .unwrap_or_else(|| "gpt-oss:120b-cloud".to_string());
+        match ollama_chat_probe(&base_url, &probe_model).await {
+            Ok(()) => (true, Some("Connected to Ollama".to_string())),
+            Err(detail) => (false, Some(friendly_ollama_cloud_message(&detail))),
+        }
+    } else {
+        (false, Some("Local models work without any Ollama account.".to_string()))
     };
 
     let (context_limit, context_limit_source) = if let Some(model) = selected.as_ref() {
-        if let Some(limit) = ollama_context_from_ps(model) {
+        if let Some(limit) = ollama_context_from_ps(model).await {
             (Some(limit), Some("ollama_ps".to_string()))
         } else if let Some(limit) = ollama_context_from_show(&base_url, model).await {
             (Some(limit), Some("api_show".to_string()))
@@ -8498,19 +8570,52 @@ async fn verify_github_pat(token: String) -> Result<GitHubUser, String> {
 #[tauri::command]
 async fn export_data(
     format: String,
-    output_path: String,
+    output_path: Option<String>,
     sessions_dir: Option<String>,
 ) -> Result<String, String> {
     let base = sessions_dir
         .map(PathBuf::from)
         .unwrap_or_else(default_sessions_dir);
+    let out = output_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_export_path(&format));
 
     match format.as_str() {
-        "zip" => export_as_zip(&base, &PathBuf::from(&output_path)),
-        "json" => export_as_json(&base, &PathBuf::from(&output_path)),
-        "markdown" => export_as_markdown(&base, &PathBuf::from(&output_path)),
+        "zip" => export_as_zip(&base, &out),
+        "json" => export_as_json(&base, &out),
+        "markdown" => export_as_markdown(&base, &out),
         _ => Err(format!("Unknown format: {}. Use 'zip', 'json', or 'markdown'.", format)),
     }
+}
+
+fn default_export_path(format: &str) -> PathBuf {
+    let ext = match format {
+        "markdown" => "md",
+        "zip" => "zip",
+        _ => "json",
+    };
+    let stamp = chrono_now().replace([':', '/'], "-");
+    dirs::download_dir()
+        .or_else(dirs::document_dir)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(account_dir)
+        .join(format!("kim-export-{stamp}.{ext}"))
+}
+
+fn sanitized_account_json(gist_id_hint: Option<&str>) -> String {
+    let Ok(raw) = fs::read_to_string(account_path()) else {
+        return "{}".to_string();
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return "{}".to_string();
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("github_token");
+        if let Some(gist_id) = gist_id_hint.map(str::trim).filter(|s| !s.is_empty()) {
+            obj.insert("gist_id".to_string(), serde_json::Value::String(gist_id.to_string()));
+        }
+    }
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn export_as_zip(sessions_base: &Path, out: &Path) -> Result<String, String> {
@@ -8528,13 +8633,11 @@ fn export_as_zip(sessions_base: &Path, out: &Path) -> Result<String, String> {
         count += 1;
     });
 
-    // Include account.json if present.
-    let acct = account_path();
-    if acct.exists() {
-        if let Ok(data) = fs::read(&acct) {
-            zip.start_file("account.json", opts).ok();
-            let _ = zip.write_all(&data);
-        }
+    // Include account metadata, but never export credentials/tokens.
+    if account_path().exists() {
+        let data = sanitized_account_json(None);
+        zip.start_file("account.json", opts).ok();
+        let _ = zip.write_all(data.as_bytes());
     }
 
     zip.finish().map_err(|e| e.to_string())?;
@@ -8654,9 +8757,13 @@ fn unix_secs_to_utc_iso(secs: u64) -> String {
 
 #[tauri::command]
 async fn import_data(
-    file_path: String,
+    file_path: Option<String>,
+    path: Option<String>,
     sessions_dir: Option<String>,
 ) -> Result<String, String> {
+    let file_path = file_path
+        .or(path)
+        .ok_or_else(|| "File path is required.".to_string())?;
     let src = PathBuf::from(&file_path);
     if !src.exists() {
         return Err(format!("File not found: {}", file_path));
@@ -8692,10 +8799,15 @@ fn import_from_zip(src: &Path, base: &Path) -> Result<String, String> {
             if !acct_path.exists() {
                 let mut buf = Vec::new();
                 entry.read_to_end(&mut buf).ok();
-                if let Some(parent) = acct_path.parent() {
-                    fs::create_dir_all(parent).ok();
+                if let Ok(mut account) = serde_json::from_slice::<KimAccount>(&buf) {
+                    account.github_token = None;
+                    if let Some(parent) = acct_path.parent() {
+                        fs::create_dir_all(parent).ok();
+                    }
+                    if let Ok(raw) = serde_json::to_vec_pretty(&account) {
+                        fs::write(&acct_path, raw).ok();
+                    }
                 }
-                fs::write(&acct_path, &buf).ok();
             }
             continue;
         }
@@ -8801,11 +8913,7 @@ async fn backup_to_gist(
         index.push(serde_json::json!({ "path": rel, "messages": line_count }));
     });
 
-    let account_data = if account_path().exists() {
-        fs::read_to_string(account_path()).unwrap_or_default()
-    } else {
-        "{}".to_string()
-    };
+    let account_data = sanitized_account_json(existing_gist_id.as_deref());
 
     let payload = serde_json::json!({
         "version": 1,
@@ -8880,7 +8988,9 @@ async fn restore_from_gist(
 
     // Restore account from gist.
     if let Some(acct_content) = gist["files"]["kim_account.json"]["content"].as_str() {
-        if let Ok(account) = serde_json::from_str::<KimAccount>(acct_content) {
+        if let Ok(mut account) = serde_json::from_str::<KimAccount>(acct_content) {
+            account.github_token = None;
+            account.gist_id = Some(gist_id.clone());
             // Write to local account file if not present.
             if !account_path().exists() {
                 let dir = account_dir();
@@ -9362,6 +9472,8 @@ pub fn run() {
             load_account,
             save_account,
             clear_account,
+            reset_onboarding,
+            delete_all_sessions,
             ollama_get_status,
             ollama_test_model,
             ollama_signin,
@@ -9395,6 +9507,7 @@ mod tests {
             &[],
             "http://local",
             "token__KIM_REQID__",
+            None,
             None
         ).unwrap();
 

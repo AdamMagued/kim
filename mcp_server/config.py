@@ -69,6 +69,14 @@ USE_REAL_BROWSER: bool = bool(
 )
 VOICE_ENABLED: bool = bool(_cfg.get("voice_enabled", False))
 
+# ── Site connectors ───────────────────────────────────────────────────────
+# `connectors.enabled` is a list of connector ids (e.g. ["guc_cms",
+# "guc_mail"]). The MCP server merges those connectors' tools into its
+# dispatch map at startup, so the LLM only sees toolkits the user has
+# explicitly opted into. Unknown ids are warned about and skipped.
+_connectors_cfg = _cfg.get("connectors", {}) or {}
+ENABLED_CONNECTOR_IDS: list[str] = list(_connectors_cfg.get("enabled", []))
+
 # ── Sensitive path deny list (#3) ─────────────────────────────────────────────
 # Even when a path falls within ALLOWED_PATHS, these directories are always
 # off-limits to prevent accidental credential/key exposure.

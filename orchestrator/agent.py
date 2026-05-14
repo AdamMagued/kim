@@ -451,6 +451,75 @@ class KimAgent:
         if self._ui_bridge:
             self._ui_bridge.log(level, message)
 
+    # In-memory plan state so we can dedupe across turns (the model may repeat
+    # the PLAN block or the same STEP marker; we only want to emit each once).
+    _last_plan_signature: str = ""
+    _last_step_signature: str = ""
+
+    def _emit_plan_markers(self, content: str) -> None:
+        """Detect PLAN: / STEP n: markers in an assistant text turn and forward
+        them to the UI as structured [STATUS] events.
+
+        The frontend (parseLogLine + parsePlanFromActivity in ChatView.tsx)
+        understands the `[PLAN]{json}` and `[STEP]{json}` envelopes and renders
+        a live checklist that crosses off each step as it completes.
+        """
+        if not content:
+            return
+
+        # ── PLAN block ──────────────────────────────────────────────────
+        # Looks for "PLAN: N steps" followed by numbered "1. ..." lines.
+        plan_match = re.search(
+            r"^\s*PLAN:\s*(\d+)\s*step",
+            content,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if plan_match:
+            # Collect numbered lines that follow the PLAN header.
+            after = content[plan_match.end():]
+            steps: list[str] = []
+            for raw in after.splitlines():
+                line = raw.strip()
+                if not line:
+                    if steps:
+                        break  # blank line ends the plan block
+                    continue
+                m = re.match(r"^(\d+)[.)]\s+(.+?)\s*$", line)
+                if m:
+                    steps.append(m.group(2).strip())
+                    continue
+                # Stop on any non-numbered, non-blank line (avoids slurping
+                # the rest of the assistant message into the plan).
+                if steps:
+                    break
+
+            if len(steps) >= 2:
+                plan_payload = {"steps": [s[:120] for s in steps[:12]]}
+                sig = json.dumps(plan_payload, separators=(",", ":"), ensure_ascii=False)
+                if sig != self._last_plan_signature:
+                    self._last_plan_signature = sig
+                    self._last_step_signature = ""  # reset step dedupe on new plan
+                    self._log("INFO", f"[STATUS] [PLAN]{sig}")
+
+        # ── STEP markers ────────────────────────────────────────────────
+        # Match the LAST step marker in this turn (the most recent one wins —
+        # a turn rarely has more than one but a model could announce a
+        # transition like "STEP 2: foo" right before calling a tool).
+        step_matches = list(
+            re.finditer(
+                r"^\s*STEP\s*(\d+)\s*:\s*(.+?)\s*$",
+                content,
+                re.IGNORECASE | re.MULTILINE,
+            )
+        )
+        if step_matches:
+            m = step_matches[-1]
+            step_payload = {"index": int(m.group(1)), "name": m.group(2).strip()[:120]}
+            sig = json.dumps(step_payload, separators=(",", ":"), ensure_ascii=False)
+            if sig != self._last_step_signature:
+                self._last_step_signature = sig
+                self._log("INFO", f"[STATUS] [STEP]{sig}")
+
     def _is_preview_mode(self) -> bool:
         if self._ui_bridge is not None:
             return self._ui_bridge.preview_mode
@@ -556,6 +625,11 @@ class KimAgent:
         self._log("INFO", f"=== Starting task: {task!r} ===")
         print("[STATUS] Kim is working on it…", flush=True)
         self._screenshot_hashes = []
+        # Reset plan/step dedupe so a fresh PLAN block at the start of this
+        # task is always forwarded to the UI (even if the previous task
+        # already emitted a plan with the same hash).
+        self._last_plan_signature = ""
+        self._last_step_signature = ""
 
         if task.strip().lower() in _COMPACT_CONTROL_TASKS:
             return await self._compact_and_reset_context()
@@ -820,6 +894,12 @@ class KimAgent:
                 content = str(response.get("content", "")).strip()
                 self.memory.add_assistant(content)
                 self._session_store.append_message({"role": "assistant", "content": content})
+
+                # Surface PLAN: / STEP n: markers as [STATUS] events so the
+                # frontend's plan-checklist UI can render them live. We emit a
+                # structured JSON blob inside the status line; the frontend
+                # parser picks it up via parseLogLine.
+                self._emit_plan_markers(content)
 
                 _tc = re.search(r"\bTASK_COMPLETE:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
                 if _tc:
@@ -1144,6 +1224,34 @@ Default loop for desktop/app tasks:
 
 Screenshots are an expensive fallback. Prefer structured UI unless the task is
 actually visual or observe_ui cannot expose the needed target.
+
+## Planning Protocol (REQUIRED for multi-step tasks)
+For any task that will take more than a single tool call, BEFORE your first tool
+call, emit a plan announcement in EXACTLY this format on a line by itself, on its
+own assistant turn (no tool call this turn):
+
+PLAN: <n> steps
+1. <short imperative step name, under 60 chars>
+2. <short imperative step name>
+...n. <short imperative step name>
+
+Rules:
+- Total steps must be between 2 and 8. Pick a number you actually believe.
+- Step names are short imperative phrases (e.g. "Open Mail", "Search for invoice",
+  "Reply to thread"). No sub-bullets, no descriptions, no markdown.
+- Emit the PLAN block exactly once per task.
+- After the plan, on your NEXT turn, emit `STEP 1: <step name>` on a line by
+  itself, THEN start executing that step (with a tool call in the SAME turn is
+  fine — put `STEP 1: ...` on its own line at the top of your text).
+- When a step is done and you are moving to the next one, emit
+  `STEP <n+1>: <name>` on a line by itself before the next action.
+- If the plan changes mid-task (you discovered a new step is needed), emit a new
+  `PLAN: <n> steps` block that supersedes the previous one.
+
+Skip the plan entirely for trivial single-action tasks (one tool call, a direct
+factual answer). For everything else, announce the plan first — the user's UI
+renders a live checklist from these markers and crosses off each step as it
+completes.
 """
         if self.config.get("voice", {}).get("human_quirks", False):
             prompt += (
@@ -1184,7 +1292,7 @@ actually visual or observe_ui cannot expose the needed target.
         tool-shaped JSON blob instead of using native tool_calls.
         """
         prompt = f"""You are Kim, a local desktop agent controlling a {_OS_NAME} computer through native tool calls.
-Use the tool schemas supplied in the API request's `tools` field. Do not print JSON tool calls, browser completion markers, KIM_* tokens, or transport hashes.
+Use the tool schemas supplied in the API request's `tools` field. Do not print JSON tool calls, browser completion markers, internal transport markers, or hashes.
 
 Current task:
 {task}
@@ -1204,6 +1312,26 @@ Operational guidance:
 - Use focus_window before typing into an application.
 - Maximum {self.max_iterations} iterations are allowed.
 - Include any important URL, image link, file path, or critical result in the TASK_COMPLETE summary.
+
+Planning protocol (REQUIRED for multi-step tasks):
+For any task that needs more than one tool call, BEFORE your first tool call emit
+a plan on its own assistant turn in this exact format:
+
+PLAN: <n> steps
+1. <short imperative step name, under 60 chars>
+2. <short step name>
+...
+
+Use 2–8 steps. Each step name is a short imperative phrase (e.g. "Open Mail",
+"Search inbox", "Reply to thread"). No sub-bullets, no markdown.
+
+After the plan, before executing each step emit `STEP <n>: <step name>` on a
+line by itself (you may then call a tool in the same turn). When the work for
+step n is finished and you move to step n+1, emit the new `STEP n+1: ...`
+marker first. The user's UI renders a live checklist from PLAN/STEP markers.
+
+Skip the plan entirely for trivial one-shot tasks (single tool call or a direct
+knowledge answer).
 """
         if self.config.get("voice", {}).get("human_quirks", False):
             prompt += (

@@ -530,7 +530,13 @@ function PathsSection({ settings, onChange }: { settings: Settings; onChange: (s
   );
 }
 
-function DataSection({ account }: { account: KimAccount }) {
+function DataSection({
+  account,
+  onAccountChange,
+}: {
+  account: KimAccount;
+  onAccountChange: (a: KimAccount) => Promise<void>;
+}) {
   const [exportState, setExportState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
   const [gistState, setGistState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
   const [statusMsg, setStatusMsg] = useState('');
@@ -556,8 +562,8 @@ function DataSection({ account }: { account: KimAccount }) {
     // In Tauri the webview file object has a non-standard `path` property at runtime
     const filePath = (file as File & { path?: string }).path ?? file.name;
     try {
-      const count = await invoke<number>('import_data', { path: filePath });
-      setStatusMsg(`Imported ${count} session${count !== 1 ? 's' : ''}`);
+      const result = await invoke<string>('import_data', { filePath });
+      setStatusMsg(result);
       setTimeout(() => setStatusMsg(''), 3000);
     } catch (err) {
       setStatusMsg(`Import failed: ${String(err)}`);
@@ -569,7 +575,13 @@ function DataSection({ account }: { account: KimAccount }) {
     if (!account.github_token) return;
     setGistState('working');
     try {
-      await invoke('backup_to_gist', { token: account.github_token, gistId: account.gist_id ?? null });
+      const gistId = await invoke<string>('backup_to_gist', {
+        token: account.github_token,
+        existingGistId: account.gist_id ?? null,
+      });
+      if (gistId && gistId !== account.gist_id) {
+        await onAccountChange({ ...account, gist_id: gistId });
+      }
       setGistState('done');
       setTimeout(() => setGistState('idle'), 2000);
     } catch (err) {
@@ -582,7 +594,8 @@ function DataSection({ account }: { account: KimAccount }) {
     if (!account.github_token || !account.gist_id) return;
     setGistState('working');
     try {
-      await invoke('restore_from_gist', { token: account.github_token, gistId: account.gist_id });
+      const restored = await invoke<KimAccount>('restore_from_gist', { token: account.github_token, gistId: account.gist_id });
+      await onAccountChange({ ...restored, github_token: account.github_token });
       setGistState('done');
       setTimeout(() => setGistState('idle'), 2000);
     } catch (err) {
@@ -1512,7 +1525,7 @@ export function SettingsPanel({ settings, onChange, onClose, appVersion, onCheck
           )}
           {activeSection === 'voice'      && <VoiceSection settings={settings} onChange={onChange} />}
           {activeSection === 'paths'      && <PathsSection settings={settings} onChange={onChange} />}
-          {activeSection === 'data'       && <DataSection account={account} />}
+          {activeSection === 'data'       && <DataSection account={account} onAccountChange={onAccountChange} />}
           {activeSection === 'account'    && <AccountSection account={account} onAccountChange={onAccountChange} />}
           {activeSection === 'mcp'        && <MCPSection />}
           {activeSection === 'feedback'   && <FeedbackSection />}

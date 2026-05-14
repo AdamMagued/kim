@@ -147,7 +147,7 @@ class TestUserProjectErrorMessages:
         }
         with pytest.raises(EnvironmentError) as exc_info:
             GeminiProvider(config)
-        assert "project ID" in str(exc_info.value).lower()
+        assert "project id" in str(exc_info.value).lower()
         assert OAUTH_USER_PROJECT_ENV in str(exc_info.value)
 
     def test_missing_access_token_error(self):
