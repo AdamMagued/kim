@@ -168,12 +168,33 @@ function renderText(text: string) {
             .join('\n');
           return <pre key={i}><code>{code}</code></pre>;
         }
-        const lines = para.split('\n');
+
+        // Simple link and image regex
+        // Image: ![alt](url)
+        // Link: [text](url)
+        const parts = para.split(/(!?\[[^\]]*\]\([^)]+\))/g);
+
         return (
           <p key={i}>
-            {lines.map((line, j) => (
-              <span key={j}>{line}{j < lines.length - 1 && <br />}</span>
-            ))}
+            {parts.map((part, j) => {
+              const imgMatch = part.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
+              if (imgMatch) {
+                return <img key={j} src={imgMatch[2]} alt={imgMatch[1] || 'image'} className="kim-bubble__img" />;
+              }
+              const linkMatch = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+              if (linkMatch) {
+                return <a key={j} href={linkMatch[2]} target="_blank" rel="noopener noreferrer" className="kim-bubble__link">{linkMatch[1]}</a>;
+              }
+              
+              const lines = part.split('\n');
+              return (
+                <span key={j}>
+                  {lines.map((line, k) => (
+                    <span key={k}>{line}{k < lines.length - 1 && <br />}</span>
+                  ))}
+                </span>
+              );
+            })}
           </p>
         );
       })}

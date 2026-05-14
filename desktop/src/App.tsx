@@ -7,9 +7,8 @@ import { useTheme } from './hooks/useTheme';
 import { useSessions } from './hooks/useSessions';
 import { useAccount } from './hooks/useAccount';
 
-import { Sidebar } from './components/Sidebar';
+import { RevampSidebar, RevampSettings } from './components/kim-ui';
 import { ChatView } from './components/ChatView';
-import { SettingsPanel } from './components/SettingsPanel';
 import { UpdateModal } from './components/UpdateModal';
 import { OnboardingFlow } from './components/OnboardingFlow';
 import { ToastProvider, toast } from './components/Toast';
@@ -22,7 +21,21 @@ import { DEFAULT_SETTINGS } from './types';
 function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem('kim-settings');
-    if (raw) return { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<Settings>) };
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<Settings>;
+      return {
+        ...DEFAULT_SETTINGS,
+        ...parsed,
+        voice: {
+          ...DEFAULT_SETTINGS.voice,
+          ...(parsed.voice ?? {}),
+        },
+        ollama: {
+          ...DEFAULT_SETTINGS.ollama,
+          ...(parsed.ollama ?? {}),
+        },
+      };
+    }
   } catch {
     // ignore
   }
@@ -70,10 +83,10 @@ function sessionKey(session: SessionInfo): string {
 
 export default function App() {
   const [settings, setSettings] = useState<Settings>(loadSettings);
-  useTheme(settings.theme);
+  const { setTheme } = useTheme(settings.theme);
   const { account, loading: accountLoading, setAccount } = useAccount();
 
-  const { kimSessions, loading, refresh } = useSessions(settings);
+  const { kimSessions, refresh } = useSessions(settings);
 
   const [activeSession, setActiveSession] = useState<SessionInfo | null>(null);
   const [newChatMode, setNewChatMode] = useState(false);
@@ -88,6 +101,9 @@ export default function App() {
   const [activeProjectPath, setActiveProjectPath] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsInitialPane, setSettingsInitialPane] = useState<
+    'appearance' | 'ai' | 'voice' | 'paths' | 'data' | 'account' | 'mcp' | 'feedback' | 'about' | undefined
+  >(undefined);
 
   const [appVersion, setAppVersion] = useState('0.1.0');
   const [updateInfo, setUpdateInfo] = useState<GithubRelease | null>(null);
@@ -168,7 +184,7 @@ export default function App() {
     function onKey(e: KeyboardEvent) {
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key.toLowerCase() === 'n') { e.preventDefault(); handleNewChat(); }
-      else if (mod && e.key === ',') { e.preventDefault(); setShowSettings(true); }
+      else if (mod && e.key === ',') { e.preventDefault(); setSettingsInitialPane(undefined); setShowSettings(true); }
       else if (mod && e.key.toLowerCase() === 'b') { e.preventDefault(); setSidebarCollapsed(v => !v); }
       else if (e.key === 'Escape') {
         if (showSettings) setShowSettings(false);
@@ -182,6 +198,7 @@ export default function App() {
   function handleSettingsChange(next: Settings) {
     setSettings(next);
     saveSettings(next);
+    if (next.theme !== settings.theme) setTheme(next.theme);
   }
 
   function handleSelectSession(session: SessionInfo) {
@@ -207,22 +224,8 @@ export default function App() {
   function handleSelectProject(path: string) {
     setActiveTab('code');
     setActiveProjectPath(path);
-    // Selecting a project opens a new chat contextualized to that project
-    setActiveSession(null);
-    setNewChatMode(true);
-    setChatSerial(s => s + 1);
-  }
-
-  // Per-project "+" button: explicitly start a new chat scoped to this
-  // project, bypassing any stale activeProjectPath. Same effect as
-  // handleSelectProject today but kept as a separate handler so the intent
-  // ("new chat in this project") is unambiguous in the UI.
-  function handleNewChatInProject(path: string) {
-    setActiveTab('code');
-    setActiveProjectPath(path);
-    setActiveSession(null);
-    setNewChatMode(true);
-    setChatSerial(s => s + 1);
+    // Selecting a project should not auto-start a new session; it only sets the
+    // active project context for subsequent "New session" actions.
   }
 
   function handleHeaderMouseDown(e: React.MouseEvent<HTMLElement>) {
@@ -327,71 +330,105 @@ export default function App() {
 
   return (
     <div className="kim-app kim-app--row">
-      <Sidebar
+      <RevampSidebar
         kimSessions={kimSessions}
         activeSessionId={activeSession ? sessionKey(activeSession) : null}
         onSelectSession={handleSelectSession}
         onNewChat={handleNewChat}
         collapsed={sidebarCollapsed}
         onToggle={() => setSidebarCollapsed(v => !v)}
-        onOpenSettings={() => setShowSettings(true)}
-        loading={loading}
+        onOpenSettings={(pane) => {
+          setSettingsInitialPane(pane);
+          setShowSettings(true);
+        }}
         account={account}
         onAccountChange={setAccount}
         activeTab={activeTab}
         onTabChange={handleTabChange}
         activeProjectPath={activeProjectPath}
         onSelectProject={handleSelectProject}
-        onNewChatInProject={handleNewChatInProject}
-        onRefreshSessions={refresh}
         sessionRefreshNonce={sessionRefreshNonce}
-        kimSessionsDir={settings.kim_sessions_dir || null}
-        clawSessionsDir={settings.claw_sessions_dir || null}
         appVersion={appVersion}
+        theme={settings.theme}
+        onCycleTheme={() => {
+          const order: Array<typeof settings.theme> = ['light', 'system', 'dark'];
+          const idx = order.indexOf(settings.theme);
+          const next = order[(idx + 1) % order.length];
+          handleSettingsChange({ ...settings, theme: next });
+        }}
       />
 
       <main className="kim-main">
         <header className="kim-topbar" data-tauri-drag-region onMouseDown={handleHeaderMouseDown}>
-          {activeSession && !newChatMode && (
-            <div className="kim-topbar__title">
-              {activeSession.session_type !== 'kim' && (
-                <span className="kim-header__session-badge kim-header__session-badge--claw">Code</span>
+          {(activeSession || newChatMode) && (
+            <div className="kim-topbar__title" style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+              {(newChatMode ? activeTab === 'code' : activeSession?.session_type !== 'kim') && (
+                <span
+                  style={{
+                    fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
+                    fontSize: 10,
+                    letterSpacing: '0.14em',
+                    color: 'var(--kim-accent)',
+                    border: '1px solid var(--kim-accent-line)',
+                    padding: '4px 8px',
+                    borderRadius: 6,
+                  }}
+                >
+                  CODE
+                </span>
               )}
-              <span className="kim-topbar__title-text">{activeSession.title?.trim() || activeSession.session_id}</span>
-              <button
-                type="button"
-                className="kim-header__summarize-btn kim-no-drag"
-                title={activeSession.has_summary ? 'Refresh the summary' : 'Generate a summary for this conversation'}
-                onClick={async () => {
-                  try {
-                    await invoke('summarize_session', {
-                      sessionId: activeSession.session_id,
-                      sessionType: activeSession.session_type,
-                      projectRoot: activeProjectPath ?? null,
-                    });
-                    toast('Summary generated', 'success');
-                    await refresh();
-                  } catch (e) {
-                    toast(`Summarize failed: ${e}`, 'error');
-                  }
-                }}
-              >
-                {activeSession.has_summary ? 'Refresh summary' : 'Generate summary'}
-              </button>
-            </div>
-          )}
-          {newChatMode && (
-            <div className="kim-topbar__title">
-              {activeTab !== 'chat' && (
-                <span className="kim-header__session-badge kim-header__session-badge--claw">Code</span>
+              {newChatMode ? (
+                <span style={{ color: 'var(--kim-text-2)', fontSize: 13, display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                  <span className="kr-pulse-dot" style={{ background: 'var(--kim-green)' }} />
+                  {activeTab === 'code' ? 'New session' : 'New chat'}
+                </span>
+              ) : activeSession && (
+                <>
+                  <span style={{ color: 'var(--kim-text)', fontSize: 13.5 }}>
+                    {activeSession.title?.trim() || activeSession.session_id}
+                  </span>
+                  <button
+                    type="button"
+                    className="kim-header__summarize-btn kim-no-drag"
+                    title={activeSession.has_summary ? 'Refresh the summary' : 'Generate a summary for this conversation'}
+                    onClick={async () => {
+                      try {
+                        await invoke('summarize_session', {
+                          sessionId: activeSession.session_id,
+                          sessionType: activeSession.session_type,
+                          projectRoot: activeProjectPath ?? null,
+                        });
+                        toast('Summary generated', 'success');
+                        await refresh();
+                      } catch (e) {
+                        toast(`Summarize failed: ${e}`, 'error');
+                      }
+                    }}
+                  >
+                    {activeSession.has_summary ? 'Refresh summary' : 'Generate summary'}
+                  </button>
+                </>
               )}
-              <span className="kim-topbar__title-text">
-                <span className="kim-pulse-dot" /> New chat
-              </span>
             </div>
           )}
 
           <div style={{ flex: 1 }} />
+
+          {activeTab === 'code' && activeProjectPath && (
+            <span
+              className="kim-no-drag"
+              style={{
+                fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
+                fontSize: 11,
+                color: 'var(--kim-text-3)',
+                marginRight: 8,
+              }}
+              title={activeProjectPath}
+            >
+              ~/{activeProjectPath.split('/').slice(-2).join('/')}
+            </span>
+          )}
+
           <button
             type="button"
             className="kim-topbar__connectors-btn kim-no-drag"
@@ -416,18 +453,24 @@ export default function App() {
           onAccountChange={setAccount}
           activeTab={activeTab}
           activeProjectPath={activeProjectPath}
+          reloadSessions={refresh}
+          onNewChat={handleNewChat}
+          onNewCodeSession={() => { setActiveTab('code'); handleNewChat(); }}
+          recentSessions={kimSessions}
+          onSelectSession={handleSelectSession}
         />
       </main>
 
       {showSettings && (
-        <SettingsPanel
+        <RevampSettings
           settings={settings}
           onChange={handleSettingsChange}
-          onClose={() => setShowSettings(false)}
+          onClose={() => { setShowSettings(false); setSettingsInitialPane(undefined); }}
           appVersion={appVersion}
           onCheckUpdate={checkForUpdates}
           account={account}
           onAccountChange={setAccount}
+          initialPane={settingsInitialPane}
         />
       )}
 

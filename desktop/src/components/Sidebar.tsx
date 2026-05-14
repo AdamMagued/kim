@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
@@ -307,7 +307,7 @@ async function pickAndAddProject(onAdd: (path: string) => Promise<void>, setErr:
 
 // ── Main Sidebar ───────────────────────────────────────────────────────────────
 
-export function Sidebar({
+function SidebarImpl({
   kimSessions, activeSessionId,
   onSelectSession, onNewChat,
   collapsed, onToggle, onOpenSettings, loading,
@@ -410,7 +410,8 @@ export function Sidebar({
     };
   }, [accountMenuOpen]);
 
-  const projectPaths = account.code_projects ?? [];
+  const projectPaths = useMemo(() => account.code_projects ?? [], [account.code_projects]);
+  const projectPathsKey = useMemo(() => JSON.stringify(projectPaths), [projectPaths]);
 
   const loadProjects = useCallback(() => {
     if (projectPaths.length === 0) {
@@ -422,7 +423,7 @@ export function Sidebar({
       .then(p => setClawProjects(p))
       .catch(() => setClawProjects([]))
       .finally(() => setProjectsLoading(false));
-  }, [JSON.stringify(projectPaths)]);
+  }, [projectPaths, projectPathsKey]);
 
   useEffect(() => {
     if (activeTab === 'code') loadProjects();
@@ -449,6 +450,23 @@ export function Sidebar({
   const sidebarStyle: React.CSSProperties = collapsed
     ? {}
     : { width: sidebarWidth, minWidth: sidebarWidth };
+
+  const sortedKimSessions = useMemo(() => {
+    return [...kimSessions].sort((a, b) => {
+      const ap = pinnedKeys.has(sessionKey(a)) ? 1 : 0;
+      const bp = pinnedKeys.has(sessionKey(b)) ? 1 : 0;
+      return bp - ap;
+    });
+  }, [kimSessions, pinnedKeys]);
+
+  const toggleSelectedSession = useCallback((key: string) => {
+    setSelectedSessions(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
 
   return (
     <>
@@ -562,12 +580,7 @@ export function Sidebar({
                   {kimSessions.length === 0 ? (
                     <div className="kim-empty-section">No sessions yet</div>
                   ) : (
-                    [...kimSessions]
-                      .sort((a, b) => {
-                        const ap = pinnedKeys.has(sessionKey(a)) ? 1 : 0;
-                        const bp = pinnedKeys.has(sessionKey(b)) ? 1 : 0;
-                        return bp - ap;
-                      })
+                    sortedKimSessions
                       .map(s => {
                         const key = sessionKey(s);
                         return (
@@ -578,12 +591,7 @@ export function Sidebar({
                             onClick={() => onSelectSession(s)}
                             editMode={editMode}
                             selected={selectedSessions.has(key)}
-                            onToggleSelect={() => {
-                              const next = new Set(selectedSessions);
-                              if (next.has(key)) next.delete(key);
-                              else next.add(key);
-                              setSelectedSessions(next);
-                            }}
+                            onToggleSelect={() => toggleSelectedSession(key)}
                             pinned={pinnedKeys.has(key)}
                             onTogglePin={() => togglePinned(key)}
                             onRequestDelete={() => requestSingleDelete(key)}
@@ -839,3 +847,21 @@ export function Sidebar({
     </>
   );
 }
+
+function areSidebarPropsEqual(prev: Props, next: Props): boolean {
+  return (
+    prev.kimSessions === next.kimSessions &&
+    prev.activeSessionId === next.activeSessionId &&
+    prev.collapsed === next.collapsed &&
+    prev.loading === next.loading &&
+    prev.account === next.account &&
+    prev.activeTab === next.activeTab &&
+    prev.activeProjectPath === next.activeProjectPath &&
+    prev.sessionRefreshNonce === next.sessionRefreshNonce &&
+    prev.kimSessionsDir === next.kimSessionsDir &&
+    prev.clawSessionsDir === next.clawSessionsDir &&
+    prev.appVersion === next.appVersion
+  );
+}
+
+export const Sidebar = memo(SidebarImpl, areSidebarPropsEqual);

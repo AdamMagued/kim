@@ -73,6 +73,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
+from orchestrator.context_meter import IMAGE_TOKEN_ESTIMATE, estimate_text_tokens
 from orchestrator.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
@@ -265,15 +266,33 @@ class BrowserProvider(BaseProvider):
         self._max_history_messages = int(bp_cfg.get("max_history_messages", 6))
         self._max_inject_chars = int(bp_cfg.get("max_inject_chars", 120000))
         self._headless = bool(bp_cfg.get("browser_headless", False))
+        # When force_headless is set, skip the CDP attempt entirely and go
+        # straight to a Kim-managed headless Chromium. This is the path that
+        # enables the "Sign in once, run invisibly forever" UX — the visible
+        # Tauri webview is only for the sign-in step; chat traffic then runs
+        # through a separate headless Chromium that reuses user_data_dir.
+        # Implies _headless=True.
+        self._force_headless = bool(bp_cfg.get("browser_force_headless", False))
+        if self._force_headless:
+            self._headless = True
         self._preferred_site = (bp_cfg.get("preferred_site") or "").strip().lower() or None
 
         env_site = os.environ.get("KIM_PREFERRED_SITE", "").strip().lower()
         if env_site:
             self._preferred_site = env_site
 
+        self._model_tier = None
+        if self._preferred_site and ":" in self._preferred_site:
+            parts = self._preferred_site.split(":", 1)
+            self._preferred_site = parts[0]
+            self._model_tier = parts[1]
+
         self._bridge_url = os.environ.get("KIM_WEBVIEW_BRIDGE_URL", "").strip().rstrip("/")
         self._bridge_token = os.environ.get("KIM_WEBVIEW_BRIDGE_TOKEN", "").strip()
         self._use_webview_bridge = bool(self._bridge_url and self._bridge_token)
+        self._gemini_authuser = self._parse_authuser_env(os.environ.get("KIM_GEMINI_AUTHUSER", ""))
+        if self._gemini_authuser is None:
+            self._gemini_authuser = self._load_active_gemini_authuser_from_account()
 
         # Track Playwright-managed browser for auto-launch mode
         self._managed_pw = None      # Playwright context manager
@@ -360,9 +379,102 @@ class BrowserProvider(BaseProvider):
         # Do NOT reset _sent_system_prompt or rebuild site config here.
         pass
 
+    def _estimate_prompt_usage(self, prompt: str, attachments: list[dict]) -> dict:
+        image_count = sum(
+            1 for a in attachments
+            if str(a.get("mime_type", "")).startswith("image/") and a.get("data_base64")
+        )
+        return {
+            "input": estimate_text_tokens(prompt) + image_count * IMAGE_TOKEN_ESTIMATE,
+            "output": 0,
+            "estimated": True,
+            "source": "browser_prompt",
+        }
+
+    @staticmethod
+    def _attach_usage(result: dict, usage: dict) -> dict:
+        if not isinstance(result, dict):
+            return result
+        if "usage" not in result:
+            result = dict(result)
+            result["usage"] = usage
+        return result
+
     # ==================================================================
     # Main entry point
     # ==================================================================
+
+    @staticmethod
+    def _parse_authuser_env(raw: str) -> Optional[int]:
+        """Return a non-negative Google authuser index from env, or None.
+
+        Google multi-login routing uses the browser-profile-local `authuser`
+        index. Kim sets KIM_GEMINI_AUTHUSER from the active linked Google
+        account before launching the orchestrator; this provider forwards it
+        to the in-app WebView bridge only for Gemini.
+        """
+        raw = str(raw or "").strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw, 10)
+        except ValueError:
+            logger.warning("Ignoring invalid KIM_GEMINI_AUTHUSER=%r", raw)
+            return None
+        if value < 0:
+            logger.warning("Ignoring negative KIM_GEMINI_AUTHUSER=%r", raw)
+            return None
+        return value
+
+    @staticmethod
+    def _kim_account_path() -> Path:
+        override = os.environ.get("KIM_ACCOUNT_PATH", "").strip()
+        if override:
+            return Path(override).expanduser()
+
+        home = Path.home()
+        system = platform.system()
+        if system == "Darwin":
+            return home / "Library" / "Application Support" / "kim" / "account.json"
+        if system == "Windows":
+            appdata = os.environ.get("APPDATA", "").strip()
+            if appdata:
+                return Path(appdata) / "kim" / "account.json"
+        config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+        base = Path(config_home).expanduser() if config_home else home / ".config"
+        return base / "kim" / "account.json"
+
+    def _load_active_gemini_authuser_from_account(self) -> Optional[int]:
+        """Read Kim's persisted active Google authuser index as a fallback.
+
+        This keeps Browser: Gemini routing working even if the Tauri sender is
+        older and does not pass KIM_GEMINI_AUTHUSER yet.
+        """
+        path = self._kim_account_path()
+        if not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("Could not read Kim account file for Gemini authuser: %s", e)
+            return None
+        accounts = raw.get("google_accounts")
+        if not isinstance(accounts, list) or not accounts:
+            return None
+        active_email = str(raw.get("google_active_account") or "").strip().lower()
+        selected = None
+        for entry in accounts:
+            if not isinstance(entry, dict):
+                continue
+            email = str(entry.get("email") or "").strip().lower()
+            if active_email and email == active_email:
+                selected = entry
+                break
+            if selected is None:
+                selected = entry
+        if not isinstance(selected, dict):
+            return None
+        return self._parse_authuser_env(str(selected.get("authuser_index", "")))
 
     async def complete(
         self,
@@ -377,18 +489,20 @@ class BrowserProvider(BaseProvider):
         If clear_chat is True, the page is refreshed to start a fresh session before sending.
         """
         prompt, attachments, completion_hash = self._format_prompt(messages, tools, system)
+        estimated_usage = self._estimate_prompt_usage(prompt, attachments)
         logger.debug(
             f"Prompt ready: {len(prompt)} chars, "
             f"{len(attachments)} attachment(s) extracted, hash={completion_hash}"
         )
 
         if self._use_webview_bridge:
-            return await self._complete_via_webview_bridge(
+            result = await self._complete_via_webview_bridge(
                 prompt,
                 attachments,
                 completion_hash,
                 clear_chat=clear_chat,
             )
+            return self._attach_usage(result, estimated_usage)
 
         try:
             async with async_playwright() as pw:
@@ -449,10 +563,16 @@ class BrowserProvider(BaseProvider):
                 # ── Step 5: Click Send + wait for response ───────────────
                 logger.info(f"[STATUS] Sending message to {site}…")
                 raw_response = await self._send_and_wait(page, cfg, prompt, site, completion_hash)
-                return self._parse_response(raw_response, completion_hash)
+                return self._attach_usage(
+                    self._parse_response(raw_response, completion_hash),
+                    estimated_usage,
+                )
         except Exception as e:
             logger.error(f"BrowserProvider.complete failed: {e}", exc_info=True)
-            return {"type": "text", "content": f"NEED_HELP: Browser connection failed — {e}"}
+            return self._attach_usage(
+                {"type": "text", "content": f"NEED_HELP: Browser connection failed — {e}"},
+                estimated_usage,
+            )
 
     async def _complete_via_webview_bridge(
         self,
@@ -518,6 +638,12 @@ class BrowserProvider(BaseProvider):
             "completion_hash": completion_hash,
             "clear_chat": bool(clear_chat),
         }
+        if getattr(self, "_model_tier", None):
+            payload["model_tier"] = self._model_tier
+            
+        if site == "gemini" and self._gemini_authuser is not None:
+            payload["authuser"] = self._gemini_authuser
+            logger.info("Routing Gemini WebView via authuser=%s", self._gemini_authuser)
 
         # ── Try split send/result API first ──────────────────────────────
         try:
@@ -730,11 +856,22 @@ class BrowserProvider(BaseProvider):
 
     async def _connect(self, pw: Playwright) -> Browser:
         """
-        Two-tier connection strategy:
+        Three-tier connection strategy:
+          0. If browser_force_headless is set, skip CDP and go directly to
+             Kim-managed headless Chromium (the "invisible after sign-in" path).
           1. Try connecting to an externally-launched Chrome via CDP.
-          2. If that fails AND headless mode is enabled, auto-launch
+          2. If that fails AND browser_headless is enabled, auto-launch
              Chromium via Playwright with the persistent session dir.
         """
+        # ── Tier 0: Force-headless short-circuit ─────────────────────────
+        # When the desktop app has captured a sign-in via the Tauri webview
+        # (which writes cookies into user_data_dir via WebView2/WKWebView
+        # share or a separate captured-state file), we don't want to ever
+        # show a visible Chrome window again. Skip CDP entirely.
+        if self._force_headless:
+            logger.info("browser_force_headless=true — bypassing CDP, launching headless directly")
+            return await self._auto_launch(pw)
+
         # ── Tier 1: Try CDP connection to user-launched Chrome ────────────
         try:
             browser = await pw.chromium.connect_over_cdp(self._cdp_url)
@@ -787,11 +924,18 @@ class BrowserProvider(BaseProvider):
         """
         session_path = Path(self._user_data_dir)
         if not any(session_path.iterdir()):
-            raise RuntimeError(
-                f"Headless mode requires a prior login session, but the session "
-                f"directory is empty: {self._user_data_dir}\n"
-                f"Run once with browser_headless: false, log into your AI chat, "
-                f"then switch to headless mode."
+            if not self._force_headless:
+                raise RuntimeError(
+                    f"Headless mode requires a prior login session, but the session "
+                    f"directory is empty: {self._user_data_dir}\n"
+                    f"Run once with browser_headless: false, log into your AI chat, "
+                    f"then switch to headless mode."
+                )
+            # force_headless path: empty dir is expected on first run; sign-in
+            # will populate it. Continue and let the caller probe auth status.
+            logger.info(
+                f"force_headless: launching with empty user_data_dir — "
+                f"sign-in must happen via the Tauri webview first."
             )
 
         logger.info(
@@ -817,13 +961,18 @@ class BrowserProvider(BaseProvider):
 
         # Do not create a fresh chat tab during an active send. A missing page
         # means there is no stateful provider chat to preserve.
+        # Exception: force_headless mode (first run, empty dir) — we have no
+        # existing chat to preserve, so opening a fresh page is the right move.
         if not context.pages:
-            raise RuntimeError(
-                "NEED_HELP: No existing provider chat page was found in the saved "
-                "browser session. Kim will not open a new provider tab because "
-                "that would lose the LLM context. Reopen the existing provider "
-                "chat window and resend."
-            )
+            if not self._force_headless:
+                raise RuntimeError(
+                    "NEED_HELP: No existing provider chat page was found in the saved "
+                    "browser session. Kim will not open a new provider tab because "
+                    "that would lose the LLM context. Reopen the existing provider "
+                    "chat window and resend."
+                )
+            # Open a blank page; caller is expected to navigate it.
+            await context.new_page()
 
         # The caller expects a Browser object for _find_chat_page.
         # launch_persistent_context returns a BrowserContext, so we

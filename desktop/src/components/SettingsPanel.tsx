@@ -1,12 +1,13 @@
 import { useEffect, useState, useRef, type ReactElement } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import type { Settings, Provider, Theme, VoiceEngine, VoiceSettings, AccentTheme, KimAccount, TypingAnimation } from '../types';
+import type { Settings, Provider, Theme, VoiceEngine, VoiceSettings, AccentTheme, KimAccount, GoogleAccount, GoogleApiAccount, TypingAnimation } from '../types';
 import { VOICES_BY_ENGINE } from '../types';
 import { toast } from './Toast';
 
 
 const PROVIDERS: { value: Provider; label: string }[] = [
+  { value: 'ollama', label: 'Ollama (local/cloud, no API key)' },
   { value: 'browser', label: 'Browser (no API key)' },
   { value: 'claude', label: 'Claude (Anthropic)' },
   { value: 'openai', label: 'GPT-4o (OpenAI)' },
@@ -43,6 +44,12 @@ interface NavItem {
   id: NavSection;
   label: string;
   icon: ReactElement;
+}
+
+interface GoogleApiStatus extends GoogleApiAccount {
+  connected: boolean;
+  needs_reauth?: boolean;
+  error?: string;
 }
 
 function SunIcon() {
@@ -372,6 +379,29 @@ function AISection({
         />
       </div>
 
+      <Field
+        label="Context budget (input tokens)"
+        hint="Kim warns when cumulative input context crosses ~80% / ~95% of this budget, then you can compact. Applies to Chat-tab agent runs. Default 200,000."
+      >
+        <input
+          type="number"
+          className="kim-input"
+          min={10_000}
+          max={2_000_000}
+          step={1000}
+          value={settings.context_budget_tokens ?? 200_000}
+          onChange={e => {
+            const n = Number.parseInt(e.target.value, 10);
+            if (Number.isFinite(n) && n >= 10_000) update('context_budget_tokens', n);
+          }}
+          onBlur={e => {
+            const n = Number.parseInt(e.target.value, 10);
+            if (!Number.isFinite(n) || n < 10_000) update('context_budget_tokens', 200_000);
+          }}
+          aria-label="Context budget in input tokens"
+        />
+      </Field>
+
     </div>
   );
 }
@@ -690,6 +720,156 @@ function AccountSection({ account, onAccountChange }: { account: KimAccount; onA
   const [tokenError, setTokenError] = useState('');
   const [githubUser, setGithubUser] = useState<{ login: string; name: string | null; avatar_url: string } | null>(null);
   const [saving, setSaving] = useState(false);
+  const [googleEmail, setGoogleEmail] = useState('');
+  const [googleAuthuser, setGoogleAuthuser] = useState('0');
+  const [googleError, setGoogleError] = useState('');
+  const [googleApiStatus, setGoogleApiStatus] = useState<GoogleApiStatus | null>(account.google_api_account ? { ...account.google_api_account } : null);
+  const [googleApiBusy, setGoogleApiBusy] = useState(false);
+  const [googleApiError, setGoogleApiError] = useState('');
+
+  const googleAccounts = account.google_accounts ?? [];
+  const activeGoogleEmail = account.google_active_account
+    ?? googleAccounts[0]?.email
+    ?? '';
+  const activeGoogleAccount = googleAccounts.find(a => a.email === activeGoogleEmail) ?? googleAccounts[0] ?? null;
+
+  useEffect(() => {
+    setNameVal(account.display_name);
+  }, [account.display_name]);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<GoogleApiStatus>('google_oauth_status')
+      .then(status => {
+        if (!cancelled) {
+          setGoogleApiStatus(status);
+          setGoogleApiError(status.error ?? '');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setGoogleApiStatus(account.google_api_account ? { ...account.google_api_account } : null);
+      });
+    return () => { cancelled = true; };
+  }, [account.google_api_account]);
+
+  async function connectGoogleApi() {
+    setGoogleApiBusy(true);
+    setGoogleApiError('');
+    try {
+      const status = await invoke<GoogleApiStatus>('google_oauth_start');
+      setGoogleApiStatus(status);
+      await onAccountChange({ ...account, google_api_account: status });
+      toast(status.email ? `Google connected as ${status.email}.` : 'Google connected for Kim.', 'success', 3000);
+    } catch (err) {
+      const message = String(err);
+      setGoogleApiError(message);
+      toast(message || 'Could not connect Google.', 'error', 6000);
+    } finally {
+      setGoogleApiBusy(false);
+    }
+  }
+
+  async function disconnectGoogleApi() {
+    setGoogleApiBusy(true);
+    setGoogleApiError('');
+    try {
+      await invoke('google_oauth_disconnect');
+      const next = { ...account, google_api_account: undefined };
+      setGoogleApiStatus({ connected: false, email: '' });
+      await onAccountChange(next);
+      toast('Google disconnected from Kim.', 'success', 2500);
+    } catch (err) {
+      const message = String(err);
+      setGoogleApiError(message);
+      toast(message || 'Could not disconnect Google.', 'error', 5000);
+    } finally {
+      setGoogleApiBusy(false);
+    }
+  }
+
+  async function testGoogleApi() {
+    setGoogleApiBusy(true);
+    setGoogleApiError('');
+    try {
+      const status = await invoke<GoogleApiStatus>('google_oauth_test');
+      setGoogleApiStatus(status);
+      await onAccountChange({ ...account, google_api_account: status });
+      toast('Google for Kim is working.', 'success', 2500);
+    } catch (err) {
+      const message = String(err);
+      setGoogleApiError(message);
+      toast(message || 'Google test failed.', 'error', 6000);
+    } finally {
+      setGoogleApiBusy(false);
+    }
+  }
+
+  async function saveGoogleAccountPatch(
+    google_accounts: GoogleAccount[],
+    google_active_account: string | undefined,
+    successMessage?: string,
+  ) {
+    setSaving(true);
+    try {
+      await onAccountChange({
+        ...account,
+        google_accounts,
+        google_active_account,
+      });
+      if (successMessage) toast(successMessage, 'success', 2500);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function addGoogleAccount() {
+    const email = googleEmail.trim().toLowerCase();
+    const index = Number.parseInt(googleAuthuser.trim(), 10);
+    setGoogleError('');
+    if (!/^\S+@\S+\.\S+$/.test(email)) {
+      setGoogleError('Enter the Google email address you use in the Gemini WebView.');
+      return;
+    }
+    if (!Number.isInteger(index) || index < 0) {
+      setGoogleError('authuser must be 0 or a positive whole number.');
+      return;
+    }
+    const nextAccounts = [
+      ...googleAccounts.filter(a => a.email.trim().toLowerCase() !== email),
+      { email, authuser_index: index },
+    ].sort((a, b) => a.authuser_index - b.authuser_index || a.email.localeCompare(b.email));
+    await saveGoogleAccountPatch(nextAccounts, email, 'Google account linked for Gemini.');
+    setGoogleEmail('');
+    setGoogleAuthuser(String(index + 1));
+  }
+
+  async function setActiveGoogle(email: string) {
+    const selected = googleAccounts.find(a => a.email === email);
+    await saveGoogleAccountPatch(googleAccounts, selected?.email, selected ? `Gemini will use authuser=${selected.authuser_index}.` : undefined);
+  }
+
+  async function removeGoogleAccount(email: string) {
+    const nextAccounts = googleAccounts.filter(a => a.email !== email);
+    const nextActive = activeGoogleEmail === email ? nextAccounts[0]?.email : activeGoogleEmail;
+    await saveGoogleAccountPatch(nextAccounts, nextActive, 'Google account removed.');
+  }
+
+  async function openActiveGemini() {
+    const authuser = activeGoogleAccount?.authuser_index;
+    const url = authuser === undefined
+      ? 'https://gemini.google.com/app'
+      : `https://gemini.google.com/app?authuser=${authuser}`;
+    try {
+      await invoke<string>('open_browser_signin_window', {
+        url,
+        providerName: 'Gemini',
+      });
+      await invoke('show_browser_window').catch(() => {});
+      toast('Gemini opened in Kim. Complete Google sign-in there if needed.', 'info', 6000);
+    } catch (err) {
+      toast(typeof err === 'string' ? err : 'Could not open Gemini.', 'error', 5000);
+    }
+  }
 
   async function saveName() {
     if (!nameVal.trim()) return;
@@ -774,6 +954,117 @@ function AccountSection({ account, onAccountChange }: { account: KimAccount; onA
           </div>
         )}
       </Field>
+
+      {/* Google OAuth connection for official Gemini API */}
+      <div className="kim-settings-section__header" style={{ marginTop: 20, marginBottom: 12 }}>
+        <span className="kim-settings-section__title" style={{ fontSize: 13 }}>Google for Kim (API)</span>
+      </div>
+      <div style={{ padding: '12px 14px', background: 'var(--surface-raised)', borderRadius: 10, border: '1px solid var(--border)', marginBottom: 18 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div style={{ width: 32, height: 32, borderRadius: '50%', background: googleApiStatus?.connected ? 'var(--accent)' : 'var(--surface)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: googleApiStatus?.connected ? 'white' : 'var(--text-muted)', fontSize: 13, fontWeight: 700 }}>
+            G
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>
+              {googleApiStatus?.connected ? 'Connected as Google' : 'Use Gemini through your Google account'}
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {googleApiStatus?.connected
+                ? (googleApiStatus.email ? `${googleApiStatus.email}${googleApiStatus.needs_reauth ? ' · reconnect required' : ''}` : 'Connected')
+                : 'Continue with Google once, then chat normally. No API key setup in Kim.'}
+            </div>
+          </div>
+          {googleApiStatus?.connected ? (
+            <>
+              <button className="kim-btn kim-btn--secondary" onClick={testGoogleApi} disabled={googleApiBusy} style={{ fontSize: 12 }}>
+                {googleApiBusy ? 'Checking…' : 'Test'}
+              </button>
+              <button className="kim-btn kim-btn--secondary" onClick={disconnectGoogleApi} disabled={googleApiBusy} style={{ fontSize: 12 }}>
+                Disconnect
+              </button>
+            </>
+          ) : (
+            <button className="kim-btn kim-btn--primary" onClick={connectGoogleApi} disabled={googleApiBusy} style={{ fontSize: 12 }}>
+              {googleApiBusy ? 'Opening Google…' : 'Continue with Google'}
+            </button>
+          )}
+        </div>
+        <div className="kim-field__hint" style={{ marginTop: 10 }}>
+          This powers the <code>gemini</code> API provider. Refresh tokens stay in OS secure storage; Kim only passes short-lived access to the Python agent.
+        </div>
+        {googleApiError && <div className="kim-inline-error" style={{ marginTop: 8 }}>{googleApiError}</div>}
+      </div>
+
+      {/* Google connection for Browser: Gemini */}
+      <div className="kim-settings-section__header" style={{ marginTop: 20, marginBottom: 12 }}>
+        <span className="kim-settings-section__title" style={{ fontSize: 13 }}>Google for Browser: Gemini</span>
+      </div>
+      <div className="kim-field__hint" style={{ marginBottom: 12 }}>
+        Kim routes Gemini with Google's <code>authuser</code> index and the cookies already in the in-app WebView. It does not save or auto-fill Google passwords.
+      </div>
+
+      {googleAccounts.length > 0 && (
+        <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
+          {googleAccounts.map(g => {
+            const active = g.email === activeGoogleEmail;
+            return (
+              <div
+                key={g.email}
+                style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', background: 'var(--surface-raised)', borderRadius: 8, border: active ? '1px solid var(--accent)' : '1px solid var(--border)' }}
+              >
+                <div style={{ width: 28, height: 28, borderRadius: '50%', background: active ? 'var(--accent)' : 'var(--surface)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: active ? 'white' : 'var(--text-muted)', fontSize: 12, fontWeight: 600 }}>
+                  G
+                </div>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{g.email}</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>authuser={g.authuser_index}{active ? ' · active' : ''}</div>
+                </div>
+                {!active && (
+                  <button className="kim-btn kim-btn--secondary" onClick={() => setActiveGoogle(g.email)} disabled={saving} style={{ fontSize: 12 }}>
+                    Use
+                  </button>
+                )}
+                <button className="kim-btn kim-btn--secondary" onClick={() => removeGoogleAccount(g.email)} disabled={saving} style={{ fontSize: 12 }}>
+                  Remove
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gap: 8, marginBottom: 8 }}>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            type="email"
+            className="kim-input"
+            placeholder="you@gmail.com"
+            value={googleEmail}
+            onChange={e => { setGoogleEmail(e.target.value); setGoogleError(''); }}
+            style={{ flex: 1 }}
+          />
+          <input
+            type="number"
+            min={0}
+            step={1}
+            className="kim-input"
+            aria-label="Google authuser index"
+            value={googleAuthuser}
+            onChange={e => { setGoogleAuthuser(e.target.value); setGoogleError(''); }}
+            style={{ width: 96 }}
+          />
+          <button className="kim-btn kim-btn--primary" onClick={addGoogleAccount} disabled={saving || !googleEmail.trim()}>
+            Link
+          </button>
+        </div>
+        <div className="kim-field__hint">
+          Use <code>0</code> for the first Google account in this WebView profile, <code>1</code> for the second, and so on. Test with “Open active Gemini”.
+        </div>
+        {googleError && <div className="kim-inline-error">{googleError}</div>}
+        <button className="kim-btn kim-btn--secondary" onClick={openActiveGemini} style={{ width: '100%' }}>
+          Open active Gemini{activeGoogleAccount ? ` (${activeGoogleAccount.email}, authuser=${activeGoogleAccount.authuser_index})` : ''}
+        </button>
+      </div>
 
       {/* GitHub connection */}
       <div className="kim-settings-section__header" style={{ marginTop: 20, marginBottom: 12 }}>

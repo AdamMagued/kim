@@ -24,3 +24,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 zip = "2"
 tiny_http = "0.12"
 base64 = "0.22"
+keyring = "2"
+rand = "0.8"
+sha2 = "0.10"
+url = "2"

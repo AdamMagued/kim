@@ -22,7 +22,8 @@ from __future__ import annotations
 import copy
 import json
 import logging
-from datetime import date
+import os
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -65,6 +66,7 @@ class SessionStore:
 
         self.session_file = self.session_dir / f"{self.session_id}.jsonl"
         self.summary_file = self.session_dir / f"{self.session_id}.summary.txt"
+        self.context_file = self.session_dir / f"{self.session_id}.context.json"
         self._message_count = 0
 
         # Create directory on first use
@@ -97,6 +99,53 @@ class SessionStore:
         """Write a human-readable summary alongside the JSONL file."""
         self.summary_file.write_text(summary.strip() + "\n", encoding="utf-8")
         logger.info(f"Session summary saved: {self.summary_file}")
+
+    def load_context_state(self) -> dict:
+        """Read this session's context-meter sidecar, if present."""
+        try:
+            if self.context_file.exists():
+                data = json.loads(self.context_file.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.debug(f"Failed to read context sidecar {self.context_file}: {e}")
+        return {}
+
+    def save_context_state(self, state: dict) -> None:
+        """Atomically write this session's context-meter sidecar."""
+        if not isinstance(state, dict):
+            raise TypeError("context state must be a dict")
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.context_file.with_suffix(self.context_file.suffix + ".tmp")
+        payload = dict(state)
+        payload.setdefault("session_id", self.session_id)
+        payload.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, self.context_file)
+
+    def save_compact_artifact(self, artifact: dict) -> Path:
+        """Persist a compact-summary artifact and return its path.
+
+        The artifact is intentionally separate from the rolling context meter so
+        fresh chats can point back to the compact checkpoint without carrying the
+        full pre-compact transcript in the active thread.
+        """
+        if not isinstance(artifact, dict):
+            raise TypeError("compact artifact must be a dict")
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = self.session_dir / f"{self.session_id}.compact.{stamp}.json"
+        payload = dict(artifact)
+        payload.setdefault("session_id", self.session_id)
+        payload.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        logger.info(f"Compact artifact saved: {path}")
+        return path
 
     # ------------------------------------------------------------------
     # Read API (class methods — work without an active session)
@@ -209,6 +258,7 @@ class SessionStore:
             for jsonl_file in sorted(date_dir.glob("*.jsonl"), reverse=True):
                 session_id = jsonl_file.stem
                 summary_file = date_dir / f"{session_id}.summary.txt"
+                context_file = date_dir / f"{session_id}.context.json"
                 try:
                     with open(jsonl_file, encoding="utf-8") as f:
                         msg_count = sum(1 for _ in f)
@@ -221,6 +271,7 @@ class SessionStore:
                     "path": str(jsonl_file),
                     "message_count": msg_count,
                     "has_summary": summary_file.exists(),
+                    "has_context": context_file.exists(),
                 })
 
         return sessions

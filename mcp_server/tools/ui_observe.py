@@ -6,10 +6,7 @@ of screenshot-first. On macOS this uses the Accessibility tree via
 System Events. Other platforms return a clean limitation for now.
 """
 
-from __future__ import annotations
-
 import asyncio
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -166,7 +163,10 @@ def _format_observation(app: str, window: str, elements: list[UIElement], limit:
         )
 
     if len(elements) > limit:
-        lines.append(f"... {len(elements) - limit} more elements omitted. Re-run observe_ui with a higher limit if needed.")
+        lines.append(
+            f"... {len(elements) - limit} more elements omitted. "
+            "Re-run observe_ui with a higher limit if needed."
+        )
 
     return "\n".join(lines)
 
@@ -266,7 +266,8 @@ async def _observe_ui_macos(limit: int, depth: int) -> str:
                 if r contains "Radio" then set interesting to true
                 if interesting then
                     set itemCount to itemCount + 1
-                    set output to output & "EL" & tab & depth & tab & r & tab & n & tab & d & tab & v & tab & px & tab & py & tab & sx & tab & sy & linefeed
+                    set output to output & "EL" & tab & depth & tab & r & tab & n & tab & d & tab & v
+                    set output to output & tab & px & tab & py & tab & sx & tab & sy & linefeed
                 end if
             end if
 

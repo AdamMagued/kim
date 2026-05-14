@@ -13,12 +13,15 @@ export interface SessionInfo {
   browser_threads?: Record<string, string>;
   browser_last_site?: string;
   browser_threads_updated_at_ms?: number;
+  /** Composer LLM choice for this session, e.g. `browser:gemini` or `claude`. */
+  last_llm_provider?: string;
 }
 
 export interface BrowserSessionMeta {
   browser_threads: Record<string, string>;
   browser_last_site?: string;
   browser_threads_updated_at_ms?: number;
+  last_llm_provider?: string;
 }
 
 export interface BrowserRestoreResult {
@@ -80,6 +83,17 @@ export interface GoogleAccount {
   authuser_index: number;
 }
 
+export interface GoogleApiAccount {
+  /** Google identity connected through OAuth for official Gemini API calls. */
+  email: string;
+  connected: boolean;
+  /** Epoch seconds for the current access token, when known. Refresh token stays in OS secure storage. */
+  expires_at?: number;
+  /** Quota/billing project used for x-goog-user-project when configured. */
+  project_id?: string;
+  needs_reauth?: boolean;
+}
+
 export interface KimAccount {
   display_name: string;
   github_username?: string;
@@ -93,15 +107,21 @@ export interface KimAccount {
   google_accounts?: GoogleAccount[];
   /** Active Google account email for Gemini browser sessions. */
   google_active_account?: string;
+  /** Official Gemini API OAuth connection. Refresh tokens are not stored here. */
+  google_api_account?: GoogleApiAccount;
 }
 
 // ── Claw (Code) project types ────────────────────────────────────────────────
 
 export interface ClawSession {
   session_id: string;
+  /** YYYY-MM-DD bucket folder name under .claw/sessions (used to locate file). */
   date: string;
+  /** ISO timestamp (UTC) based on file modified time (used for sorting/display). */
+  updated_at: string;
   message_count: number;
   summary?: string;
+  title: string;
 }
 
 export interface ClawBranch {
@@ -119,10 +139,20 @@ export interface ClawProject {
 // ── Settings ─────────────────────────────────────────────────────────────────
 
 export type Theme = 'dark' | 'light' | 'system';
-export type Provider = 'claude' | 'openai' | 'gemini' | 'deepseek' | 'browser';
+export type Provider = 'claude' | 'openai' | 'gemini' | 'deepseek' | 'browser' | 'ollama';
 export type AccentTheme = 'indigo' | 'ocean' | 'ember' | 'teal' | 'jade' | 'mono';
 export type VoiceEngine = 'kokoro' | 'maya1' | 'http' | 'hume';
 export type TypingAnimation = 'none' | 'typewriter' | 'word-fade' | 'char-blur';
+
+export interface OllamaSettings {
+  base_url: string;
+  mode: 'local' | 'cloud';
+  local_model: string;
+  cloud_model: string;
+  connected: boolean;
+  cloud_connected: boolean;
+  context_limit_override: number | null;
+}
 
 export interface VoiceSettings {
   enabled: boolean;
@@ -137,19 +167,23 @@ export interface Settings {
   provider: Provider;
   allow_message_queue: boolean;
   keep_browser_visible: boolean;
+  /** Cumulative input/context budget before Kim prompts to compact. */
+  context_budget_tokens: number;
   theme: Theme;
   accent: AccentTheme;
   voice: VoiceSettings;
   typing_animation: TypingAnimation;
+  ollama: OllamaSettings;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
   kim_sessions_dir: '',
   claw_sessions_dir: '',
   project_root: '',
-  provider: 'browser',
+  provider: 'ollama',
   allow_message_queue: false,
   keep_browser_visible: false,
+  context_budget_tokens: 200_000,
   theme: 'system',
   accent: 'indigo',
   voice: {
@@ -158,6 +192,15 @@ export const DEFAULT_SETTINGS: Settings = {
     voice_id: 'af_heart',
   },
   typing_animation: 'none',
+  ollama: {
+    base_url: 'http://localhost:11434',
+    mode: 'cloud',
+    local_model: '',
+    cloud_model: 'gpt-oss:120b-cloud',
+    connected: false,
+    cloud_connected: false,
+    context_limit_override: null,
+  },
 };
 
 // Voice catalog per engine — used by SettingsPanel to populate the voice dropdown.

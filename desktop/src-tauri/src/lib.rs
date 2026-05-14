@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Listener, Manager, State};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use tokio::sync::Mutex;
+
+mod google_oauth;
 
 // ---------------------------------------------------------------------------
 // Shared state — currently running agent child (for cancellation)
@@ -61,6 +63,9 @@ struct BridgeCompleteRequest {
     /// before injecting the prompt.
     #[serde(default)]
     authuser: Option<u32>,
+    /// Optional model tier (e.g. "fast", "pro", "thinking") requested by the user.
+    #[serde(default)]
+    model_tier: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -96,6 +101,10 @@ struct BridgeIpcEvent {
     site: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    msg: Option<String>,
 }
 
 static IPC_LISTENER_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -143,6 +152,9 @@ pub struct SessionInfo {
     pub browser_last_site: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_threads_updated_at_ms: Option<u64>,
+    /// Full composer provider for this session, e.g. `browser:gemini`, `claude`, `gemini`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_llm_provider: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -167,6 +179,8 @@ pub struct BrowserSessionMeta {
     pub browser_last_site: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_threads_updated_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_llm_provider: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -646,6 +660,12 @@ fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<Session
             let title = infer_session_title(&session_file, summary.as_ref(), &session_id);
 
             let browser_meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
+            let BrowserSessionMeta {
+                browser_threads,
+                browser_last_site,
+                browser_threads_updated_at_ms,
+                last_llm_provider,
+            } = browser_meta;
             sessions.push(SessionInfo {
                 session_key: format!("{}:{}:{}", session_type, date_str, session_id),
                 session_id,
@@ -655,9 +675,10 @@ fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<Session
                 has_summary,
                 summary,
                 session_type: session_type.to_string(),
-                browser_threads: if browser_meta.browser_threads.is_empty() { None } else { Some(browser_meta.browser_threads) },
-                browser_last_site: browser_meta.browser_last_site,
-                browser_threads_updated_at_ms: browser_meta.browser_threads_updated_at_ms,
+                browser_threads: if browser_threads.is_empty() { None } else { Some(browser_threads) },
+                browser_last_site,
+                browser_threads_updated_at_ms,
+                last_llm_provider,
             });
         }
     }
@@ -913,6 +934,65 @@ fn normalize_site(site: &str) -> String {
     }
 }
 
+fn last_llm_provider_allowed(p: &str) -> bool {
+    if p.is_empty() || p.len() > 64 {
+        return false;
+    }
+    matches!(
+        p,
+        "browser"
+            | "browser:claude"
+            | "browser:chatgpt"
+            | "browser:gemini"
+            | "browser:grok"
+            | "browser:deepseek"
+            | "browser:custom"
+            | "claude"
+            | "openai"
+            | "gemini"
+            | "deepseek"
+    )
+}
+
+fn apply_browser_meta_writes(
+    meta: &mut BrowserSessionMeta,
+    browser_last_site: Option<String>,
+    site: Option<String>,
+    url: Option<String>,
+    last_llm_provider: Option<String>,
+) -> Result<(), String> {
+    if let Some(last) = browser_last_site
+        .as_deref()
+        .map(normalize_site)
+        .filter(|s| !s.is_empty())
+    {
+        meta.browser_last_site = Some(last);
+    }
+
+    if let (Some(site_raw), Some(url_raw)) = (site.as_deref(), url.as_deref()) {
+        let site_norm = normalize_site(site_raw);
+        if browser_url_is_bad_for_commit(url_raw, &site_norm) {
+            return Err(format!(
+                "Refusing to store non-conversation/login URL for {}: {}",
+                site_norm, url_raw
+            ));
+        }
+        meta.browser_threads
+            .insert(site_norm.clone(), url_raw.trim().to_string());
+        meta.browser_last_site = Some(site_norm);
+    }
+
+    if let Some(p) = last_llm_provider {
+        let t = p.trim();
+        if last_llm_provider_allowed(t) {
+            meta.last_llm_provider = Some(t.to_string());
+        }
+    }
+
+    meta.browser_threads_updated_at_ms = Some(now_ms());
+    Ok(())
+}
+
 fn default_site_url(site: &str) -> &'static str {
     match normalize_site(site).as_str() {
         "chatgpt" => "https://chatgpt.com",
@@ -1004,6 +1084,26 @@ fn webview_current_href(window: &tauri::WebviewWindow) -> String {
         .unwrap_or_default()
 }
 
+fn gemini_url_has_conversation_path(raw_url: &str) -> bool {
+    let Ok(url) = tauri::Url::parse(raw_url) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host != "gemini.google.com" {
+        return false;
+    }
+    let segments: Vec<&str> = url
+        .path_segments()
+        .map(|s| s.filter(|seg| !seg.is_empty()).collect())
+        .unwrap_or_else(Vec::new);
+    for i in 0..segments.len() {
+        if segments[i] == "app" {
+            return segments.get(i + 1).is_some_and(|next| !next.is_empty());
+        }
+    }
+    false
+}
+
 fn prepare_gemini_webview(window: &tauri::WebviewWindow, authuser: Option<u32>, force: bool) {
     let current_url = webview_current_href(window);
     let task_running = is_bridge_task_running();
@@ -1019,9 +1119,11 @@ fn prepare_gemini_webview(window: &tauri::WebviewWindow, authuser: Option<u32>, 
         .lock()
         .map(|guard| *guard != authuser)
         .unwrap_or(true);
+    let has_thread_path = gemini_url_has_conversation_path(&current_url);
     let missing_selected_authuser = authuser.is_some_and(|index| {
         current_url.contains("gemini.google.com")
             && !current_url.contains(&format!("authuser={index}"))
+            && !has_thread_path
     });
     let wrong_page = current_url.is_empty()
         || !current_url.contains("gemini.google.com")
@@ -1236,7 +1338,7 @@ fn write_text_prompt_to_clipboard(_prompt: &str) -> bool {
 const PERSISTENT_BRIDGE_JS: &str = r#"
 (() => {
   // Guard: only install once per page load.
-  if (window.__kimBridge && window.__kimBridge._v >= 8) return;
+  if (window.__kimBridge && window.__kimBridge._v >= 10) return;
 
   const SITE_CONFIGS = {
     claude: {
@@ -1707,9 +1809,12 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
   };
 
   // ── Main send function ───────────────────────────────────────────────
-  const send = async (prompt, reqId, site, attachments, callbackUrl, completionHash) => {
+  const send = async (prompt, reqId, site, attachments, callbackUrl, completionHash, modelTier) => {
+    window.__kimModelTier = modelTier;
     const siteKey = SITE_CONFIGS[site] ? site : 'claude';
     const cfg = SITE_CONFIGS[siteKey];
+    const baselineResponseCount = countResponseNodes(cfg, siteKey);
+    const baselineResponseText = getLatestResponseText(cfg, siteKey) || '';
     const HARD_TIMEOUT = 120000;
     const hardDeadlineAt = Date.now() + HARD_TIMEOUT;
 
@@ -1814,6 +1919,97 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         }
       }
 
+      if (siteKey === 'gemini') {
+        const rawTier = (window.__kimModelTier == null ? '' : String(window.__kimModelTier)).trim().toLowerCase();
+        const tier = rawTier === 'advanced' ? 'pro' : (rawTier === 'fast' ? 'flash' : rawTier);
+        const hasExplicitTier = tier === 'flash' || tier === 'pro' || tier === 'thinking';
+        if (!hasExplicitTier) {
+          console.log('[KimBridge] Gemini model auto-switch skipped (no explicit model tier)');
+        } else {
+        const selectGeminiPro = async () => {
+            let modelBtn = null;
+            const walker1 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+            while (walker1.nextNode()) {
+                const node = walker1.currentNode;
+                const txt = (node.textContent || '').replace(/[\\s\\u00A0]+/g, ' ').toLowerCase().trim();
+                const words = txt.split(' ');
+                
+                if (words.includes('gemini') || words.includes('flash') || words.includes('fast') || words.includes('pro') || words.includes('advanced') || words.includes('thinking')) {
+                    if (!txt.includes('upgrade') && !txt.includes('try') && !txt.includes('learn') && !txt.includes('help') && !txt.includes('chat')) {
+                        const el = node.parentElement;
+                        if (el && isVisible(el)) {
+                            const clickable = el.closest('button, [role="button"], [role="combobox"], [aria-haspopup], .mat-mdc-button, .mat-mdc-menu-trigger');
+                            if (clickable) {
+                                modelBtn = clickable;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (modelBtn) {
+                const currentTxt = (modelBtn.textContent || '').replace(/[\\s\\u00A0]+/g, ' ').toLowerCase();
+                const isTargetFlash = tier === 'flash' || tier === 'fast';
+                const isTargetPro = tier === 'pro' || tier === 'advanced';
+                const isTargetThinking = tier === 'thinking';
+                
+                let needsSwitch = false;
+                if (isTargetFlash && !currentTxt.includes('flash') && !currentTxt.includes('fast')) {
+                    if (currentTxt !== 'gemini') needsSwitch = true;
+                }
+                if (isTargetPro && !currentTxt.includes('advanced') && !currentTxt.includes('pro')) needsSwitch = true;
+                if (isTargetThinking && !currentTxt.includes('thinking')) needsSwitch = true;
+                
+                if (needsSwitch) {
+                    console.log(`[KimBridge] Switching Gemini Model Tier to ${tier}`);
+                    modelBtn.click();
+                    await new Promise(r => setTimeout(r, 700));
+                    
+                    let targetClicked = false;
+                    const targetTerms = isTargetThinking ? ['thinking'] : (isTargetFlash ? ['flash', 'fast', 'gemini'] : ['advanced', 'pro']);
+                    
+                    const overlays = document.querySelectorAll('.cdk-overlay-container, [role="menu"], [role="listbox"], [role="dialog"]');
+                    const menuRoot = Array.from(overlays).find(o => isVisible(o)) || document.body;
+                    
+                    const walker2 = document.createTreeWalker(menuRoot, NodeFilter.SHOW_TEXT, null, false);
+                    let targetNode = null;
+                    while (walker2.nextNode()) {
+                        const node = walker2.currentNode;
+                        const txt = (node.textContent || '').replace(/[\\s\\u00A0]+/g, ' ').toLowerCase();
+                        if (targetTerms.some(t => txt.includes(t)) && !txt.includes('upgrade') && !txt.includes('learn')) {
+                            if (isTargetFlash && (txt.includes('advanced') || txt.includes('pro') || txt.includes('thinking'))) continue;
+                            const el = node.parentElement;
+                            if (el && isVisible(el)) {
+                                targetNode = el;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (targetNode) {
+                        const clickable = targetNode.closest('button, [role="button"], [role="menuitem"], [role="option"], a, li, mat-option') || targetNode;
+                        clickable.click();
+                        targetClicked = true;
+                        await new Promise(r => setTimeout(r, 1200));
+                    }
+
+                    if (!targetClicked) {
+                        console.warn(`[KimBridge] Failed to find target Gemini model '${tier}' in menu`);
+                        document.body.click();
+                        await new Promise(r => setTimeout(r, 200));
+                    }
+                } else {
+                    console.log(`[KimBridge] Gemini Model already correct (${tier})`);
+                }
+            } else {
+                console.warn('[KimBridge] Gemini Model selector button not found');
+            }
+        };
+        await selectGeminiPro();
+        }
+      }
+
       // 1. Find input (use shadow-DOM-aware finder for Gemini)
       const inputEl = (siteKey === 'gemini' ? findGeminiInput() : null) || findElement(cfg.input_selectors, { visible: true });
       if (!inputEl) {
@@ -1913,12 +2109,20 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       let responseText = '';
       let lastTextLength = 0;
       let idleCount = 0;
+      let sawNewResponse = false;
 
       while (Date.now() < hardDeadlineAt) {
         await new Promise(r => setTimeout(r, POLL_MS));
         if (isSuperseded()) { console.log('[KimBridge] send superseded during response wait, bailing'); ipcEmit({ ok: false, event: 'error', req_id: reqId, error: 'Request superseded by newer send', site: siteKey }); return; }
 
         const latestText = getLatestResponseText(cfg, siteKey) || '';
+        const latestCount = countResponseNodes(cfg, siteKey);
+        if (
+          latestCount > baselineResponseCount
+          || (latestText && latestText !== baselineResponseText)
+        ) {
+          sawNewResponse = true;
+        }
         reportProgress(latestText);
         if (completionHash && latestText.includes(completionHash)) {
           responseText = latestText.replace(completionHash, '').trim();
@@ -1933,7 +2137,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
         }
 
         if (latestText && latestText.length > 0 && !isAnyStopVisible(cfg)) {
-          if (idleCount >= 10) { // 3 seconds of no text growth
+          if (sawNewResponse && idleCount >= 10) { // 3 seconds of no text growth
             console.log('[KimBridge] stop button gone and text idle. Falling back to latest text.');
             responseText = latestText;
             break;
@@ -1944,12 +2148,16 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
       if (!responseText) {
         // Last-ditch: try to grab whatever text is on the page
         const lastTry = getLatestResponseText(cfg, siteKey) || '';
+        const lastTryCount = countResponseNodes(cfg, siteKey);
+        const hasNewTurn =
+          lastTryCount > baselineResponseCount
+          || (lastTry && lastTry !== baselineResponseText);
         if (completionHash && lastTry.includes(completionHash)) {
           responseText = lastTry.replace(completionHash, '').trim();
-        } else if (lastTry.length > 0) {
+        } else if (lastTry.length > 0 && hasNewTurn) {
           responseText = lastTry;
         } else {
-          throw new Error(`Timed out waiting for completion hash in response (${HARD_TIMEOUT}ms)`);
+          throw new Error(`Timed out waiting for completion hash in response (${HARD_TIMEOUT}ms); no new response turn detected`);
         }
       }
 
@@ -1998,7 +2206,7 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
 
   // ── Public API ─────────────────────────────────────────────────────────
   window.__kimBridge = {
-    _v: 9,
+    _v: 10,
     _lastHash: null, // Tracks the completion hash of the most recent request
     _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
     send,
@@ -2019,6 +2227,20 @@ const PERSISTENT_BRIDGE_JS: &str = r#"
 fn open_browser_signin_window_impl(
     url: &str,
     provider_name: Option<String>,
+    app_handle: &tauri::AppHandle,
+) -> Result<String, String> {
+    open_browser_signin_window_with_visibility(url, provider_name, true, app_handle)
+}
+
+/// Underlying implementation that lets callers create the window in a hidden
+/// offscreen state. Used by `restore_browser_for_session` (we want the webview
+/// alive so cookies/session URL hydrate, but the user should not see a popup
+/// appear every time they click a chat in the sidebar) and by the auth-probe
+/// path (we want to silently fetch /api/auth/session in the background).
+fn open_browser_signin_window_with_visibility(
+    url: &str,
+    provider_name: Option<String>,
+    initially_visible: bool,
     app_handle: &tauri::AppHandle,
 ) -> Result<String, String> {
     let trimmed = url.trim();
@@ -2046,6 +2268,14 @@ fn open_browser_signin_window_impl(
 
         let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
         let _ = existing.eval(format!("window.location.href = {};", js_url));
+        // Preserve current visibility: if the caller wants invisible and the
+        // window is currently shown, hide it; if visible and currently hidden,
+        // bring it back into view.
+        if initially_visible && is_browser_window_offscreen(&existing) {
+            show_browser_window_impl(app_handle);
+        } else if !initially_visible && !is_browser_window_offscreen(&existing) {
+            hide_browser_window_offscreen(&existing);
+        }
         return Ok("Navigated existing Kim browser window".to_string());
     }
 
@@ -2068,10 +2298,17 @@ fn open_browser_signin_window_impl(
     .title(title)
     .inner_size(1280.0, 860.0)
     .resizable(true)
-    .visible(true) // Open visible + centered so the sign-in page is reachable.
+    .visible(initially_visible)
     .initialization_script(PERSISTENT_BRIDGE_JS)
     .build()
     .map_err(|e| format!("Failed to open Kim browser window: {}", e))?;
+
+    // If we built it invisible, immediately move it offscreen so that later
+    // calls to `is_browser_window_offscreen` recognise it as hidden and so the
+    // page still has a real viewport for layout (required for the bridge JS).
+    if !initially_visible {
+        hide_browser_window_offscreen(&window);
+    }
 
     let window_for_close = window.clone();
     let app_for_close = app_handle.clone();
@@ -2308,6 +2545,7 @@ fn build_bridge_complete_script(
     callback_url: &str,
     callback_token: &str,
     completion_hash: Option<&str>,
+    model_tier: Option<&str>,
 ) -> Result<String, String> {
     let site_json = serde_json::to_string(site).map_err(|e| e.to_string())?;
     let prompt_json = serde_json::to_string(prompt).map_err(|e| e.to_string())?;
@@ -2327,6 +2565,7 @@ fn build_bridge_complete_script(
   const __kimCallbackUrl = {callback_url};
   const __kimCallbackToken = {callback_token};
   const __kimCompletionHash = {hash};
+  window.__kimModelTier = {tier};
     let __kimFinished = false;
     let __kimWatchdog = null;
 "#,
@@ -2336,7 +2575,8 @@ fn build_bridge_complete_script(
         attachments=attachments_json,
         callback_url=callback_url_json,
         callback_token=callback_token_json,
-        hash=hash_json
+        hash=hash_json,
+        tier=serde_json::to_string(&model_tier).unwrap_or_else(|_| "null".to_string())
     );
 
     let body = r#"
@@ -3029,6 +3269,102 @@ fn build_bridge_complete_script(
     }
     inputEl.focus();
 
+        if (siteKey === 'gemini') {
+            const rawTier = (window.__kimModelTier == null ? '' : String(window.__kimModelTier)).trim().toLowerCase();
+            const tier = rawTier === 'advanced' ? 'pro' : (rawTier === 'fast' ? 'flash' : rawTier);
+            const hasExplicitTier = tier === 'flash' || tier === 'pro' || tier === 'thinking';
+            if (!hasExplicitTier) {
+                __kimDbg('H1', 'Gemini model auto-switch skipped (no explicit model tier)');
+            } else {
+            const selectGeminiPro = async () => {
+                let modelBtn = null;
+                const walker1 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+                while (walker1.nextNode()) {
+                    const node = walker1.currentNode;
+                    const txt = normalizeText(node.textContent).toLowerCase().trim();
+                    const words = txt.split(/\s+/);
+                    
+                    if (words.includes('gemini') || words.includes('flash') || words.includes('fast') || words.includes('pro') || words.includes('advanced') || words.includes('thinking')) {
+                        if (!txt.includes('upgrade') && !txt.includes('try') && !txt.includes('learn') && !txt.includes('help') && !txt.includes('chat')) {
+                            const el = node.parentElement;
+                            if (el && isVisible(el)) {
+                                const clickable = el.closest('button, [role="button"], [role="combobox"], [aria-haspopup], .mat-mdc-button, .mat-mdc-menu-trigger');
+                                if (clickable) {
+                                    modelBtn = clickable;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if (modelBtn) {
+                    const currentTxt = normalizeText(modelBtn.textContent || '').toLowerCase();
+                    const isTargetFlash = tier === 'flash' || tier === 'fast';
+                    const isTargetPro = tier === 'pro' || tier === 'advanced';
+                    const isTargetThinking = tier === 'thinking';
+                    
+                    let needsSwitch = false;
+                    if (isTargetFlash && !currentTxt.includes('flash') && !currentTxt.includes('fast')) {
+                        // If it's just 'gemini', it's likely flash.
+                        if (currentTxt !== 'gemini') needsSwitch = true;
+                    }
+                    if (isTargetPro && !currentTxt.includes('advanced') && !currentTxt.includes('pro')) needsSwitch = true;
+                    if (isTargetThinking && !currentTxt.includes('thinking')) needsSwitch = true;
+                    
+                    if (needsSwitch) {
+                        __kimDbg('H1', 'Switching Gemini Model Tier', { current: currentTxt, target: tier });
+                        modelBtn.click();
+                        await sleep(700);
+                        
+                        let targetClicked = false;
+                        // For Flash, if "fast" or "flash" is missing, clicking the basic "gemini" option is correct
+                        const targetTerms = isTargetThinking ? ['thinking'] : (isTargetFlash ? ['flash', 'fast', 'gemini'] : ['advanced', 'pro']);
+                        
+                        // Search overlays first (dropdown menus usually attach to body end or cdk-overlay)
+                        const overlays = document.querySelectorAll('.cdk-overlay-container, [role="menu"], [role="listbox"], [role="dialog"]');
+                        const menuRoot = Array.from(overlays).find(o => isVisible(o)) || document.body;
+                        
+                        const walker2 = document.createTreeWalker(menuRoot, NodeFilter.SHOW_TEXT, null, false);
+                        let targetNode = null;
+                        while (walker2.nextNode()) {
+                            const node = walker2.currentNode;
+                            const txt = normalizeText(node.textContent).toLowerCase();
+                            if (targetTerms.some(t => txt.includes(t)) && !txt.includes('upgrade') && !txt.includes('learn')) {
+                                // For flash targeting "gemini", avoid matching "gemini advanced"
+                                if (isTargetFlash && (txt.includes('advanced') || txt.includes('pro') || txt.includes('thinking'))) continue;
+                                
+                                const el = node.parentElement;
+                                if (el && isVisible(el)) {
+                                    targetNode = el;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if (targetNode) {
+                            const clickable = targetNode.closest('button, [role="button"], [role="menuitem"], [role="option"], a, li, mat-option') || targetNode;
+                            clickable.click();
+                            targetClicked = true;
+                            await sleep(1200); // wait for page to reload/react
+                        }
+
+                        if (!targetClicked) {
+                            __kimDbg('H1', 'Failed to find target Gemini model in menu', { target: tier });
+                            document.body.click(); // Close menu
+                            await sleep(200);
+                        }
+                    } else {
+                        __kimDbg('H1', 'Gemini Model already correct', { current: currentTxt, target: tier });
+                    }
+                } else {
+                    __kimDbg('H1', 'Gemini Model selector button not found');
+                }
+            };
+            await selectGeminiPro();
+            }
+        }
+
         const uploadedCount = await injectAttachments(cfg, inputEl);
 
         const injectedLen = await injectPromptText(inputEl, __kimPrompt);
@@ -3379,6 +3715,7 @@ fn run_bridge_completion_once(
     callback_url: &str,
     callback_token: &str,
     completion_hash: Option<&str>,
+    model_tier: Option<&str>,
 ) -> Result<BridgeCompleteResponse, String> {
     let req_id = format!(
         "r-{}-{}",
@@ -3419,10 +3756,12 @@ fn run_bridge_completion_once(
     let attachments_json = serde_json::to_string(attachments).map_err(|e| e.to_string())?;
     let hash_json = serde_json::to_string(&completion_hash).unwrap_or_else(|_| "null".to_string());
 
+    let tier_json = serde_json::to_string(&model_tier).unwrap_or_else(|_| "null".to_string());
+
     let bridge_call = format!(
         r#"(() => {{
             if (window.__kimBridge && window.__kimBridge._v >= 2) {{
-                window.__kimBridge.send({prompt}, {req_id}, {site}, {attachments}, null, {hash});
+                window.__kimBridge.send({prompt}, {req_id}, {site}, {attachments}, null, {hash}, {tier});
             }} else {{
                 // Persistent bridge not installed — signal to fall back
                 document.title = '__KIMBRIDGE_NO_PERSISTENT__';
@@ -3433,6 +3772,7 @@ fn run_bridge_completion_once(
         site = site_json,
         attachments = attachments_json,
         hash = hash_json,
+        tier = tier_json,
     );
 
     agent_debug_log(
@@ -3471,7 +3811,7 @@ fn run_bridge_completion_once(
         }
 
         let script = build_bridge_complete_script(
-            site, prompt, &req_id, attachments, callback_url, callback_token, completion_hash,
+            site, prompt, &req_id, attachments, callback_url, callback_token, completion_hash, model_tier,
         ).map_err(|e| format!("Script build failed: {}", e))?;
 
         if let Err(e) = window.eval(&script) {
@@ -3842,6 +4182,7 @@ fn handle_webview_bridge_request(
                 &callback_url,
                 token.as_str(),
                 parsed.completion_hash.as_deref(),
+                parsed.model_tier.as_deref(),
             );
 
             let needs_nav_retry = match &completion {
@@ -4021,11 +4362,12 @@ fn handle_webview_bridge_request(
             let site_json = serde_json::to_string(&site).unwrap_or_else(|_| "\"\"".to_string());
             let attachments_json = serde_json::to_string(&attachments).unwrap_or_else(|_| "\"[]\"".to_string());
             let hash_json = serde_json::to_string(&parsed.completion_hash).unwrap_or_else(|_| "null".to_string());
+            let tier_json = serde_json::to_string(&parsed.model_tier).unwrap_or_else(|_| "null".to_string());
 
             let bridge_call = format!(
                 r#"(() => {{
                     if (window.__kimBridge && window.__kimBridge._v >= 2) {{
-                        window.__kimBridge.send({prompt}, {req_id}, {site}, {attachments}, null, {hash});
+                        window.__kimBridge.send({prompt}, {req_id}, {site}, {attachments}, null, {hash}, {tier});
                     }} else {{
                         document.title = '__KIMBRIDGE_NO_PERSISTENT__';
                     }}
@@ -4035,6 +4377,7 @@ fn handle_webview_bridge_request(
                 site = site_json,
                 attachments = attachments_json,
                 hash = hash_json,
+                tier = tier_json,
             );
 
             // The window stays offscreen (1x1 at -10000,-10000) during
@@ -4241,6 +4584,8 @@ fn handle_webview_bridge_request(
                 #[serde(default)]
                 browser_last_site: Option<String>,
                 #[serde(default)]
+                last_llm_provider: Option<String>,
+                #[serde(default)]
                 kim_dir: Option<String>,
                 #[serde(default)]
                 claw_dir: Option<String>,
@@ -4269,28 +4614,17 @@ fn handle_webview_bridge_request(
             };
             let mut meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id).unwrap_or_default();
 
-            if let Some(last) = parsed.browser_last_site.as_deref().map(normalize_site).filter(|s| !s.is_empty()) {
-                meta.browser_last_site = Some(last);
+            if let Err(e) = apply_browser_meta_writes(
+                &mut meta,
+                parsed.browser_last_site.clone(),
+                parsed.site.clone(),
+                parsed.url.clone(),
+                parsed.last_llm_provider.clone(),
+            ) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                return;
             }
 
-            if let (Some(site_raw), Some(url_raw)) = (parsed.site.as_deref(), parsed.url.as_deref()) {
-                let site_norm = normalize_site(site_raw);
-                if browser_url_is_bad_for_commit(url_raw, &site_norm) {
-                    respond_json(
-                        request,
-                        400,
-                        serde_json::json!({
-                            "ok": false,
-                            "error": format!("Refusing to store non-conversation/login URL for {}.", site_norm),
-                        }),
-                    );
-                    return;
-                }
-                meta.browser_threads.insert(site_norm.clone(), url_raw.trim().to_string());
-                meta.browser_last_site = Some(site_norm);
-            }
-
-            meta.browser_threads_updated_at_ms = Some(now_ms());
             match write_browser_session_meta_to_dir(&date_dir, &parsed.session_id, &meta) {
                 Ok(()) => respond_json(request, 200, serde_json::json!({"ok": true, "meta": meta})),
                 Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": e})),
@@ -4429,7 +4763,7 @@ fn handle_webview_bridge_request(
                 .unwrap_or_else(|| "claude".to_string());
 
             let mut restored = false;
-            let mut reason = "fallback_home".to_string();
+            let reason;
             let target = if let Some(saved) = meta.browser_threads.get(&site) {
                 if browser_url_allowed_for_restore(saved, &site) {
                     restored = true;
@@ -4445,7 +4779,8 @@ fn handle_webview_bridge_request(
             };
 
             let provider_name = Some(format!("{} (session)", capitalize(&site)));
-            match open_browser_signin_window_impl(&target, provider_name, &app_handle) {
+            // Match the Tauri-command path: chat-select restores happen invisibly.
+            match open_browser_signin_window_with_visibility(&target, provider_name, false, &app_handle) {
                 Ok(_) => {
                     let message = if restored {
                         "Restored the saved browser conversation for this session."
@@ -4576,6 +4911,25 @@ fn handle_webview_bridge_request(
                 cmd.env("KIM_BROWSER_RESTORE_STATUS", restore_status);
             }
 
+            if provider.trim().eq_ignore_ascii_case("gemini") {
+                let google_env = match tauri::async_runtime::block_on(google_oauth::google_oauth_env_for_agent()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        respond_json(request, 400, serde_json::json!({
+                            "ok": false,
+                            "error": format!(
+                                "Google for Kim is not connected. Open Settings → Account → Google for Kim (API), then Continue with Google. {}",
+                                err
+                            ),
+                        }));
+                        return;
+                    }
+                };
+                for (key, value) in google_env.as_env_pairs() {
+                    cmd.env(key, value);
+                }
+            }
+
             match cmd.spawn() {
                 Ok(mut child) => {
                     let child_pid = child.id();
@@ -4622,6 +4976,16 @@ fn handle_webview_bridge_request(
                         }
                         if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
                             *guard = None;
+                        }
+                        if let Some(cancel_win) = app_for_wait.get_webview_window("cancel-widget") {
+                            let _ = cancel_win.close();
+                        }
+                        if let Some(flash_win) = app_for_wait.get_webview_window("screenshot-flash") {
+                            let _ = flash_win.close();
+                        }
+                        if let Some(main_win) = app_for_wait.get_webview_window("main") {
+                            let _ = main_win.show();
+                            let _ = main_win.set_focus();
                         }
                         let _ = app_for_wait.emit("kim-agent-done", success);
                     });
@@ -5400,10 +5764,8 @@ async fn summarize_session(
             if let Some(ref t) = text {
                 let clean = t.trim();
                 // Skip tool result pseudo-user messages
-                if !clean.starts_with("[Tool result:") && !clean.is_empty() {
-                    if first_user_text.is_none() {
-                        first_user_text = Some(clean.strip_prefix("Task: ").unwrap_or(clean).to_string());
-                    }
+                if !clean.starts_with("[Tool result:") && !clean.is_empty() && first_user_text.is_none() {
+                    first_user_text = Some(clean.strip_prefix("Task: ").unwrap_or(clean).to_string());
                 }
             }
         } else if role == "assistant" {
@@ -5878,6 +6240,7 @@ async fn set_task_active_mode(app_handle: tauri::AppHandle, active: bool) -> Res
             .always_on_top(true)
             .decorations(false)
             .transparent(true)
+            .shadow(false)
             .build()
             .map_err(|e| format!("Failed to build cancel widget: {}", e))?;
 
@@ -6005,6 +6368,7 @@ async fn session_browser_meta_write(
     site: Option<String>,
     url: Option<String>,
     browser_last_site: Option<String>,
+    last_llm_provider: Option<String>,
     kim_dir: Option<String>,
     claw_dir: Option<String>,
 ) -> Result<BrowserSessionMeta, String> {
@@ -6014,20 +6378,13 @@ async fn session_browser_meta_write(
     let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
     let mut meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
 
-    if let Some(last) = browser_last_site.as_deref().map(normalize_site).filter(|s| !s.is_empty()) {
-        meta.browser_last_site = Some(last);
-    }
-
-    if let (Some(site_raw), Some(url_raw)) = (site.as_deref(), url.as_deref()) {
-        let site_norm = normalize_site(site_raw);
-        if browser_url_is_bad_for_commit(url_raw, &site_norm) {
-            return Err(format!("Refusing to store non-conversation/login URL for {}: {}", site_norm, url_raw));
-        }
-        meta.browser_threads.insert(site_norm.clone(), url_raw.trim().to_string());
-        meta.browser_last_site = Some(site_norm);
-    }
-
-    meta.browser_threads_updated_at_ms = Some(now_ms());
+    apply_browser_meta_writes(
+        &mut meta,
+        browser_last_site,
+        site,
+        url,
+        last_llm_provider,
+    )?;
     write_browser_session_meta_to_dir(&date_dir, &session_id, &meta)?;
     Ok(meta)
 }
@@ -6076,6 +6433,7 @@ async fn session_browser_url_commit(
         Some(site),
         Some(current_url),
         None,
+        None,
         kim_dir,
         claw_dir,
     ).await
@@ -6123,7 +6481,12 @@ async fn restore_browser_for_session(
     };
 
     let provider_name = Some(format!("{} (session)", capitalize(&site)));
-    open_browser_signin_window_impl(&target, provider_name, &app_handle)?;
+    // Restore the webview offscreen — selecting a chat in the sidebar should
+    // never pop up a Chrome window. The webview is still created (or its URL
+    // updated) so cookies hydrate and the bridge is ready when the user sends
+    // their first message, but it stays invisible until the user explicitly
+    // clicks the "Sign in" / "Show provider" affordance.
+    open_browser_signin_window_with_visibility(&target, provider_name, false, &app_handle)?;
 
     let message = if restored {
         Some("Restored the saved browser conversation for this session.".to_string())
@@ -6140,6 +6503,360 @@ async fn restore_browser_for_session(
         reason,
         message,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Provider auth: status probe, sign-in popup, sign-out
+//
+// These commands let the React side display a "Signed in as X" indicator
+// below the chat composer and trigger an OAuth-style sign-in flow that uses
+// the real provider page underneath. Auth state is sourced from the actual
+// provider cookies inside the kim-browser-signin webview, so it survives app
+// restarts and naturally reflects expiry / multi-account changes.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ProviderAuthStatus {
+    pub provider: String,
+    pub signed_in: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn provider_origin(site: &str) -> Option<&'static str> {
+    match site {
+        "chatgpt" | "openai" => Some("https://chatgpt.com"),
+        "claude" | "anthropic" => Some("https://claude.ai"),
+        "gemini" | "google" => Some("https://gemini.google.com"),
+        "deepseek" => Some("https://chat.deepseek.com"),
+        "grok" => Some("https://grok.com"),
+        _ => None,
+    }
+}
+
+fn provider_login_url(site: &str) -> Option<String> {
+    match site {
+        "chatgpt" | "openai" => Some("https://chatgpt.com/auth/login".to_string()),
+        "claude" | "anthropic" => Some("https://claude.ai/login".to_string()),
+        "gemini" | "google" => Some(
+            "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgemini.google.com%2Fapp"
+                .to_string(),
+        ),
+        "deepseek" => Some("https://chat.deepseek.com/sign_in".to_string()),
+        "grok" => Some("https://grok.com/sign-in".to_string()),
+        _ => None,
+    }
+}
+
+fn build_auth_probe_js(site: &str, req_id: &str, base_url: &str, token: &str) -> String {
+    let endpoint = match site {
+        "chatgpt" | "openai" => "/api/auth/session",
+        "claude" | "anthropic" => "/api/organizations",
+        "gemini" | "google" => "__GEMINI_DOM__",
+        _ => "__UNKNOWN__",
+    };
+    let req_id_js = serde_json::to_string(req_id).unwrap_or_else(|_| "\"\"".to_string());
+    let base_js = serde_json::to_string(base_url).unwrap_or_else(|_| "\"\"".to_string());
+    let token_js = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
+    let site_js = serde_json::to_string(site).unwrap_or_else(|_| "\"\"".to_string());
+    let endpoint_js = serde_json::to_string(endpoint).unwrap_or_else(|_| "\"\"".to_string());
+
+    format!(
+        r#"(async () => {{
+    const reqId = {req_id_js};
+    const baseUrl = {base_js};
+    const token = {token_js};
+    const site = {site_js};
+    const endpoint = {endpoint_js};
+    async function callback(payload) {{
+        try {{
+            await fetch(baseUrl + '/v1/callback', {{
+                method: 'POST',
+                headers: {{ 'X-Kim-Token': token, 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ req_id: reqId, payload: payload }}),
+            }});
+        }} catch (e) {{ console.error('[KimAuth] callback failed', e); }}
+    }}
+    try {{
+        let info = {{ provider: site, signed_in: false }};
+        if (endpoint === '__GEMINI_DOM__') {{
+            const link = document.querySelector('a[aria-label*="Google Account"]')
+                          || document.querySelector('a[aria-label*="compte Google"]')
+                          || document.querySelector('a[aria-label*="Google-Konto"]');
+            if (link) {{
+                const label = link.getAttribute('aria-label') || '';
+                const emailMatch = label.match(/[\w.+-]+@[\w.-]+/);
+                const nameMatch = label.match(/(?:Account|compte|Konto)[^:]*:\s*([^()\n,]+?)(?:\s*\(|,|$)/i);
+                info = {{
+                    provider: 'gemini',
+                    signed_in: true,
+                    email: emailMatch ? emailMatch[0] : null,
+                    name: nameMatch ? nameMatch[1].trim() : null,
+                }};
+            }}
+        }} else if (endpoint !== '__UNKNOWN__') {{
+            const resp = await fetch(endpoint, {{ credentials: 'include', cache: 'no-store' }});
+            const text = await resp.text();
+            if (resp.ok) {{
+                try {{
+                    const data = JSON.parse(text);
+                    if (site === 'chatgpt' || site === 'openai') {{
+                        if (data && data.user && data.user.email) {{
+                            info = {{
+                                provider: 'chatgpt',
+                                signed_in: true,
+                                email: data.user.email,
+                                name: data.user.name || null,
+                                avatar: data.user.image || data.user.picture || null,
+                            }};
+                        }}
+                    }} else if (site === 'claude' || site === 'anthropic') {{
+                        if (Array.isArray(data) && data.length > 0) {{
+                            const org = data[0] || {{}};
+                            info = {{
+                                provider: 'claude',
+                                signed_in: true,
+                                email: org.email_address || org.billing_email || null,
+                                name: org.name || null,
+                            }};
+                        }}
+                    }}
+                }} catch (parseErr) {{ /* response was HTML (sign-in page) */ }}
+            }}
+        }}
+        await callback({{ ok: true, response: JSON.stringify(info) }});
+    }} catch (e) {{
+        await callback({{ ok: false, error: String(e) }});
+    }}
+}})();"#
+    )
+}
+
+fn parse_auth_response(site: &str, result: &BridgeCompleteResponse) -> ProviderAuthStatus {
+    if !result.ok {
+        return ProviderAuthStatus {
+            provider: site.to_string(),
+            signed_in: false,
+            email: None,
+            name: None,
+            avatar: None,
+            error: result.error.clone(),
+        };
+    }
+    let response_str = result.response.as_deref().unwrap_or("{}");
+    match serde_json::from_str::<serde_json::Value>(response_str) {
+        Ok(v) => ProviderAuthStatus {
+            provider: v
+                .get("provider")
+                .and_then(|x| x.as_str())
+                .unwrap_or(site)
+                .to_string(),
+            signed_in: v.get("signed_in").and_then(|x| x.as_bool()).unwrap_or(false),
+            email: v.get("email").and_then(|x| x.as_str()).map(String::from),
+            name: v.get("name").and_then(|x| x.as_str()).map(String::from),
+            avatar: v.get("avatar").and_then(|x| x.as_str()).map(String::from),
+            error: None,
+        },
+        Err(e) => ProviderAuthStatus {
+            provider: site.to_string(),
+            signed_in: false,
+            email: None,
+            name: None,
+            avatar: None,
+            error: Some(format!("parse: {}", e)),
+        },
+    }
+}
+
+#[tauri::command]
+async fn provider_check_auth(
+    provider: String,
+    app_handle: tauri::AppHandle,
+) -> Result<ProviderAuthStatus, String> {
+    let site = normalize_site(&provider);
+    let origin = provider_origin(&site)
+        .ok_or_else(|| format!("Unsupported provider: {}", provider))?;
+
+    let cfg = WEBVIEW_BRIDGE_CFG
+        .get()
+        .ok_or_else(|| "Bridge server not initialised yet.".to_string())?
+        .clone();
+
+    // Ensure the kim-browser-signin webview exists and is on the provider's
+    // origin (so document.cookie is the right jar for the fetch). Stay hidden.
+    let webview = match app_handle.get_webview_window("kim-browser-signin") {
+        Some(w) => {
+            let current = w.url().map(|u| u.to_string()).unwrap_or_default();
+            if !current.starts_with(origin) {
+                let js_url = serde_json::to_string(origin).map_err(|e| e.to_string())?;
+                let _ = w.eval(format!("window.location.href = {};", js_url));
+                tokio::time::sleep(Duration::from_millis(1800)).await;
+            }
+            w
+        }
+        None => {
+            open_browser_signin_window_with_visibility(
+                origin,
+                Some(site.clone()),
+                false,
+                &app_handle,
+            )?;
+            // Cold-creating a webview + first authenticated fetch takes
+            // longer than navigating an existing one. 2.5s is conservative;
+            // the probe still polls for up to 12s.
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            app_handle
+                .get_webview_window("kim-browser-signin")
+                .ok_or_else(|| "Failed to create provider webview".to_string())?
+        }
+    };
+
+    let req_id = format!(
+        "auth-{}-{}",
+        site,
+        WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let probe_js = build_auth_probe_js(&site, &req_id, &cfg.base_url, &cfg.token);
+    webview
+        .eval(&probe_js)
+        .map_err(|e| format!("eval failed: {}", e))?;
+
+    let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(mut guard) = store.lock() {
+            if let Some(result) = guard.remove(&req_id) {
+                drop(guard);
+                return Ok(parse_auth_response(&site, &result));
+            }
+        }
+    }
+    // Timed out: report not-signed-in with an error so the UI shows the
+    // re-sign-in affordance rather than blocking forever.
+    Ok(ProviderAuthStatus {
+        provider: site,
+        signed_in: false,
+        email: None,
+        name: None,
+        avatar: None,
+        error: Some("auth probe timed out".to_string()),
+    })
+}
+
+fn post_signin_url_patterns(site: &str) -> Vec<&'static str> {
+    match site {
+        "chatgpt" | "openai" => vec!["chatgpt.com/c/", "chatgpt.com/?", "chatgpt.com/g/"],
+        "claude" | "anthropic" => vec!["claude.ai/chat", "claude.ai/new", "claude.ai/chats", "claude.ai/projects"],
+        "gemini" | "google" => vec!["gemini.google.com/app"],
+        "deepseek" => vec!["chat.deepseek.com/a", "chat.deepseek.com/?"],
+        "grok" => vec!["grok.com/chat", "grok.com/?"],
+        _ => vec![],
+    }
+}
+
+fn spawn_post_signin_watcher(site: String, app_handle: tauri::AppHandle) {
+    let label = "kim-browser-signin";
+    let Some(window) = app_handle.get_webview_window(label) else {
+        return;
+    };
+    let patterns: Vec<String> = post_signin_url_patterns(&site)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if patterns.is_empty() {
+        return;
+    }
+
+    let app = app_handle.clone();
+    let window_clone = window.clone();
+    let site_owned = site.clone();
+
+    // Tauri 2 doesn't expose a stable per-window navigation listener on every
+    // backend (WKWebView vs WebView2 differ), so polling window.url() every
+    // 600ms is the portable approximation. The moment we see a post-login URL,
+    // hide the window, refocus main, and emit `kim-auth-changed` so the React
+    // side re-probes auth status.
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(300);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            if start.elapsed() > timeout {
+                return;
+            }
+            let url_str = window_clone
+                .url()
+                .map(|u| u.to_string())
+                .unwrap_or_default();
+            if patterns.iter().any(|p| url_str.contains(p)) {
+                hide_browser_window_offscreen(&window_clone);
+                if let Some(main_win) = app.get_webview_window("main") {
+                    let _ = main_win.show();
+                    let _ = main_win.set_focus();
+                }
+                let _ = app.emit("kim-auth-changed", site_owned.clone());
+                return;
+            }
+        }
+    });
+}
+
+#[tauri::command]
+async fn provider_signin(
+    provider: String,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let site = normalize_site(&provider);
+    let login_url = provider_login_url(&site)
+        .ok_or_else(|| format!("No login URL configured for provider: {}", provider))?;
+
+    open_browser_signin_window_with_visibility(
+        &login_url,
+        Some(site.clone()),
+        true,
+        &app_handle,
+    )?;
+    // Force-show even if the window already existed and was hidden.
+    show_browser_window_impl(&app_handle);
+
+    spawn_post_signin_watcher(site.clone(), app_handle.clone());
+    Ok(format!("Opened sign-in for {}", site))
+}
+
+#[tauri::command]
+async fn provider_signout(
+    provider: String,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let site = normalize_site(&provider);
+    let origin = provider_origin(&site)
+        .ok_or_else(|| format!("Unsupported provider: {}", provider))?;
+
+    // Each provider has its own logout flow; navigating the webview to the
+    // logout endpoint causes the page to clear its auth cookies in-place.
+    let logout_url = match site.as_str() {
+        "chatgpt" | "openai" => format!("{}/auth/logout", origin),
+        "claude" | "anthropic" => format!("{}/login?logout=true", origin),
+        "gemini" | "google" => "https://accounts.google.com/Logout".to_string(),
+        _ => format!("{}/logout", origin),
+    };
+
+    if let Some(window) = app_handle.get_webview_window("kim-browser-signin") {
+        let js = format!(
+            "window.location.href = {};",
+            serde_json::to_string(&logout_url).unwrap_or_else(|_| "\"about:blank\"".to_string())
+        );
+        let _ = window.eval(&js);
+    }
+
+    let _ = app_handle.emit("kim-auth-changed", site.clone());
+    Ok(format!("Signed out of {}", site))
 }
 
 // ---------------------------------------------------------------------------
@@ -6236,6 +6953,112 @@ fn read_env_file_var(kim_root: &Path, key: &str) -> Option<String> {
     None
 }
 
+fn read_first_env_file_var(kim_root: &Path, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| read_env_file_var(kim_root, key))
+}
+
+fn ollama_openai_base_url(base_url: Option<&str>) -> String {
+    let base = base_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("http://localhost:11434")
+        .trim_end_matches('/');
+    if base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{}/v1", base)
+    }
+}
+
+fn selected_ollama_claw_model(
+    mode: Option<&str>,
+    local_model: Option<&str>,
+    cloud_model: Option<&str>,
+) -> Result<String, String> {
+    let mode = mode.unwrap_or("cloud").trim().to_ascii_lowercase();
+    if mode == "local" {
+        let model = local_model.unwrap_or("").trim();
+        if model.is_empty() {
+            return Err("Pick an Ollama local model before running Claw with Ollama Local.".to_string());
+        }
+        return Ok(model.to_string());
+    }
+    Ok(cloud_model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("gpt-oss:120b-cloud")
+        .to_string())
+}
+
+fn configure_claw_direct_provider(
+    cmd: &mut tokio::process::Command,
+    provider_arg: &str,
+    kim_root: &Path,
+    ollama_base_url: Option<&str>,
+    ollama_mode: Option<&str>,
+    ollama_local_model: Option<&str>,
+    ollama_cloud_model: Option<&str>,
+) -> Result<String, String> {
+    let provider = provider_arg.trim().to_ascii_lowercase();
+    match provider.as_str() {
+        "ollama" => {
+            let model = selected_ollama_claw_model(ollama_mode, ollama_local_model, ollama_cloud_model)?;
+            cmd.arg("--model").arg(&model)
+                .env("OPENAI_BASE_URL", ollama_openai_base_url(ollama_base_url))
+                // Required by OpenAI-compatible clients; ignored by Ollama.
+                .env("OPENAI_API_KEY", "ollama");
+            Ok(format!("Ollama via local daemon ({model})"))
+        }
+        "openai" => {
+            let key = read_env_file_var(kim_root, "OPENAI_API_KEY")
+                .ok_or_else(|| "Claw with OpenAI needs OPENAI_API_KEY in the environment or Kim's .env.".to_string())?;
+            let model = read_first_env_file_var(kim_root, &["CLAW_OPENAI_MODEL", "OPENAI_MODEL"])
+                .unwrap_or_else(|| "openai/gpt-4o".to_string());
+            cmd.arg("--model").arg(&model)
+                .env("OPENAI_API_KEY", key);
+            if let Some(base) = read_env_file_var(kim_root, "OPENAI_BASE_URL") {
+                cmd.env("OPENAI_BASE_URL", base);
+            }
+            Ok(format!("OpenAI-compatible API ({model})"))
+        }
+        "deepseek" => {
+            let key = read_env_file_var(kim_root, "DEEPSEEK_API_KEY")
+                .ok_or_else(|| "Claw with DeepSeek needs DEEPSEEK_API_KEY in the environment or Kim's .env.".to_string())?;
+            let model = read_first_env_file_var(kim_root, &["CLAW_DEEPSEEK_MODEL", "DEEPSEEK_MODEL"])
+                .unwrap_or_else(|| "deepseek-chat".to_string());
+            let base = read_env_file_var(kim_root, "DEEPSEEK_BASE_URL")
+                .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
+            cmd.arg("--model").arg(&model)
+                .env("OPENAI_API_KEY", key)
+                .env("OPENAI_BASE_URL", base);
+            Ok(format!("DeepSeek API ({model})"))
+        }
+        "gemini" => {
+            let key = read_env_file_var(kim_root, "GOOGLE_API_KEY")
+                .ok_or_else(|| "Claw with Gemini direct API needs GOOGLE_API_KEY in the environment or Kim's .env. Kim's Google OAuth token is only wired into the Chat provider path.".to_string())?;
+            let model = read_first_env_file_var(kim_root, &["CLAW_GEMINI_MODEL", "GEMINI_MODEL"])
+                .unwrap_or_else(|| "gemini-2.0-flash".to_string());
+            let base = read_env_file_var(kim_root, "GEMINI_OPENAI_BASE_URL")
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta/openai".to_string());
+            cmd.arg("--model").arg(&model)
+                .env("OPENAI_API_KEY", key)
+                .env("OPENAI_BASE_URL", base);
+            Ok(format!("Gemini OpenAI-compatible API ({model})"))
+        }
+        _ => {
+            let key = read_first_env_file_var(kim_root, &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"])
+                .ok_or_else(|| "Claw needs an Anthropic API key for Claude direct mode. Add ANTHROPIC_API_KEY to Kim's .env, or switch the provider dropdown to Ollama/Browser.".to_string())?;
+            cmd.env("ANTHROPIC_API_KEY", key);
+            for key in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAW_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
+                if let Some(value) = read_env_file_var(kim_root, key) {
+                    cmd.env(key, value);
+                }
+            }
+            Ok("Claude direct API".to_string())
+        }
+    }
+}
+
 /// Locate the `claw` binary. Search order:
 /// 1. CLAW_BIN env var (explicit override)
 /// 2. <kim_root>/pythonExperimentTool/... (nested layout — pythonExperimentTool inside kim-pro)
@@ -6282,6 +7105,14 @@ async fn send_task(
     provider: Option<String>,
     project_root: Option<String>,
     resume_session_id: Option<String>,
+    google_authuser: Option<u32>,
+    // Forwarded as KIM_CONTEXT_BUDGET_TOKENS for orchestrator context meter.
+    context_budget_tokens: Option<u32>,
+    ollama_base_url: Option<String>,
+    ollama_mode: Option<String>,
+    ollama_local_model: Option<String>,
+    ollama_cloud_model: Option<String>,
+    ollama_context_limit_override: Option<u32>,
     app_handle: tauri::AppHandle,
     state: State<'_, TaskState>,
 ) -> Result<String, String> {
@@ -6324,12 +7155,12 @@ async fn send_task(
         kim_root.join("kim_sessions")
     };
 
-    // Default to the browser provider (no API key required) when the caller
-    // omits one or passes an empty string. Never silently fall through to a
-    // paid API key provider. Claw does its own provider/auth handling.
+    // Default to Ollama (no API key in Kim) when the caller omits a provider.
+    // The frontend normally sends an explicit provider, but keeping this
+    // fallback aligned with Settings avoids surprise Browser runs.
     let provider_arg = provider
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "browser".to_string());
+        .unwrap_or_else(|| "ollama".to_string());
     // Whether the user picked a browser-backed provider in the composer (e.g.
     // "browser:gemini"). For Code-tab tasks this routes Claw through Kim's
     // BrowserProvider via the file-bridge instead of calling Anthropic.
@@ -6343,8 +7174,6 @@ async fn send_task(
     let mut cmd = if is_claw {
         let claw_bin = find_claw_binary(&kim_root)
             .ok_or_else(|| "Claw binary not found. Build it with `cargo build --release` in pythonExperimentTool/claw-code/rust, or set CLAW_BIN to the binary path.".to_string())?;
-        let claw_key = read_env_file_var(&kim_root, "ANTHROPIC_API_KEY")
-            .or_else(|| read_env_file_var(&kim_root, "CLAUDE_API_KEY"));
 
         if is_browser_provider {
             // ── Browser-bridge mode ──────────────────────────────────────
@@ -6377,32 +7206,25 @@ async fn send_task(
             c
         } else {
             // ── Direct API mode ──────────────────────────────────────────
-            // Pre-flight: surface a readable error before invoking Claw if
-            // no Anthropic credentials are reachable. Otherwise Claw exits
-            // with a bare JSON error and the UI just shows "Agent Error".
-            if claw_key.as_deref().map(str::trim).unwrap_or("").is_empty() {
-                return Err(
-                    "Claw needs an Anthropic API key for direct-API mode. Add `ANTHROPIC_API_KEY=sk-ant-…` to your .env (Kim repo root) or switch the provider dropdown back to 'Browser' to run Claw through your logged-in browser session.".to_string()
-                );
-            }
-            let _ = app_handle.emit(
-                "kim-agent-output",
-                format!("[STATUS] Routing to Claw (direct Anthropic API): {}", claw_bin.display()),
-            );
             let mut c = Command::new(&claw_bin);
             c.arg("--output-format").arg("json")
-                .arg("prompt").arg(&task)
                 .current_dir(&target_root)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            if let Some(k) = claw_key { c.env("ANTHROPIC_API_KEY", k); }
-            // Forward optional helpers if present in .env or env so users can
-            // pin a model or proxy without re-launching Kim.
-            for k in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAW_MODEL", "CLAUDE_MODEL"] {
-                if let Some(v) = read_env_file_var(&kim_root, k) {
-                    c.env(k, v);
-                }
-            }
+            let route = configure_claw_direct_provider(
+                &mut c,
+                &provider_arg,
+                &kim_root,
+                ollama_base_url.as_deref(),
+                ollama_mode.as_deref(),
+                ollama_local_model.as_deref(),
+                ollama_cloud_model.as_deref(),
+            )?;
+            let _ = app_handle.emit(
+                "kim-agent-output",
+                format!("[STATUS] Routing unchanged task to Claw via {}: {}", route, claw_bin.display()),
+            );
+            c.arg("prompt").arg(&task);
             c
         }
     } else {
@@ -6446,6 +7268,18 @@ async fn send_task(
         cmd.env("KIM_BROWSER_RESTORE_STATUS", restore_status);
     }
 
+    if !is_claw && provider_arg.trim().eq_ignore_ascii_case("gemini") {
+        let google_env = google_oauth::google_oauth_env_for_agent().await.map_err(|err| {
+            format!(
+                "Google for Kim is not connected. Open Settings → Account → Google for Kim (API), then Continue with Google. {}",
+                err
+            )
+        })?;
+        for (key, value) in google_env.as_env_pairs() {
+            cmd.env(key, value);
+        }
+    }
+
     // Chrome CDP launch is needed whenever a browser provider is in play —
     // both for Kim's Chat-tab tasks and for Claw running in browser-bridge
     // mode (which calls into BrowserProvider via run_claw_bridge).
@@ -6484,6 +7318,39 @@ async fn send_task(
 
     if !is_claw {
         cmd.arg("--provider").arg(&provider_arg);
+    }
+
+    if !is_claw && provider_arg.trim().eq_ignore_ascii_case("ollama") {
+        if let Some(base_url) = ollama_base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            cmd.env("KIM_OLLAMA_BASE_URL", base_url);
+        }
+        if let Some(mode) = ollama_mode.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            cmd.env("KIM_OLLAMA_MODE", mode);
+        }
+        if let Some(model) = ollama_local_model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            cmd.env("KIM_OLLAMA_LOCAL_MODEL", model);
+        }
+        if let Some(model) = ollama_cloud_model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            cmd.env("KIM_OLLAMA_CLOUD_MODEL", model);
+        }
+        if let Some(limit) = ollama_context_limit_override.filter(|n| *n > 0) {
+            cmd.env("KIM_OLLAMA_CONTEXT_LIMIT_OVERRIDE", limit.to_string());
+        }
+    }
+
+    if let Some(idx) = google_authuser {
+        cmd.env("KIM_GEMINI_AUTHUSER", idx.to_string());
+    }
+
+    if !is_claw {
+        if let Some(budget) = context_budget_tokens.filter(|b| *b > 0) {
+            cmd.env("KIM_CONTEXT_BUDGET_TOKENS", budget.to_string());
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
     }
 
     let mut child = cmd
@@ -6547,6 +7414,11 @@ async fn send_task(
     }
     if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
         *guard = None;
+    }
+
+    let _ = set_task_active_mode(app_handle.clone(), false).await;
+    if let Some(flash_win) = app_handle.get_webview_window("screenshot-flash") {
+        let _ = flash_win.close();
     }
 
     if is_claw {
@@ -6872,6 +7744,20 @@ pub struct GoogleAccountEntry {
     pub authuser_index: u32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GoogleApiAccount {
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_reauth: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum GoogleAccountEntryCompat {
@@ -6938,6 +7824,9 @@ pub struct KimAccount {
     pub google_accounts: Vec<GoogleAccountEntry>,
     /// Active Google account email for Gemini browser sessions.
     pub google_active_account: Option<String>,
+    /// Official Gemini API OAuth connection metadata. Refresh token is not stored in account.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google_api_account: Option<GoogleApiAccount>,
 }
 
 fn account_dir() -> PathBuf {
@@ -6977,6 +7866,597 @@ async fn clear_account() -> Result<(), String> {
     if path.exists() {
         fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Ollama — local daemon status, sign-in launcher, model management
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct OllamaModelInfo {
+    name: String,
+    size: u64,
+    modified_at: Option<String>,
+    family: Option<String>,
+    parameter_size: Option<String>,
+    quantization_level: Option<String>,
+    cloud: bool,
+    installed: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct OllamaStatus {
+    installed: bool,
+    running: bool,
+    version: Option<String>,
+    state: String,
+    message: String,
+    installed_path: Option<String>,
+    local_models: Vec<OllamaModelInfo>,
+    cloud_models: Vec<OllamaModelInfo>,
+    cloud_connected: bool,
+    cloud_message: Option<String>,
+    selected_model: Option<String>,
+    selected_model_available: bool,
+    selected_mode: String,
+    context_limit: Option<u32>,
+    context_limit_source: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct OllamaPullProgress {
+    model: String,
+    line: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct OllamaPullFinished {
+    model: String,
+    success: bool,
+    error: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct OllamaTagsResponse {
+    #[serde(default)]
+    models: Vec<OllamaTagModel>,
+}
+
+#[derive(Deserialize, Default)]
+struct OllamaTagModel {
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    modified_at: Option<String>,
+    #[serde(default)]
+    details: Option<OllamaTagDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct OllamaTagDetails {
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    parameter_size: Option<String>,
+    #[serde(default)]
+    quantization_level: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct OllamaVersionResponse {
+    #[serde(default)]
+    version: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct OllamaShowResponse {
+    #[serde(default)]
+    parameters: Option<String>,
+    #[serde(default)]
+    modelfile: Option<String>,
+}
+
+fn known_ollama_cloud_models() -> Vec<String> {
+    vec![
+        "gpt-oss:20b-cloud".to_string(),
+        "gpt-oss:120b-cloud".to_string(),
+    ]
+}
+
+fn find_ollama_binary() -> Option<String> {
+    #[cfg(windows)]
+    let probe = ("where", vec!["ollama"]);
+    #[cfg(not(windows))]
+    let probe = ("which", vec!["ollama"]);
+
+    let out = std::process::Command::new(probe.0).args(probe.1).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let first = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .to_string();
+    Some(first)
+}
+
+fn parse_ollama_num_ctx(text: &str) -> Option<u32> {
+    for line in text.lines() {
+        let normalized = line.trim().replace(['=', ':'], " ");
+        let parts: Vec<&str> = normalized.split_whitespace().collect();
+        for idx in 0..parts.len().saturating_sub(1) {
+            if parts[idx] == "num_ctx" {
+                if let Ok(n) = parts[idx + 1].parse::<u32>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_context_column(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (num, mult) = if let Some(num) = trimmed.strip_suffix(['K', 'k']) {
+        (num, 1_000f64)
+    } else if let Some(num) = trimmed.strip_suffix(['M', 'm']) {
+        (num, 1_000_000f64)
+    } else {
+        (trimmed, 1f64)
+    };
+    let parsed = num.trim().parse::<f64>().ok()?;
+    Some((parsed * mult).round() as u32)
+}
+
+fn parse_ollama_ps_context(stdout: &str, model: &str) -> Option<u32> {
+    let wanted = model.trim().to_lowercase();
+    for line in stdout.lines() {
+        let stripped = line.trim();
+        if stripped.is_empty() || stripped.to_ascii_lowercase().starts_with("name ") {
+            continue;
+        }
+        if !stripped.to_ascii_lowercase().starts_with(&wanted) {
+            continue;
+        }
+        let cols: Vec<&str> = stripped.split_whitespace().collect();
+        if cols.len() < 2 {
+            continue;
+        }
+        return cols.last().and_then(|s| parse_context_column(s));
+    }
+    None
+}
+
+fn ollama_context_from_ps(model: &str) -> Option<u32> {
+    let out = std::process::Command::new("ollama")
+        .arg("ps")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_ollama_ps_context(&String::from_utf8_lossy(&out.stdout), model)
+}
+
+async fn ollama_context_from_show(base_url: &str, model: &str) -> Option<u32> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/show", base_url.trim_end_matches('/')))
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let payload: OllamaShowResponse = resp.json().await.ok()?;
+    payload
+        .parameters
+        .as_deref()
+        .and_then(parse_ollama_num_ctx)
+        .or_else(|| payload.modelfile.as_deref().and_then(parse_ollama_num_ctx))
+}
+
+async fn ollama_version(base_url: &str) -> Result<Option<String>, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/api/version", base_url.trim_end_matches('/')))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let payload: OllamaVersionResponse = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(payload.version)
+}
+
+async fn ollama_tags(base_url: &str) -> Result<Vec<OllamaModelInfo>, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/api/tags", base_url.trim_end_matches('/')))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let payload: OllamaTagsResponse = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(payload
+        .models
+        .into_iter()
+        .map(|m| OllamaModelInfo {
+            name: m.name,
+            size: m.size,
+            modified_at: m.modified_at,
+            family: m.details.as_ref().and_then(|d| d.family.clone()),
+            parameter_size: m.details.as_ref().and_then(|d| d.parameter_size.clone()),
+            quantization_level: m.details.as_ref().and_then(|d| d.quantization_level.clone()),
+            cloud: false,
+            installed: true,
+        })
+        .collect())
+}
+
+async fn ollama_chat_probe(base_url: &str, model: &str) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/chat", base_url.trim_end_matches('/')))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "Reply with OK." }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    let status = resp.status();
+    let detail = resp.text().await.unwrap_or_default();
+    Err(if detail.trim().is_empty() {
+        format!("HTTP {}", status)
+    } else {
+        detail
+    })
+}
+
+fn friendly_ollama_cloud_message(detail: &str) -> String {
+    let lowered = detail.to_lowercase();
+    if lowered.contains("sign in") || lowered.contains("unauthorized") || lowered.contains("forbidden") {
+        "Sign in to Ollama to use cloud models".to_string()
+    } else if lowered.contains("not found") || lowered.contains("pull") {
+        "Cloud model unavailable; use a local model or install the cloud model".to_string()
+    } else {
+        "Cloud model unavailable; use a local model or sign in".to_string()
+    }
+}
+
+#[tauri::command]
+async fn ollama_get_status(
+    base_url: Option<String>,
+    selected_model: Option<String>,
+    mode: Option<String>,
+    context_limit_override: Option<u32>,
+) -> Result<OllamaStatus, String> {
+    let base_url = base_url.unwrap_or_else(|| "http://localhost:11434".to_string());
+    let selected_mode = mode.unwrap_or_else(|| "local".to_string()).to_lowercase();
+    let installed_path = find_ollama_binary();
+    if installed_path.is_none() {
+        return Ok(OllamaStatus {
+            installed: false,
+            running: false,
+            version: None,
+            state: "not_installed".to_string(),
+            message: "Ollama is not installed".to_string(),
+            installed_path: None,
+            local_models: vec![],
+            cloud_models: known_ollama_cloud_models()
+                .into_iter()
+                .map(|name| OllamaModelInfo {
+                    name,
+                    size: 0,
+                    modified_at: None,
+                    family: None,
+                    parameter_size: None,
+                    quantization_level: None,
+                    cloud: true,
+                    installed: false,
+                })
+                .collect(),
+            cloud_connected: false,
+            cloud_message: Some("Install Ollama from ollama.com/download".to_string()),
+            selected_model,
+            selected_model_available: false,
+            selected_mode,
+            context_limit: context_limit_override,
+            context_limit_source: context_limit_override.map(|_| "override".to_string()),
+            error: None,
+        });
+    }
+
+    let version = match ollama_version(&base_url).await {
+        Ok(version) => version,
+        Err(_) => {
+            return Ok(OllamaStatus {
+                installed: true,
+                running: false,
+                version: None,
+                state: "installed_not_running".to_string(),
+                message: "Ollama is installed but not running".to_string(),
+                installed_path,
+                local_models: vec![],
+                cloud_models: known_ollama_cloud_models()
+                    .into_iter()
+                    .map(|name| OllamaModelInfo {
+                        name,
+                        size: 0,
+                        modified_at: None,
+                        family: None,
+                        parameter_size: None,
+                        quantization_level: None,
+                        cloud: true,
+                        installed: false,
+                    })
+                    .collect(),
+                cloud_connected: false,
+                cloud_message: Some("Start Ollama to use local or cloud models".to_string()),
+                selected_model,
+                selected_model_available: false,
+                selected_mode,
+                context_limit: context_limit_override,
+                context_limit_source: context_limit_override.map(|_| "override".to_string()),
+                error: None,
+            });
+        }
+    };
+
+    let local_models = ollama_tags(&base_url).await.unwrap_or_default();
+    let local_names: std::collections::HashSet<String> = local_models
+        .iter()
+        .map(|m| m.name.to_lowercase())
+        .collect();
+    let mut cloud_models: Vec<OllamaModelInfo> = known_ollama_cloud_models()
+        .into_iter()
+        .map(|name| OllamaModelInfo {
+            installed: local_names.contains(&name.to_lowercase()),
+            cloud: true,
+            name,
+            size: 0,
+            modified_at: None,
+            family: None,
+            parameter_size: None,
+            quantization_level: None,
+        })
+        .collect();
+    if let Some(extra) = selected_model.as_ref().filter(|m| m.ends_with("-cloud")) {
+        if !cloud_models.iter().any(|m| m.name == *extra) {
+            cloud_models.push(OllamaModelInfo {
+                installed: local_names.contains(&extra.to_lowercase()),
+                cloud: true,
+                name: extra.clone(),
+                size: 0,
+                modified_at: None,
+                family: None,
+                parameter_size: None,
+                quantization_level: None,
+            });
+        }
+    }
+
+    let selected = selected_model.clone().filter(|m| !m.trim().is_empty()).or_else(|| {
+        if selected_mode == "cloud" {
+            Some("gpt-oss:120b-cloud".to_string())
+        } else {
+            local_models.first().map(|m| m.name.clone())
+        }
+    });
+    let selected_available = selected
+        .as_ref()
+        .map(|m| {
+            if selected_mode == "cloud" {
+                m.ends_with("-cloud") || local_names.contains(&m.to_lowercase())
+            } else {
+                local_names.contains(&m.to_lowercase())
+            }
+        })
+        .unwrap_or(false);
+
+    let probe_model = selected
+        .clone()
+        .filter(|m| selected_mode == "cloud" || m.ends_with("-cloud"))
+        .unwrap_or_else(|| "gpt-oss:120b-cloud".to_string());
+    let (cloud_connected, cloud_message) = match ollama_chat_probe(&base_url, &probe_model).await {
+        Ok(()) => (true, Some("Connected to Ollama".to_string())),
+        Err(detail) => (false, Some(friendly_ollama_cloud_message(&detail))),
+    };
+
+    let (context_limit, context_limit_source) = if let Some(model) = selected.as_ref() {
+        if let Some(limit) = ollama_context_from_ps(model) {
+            (Some(limit), Some("ollama_ps".to_string()))
+        } else if let Some(limit) = ollama_context_from_show(&base_url, model).await {
+            (Some(limit), Some("api_show".to_string()))
+        } else if let Some(limit) = context_limit_override {
+            (Some(limit), Some("override".to_string()))
+        } else {
+            (None, Some("unknown".to_string()))
+        }
+    } else if let Some(limit) = context_limit_override {
+        (Some(limit), Some("override".to_string()))
+    } else {
+        (None, Some("unknown".to_string()))
+    };
+
+    let state = if selected_mode == "cloud" {
+        if cloud_connected { "connected" } else { "running_not_signed_in" }
+    } else if !local_models.is_empty() {
+        "connected"
+    } else {
+        "error"
+    };
+    let message = match state {
+        "connected" => "Connected to Ollama".to_string(),
+        "running_not_signed_in" => "Sign in to Ollama to use cloud models".to_string(),
+        _ => {
+            if local_models.is_empty() {
+                "Ollama is running, but no local models are installed".to_string()
+            } else {
+                "Ollama status unavailable".to_string()
+            }
+        }
+    };
+
+    Ok(OllamaStatus {
+        installed: true,
+        running: true,
+        version,
+        state: state.to_string(),
+        message,
+        installed_path,
+        local_models,
+        cloud_models,
+        cloud_connected,
+        cloud_message,
+        selected_model: selected,
+        selected_model_available: selected_available,
+        selected_mode,
+        context_limit,
+        context_limit_source,
+        error: None,
+    })
+}
+
+#[tauri::command]
+async fn ollama_test_model(
+    base_url: Option<String>,
+    model: String,
+) -> Result<bool, String> {
+    let base_url = base_url.unwrap_or_else(|| "http://localhost:11434".to_string());
+    ollama_chat_probe(&base_url, &model).await.map(|_| true)
+}
+
+#[tauri::command]
+async fn ollama_signin() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let script = r#"tell application "Terminal"
+activate
+do script "ollama signin"
+end tell"#;
+        std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", "cmd", "/K", "ollama signin"])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let candidates = [
+            ("x-terminal-emulator", vec!["-e", "sh", "-lc", "ollama signin"]),
+            ("gnome-terminal", vec!["--", "sh", "-lc", "ollama signin"]),
+            ("konsole", vec!["-e", "sh", "-lc", "ollama signin"]),
+        ];
+        for (cmd, args) in candidates {
+            if std::process::Command::new(cmd).args(args.clone()).spawn().is_ok() {
+                return Ok(());
+            }
+        }
+        return Err("Could not launch a terminal for `ollama signin`.".to_string());
+    }
+}
+
+#[tauri::command]
+async fn ollama_pull_model(
+    model: String,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let model_name = model.trim().to_string();
+    if model_name.is_empty() {
+        return Err("Model name is required".to_string());
+    }
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        use tokio::process::Command;
+
+        let mut cmd = Command::new("ollama");
+        cmd.arg("pull")
+            .arg(&model_name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(stdout) = child.stdout.take() {
+                    let app = app_handle.clone();
+                    let model = model_name.clone();
+                    tokio::spawn(async move {
+                        let mut lines = tokio::io::BufReader::new(stdout).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let _ = app.emit("ollama-pull-progress", OllamaPullProgress { model: model.clone(), line });
+                        }
+                    });
+                }
+                if let Some(stderr) = child.stderr.take() {
+                    let app = app_handle.clone();
+                    let model = model_name.clone();
+                    tokio::spawn(async move {
+                        let mut lines = tokio::io::BufReader::new(stderr).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let _ = app.emit("ollama-pull-progress", OllamaPullProgress { model: model.clone(), line });
+                        }
+                    });
+                }
+                let finished = child.wait().await.map_err(|e| e.to_string());
+                match finished {
+                    Ok(status) if status.success() => {
+                        let _ = app_handle.emit("ollama-pull-finished", OllamaPullFinished {
+                            model: model_name,
+                            success: true,
+                            error: None,
+                        });
+                    }
+                    Ok(status) => {
+                        let _ = app_handle.emit("ollama-pull-finished", OllamaPullFinished {
+                            model: model_name,
+                            success: false,
+                            error: Some(format!("`ollama pull` exited with {}", status)),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = app_handle.emit("ollama-pull-finished", OllamaPullFinished {
+                            model: model_name,
+                            success: false,
+                            error: Some(err),
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = app_handle.emit("ollama-pull-finished", OllamaPullFinished {
+                    model: model_name,
+                    success: false,
+                    error: Some(err.to_string()),
+                });
+            }
+        }
+    });
     Ok(())
 }
 
@@ -7132,13 +8612,15 @@ where
 }
 
 fn chrono_now() -> String {
-    // Build a readable UTC timestamp without the chrono crate.
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    unix_secs_to_utc_iso(secs)
+}
 
+fn unix_secs_to_utc_iso(secs: u64) -> String {
     // Convert Unix seconds to (year, month, day, h, m, s) UTC.
     let s = secs % 60;
     let m = (secs / 60) % 60;
@@ -7421,9 +8903,13 @@ async fn restore_from_gist(
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ClawSession {
     pub session_id: String,
+    /// YYYY-MM-DD bucket under <project>/.claw/sessions. Used to locate the file on disk.
     pub date: String,
+    /// ISO timestamp (UTC) derived from file modified time. Used for sorting/display.
+    pub updated_at: String,
     pub message_count: usize,
     pub summary: Option<String>,
+    pub title: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -7548,6 +9034,41 @@ async fn remove_code_project(path: String) -> Result<Vec<String>, String> {
     Ok(account.code_projects)
 }
 
+/// Open a filesystem path in the OS file manager.
+/// On macOS this opens Finder (equivalent to "Open in Finder").
+#[tauri::command]
+async fn open_in_finder(path: String) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    if !p.exists() {
+        return Err(format!("Path does not exist: {path}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+}
+
 fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
     // Claw stores sessions bucketed by date: <dir>/<YYYY-MM-DD>/<session_id>.jsonl.
     // Walk each date subdirectory, then collect the .jsonl files inside.
@@ -7584,6 +9105,14 @@ fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
+            let modified_secs = fe
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let modified_at = unix_secs_to_utc_iso(modified_secs);
             let message_count = count_lines(&fe.path()).unwrap_or(0);
             let summary_path = date_path.join(format!("{}.summary.txt", session_id));
             let summary = if summary_path.exists() {
@@ -7594,11 +9123,14 @@ fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
             } else {
                 None
             };
+            let title = infer_session_title(&fe.path(), summary.as_ref(), &session_id);
             sessions.push(ClawSession {
                 session_id,
                 date: date.clone(),
+                updated_at: modified_at,
                 message_count,
                 summary,
+                title,
             });
         }
     }
@@ -7812,6 +9344,9 @@ pub fn run() {
             show_browser_window,
             hide_browser_window,
             set_browser_keep_visible,
+            provider_check_auth,
+            provider_signin,
+            provider_signout,
             hide_main_window,
             show_main_window,
             set_task_active_mode,
@@ -7819,9 +9354,18 @@ pub fn run() {
             cancel_task,
             read_voice_config,
             write_voice_config,
+            google_oauth::google_oauth_status,
+            google_oauth::google_oauth_start,
+            google_oauth::google_oauth_disconnect,
+            google_oauth::google_oauth_test,
+            google_oauth::google_oauth_setup_free_tier_project,
             load_account,
             save_account,
             clear_account,
+            ollama_get_status,
+            ollama_test_model,
+            ollama_signin,
+            ollama_pull_model,
             verify_github_pat,
             export_data,
             import_data,
@@ -7830,6 +9374,7 @@ pub fn run() {
             list_claw_projects,
             add_code_project,
             remove_code_project,
+            open_in_finder,
             send_feedback,
             show_screenshot_flash,
         ])
