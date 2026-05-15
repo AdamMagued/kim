@@ -35,6 +35,8 @@ interface LivePlanParsed {
    *  Steps with index < activeStep are complete; step at activeStep is in
    *  flight; steps > activeStep are pending. */
   activeStep: number;
+  /** 1-based indexes explicitly marked complete by `[DONE]{json}`. */
+  doneSteps: number[];
   /** True when the plan came from the new structured `[PLAN]{json}` event
    *  emitted by the agent (vs the older heuristic phrase-detection). When
    *  structured, we trust the step count exactly; otherwise we treat it as
@@ -57,6 +59,8 @@ function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | null {
   // ── Preferred: structured [PLAN]{json} / [STEP]{json} envelopes ────────
   let structuredSteps: string[] | null = null;
   let structuredActive = 0;
+  const structuredDone = new Set<number>();
+  const orphanStructuredSteps = new Map<number, string>();
   for (const it of items) {
     const t = it.text;
     const planTag = t.indexOf('[PLAN]{');
@@ -69,6 +73,8 @@ function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | null {
           if (arr.length >= 2) {
             structuredSteps = arr.slice(0, 12);
             structuredActive = 0;
+            structuredDone.clear();
+            orphanStructuredSteps.clear();
           }
         }
       } catch {
@@ -77,12 +83,30 @@ function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | null {
       continue;
     }
     const stepTag = t.indexOf('[STEP]{');
-    if (stepTag !== -1 && structuredSteps) {
+    if (stepTag !== -1) {
       try {
         const json = t.slice(stepTag + '[STEP]'.length);
+        const parsed = JSON.parse(json) as { index?: number; name?: unknown };
+        if (typeof parsed.index === 'number' && parsed.index > 0) {
+          if (structuredSteps) {
+            structuredActive = Math.min(parsed.index, structuredSteps.length);
+          } else if (typeof parsed.name === 'string' && parsed.name.trim()) {
+            orphanStructuredSteps.set(parsed.index, parsed.name.trim().slice(0, 120));
+            structuredActive = parsed.index;
+          }
+        }
+      } catch {
+        // ignore
+      }
+      continue;
+    }
+    const doneTag = t.indexOf('[DONE]{');
+    if (doneTag !== -1) {
+      try {
+        const json = t.slice(doneTag + '[DONE]'.length);
         const parsed = JSON.parse(json) as { index?: number };
         if (typeof parsed.index === 'number' && parsed.index > 0) {
-          structuredActive = Math.min(parsed.index, structuredSteps.length);
+          structuredDone.add(parsed.index);
         }
       } catch {
         // ignore
@@ -90,7 +114,18 @@ function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | null {
     }
   }
   if (structuredSteps) {
-    return { steps: structuredSteps, activeStep: structuredActive, structured: true };
+    return { steps: structuredSteps, activeStep: structuredActive, doneSteps: [...structuredDone], structured: true };
+  }
+  if (orphanStructuredSteps.size >= 2) {
+    const indexes = [...orphanStructuredSteps.keys()].sort((a, b) => a - b).slice(0, 12);
+    const steps = indexes.map(idx => orphanStructuredSteps.get(idx) || `Step ${idx}`);
+    const activeMapped = indexes.includes(structuredActive) ? indexes.indexOf(structuredActive) + 1 : Math.min(structuredActive, steps.length);
+    return {
+      steps,
+      activeStep: activeMapped,
+      doneSteps: [...structuredDone].filter(idx => indexes.includes(idx)).map(idx => indexes.indexOf(idx) + 1),
+      structured: true,
+    };
   }
 
   // ── Heuristic fallback (older sessions / non-compliant models) ─────────
@@ -130,7 +165,7 @@ function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | null {
   }
 
   if (steps.length >= 2) {
-    return { steps: steps.slice(0, 12), activeStep: 0, structured: false };
+    return { steps: steps.slice(0, 12), activeStep: 0, doneSteps: [], structured: false };
   }
 
   const numbered: string[] = [];
@@ -144,7 +179,7 @@ function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | null {
     else if (numbered.length > 0) break;
   }
   return numbered.length >= 2
-    ? { steps: numbered.slice(0, 12), activeStep: 0, structured: false }
+    ? { steps: numbered.slice(0, 12), activeStep: 0, doneSteps: [], structured: false }
     : null;
 }
 
@@ -155,7 +190,10 @@ function livePlanProgressLabel(plan: LivePlanParsed, items: ActivityItem[], runn
   // Otherwise fall back to counting tool calls as a rough completion proxy.
   let done: number;
   if (plan.structured) {
-    done = Math.max(0, plan.activeStep - 1);
+    const completed = new Set<number>();
+    for (let i = 1; i < plan.activeStep; i++) completed.add(i);
+    for (const idx of plan.doneSteps) completed.add(idx);
+    done = Math.min(completed.size, stepCount);
   } else {
     const nTools = items.filter(i => i.kind === 'tool').length;
     done = Math.min(nTools, stepCount);
@@ -319,6 +357,7 @@ function cleanAssistantAnswerText(t: string): string {
     // text — they drive the live plan checklist, not the conversation bubble.
     .replace(/^\s*PLAN:\s*\d+\s*steps?\s*\n(?:\s*\d+[.)]\s+.+\n?)+/gim, '')
     .replace(/^\s*STEP\s*\d+\s*:\s*.+$/gim, '')
+    .replace(/^\s*DONE\s*\d+\s*:\s*.+$/gim, '')
     .trim();
 
   for (let i = 0; i < 3; i++) {
@@ -1021,6 +1060,7 @@ interface Props {
   onTaskDone: (sessionId?: string, completedSession?: SessionInfo) => void;
   account: KimAccount;
   onAccountChange: (account: KimAccount) => Promise<void>;
+  onOpenSettings?: (pane?: 'ai') => void;
   activeTab: 'chat' | 'code';
   activeProjectPath?: string | null;
   reloadSessions: () => void;
@@ -1033,7 +1073,7 @@ interface Props {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function ChatView({ session, newChatMode, settings, onSettingsChange, onTaskDone, account, activeTab, activeProjectPath, onNewChat, onNewCodeSession, recentSessions, onSelectSession }: Props) {
+export function ChatView({ session, newChatMode, settings, onSettingsChange, onTaskDone, account, activeTab, activeProjectPath, onOpenSettings, onNewChat, onNewCodeSession, recentSessions, onSelectSession }: Props) {
   const activityCounterRef = useRef(0);
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
@@ -2243,7 +2283,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
                     const oneBased = i + 1;
                     let state: 'done' | 'active' | 'pending' = 'pending';
                     if (livePlan.structured) {
-                      if (oneBased < livePlan.activeStep) state = 'done';
+                      if (livePlan.doneSteps.includes(oneBased) || oneBased < livePlan.activeStep) state = 'done';
                       else if (oneBased === livePlan.activeStep) state = 'active';
                     }
                     return (
@@ -2275,7 +2315,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
               // Hide the raw [PLAN]{json} / [STEP]{json} envelopes from the
               // visible feed — they drive the plan checklist above, the user
               // doesn't need to see them as duplicate status lines.
-              .filter(item => !/^\s*\[(?:PLAN|STEP)\]\{/.test(item.text))
+              .filter(item => !/^\s*\[(?:PLAN|STEP|DONE)\]\{/.test(item.text))
               .map(item => (
                 <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
                   <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
@@ -2311,7 +2351,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
             <div className="kim-worked-for__panel">
               <div className="kim-activity-feed kim-activity-feed--archive">
                 {run.activity
-                  .filter(item => !/^\s*\[(?:PLAN|STEP)\]\{/.test(item.text))
+                  .filter(item => !/^\s*\[(?:PLAN|STEP|DONE)\]\{/.test(item.text))
                   .map(item => (
                     <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
                       <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
@@ -2431,9 +2471,20 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     });
   }, [onSettingsChange, settings]);
 
+  const handleOllamaModeChange = useCallback((mode: 'local' | 'cloud') => {
+    if (!onSettingsChange || settings.ollama.mode === mode) return;
+    onSettingsChange({
+      ...settings,
+      provider: 'ollama',
+      ollama: {
+        ...settings.ollama,
+        mode,
+      },
+    });
+  }, [onSettingsChange, settings]);
+
   function renderComposer(heroMode = false) {
     const resolvedProvider = resolveProvider();
-    const browserProviderId = resolvedProvider.startsWith('browser:') ? resolvedProvider.split(':')[1] : '';
     return (
       <form className="kim-composer" onSubmit={handleSubmit}>
         <div className="kim-composer__row">
@@ -2714,7 +2765,9 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
           resolvedProvider={resolvedProvider}
           ollama={settings.ollama}
           onChangeProvider={handleProviderChange}
+          onChangeOllamaMode={handleOllamaModeChange}
           onChangeOllamaModel={handleOllamaModelChange}
+          onOpenOllamaSettings={() => onOpenSettings?.('ai')}
           disabled={isRunning}
         />
         <div className="kim-composer__hint">
@@ -2725,66 +2778,6 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
           </span>
           <span className="kim-composer__hint-sep">·</span>
           <span><kbd>⇧</kbd>+<kbd>↵</kbd> for new line</span>
-          <span className="kim-composer__hint-sep">·</span>
-          <span className="kim-composer__provider-pill">
-            <select
-              value={resolveProvider()}
-              onChange={e => void handleProviderChange(e.target.value)}
-              className="kim-composer__provider-select"
-            >
-              <optgroup label="Ollama">
-                <option value="ollama">Ollama</option>
-              </optgroup>
-              <optgroup label="Browser (free — uses your sign-in)">
-                <option value="browser:claude">Browser: Claude</option>
-                <option value="browser:chatgpt">Browser: ChatGPT</option>
-                <option value="browser:gemini">Browser: Gemini</option>
-                <option value="browser:grok">Browser: Grok</option>
-                <option value="browser:deepseek">Browser: DeepSeek</option>
-                <option value="browser:custom">Browser: Custom</option>
-              </optgroup>
-              <optgroup label="API (requires API key)">
-                <option value="claude">Claude API</option>
-                <option value="openai">OpenAI API</option>
-                <option value="gemini">Gemini API</option>
-                <option value="deepseek">DeepSeek API</option>
-              </optgroup>
-            </select>
-            <svg className="kim-composer__provider-chevron" viewBox="0 0 10 10" width="8" height="8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M2 4l3 3 3-3" />
-            </svg>
-          </span>
-          {browserProviderId && browserProviderId !== 'custom' && (
-            <>
-              <span className="kim-composer__hint-sep">·</span>
-              <button
-                type="button"
-                className="kim-composer__signin-btn"
-                onClick={async () => {
-                  const p = browserProviderId;
-                  const providerName = p.charAt(0).toUpperCase() + p.slice(1);
-                  let url = '';
-                  if (p === 'claude') url = 'https://claude.ai';
-                  else if (p === 'chatgpt') url = 'https://chatgpt.com';
-                  else if (p === 'gemini') url = 'https://gemini.google.com/app';
-                  else if (p === 'grok') url = 'https://grok.com';
-                  else if (p === 'deepseek') url = 'https://chat.deepseek.com';
-
-                  if (url) {
-                    try {
-                      await invoke<string>('open_browser_signin_window', { url, providerName });
-                      await invoke('show_browser_window').catch(() => {});
-                      toast(`${providerName} opened! Close the window when you're done signing in.`, 'info', 7000);
-                    } catch (err) {
-                      toast(typeof err === 'string' ? err : `Could not open ${providerName}.`, 'error', 5000);
-                    }
-                  }
-                }}
-              >
-                Sign into {browserProviderId.charAt(0).toUpperCase() + browserProviderId.slice(1)}
-              </button>
-            </>
-          )}
           {(queuedTasks.length > 0 || interruptTask) && (
             <>
               <span className="kim-composer__hint-sep">·</span>

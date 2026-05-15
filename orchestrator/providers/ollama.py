@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 from typing import Any
 
@@ -112,6 +113,9 @@ class OllamaProvider(BaseProvider):
         self._context_override = _coerce_optional_int(
             _env_or_cfg(config, "KIM_OLLAMA_CONTEXT_LIMIT_OVERRIDE", "ollama", "context_limit_override", default=ollama_cfg.get("context_limit_override"))
         )
+        self._keep_alive = str(
+            _env_or_cfg(config, "KIM_OLLAMA_KEEP_ALIVE", "ollama", "keep_alive", default=ollama_cfg.get("keep_alive") or "5m")
+        ).strip()
         self._timeout_s = 600.0
         logger.info(
             "OllamaProvider: base_url=%s mode=%s local_model=%s cloud_model=%s",
@@ -136,6 +140,8 @@ class OllamaProvider(BaseProvider):
             "messages": self._to_ollama_messages(messages, system),
             "stream": True,
         }
+        if self._keep_alive:
+            payload["keep_alive"] = self._keep_alive
         if tools:
             payload["tools"] = self._to_ollama_tools(tools)
         if self._context_override:
@@ -163,6 +169,7 @@ class OllamaProvider(BaseProvider):
                 "type": "tool_call",
                 "tool": name,
                 "args": args,
+                "content": content,
                 "usage": usage,
             }
 
@@ -232,18 +239,46 @@ class OllamaProvider(BaseProvider):
         for msg in messages:
             role = str(msg.get("role") or "user")
             content = msg.get("content")
+            if role == "assistant" and isinstance(content, str):
+                native_tool_call = _assistant_tool_call_message(content)
+                if native_tool_call:
+                    out.append(native_tool_call)
+                    continue
             if isinstance(content, list):
                 text_parts: list[str] = []
+                images: list[str] = []
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "text":
                         text_parts.append(str(item.get("text") or ""))
+                    elif isinstance(item, dict) and item.get("type") == "image":
+                        image_data = _normalize_image_data(item.get("data"))
+                        if image_data:
+                            images.append(image_data)
                     elif isinstance(item, dict):
-                        text_parts.append(json.dumps(item, ensure_ascii=False))
+                        text = item.get("text") or item.get("content")
+                        if text:
+                            text_parts.append(str(text))
                     else:
                         text_parts.append(str(item))
-                out.append({"role": role, "content": "\n".join([p for p in text_parts if p]).strip()})
+                converted: dict[str, Any] = {
+                    "role": role,
+                    "content": "\n".join([p for p in text_parts if p]).strip(),
+                }
+                if images:
+                    converted["images"] = images
+                else:
+                    tool_result = _tool_result_message(role, converted["content"])
+                    if tool_result:
+                        out.append(tool_result)
+                        continue
+                out.append(converted)
             else:
-                out.append({"role": role, "content": str(content or "")})
+                text = str(content or "")
+                tool_result = _tool_result_message(role, text)
+                if tool_result:
+                    out.append(tool_result)
+                    continue
+                out.append({"role": role, "content": text})
         return out
 
     def _to_ollama_tools(self, tools: list[dict]) -> list[dict]:
@@ -271,6 +306,11 @@ class OllamaProvider(BaseProvider):
                 if resp.status_code >= 400:
                     detail = (await resp.aread()).decode("utf-8", errors="replace").strip()
                     lowered = detail.lower()
+                    if _looks_like_vision_model_error(lowered):
+                        raise EnvironmentError(
+                            "The selected Ollama model does not appear to support images. "
+                            "Pick a vision-capable Ollama model or use structured UI observation instead of screenshots."
+                        )
                     if "not found" in lowered or "pull" in lowered:
                         raise EnvironmentError(
                             f"Ollama model {payload.get('model')!r} is unavailable. Pull it in Settings → AI → Ollama or pick another model."
@@ -293,6 +333,11 @@ class OllamaProvider(BaseProvider):
                         lowered = detail.lower()
                         if "sign in" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
                             raise PermissionError("Sign in to Ollama to use cloud models.")
+                        if _looks_like_vision_model_error(lowered):
+                            raise EnvironmentError(
+                                "The selected Ollama model does not appear to support images. "
+                                "Pick a vision-capable Ollama model or use structured UI observation instead of screenshots."
+                            )
                         if "not found" in lowered or "pull" in lowered:
                             raise EnvironmentError(
                                 f"Ollama model {payload.get('model')!r} is unavailable. Pull it in Settings → AI → Ollama or pick another model."
@@ -416,6 +461,72 @@ def _normalize_tool_arguments(raw: Any) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def _assistant_tool_call_message(raw_content: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(raw_content)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict) or parsed.get("type") != "tool_call":
+        return None
+    name = str(parsed.get("tool") or "").strip()
+    if not name:
+        return None
+    args = _normalize_tool_arguments(parsed.get("args"))
+    content = str(parsed.get("content") or "").strip()
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {
+                "type": "function",
+                "function": {
+                    "index": 0,
+                    "name": name,
+                    "arguments": args,
+                },
+            }
+        ],
+    }
+
+
+def _tool_result_message(role: str, text: str) -> dict[str, Any] | None:
+    if role != "user":
+        return None
+    match = re.match(r"^\s*\[Tool result:\s*([A-Za-z0-9_.:-]+)\]\s*\n?([\s\S]*)$", text)
+    if not match:
+        return None
+    name = match.group(1).strip()
+    body = match.group(2).strip()
+    if not name:
+        return None
+    return {
+        "role": "tool",
+        "tool_name": name,
+        "content": body,
+    }
+
+
+def _normalize_image_data(raw: Any) -> str:
+    data = str(raw or "").strip()
+    if not data or data == "[image data stripped]":
+        return ""
+    if data.startswith("data:") and "," in data:
+        return data.split(",", 1)[1].strip()
+    return data
+
+
+def _looks_like_vision_model_error(lowered_detail: str) -> bool:
+    return (
+        ("image" in lowered_detail or "vision" in lowered_detail or "multimodal" in lowered_detail)
+        and (
+            "support" in lowered_detail
+            or "unsupported" in lowered_detail
+            or "does not" in lowered_detail
+            or "cannot" in lowered_detail
+        )
+    )
 
 
 def _coerce_optional_int(value: Any) -> int | None:

@@ -2188,7 +2188,7 @@ kbd {
 /* ── Unified Provider Picker (below chat composer, replaces auth chip) ── */
 .kim-provider-picker {
   position: relative;
-  max-width: 680px;
+  max-width: 820px;
   margin: 10px auto 0;
   padding: 0 4px;
   display: flex;
@@ -2274,6 +2274,139 @@ kbd {
   border-color: var(--kim-red, #ef4444);
   color: var(--kim-red, #ef4444);
   background: rgba(239, 68, 68, 0.06);
+}
+
+.kim-provider-picker__ollama-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 520px;
+  padding: 5px;
+  border: 1px solid var(--kim-border);
+  background: color-mix(in srgb, var(--kim-bg-2) 88%, var(--kim-surface));
+  border-radius: 12px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.025);
+}
+.kim-provider-picker__mode-switch {
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--kim-border);
+  background: var(--kim-bg);
+  border-radius: 9px;
+}
+.kim-provider-picker__mode-option {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--kim-text-3);
+  border-radius: 7px;
+  padding: 6px 10px;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+}
+.kim-provider-picker__mode-option:hover:not(:disabled) {
+  color: var(--kim-text-2);
+}
+.kim-provider-picker__mode-option.is-active {
+  background: var(--kim-surface);
+  color: var(--kim-text);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+}
+.kim-provider-picker__mode-option:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.kim-provider-picker__model-field {
+  display: grid;
+  grid-template-columns: auto minmax(170px, 1fr);
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 2px;
+  flex: 1 1 320px;
+  min-width: 220px;
+}
+.kim-provider-picker__model-field-label {
+  grid-row: 1 / span 2;
+  color: var(--kim-text-3);
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.kim-provider-picker__select-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.kim-provider-picker__select-wrap select {
+  width: 100%;
+  min-width: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--kim-border);
+  background: var(--kim-surface);
+  color: var(--kim-text);
+  border-radius: 8px;
+  padding: 7px 30px 7px 10px;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  outline: none;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+}
+.kim-provider-picker__select-wrap select:focus {
+  border-color: var(--kim-accent-line);
+}
+.kim-provider-picker__select-wrap select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.kim-provider-picker__select-wrap svg {
+  position: absolute;
+  right: 11px;
+  color: var(--kim-text-3);
+  pointer-events: none;
+}
+.kim-provider-picker__model-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--kim-text-4);
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 10px;
+}
+.kim-provider-picker__mini-settings {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  border: 1px solid var(--kim-border);
+  background: var(--kim-surface);
+  color: var(--kim-text-2);
+  border-radius: 7px;
+  padding: 5px 9px;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.kim-provider-picker__mini-settings:hover:not(:disabled) {
+  border-color: var(--kim-accent-line);
+  color: var(--kim-text);
+  background: var(--kim-surface-2);
+}
+.kim-provider-picker__mini-settings:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 /* Dropdown panel — anchored under the pill. */
@@ -2409,74 +2542,29 @@ kbd {
 }
 .kim-provider-picker__status a:hover { text-decoration: underline; }
 
-/* Ollama Local/Cloud mode tabs — segmented control inside the Local section,
- * lets the user pick the bucket before drilling into individual models. */
-.kim-provider-picker__ollama-tabs {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 4px;
-  margin: 6px 6px 4px;
-  padding: 3px;
-  background: var(--kim-bg-2);
-  border: 1px solid var(--kim-border);
-  border-radius: 8px;
-}
-.kim-provider-picker__ollama-tab {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  background: transparent;
-  border: none;
-  color: var(--kim-text-3);
-  padding: 5px 0;
-  border-radius: 6px;
-  font: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.12s ease, color 0.12s ease;
-}
-.kim-provider-picker__ollama-tab:hover { color: var(--kim-text-2); }
-.kim-provider-picker__ollama-tab.is-active {
-  background: var(--kim-surface);
-  color: var(--kim-text);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
-}
-.kim-provider-picker__ollama-tab-count {
-  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
-  font-size: 10px;
-  color: var(--kim-text-4);
-  background: var(--kim-bg-2);
-  border-radius: 4px;
-  padding: 1px 5px;
-}
-.kim-provider-picker__ollama-tab.is-active .kim-provider-picker__ollama-tab-count {
-  background: var(--kim-bg);
-  color: var(--kim-text-3);
-}
-
-/* Ollama model search + scrollable list. */
-.kim-provider-picker__search {
-  margin: 4px 6px 6px;
-  padding: 6px 9px;
-  font: inherit;
-  font-size: 12.5px;
-  border: 1px solid var(--kim-border);
-  background: var(--kim-bg-2);
-  border-radius: 7px;
-  color: var(--kim-text);
-  outline: none;
-}
-.kim-provider-picker__search:focus {
-  border-color: var(--kim-accent);
-}
-.kim-provider-picker__model-list {
-  max-height: 240px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 0;
+@media (max-width: 720px) {
+  .kim-provider-picker {
+    align-items: stretch;
+  }
+  .kim-provider-picker__ollama-inline {
+    flex-basis: 100%;
+    flex-wrap: wrap;
+  }
+  .kim-provider-picker__mode-switch {
+    flex: 1 1 180px;
+  }
+  .kim-provider-picker__mode-option {
+    flex: 1;
+  }
+  .kim-provider-picker__model-field {
+    flex-basis: 100%;
+    grid-template-columns: 1fr;
+  }
+  .kim-provider-picker__mini-settings,
+  .kim-provider-picker__ollama-inline .kim-provider-picker__signin-btn {
+    flex: 1 1 160px;
+    justify-content: center;
+  }
 }
 
 /* ── Auth indicator (below chat composer) ──────────────────────────────── */
@@ -6313,4 +6401,110 @@ kbd {
 
 .kim-chat--empty-hero .kim-composer__hint {
   display: none;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Phone Relay — pairing modal + small status pill used in the Settings page.
+   The pill doubles as the "RELAY_PC_API_KEY missing" hint and any inline
+   error from the relay round-trip, with `data-state` swapping the colour.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.kim-pairing-modal {
+  width: 420px;
+  max-width: 94vw;
+}
+.kim-pairing-modal__subtitle {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+.kim-pairing-modal__body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 24px;
+}
+.kim-pairing-modal__loading,
+.kim-pairing-modal__error {
+  width: 100%;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: 18px 0;
+}
+.kim-pairing-modal__error {
+  color: var(--kim-danger, #c44d4d);
+}
+.kim-pairing-modal__qr {
+  padding: 12px;
+  background: #fff;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+}
+.kim-pairing-modal__code {
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-size: 22px;
+  letter-spacing: 0.18em;
+  font-weight: 700;
+  color: var(--text-strong);
+  user-select: all;
+}
+.kim-pairing-modal__hint {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  text-align: center;
+}
+.kim-pairing-modal__payload {
+  width: 100%;
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 11px;
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  color: var(--text-muted);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: all;
+}
+.kim-pairing-modal__success {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+.kim-pairing-modal__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 0 4px color-mix(in srgb, #22c55e 22%, transparent);
+}
+
+/* Generic status pill — used by PhoneRelaySection for both "configured" and
+   "missing key" states. Reused by other future warnings in Settings. */
+.kim-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text);
+}
+.kim-pill[data-state="ok"] {
+  color: #2f7a4f;
+  border-color: color-mix(in srgb, #22c55e 36%, var(--border));
+  background: color-mix(in srgb, #22c55e 8%, var(--bg-card));
+}
+.kim-pill[data-state="warn"] {
+  color: var(--kim-danger, #b8593b);
+  border-color: color-mix(in srgb, #b8593b 36%, var(--border));
+  background: color-mix(in srgb, #b8593b 8%, var(--bg-card));
 }
