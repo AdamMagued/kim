@@ -478,6 +478,10 @@ export function groupClawMessages(messages: KimMessage[]): ClawRunGroup[] {
 const HIDDEN_SUBSTRINGS = [
   // screenshot / internal commands
   'take_screenshot', 'screenshot', 'capture_screen',
+  // model reasoning preambles
+  'Thought for ',
+  // raw text-JSON tool calls emitted by models that can't use native tool_calls
+  '"tool":', '"args":',
   // kimdir noise
   'INFO] kimdir', 'DEBUG] kimdir',
   // CLI noise
