@@ -128,6 +128,38 @@ def _normalize_tool_name(raw_name: Any) -> str:
     return _TOOL_NAME_ALIASES.get(name, name)
 
 
+def _extract_json_tool_call(content: str) -> dict | None:
+    """Find and parse a text-JSON tool call of the form {"tool": "...", "args": {...}}.
+
+    Some models (e.g. gpt-oss:20b) cannot use native tool_calls and instead emit
+    the call as plain text JSON. This extracts the first valid call found so the
+    agent can execute it rather than storing raw JSON in the chat history.
+    Returns a dict with 'tool', 'args', 'start', 'end' keys, or None.
+    """
+    idx = content.find('"tool"')
+    while idx != -1:
+        start = content.rfind('{', 0, idx)
+        if start == -1:
+            break
+        depth = 0
+        for i in range(start, len(content)):
+            if content[i] == '{':
+                depth += 1
+            elif content[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(content[start:i + 1])
+                        if isinstance(obj.get('tool'), str) and isinstance(obj.get('args'), dict):
+                            return {'start': start, 'end': i + 1,
+                                    'tool': obj['tool'], 'args': obj['args']}
+                    except (json.JSONDecodeError, KeyError, ValueError):
+                        pass
+                    break
+        idx = content.find('"tool"', idx + 1)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # UIBridge — thread-safe channel between async agent and Tkinter UI
 # ---------------------------------------------------------------------------
@@ -946,6 +978,31 @@ class KimAgent:
             # ── Text response ────────────────────────────────────────────
             if response["type"] == "text":
                 content = str(response.get("content", "")).strip()
+
+                # Strip "Thought for Xs" reasoning preamble that some models prepend.
+                content = re.sub(r'^Thought for \d+s\s*\n?', '', content, flags=re.IGNORECASE).strip()
+
+                # Some models (e.g. gpt-oss:20b) cannot use native tool_calls and
+                # instead emit {"tool": "...", "args": {...}} as plain text.
+                # Parse and execute it so it never pollutes chat history.
+                _json_call = _extract_json_tool_call(content)
+                if _json_call:
+                    # Keep only the thinking narration (strip the raw JSON blob).
+                    thinking = (content[:_json_call['start']] + content[_json_call['end']:]).strip()
+                    if thinking:
+                        self.memory.add_assistant(thinking)
+                        self._session_store.append_message({"role": "assistant", "content": thinking})
+                        self._emit_plan_markers(thinking)
+                    tool_name = _normalize_tool_name(_json_call['tool'])
+                    tool_args = _json_call['args']
+                    self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]}) [text-json]")
+                    consecutive_continues = 0
+                    result_text = await self._execute_tool(tool_name, tool_args)
+                    user_content = f"[Tool result: {tool_name}]\n{result_text}"
+                    self.memory.add_user(user_content)
+                    self._session_store.append_message({"role": "user", "content": user_content})
+                    continue
+
                 self.memory.add_assistant(content)
                 self._session_store.append_message({"role": "assistant", "content": content})
 
