@@ -130,6 +130,16 @@ class _AsyncRunner:
         self._current_task = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return self._current_task
 
+    def spawn_daemon(self, coro):
+        """
+        Schedule a long-running background coroutine on the asyncio loop.
+        Unlike `submit`, this doesn't overwrite `_current_task` (which is
+        reserved for the one cancellable user task), so things like the
+        relay worker can run alongside without blocking cancellation of
+        local tasks.
+        """
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
     def cancel_current(self) -> None:
         if self._current_task and not self._current_task.done():
             self._current_task.cancel()
@@ -165,6 +175,14 @@ class KimApp:
         # Voice engine (constructor is cheap — no model loading here)
         self._voice = VoiceEngine(self._config)
 
+        # Shared agent lock — held while either a tray-local task or a relay
+        # task is mid-flight, so the two paths never race for the screen,
+        # MCP session, or voice engine. Created lazily on the asyncio loop.
+        self._agent_lock: Optional[asyncio.Lock] = None
+        # Future handle for the relay worker background task (so we can stop
+        # it cleanly on shutdown).
+        self._relay_worker_future = None
+
         # pystray icon
         self._icon: Optional[pystray.Icon] = None
 
@@ -189,6 +207,10 @@ class KimApp:
         self._voice.set_status_callback(self._on_voice_status)
         self._voice.warm_up()
 
+        # Spin up the relay worker if `relay.url` + RELAY_PC_API_KEY are set.
+        # Quietly no-ops otherwise so the tray works without the relay.
+        self._start_relay_worker()
+
         # Poll for cross-thread events every 50 ms
         self._root.after(50, self._poll)
         try:
@@ -206,6 +228,36 @@ class KimApp:
         if self._control_panel and self._control_panel.winfo_exists():
             self._control_panel.set_voice_status(status, message)
 
+    def _start_relay_worker(self) -> None:
+        """Schedule the relay poller on the asyncio loop, if configured.
+
+        Designed to be quiet: if the relay isn't set up we log a single line
+        and return — the user still gets a working tray with no relay."""
+        relay_cfg = (self._config.get("relay") or {})
+        if not (relay_cfg.get("url") or "").strip():
+            logger.info("Relay disabled (no relay.url) — phone relay won't be available.")
+            return
+
+        try:
+            from orchestrator.relay_worker import run_relay_worker
+        except Exception as e:
+            logger.warning(f"Couldn't import relay_worker: {e}")
+            return
+
+        async def _boot():
+            # The lock has to be created on the loop that will await it.
+            if self._agent_lock is None:
+                self._agent_lock = asyncio.Lock()
+            await run_relay_worker(
+                self._config,
+                ui_bridge=self._bridge,
+                voice_engine=self._voice,
+                agent_lock=self._agent_lock,
+            )
+
+        self._relay_worker_future = self._runner.spawn_daemon(_boot())
+        logger.info("Relay worker scheduled.")
+
     def _cleanup(self) -> None:
         if self._hotkey_listener:
             try:
@@ -215,6 +267,12 @@ class KimApp:
         if self._icon:
             try:
                 self._icon.stop()
+            except Exception:
+                pass
+        # Cancel the relay worker so the asyncio loop can exit cleanly.
+        if self._relay_worker_future is not None and not self._relay_worker_future.done():
+            try:
+                self._relay_worker_future.cancel()
             except Exception:
                 pass
         self._runner.stop()
@@ -409,14 +467,20 @@ class KimApp:
         self._update_icon_colour(_COLOUR_RUNNING)
 
         async def _run():
+            # Lazily create the shared lock on first use, on the loop that
+            # owns it. The relay worker uses the same lock so a phone-sourced
+            # task can't sneak in while a local one is running.
+            if self._agent_lock is None:
+                self._agent_lock = asyncio.Lock()
             try:
-                async with mcp_agent_context(
-                    self._config,
-                    provider_name=self._active_provider,
-                    ui_bridge=self._bridge,
-                    voice_engine=self._voice,
-                ) as agent:
-                    result = await agent.run(task)
+                async with self._agent_lock:
+                    async with mcp_agent_context(
+                        self._config,
+                        provider_name=self._active_provider,
+                        ui_bridge=self._bridge,
+                        voice_engine=self._voice,
+                    ) as agent:
+                        result = await agent.run(task)
                 self._root.after(0, self._on_task_done, result, True)
             except asyncio.CancelledError:
                 self._root.after(0, self._on_task_done, "Cancelled", False)

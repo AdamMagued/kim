@@ -8,6 +8,9 @@ import { toast } from './Toast';
 interface OllamaModelInfo {
   name: string;
   size: number;
+  family?: string | null;
+  parameter_size?: string | null;
+  quantization_level?: string | null;
   cloud: boolean;
   installed: boolean;
 }
@@ -35,8 +38,12 @@ interface ProviderPickerProps {
   };
   /** Called when the user picks a different provider. */
   onChangeProvider: (next: string) => void | Promise<void>;
+  /** Called when the user switches Ollama between local/cloud mode. */
+  onChangeOllamaMode: (mode: 'local' | 'cloud') => void | Promise<void>;
   /** Called when the user picks a different Ollama model. */
   onChangeOllamaModel: (mode: 'local' | 'cloud', model: string) => void | Promise<void>;
+  /** Opens the full Ollama settings pane for local daemon details / pulls. */
+  onOpenOllamaSettings?: () => void;
   /** Disabled while a task is running. */
   disabled?: boolean;
 }
@@ -56,42 +63,28 @@ const API_PROVIDERS: { id: string; label: string }[] = [
   { id: 'deepseek', label: 'DeepSeek API' },
 ];
 
-function bytesToHuman(n: number): string {
-  if (!n) return '';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
-  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
-}
-
 /**
  * Unified provider/model picker. Replaces the older AuthIndicator chip with a
  * single control that lets the user:
- *   - Switch between Browser / API / Local (Ollama) providers.
+ *   - Switch between Ollama / Browser / API providers.
  *   - Sign in to a browser provider inline.
- *   - Pick from available Ollama models (local + cloud) with search.
+ *   - Pick Ollama mode/model inline under the composer.
  *
  * The pill shows the CURRENT selection plus a status badge — e.g.
- * "Browser: ChatGPT · signed in" or "Ollama · gpt-oss:120b-cloud · connected"
- * or "Claude API". Click to open the picker panel.
+ * "Browser: ChatGPT · signed in", "Ollama · cloud", or "Claude API".
  */
 export function ProviderPicker({
   resolvedProvider,
   ollama,
   onChangeProvider,
+  onChangeOllamaMode,
   onChangeOllamaModel,
+  onOpenOllamaSettings,
   disabled = false,
 }: ProviderPickerProps) {
   const [open, setOpen] = useState(false);
-  const [search, setSearch] = useState('');
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
   const [ollamaLoading, setOllamaLoading] = useState(false);
-  // Mode tab inside the Ollama section — defaults to whatever the user last
-  // saved in settings, but the user can flip it inside the dropdown to browse
-  // the other side's models without committing yet (no save until they click
-  // a model).
-  const [ollamaModeTab, setOllamaModeTab] = useState<'local' | 'cloud'>(ollama.mode);
   const panelRef = useRef<HTMLDivElement | null>(null);
 
   // Currently active provider category — derived from resolvedProvider.
@@ -99,12 +92,6 @@ export function ProviderPicker({
   const isOllama  = resolvedProvider === 'ollama';
   const currentBrowserSite = isBrowser ? resolvedProvider.slice('browser:'.length) : '';
   const currentApiProvider = !isBrowser && !isOllama ? resolvedProvider : '';
-
-  // Keep the in-dropdown tab in sync with the persisted Ollama mode when it
-  // changes from elsewhere (e.g. user switched via Settings panel).
-  useEffect(() => {
-    setOllamaModeTab(ollama.mode);
-  }, [ollama.mode]);
 
   // Browser-provider auth status — only for the currently selected one
   // (probing all 5 at once would create unnecessary popups / requests).
@@ -188,9 +175,7 @@ export function ProviderPicker({
       return `Browser: ${currentBrowserLabel}`;
     }
     if (isOllama) {
-      const model =
-        ollama.mode === 'cloud' ? ollama.cloud_model : ollama.local_model;
-      return model ? `Ollama · ${model}` : 'Ollama';
+      return `Ollama · ${ollama.mode}`;
     }
     const label = API_PROVIDERS.find(p => p.id === resolvedProvider)?.label
       ?? resolvedProvider;
@@ -221,17 +206,34 @@ export function ProviderPicker({
     status === 'warn' ? '#eab308' :
                         'var(--kim-text-3)';
 
-  // Models shown for the currently-selected Ollama mode tab. Local and cloud
-  // are two distinct catalogues from the user's perspective — the user picks
-  // the bucket first ("Local" or "Cloud") and only then sees the models that
-  // live in it. Search filters within the active bucket.
-  const activeOllamaModels = useMemo(() => {
-    const list = ollamaModeTab === 'cloud'
+  const inlineOllamaModels = useMemo(() => {
+    const base = ollama.mode === 'cloud'
       ? (ollamaStatus?.cloud_models ?? [])
       : (ollamaStatus?.local_models ?? []);
-    const q = search.trim().toLowerCase();
-    return q ? list.filter(m => m.name.toLowerCase().includes(q)) : list;
-  }, [ollamaStatus, ollamaModeTab, search]);
+    const selected = ollama.mode === 'cloud' ? ollama.cloud_model : ollama.local_model;
+    if (!selected || base.some(m => m.name === selected)) return base;
+    return [
+      ...base,
+      {
+        name: selected,
+        size: 0,
+        family: null,
+        parameter_size: null,
+        quantization_level: null,
+        cloud: ollama.mode === 'cloud',
+        installed: false,
+      },
+    ];
+  }, [ollama.mode, ollama.cloud_model, ollama.local_model, ollamaStatus]);
+  const selectedOllamaModel = ollama.mode === 'cloud'
+    ? (ollama.cloud_model || 'gpt-oss:120b-cloud')
+    : ollama.local_model;
+  const selectedOllamaModelInfo = inlineOllamaModels.find(m => m.name === selectedOllamaModel);
+  const selectedOllamaMeta = [
+    selectedOllamaModelInfo?.parameter_size,
+    selectedOllamaModelInfo?.quantization_level,
+    selectedOllamaModelInfo?.family,
+  ].filter(Boolean).join(' · ');
 
   // Action handlers ------------------------------------------------------
   const pick = (next: string) => {
@@ -240,11 +242,10 @@ export function ProviderPicker({
     setOpen(false);
   };
 
-  const pickOllamaModel = (mode: 'local' | 'cloud', model: string) => {
+  const switchOllamaMode = (mode: 'local' | 'cloud') => {
     if (disabled) return;
-    void onChangeOllamaModel(mode, model);
+    void onChangeOllamaMode(mode);
     if (resolvedProvider !== 'ollama') void onChangeProvider('ollama');
-    setOpen(false);
   };
 
   const signInCurrent = async () => {
@@ -291,7 +292,7 @@ export function ProviderPicker({
         }
         onClick={() => !disabled && setOpen(v => !v)}
         disabled={disabled}
-        title="Change model or sign in"
+        title="Change provider"
       >
         <span
           className="kim-provider-picker__dot"
@@ -335,166 +336,112 @@ export function ProviderPicker({
         </button>
       )}
 
-      {open && (
-        <div className="kim-provider-picker__panel" role="menu">
-          {/* ── Local (Ollama) ──────────────────────────────────────── */}
-          <div className="kim-provider-picker__section-label">
-            Ollama <span>local or cloud · no API key</span>
+      {isOllama && (
+        <div className="kim-provider-picker__ollama-inline" aria-label="Ollama quick settings">
+          <div className="kim-provider-picker__mode-switch" role="group" aria-label="Ollama mode">
+            <button
+              type="button"
+              className={'kim-provider-picker__mode-option' + (ollama.mode === 'cloud' ? ' is-active' : '')}
+              onClick={() => switchOllamaMode('cloud')}
+              disabled={disabled}
+            >
+              Cloud
+            </button>
+            <button
+              type="button"
+              className={'kim-provider-picker__mode-option' + (ollama.mode === 'local' ? ' is-active' : '')}
+              onClick={() => switchOllamaMode('local')}
+              disabled={disabled}
+            >
+              Local
+            </button>
           </div>
 
-          {/* Connection state row — shown regardless of which tab is active,
-           *  because if Ollama itself isn't running you can't reach either
-           *  mode. (Cloud models still go THROUGH the local ollama daemon.) */}
-          {(() => {
-            if (ollamaLoading && !ollamaStatus) {
-              return (
-                <div className="kim-provider-picker__status">
-                  Checking Ollama…
-                </div>
-              );
-            }
-            if (!ollamaStatus || !ollamaStatus.installed) {
-              return (
-                <div className="kim-provider-picker__status kim-provider-picker__status--warn">
-                  <span>Ollama not installed</span>
-                  <a href="https://ollama.com/download" target="_blank" rel="noreferrer">
-                    Get it →
-                  </a>
-                </div>
-              );
-            }
-            if (!ollamaStatus.running) {
-              return (
-                <div className="kim-provider-picker__status kim-provider-picker__status--warn">
-                  Ollama installed but not running
-                </div>
-              );
-            }
-            return (
-              <div className="kim-provider-picker__status kim-provider-picker__status--ok">
-                Connected{ollamaStatus.version ? ` · v${ollamaStatus.version}` : ''}
-              </div>
-            );
-          })()}
+          <label className="kim-provider-picker__model-field">
+            <span className="kim-provider-picker__model-field-label">Model</span>
+            <span className="kim-provider-picker__select-wrap">
+              <select
+                value={selectedOllamaModel}
+                disabled={disabled || !ollamaStatus?.running || inlineOllamaModels.length === 0}
+                onChange={e => {
+                  const model = e.target.value;
+                  if (model) void onChangeOllamaModel(ollama.mode, model);
+                }}
+              >
+                {ollama.mode === 'local' && inlineOllamaModels.length === 0 && (
+                  <option value="">No local models</option>
+                )}
+                {ollama.mode === 'cloud' && inlineOllamaModels.length === 0 && (
+                  <option value="gpt-oss:120b-cloud">gpt-oss:120b-cloud</option>
+                )}
+                {inlineOllamaModels.map(model => (
+                  <option key={`${ollama.mode}-${model.name}`} value={model.name}>
+                    {model.name}
+                    {model.parameter_size ? ` · ${model.parameter_size}` : ''}
+                    {model.quantization_level ? ` · ${model.quantization_level}` : ''}
+                  </option>
+                ))}
+              </select>
+              <svg viewBox="0 0 10 10" width="9" height="9" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M2 4l3 3 3-3" />
+              </svg>
+            </span>
+            {selectedOllamaMeta && <span className="kim-provider-picker__model-meta">{selectedOllamaMeta}</span>}
+          </label>
 
-          {/* Local/Cloud mode tabs — only meaningful when the daemon is up. */}
-          {ollamaStatus?.running && (
-            <div className="kim-provider-picker__ollama-tabs" role="tablist">
+          {ollama.mode === 'local' ? (
+            <button
+              type="button"
+              className="kim-provider-picker__mini-settings"
+              onClick={onOpenOllamaSettings}
+              disabled={disabled || !onOpenOllamaSettings}
+              title="Configure local Ollama"
+              aria-label="Configure local Ollama"
+            >
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="8" cy="8" r="2.2" />
+                <path d="M8 1.8v1.5M8 12.7v1.5M3.6 3.6l1 1M11.4 11.4l1 1M1.8 8h1.5M12.7 8h1.5M3.6 12.4l1-1M11.4 4.6l1-1" />
+              </svg>
+              <span>Configure local</span>
+            </button>
+          ) : (
+            ollamaStatus?.running && !ollamaStatus.cloud_connected && (
               <button
                 type="button"
-                role="tab"
-                aria-selected={ollamaModeTab === 'local'}
-                className={
-                  'kim-provider-picker__ollama-tab' +
-                  (ollamaModeTab === 'local' ? ' is-active' : '')
-                }
-                onClick={() => { setOllamaModeTab('local'); setSearch(''); }}
+                className="kim-provider-picker__signin-btn"
+                onClick={async () => {
+                  try {
+                    await invoke('ollama_signin');
+                    toast('Opening Ollama sign-in...', 'info', 2500);
+                    setTimeout(() => { void refreshOllama(); }, 800);
+                  } catch (err) {
+                    toast(`Could not open Ollama sign-in: ${err}`, 'error', 4000);
+                  }
+                }}
               >
-                Local
-                <span className="kim-provider-picker__ollama-tab-count">
-                  {ollamaStatus.local_models.length}
-                </span>
+                Sign in
               </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={ollamaModeTab === 'cloud'}
-                className={
-                  'kim-provider-picker__ollama-tab' +
-                  (ollamaModeTab === 'cloud' ? ' is-active' : '')
-                }
-                onClick={() => { setOllamaModeTab('cloud'); setSearch(''); }}
-              >
-                Cloud
-                <span className="kim-provider-picker__ollama-tab-count">
-                  {ollamaStatus.cloud_models.length}
-                </span>
-              </button>
-            </div>
-          )}
-
-          {/* Cloud-specific status (signed in to ollama.com or not). Only when
-           *  Cloud tab is active and the daemon is reachable. */}
-          {ollamaStatus?.running && ollamaModeTab === 'cloud' && (
-            ollamaStatus.cloud_connected ? (
-              <div className="kim-provider-picker__status kim-provider-picker__status--ok">
-                Cloud signed in
-              </div>
-            ) : (
-              <div className="kim-provider-picker__status kim-provider-picker__status--warn">
-                <span>{ollamaStatus.cloud_message ?? 'Not signed in to Ollama Cloud'}</span>
-                <button
-                  type="button"
-                  className="kim-provider-picker__row-action"
-                  onClick={async (e) => {
-                    e.stopPropagation();
-                    try {
-                      await invoke('ollama_signin');
-                      toast('Opening Ollama sign-in…', 'info', 2500);
-                      setTimeout(() => { void refreshOllama(); }, 800);
-                    } catch (err) {
-                      toast(`Could not open Ollama sign-in: ${err}`, 'error', 4000);
-                    }
-                  }}
-                >
-                  Sign in
-                </button>
-              </div>
             )
           )}
+        </div>
+      )}
 
-          {/* Search field appears once the active bucket has enough entries
-           *  to justify it (≥6). Below that it's just clutter. */}
-          {ollamaStatus?.running &&
-            (ollamaModeTab === 'cloud' ? ollamaStatus.cloud_models : ollamaStatus.local_models).length > 6 && (
-              <input
-                type="text"
-                className="kim-provider-picker__search"
-                placeholder={`Search ${ollamaModeTab} models…`}
-                value={search}
-                onChange={e => setSearch(e.target.value)}
-              />
-            )}
-
-          {/* Active-bucket model list. */}
-          {ollamaStatus?.running && activeOllamaModels.length > 0 && (
-            <div className="kim-provider-picker__model-list">
-              {activeOllamaModels.map(m => {
-                const selected = isOllama && (
-                  ollamaModeTab === 'cloud'
-                    ? ollama.cloud_model === m.name
-                    : ollama.local_model === m.name
-                );
-                return (
-                  <button
-                    key={`${ollamaModeTab}-${m.name}`}
-                    type="button"
-                    className={'kim-provider-picker__item' + (selected ? ' is-active' : '')}
-                    onClick={() => pickOllamaModel(ollamaModeTab, m.name)}
-                  >
-                    <span className="kim-provider-picker__item-name">{m.name}</span>
-                    <span className="kim-provider-picker__badge">
-                      {ollamaModeTab === 'cloud'
-                        ? (m.installed ? 'pulled' : 'cloud')
-                        : (bytesToHuman(m.size) || 'local')}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-
-          {/* Empty states for the active bucket. */}
-          {ollamaStatus?.running && activeOllamaModels.length === 0 && search && (
-            <div className="kim-provider-picker__status">
-              No {ollamaModeTab} models match "{search}"
-            </div>
-          )}
-          {ollamaStatus?.running && activeOllamaModels.length === 0 && !search && ollamaModeTab === 'local' && (
-            <div className="kim-provider-picker__status">
-              No local models yet. Pull one in Settings → AI → Ollama.
-            </div>
-          )}
+      {open && (
+        <div className="kim-provider-picker__panel" role="menu">
+          {/* ── Model provider ──────────────────────────────────────── */}
+          <div className="kim-provider-picker__section-label">
+            Model <span>local, cloud, browser, or API</span>
+          </div>
+          <button
+            type="button"
+            className={'kim-provider-picker__item' + (isOllama ? ' is-active' : '')}
+            onClick={() => pick('ollama')}
+          >
+            <span className="kim-provider-picker__item-name">Ollama</span>
+            <span className="kim-provider-picker__badge">
+              no API key
+            </span>
+          </button>
 
           {/* ── Browser providers ───────────────────────────────────── */}
           <div className="kim-provider-picker__section-label">

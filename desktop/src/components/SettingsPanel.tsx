@@ -4,6 +4,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type { Settings, Provider, Theme, VoiceEngine, VoiceSettings, AccentTheme, KimAccount, GoogleAccount, GoogleApiAccount, TypingAnimation } from '../types';
 import { VOICES_BY_ENGINE } from '../types';
 import { toast } from './Toast';
+import { PairingModal } from './PairingModal';
 
 
 const PROVIDERS: { value: Provider; label: string }[] = [
@@ -38,7 +39,7 @@ const TYPING_ANIMATIONS: { value: string; label: string; desc: string; icon: str
   { value: 'char-blur',  label: 'Char blur',   desc: 'Letters crystallise from blur',  icon: '◎' },
 ];
 
-type NavSection = 'appearance' | 'ai' | 'voice' | 'paths' | 'data' | 'account' | 'mcp' | 'feedback' | 'about';
+type NavSection = 'appearance' | 'ai' | 'voice' | 'paths' | 'data' | 'account' | 'mcp' | 'relay' | 'feedback' | 'about';
 
 interface NavItem {
   id: NavSection;
@@ -208,6 +209,14 @@ function PickerIcon() {
     </svg>
   );
 }
+function PhoneIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="7" y="2" width="10" height="20" rx="2" />
+      <path d="M11 18h2" />
+    </svg>
+  );
+}
 
 const THEMES: { value: Theme; label: string; icon: ReactElement }[] = [
   { value: 'light', label: 'Light', icon: <SunIcon /> },
@@ -223,6 +232,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'data',       label: 'Data',       icon: <DatabaseIcon /> },
   { id: 'account',    label: 'Account',    icon: <UserIcon /> },
   { id: 'mcp',        label: 'MCP',        icon: <PlugIcon /> },
+  { id: 'relay',      label: 'Phone Relay', icon: <PhoneIcon /> },
   { id: 'feedback',   label: 'Feedback',   icon: <MessageSquareIcon /> },
   { id: 'about',      label: 'About',      icon: <InfoIcon /> },
 ];
@@ -1349,6 +1359,138 @@ mcp_servers:
 
 // ── Feedback section ──────────────────────────────────────────────────────────
 
+// ── Phone Relay section ───────────────────────────────────────────────────────
+
+interface RelayConfigSnapshot {
+  url: string;
+  pc_key_configured: boolean;
+}
+
+function PhoneRelaySection({ settings }: { settings: Settings }) {
+  const [cfg, setCfg] = useState<RelayConfigSnapshot | null>(null);
+  const [urlDraft, setUrlDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [pairOpen, setPairOpen] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // Pull live config from Rust on mount so the URL stays in sync with the
+  // YAML (someone might have edited it by hand).
+  async function refresh() {
+    try {
+      const snap = await invoke<RelayConfigSnapshot>('read_relay_config', {
+        projectRoot: settings.project_root || null,
+      });
+      setCfg(snap);
+      setUrlDraft(snap.url);
+      setErr(null);
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+  useEffect(() => { refresh(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+
+  async function saveUrl() {
+    setSaving(true);
+    try {
+      await invoke('write_relay_url', {
+        url: urlDraft.trim(),
+        projectRoot: settings.project_root || null,
+      });
+      toast('Relay URL saved.');
+      await refresh();
+    } catch (e) {
+      toast(`Failed to save: ${String(e)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const urlDirty = (cfg?.url ?? '') !== urlDraft.trim();
+  const canPair = !!(cfg?.url && cfg?.pc_key_configured);
+
+  return (
+    <div className="kim-settings-content">
+      <div className="kim-settings-content__title">Phone Relay</div>
+
+      <p style={{ color: 'var(--kim-text-muted)', fontSize: 13, lineHeight: 1.55, marginBottom: 16 }}>
+        Send prompts from your phone to this PC. Kim runs the task here (with full
+        access to your files, browser, and screen) and streams the result back.
+        Pair once with a QR code; after that, prompts route automatically while
+        relay mode is on.
+      </p>
+
+      <Field
+        label="Relay URL"
+        hint="The relay server that bridges phone ↔ PC. Self-host or use the one shared with you."
+      >
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            className="kim-input"
+            placeholder="https://kim-relay.fly.dev"
+            value={urlDraft}
+            onChange={(e) => setUrlDraft(e.target.value)}
+            spellCheck={false}
+            autoCapitalize="none"
+            autoCorrect="off"
+            style={{ flex: 1 }}
+          />
+          <button
+            className="kim-btn kim-btn--primary"
+            onClick={saveUrl}
+            disabled={!urlDirty || saving}
+          >
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </Field>
+
+      <Field
+        label="PC API key"
+        hint="Stored in .env as RELAY_PC_API_KEY. Set this before pairing."
+      >
+        <div className="kim-pill" data-state={cfg?.pc_key_configured ? 'ok' : 'warn'}>
+          {cfg?.pc_key_configured
+            ? '✓ Configured — your PC can authenticate to the relay.'
+            : '⚠ Missing — add RELAY_PC_API_KEY=… to .env in the project root.'}
+        </div>
+      </Field>
+
+      {err && (
+        <div className="kim-pill" data-state="warn" style={{ marginTop: 12 }}>
+          {err}
+        </div>
+      )}
+
+      <div style={{ marginTop: 24, display: 'flex', gap: 12, alignItems: 'center' }}>
+        <button
+          className="kim-btn kim-btn--primary"
+          onClick={() => setPairOpen(true)}
+          disabled={!canPair}
+          title={
+            !cfg?.url
+              ? 'Set a relay URL first.'
+              : !cfg.pc_key_configured
+              ? 'Add RELAY_PC_API_KEY to .env first.'
+              : ''
+          }
+        >
+          Pair a phone
+        </button>
+        <span style={{ color: 'var(--kim-text-muted)', fontSize: 12 }}>
+          You'll get a QR. Open Kim on the phone → Settings → Phone Relay → paste it.
+        </span>
+      </div>
+
+      <PairingModal
+        open={pairOpen}
+        onClose={() => setPairOpen(false)}
+        projectRoot={settings.project_root || undefined}
+      />
+    </div>
+  );
+}
+
+
 const FEEDBACK_CATEGORIES = [
   { id: 'bug',     label: 'Bug',             desc: 'Something is broken or not working' },
   { id: 'feature', label: 'Feature request', desc: 'Something you\'d like Kim to do' },
@@ -1528,6 +1670,7 @@ export function SettingsPanel({ settings, onChange, onClose, appVersion, onCheck
           {activeSection === 'data'       && <DataSection account={account} onAccountChange={onAccountChange} />}
           {activeSection === 'account'    && <AccountSection account={account} onAccountChange={onAccountChange} />}
           {activeSection === 'mcp'        && <MCPSection />}
+          {activeSection === 'relay'      && <PhoneRelaySection settings={settings} />}
           {activeSection === 'feedback'   && <FeedbackSection />}
           {activeSection === 'about'      && <AboutSection appVersion={appVersion} onCheckUpdate={onCheckUpdate} />}
         </div>

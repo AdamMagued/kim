@@ -452,6 +452,10 @@ export default function App() {
           onTaskDone={handleTaskDone}
           account={account}
           onAccountChange={setAccount}
+          onOpenSettings={(pane) => {
+            setSettingsInitialPane(pane);
+            setShowSettings(true);
+          }}
           activeTab={activeTab}
           activeProjectPath={activeProjectPath}
           reloadSessions={refresh}

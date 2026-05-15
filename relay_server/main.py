@@ -43,6 +43,10 @@ from fastapi.responses import JSONResponse
 
 from relay_server.auth import require_any_key, require_pc_key, require_phone_key
 from relay_server.models import (
+    PairCompleteRequest,
+    PairCompleteResponse,
+    PairInitResponse,
+    PairStatusResponse,
     PromptRequest,
     PromptResponse,
     ResultRequest,
@@ -256,6 +260,67 @@ async def get_status() -> StatusResponse:
     )
 
 
+# ── Pairing ────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/pair/init",
+    response_model=PairInitResponse,
+    summary="PC: start a new pairing handshake",
+    dependencies=[Depends(require_pc_key)],
+)
+async def pair_init() -> PairInitResponse:
+    """
+    PC asks the relay for a short-lived `pair_code`. The PC's UI renders the
+    code as a QR. A phone scans it and calls `/pair/complete` to redeem.
+    The code is single-use and expires after `PAIR_CODE_TTL_S` seconds.
+    """
+    result = await db.create_pairing()
+    return PairInitResponse(**result)
+
+
+@app.post(
+    "/pair/complete",
+    response_model=PairCompleteResponse,
+    summary="Phone: redeem a pair_code in exchange for a long-lived device_token",
+)
+async def pair_complete(body: PairCompleteRequest) -> PairCompleteResponse:
+    """
+    Phone exchanges the short-lived `pair_code` (shown on the PC) for a
+    permanent `device_token`. The token is used as `X-API-Key` in every
+    subsequent request. No prior credential is required — possession of the
+    code is the proof, and the code is invalidated atomically on success.
+    """
+    result = await db.complete_pairing(body.pair_code, body.device_name)
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pairing code is invalid, expired, or already used.",
+        )
+    return PairCompleteResponse(**result)
+
+
+@app.get(
+    "/pair/status/{pair_code}",
+    response_model=PairStatusResponse,
+    summary="PC: check whether a pair_code has been redeemed yet",
+    dependencies=[Depends(require_pc_key)],
+)
+async def pair_status(pair_code: str) -> PairStatusResponse:
+    """
+    PC polls this to know when the phone has scanned the QR. Returns
+    `claimed=True` once the handshake completes; the PC then closes its
+    pairing modal.
+    """
+    pair_code = pair_code.strip().upper()
+    info = await db.get_pairing_status(pair_code)
+    if info is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Pairing code {pair_code!r} not found",
+        )
+    return PairStatusResponse(**info)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     """
@@ -271,7 +336,11 @@ async def websocket_endpoint(ws: WebSocket):
     # we enforce header-based auth to avoid token leakage in URL logs.
     token_header = ws.headers.get("x-api-key", "")
     phone_key = os.environ.get("RELAY_PHONE_API_KEY", "")
-    if not phone_key or not token_header or not secrets.compare_digest(token_header, phone_key):
+    authed = (
+        bool(phone_key and token_header and secrets.compare_digest(token_header, phone_key))
+        or (token_header and (await db.lookup_device_by_token(token_header)) is not None)
+    )
+    if not authed:
         await ws.close(code=4001, reason="Invalid or missing token header")
         return
 

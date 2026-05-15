@@ -423,6 +423,11 @@ class KimAgent:
         # on cumulative input/context tokens. Output tokens are still retained
         # for legacy [STATS] UI when providers return exact usage.
         self._total_tokens: dict = {"input": 0, "output": 0}
+        self._last_plan_signature = ""
+        self._last_step_signature = ""
+        self._last_done_signature = ""
+        self._current_plan_steps: list[str] = []
+        self._current_step_index = 0
         configured_budget = (
             config.get("context_budget_tokens")
             or os.environ.get("KIM_CONTEXT_BUDGET_TOKENS")
@@ -455,6 +460,9 @@ class KimAgent:
     # the PLAN block or the same STEP marker; we only want to emit each once).
     _last_plan_signature: str = ""
     _last_step_signature: str = ""
+    _last_done_signature: str = ""
+    _current_plan_steps: list[str] = []
+    _current_step_index: int = 0
 
     def _emit_plan_markers(self, content: str) -> None:
         """Detect PLAN: / STEP n: markers in an assistant text turn and forward
@@ -498,7 +506,10 @@ class KimAgent:
                 sig = json.dumps(plan_payload, separators=(",", ":"), ensure_ascii=False)
                 if sig != self._last_plan_signature:
                     self._last_plan_signature = sig
+                    self._current_plan_steps = plan_payload["steps"]
+                    self._current_step_index = 0
                     self._last_step_signature = ""  # reset step dedupe on new plan
+                    self._last_done_signature = ""
                     self._log("INFO", f"[STATUS] [PLAN]{sig}")
 
         # ── STEP markers ────────────────────────────────────────────────
@@ -518,7 +529,24 @@ class KimAgent:
             sig = json.dumps(step_payload, separators=(",", ":"), ensure_ascii=False)
             if sig != self._last_step_signature:
                 self._last_step_signature = sig
+                self._current_step_index = int(m.group(1))
                 self._log("INFO", f"[STATUS] [STEP]{sig}")
+
+        # ── DONE markers ────────────────────────────────────────────────
+        done_matches = list(
+            re.finditer(
+                r"^\s*DONE\s*(\d+)\s*:\s*(.+?)\s*$",
+                content,
+                re.IGNORECASE | re.MULTILINE,
+            )
+        )
+        if done_matches:
+            m = done_matches[-1]
+            done_payload = {"index": int(m.group(1)), "summary": m.group(2).strip()[:160]}
+            sig = json.dumps(done_payload, separators=(",", ":"), ensure_ascii=False)
+            if sig != self._last_done_signature:
+                self._last_done_signature = sig
+                self._log("INFO", f"[STATUS] [DONE]{sig}")
 
     def _is_preview_mode(self) -> bool:
         if self._ui_bridge is not None:
@@ -630,6 +658,9 @@ class KimAgent:
         # already emitted a plan with the same hash).
         self._last_plan_signature = ""
         self._last_step_signature = ""
+        self._last_done_signature = ""
+        self._current_plan_steps = []
+        self._current_step_index = 0
 
         if task.strip().lower() in _COMPACT_CONTROL_TASKS:
             return await self._compact_and_reset_context()
@@ -720,6 +751,7 @@ class KimAgent:
 
             # ── Tool call ────────────────────────────────────────────────
             if response["type"] == "tool_call":
+                self._emit_plan_markers(str(response.get("content", "")))
                 consecutive_continues = 0
                 raw_tool_name = response["tool"]
                 tool_name = _normalize_tool_name(raw_tool_name)
@@ -1243,8 +1275,11 @@ Rules:
 - After the plan, on your NEXT turn, emit `STEP 1: <step name>` on a line by
   itself, THEN start executing that step (with a tool call in the SAME turn is
   fine — put `STEP 1: ...` on its own line at the top of your text).
-- When a step is done and you are moving to the next one, emit
-  `STEP <n+1>: <name>` on a line by itself before the next action.
+- When a step is done, emit `DONE <n>: <brief completed result>` on a line by
+  itself. Then, if more work remains, emit `STEP <n+1>: <name>` on a line by
+  itself before the next action.
+- Before `TASK_COMPLETE`, emit `DONE <n>: <brief completed result>` for the
+  final active step if you have not already done so.
 - If the plan changes mid-task (you discovered a new step is needed), emit a new
   `PLAN: <n> steps` block that supersedes the previous one.
 
@@ -1327,8 +1362,11 @@ Use 2–8 steps. Each step name is a short imperative phrase (e.g. "Open Mail",
 
 After the plan, before executing each step emit `STEP <n>: <step name>` on a
 line by itself (you may then call a tool in the same turn). When the work for
-step n is finished and you move to step n+1, emit the new `STEP n+1: ...`
-marker first. The user's UI renders a live checklist from PLAN/STEP markers.
+step n is finished, emit `DONE <n>: <brief completed result>` on a line by
+itself. If more work remains, emit `STEP n+1: ...` before the next action.
+Before `TASK_COMPLETE`, emit `DONE <n>: <brief completed result>` for the final
+active step if you have not already done so. The user's UI renders a live
+checklist from PLAN/STEP/DONE markers.
 
 Skip the plan entirely for trivial one-shot tasks (single tool call or a direct
 knowledge answer).

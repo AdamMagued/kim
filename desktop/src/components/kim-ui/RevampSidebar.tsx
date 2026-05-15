@@ -215,7 +215,7 @@ export function RevampSidebar({
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'center',
-          padding: '14px 8px',
+          padding: '58px 8px 14px',
           gap: 12,
         }}
       >
@@ -270,7 +270,7 @@ export function RevampSidebar({
         borderRight: '1px solid var(--kim-border)',
         display: 'flex',
         flexDirection: 'column',
-        padding: '16px 14px',
+        padding: '58px 14px 16px',
       }}
     >
       {/* Logo + collapse */}

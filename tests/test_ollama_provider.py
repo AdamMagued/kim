@@ -4,6 +4,7 @@ from unittest.mock import patch
 from orchestrator.providers.ollama import (
     DEFAULT_OLLAMA_CLOUD_MODEL,
     OllamaProvider,
+    _normalize_image_data,
     _normalize_tool_arguments,
     _parse_num_ctx,
     _parse_ollama_ps_context,
@@ -50,6 +51,69 @@ llama3.2:latest         def456          2.0 GB    100% GPU     4 minutes from no
         self.assertEqual(provider._base_url, "http://127.0.0.1:11434")
         self.assertEqual(provider._mode, "cloud")
         self.assertEqual(provider._cloud_model, DEFAULT_OLLAMA_CLOUD_MODEL)
+
+    def test_image_content_uses_ollama_images_field_not_text_json(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        converted = provider._to_ollama_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Screenshot captured."},
+                        {"type": "image", "data": "abc123", "media_type": "image/png"},
+                    ],
+                }
+            ],
+            "",
+        )
+        self.assertEqual(converted, [{"role": "user", "content": "Screenshot captured.", "images": ["abc123"]}])
+        self.assertNotIn("abc123", converted[0]["content"])
+
+    def test_image_content_strips_data_url_prefix(self):
+        self.assertEqual(
+            _normalize_image_data("data:image/png;base64,abc123"),
+            "abc123",
+        )
+
+    def test_tool_call_transcript_uses_ollama_native_roles(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        converted = provider._to_ollama_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": '{"type":"tool_call","tool":"observe_ui","args":{"target":"screen"},"usage":{"input":99}}',
+                },
+                {
+                    "role": "user",
+                    "content": "[Tool result: observe_ui]\n{\"ok\":true}",
+                },
+            ],
+            "",
+        )
+        self.assertEqual(converted[0]["role"], "assistant")
+        self.assertEqual(converted[0]["tool_calls"][0]["function"]["name"], "observe_ui")
+        self.assertNotIn("usage", converted[0]["content"])
+        self.assertEqual(
+            converted[1],
+            {"role": "tool", "tool_name": "observe_ui", "content": '{"ok":true}'},
+        )
+
+    def test_screenshot_tool_result_stays_image_message(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        converted = provider._to_ollama_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "[Tool result: take_screenshot]\nScreenshot captured."},
+                        {"type": "image", "data": "abc123", "media_type": "image/png"},
+                    ],
+                }
+            ],
+            "",
+        )
+        self.assertEqual(converted[0]["role"], "user")
+        self.assertEqual(converted[0]["images"], ["abc123"])
 
 
 if __name__ == "__main__":
