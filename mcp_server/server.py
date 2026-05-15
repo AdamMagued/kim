@@ -102,12 +102,24 @@ from mcp_server.tools.search import (
     handle_find_files,
 )
 
-# Logging goes to stderr — stdout is reserved for MCP protocol messages
-logging.basicConfig(
-    stream=sys.stderr,
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+# Logging goes to stderr — stdout is reserved for MCP protocol messages.
+# Try to attach the structured JSONL handler so `logs/kim_*.jsonl` is
+# actually produced (previously the helper was defined but never wired in).
+# Fall back to plain stderr-only logging if log-dir creation fails for any
+# reason — we must never crash the MCP server on a logging-setup failure.
+_LOG_LEVEL = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
+try:
+    from mcp_server.logger import setup_structured_logging
+    setup_structured_logging(level=_LOG_LEVEL, also_stderr=True)
+except Exception as _log_e:
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=_LOG_LEVEL,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    logging.getLogger("kim.server").warning(
+        "Structured logging disabled (%s); falling back to stderr only", _log_e
+    )
 logger = logging.getLogger("kim.server")
 
 server = Server("kim")
@@ -469,12 +481,15 @@ _TOOLS: list[Tool] = [
     # ── Keyboard ─────────────────────────────────────────────────────────────
     Tool(
         name="type_text",
-        description="Type a string of text at the current cursor position.",
+        description=(
+            "Type a string of text at the current cursor position. "
+            "Uses the system clipboard for paste, so it's instantaneous; "
+            "per-keystroke timing is not supported."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "Text to type"},
-                "interval": {"type": "number", "description": "Seconds between keystrokes", "default": 0.02},
             },
             "required": ["text"],
         },
@@ -543,7 +558,13 @@ _TOOLS: list[Tool] = [
     ),
     Tool(
         name="open_url",
-        description="Open a URL in the system default browser.",
+        description=(
+            "Open a URL in Kim's controlled (Playwright-driven) web browser. "
+            "Use this for sites you intend to inspect or interact with via "
+            "the web_* tools afterwards. For opening URLs in the user's own "
+            "default browser, use run_command with the appropriate platform "
+            "command (open / xdg-open / start)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {

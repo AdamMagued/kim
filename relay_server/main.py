@@ -191,23 +191,27 @@ async def post_result(body: ResultRequest) -> ResultResponse:
     after completing (or failing) a task.
     """
     _mark_pc_seen()
-    await db.complete(
+    updated = await db.complete(
         task_id=body.task_id,
         summary=body.summary,
         screenshot=body.screenshot,
         success=body.success,
     )
 
-    # Broadcast to any connected phone WebSocket clients
-    row = await db.get(body.task_id)
-    if row:
-        await ws_manager.broadcast({
-            "task_id":    body.task_id,
-            "status":     row["status"],
-            "summary":    body.summary,
-            "screenshot": body.screenshot,
-            "success":    body.success,
-        })
+    # Only broadcast on a real status transition. If `complete()` returned
+    # False the task_id was unknown (or already terminal) — broadcasting in
+    # that case would push a stale or fabricated status to every connected
+    # WS client.
+    if updated:
+        row = await db.get(body.task_id)
+        if row:
+            await ws_manager.broadcast({
+                "task_id":    body.task_id,
+                "status":     row["status"],
+                "summary":    body.summary,
+                "screenshot": body.screenshot,
+                "success":    body.success,
+            })
 
     return ResultResponse(ok=True)
 
@@ -237,6 +241,19 @@ async def get_result(task_id: str) -> TaskStatusResponse:
         created_at=_parse_ts(row.get("created_at")),
         completed_at=_parse_ts(row.get("completed_at")),
     )
+
+
+@app.get(
+    "/health",
+    summary="Liveness probe (no auth)",
+)
+async def get_health() -> dict:
+    """
+    Lightweight liveness probe used by Railway/Render/Fly healthchecks.
+    No authentication so the platform's prober can hit it without a key.
+    Does NOT leak queue depth or PC presence — use /status for that.
+    """
+    return {"ok": True}
 
 
 @app.get(

@@ -296,8 +296,17 @@ class MultiMCPClient:
         for session in self.sessions:
             res = await session.list_tools()
             for t in res.tools:
-                # If multiple servers provide the same tool name, the last one wins.
-                # Usually MCP tool names are expected to be unique within a client's context.
+                if t.name in self._tool_map and self._tool_map[t.name] is not session:
+                    # Name collision across servers. Without this warning the
+                    # later server would silently win and the tool would
+                    # route somewhere unexpected. Keep the FIRST registration
+                    # (servers earlier in config win) so behaviour is stable.
+                    logger.warning(
+                        "MCP tool name collision: %r is offered by multiple "
+                        "servers; keeping the first registration",
+                        t.name,
+                    )
+                    continue
                 self._tool_map[t.name] = session
                 all_tools.append(t)
         # Wrap in a simple object that has a .tools attribute to match MCP SDK expectations

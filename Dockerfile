@@ -38,6 +38,10 @@ ENV PYTHONPATH=/app
 
 EXPOSE 3001
 
-CMD ["python", "-m", "uvicorn", "relay_server.main:app", \
-     "--host", "0.0.0.0", "--port", "3001", \
-     "--workers", "1", "--log-level", "info"]
+# Use shell form so $PORT (injected by Railway/Render/Fly) expands at runtime.
+# The exec-form list-based CMD treated "$PORT" literally and ignored the env
+# var, so the container always bound to 3001 regardless of the platform's
+# assigned port.
+CMD python -m uvicorn relay_server.main:app \
+    --host 0.0.0.0 --port "${PORT:-3001}" \
+    --workers 1 --log-level info
