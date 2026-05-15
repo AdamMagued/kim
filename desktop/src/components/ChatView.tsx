@@ -2591,7 +2591,10 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
             onChange={handleTextareaInput}
             placeholder={isRunning
               ? (queueEnabled ? 'Kim is working — type now, Send adds to queue' : 'Kim is working — Send interrupts current task')
-              : attachedFiles.length > 0 ? 'Add a message or just send…' : 'Message Kim…'}
+              : attachedFiles.length > 0 ? 'Add a message or just send…'
+              : (activeTab === 'code' && activeProjectPath)
+                ? `What should we work on in ${activeProjectPath.split('/').filter(Boolean).pop() ?? 'this project'}?`
+                : 'Message Kim…'}
             rows={1}
             onKeyDown={e => {
               if (e.key === 'Enter' && !e.shiftKey) {
@@ -3131,7 +3134,10 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
                   lineHeight: 1.1,
                 }}
               >
-                {activeTab === 'code' ? 'What are we building?' : getGreeting(account.display_name.split(' ')[0])}
+                {activeTab === 'code' && activeProjectPath
+                  ? `What should we work on in ${activeProjectPath.split('/').filter(Boolean).pop() ?? 'this project'}?`
+                  : activeTab === 'code' ? 'What are we building?'
+                  : getGreeting(account.display_name.split(' ')[0])}
               </h1>
               <p
                 style={{
