@@ -23,7 +23,7 @@ class AnthropicProvider(BaseProvider):
             raise EnvironmentError("ANTHROPIC_API_KEY is not set")
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
         models = config.get("model", {})
-        self._model = models.get("claude", "claude-opus-4-5")
+        self._model = models.get("claude", "claude-opus-4-6")
         self._max_tokens = int(config.get("max_tokens", 4096))
         logger.info(f"AnthropicProvider: model={self._model}")
 

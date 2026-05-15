@@ -35,6 +35,31 @@ class UIElement:
 
 _LAST_ELEMENTS: dict[str, UIElement] = {}
 
+# Cached AX-trust result. None until probed; True/False once known. macOS TCC
+# is process-lifetime sticky — if we have access once, we have it for the rest
+# of this process, so cache to skip the AppleScript probe on every call.
+_AX_TRUSTED_CACHE: bool | None = None
+
+
+def _native_ax_trusted() -> bool | None:
+    """Return True if the current process has Accessibility access via the
+    native AX API, False if not, or None if PyObjC isn't available (caller
+    should fall back to the AppleScript probe).
+
+    This is more reliable than the AppleScript probe because it returns a
+    clean bool from the kernel's TCC layer, not an AppleScript error code
+    that can come from many sources.
+    """
+    try:
+        # ApplicationServices ships with macOS; on Python it lives under
+        # pyobjc-framework-ApplicationServices, but pyobjc-core +
+        # pyobjc-framework-Quartz (already required) pull in enough Cocoa
+        # bridging to import HIServices and call AXIsProcessTrusted.
+        from HIServices import AXIsProcessTrusted  # type: ignore
+        return bool(AXIsProcessTrusted())
+    except Exception:
+        return None
+
 
 async def _run_osascript(script: str, timeout: float = 15.0) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
@@ -171,25 +196,50 @@ def _format_observation(app: str, window: str, elements: list[UIElement], limit:
     return "\n".join(lines)
 
 
+_PERMISSION_HINT = (
+    "PERMISSION_ERROR: macOS Accessibility access is required for observe_ui. "
+    "Open System Settings → Privacy & Security → Accessibility and make sure "
+    "the process running Kim is enabled. If Kim is already listed there, "
+    "toggle it OFF then ON again — a recent rebuild can leave the TCC entry "
+    "pointing at the old binary signature. NEED_HELP and ask the user to grant it."
+)
+
+
 async def _observe_ui_macos(limit: int, depth: int) -> str:
-    preflight = '''
-        tell application "System Events"
-            set frontProc to first application process whose frontmost is true
-            try
-                set frontWin to front window of frontProc
-                return role of frontWin
-            on error errMsg number errNum
-                return "ERROR:" & errNum & ":" & errMsg
-            end try
-        end tell
-    '''
-    _, preflight_out, preflight_err = await _run_osascript(preflight, timeout=1.5)
-    if "-1719" in preflight_out or "-1719" in preflight_err:
-        return (
-            "PERMISSION_ERROR: macOS Accessibility access is required for observe_ui. "
-            "Open System Settings → Privacy & Security → Accessibility and add the "
-            "process running Kim. NEED_HELP and ask the user to grant it."
-        )
+    global _AX_TRUSTED_CACHE
+
+    # Prefer the native AX trust check — clean bool, no AppleScript ambiguity.
+    if _AX_TRUSTED_CACHE is None:
+        _AX_TRUSTED_CACHE = _native_ax_trusted()
+    if _AX_TRUSTED_CACHE is False:
+        return _PERMISSION_HINT
+
+    # Fall back to AppleScript probe if the native check is unavailable
+    # (PyObjC missing). The probe distinguishes -1719 (TCC denial) from
+    # all other AppleScript errors so we don't claim "permission needed"
+    # when the actual failure is something else.
+    if _AX_TRUSTED_CACHE is None:
+        preflight = '''
+            tell application "System Events"
+                set frontProc to first application process whose frontmost is true
+                try
+                    set frontWin to front window of frontProc
+                    return role of frontWin
+                on error errMsg number errNum
+                    return "ERROR:" & errNum & ":" & errMsg
+                end try
+            end tell
+        '''
+        pre_code, preflight_out, preflight_err = await _run_osascript(preflight, timeout=1.5)
+        if "-1719" in preflight_out or "-1719" in preflight_err:
+            return _PERMISSION_HINT
+        if pre_code != 0:
+            # Genuine AppleScript / System Events failure that isn't a TCC
+            # denial. Surface the real error instead of misclaiming permission.
+            return (
+                f"ERROR: observe_ui preflight failed (AppleScript exit {pre_code}). "
+                f"{preflight_err or preflight_out}"
+            )
 
     # AppleScript returns tab-separated rows to avoid fragile JSON escaping.
     script = f'''
@@ -298,7 +348,14 @@ async def _observe_ui_macos(limit: int, depth: int) -> str:
     '''
     code, out, err = await _run_osascript(script)
     if code != 0:
-        return f"ERROR: macOS Accessibility observation failed: {err or out}"
+        combined = f"{err or out}".strip()
+        # Real TCC denial during the main walk — fall through to the same
+        # permission hint as the preflight branch.
+        if "-1719" in combined:
+            return _PERMISSION_HINT
+        # Any other non-zero exit is NOT a permission issue. Be explicit so
+        # the LLM (and the user) don't mis-attribute the failure to TCC.
+        return f"ERROR: observe_ui AppleScript walk failed (exit {code}): {combined}"
     app, window, elements = _parse_elements(out)
     return _format_observation(app, window, elements, limit)
 

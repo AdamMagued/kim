@@ -18,9 +18,31 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from pathlib import Path
+
 from mcp_server.config import PROJECT_ROOT, SHELL_TIMEOUT, validate_path
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_git_paths(paths: list[str], cwd: str) -> str | None:
+    """Resolve every git path argument relative to cwd and ensure it stays
+    within ALLOWED_PATHS. Returns an error string on rejection, None on pass.
+
+    Skips path-flag tokens (anything starting with '-') and the bare '--'
+    pathspec separator, which git uses to disambiguate revs from paths.
+    """
+    cwd_path = Path(cwd).resolve()
+    for raw in paths:
+        if not raw or raw.startswith("-") or raw == "--":
+            continue
+        candidate = Path(raw)
+        resolved = candidate if candidate.is_absolute() else (cwd_path / raw)
+        try:
+            validate_path(str(resolved))
+        except PermissionError as e:
+            return f"PERMISSION_ERROR: refusing git path {raw!r} ({e})"
+    return None
 
 
 async def _run_git(*args: str, cwd: str = None, timeout: int = None) -> str:
@@ -96,6 +118,10 @@ async def handle_git_diff(args: dict) -> str:
     cwd = args.get("cwd", str(PROJECT_ROOT))
     path = args.get("path", "")
     staged = args.get("staged", False)
+    if path:
+        rejection = _validate_git_paths([path], cwd)
+        if rejection:
+            return rejection
     try:
         git_args = ["diff"]
         if staged:
@@ -119,6 +145,9 @@ async def handle_git_add(args: dict) -> str:
     try:
         if isinstance(paths, str):
             paths = [paths]
+        rejection = _validate_git_paths(paths, cwd)
+        if rejection:
+            return rejection
         git_args = ["add"] + paths
         return await _run_git(*git_args, cwd=cwd)
     except Exception as e:
@@ -175,6 +204,12 @@ async def handle_git_checkout(args: dict) -> str:
     create = args.get("create", False)
     if not target.strip():
         return "ERROR: 'target' parameter is required (branch name or file path)."
+    # Refuse obvious path-escape attempts. Legitimate branches can contain '/'
+    # so we don't run them through validate_path, but a leading '..' or an
+    # absolute path is never a valid branch name and almost always a file
+    # restore that bypasses ALLOWED_PATHS.
+    if target.startswith("..") or target.startswith("/") or target.startswith("\\"):
+        return f"PERMISSION_ERROR: refusing git checkout target {target!r}"
     try:
         git_args = ["checkout"]
         if create:

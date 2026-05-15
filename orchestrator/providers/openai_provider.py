@@ -149,25 +149,31 @@ class OpenAIProvider(BaseProvider):
             }
 
         if msg.tool_calls:
+            def _parse_one(tc):
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    args = {}
+                return {"tool": tc.function.name, "args": args}
+
             if len(msg.tool_calls) > 1:
+                # Surface multi-tool requests as a `batch` call so the agent
+                # can sequence them through its existing batch dispatcher.
+                # Previously this returned a text error, which the agent
+                # interpreted as a stuck-loop turn and bailed with NEED_HELP.
                 return {
-                    "type": "text",
-                    "content": (
-                        f"SYSTEM ERROR: You requested {len(msg.tool_calls)} "
-                        "parallel tool calls, but only 1 is supported at a time. "
-                        "Please pick the most important one and try again."
-                    ),
-                    "usage": usage
+                    "type": "tool_call",
+                    "tool": "batch",
+                    "args": {"calls": [_parse_one(tc) for tc in msg.tool_calls]},
+                    "usage": usage,
                 }
+
             tc = msg.tool_calls[0]
-            try:
-                args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                args = {}
+            parsed = _parse_one(tc)
             return {
                 "type": "tool_call",
-                "tool": tc.function.name,
-                "args": args,
+                "tool": parsed["tool"],
+                "args": parsed["args"],
                 "usage": usage,
             }
 

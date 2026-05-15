@@ -150,25 +150,30 @@ class OllamaProvider(BaseProvider):
         final_obj, content, tool_calls = await self._stream_chat(payload)
         usage = await self._usage_from_final(final_obj, model)
 
-        if tool_calls:
-            if len(tool_calls) > 1:
-                return {
-                    "type": "text",
-                    "content": (
-                        f"SYSTEM ERROR: You requested {len(tool_calls)} parallel tool calls, "
-                        "but only 1 is supported at a time. Please pick the most important one and try again."
-                    ),
-                    "usage": usage,
-                }
-            tc = tool_calls[0]
+        def _parse_one(tc):
             fn = tc.get("function") if isinstance(tc, dict) else None
             name = str((fn or {}).get("name") or tc.get("name") or "").strip()
-            args_raw = (fn or {}).get("arguments")
-            args = _normalize_tool_arguments(args_raw)
+            args = _normalize_tool_arguments((fn or {}).get("arguments"))
+            return {"tool": name, "args": args}
+
+        if tool_calls:
+            if len(tool_calls) > 1:
+                # Wrap as `batch` so the agent's batch dispatcher executes
+                # the calls sequentially. Previously this returned a text
+                # error which the agent treated as a stuck-loop turn.
+                return {
+                    "type": "tool_call",
+                    "tool": "batch",
+                    "args": {"calls": [_parse_one(tc) for tc in tool_calls]},
+                    "content": content,
+                    "usage": usage,
+                }
+
+            parsed = _parse_one(tool_calls[0])
             return {
                 "type": "tool_call",
-                "tool": name,
-                "args": args,
+                "tool": parsed["tool"],
+                "args": parsed["args"],
                 "content": content,
                 "usage": usage,
             }

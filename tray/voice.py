@@ -635,8 +635,19 @@ class HumeVoiceProvider(BaseVoiceProvider):
         if not self.initialize():
             return False
 
+        # Re-read the key at speak time, not just init time. Without this, a
+        # key that was valid at startup but later removed/rotated would cause
+        # urlopen to hang up to the network timeout on every call.
+        import os as _os
+        current_key = (_os.getenv("HUME_API_KEY") or "").strip()
+        if not current_key:
+            return False
+        self._api_key = current_key
+
         try:
             import urllib.request
+            import urllib.error
+            import socket
             import json as json_mod
             import base64
             import sounddevice as sd
@@ -678,7 +689,10 @@ class HumeVoiceProvider(BaseVoiceProvider):
                 method="POST",
             )
 
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            # 3s cap (Hume normally answers in <500ms). The prior 15s value
+            # let an unreachable / wrong-key Hume freeze the voice executor —
+            # which compounded into agent loop delays for chained tool calls.
+            with urllib.request.urlopen(req, timeout=3) as resp:
                 body = json_mod.loads(resp.read().decode("utf-8"))
 
             # Extract base64 audio from response
@@ -713,6 +727,18 @@ class HumeVoiceProvider(BaseVoiceProvider):
 
         except ImportError as e:
             logger.warning(f"Hume TTS dependency missing: {e}")
+            return False
+        except (urllib.error.URLError, socket.timeout) as e:
+            # Network-level failure (timeout, DNS, refused). Downgrade quietly
+            # so the fallback chain (Kokoro / HTTP) gets a turn.
+            logger.warning(f"Hume TTS network error: {e}")
+            return False
+        except urllib.error.HTTPError as e:
+            # 401/403/etc. — credentials issue. Cache `unavailable` so we
+            # stop hammering the endpoint with the same bad key.
+            logger.warning(f"Hume TTS HTTP {e.code}: {e.reason}")
+            if e.code in (401, 403):
+                self._available = False
             return False
         except Exception as e:
             logger.warning(f"Hume TTS error: {e}")
