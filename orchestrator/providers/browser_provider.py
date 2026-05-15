@@ -2076,6 +2076,17 @@ class BrowserProvider(BaseProvider):
                     "TASK_COMPLETE saying it is open at the sign-in prompt. Do not log in "
                     "unless the current task explicitly asks you to sign in or provides "
                     "credentials. Never reuse credentials from recent context alone.\n"
+                    "THINKING: Before each tool call or TASK_COMPLETE, write 1-2 sentences "
+                    "of plain text narrating what you are about to do and why. The user's "
+                    "Thinking panel shows this stream live — be brief and natural.\n"
+                    "PLANNING: For multi-step tasks, emit a plan BEFORE your first tool call "
+                    "on its own turn:\n"
+                    "  PLAN: <n> steps\n"
+                    "  1. <short step name>\n"
+                    "  2. <short step name>\n"
+                    "Then before each step emit: STEP <n>: <name>\n"
+                    "After each step emit: DONE <n>: <brief result>\n"
+                    "The UI renders a live checklist from PLAN/STEP/DONE markers.\n"
                     "Respond with EXACTLY ONE of:\n"
                     '1. A JSON tool call on a single line: '
                     '{"tool": "<name>", "args": {<args>}}\n'

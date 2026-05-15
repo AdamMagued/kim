@@ -3,6 +3,35 @@
 
 ---
 
+## Navigation & debugging — read this first
+
+**Real app root:** `kim-pro/` — NOT `kimFORK/` (different capitalisation; `kimFORK/` is a proxy admin gateway, not the app).
+
+### Key source files (current as of May 2026)
+| File | What it does |
+|------|-------------|
+| `desktop/src/components/ChatView.tsx` | Main chat UI — activity feed, trace helpers, plan parsing, run history |
+| `desktop/src/components/kim-ui/ThinkingWithPlan.tsx` | Live thinking panel component (`TraceItem[]`, plan card, auto-collapse) |
+| `desktop/src/components/kim-ui/CollapsiblePlan.tsx` | `PlanStep` / `PlanStepStatus` types |
+| `orchestrator/agent.py` | Agent loop, system prompts (`_build_system_prompt`, `_build_lean_system_prompt`), `[UI] SCREENSHOT_FLASH` / `[UI] SHOW` handling |
+| `orchestrator/providers/ollama.py` | Ollama provider — native tool calls, vision-error retry, image stripping |
+| `orchestrator/providers/browser_provider.py` | Browser LLM provider (Gemini / Claude / ChatGPT in-app webview) |
+| `desktop/src-tauri/src/lib.rs` | ~9800-line Rust shell; key commands: `set_task_active_mode`, `show_main_window`, `hide_main_window`, `send_task`, `cancel_task` |
+| `mcp_server/server.py` | MCP server (stdio transport) — 31 tools |
+| `orchestrator/memory.py` | Conversation history + compression |
+
+### Finding a bug — use this order
+1. **If you already know which file is involved** — open it directly. Don't consult any map.
+2. **If you don't know where to look** — read `repomap.md` in this directory first. It lists every file with a one-line purpose. *(Note: `repomap.md` does not exist yet — if it's missing, fall back to step 3.)*
+3. **If the map is insufficient or missing** — then and only then browse the repo yourself (targeted `grep` / `find`, not a full sweep).
+
+Never do a broad repo-wide search as your first move when the bug location is unknown — check `repomap.md` first.
+
+### Pre-existing build error (not your bug)
+`desktop/src/components/PairingModal.tsx` — missing `qrcode.react` type declarations. Ignore this error; it predates all recent work.
+
+---
+
 ## What you are building
 
 **Kim** is a local AI agent platform for **Windows, macOS, and Linux**. It connects any cloud LLM (Claude, GPT-4o, Gemini, DeepSeek) to full OS control — screen vision, mouse/keyboard, file system, browser automation, and shell execution. It is the personal equivalent of Claude Code + Claude Computer Use, running locally, controlled by the user.

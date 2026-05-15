@@ -6,8 +6,8 @@ import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock, ToolUseB
 import { MessageBubble } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
 import { toast } from './Toast';
-import { ConnectorsPanel } from './kim-ui';
-import type { Connector } from './kim-ui';
+import { ConnectorsPanel, ThinkingWithPlan } from './kim-ui';
+import type { Connector, TraceItem } from './kim-ui';
 import { ProviderPicker } from './ProviderPicker';
 
 const MAX_ACTIVITY_ITEMS = 300;
@@ -181,26 +181,6 @@ function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | null {
   return numbered.length >= 2
     ? { steps: numbered.slice(0, 12), activeStep: 0, doneSteps: [], structured: false }
     : null;
-}
-
-function livePlanProgressLabel(plan: LivePlanParsed, items: ActivityItem[], running: boolean): string | undefined {
-  const stepCount = plan.steps.length;
-  if (stepCount < 2) return undefined;
-  // When we have a structured plan, trust the active-step marker exactly.
-  // Otherwise fall back to counting tool calls as a rough completion proxy.
-  let done: number;
-  if (plan.structured) {
-    const completed = new Set<number>();
-    for (let i = 1; i < plan.activeStep; i++) completed.add(i);
-    for (const idx of plan.doneSteps) completed.add(idx);
-    done = Math.min(completed.size, stepCount);
-  } else {
-    const nTools = items.filter(i => i.kind === 'tool').length;
-    done = Math.min(nTools, stepCount);
-  }
-  let s = `${done} of ${stepCount} done`;
-  if (running && done < stepCount) s += ' · 1 in flight';
-  return s;
 }
 
 
@@ -564,9 +544,9 @@ const HIDDEN_REGEX: RegExp[] = [
 ];
 
 function isNoiseLine(raw: string): boolean {
-  // Never suppress status lines — from stdout ("[STATUS] …") or embedded in
-  // a stderr log record ("[err] … [STATUS] …"). These are user-facing signals.
+  // Never suppress user-facing response lines regardless of summary content.
   if (raw.startsWith('[STATUS]') || raw.includes('[STATUS]') || raw.startsWith('[ANSWER]') || raw.includes('[ANSWER]')) return false;
+  if (raw.includes('[SUCCESS]') || raw.includes('[FAILED]') || raw.includes('[ERROR]')) return false;
   // Strip the [err] prefix that appendRaw prepends before pattern-matching,
   // otherwise regex anchors like /^\s*\|/ never fire.
   const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
@@ -686,7 +666,23 @@ export function friendlyError(raw: string): string {
 function parseLogLine(raw: string, id: number): ActivityItem | null {
   if (!raw.trim()) return null;
 
-  // Aggressive noise suppression first — catches tracebacks, internal debug, etc.
+  // SUCCESS / FAILED — check BEFORE noise suppression so summary text containing
+  // noise words (e.g. "screenshot", "traceback") is never accidentally dropped.
+  if (raw.includes('[SUCCESS]')) {
+    let text = raw.replace(/.*\[SUCCESS\]\s*/, '').trim();
+    // Strip Claw-internal completion messages — replace with a clean summary.
+    if (/^Claw (?:completed|finished)/i.test(text) || /\bLLM calls\b/i.test(text)) {
+      text = 'Task completed';
+    }
+    return { id, kind: 'success', icon: '✓', text: text || 'Task completed successfully' };
+  }
+  if (raw.includes('[FAILED]') || (raw.includes('[ERROR]') && !raw.startsWith('[err]'))) {
+    const msg = raw.replace(/.*\[(FAILED|ERROR)\]\s*/, '').trim();
+    return { id, kind: 'error', icon: '⚠', text: friendlyError(msg) };
+  }
+
+  // Aggressive noise suppression — catches tracebacks, internal debug, etc.
+  // Must come AFTER [SUCCESS]/[FAILED] so summary text never gets suppressed.
   if (isNoiseLine(raw)) return null;
 
   // Truncated meta-lines
@@ -695,16 +691,6 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
   // ⏹ Cancelled
   if (raw.startsWith('⏹')) {
     return { id, kind: 'cancelled', icon: '⏹', text: 'Task stopped' };
-  }
-
-  // SUCCESS from stdout
-  if (raw.includes('[SUCCESS]')) {
-    let text = raw.replace(/.*\[SUCCESS\]\s*/, '').trim();
-    // Strip Claw-internal completion messages — replace with a clean summary.
-    if (/^Claw (?:completed|finished)/i.test(text) || /\bLLM calls\b/i.test(text)) {
-      text = 'Task completed';
-    }
-    return { id, kind: 'success', icon: '✓', text: text || 'Task completed successfully' };
   }
 
   // [err] prefix = came from stderr
@@ -818,6 +804,15 @@ const PROVIDER_LABELS: Record<string, string> = {
   'browser:deepseek': 'Browser DeepSeek',
   'browser:custom': 'Browser Custom',
 };
+
+interface AttachedFile {
+  name: string;
+  kind: 'text' | 'image' | 'binary';
+  content?: string;   // text files: raw text; binary: unused
+  savedPath?: string; // images: temp path on disk
+  previewUrl?: string; // images: object URL for thumbnail
+  sizeLabel: string;
+}
 
 interface PendingTask {
   id: number;
@@ -1082,6 +1077,9 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
   const [messageReloadNonce, setMessageReloadNonce] = useState(0);
   const prevMsgCountRef = useRef(0);
   const [taskInput, setTaskInput] = useState('');
+  const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [activity, setActivity] = useState<ActivityItem[]>([]);
@@ -1152,7 +1150,6 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
   const [autoFollowOutput, setAutoFollowOutput] = useState(true);
   const [connectorsOpen, setConnectorsOpen] = useState(false);
   const [connectorsClosing, setConnectorsClosing] = useState(false);
-  const [livePlanExpanded, setLivePlanExpanded] = useState(true);
   // Which browser AI provider is selected (only relevant when settings.provider === 'browser')
   const [browserProvider, setBrowserProvider] = useState('claude');
   const [conversationId] = useState(() => makeConversationId());
@@ -1641,11 +1638,20 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
       if (line.includes('[UI] SCREENSHOT_FLASH')) {
         if (isRunningRef.current) {
           invoke('show_screenshot_flash').catch(() => {});
-          // Only now hide the main window and show the cancel widget — the agent
-          // is actually going to look at the screen. Simple tasks ("hi", etc.)
-          // never emit this so they run with the window visible the whole time.
+          // Hide the main window and show the cancel widget so Kim is out of
+          // the screenshot. The [UI] SHOW event below re-shows the window once
+          // the capture is complete, so the user can monitor progress.
           invoke('set_task_active_mode', { active: true }).catch(() => {});
         }
+        return;
+      }
+      if (line.includes('[UI] SHOW')) {
+        // Screenshot is done — restore the main window so the user can see
+        // the thinking panel and monitor what Kim is doing.
+        if (isRunningRef.current) {
+          invoke('show_main_window').catch(() => {});
+        }
+        return;
       }
       return;
     }
@@ -2122,12 +2128,15 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    const task = taskInput.trim();
-    if (!task) return;
+    const rawTask = taskInput.trim();
+    if (!rawTask && attachedFiles.length === 0) return;
 
+    const prefix = buildAttachmentPrefix(attachedFiles);
+    const task = prefix + (rawTask || 'Please look at the attached file(s).');
     const pending = makePendingTask(task);
 
     setTaskInput('');
+    setAttachedFiles([]);
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
     if (isRunning) {
@@ -2199,131 +2208,172 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
   }
 
-  // ── Activity feed render ─────────────────────────────────────────────────────
+  // ── File attachment helpers ──────────────────────────────────────────────────
 
-  /** Renders activity text: backtick → <code>, +N → green, -N → red */
-  function renderActivityText(text: string): React.ReactNode {
-    // Highlight diff tokens only when they are standalone words (e.g. " +12 "),
-    // not embedded math like "2+2".
-    const parts = text.split(/(`[^`]+`|(?:^|\s)(?:[+-]\d+)(?=$|\s))/g);
-    if (parts.length === 1) return text;
-    return parts.map((p, i) => {
-      if (p.startsWith('`') && p.endsWith('`'))
-        return <code key={i}>{p.slice(1, -1)}</code>;
-      if (/^\s*\+\d+\s*$/.test(p))
-        return <span key={i} className="kim-diff-added">{p}</span>;
-      if (/^\s*-\d+\s*$/.test(p))
-        return <span key={i} className="kim-diff-removed">{p}</span>;
-      return p;
+  function fmtBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  async function processFiles(files: FileList | File[]) {
+    const arr = Array.from(files);
+    const results: AttachedFile[] = [];
+    for (const file of arr) {
+      const sizeLabel = fmtBytes(file.size);
+      if (file.type.startsWith('image/')) {
+        // Read as base64 → save to disk → keep the path for the task message
+        const base64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const url = reader.result as string;
+            resolve(url.split(',')[1]); // strip "data:image/...;base64,"
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+        const previewUrl = URL.createObjectURL(file);
+        try {
+          const savedPath = await invoke<string>('save_attachment', {
+            filename: file.name,
+            dataBase64: base64,
+          });
+          results.push({ name: file.name, kind: 'image', savedPath, previewUrl, sizeLabel });
+        } catch {
+          toast(`Could not save image: ${file.name}`, 'error', 3000);
+        }
+      } else if (file.type.startsWith('text/') || /\.(md|txt|py|js|ts|tsx|jsx|json|yaml|yml|toml|sh|bash|zsh|fish|csv|xml|sql|rs|go|java|c|cpp|h|swift|kt|rb|php|html|css|scss|less|env|gitignore|dockerfile)$/i.test(file.name)) {
+        // Read as text and inline
+        const content = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsText(file);
+        });
+        results.push({ name: file.name, kind: 'text', content, sizeLabel });
+      } else {
+        toast(`${file.name}: binary files are not yet supported — attach text or image files.`, 'warning', 4000);
+      }
+    }
+    if (results.length > 0) {
+      setAttachedFiles(prev => [...prev, ...results]);
+    }
+  }
+
+  function removeAttachment(idx: number) {
+    setAttachedFiles(prev => {
+      const next = [...prev];
+      const removed = next.splice(idx, 1)[0];
+      if (removed.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+      return next;
     });
   }
+
+  function buildAttachmentPrefix(files: AttachedFile[]): string {
+    if (files.length === 0) return '';
+    return files.map(f => {
+      if (f.kind === 'image') {
+        return `[Attached image: ${f.name}]\nPath on disk: ${f.savedPath ?? 'unknown'}\n`;
+      }
+      return `[Attached file: ${f.name}]\n\`\`\`\n${f.content ?? ''}\n\`\`\`\n`;
+    }).join('\n') + '\n---\n';
+  }
+
+  // ── Activity feed render ─────────────────────────────────────────────────────
+
+  // ── Trace helpers (activity → ThinkingWithPlan format) ─────────────────────
+
+  function parseToolVerb(text: string): { verb: string; target: string } | null {
+    // Standard "Verb target" format produced by TOOL_MAP labels
+    const verbMatch = text.match(
+      /^(Reading|Writing|Running|Editing|Creating|Deleting|Listing|Searching|Opening|Clicking|Typing|Pressing|Checking|Viewing|Updating|Appending|Using|Asking|Dragging|Scrolling|Focusing|Observing|Navigating|Fetching|Committing|Installing|Moving|Copying|Renaming|Double-clicking|Right-clicking|Git)\s*(.*)/i
+    );
+    if (verbMatch) {
+      return { verb: verbMatch[1], target: verbMatch[2].replace(/`/g, '').trim() };
+    }
+    // "Using tool: `tool_name`" raw fallback
+    const usingMatch = text.match(/^Using tool:\s*`?([^`\n]+)`?/i);
+    if (usingMatch) {
+      const name = usingMatch[1].trim().replace(/_/g, ' ');
+      const capitalized = name.charAt(0).toUpperCase() + name.slice(1);
+      return { verb: 'Using', target: capitalized };
+    }
+    return null;
+  }
+
+  function buildPlanTraceItem(livePlan: LivePlanParsed): TraceItem {
+    return {
+      kind: 'plan',
+      title: 'Plan',
+      items: livePlan.steps.map((s, i) => {
+        const oneBased = i + 1;
+        let status: 'done' | 'active' | 'pending' | 'todo' = 'pending';
+        if (livePlan.structured) {
+          if (livePlan.doneSteps.includes(oneBased) || oneBased < livePlan.activeStep) {
+            status = 'done';
+          } else if (oneBased === livePlan.activeStep) {
+            status = 'active';
+          }
+        }
+        return { text: s, status };
+      }),
+    };
+  }
+
+  function buildThinkingTrace(items: ActivityItem[], livePlan: LivePlanParsed | null): TraceItem[] {
+    const trace: TraceItem[] = [];
+    let planInserted = false;
+
+    for (const item of items) {
+      const t = item.text;
+      // Skip raw JSON envelope lines — they drive the plan widget
+      if (/^\s*\[(?:PLAN|STEP|DONE)\]\{/.test(t)) {
+        if (t.includes('[PLAN]{') && !planInserted && livePlan && livePlan.steps.length >= 2) {
+          trace.push(buildPlanTraceItem(livePlan));
+          planInserted = true;
+        }
+        continue;
+      }
+      if (item.kind === 'tool') {
+        const parsed = parseToolVerb(t);
+        if (parsed) {
+          trace.push({ kind: 'tool', verb: parsed.verb, target: parsed.target });
+        } else {
+          trace.push({ kind: 'thought', text: t });
+        }
+      } else if (item.kind === 'status' || item.kind === 'info') {
+        trace.push({ kind: 'thought', text: t });
+      }
+    }
+
+    // If plan never appeared in-stream (unstructured), insert before first tool
+    if (!planInserted && livePlan && livePlan.steps.length >= 2) {
+      const firstToolIdx = trace.findIndex(t => t.kind === 'tool');
+      const insertAt = firstToolIdx > 0 ? firstToolIdx : trace.length;
+      trace.splice(insertAt, 0, buildPlanTraceItem(livePlan));
+    }
+
+    return trace;
+  }
+
+  // ── Activity feed render ─────────────────────────────────────────────────────
 
   function renderActivityFeed() {
     if (activity.length === 0) return null;
     const livePlan = parsePlanFromActivity(activity);
     const toolCalls = activity.filter(a => a.kind === 'tool').length;
     const streamStepCount = Math.max(toolCalls, activity.length);
-    const planProgress =
-      livePlan ? livePlanProgressLabel(livePlan, activity, isRunning) : undefined;
+    const trace = buildThinkingTrace(activity, livePlan);
 
     return (
       <div className="kim-msg-row kim-msg-row--assistant kim-msg-row--live">
-        <div className="kim-bubble kim-bubble--assistant kim-bubble--live kim-bubble--live-stream">
-          <div className="kim-thinking-header kim-thinking-header--stream">
-            <span className="kim-thinking-header__lead">
-              <span className="kim-thinking-header__dot" aria-hidden="true" />
-              <span className="kim-thinking-header__label">Thinking</span>
-            </span>
-            <span className="kim-thinking-header__trail">
-              {elapsed > 0 && (
-                <span className="kim-thinking-header__timer">{formatDuration(elapsed)}</span>
-              )}
-              {elapsed > 0 && (
-                <span className="kim-thinking-header__sep" aria-hidden="true">
-                  ·
-                </span>
-              )}
-              <span className="kim-thinking-header__steps">
-                {streamStepCount} {streamStepCount === 1 ? 'step' : 'steps'}
-              </span>
-            </span>
-          </div>
-          {livePlan && (
-            <div className="kim-plan-live">
-              <button
-                type="button"
-                className={'kim-plan-live__toggle' + (livePlanExpanded ? ' is-expanded' : '')}
-                onClick={() => setLivePlanExpanded(e => !e)}
-                aria-expanded={livePlanExpanded}
-              >
-                <svg
-                  className="kim-plan-live__chev"
-                  viewBox="0 0 16 16"
-                  width="12"
-                  height="12"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
-                >
-                  <path d="M5 3l5 5-5 5" />
-                </svg>
-                <span className="kim-plan-live__title">Plan</span>
-                {planProgress && (
-                  <span className="kim-plan-live__progress">{planProgress}</span>
-                )}
-              </button>
-              {livePlanExpanded && (
-                <ol className="kim-plan-live__list">
-                  {livePlan.steps.map((s, i) => {
-                    // Step state derives from the most recent STEP marker.
-                    // For non-structured plans we don't claim per-step state.
-                    const oneBased = i + 1;
-                    let state: 'done' | 'active' | 'pending' = 'pending';
-                    if (livePlan.structured) {
-                      if (livePlan.doneSteps.includes(oneBased) || oneBased < livePlan.activeStep) state = 'done';
-                      else if (oneBased === livePlan.activeStep) state = 'active';
-                    }
-                    return (
-                      <li
-                        key={i}
-                        className={`kim-plan-live__step kim-plan-live__step--${state}`}
-                      >
-                        <span className="kim-plan-live__idx" aria-hidden="true">
-                          {state === 'done' ? (
-                            <svg viewBox="0 0 12 12" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                              <path d="M2.5 6.5L5 9l4.5-5.5" />
-                            </svg>
-                          ) : state === 'active' ? (
-                            <span className="kim-plan-live__active-dot" />
-                          ) : (
-                            oneBased
-                          )}
-                        </span>
-                        <span className="kim-plan-live__text">{s}</span>
-                      </li>
-                    );
-                  })}
-                </ol>
-              )}
-            </div>
-          )}
-          <div className="kim-activity-feed">
-            {activity
-              // Hide the raw [PLAN]{json} / [STEP]{json} envelopes from the
-              // visible feed — they drive the plan checklist above, the user
-              // doesn't need to see them as duplicate status lines.
-              .filter(item => !/^\s*\[(?:PLAN|STEP|DONE)\]\{/.test(item.text))
-              .map(item => (
-                <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
-                  <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
-                  <span className="kim-activity-item__text">{renderActivityText(item.text)}</span>
-                </div>
-              ))}
-          </div>
-        </div>
+        <ThinkingWithPlan
+          trace={trace}
+          duration={elapsed > 0 ? formatDuration(elapsed) : undefined}
+          steps={streamStepCount}
+          planLook="card"
+          style={{ flex: 1, minWidth: 0 }}
+        />
       </div>
     );
   }
@@ -2331,8 +2381,9 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
   function renderWorkedFor(idx: number, run: { activity: ActivityItem[]; durationSec: number }) {
     const expanded = expandedRunIdx === idx;
     const durationLabel = run.durationSec > 0
-      ? `Worked for ${formatDuration(run.durationSec)}`
-      : 'Worked on this';
+      ? `Thought for ${formatDuration(run.durationSec)}`
+      : 'Thought about this';
+    const historyTrace = buildThinkingTrace(run.activity, parsePlanFromActivity(run.activity));
     return (
       <div className="kim-msg-row kim-msg-row--assistant">
         <div className="kim-worked-for">
@@ -2347,18 +2398,15 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
             </svg>
             <span>{durationLabel}</span>
           </button>
-          {expanded && (
+          {expanded && historyTrace.length > 0 && (
             <div className="kim-worked-for__panel">
-              <div className="kim-activity-feed kim-activity-feed--archive">
-                {run.activity
-                  .filter(item => !/^\s*\[(?:PLAN|STEP|DONE)\]\{/.test(item.text))
-                  .map(item => (
-                    <div key={item.id} className={`kim-activity-item kim-activity-item--${item.kind}`}>
-                      <span className="kim-activity-item__icon" aria-hidden="true">{item.icon}</span>
-                      <span className="kim-activity-item__text">{renderActivityText(item.text)}</span>
-                    </div>
-                  ))}
-              </div>
+              <ThinkingWithPlan
+                trace={historyTrace}
+                duration={run.durationSec > 0 ? formatDuration(run.durationSec) : undefined}
+                planLook="card"
+                live={false}
+                style={{ marginTop: 8 }}
+              />
             </div>
           )}
         </div>
@@ -2486,7 +2534,51 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
   function renderComposer(heroMode = false) {
     const resolvedProvider = resolveProvider();
     return (
-      <form className="kim-composer" onSubmit={handleSubmit}>
+      <form
+        className={`kim-composer${isDragOver ? ' kim-composer--drag-over' : ''}`}
+        onSubmit={handleSubmit}
+        onDragOver={e => { e.preventDefault(); setIsDragOver(true); }}
+        onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setIsDragOver(false); }}
+        onDrop={e => {
+          e.preventDefault();
+          setIsDragOver(false);
+          if (e.dataTransfer.files.length > 0) void processFiles(e.dataTransfer.files);
+        }}
+      >
+        {/* Hidden file input */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          style={{ display: 'none' }}
+          onChange={e => { if (e.target.files) { void processFiles(e.target.files); e.target.value = ''; } }}
+        />
+
+        {/* Attachment chips */}
+        {attachedFiles.length > 0 && (
+          <div className="kim-composer__attachments">
+            {attachedFiles.map((f, i) => (
+              <div key={i} className="kim-composer__attach-chip">
+                {f.kind === 'image' && f.previewUrl
+                  ? <img src={f.previewUrl} alt={f.name} className="kim-composer__attach-thumb" />
+                  : <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, opacity: 0.7 }}>
+                      <path d="M9 1H4a1 1 0 00-1 1v12a1 1 0 001 1h8a1 1 0 001-1V5L9 1z" />
+                      <polyline points="9 1 9 5 13 5" />
+                    </svg>
+                }
+                <span className="kim-composer__attach-name">{f.name}</span>
+                <span className="kim-composer__attach-size">{f.sizeLabel}</span>
+                <button
+                  type="button"
+                  className="kim-composer__attach-remove"
+                  onClick={() => removeAttachment(i)}
+                  aria-label={`Remove ${f.name}`}
+                >×</button>
+              </div>
+            ))}
+          </div>
+        )}
+
         <div className="kim-composer__row">
         <div className={'kim-composer__box' + (isRunning ? ' kim-composer__box--running' : '') + (heroMode ? ' kim-composer__box--hero' : '')}>
           <textarea
@@ -2495,7 +2587,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
             onChange={handleTextareaInput}
             placeholder={isRunning
               ? (queueEnabled ? 'Kim is working — type now, Send adds to queue' : 'Kim is working — Send interrupts current task')
-              : 'Message Kim…'}
+              : attachedFiles.length > 0 ? 'Add a message or just send…' : 'Message Kim…'}
             rows={1}
             onKeyDown={e => {
               if (e.key === 'Enter' && !e.shiftKey) {
@@ -2519,7 +2611,13 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
                   <path d="M2 4.5h12M2 8h12M2 11.5h8" />
                 </svg>
               </button>
-              <button type="button" className="kim-composer__tool-btn" disabled tabIndex={-1} aria-label="Attach file">
+              <button
+                type="button"
+                className="kim-composer__tool-btn"
+                tabIndex={-1}
+                aria-label="Attach file"
+                onClick={() => fileInputRef.current?.click()}
+              >
                 <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M11.5 5.5L6 11a2.5 2.5 0 01-3.5-3.5L8 2a1.5 1.5 0 012 2L4.5 9.5a.5.5 0 00.7.7L10 5.5" />
                 </svg>
@@ -2528,6 +2626,19 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
           )}
 
           <div className="kim-composer__actions">
+            {!heroMode && !isRunning && (
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="kim-btn kim-btn--attach"
+                aria-label="Attach file"
+                title="Attach file"
+              >
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M11.5 5.5L6 11a2.5 2.5 0 01-3.5-3.5L8 2a1.5 1.5 0 012 2L4.5 9.5a.5.5 0 00.7.7L10 5.5" />
+                </svg>
+              </button>
+            )}
             {isRunning && !cancelling && (
               <button
                 type="button"
@@ -2547,7 +2658,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
             )}
             <button
               type="submit"
-              disabled={!taskInput.trim()}
+              disabled={!taskInput.trim() && attachedFiles.length === 0}
               className={'kim-btn kim-btn--send' + (heroMode ? ' kim-btn--send-hero' : '')}
               aria-label="Send"
             >

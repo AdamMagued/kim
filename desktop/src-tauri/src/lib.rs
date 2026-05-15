@@ -9600,6 +9600,25 @@ const DISCORD_WEBHOOK_URL: &str = match option_env!("KIM_DISCORD_WEBHOOK") {
     None => "",
 };
 
+#[tauri::command]
+async fn save_attachment(filename: String, data_base64: String) -> Result<String, String> {
+    use std::path::PathBuf;
+    let dir = std::env::temp_dir().join("kim_attachments");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Sanitise filename — strip any path components
+    let safe_name = PathBuf::from(&filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+    let dest = dir.join(&safe_name);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.trim())
+        .map_err(|e| format!("base64 decode error: {e}"))?;
+    fs::write(&dest, bytes).map_err(|e| e.to_string())?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
 #[derive(serde::Deserialize)]
 pub struct FeedbackPayload {
     pub category: String,    // "bug" | "feature" | "general" | "praise" | "other"
@@ -9768,6 +9787,7 @@ pub fn run() {
             open_in_finder,
             send_feedback,
             show_screenshot_flash,
+            save_attachment,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
