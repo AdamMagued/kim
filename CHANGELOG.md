@@ -1,6 +1,64 @@
 # Changelog
 
-Changes on `fix/observe-ui-and-cancel` compared with `origin/main` as of 2026-05-11.
+## File Attachments, Blank Response Fixes & Agent Polish (2026-05-16)
+
+### New: File Attachments & Drag-and-Drop
+
+Users can now attach any file to a message before sending — no more copy-pasting content manually.
+
+- **Drag-and-drop on composer** (`ChatView.tsx`): Drop any file onto the message composer to attach it. The composer shows a blue tint while a file is dragged over.
+- **Paperclip button** (`ChatView.tsx`): Paperclip icon in the toolbar opens a file picker as an alternative to drag-and-drop.
+- **File chips** (`ChatView.tsx`, `index.css`): Attached files appear as inline chips above the textarea showing a thumbnail (for images), filename, file size, and an × to remove. Multiple files can be attached at once.
+- **Text file inlining** (`ChatView.tsx`): Text-based files (`.txt`, `.py`, `.js`, `.md`, etc.) are read and inlined into the message as fenced code blocks. The model sees the full file content.
+- **Image handling** (`ChatView.tsx`, `lib.rs`): Images are saved to disk at `/tmp/kim_attachments/<filename>` via a new `save_attachment` Rust command, and the path is included in the message so the agent can reference the file. A thumbnail is shown in the chip.
+- **Binary file notice** (`ChatView.tsx`): Unsupported binary files (e.g. `.zip`, `.exe`) show a toast explaining they can't be read, rather than silently failing.
+- **Submit with attachments only** (`ChatView.tsx`): You can send a message that contains only attachments and no text — Kim will default to "Please look at the attached file(s)."
+- **`save_attachment` Rust command** (`lib.rs`): New Tauri command that takes a filename + base64-encoded payload, validates the filename (strips path traversal), and writes the bytes to a temp directory. Returns the saved path.
+
+### Bug Fix: Blank Response After Task Completion
+
+Tasks whose summary contained noise words (like "screenshot", "traceback") were silently dropped and the chat appeared to go blank after completing.
+
+- **Root cause** (`ChatView.tsx` → `parseLogLine`): `isNoiseLine()` was running before the `[SUCCESS]` check, so a line like `[SUCCESS] Captured a screenshot of the primary monitor.` was matched by the `'screenshot'` entry in `HIDDEN_SUBSTRINGS` and discarded before it could become a chat bubble.
+- **Fix**: Moved `[SUCCESS]` and `[FAILED]` checks to the very top of `parseLogLine`, before any noise suppression runs. Also added `[SUCCESS]`, `[FAILED]`, and `[ERROR]` to the `isNoiseLine` whitelist as a second layer of protection. These lines now always reach `liveHistory` regardless of what words appear in the summary.
+
+### Bug Fix: `task_complete` Called as MCP Tool
+
+Some models (e.g. gpt-oss:20b) call `task_complete` as an MCP tool call instead of emitting `TASK_COMPLETE:` text, causing a wasted turn and an error shown to the user.
+
+- **Fix** (`orchestrator/agent.py`): The agent now intercepts tool calls named `task_complete` or `TASK_COMPLETE` before dispatching to MCP. It extracts the summary from the tool arguments (`message`, `summary`, or `result` fields) and treats the call as a successful `TASK_COMPLETE:` completion, including voice playback and session flush.
+
+### Bug Fix: Ollama Vision Models — Automatic Image Stripping on Error
+
+Ollama models that don't support vision previously failed the entire request when images were in the message history.
+
+- **Fix** (`orchestrator/providers/ollama.py`): The provider now catches vision-related errors and automatically retries the request with all images stripped from the message history. When an image is stripped, a text note is inserted in its place so the model knows an image was present. Vision support is cached per model name so subsequent calls skip images proactively without waiting for an error.
+
+### Improvement: Main Window Restored After Screenshot
+
+After Kim takes a screenshot to look at the screen, the main app window now automatically comes back so you can see the thinking panel and monitor what Kim is doing in real time.
+
+- **Before**: Window was hidden when `[UI] SCREENSHOT_FLASH` fired and never re-shown until the task completed.
+- **Fix** (`ChatView.tsx`, `agent.py`): `agent.py` emits `[UI] SHOW` after the screenshot is captured. `ChatView.tsx` now handles `[UI] SHOW` by calling `show_main_window`, restoring the window immediately after the capture without waiting for the task to finish.
+
+### Improvement: ThinkingWithPlan — History Mode & Auto-Collapse
+
+- **History mode** (`ThinkingWithPlan.tsx`): Component now accepts a `live` prop (default `true`). When `live=false` (used when displaying past runs), the pulse dot, shimmer animation, and fade-in effects are disabled. All trace items render at 80% opacity with a static dot — making it visually clear the run is historical, not active.
+- **Auto-collapse on completion** (`ThinkingWithPlan.tsx`): The plan card now automatically collapses once every step is marked done, keeping the UI tidy after a task finishes without requiring the user to close it manually.
+- **Target rendering fixed** (`ThinkingWithPlan.tsx`): Tool target text (the secondary label on each trace row) is now only rendered when a target exists, preventing spurious empty space in trace rows.
+
+### Improvement: Agent Thinking & Planning Instructions
+
+- **Thinking out loud** (`agent.py`, `browser_provider.py`): System prompts now explicitly instruct the model to write 1–2 sentences of plain text before each tool call narrating what it's about to do. These appear live in the Thinking panel and make Kim feel like a capable colleague working through a problem.
+- **Plan protocol** (`agent.py`, `browser_provider.py`): Clearer PLAN/STEP/DONE format instructions so the live plan checklist in the UI stays accurate across providers. Models are told to emit the plan block on its own turn before any tool calls.
+- **`task_complete` reminder** (`agent.py`): After bare text responses (no tool call, no `TASK_COMPLETE:`), the agent now injects a reminder telling the model to either call a tool or emit `TASK_COMPLETE:`, eliminating wasted turns where the model replies conversationally.
+
+### New: Discord Feedback Webhook
+
+- **`send_feedback` command** (`lib.rs`): Feedback submitted via the in-app button is POSTed to a private Discord webhook. The URL is embedded at compile time via `KIM_DISCORD_WEBHOOK` env var (`option_env!`) and is never exposed to the frontend or stored in source.
+- **`TO_BE_DONE.md`**: Added a security roadmap describing how to proxy the webhook through a Cloudflare Worker before open-sourcing so the raw Discord URL can't be extracted from the binary.
+
+---
 
 ## 47-Bug Fix Sweep (2026-05-11)
 

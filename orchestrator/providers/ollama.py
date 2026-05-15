@@ -95,6 +95,7 @@ class OllamaProvider(BaseProvider):
     lean_system_prompt = True
 
     def __init__(self, config: dict):
+        self._vision_cache: dict[str, bool] = {}
         ollama_cfg = dict(config.get("ollama") or {})
         self._base_url = str(
             _env_or_cfg(config, "KIM_OLLAMA_BASE_URL", "ollama", "base_url", default=ollama_cfg.get("base_url") or DEFAULT_OLLAMA_BASE_URL)
@@ -135,19 +136,36 @@ class OllamaProvider(BaseProvider):
         await self._ensure_daemon_running()
         await self._validate_model(model)
 
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": self._to_ollama_messages(messages, system),
-            "stream": True,
-        }
-        if self._keep_alive:
-            payload["keep_alive"] = self._keep_alive
-        if tools:
-            payload["tools"] = self._to_ollama_tools(tools)
-        if self._context_override:
-            payload["options"] = {"num_ctx": self._context_override}
+        # Proactively strip images for models we know don't support vision.
+        if self._vision_cache.get(model) is False:
+            messages = self._strip_images_from_messages(messages)
 
-        final_obj, content, tool_calls = await self._stream_chat(payload)
+        def _build_payload(msgs: list[dict]) -> dict[str, Any]:
+            p: dict[str, Any] = {
+                "model": model,
+                "messages": self._to_ollama_messages(msgs, system),
+                "stream": True,
+            }
+            if self._keep_alive:
+                p["keep_alive"] = self._keep_alive
+            if tools:
+                p["tools"] = self._to_ollama_tools(tools)
+            if self._context_override:
+                p["options"] = {"num_ctx": self._context_override}
+            return p
+
+        try:
+            final_obj, content, tool_calls = await self._stream_chat(_build_payload(messages))
+        except EnvironmentError as exc:
+            if _looks_like_vision_model_error(str(exc).lower()) and self._messages_have_images(messages):
+                # Model doesn't support images — cache and retry without them.
+                logger.info("OllamaProvider: %s doesn't support vision; retrying without images.", model)
+                self._vision_cache[model] = False
+                messages = self._strip_images_from_messages(messages)
+                final_obj, content, tool_calls = await self._stream_chat(_build_payload(messages))
+            else:
+                raise
+
         usage = await self._usage_from_final(final_obj, model)
 
         def _parse_one(tc):
@@ -183,6 +201,31 @@ class OllamaProvider(BaseProvider):
             "content": content,
             "usage": usage,
         }
+
+    def _messages_have_images(self, messages: list[dict]) -> bool:
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                if any(isinstance(item, dict) and item.get("type") == "image" for item in content):
+                    return True
+        return False
+
+    def _strip_images_from_messages(self, messages: list[dict]) -> list[dict]:
+        cleaned: list[dict] = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                new_content = [item for item in content if not (isinstance(item, dict) and item.get("type") == "image")]
+                had_image = len(new_content) < len(content)
+                if had_image:
+                    new_content.append({
+                        "type": "text",
+                        "text": "[Screenshot captured but this model does not support vision. Use observe_ui or run_command to get UI context instead.]",
+                    })
+                cleaned.append({**msg, "content": new_content})
+            else:
+                cleaned.append(msg)
+        return cleaned
 
     async def _ensure_daemon_running(self) -> None:
         async with httpx.AsyncClient(timeout=10.0) as client:

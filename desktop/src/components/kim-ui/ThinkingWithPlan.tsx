@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import type { PlanStep } from './CollapsiblePlan';
 
 export type TraceItem =
@@ -11,6 +11,10 @@ interface Props {
   duration?: string;
   steps?: number;
   planLook?: 'card' | 'compact';
+  style?: React.CSSProperties;
+  className?: string;
+  /** false = historical view: no pulse dot, no shimmer, all items full opacity */
+  live?: boolean;
 }
 
 const VERB_COLORS: Record<string, string> = {
@@ -25,7 +29,14 @@ function verbColor(verb: string): string {
 }
 
 function InlinePlanBlock({ plan, look = 'card' }: { plan: Extract<TraceItem, { kind: 'plan' }>; look?: 'card' | 'compact' }) {
+  const allDone = plan.items.length > 0 && plan.items.every((i) => i.status === 'done');
   const [open, setOpen] = useState(true);
+
+  // Auto-collapse once every step is checked off
+  useEffect(() => {
+    if (allDone) setOpen(false);
+  }, [allDone]);
+
   const done = plan.items.filter((i) => i.status === 'done').length;
   const total = plan.items.length;
   const inFlight = plan.items.filter((i) => i.status === 'active').length;
@@ -277,20 +288,22 @@ function InlinePlanBlock({ plan, look = 'card' }: { plan: Extract<TraceItem, { k
   );
 }
 
-export function ThinkingWithPlan({ trace, duration = '0:23', steps, planLook = 'card' }: Props) {
+export function ThinkingWithPlan({ trace, duration = '0:23', steps, planLook = 'card', style, className, live = true }: Props) {
   const explicitActive = trace.findIndex((i) => 'active' in i && (i as { active?: boolean }).active);
   const streamItems = trace.map((it, i) => ({ ...it, i })).filter((it) => it.kind !== 'plan');
   const lastItem = streamItems[streamItems.length - 1] as { i: number } | undefined;
-  const activeIdx = explicitActive !== -1 ? explicitActive : lastItem?.i ?? -1;
+  const activeIdx = live ? (explicitActive !== -1 ? explicitActive : lastItem?.i ?? -1) : -1;
 
   return (
     <div
+      className={className}
       style={{
         background: 'var(--kim-bg-2)',
         border: '1px solid var(--kim-border)',
         borderRadius: 14,
         padding: '16px 20px 18px',
         fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
+        ...style,
       }}
     >
       <div
@@ -303,8 +316,8 @@ export function ThinkingWithPlan({ trace, duration = '0:23', steps, planLook = '
           borderBottom: '1px dashed var(--kim-border)',
         }}
       >
-        <span className="kr-pulse-dot" />
-        <span className="kr-shimmer" style={{ fontSize: 13.5 }}>
+        {live ? <span className="kr-pulse-dot" /> : <span style={{ width: 8, height: 8, borderRadius: 999, background: 'var(--kim-text-4)', flexShrink: 0 }} />}
+        <span className={live ? 'kr-shimmer' : undefined} style={{ fontSize: 13.5, color: live ? undefined : 'var(--kim-text-2)' }}>
           Thinking
         </span>
         <span style={{ marginLeft: 'auto', color: 'var(--kim-text-3)', fontSize: 11.5 }}>
@@ -324,11 +337,13 @@ export function ThinkingWithPlan({ trace, duration = '0:23', steps, planLook = '
           }
           const isActive = i === activeIdx;
           const cursor = isActive ? '▌' : '›';
+          // In history mode (live=false), all items render at full opacity with no shimmer
+          const rowOpacity = live ? (isActive ? 1 : 0.55) : 0.8;
           const content =
             it.kind === 'thought' ? (
               <span
                 style={{ fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace', fontSize: 14, color: isActive ? undefined : 'var(--kim-text-3)' }}
-                className={isActive ? 'kr-shimmer-mono' : ''}
+                className={isActive && live ? 'kr-shimmer-mono' : ''}
               >
                 {it.text}
               </span>
@@ -336,19 +351,19 @@ export function ThinkingWithPlan({ trace, duration = '0:23', steps, planLook = '
               <span style={{ fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace', fontSize: 14 }}>
                 <span
                   style={{ color: isActive ? undefined : verbColor(it.verb), opacity: isActive ? 1 : 0.85 }}
-                  className={isActive ? 'kr-shimmer-mono' : ''}
+                  className={isActive && live ? 'kr-shimmer-mono' : ''}
                 >
                   {it.verb}
                 </span>
-                <span style={{ color: 'var(--kim-text-3)' }}> </span>
-                <span style={{ color: isActive ? 'var(--kim-text)' : 'var(--kim-text-2)' }}>{it.target}</span>
+                {it.target && <span style={{ color: 'var(--kim-text-3)' }}> </span>}
+                {it.target && <span style={{ color: isActive ? 'var(--kim-text)' : 'var(--kim-text-2)' }}>{it.target}</span>}
               </span>
             );
           return (
             <div
               key={i}
-              className="kr-fade-up"
-              style={{ display: 'flex', gap: 12, alignItems: 'baseline', opacity: isActive ? 1 : 0.55 }}
+              className={live ? 'kr-fade-up' : undefined}
+              style={{ display: 'flex', gap: 12, alignItems: 'baseline', opacity: rowOpacity }}
             >
               <span style={{ color: 'var(--kim-text-4)', width: 12, flexShrink: 0, fontSize: 14 }}>{cursor}</span>
               {content}
