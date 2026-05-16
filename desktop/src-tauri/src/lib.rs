@@ -8580,7 +8580,7 @@ async fn ollama_get_status(
             quantization_level: None,
         })
         .collect();
-    if let Some(extra) = selected_model.as_ref().filter(|m| m.ends_with("-cloud")) {
+    if let Some(extra) = selected_model.as_ref().filter(|m| !m.trim().is_empty()) {
         if !cloud_models.iter().any(|m| m.name == *extra) {
             cloud_models.push(OllamaModelInfo {
                 installed: local_names.contains(&extra.to_lowercase()),
@@ -8606,7 +8606,7 @@ async fn ollama_get_status(
         .as_ref()
         .map(|m| {
             if selected_mode == "cloud" {
-                m.ends_with("-cloud") || local_names.contains(&m.to_lowercase())
+                !m.trim().is_empty()
             } else {
                 local_names.contains(&m.to_lowercase())
             }
@@ -8614,10 +8614,7 @@ async fn ollama_get_status(
         .unwrap_or(false);
 
     let (cloud_connected, cloud_message) = if selected_mode == "cloud" {
-        let probe_model = selected
-            .clone()
-            .filter(|m| m.ends_with("-cloud"))
-            .unwrap_or_else(|| "gpt-oss:120b-cloud".to_string());
+        let probe_model = selected.clone().unwrap_or_else(|| "gpt-oss:120b-cloud".to_string());
         match ollama_chat_probe(&base_url, &probe_model).await {
             Ok(()) => (true, Some("Connected to Ollama".to_string())),
             Err(detail) => (false, Some(friendly_ollama_cloud_message(&detail))),
