@@ -23,10 +23,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_CLOUD_MODEL = "gpt-oss:120b-cloud"
-KNOWN_CLOUD_MODELS = {
-    "gpt-oss:20b-cloud",
-    DEFAULT_OLLAMA_CLOUD_MODEL,
-}
 
 
 def _env_or_cfg(config: dict, env_key: str, *path: str, default: Any = None) -> Any:
@@ -255,9 +251,9 @@ class OllamaProvider(BaseProvider):
 
     async def _validate_model(self, model: str) -> None:
         if self._mode == "cloud":
-            if model not in KNOWN_CLOUD_MODELS and not model.endswith("-cloud"):
+            if not model.strip():
                 raise EnvironmentError(
-                    f"Ollama cloud model {model!r} is not recognized. Pick a cloud model in Settings → AI → Ollama."
+                    "No Ollama cloud model selected. Pick a model in Settings → AI → Ollama, then try again."
                 )
             return
 

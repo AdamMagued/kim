@@ -85,6 +85,7 @@ export function ProviderPicker({
   const [open, setOpen] = useState(false);
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
   const [ollamaLoading, setOllamaLoading] = useState(false);
+  const [ollamaCustomModel, setOllamaCustomModel] = useState('');
   const panelRef = useRef<HTMLDivElement | null>(null);
 
   // Currently active provider category — derived from resolvedProvider.
@@ -234,6 +235,10 @@ export function ProviderPicker({
     selectedOllamaModelInfo?.quantization_level,
     selectedOllamaModelInfo?.family,
   ].filter(Boolean).join(' · ');
+
+  useEffect(() => {
+    setOllamaCustomModel(selectedOllamaModel);
+  }, [selectedOllamaModel, ollama.mode]);
 
   // Action handlers ------------------------------------------------------
   const pick = (next: string) => {
@@ -386,6 +391,22 @@ export function ProviderPicker({
                 <path d="M2 4l3 3 3-3" />
               </svg>
             </span>
+            <input
+              className="kim-provider-picker__model-input"
+              value={ollamaCustomModel}
+              placeholder={ollama.mode === 'cloud' ? 'Type a cloud model (e.g. deepseek-v4-pro)…' : 'Type a local model to pull…'}
+              disabled={disabled || !ollamaStatus?.running}
+              onChange={e => setOllamaCustomModel(e.target.value)}
+              onKeyDown={e => {
+                if (e.key !== 'Enter') return;
+                const next = ollamaCustomModel.trim();
+                if (next) void onChangeOllamaModel(ollama.mode, next);
+              }}
+              onBlur={() => {
+                const next = ollamaCustomModel.trim();
+                if (next && next !== selectedOllamaModel) void onChangeOllamaModel(ollama.mode, next);
+              }}
+            />
             {selectedOllamaMeta && <span className="kim-provider-picker__model-meta">{selectedOllamaMeta}</span>}
           </label>
 

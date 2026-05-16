@@ -2382,12 +2382,12 @@ kbd {
   grid-template-columns: auto minmax(170px, 1fr);
   align-items: center;
   column-gap: 8px;
-  row-gap: 2px;
+  row-gap: 6px;
   flex: 1 1 320px;
   min-width: 220px;
 }
 .kim-provider-picker__model-field-label {
-  grid-row: 1 / span 2;
+  grid-row: 1 / span 3;
   color: var(--kim-text-3);
   font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
   font-size: 10px;
@@ -2430,7 +2430,29 @@ kbd {
   color: var(--kim-text-3);
   pointer-events: none;
 }
+.kim-provider-picker__model-input {
+  grid-column: 2;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--kim-border);
+  background: color-mix(in srgb, var(--kim-surface) 86%, var(--kim-bg));
+  color: var(--kim-text);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  outline: none;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+}
+.kim-provider-picker__model-input:focus {
+  border-color: var(--kim-accent-line);
+}
+.kim-provider-picker__model-input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
 .kim-provider-picker__model-meta {
+  grid-column: 2;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;

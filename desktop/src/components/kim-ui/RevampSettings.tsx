@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { openUrl as openExternal } from '@tauri-apps/plugin-opener';
 import type {
   Settings,
   Provider,
@@ -616,28 +617,39 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.4fr', gap: 12, marginBottom: 12 }}>
           <div>
             <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginBottom: 6 }}>account</div>
-            <button
-              type="button"
-              className="kr-btn"
-              style={{ width: '100%', justifyContent: 'center' }}
-              onClick={async () => {
-                setOllamaBusy('signin');
-                setOllamaError(null);
-                try {
-                  await invoke('ollama_signin');
-                  toast('Ollama sign-in launched. Finish the Ollama flow, then Kim will re-check the daemon.', 'info', 5000);
-                  window.setTimeout(() => { void refreshOllamaStatus(); }, 2500);
-                  window.setTimeout(() => { void refreshOllamaStatus(); }, 7000);
-                } catch (err) {
-                  setOllamaError(String(err));
-                } finally {
-                  setOllamaBusy('idle');
-                }
-              }}
-              disabled={ollamaBusy !== 'idle'}
-            >
-              Sign in to Ollama
-            </button>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <button
+                type="button"
+                className="kr-btn"
+                style={{ width: '100%', justifyContent: 'center' }}
+                onClick={async () => {
+                  setOllamaBusy('signin');
+                  setOllamaError(null);
+                  try {
+                    await invoke('ollama_signin');
+                    toast('Ollama sign-in launched. Finish the Ollama flow, then Kim will re-check the daemon.', 'info', 5000);
+                    window.setTimeout(() => { void refreshOllamaStatus(); }, 2500);
+                    window.setTimeout(() => { void refreshOllamaStatus(); }, 7000);
+                  } catch (err) {
+                    setOllamaError(String(err));
+                  } finally {
+                    setOllamaBusy('idle');
+                  }
+                }}
+                disabled={ollamaBusy !== 'idle'}
+              >
+                Sign in to Ollama
+              </button>
+              <button
+                type="button"
+                className="kr-btn"
+                style={{ width: '100%', justifyContent: 'center' }}
+                onClick={() => void openExternal('https://www.ollama.com/usage')}
+                disabled={ollamaBusy !== 'idle'}
+              >
+                Open usage dashboard
+              </button>
+            </div>
           </div>
           <div>
             <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginBottom: 6 }}>mode</div>
@@ -682,6 +694,24 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
                 </option>
               ))}
             </select>
+            <input
+              className="kr-input"
+              style={{ marginTop: 8 }}
+              value={selectedModel}
+              onChange={(e) => {
+                if (settings.ollama.mode === 'cloud') {
+                  updateOllama({ cloud_model: e.target.value });
+                } else {
+                  updateOllama({ local_model: e.target.value });
+                }
+              }}
+              placeholder={settings.ollama.mode === 'cloud' ? 'Type a cloud model name (e.g. deepseek-v4-pro)…' : 'Type a model name to pull (e.g. qwen2.5vl)…'}
+            />
+            <div style={{ fontSize: 11.5, color: 'var(--kim-text-3)', marginTop: 6, lineHeight: 1.35 }}>
+              {settings.ollama.mode === 'cloud'
+                ? 'Kim can’t auto-discover every cloud model. Type any model name from the Ollama cloud catalog.'
+                : 'Local mode only lists installed models. Type a model name then click “Pull model”.'}
+            </div>
           </div>
         </div>
 
