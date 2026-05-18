@@ -95,7 +95,7 @@ pub fn load_session_messages(path: &Path) -> Result<Vec<UiMessage>, String> {
         let message_role = match role {
             "user" => MessageRole::User,
             "assistant" => MessageRole::Assistant,
-            "system" => MessageRole::System,
+            "system" | "compact_summary" => MessageRole::System,
             _ => continue,
         };
         messages.push(UiMessage {

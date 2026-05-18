@@ -129,11 +129,13 @@ impl App {
             Ok(messages) => {
                 self.messages = messages;
                 self.view = ViewState::InChat;
-                self.scroll =
-                    u16::try_from(self.messages.len().saturating_mul(3)).unwrap_or(u16::MAX);
+                self.scroll = 0;
                 self.status = format!("resumed {}", session.label);
             }
-            Err(error) => self.push(MessageRole::Error, error),
+            Err(error) => {
+                self.view = ViewState::InChat;
+                self.push(MessageRole::Error, error);
+            }
         }
     }
 
@@ -302,7 +304,6 @@ impl App {
             role,
             content: content.into(),
         });
-        self.scroll = u16::try_from(self.messages.len().saturating_mul(3)).unwrap_or(u16::MAX);
     }
 
     fn chat_history(&self) -> Vec<ChatMessage> {
@@ -376,12 +377,15 @@ impl App {
             Ok(messages) => {
                 self.messages = messages;
                 self.view = ViewState::InChat;
-                self.scroll =
-                    u16::try_from(self.messages.len().saturating_mul(3)).unwrap_or(u16::MAX);
+                self.scroll = 0;
                 self.current_session_id.clone_from(&session.id);
                 self.status = format!("opened {}", session.label);
             }
-            Err(error) => self.push(MessageRole::Error, error),
+            Err(error) => {
+                self.view = ViewState::InChat;
+                self.push(MessageRole::Error, error);
+                self.status = "could not open session".to_string();
+            }
         }
     }
 
@@ -540,10 +544,14 @@ async fn handle_key(
             apply_outcome(app, outcome).await
         }
         KeyCode::Esc => {
-            if !app.close_overlays() {
-                return Ok(true);
+            if app.close_overlays() {
+                return Ok(false);
             }
-            Ok(false)
+            if app.view == ViewState::InChat {
+                app.show_session_menu();
+                return Ok(false);
+            }
+            Ok(app.arm_or_exit_with_ctrl_c())
         }
         KeyCode::Backspace => {
             app.reset_ctrl_c();
@@ -582,7 +590,7 @@ async fn handle_key(
             app.reset_ctrl_c();
             if app.input.starts_with('/') {
                 app.move_slash_selection(-1);
-            } else if app.input.is_empty() {
+            } else if app.view == ViewState::SessionMenu {
                 app.allow_empty_session_open = true;
                 app.move_session_selection(-1);
             } else {
@@ -594,7 +602,7 @@ async fn handle_key(
             app.reset_ctrl_c();
             if app.input.starts_with('/') {
                 app.move_slash_selection(1);
-            } else if app.input.is_empty() {
+            } else if app.view == ViewState::SessionMenu {
                 app.allow_empty_session_open = true;
                 app.move_session_selection(1);
             } else {
@@ -628,6 +636,20 @@ async fn apply_outcome(
                 return Ok(false);
             } else if message == "__KIM_TOGGLE_MODE__" {
                 app.toggle_mode();
+                return Ok(false);
+            } else if message == "__KIM_COMPACT__" {
+                let kept = app.messages.len().min(6);
+                let dropped = app.messages.len().saturating_sub(kept);
+                if dropped > 0 {
+                    let tail = app.messages.split_off(app.messages.len() - kept);
+                    app.messages = tail;
+                }
+                app.scroll = 0;
+                app.push(
+                    MessageRole::System,
+                    format!("Compacted conversation: dropped {dropped} older message(s), kept last {kept}."),
+                );
+                app.status = "compacted".to_string();
                 return Ok(false);
             } else {
                 app.push(MessageRole::System, message);
@@ -756,8 +778,7 @@ fn help_text() -> &'static str {
 fn new_session_id() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_millis());
     format!("session-{millis}")
 }
 
