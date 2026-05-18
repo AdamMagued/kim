@@ -173,13 +173,14 @@ Renders: `RevampSidebar` + `kim-main` (topbar + `ChatView`) + `RevampSettings` m
 
 If `!account`, shows `OnboardingFlow` instead of the main UI.
 
-#### `components/ChatView.tsx` (3,327 lines — the biggest TSX file)
+#### `components/ChatView.tsx` (~3,600 lines — the biggest TSX file)
 The main chat surface. Owns:
 - **Activity feed** — `ActivityItem[]` derived from `[STATUS]/[TOOL]/[DIFF]/[USAGE]/[CONTEXT]/[PLAN]/[STEP]/[DONE]` lines streamed from the agent's stdout via Tauri events.
 - **Plan parser** — `parsePlanFromActivity()` reads structured `[PLAN]{json}` / `[STEP]{json}` / `[DONE]{json}` envelopes (preferred) or falls back to heuristic phrase detection. Drives the `CollapsiblePlan` widget.
 - **Touched-files extractor** — `extractTouchedFiles()` walks tool calls to find `write_file/edit_file/create_file` and surfaces filenames in the UI.
 - **Run-history persistence** — `invoke('save_run_history')` per task (used to show "Worked for 12s" badges on past Claw runs).
-- **Message rendering** — `collapseMessages()` merges adjacent tool-use + tool-result; `groupClawMessages()` clusters Claw subtasks per user turn.
+- **Message rendering** — `collapseMessages()` merges adjacent tool-use + tool-result; `groupClawMessages()` clusters Claw subtasks per user turn. `isIntermediateToolCall()` identifies pure-tool-call assistant messages (suppressed as bubbles; surfaced via WorkedForPill instead). `synthesizeExchangeActivity()` reconstructs `WorkedForTraceItem[]` from saved Ollama sessions where no `runHistory` entry exists.
+- **Compact summary filter** — `compact_summary` role messages are stripped at `setMessages()` time and never shown as chat bubbles; the sentinel is injected into the system prompt by the orchestrator instead.
 - **Composer** — input bar with attachments, screenshot drop, provider switcher, context ring.
 
 Key Tauri commands invoked from this file (full list):
@@ -243,11 +244,16 @@ First-run wizard. Welcome → choose provider → sign in → ready. Calls
 `open_browser_signin_window` to open the in-app browser for provider auth.
 Uses `useChromaShader` for the animated metallic background.
 
-#### `components/ProviderPicker.tsx` (523 lines)
+#### `components/ProviderPicker.tsx` (~560 lines)
 Provider dropdown. Knows about every provider (cloud + browser:* + ollama).
 Reads `OllamaStatus` from Rust (`ollama_get_status`), shows model list, lets
 the user pick local vs cloud, install models with `ollama_pull_model`. Calls
 `useAuthStatus` to show a sign-in chip per browser provider.
+
+Cloud Ollama model selection has two modes (toggled by pill buttons): dropdown (pick from a curated list) or free-text (type any Ollama cloud model name and press Enter). Free-text mode is only available when the mode is set to `cloud`; switching to `local` collapses it automatically.
+
+#### `components/kim-ui/WorkedForPill.tsx` (NEW)
+Standalone disclosure pill shown before a final assistant answer in saved Kim/Ollama sessions. Displays a collapsed "Worked for Ns" badge that expands into a list of `WorkedForTraceItem` rows (tool name, target, duration). Used by `ChatView` when `runHistory` has no entry for an exchange (i.e., the session was saved before run-history tracking or is a non-Claw session).
 
 #### `components/BrowserProviderPicker.tsx` (212 lines)
 The grid of provider tiles (Claude / ChatGPT / Gemini / Grok / DeepSeek /
@@ -497,8 +503,9 @@ Scopes requested:
 | File | Lines | Role |
 |---|---|---|
 | `__init__.py` | 0 | Package marker |
-| `agent.py` | 1,690 | Main loop, `KimAgent`, `UIBridge`, `MultiMCPClient`, `mcp_*_context` |
-| `memory.py` | 147 | Sliding-window conversation memory with screenshot pruning |
+| `agent.py` | ~1,780 | Main loop, `KimAgent`, `UIBridge`, `MultiMCPClient`, `mcp_*_context` |
+| `memory.py` | ~190 | Sliding-window conversation memory with screenshot pruning; compact-summary sentinel support |
+| `compaction.py` | ~220 | NEW: Claw-style local compaction (no LLM call); `compact_messages()`, `should_compact()`, `_fix_tool_boundary()`, `_summarize_messages()`, `_merge_summaries()` |
 | `task_queue.py` | 138 | Local+relay async task queue (dormant by default) |
 | `relay_worker.py` | 123 | NEW: wires `TaskQueue` to `KimAgent` for end-to-end execution |
 | `context_meter.py` | 261 | Token-budget tracker; emits `[CONTEXT]` log lines |
@@ -528,11 +535,11 @@ Scopes requested:
   carries forward `needs_fresh_chat` into `_clear_chat_on_next_call`.
 
 `run(task)`:
-1. Check task against `_COMPACT_CONTROL_TASKS` → if match, delegate to `_compact_and_reset_context()`.
+1. Check task against `_COMPACT_CONTROL_TASKS` → if match, delegate to `_compact_and_reset_context()`. Browser providers use LLM-based compaction (sets `_clear_chat_on_next_call`); API providers (Ollama, Claude, etc.) use `_compact_api_provider()` — local, no LLM call, no browser flags.
 2. `provider.reset_session()` if provider supports it (BrowserProvider does).
 3. Load session memory (resume or fresh).
 4. `_refresh_tools()` — `list_tools` via MCP, canonicalize.
-5. `_build_system_prompt(task)` — assembles the system prompt with per-task nonce, tool list, OS guidance, plan protocol, KIM.md, recent summaries. Uses `_build_lean_system_prompt` for `provider.lean_system_prompt = True` (Ollama).
+5. `_build_system_prompt(task)` — assembles the system prompt with per-task nonce, tool list, OS guidance, plan protocol, KIM.md, recent summaries. Uses `_build_lean_system_prompt` for `provider.lean_system_prompt = True` (Ollama). If `memory.compact_summary` is set, prepends it to the system prompt so the compaction context is visible to the LLM without embedding a system-role message in the messages array (which Anthropic's API forbids).
 6. Append `"Task: <task>"` user message.
 7. **Loop up to `max_iterations`:**
    - Cancellation check via `UIBridge`.

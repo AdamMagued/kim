@@ -69,7 +69,7 @@ export interface OpenAIToolCall {
 }
 
 export interface KimMessage {
-  role: 'user' | 'assistant' | 'tool' | 'system';
+  role: 'user' | 'assistant' | 'tool' | 'system' | 'compact_summary';
   content: string | ContentBlock[];
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;

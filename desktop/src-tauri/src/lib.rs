@@ -8301,8 +8301,23 @@ struct OllamaShowResponse {
 
 fn known_ollama_cloud_models() -> Vec<String> {
     vec![
+        // OpenAI open-source models (Ollama cloud routing)
         "gpt-oss:20b-cloud".to_string(),
         "gpt-oss:120b-cloud".to_string(),
+        // Llama (Meta)
+        "llama3.3:70b-cloud".to_string(),
+        "llama3.1:405b-cloud".to_string(),
+        // Qwen (Alibaba)
+        "qwen2.5:72b-cloud".to_string(),
+        "qwen2.5-coder:32b-cloud".to_string(),
+        // DeepSeek
+        "deepseek-r1:671b-cloud".to_string(),
+        "deepseek-v3:685b-cloud".to_string(),
+        "deepseek-coder-v4:cloud".to_string(),
+        // Mistral
+        "mistral-large:latest-cloud".to_string(),
+        // Gemma (Google)
+        "gemma3:27b-cloud".to_string(),
     ]
 }
 

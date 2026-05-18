@@ -86,6 +86,8 @@ export function ProviderPicker({
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
   const [ollamaLoading, setOllamaLoading] = useState(false);
   const [ollamaCustomModel, setOllamaCustomModel] = useState('');
+  const [customModelMode, setCustomModelMode] = useState(false);
+  const customInputRef = useRef<HTMLInputElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
 
   // Currently active provider category — derived from resolvedProvider.
@@ -238,7 +240,15 @@ export function ProviderPicker({
 
   useEffect(() => {
     setOllamaCustomModel(selectedOllamaModel);
+    // Custom mode only valid in cloud; collapse it when switching to local
+    if (ollama.mode === 'local') setCustomModelMode(false);
   }, [selectedOllamaModel, ollama.mode]);
+
+  useEffect(() => {
+    if (customModelMode && customInputRef.current) {
+      customInputRef.current.focus();
+    }
+  }, [customModelMode]);
 
   // Action handlers ------------------------------------------------------
   const pick = (next: string) => {
@@ -251,6 +261,15 @@ export function ProviderPicker({
     if (disabled) return;
     void onChangeOllamaMode(mode);
     if (resolvedProvider !== 'ollama') void onChangeProvider('ollama');
+    setCustomModelMode(false);
+  };
+
+  const confirmCustomModel = () => {
+    const next = ollamaCustomModel.trim();
+    if (next) {
+      void onChangeOllamaModel(ollama.mode, next);
+      setCustomModelMode(false);
+    }
   };
 
   const signInCurrent = async () => {
@@ -362,53 +381,93 @@ export function ProviderPicker({
             </button>
           </div>
 
-          <label className="kim-provider-picker__model-field">
+          <div className="kim-provider-picker__model-field">
             <span className="kim-provider-picker__model-field-label">Model</span>
-            <span className="kim-provider-picker__select-wrap">
-              <select
-                value={selectedOllamaModel}
-                disabled={disabled || !ollamaStatus?.running || inlineOllamaModels.length === 0}
-                onChange={e => {
-                  const model = e.target.value;
-                  if (model) void onChangeOllamaModel(ollama.mode, model);
-                }}
-              >
-                {ollama.mode === 'local' && inlineOllamaModels.length === 0 && (
-                  <option value="">No local models</option>
+
+            {customModelMode ? (
+              <div className="kim-provider-picker__custom-row">
+                <input
+                  ref={customInputRef}
+                  className="kim-provider-picker__model-input"
+                  value={ollamaCustomModel}
+                  placeholder={ollama.mode === 'cloud' ? 'e.g. deepseek-v3:685b-cloud' : 'e.g. llama3.2:3b'}
+                  disabled={disabled}
+                  onChange={e => setOllamaCustomModel(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') confirmCustomModel();
+                    if (e.key === 'Escape') setCustomModelMode(false);
+                  }}
+                />
+                <button
+                  type="button"
+                  className="kim-provider-picker__custom-confirm"
+                  onClick={confirmCustomModel}
+                  title="Use this model"
+                  aria-label="Confirm model name"
+                >
+                  <svg viewBox="0 0 12 12" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M2 6l3 3 5-5" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  className="kim-provider-picker__custom-cancel"
+                  onClick={() => { setCustomModelMode(false); setOllamaCustomModel(selectedOllamaModel); }}
+                  title="Cancel"
+                  aria-label="Cancel"
+                >
+                  <svg viewBox="0 0 12 12" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M2 2l8 8M10 2l-8 8" />
+                  </svg>
+                </button>
+              </div>
+            ) : (
+              <>
+                <span className="kim-provider-picker__select-wrap">
+                  <select
+                    value={selectedOllamaModel}
+                    disabled={disabled || !ollamaStatus?.running || inlineOllamaModels.length === 0}
+                    onChange={e => {
+                      const model = e.target.value;
+                      if (model) void onChangeOllamaModel(ollama.mode, model);
+                    }}
+                  >
+                    {ollama.mode === 'local' && inlineOllamaModels.length === 0 && (
+                      <option value="">No local models</option>
+                    )}
+                    {ollama.mode === 'cloud' && inlineOllamaModels.length === 0 && (
+                      <option value="gpt-oss:120b-cloud">gpt-oss:120b-cloud</option>
+                    )}
+                    {inlineOllamaModels.map(model => (
+                      <option key={`${ollama.mode}-${model.name}`} value={model.name}>
+                        {model.name}
+                        {model.parameter_size ? ` · ${model.parameter_size}` : ''}
+                        {model.quantization_level ? ` · ${model.quantization_level}` : ''}
+                      </option>
+                    ))}
+                  </select>
+                  <svg viewBox="0 0 10 10" width="9" height="9" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M2 4l3 3 3-3" />
+                  </svg>
+                </span>
+                {ollama.mode === 'cloud' && (
+                  <button
+                    type="button"
+                    className="kim-provider-picker__enter-name-btn"
+                    onClick={() => { setOllamaCustomModel(selectedOllamaModel); setCustomModelMode(true); }}
+                    disabled={disabled}
+                    title="Type an exact model name"
+                  >
+                    Enter model name
+                  </button>
                 )}
-                {ollama.mode === 'cloud' && inlineOllamaModels.length === 0 && (
-                  <option value="gpt-oss:120b-cloud">gpt-oss:120b-cloud</option>
-                )}
-                {inlineOllamaModels.map(model => (
-                  <option key={`${ollama.mode}-${model.name}`} value={model.name}>
-                    {model.name}
-                    {model.parameter_size ? ` · ${model.parameter_size}` : ''}
-                    {model.quantization_level ? ` · ${model.quantization_level}` : ''}
-                  </option>
-                ))}
-              </select>
-              <svg viewBox="0 0 10 10" width="9" height="9" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <path d="M2 4l3 3 3-3" />
-              </svg>
-            </span>
-            <input
-              className="kim-provider-picker__model-input"
-              value={ollamaCustomModel}
-              placeholder={ollama.mode === 'cloud' ? 'Type a cloud model (e.g. deepseek-v4-pro)…' : 'Type a local model to pull…'}
-              disabled={disabled || !ollamaStatus?.running}
-              onChange={e => setOllamaCustomModel(e.target.value)}
-              onKeyDown={e => {
-                if (e.key !== 'Enter') return;
-                const next = ollamaCustomModel.trim();
-                if (next) void onChangeOllamaModel(ollama.mode, next);
-              }}
-              onBlur={() => {
-                const next = ollamaCustomModel.trim();
-                if (next && next !== selectedOllamaModel) void onChangeOllamaModel(ollama.mode, next);
-              }}
-            />
-            {selectedOllamaMeta && <span className="kim-provider-picker__model-meta">{selectedOllamaMeta}</span>}
-          </label>
+              </>
+            )}
+
+            {!customModelMode && selectedOllamaMeta && (
+              <span className="kim-provider-picker__model-meta">{selectedOllamaMeta}</span>
+            )}
+          </div>
 
           {ollama.mode === 'local' ? (
             <button
@@ -426,22 +485,35 @@ export function ProviderPicker({
               <span>Configure local</span>
             </button>
           ) : (
-            ollamaStatus?.running && !ollamaStatus.cloud_connected && (
-              <button
-                type="button"
-                className="kim-provider-picker__signin-btn"
-                onClick={async () => {
-                  try {
-                    await invoke('ollama_signin');
-                    toast('Opening Ollama sign-in...', 'info', 2500);
-                    setTimeout(() => { void refreshOllama(); }, 800);
-                  } catch (err) {
-                    toast(`Could not open Ollama sign-in: ${err}`, 'error', 4000);
-                  }
-                }}
-              >
-                Sign in
-              </button>
+            ollamaStatus?.running && (
+              <div className="kim-provider-picker__cloud-actions">
+                {!ollamaStatus.cloud_connected && (
+                  <button
+                    type="button"
+                    className="kim-provider-picker__signin-btn"
+                    onClick={async () => {
+                      try {
+                        await invoke('ollama_signin');
+                        toast('Opening Ollama sign-in...', 'info', 2500);
+                        setTimeout(() => { void refreshOllama(); }, 800);
+                      } catch (err) {
+                        toast(`Could not open Ollama sign-in: ${err}`, 'error', 4000);
+                      }
+                    }}
+                  >
+                    Sign in
+                  </button>
+                )}
+                <a
+                  href="https://ollama.com/settings"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="kim-provider-picker__usage-link"
+                  title="View cloud usage on ollama.com"
+                >
+                  View usage ↗
+                </a>
+              </div>
             )
           )}
         </div>

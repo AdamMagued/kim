@@ -65,6 +65,7 @@ from orchestrator.memory import ConversationMemory
 from orchestrator.providers.base import BaseProvider, create_provider
 from orchestrator.session_store import SessionStore
 from orchestrator.context_loader import discover_instruction_files, build_instruction_prompt
+from orchestrator import compaction as _compaction
 
 if TYPE_CHECKING:
     from tray.voice import VoiceEngine
@@ -741,6 +742,12 @@ class KimAgent:
 
         self._emit_context_snapshot()
         system_prompt = self._build_system_prompt(task)
+        # Inject compact summary (if present) at the top of the system prompt so
+        # all API providers receive it without embedding a system-role message in
+        # the messages list (which Anthropic's API does not permit).
+        compact_ctx = self.memory.compact_summary
+        if compact_ctx:
+            system_prompt = compact_ctx + "\n\n---\n\n" + system_prompt
         consecutive_continues = 0
 
         first_msg = {"role": "user", "content": f"Task: {task}"}
@@ -800,6 +807,7 @@ class KimAgent:
                 if raw_tool_name != tool_name:
                     self._log("INFO", f"Normalized tool name '{raw_tool_name}' -> '{tool_name}'")
                 self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]})")
+                print(f"[TOOL] {tool_name}({json.dumps(tool_args)[:120]})", flush=True)
                 await self._voice_speak(f"Running {tool_name}")
 
                 # Model tried to call task_complete as a tool — treat it as TASK_COMPLETE: text
@@ -996,6 +1004,7 @@ class KimAgent:
                     tool_name = _normalize_tool_name(_json_call['tool'])
                     tool_args = _json_call['args']
                     self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]}) [text-json]")
+                    print(f"[TOOL] {tool_name}({json.dumps(tool_args)[:120]})", flush=True)
                     consecutive_continues = 0
                     result_text = await self._execute_tool(tool_name, tool_args)
                     user_content = f"[Tool result: {tool_name}]\n{result_text}"
@@ -1461,7 +1470,9 @@ Rules:
 - Skip the plan for trivial single-tool or single-knowledge-answer tasks.
 
 ## Operational guidelines
-- For desktop/app tasks: use `observe_ui` first to read the accessibility tree, then `click_ui` or `type_text`. Screenshots are expensive — only use them for visual inspection or when `observe_ui` is empty.
+- **Visual questions** ("what's on my screen?", "what do you see?", "describe my screen", "what's open?"): call `take_screenshot` FIRST, then look at the image and describe in detail what you actually see — apps, windows, text, UI elements, colors, layout. Do NOT say "I captured a screenshot" or list window titles from `get_windows`. The user wants visual description from a real screenshot.
+- **Window management tasks** ("list my windows", "switch to X", "close Y", "resize Z"): use `get_windows` to enumerate windows, then `focus_window` or other tools.
+- **Clicking / interacting with an app**: use `observe_ui` to read the accessibility tree, then `click_ui` or `type_text`. Take a screenshot only when `observe_ui` returns empty or for visual confirmation.
 - Use `focus_window` before typing into any application.
 - Use {_PATH_STYLE}.
 - Maximum {self.max_iterations} tool calls allowed. If you exceed this, the task will be cancelled.
@@ -1493,14 +1504,24 @@ Rules:
     async def _compact_and_reset_context(self) -> dict:
         """Summarize the current session, persist an artifact, and reset memory/meter.
 
-        Browser policy: compact runs in the current browser thread so it can see
-        the same conversational context. After a successful artifact write we
-        reset Kim's in-process memory and context meter; the next normal browser
-        task should be sent with a fresh browser thread by the desktop bridge via
-        its existing clear-chat/new-session path. API providers naturally start
-        from the reset canonical memory on the next call.
+        Browser providers: compact runs in the current browser thread so it can see
+        the same conversational context.  After a successful artifact write we reset
+        Kim's in-process memory and context meter; the next normal browser task
+        should be sent with a fresh browser thread via the desktop bridge.
+
+        API providers (Ollama, Claude, OpenAI, etc.): use Claw-style local
+        deterministic compaction — no LLM call, no browser-specific flags.  Old
+        messages are summarised locally and injected as a system sentinel; the
+        verbatim recent tail is kept.
         """
+        from orchestrator.providers.browser_provider import BrowserProvider
+
         self._log("INFO", "[STATUS] Compacting this chat into a fresh checkpoint…")
+
+        if not isinstance(self.provider, BrowserProvider):
+            return await self._compact_api_provider()
+
+        # ── Browser path (LLM-based) ──────────────────────────────────────
         messages = SessionStore.load_session(
             self._session_store.session_id,
             base_dir=self._session_store.base_dir,
@@ -1558,6 +1579,48 @@ Rules:
         done = f"TASK_COMPLETE: Compacted context into {artifact_path.name}; fresh chat memory is ready."
         self._session_store.append_message({"role": "assistant", "content": done})
         return {"success": True, "summary": done, "screenshot": "", "compact_artifact": str(artifact_path)}
+
+    async def _compact_api_provider(self) -> dict:
+        """Claw-style local compaction for stateless API providers (Ollama, Claude, etc.)."""
+        # Use the raw internal messages (with compact_summary sentinel preserved) so
+        # _split_existing_summary can detect a prior compaction and merge summaries.
+        messages = list(self.memory._messages)
+        if not messages:
+            msg = "NEED_HELP: There is no conversation to compact yet."
+            self._log("WARN", msg)
+            return {"success": False, "summary": msg, "screenshot": ""}
+
+        try:
+            compacted = _compaction.compact_messages(messages)
+        except Exception as e:
+            msg = f"NEED_HELP: Local compaction failed: {e}"
+            self._log("ERROR", msg)
+            return {"success": False, "summary": msg, "screenshot": ""}
+
+        # Replace in-memory history with the compacted version
+        self.memory.load_from_messages(compacted)
+
+        # Persist: save the summary sentinel and reset context meter
+        summary_content = compacted[0].get("content", "") if compacted else ""
+        compacted_at = datetime.now(timezone.utc).isoformat()
+        snapshot = self._context_meter.reset_after_compact(compacted_at=compacted_at)
+        self._log("INFO", snapshot.to_log_line())
+
+        # Persist compacted history to session store
+        try:
+            self._session_store.save_summary(
+                f"Context compacted at {compacted_at}. "
+                f"Kept {len(compacted) - 1} recent messages verbatim."
+            )
+        except Exception as e:
+            logger.warning(f"Could not save compact summary: {e}")
+
+        done = (
+            f"TASK_COMPLETE: Context compacted. "
+            f"Kept {len(compacted) - 1} recent messages; older history summarised locally."
+        )
+        self._session_store.append_message({"role": "assistant", "content": done})
+        return {"success": True, "summary": done, "screenshot": ""}
 
     async def _generate_and_save_summary(self, task: str, result_summary: str) -> None:
         """Save a session summary to disk.

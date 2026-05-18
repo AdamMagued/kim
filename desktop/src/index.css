@@ -2333,7 +2333,7 @@ kbd {
 
 .kim-provider-picker__ollama-inline {
   display: inline-flex;
-  align-items: center;
+  align-items: stretch;
   gap: 8px;
   min-width: 0;
   flex: 1 1 520px;
@@ -2345,6 +2345,8 @@ kbd {
 }
 .kim-provider-picker__mode-switch {
   display: inline-flex;
+  align-items: center;
+  align-self: stretch;
   flex-shrink: 0;
   gap: 3px;
   padding: 3px;
@@ -2379,15 +2381,16 @@ kbd {
 }
 .kim-provider-picker__model-field {
   display: grid;
-  grid-template-columns: auto minmax(170px, 1fr);
+  grid-template-columns: auto minmax(170px, 1fr) auto;
+  grid-template-rows: minmax(30px, auto) auto;
   align-items: center;
   column-gap: 8px;
-  row-gap: 6px;
+  row-gap: 3px;
   flex: 1 1 320px;
   min-width: 220px;
 }
 .kim-provider-picker__model-field-label {
-  grid-row: 1 / span 3;
+  grid-row: 1;
   color: var(--kim-text-3);
   font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
   font-size: 10px;
@@ -2395,7 +2398,76 @@ kbd {
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
+.kim-provider-picker__enter-name-btn {
+  grid-column: 3;
+  grid-row: 1;
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  height: 30px;
+  background: none;
+  border: none;
+  padding: 0 2px;
+  color: var(--kim-text-4);
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: transparent;
+  transition: color 0.12s, text-decoration-color 0.12s;
+}
+.kim-provider-picker__enter-name-btn:hover:not(:disabled) {
+  color: var(--kim-text-2);
+  text-decoration-color: currentColor;
+}
+.kim-provider-picker__enter-name-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.kim-provider-picker__custom-row {
+  grid-column: 2 / 4;
+  grid-row: 1;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.kim-provider-picker__custom-row .kim-provider-picker__model-input {
+  grid-column: unset;
+  flex: 1 1 0;
+  min-width: 0;
+}
+.kim-provider-picker__custom-confirm,
+.kim-provider-picker__custom-cancel {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  border: 1px solid var(--kim-border);
+  background: var(--kim-surface);
+  color: var(--kim-text-3);
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s, background 0.12s;
+}
+.kim-provider-picker__custom-confirm:hover {
+  border-color: #22c55e;
+  color: #22c55e;
+  background: rgba(34, 197, 94, 0.08);
+}
+.kim-provider-picker__custom-cancel:hover {
+  border-color: rgba(239, 68, 68, 0.5);
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.06);
+}
 .kim-provider-picker__select-wrap {
+  grid-column: 2;
+  grid-row: 1;
   position: relative;
   display: flex;
   align-items: center;
@@ -2431,7 +2503,6 @@ kbd {
   pointer-events: none;
 }
 .kim-provider-picker__model-input {
-  grid-column: 2;
   width: 100%;
   min-width: 0;
   border: 1px solid var(--kim-border);
@@ -2452,7 +2523,8 @@ kbd {
   cursor: not-allowed;
 }
 .kim-provider-picker__model-meta {
-  grid-column: 2;
+  grid-column: 2 / 4;
+  grid-row: 2;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2460,6 +2532,28 @@ kbd {
   color: var(--kim-text-4);
   font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
   font-size: 10px;
+}
+.kim-provider-picker__cloud-actions {
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.kim-provider-picker__usage-link {
+  display: inline-flex;
+  align-items: center;
+  color: var(--kim-text-4);
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  text-decoration: none;
+  flex-shrink: 0;
+  transition: color 0.12s;
+}
+.kim-provider-picker__usage-link:hover {
+  color: var(--kim-text-2);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .kim-provider-picker__mini-settings {
   display: inline-flex;

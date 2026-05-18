@@ -18,3 +18,6 @@ export type { Connector, ConnectorState, ConnectorActivity } from './ConnectorsP
 export { RevampSidebar } from './RevampSidebar';
 
 export { RevampSettings } from './RevampSettings';
+
+export { WorkedForPill } from './WorkedForPill';
+export type { WorkedForPillProps, WorkedForTraceItem, WorkedForToolKind } from './WorkedForPill';

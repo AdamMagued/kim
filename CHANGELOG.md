@@ -1,5 +1,39 @@
 # Changelog
 
+## Claw-style Compaction, WorkedForPill, Model Picker Polish (2026-05-18)
+
+### New: Claw-style Local Compaction for API Providers
+
+When a user types `/compact` with Ollama or any other API provider (Claude, OpenAI, etc.), Kim now uses the same deterministic, no-LLM compaction algorithm as the Claw binary instead of sending an extra LLM round-trip.
+
+- **`orchestrator/compaction.py`** (new file): Python port of Claw's `compact.rs`. Summarises old messages locally — extracts user requests, tools used, key file paths, and a chronological timeline — then injects the result as a pinned system-level sentinel. The verbatim recent tail (last 6 messages by default) is always preserved. Tool-use/tool-result boundary protection walks back the split point to avoid orphaning a tool result without its paired tool call. Repeated compactions merge the old summary with the new one.
+- **`orchestrator/agent.py`**: `_compact_and_reset_context()` now branches on `isinstance(self.provider, BrowserProvider)`. Browser providers keep the existing LLM-based compact path (with `_clear_chat_on_next_call`). All API providers (Ollama, Claude, OpenAI, etc.) use the new `_compact_api_provider()` method — no LLM call, no browser flags. The compact summary is injected at the top of the system prompt on each subsequent call so every provider (including Anthropic's API, which forbids system-role messages inside the messages array) receives it correctly.
+- **`orchestrator/memory.py`**: New `compact_summary` property exposes the pinned sentinel text. `get_messages()` skips the sentinel (it goes into the system prompt instead). `_enforce_limits()` pins the sentinel at index 0 — it is never dropped by the sliding-window trim.
+- **`desktop/src/types/index.ts`**: Added `'compact_summary'` to the `KimMessage.role` union so the Rust → TypeScript message boundary handles it without a type error.
+- **`desktop/src/components/ChatView.tsx`**: `compact_summary` messages are filtered out at `setMessages()` time so they never appear as chat bubbles.
+
+### New: WorkedForPill for Saved Ollama Sessions
+
+Ollama chat histories (loaded from disk) now show the "Worked on this" activity disclosure pill before each assistant answer, matching the behaviour of live Claw sessions.
+
+- **`desktop/src/components/kim-ui/WorkedForPill.tsx`** (new file): Standalone pill component that renders a collapsed "Worked for Ns" badge expandable into a list of tool-call trace rows.
+- **`desktop/src/components/ChatView.tsx`**: Added `isIntermediateToolCall()` (detects assistant messages that are pure tool calls, not final answers) and `synthesizeExchangeActivity()` (walks the saved message list for a given user-message index and builds a `WorkedForTraceItem[]` from tool calls found between that turn and the next user message). The message renderer uses these to show `WorkedForPill` before final answers even when `runHistory` has no entry for the exchange.
+- **`desktop/src/components/kim-ui/index.ts`**: Exports `WorkedForPill` and its types.
+
+### Improvement: Ollama Model Picker — Toggle + Free-Text for Cloud Models
+
+The Ollama model selector no longer forces every cloud model into a dropdown. Cloud mode now has a toggle between "pick from list" and "enter model name", making it easy to use any Ollama-hosted model without waiting for us to add it to the list.
+
+- **`desktop/src/components/ProviderPicker.tsx`**: Replaced the single `<select>` with a mode toggle (pill buttons: list vs. custom). In list mode the dropdown is shown as before. In custom mode a text input appears pre-filled with the current model name; pressing Enter or clicking the checkmark confirms the selection. Toggle automatically collapses when switching to local mode.
+- **`desktop/src-tauri/src/lib.rs`** (`known_ollama_cloud_models`): Expanded the cloud model list with Llama 3.1/3.3, Qwen 2.5 (including Coder), DeepSeek R1/V3/Coder-v4, Mistral Large, and Gemma 3 — all via Ollama's cloud routing suffix.
+- **`desktop/src/index.css`**: Added styles for the model-picker toggle and custom-model input field.
+
+### Fix: Ollama Operational Guidelines — Screenshot vs get_windows
+
+The Ollama lean system prompt now explicitly tells the model to call `take_screenshot` rather than `get_windows` for screen awareness, and to use `observe_ui` before any click when exact coordinates are uncertain. This reduces wasted tool-call turns on vision-capable Ollama models.
+
+---
+
 ## File Attachments, Blank Response Fixes & Agent Polish (2026-05-16)
 
 ### New: File Attachments & Drag-and-Drop
