@@ -94,7 +94,7 @@ class OllamaProvider(BaseProvider):
         self._vision_cache: dict[str, bool] = {}
         ollama_cfg = dict(config.get("ollama") or {})
         self._base_url = str(
-            _env_or_cfg(config, "KIM_OLLAMA_BASE_URL", "ollama", "base_url", default=ollama_cfg.get("base_url") or DEFAULT_OLLAMA_BASE_URL)
+            _env_or_cfg(config, "KIM_OLLAMA_BASE_URL", "ollama", "base_url", default=ollama_cfg.get("base_url") or DEFAULT_OLLAMA_BASE_URL)  # noqa: E501
         ).rstrip("/")
         self._mode = str(
             _env_or_cfg(config, "KIM_OLLAMA_MODE", "ollama", "mode", default=ollama_cfg.get("mode") or "local")
@@ -102,16 +102,16 @@ class OllamaProvider(BaseProvider):
         if self._mode not in {"local", "cloud"}:
             self._mode = "local"
         self._local_model = str(
-            _env_or_cfg(config, "KIM_OLLAMA_LOCAL_MODEL", "ollama", "local_model", default=ollama_cfg.get("local_model") or "")
+            _env_or_cfg(config, "KIM_OLLAMA_LOCAL_MODEL", "ollama", "local_model", default=ollama_cfg.get("local_model") or "")  # noqa: E501
         ).strip()
         self._cloud_model = str(
-            _env_or_cfg(config, "KIM_OLLAMA_CLOUD_MODEL", "ollama", "cloud_model", default=ollama_cfg.get("cloud_model") or DEFAULT_OLLAMA_CLOUD_MODEL)
+            _env_or_cfg(config, "KIM_OLLAMA_CLOUD_MODEL", "ollama", "cloud_model", default=ollama_cfg.get("cloud_model") or DEFAULT_OLLAMA_CLOUD_MODEL)  # noqa: E501
         ).strip()
         self._context_override = _coerce_optional_int(
-            _env_or_cfg(config, "KIM_OLLAMA_CONTEXT_LIMIT_OVERRIDE", "ollama", "context_limit_override", default=ollama_cfg.get("context_limit_override"))
+            _env_or_cfg(config, "KIM_OLLAMA_CONTEXT_LIMIT_OVERRIDE", "ollama", "context_limit_override", default=ollama_cfg.get("context_limit_override"))  # noqa: E501
         )
         self._keep_alive = str(
-            _env_or_cfg(config, "KIM_OLLAMA_KEEP_ALIVE", "ollama", "keep_alive", default=ollama_cfg.get("keep_alive") or "5m")
+            _env_or_cfg(config, "KIM_OLLAMA_KEEP_ALIVE", "ollama", "keep_alive", default=ollama_cfg.get("keep_alive") or "5m")  # noqa: E501
         ).strip()
         self._timeout_s = 600.0
         logger.info(
@@ -216,7 +216,7 @@ class OllamaProvider(BaseProvider):
                 if had_image:
                     new_content.append({
                         "type": "text",
-                        "text": "[Screenshot captured but this model does not support vision. Use observe_ui or run_command to get UI context instead.]",
+                        "text": "[Screenshot captured but this model does not support vision. Use observe_ui or run_command to get UI context instead.]",  # noqa: E501
                     })
                 cleaned.append({**msg, "content": new_content})
             else:
@@ -265,7 +265,7 @@ class OllamaProvider(BaseProvider):
         }
         if model.strip().lower() not in names:
             raise EnvironmentError(
-                f"Ollama local model {model!r} is not installed. Pull it in Settings → AI → Ollama or pick another model."
+                f"Ollama local model {model!r} is not installed. Pull it in Settings → AI → Ollama or pick another model."  # noqa: E501
             )
 
     async def _fetch_tags(self) -> list[dict]:
@@ -353,11 +353,11 @@ class OllamaProvider(BaseProvider):
                     if _looks_like_vision_model_error(lowered):
                         raise EnvironmentError(
                             "The selected Ollama model does not appear to support images. "
-                            "Pick a vision-capable Ollama model or use structured UI observation instead of screenshots."
+                            "Pick a vision-capable Ollama model or use structured UI observation instead of screenshots."  # noqa: E501
                         )
                     if "not found" in lowered or "pull" in lowered:
                         raise EnvironmentError(
-                            f"Ollama model {payload.get('model')!r} is unavailable. Pull it in Settings → AI → Ollama or pick another model."
+                            f"Ollama model {payload.get('model')!r} is unavailable. Pull it in Settings → AI → Ollama or pick another model."  # noqa: E501
                         )
                     if "sign in" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
                         raise PermissionError("Sign in to Ollama to use cloud models.")
@@ -380,11 +380,11 @@ class OllamaProvider(BaseProvider):
                         if _looks_like_vision_model_error(lowered):
                             raise EnvironmentError(
                                 "The selected Ollama model does not appear to support images. "
-                                "Pick a vision-capable Ollama model or use structured UI observation instead of screenshots."
+                                "Pick a vision-capable Ollama model or use structured UI observation instead of screenshots."  # noqa: E501
                             )
                         if "not found" in lowered or "pull" in lowered:
                             raise EnvironmentError(
-                                f"Ollama model {payload.get('model')!r} is unavailable. Pull it in Settings → AI → Ollama or pick another model."
+                                f"Ollama model {payload.get('model')!r} is unavailable. Pull it in Settings → AI → Ollama or pick another model."  # noqa: E501
                             )
                         raise RuntimeError(detail)
 
@@ -425,7 +425,7 @@ class OllamaProvider(BaseProvider):
             "mode": self._mode,
             "usage_available": usage_available,
             "forbid_fallback": True,
-            "billing": "Local: no API billing" if self._mode == "local" else "Cloud account usage is managed by Ollama. Kim can show token usage, not remaining account balance.",
+            "billing": "Local: no API billing" if self._mode == "local" else "Cloud account usage is managed by Ollama. Kim can show token usage, not remaining account balance.",  # noqa: E501
         }
         if prompt_eval_count is not None:
             usage["input"] = prompt_eval_count

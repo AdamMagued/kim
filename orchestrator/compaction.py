@@ -11,7 +11,6 @@ Browser providers use a different (LLM-based) compact path in agent.py.
 from __future__ import annotations
 
 import json
-import math
 from typing import Any
 
 COMPACT_PREAMBLE = (

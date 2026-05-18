@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2540,6 +2540,7 @@ fn notify_bridge_result() {
     condvar.notify_all();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_bridge_complete_script(
     site: &str,
     prompt: &str,
@@ -3710,6 +3711,7 @@ fn pull_payload_from_js_store_legacy(
 /// The persistent bridge is already loaded via initialization_script:
 ///   window.__kimBridge.send(prompt, reqId, site, attachments)
 /// This is a ~100 byte eval call vs the previous ~30KB script injection.
+#[allow(clippy::too_many_arguments)]
 fn run_bridge_completion_once(
     window: &tauri::WebviewWindow,
     site: &str,
@@ -6363,6 +6365,7 @@ async fn session_browser_meta_read(
     Ok(read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default())
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn session_browser_meta_write(
     session_id: String,
@@ -6493,7 +6496,7 @@ async fn restore_browser_for_session(
 
     let message = if restored {
         Some("Restored the saved browser conversation for this session.".to_string())
-    } else if meta.browser_threads.get(&site).is_some() {
+    } else if meta.browser_threads.contains_key(&site) {
         Some("Saved browser URL was no longer safe/valid, so Kim opened a fresh provider page.".to_string())
     } else {
         Some("No saved browser conversation for this provider; opened the provider start page.".to_string())
@@ -7117,6 +7120,7 @@ fn find_claw_binary(kim_root: &Path) -> Option<PathBuf> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn send_task(
     task: String,
@@ -8737,7 +8741,7 @@ end tell"#;
                 return Ok(());
             }
         }
-        return Err("Could not launch a terminal for `ollama signin`.".to_string());
+        Err("Could not launch a terminal for `ollama signin`.".to_string())
     }
 }
 
@@ -9462,7 +9466,7 @@ async fn open_in_finder(path: String) -> Result<(), String> {
             .arg(&path)
             .spawn()
             .map_err(|e| e.to_string())?;
-        return Ok(());
+        Ok(())
     }
 }
 

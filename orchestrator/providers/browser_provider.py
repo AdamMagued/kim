@@ -526,13 +526,13 @@ class BrowserProvider(BaseProvider):
                             "Please reopen the existing provider chat window and resend."
                         ),
                     }
-                
+
                 if clear_chat:
                     logger.info(f"Clearing chat context by reloading {page.url}...")
                     await page.goto(page.url, wait_until="domcontentloaded")
                     await asyncio.sleep(2.0)
                     self._sent_system_prompt = False
-                    
+
                 cfg = self._site_configs[site]
 
                 image_attachments = [
@@ -640,7 +640,7 @@ class BrowserProvider(BaseProvider):
         }
         if getattr(self, "_model_tier", None):
             payload["model_tier"] = self._model_tier
-            
+
         if site == "gemini" and self._gemini_authuser is not None:
             payload["authuser"] = self._gemini_authuser
             logger.info("Routing Gemini WebView via authuser=%s", self._gemini_authuser)
@@ -710,7 +710,7 @@ class BrowserProvider(BaseProvider):
             logger.warning("Bridge /v1/send timed out (prompt may already be injected)")
             return {
                 "type": "text",
-                "content": "NEED_HELP: Bridge /v1/send timed out. The prompt may have been partially sent. Please check the browser window and retry if needed.",
+                "content": "NEED_HELP: Bridge /v1/send timed out. The prompt may have been partially sent. Please check the browser window and retry if needed.",  # noqa: E501
             }
         except Exception as e:
             logger.warning(f"Bridge /v1/send failed ({e})")
@@ -934,8 +934,8 @@ class BrowserProvider(BaseProvider):
             # force_headless path: empty dir is expected on first run; sign-in
             # will populate it. Continue and let the caller probe auth status.
             logger.info(
-                f"force_headless: launching with empty user_data_dir — "
-                f"sign-in must happen via the Tauri webview first."
+                "force_headless: launching with empty user_data_dir — "
+                "sign-in must happen via the Tauri webview first."
             )
 
         logger.info(
@@ -1108,7 +1108,7 @@ class BrowserProvider(BaseProvider):
     @staticmethod
     def _extract_conversation_id(url: str) -> str:
         """Extract a conversation-identifying path from a provider URL.
-        
+
         Examples:
             claude.ai/chat/abc-123  → /chat/abc-123
             chatgpt.com/c/xyz       → /c/xyz
@@ -1125,7 +1125,7 @@ class BrowserProvider(BaseProvider):
         Resets when:
         1. The site/domain changed (e.g. claude.ai → gemini.google.com)
         2. The conversation ID changed within the same site (e.g. /chat/123 → /chat/456)
-        
+
         Does NOT reset for trivial URL changes like query param updates.
         """
         if not self._last_chat_page_url:
@@ -1383,7 +1383,7 @@ class BrowserProvider(BaseProvider):
                     if (!el) return false;
                     el.focus();
                     if ('value' in el) {
-                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;  # noqa: E501
                         if (nativeInputValueSetter) {
                             nativeInputValueSetter.call(el, text);
                         } else {
@@ -1443,7 +1443,7 @@ class BrowserProvider(BaseProvider):
         prompt as multiple broken messages.
         """
         actual = await self._read_editor_text(page, selector)
-        
+
         def normalize_typo(s: str) -> str:
             return (
                 " ".join(s.split())
@@ -1452,7 +1452,7 @@ class BrowserProvider(BaseProvider):
                 .replace("—", "--").replace("–", "--")
                 .replace("…", "...")
             )
-            
+
         expected_norm = normalize_typo(expected)
         actual_norm = normalize_typo(actual)
 
@@ -1465,9 +1465,9 @@ class BrowserProvider(BaseProvider):
             return actual_norm == expected_norm
 
         if len(actual_norm) < max(_VERIFY_MIN_CHARS, int(len(expected_norm) * 0.98)):
-            logger.warning(f"Injection failed: actual length {len(actual_norm)} is < 98% of expected {len(expected_norm)}")
+            logger.warning(f"Injection failed: actual length {len(actual_norm)} is < 98% of expected {len(expected_norm)}")  # noqa: E501
             return False
-            
+
         # We only need the first/last few chars to match to ensure it wasn't truncated.
         # But we use a fuzzy check in case of stray punctuation that wasn't normalized.
         def fuzzy_match(a: str, b: str) -> bool:
@@ -1476,11 +1476,11 @@ class BrowserProvider(BaseProvider):
             return re.sub(r'\W+', '', a) == re.sub(r'\W+', '', b)
 
         if not fuzzy_match(actual_norm[:200], expected_norm[:200]):
-            logger.warning(f"Injection failed: Prefix mismatch. Actual: {actual_norm[:50]}... Expected: {expected_norm[:50]}...")
+            logger.warning(f"Injection failed: Prefix mismatch. Actual: {actual_norm[:50]}... Expected: {expected_norm[:50]}...")  # noqa: E501
             return False
-            
+
         if not fuzzy_match(actual_norm[-200:], expected_norm[-200:]):
-            logger.warning(f"Injection failed: Suffix mismatch. Actual: ...{actual_norm[-50:]} Expected: ...{expected_norm[-50:]}")
+            logger.warning(f"Injection failed: Suffix mismatch. Actual: ...{actual_norm[-50:]} Expected: ...{expected_norm[-50:]}")  # noqa: E501
             return False
 
         return True
@@ -1489,7 +1489,7 @@ class BrowserProvider(BaseProvider):
     # Send + wait + scrape
     # ==================================================================
 
-    async def _send_and_wait(self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = "") -> str:
+    async def _send_and_wait(self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = "") -> str:  # noqa: E501
         """Inject the prompt, click Send, and wait for the full response."""
         # Find the best response selector and count current responses before sending
         response_sel = await self._find_selector(page, cfg["response_selectors"])
@@ -1551,10 +1551,10 @@ class BrowserProvider(BaseProvider):
 
         # Wait for generation to finish (stop button disappears or completion hash found)
         await self._wait_for_generation_complete(
-            page, 
-            cfg["stop_selectors"], 
-            cfg["response_selectors"], 
-            completion_hash, 
+            page,
+            cfg["stop_selectors"],
+            cfg["response_selectors"],
+            completion_hash,
             site,
             min_index=new_element_index
         )
@@ -1584,8 +1584,6 @@ class BrowserProvider(BaseProvider):
                 continue
         return None
 
-
-
     async def _wait_for_new_response(
         self, page: Page, response_sel: str, initial_count: int
     ) -> bool:
@@ -1602,7 +1600,7 @@ class BrowserProvider(BaseProvider):
         return False
 
     async def _wait_for_generation_complete(
-        self, page: Page, stop_selectors: list[str], response_selectors: list[str], completion_hash: str | None, site: str = "AI", min_index: int = 0
+        self, page: Page, stop_selectors: list[str], response_selectors: list[str], completion_hash: str | None, site: str = "AI", min_index: int = 0  # noqa: E501
     ) -> None:
         """
         Wait until all known stop-button selectors are invisible (generation
@@ -1617,16 +1615,16 @@ class BrowserProvider(BaseProvider):
         # returning old responses when TTFT is slow (#21)
         min_generation_time = loop.time() + 5.0
         elapsed = 0
-        
+
         last_text_len = 0
         idle_count = 0
-        
+
         while loop.time() < deadline:
             # Check for completion hash first to short-circuit
             current_text = ""
             try:
                 current_text = await self._scrape_last_response(page, response_selectors, min_index=min_index)
-                logger.debug(f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}")
+                logger.debug(f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}")  # noqa: E501
                 if completion_hash and completion_hash in current_text:
                     logger.debug("Generation complete (completion hash found)")
                     return
@@ -1977,9 +1975,8 @@ class BrowserProvider(BaseProvider):
 
         last_text = last_text.strip()
 
-        import uuid
         # Use a unique, memorable sentinel instead of a static hash.
-        # This guarantees the scraper will NEVER accidentally match the previous 
+        # This guarantees the scraper will NEVER accidentally match the previous
         # turn's marker if the DOM is slow to update.
         unique_id = uuid.uuid4().hex[:8]
         completion_hash = f"[END_OF_RESPONSE_{unique_id}]"
