@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::theme::Theme;
@@ -183,7 +183,11 @@ fn draw_session_browser(frame: &mut Frame<'_>, app: &App, area: Rect, theme: The
             .border_style(Style::default().fg(theme.border))
             .style(Style::default().bg(theme.bg)),
     );
-    frame.render_widget(list, rows[1]);
+    // Use ListState so ratatui auto-scrolls the viewport when the selection
+    // moves beyond the visible area. Each row is 2 lines tall.
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.selected_session));
+    frame.render_stateful_widget(list, rows[1], &mut list_state);
 }
 
 fn session_row<'a>(title: &'a str, preview: &'a str, selected: bool, theme: Theme) -> ListItem<'a> {

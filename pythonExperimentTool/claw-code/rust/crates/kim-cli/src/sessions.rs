@@ -146,10 +146,17 @@ fn collect_jsonl_sessions(root: &Path, sessions: &mut Vec<SessionEntry>) {
 
 fn session_entry(path: &Path) -> Option<SessionEntry> {
     let id = path.file_stem()?.to_string_lossy().to_string();
-    let context = session_context(path, &id);
     let preview = preview_for_session(path);
+    let context = session_context(path, &id);
+    let label = if preview == "Untitled conversation" {
+        // Use a readable timestamp rather than the raw hash/id as the title.
+        let ts = readable_modified_time(path);
+        format!("{context} · {ts}")
+    } else {
+        preview.clone()
+    };
     Some(SessionEntry {
-        label: title_for_session(&preview, &context),
+        label,
         id,
         preview: context,
         path: path.to_path_buf(),
@@ -223,7 +230,7 @@ pub fn display_message_text(text: &str) -> Option<String> {
     clean_message_text(text)
 }
 
-fn session_context(path: &Path, id: &str) -> String {
+fn session_context(path: &Path, _id: &str) -> String {
     let parent = path.parent().and_then(Path::file_name).map_or_else(
         || "saved chat".to_string(),
         |name| name.to_string_lossy().to_string(),
@@ -232,18 +239,43 @@ fn session_context(path: &Path, id: &str) -> String {
         parent.as_str(),
         "sessions" | "kim_sessions" | ".kim" | ".claw"
     ) {
-        format!("saved chat {}", truncate(id, 8))
+        "saved chat".to_string()
     } else {
         parent
     }
 }
 
-fn title_for_session(preview: &str, context: &str) -> String {
-    if preview == "Untitled conversation" {
-        format!("{context} · Untitled")
-    } else {
-        preview.to_string()
-    }
+fn readable_modified_time(path: &Path) -> String {
+    use std::time::UNIX_EPOCH;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return "saved chat".to_string();
+    };
+    let Ok(modified) = meta.modified() else {
+        return "saved chat".to_string();
+    };
+    let secs = modified
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Format as "May 18 14:23" — no external crate needed.
+    let minutes = secs / 60;
+    let hours = (minutes / 60) % 24;
+    let day_of_year = (secs / 86400) % 365;
+    let month_starts: [u64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let month_names = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month_idx = month_starts
+        .iter()
+        .rposition(|&start| day_of_year >= start)
+        .unwrap_or(0);
+    let day = day_of_year - month_starts[month_idx] + 1;
+    let hour = hours % 24;
+    let min = minutes % 60;
+    format!(
+        "{} {} {:02}:{:02}",
+        month_names[month_idx], day, hour, min
+    )
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
