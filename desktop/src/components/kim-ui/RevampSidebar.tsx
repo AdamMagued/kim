@@ -1,8 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type { SessionInfo, KimAccount, ClawProject, Theme } from '../../types';
+
+const SIDEBAR_MIN_WIDTH = 220;
+const SIDEBAR_MAX_WIDTH = 520;
+const SIDEBAR_DEFAULT_WIDTH = 280;
 
 export type SettingsPane =
   | 'appearance'
@@ -126,6 +131,53 @@ export function RevampSidebar({
   const [openProjects, setOpenProjects] = useState<string[]>([]);
   const [acctMenuOpen, setAcctMenuOpen] = useState(false);
   const acctMenuRef = useRef<HTMLDivElement>(null);
+  const sidebarRef = useRef<HTMLDivElement>(null);
+
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem('kim-revamp-sidebar-width');
+      const v = raw ? parseInt(raw, 10) : NaN;
+      if (Number.isFinite(v)) return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, v));
+    } catch {}
+    return SIDEBAR_DEFAULT_WIDTH;
+  });
+  const [resizing, setResizing] = useState(false);
+  const resizingRef = useRef(false);
+  const resizeLeftRef = useRef(0);
+  useEffect(() => {
+    if (!resizing) return;
+    function onMove(e: PointerEvent) {
+      if (!resizingRef.current) return;
+      const raw = e.clientX - resizeLeftRef.current;
+      const next = Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, raw));
+      setSidebarWidth(next);
+    }
+    function onUp() {
+      resizingRef.current = false;
+      setResizing(false);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+  }, [resizing]);
+  useEffect(() => {
+    try { localStorage.setItem('kim-revamp-sidebar-width', String(sidebarWidth)); } catch {}
+  }, [sidebarWidth]);
+  function startResize(e: ReactPointerEvent<HTMLDivElement>) {
+    e.preventDefault();
+    resizingRef.current = true;
+    resizeLeftRef.current = sidebarRef.current?.getBoundingClientRect().left ?? 0;
+    setResizing(true);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }
 
   const [projectMenu, setProjectMenu] = useState<{ x: number; y: number; path: string } | null>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
@@ -263,14 +315,16 @@ export function RevampSidebar({
 
   return (
     <div
+      ref={sidebarRef}
       style={{
-        width: 280,
+        width: sidebarWidth,
         flexShrink: 0,
         background: 'var(--kim-sidebar-gradient)',
         borderRight: '1px solid var(--kim-border)',
         display: 'flex',
         flexDirection: 'column',
         padding: '58px 14px 16px',
+        position: 'relative',
       }}
     >
       {/* Logo + collapse */}
@@ -310,6 +364,17 @@ export function RevampSidebar({
           </svg>
         </button>
       </div>
+
+      {/* Resize handle */}
+      <div
+        className={`kr-sidebar__resize-handle${resizing ? ' kr-sidebar__resize-handle--active' : ''}`}
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize sidebar"
+        onPointerDown={startResize}
+        onDoubleClick={() => setSidebarWidth(SIDEBAR_DEFAULT_WIDTH)}
+        title="Drag to resize · double-click to reset"
+      />
 
       {/* New chat */}
       <button

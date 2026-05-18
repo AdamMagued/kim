@@ -1499,17 +1499,19 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     })
       .then(msgs => {
         const prev = prevMsgCountRef.current;
-        const lastAssistantIdx = msgs.reduceRight((found, m, i) =>
+        // Filter compact_summary before counting so prevMsgCountRef and all
+        // "did new messages arrive?" checks use the same baseline.
+        const displayMsgs = msgs.filter(m => m.role !== 'compact_summary');
+        const lastAssistantIdx = displayMsgs.reduceRight((found, m, i) =>
           found === -1 && m.role === 'assistant' ? i : found, -1);
         // Animate only on session change. On silent refresh the bubble was
         // already shown (and animated) via liveHistory — re-animating it
         // looks like the chat is "refreshing".
-        if (isSessionChange && !isSeamlessTransition && prev > 0 && msgs.length > prev && lastAssistantIdx >= prev) {
+        if (isSessionChange && !isSeamlessTransition && prev > 0 && displayMsgs.length > prev && lastAssistantIdx >= prev) {
           setNewestMsgIdx(lastAssistantIdx);
         } else {
           setNewestMsgIdx(null);
         }
-        const displayMsgs = msgs.filter(m => m.role !== 'compact_summary');
         prevMsgCountRef.current = displayMsgs.length;
         setMessages(displayMsgs);
         // Group Claw session messages into per-run structures so intermediate
@@ -1527,7 +1529,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
         // would wipe the new response. Only clear when the disk data
         // actually absorbed the new content (msg count grew).
         if (!isSessionChange || isSeamlessTransition) {
-          if (msgs.length > prev) {
+          if (displayMsgs.length > prev) {
             setLiveHistory([]);
           }
         }
@@ -2055,17 +2057,20 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
 
     const isCompactTask = ['__kim_compact_context__', '/compact', 'compact'].includes(pending.text.trim().toLowerCase());
 
+    // Show thinking indicator immediately — bypass the 50ms flush queue so the
+    // user sees feedback the instant they press send, not after the subprocess starts.
+    activityRef.current = [{
+      id: ++activityCounterRef.current,
+      kind: 'status' as const,
+      icon: '›',
+      text: isCompactTask ? 'Compacting this chat…' : 'Kim is thinking…',
+    }];
+    setActivity(activityRef.current);
+
     // Add user message to live history for chat bubble display. Compact is an
     // internal control task, so keep it out of the visible conversation.
     if (!isCompactTask) {
       setLiveHistory(prev => [...prev, { role: 'user', content: pending.text }]);
-    } else {
-      enqueueActivityUpdate(prev => [...prev, {
-        id: ++activityCounterRef.current,
-        kind: 'status',
-        icon: '›',
-        text: 'Compacting this chat…',
-      }]);
     }
 
     try {
@@ -2338,8 +2343,28 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
           reader.readAsText(file);
         });
         results.push({ name: file.name, kind: 'text', content, sizeLabel });
+      } else if (file.type.startsWith('audio/') || file.type.startsWith('video/')) {
+        toast(`${file.name}: audio and video files are not supported.`, 'warning', 4000);
       } else {
-        toast(`${file.name}: binary files are not yet supported — attach text or image files.`, 'warning', 4000);
+        // PDFs, DOCX, XLS, ZIP, etc. — save to disk so the agent can read/process them
+        const base64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const url = reader.result as string;
+            resolve(url.includes(',') ? url.split(',')[1] : url);
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+        try {
+          const savedPath = await invoke<string>('save_attachment', {
+            filename: file.name,
+            dataBase64: base64,
+          });
+          results.push({ name: file.name, kind: 'binary', savedPath, sizeLabel });
+        } catch {
+          toast(`Could not save ${file.name}`, 'error', 3000);
+        }
       }
     }
     if (results.length > 0) {
@@ -2361,6 +2386,9 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     return files.map(f => {
       if (f.kind === 'image') {
         return `[Attached image: ${f.name}]\nPath on disk: ${f.savedPath ?? 'unknown'}\n`;
+      }
+      if (f.kind === 'binary') {
+        return `[Attached file: ${f.name}]\nPath on disk: ${f.savedPath ?? 'unknown'}\nUse read_file, bash (e.g. pdftotext, unzip, file), or other tools to access its contents.\n`;
       }
       return `[Attached file: ${f.name}]\n\`\`\`\n${f.content ?? ''}\n\`\`\`\n`;
     }).join('\n') + '\n---\n';
