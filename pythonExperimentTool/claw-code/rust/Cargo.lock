@@ -981,11 +981,13 @@ dependencies = [
 name = "kim-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "crossterm",
  "dirs",
  "ratatui",
  "reqwest",
  "rpassword",
+ "runtime",
  "serde",
  "serde_json",
  "tokio",

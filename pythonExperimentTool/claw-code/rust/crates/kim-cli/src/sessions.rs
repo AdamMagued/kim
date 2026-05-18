@@ -84,18 +84,27 @@ pub fn load_session_messages(path: &Path) -> Result<Vec<UiMessage>, String> {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let Some(role) = value.get("role").and_then(Value::as_str) else {
-            continue;
+        let role = value.get("role").and_then(Value::as_str);
+        let record_type = value.get("type").and_then(Value::as_str);
+        let compact_summary = match (role, record_type) {
+            (Some("compact_summary"), _) | (_, Some("compaction")) => {
+                value.get("summary").and_then(Value::as_str)
+            }
+            _ => None,
         };
-        let Some(content) =
-            content_text(value.get("content")).and_then(|text| display_message_text(&text))
+        let Some(content) = compact_summary
+            .map(ToOwned::to_owned)
+            .or_else(|| content_text(value.get("content")))
+            .and_then(|text| display_message_text(&text))
         else {
             continue;
         };
         let message_role = match role {
-            "user" => MessageRole::User,
-            "assistant" => MessageRole::Assistant,
-            "system" | "compact_summary" => MessageRole::System,
+            Some("user") => MessageRole::User,
+            Some("assistant") => MessageRole::Assistant,
+            Some("system" | "compact_summary") | None if record_type == Some("compaction") => {
+                MessageRole::System
+            }
             _ => continue,
         };
         messages.push(UiMessage {
@@ -137,12 +146,12 @@ fn collect_jsonl_sessions(root: &Path, sessions: &mut Vec<SessionEntry>) {
 
 fn session_entry(path: &Path) -> Option<SessionEntry> {
     let id = path.file_stem()?.to_string_lossy().to_string();
-    let date = session_date(path);
+    let context = session_context(path, &id);
     let preview = preview_for_session(path);
     Some(SessionEntry {
-        label: title_for_session(&preview, &date),
+        label: title_for_session(&preview, &context),
         id,
-        preview: date,
+        preview: context,
         path: path.to_path_buf(),
     })
 }
@@ -214,16 +223,24 @@ pub fn display_message_text(text: &str) -> Option<String> {
     clean_message_text(text)
 }
 
-fn session_date(path: &Path) -> String {
-    path.parent().and_then(Path::file_name).map_or_else(
-        || "session".to_string(),
-        |date| date.to_string_lossy().to_string(),
-    )
+fn session_context(path: &Path, id: &str) -> String {
+    let parent = path.parent().and_then(Path::file_name).map_or_else(
+        || "saved chat".to_string(),
+        |name| name.to_string_lossy().to_string(),
+    );
+    if matches!(
+        parent.as_str(),
+        "sessions" | "kim_sessions" | ".kim" | ".claw"
+    ) {
+        format!("saved chat {}", truncate(id, 8))
+    } else {
+        parent
+    }
 }
 
-fn title_for_session(preview: &str, date: &str) -> String {
+fn title_for_session(preview: &str, context: &str) -> String {
     if preview == "Untitled conversation" {
-        format!("{date} · Untitled")
+        format!("{context} · Untitled")
     } else {
         preview.to_string()
     }
@@ -268,4 +285,36 @@ fn modified_time(path: &Path) -> std::time::SystemTime {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::load_session_messages;
+    use crate::MessageRole;
+
+    #[test]
+    fn loads_runtime_compaction_summary_records() {
+        let path = std::env::temp_dir().join(format!(
+            "kim-cli-compaction-{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"{"type":"compaction","summary":"Earlier work was compacted."}"#,
+        )
+        .expect("session fixture should write");
+
+        let messages = load_session_messages(&path).expect("summary should load");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert_eq!(messages[0].content, "Earlier work was compacted.");
+    }
 }

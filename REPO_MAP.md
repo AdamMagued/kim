@@ -864,19 +864,20 @@ Kim has two terminal surfaces now:
 
 | File | Purpose |
 |---|---|
-| `Cargo.toml` | Binary crate named `kim`; deps are `ratatui`, `crossterm`, `tokio`, `reqwest`, `serde`, `dirs`, `rpassword`. |
-| `src/main.rs` | App loop, terminal lifecycle, keyboard handling, Chat/Code mode switching, model picker state, Ctrl-C clear/exit flow, session resume IDs, single-thread Tokio runtime, `--help` / `--version` / `--resume`. |
-| `src/ui.rs` | Ratatui layout: header, Chat/Code mode badge, sidebar/session rail, chat transcript, slash-command picker, model picker, input bar, status/footer. |
+| `Cargo.toml` | Binary crate named `kim`; deps are `ratatui`, `crossterm` with bracketed paste, `tokio`, `reqwest`, `serde`, `dirs`, `rpassword`, plus shared `runtime` compaction. |
+| `src/main.rs` | App loop, terminal lifecycle, keyboard handling, menu-first Chat/Code mode switching (`Tab`), `Esc` back-to-chat-list behavior, bracketed-paste with file-path-first detection (chat view also accepts plain text paste), model picker state, Ctrl-C clear/exit flow, session resume IDs, single-thread Tokio runtime, `--help` / `--version` / `--resume`. Panic hook (`install_panic_hook`) restores raw mode / alternate screen / bracketed paste before printing the panic message so the terminal is never left broken. Key events filtered to `Press | Repeat` (eliminates Windows key-release duplicate characters). |
+| `src/provider.rs` | Provider adapters for Ollama/OpenAI-compatible APIs, Claude Messages API, optional Kim desktop bridge, and image attachment payload conversion for pasted PNG/JPEG/WebP/GIF paths. |
+| `src/ui.rs` | Ratatui layout: header, full-screen chat/session picker at launch, Chat/Code mode tabs, full-screen chat view with persistent Esc-to-list hint, slash-command picker, model picker, input bar, status/footer. |
 | `src/theme.rs` | Merged TUI palettes from the ZIP mocks: default `dark-neovim` and soft muted novel `quiet-light`. |
 | `src/config.rs` | Persists provider/model/theme/API keys at `~/.kim/cli-config.json`. |
-| `src/provider.rs` | Provider adapters for Ollama/OpenAI-compatible APIs, Claude Messages API, and optional Kim desktop bridge. |
 | `src/commands.rs` | Kim-ready slash command subset and focused unit tests. |
 | `src/sessions.rs` | Discovers repo/home Kim, Claw, desktop, and project-only session roots; humanizes JSONL titles/previews and filters raw tool/usage blobs before loading sessions into the TUI. |
+| `../runtime/src/compact.rs` | Shared Claw-style local compaction used by `/compact`; no LLM/webview call is needed for API/Ollama terminal sessions. |
 
 ### Supported slash commands
 
 Core: `/login`, `/logout`, `/provider`, `/model`, `/status`, `/help`, `/clear`, `/exit`.
-Sessions: `/sessions`, `/resume`, `/usage`, `/compact`.
+Sessions: `/sessions`, `/resume`, `/usage`, `/compact` (shared runtime local compaction with recent messages preserved).
 UI: `/theme`, `/mode`, `/chat`, `/code`.
 Coding helpers: `/diff`, `/run`, `/git`, `/search`, `/files`, `/init`.
 
@@ -885,7 +886,7 @@ Claw commands that are placeholders or not backed by current Kim behavior are in
 ### Provider and login behavior
 
 - Default provider is `ollama` with `http://127.0.0.1:11434/v1` compatibility.
-- `/login` defaults to Ollama and runs `ollama signin`; API key login requires an explicit `/login claude|openai|gemini|deepseek`.
+- `/login` defaults to Ollama. On **Windows**, `ollama signin` is piped (no interactive TTY), so the CLI immediately opens `https://ollama.com/signin` in the default browser and then sets provider to `ollama`. If `ollama` is not on PATH it prints a clear install link. On macOS/Linux, `ollama signin` is tried first (15 s timeout) with browser fallback. API key login requires an explicit `/login claude|openai|gemini|deepseek`.
 - `/login claude|openai|gemini|deepseek` prompts for an API key and saves it in `~/.kim/cli-config.json`.
 - `/provider desktop` posts to Kim desktop's bridge at `http://127.0.0.1:18991/v1/task`; this requires the desktop app to be running.
 - The CLI does not embed a browser/webview and does not spawn Node/Electron, preserving a low memory profile.
@@ -893,9 +894,29 @@ Claw commands that are placeholders or not backed by current Kim behavior are in
 
 ### Installer / release flow
 
-`scripts/install-kim.sh` is the one-command installer scaffold. It detects OS/arch, downloads a private GitHub Release asset named like `kim-aarch64-apple-darwin.tar.gz`, installs it to `~/.kim/bin/kim`, and supports private release downloads through `GITHUB_TOKEN`.
+`scripts/install-kim.sh` is the macOS/Linux/Git-Bash installer scaffold. It detects OS/arch, downloads a private GitHub Release asset named like `kim-aarch64-apple-darwin.tar.gz` or `kim-x86_64-pc-windows-msvc.zip`, installs it to `~/.kim/bin/kim` or `~/.kim/bin/kim.exe`, and supports private release downloads through `GITHUB_TOKEN`.
 
-Known v1 limitation: macOS is the polished target. Linux and Windows asset names are stubbed in the installer, but full platform QA still needs release binaries and smoke testing on those systems.
+`scripts/install-kim.ps1` is the native Windows PowerShell installer for the same `kim` TUI binary. It downloads `kim-x86_64-pc-windows-msvc.zip` or `kim-aarch64-pc-windows-msvc.zip`, extracts `kim.exe`, installs it to `%USERPROFILE%\.kim\bin\kim.exe`, and adds that directory to the user's PATH.
+
+One-command Windows beta install target:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "iwr https://raw.githubusercontent.com/AdamMagued/kim/main/scripts/install-kim.ps1 -UseB | iex"
+```
+
+For private release assets, set `GITHUB_TOKEN` before running the installer. The release must publish the matching Windows ZIP asset containing `kim.exe`; the script reports the exact missing asset name if it cannot download it.
+
+Known v1 limitation: macOS is the polished target. Linux and Windows installers are present, but full Windows QA still requires publishing signed or trusted release binaries and smoke testing `kim`, `/login`, `/provider`, `/model`, and one Ollama prompt on a real Windows terminal.
+
+#### Windows-specific hardening (applied 2026-05-18)
+
+| Issue | Fix |
+|---|---|
+| Duplicate/triple characters on key press/release | Key events filtered to `KeyEventKind::Press \| Repeat`; Release events ignored |
+| Right-click paste corrupts commands | Bracketed paste fires `Event::Paste`; pasted text checked for existing file paths first; in chat view non-path text is accepted as-is; in session menu non-path paste is dropped |
+| `ollama signin` hangs 15 s on Windows | Windows skips `signin` entirely, probes `ollama --version` to detect install, then opens browser immediately |
+| Crash leaves terminal raw mode broken | `install_panic_hook()` restores `disable_raw_mode + LeaveAlternateScreen + DisableBracketedPaste` before printing panic message |
+| Windows cross-compile target | `x86_64-pc-windows-gnu` builds cleanly; release CI uses `windows-latest` (MSVC, default target) matching installer asset name `pc-windows-msvc` |
 
 ---
 

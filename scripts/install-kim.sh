@@ -56,13 +56,20 @@ if [ ! -f "$bin" ]; then
   exit 1
 fi
 
-cp "$bin" "$INSTALL_DIR/kim"
-chmod +x "$INSTALL_DIR/kim"
+dest="$INSTALL_DIR/kim"
+if [ "$platform" = "pc-windows-msvc" ]; then
+  dest="$INSTALL_DIR/kim.exe"
+fi
+
+cp "$bin" "$dest"
+if [ "$platform" != "pc-windows-msvc" ]; then
+  chmod +x "$dest"
+fi
 
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) echo "Add this to your shell profile: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
 esac
 
-echo "Kim installed at $INSTALL_DIR/kim"
+echo "Kim installed at $dest"
 echo "Next: run 'kim', then type /login."
