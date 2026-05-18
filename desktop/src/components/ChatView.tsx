@@ -206,7 +206,7 @@ export function collapseMessages(msgs: KimMessage[]) {
   return res;
 }
 
-// ── Claw session grouping ─────────────────────────────────────────────────────
+// ── Codex session grouping ────────────────────────────────────────────────────
 
 export interface TouchedFile {
   path: string;
@@ -214,7 +214,7 @@ export interface TouchedFile {
   removed: number;
 }
 
-export interface ClawRunGroup {
+export interface CodexRunGroup {
   userMessage: KimMessage;
   intermediateMessages: KimMessage[];
   intermediateActivity: ActivityItem[];
@@ -299,7 +299,7 @@ function synthesizeExchangeActivity(
   return synthesizeActivityFromMessages(actSlice, TOOL_MAP);
 }
 
-function clawBridgeFiller(text: string): boolean {
+function codexBridgeFiller(text: string): boolean {
   return /^Calling\s+[A-Za-z_][\w-]*\.$/.test(text.trim());
 }
 
@@ -483,7 +483,7 @@ function synthesizeActivityFromMessages(messages: KimMessage[], toolMap: typeof 
     for (const block of msg.content) {
       if (block.type === 'text') {
         const rawT = (block as TextBlock).text.trim();
-        if (!rawT || rawT.startsWith('[Tool result:') || clawBridgeFiller(rawT)) continue;
+        if (!rawT || rawT.startsWith('[Tool result:') || codexBridgeFiller(rawT)) continue;
         if (msg.role === 'assistant') {
           const t = cleanActivityText(rawT);
           items.push({ id: ++id, kind: 'status', icon: '›', text: t.length > 120 ? t.slice(0, 120) + '…' : t });
@@ -515,7 +515,7 @@ function synthesizeActivityFromMessages(messages: KimMessage[], toolMap: typeof 
   return items;
 }
 
-function finalizeClawRun(userMessage: KimMessage, intermediates: KimMessage[]): ClawRunGroup {
+function finalizeCodexRun(userMessage: KimMessage, intermediates: KimMessage[]): CodexRunGroup {
   let finalIdx = -1;
   for (let i = intermediates.length - 1; i >= 0; i--) {
     if (isTextOnlyAssistant(intermediates[i])) { finalIdx = i; break; }
@@ -534,20 +534,20 @@ function finalizeClawRun(userMessage: KimMessage, intermediates: KimMessage[]): 
   };
 }
 
-export function groupClawMessages(messages: KimMessage[]): ClawRunGroup[] {
-  const runs: ClawRunGroup[] = [];
+export function groupCodexMessages(messages: KimMessage[]): CodexRunGroup[] {
+  const runs: CodexRunGroup[] = [];
   let currentUser: KimMessage | null = null;
   let currentIntermediate: KimMessage[] = [];
   for (const msg of messages) {
     if (isRealUserMessage(msg)) {
-      if (currentUser) runs.push(finalizeClawRun(currentUser, currentIntermediate));
+      if (currentUser) runs.push(finalizeCodexRun(currentUser, currentIntermediate));
       currentUser = msg;
       currentIntermediate = [];
     } else if (currentUser) {
       currentIntermediate.push(msg);
     }
   }
-  if (currentUser) runs.push(finalizeClawRun(currentUser, currentIntermediate));
+  if (currentUser) runs.push(finalizeCodexRun(currentUser, currentIntermediate));
   return runs;
 }
 
@@ -598,13 +598,13 @@ const HIDDEN_SUBSTRINGS = [
   'unhandled errors in a TaskGroup',
   'return future.result()',
   'File "<frozen runpy>"',
-  // Claw bridge internal output
-  'Claw completed', 'Claw failed', 'LLM calls,', 'bridge_request', 'bridge_response',
+  // Codex bridge internal output
+  'Codex completed', 'Codex failed', 'LLM calls,', 'bridge_request', 'bridge_response',
   'relay #', 'sending to browser LLM', 'browser LLM',
-  'CLAW_FILE_BRIDGE', 'CLAW_BRIDGE_DIR', 'claw binary:',
+  'CODEX_PROXY', 'codex binary:', 'codex-config',
   // Provider internal noise
   'sending to gemini', 'sending to claude', 'sending to chatgpt',
-  'Routing to Claw', 'Routing Claw',
+  'Routing to Codex', 'Routing Codex',
   'getattr(logger, level.lower(), logger.info)(message)',
 ];
 
@@ -704,7 +704,7 @@ const TOOL_MAP: Record<string, { icon: string; label: (args: Record<string, unkn
   git_diff:           { icon: '›', label: _a => 'Viewing git diff' },
   // User interaction
   ask_user:           { icon: '›', label: a => `Asking: "${String(a.question ?? '')}"` },
-  // Claw tool names
+  // Codex tool names
   bash:               { icon: '›', label: a => {
     const cmd = String(a.command ?? a.cmd ?? '');
     return cmd.trim().startsWith('open ')
@@ -762,8 +762,8 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
   // noise words (e.g. "screenshot", "traceback") is never accidentally dropped.
   if (raw.includes('[SUCCESS]')) {
     let text = raw.replace(/.*\[SUCCESS\]\s*/, '').trim();
-    // Strip Claw-internal completion messages — replace with a clean summary.
-    if (/^Claw (?:completed|finished)/i.test(text) || /\bLLM calls\b/i.test(text)) {
+    // Strip Codex-internal completion messages — replace with a clean summary.
+    if (/^Codex (?:completed|finished)/i.test(text) || /\bLLM calls\b/i.test(text)) {
       text = 'Task completed';
     }
     return { id, kind: 'success', icon: '✓', text: text || 'Task completed successfully' };
@@ -1223,7 +1223,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
   // one entry; rendered as a collapsible "Worked for Xm Ys" badge before the
   // corresponding assistant turn in liveHistory.
   const [runHistory, setRunHistory] = useState<{ activity: ActivityItem[]; durationSec: number }[]>([]);
-  const [clawRuns, setClawRuns] = useState<ClawRunGroup[]>([]);
+  const [codexRuns, setCodexRuns] = useState<CodexRunGroup[]>([]);
   const [taskError, setTaskError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
@@ -1425,6 +1425,21 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
   //      no spinner, don't wipe liveHistory until new disk messages arrive,
   //      don't re-animate the latest bubble (liveHistory already animated it).
   const lastLoadedSessionIdRef = useRef<string | null>(null);
+  
+  // "Codex continuation": In Code tab, each follow-up task creates a new
+  // Codex session (Codex doesn't support --resume). When the task completes,
+  // the Tauri side emits `code-session-completed` and ChatView auto-loads
+  // that new session. We detect this case (the session changed via the
+  // sidebar item) and the session is a codex session.
+  //
+  // In this case we keep the live activity / messages so the user sees
+  // a seamless conversation even though the backend started a new session.
+  const isCodexContinuation =
+    session &&
+    lastSessionRef.current &&
+    session.session_id !== lastSessionRef.current.session_id &&
+    session.session_type === 'codex';
+
   useEffect(() => {
     if (!session) {
       setMessages([]);
@@ -1439,23 +1454,23 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     // liveHistory and skip the spinner so the chat doesn't appear to vanish
     // and then reappear (issue #3 §4).
     //
-    // "Claw continuation": In Code tab, each follow-up task creates a new
-    // Claw session (Claw doesn't support --resume). When the task completes,
+    // "Codex continuation": In Code tab, each follow-up task creates a new
+    // Codex session (Codex doesn't support --resume). When the task completes,
     // handleTaskDone navigates to the new session, causing a session change.
     // Without this guard the UI would wipe liveHistory and show a spinner,
     // making it look like a "chat reset". We detect this by checking that
     // hasSentMessageRef is true (we were actively chatting, not clicking a
-    // sidebar item) and the session is a claw session.
-    const isClawContinuation =
+    // sidebar item) and the session is a codex session.
+    const isCodexContinuation =
       isSessionChange &&
       prevId !== null &&
-      session.session_type === 'claw' &&
+      session.session_type === 'codex' &&
       hasSentMessageRef.current;
     const isSelfTransition =
       isSessionChange &&
       prevId === null &&
       session.session_id === activeResumeSessionIdRef.current;
-    const isSeamlessTransition = isSelfTransition || isClawContinuation;
+    const isSeamlessTransition = isSelfTransition || isCodexContinuation;
     lastLoadedSessionIdRef.current = session.session_id;
 
     if (isSessionChange && !isSeamlessTransition) {
@@ -1464,22 +1479,22 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
       // Reset run history and re-hydrate from the sidecar `<id>.runs.json` file.
       setRunHistory([]);
 
-      setClawRuns([]); 
+      setCodexRuns([]); 
       invoke<{ activity: ActivityItem[]; durationSec: number }[]>('load_run_history', {
         sessionId: session.session_id,
         sessionDate: session.date || null,
         kimDir: settings.kim_sessions_dir || null,
-        clawDir: session.session_type === 'claw' && session.project_path
-          ? `${session.project_path}/.claw/sessions`
-          : settings.claw_sessions_dir || null,
+        codexDir: session.session_type === 'codex' && session.project_path
+          ? `${session.project_path}/.codex/sessions`
+          : settings.codex_sessions_dir || null,
       })
         .then(runs => {
           if (Array.isArray(runs)) {
             setRunHistory(runs);
-            // Merge saved durations into clawRuns so the "Worked for X"
-            // badge shows the correct time on old Claw sessions.
+            // Merge saved durations into codexRuns so the "Worked for X"
+            // badge shows the correct time on old Codex sessions.
             if (runs.length > 0) {
-              setClawRuns(prev => prev.map((run, i) =>
+              setCodexRuns(prev => prev.map((run, i) =>
                 i < runs.length && runs[i].durationSec > 0
                   ? { ...run, durationSec: runs[i].durationSec }
                   : run
@@ -1493,9 +1508,9 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
       sessionId: session.session_id,
       sessionDate: session.date || null,
       kimDir: settings.kim_sessions_dir || null,
-      clawDir: session.session_type === 'claw' && session.project_path
-        ? `${session.project_path}/.claw/sessions`
-        : settings.claw_sessions_dir || null,
+      codexDir: session.session_type === 'codex' && session.project_path
+        ? `${session.project_path}/.codex/sessions`
+        : settings.codex_sessions_dir || null,
     })
       .then(msgs => {
         const prev = prevMsgCountRef.current;
@@ -1514,16 +1529,16 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
         }
         prevMsgCountRef.current = displayMsgs.length;
         setMessages(displayMsgs);
-        // Group Claw session messages into per-run structures so intermediate
-        // tool calls are hidden behind "Worked on this" disclosures.
-        if (session.session_type === 'claw') {
-          setClawRuns(groupClawMessages(msgs));
+        // Group Codex session messages into per-run structures so intermediate
+        // tool calls collapse into a disclosure.
+        if (session.session_type === 'codex') {
+          setCodexRuns(groupCodexMessages(msgs));
         } else {
-          setClawRuns([]);
+          setCodexRuns([]);
         }
         // Silent refresh AND self-transition: clear liveHistory only after
         // disk messages are loaded so the chat doesn't blink empty.
-        // BUT: when staying on an old Claw session after a task completes
+        // BUT: when staying on an old Codex session after a task completes
         // (the new turn lives in a different session file), the disk
         // messages for this session haven't changed. Clearing liveHistory
         // would wipe the new response. Only clear when the disk data
@@ -1538,7 +1553,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
       .finally(() => {
         if (isSessionChange && !isSeamlessTransition) setLoadingMessages(false);
       });
-  }, [session, settings.kim_sessions_dir, settings.claw_sessions_dir, messageReloadNonce]);
+  }, [session, settings.kim_sessions_dir, settings.codex_sessions_dir, messageReloadNonce]);
 
   // ── Scroll behavior ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -1579,7 +1594,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
       clearActivityNow();
       setRunHistory([]);
 
-      setClawRuns([]);
+      setCodexRuns([]);
       setTaskError(null);
       setTokenStats(null);
       setContextState(null);
@@ -1666,7 +1681,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
       return;
     }
 
-    // [ANSWER] is a final assistant message from the Claw browser bridge. It
+    // [ANSWER] is a final assistant message from the Codex browser bridge. It
     // should render as a chat bubble, never as an activity feed/status item.
     const answerText = parseAnswerLine(line);
     if (answerText !== null) {
@@ -1681,9 +1696,9 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
       return;
     }
 
-    // Surface Claw's structured JSON error output as a real error banner
+    // Surface Codex's structured JSON error output as a real error banner
     // instead of silently dropping the line and showing only "Agent Error".
-    // Claw emits e.g. {"error":"missing Anthropic credentials …","type":"error"}
+    // Codex emits e.g. {"error":"missing Anthropic credentials …","type":"error"}
     // on stdout right before exiting non-zero.
     const stdoutLine = line.startsWith('[err]') ? line.slice(5).trimStart() : line;
     if (stdoutLine.startsWith('{') && stdoutLine.includes('"error"')) {
@@ -1795,8 +1810,8 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     });
 
     // Capture success results as assistant bubbles in liveHistory.
-    // This must also happen in Claw (Code-tab) mode: when the user sends a
-    // follow-up from an old Claw session, we stay on that session to
+    // This must also happen in Codex (Code-tab) mode: when the user sends a
+    // follow-up from an old Codex session, we stay on that session to
     // preserve history. The new task's response appears via liveHistory.
     if (item.kind === 'success') {
       const genericSuccess = /^Task completed(?: successfully)?$/i.test(item.text.trim());
@@ -1848,9 +1863,9 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
               sessionId: sid,
               sessionDate: completedCodeSession?.date ?? session?.date ?? null,
               kimDir: settings.kim_sessions_dir || null,
-              clawDir: completedCodeSession?.project_path
-                ? `${completedCodeSession.project_path}/.claw/sessions`
-                : settings.claw_sessions_dir || null,
+              codexDir: completedCodeSession?.project_path
+                ? `${completedCodeSession.project_path}/.codex/sessions`
+                : settings.codex_sessions_dir || null,
               runs: next,
             }).catch(() => { /* non-fatal */ });
           }
@@ -1932,15 +1947,15 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
   ) => {
     const s = targetSession ?? sessionRef.current;
     const st = settingsRef.current;
-    const sessionType = s?.session_type ?? (activeTabRef.current === 'code' ? 'claw' : 'kim');
+    const sessionType = s?.session_type ?? (activeTabRef.current === 'code' ? 'codex' : 'kim');
     return {
       sessionId: overrideSessionId ?? s?.session_id ?? activeResumeSessionIdRef.current,
       sessionDate: s?.date ?? null,
       sessionType,
       kimDir: st.kim_sessions_dir || null,
-      clawDir: sessionType === 'claw' && s?.project_path
-        ? `${s.project_path}/.claw/sessions`
-        : st.claw_sessions_dir || null,
+      codexDir: sessionType === 'codex' && s?.project_path
+        ? `${s.project_path}/.codex/sessions`
+        : st.codex_sessions_dir || null,
     };
   }, []);
 
@@ -3416,10 +3431,10 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
           </div>
         ) : (
           <>
-            {clawRuns.length > 0 ? (
-              /* ── Claw grouped view: per-run user→disclosure→answer→pills ── */
-              clawRuns.map((run, runIdx) => (
-                <div key={`claw-run-${runIdx}`}>
+            {codexRuns.length > 0 ? (
+              /* ── Codex grouped view: per-run user→disclosure→answer→pills ── */
+              codexRuns.map((run, runIdx) => (
+                <div key={`codex-run-${runIdx}`}>
                   <MessageBubble
                     message={run.userMessage}
                     typingAnimation={settings.typing_animation ?? 'none'}
@@ -3432,7 +3447,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
                   {run.finalAssistantMessage && (
                     <MessageBubble
                       message={run.finalAssistantMessage}
-                      animate={runIdx === clawRuns.length - 1}
+                      animate={runIdx === codexRuns.length - 1}
                       typingAnimation={settings.typing_animation ?? 'none'}
                       onRetry={handleRetryLast}
                     />
