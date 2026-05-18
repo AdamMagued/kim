@@ -38,6 +38,10 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("terminal", Style::default().fg(theme.text_dim)),
+        Span::styled(
+            " v1.192",
+            Style::default().fg(theme.text_dimmer),
+        ),
         Span::raw("  "),
         Span::styled(
             format!("[{}]", app.mode.label()),
@@ -67,31 +71,123 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 }
 
 fn draw_body(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(28), Constraint::Min(30)])
-        .split(area);
-    draw_sidebar(frame, app, columns[0], theme);
-    draw_chat(frame, app, columns[1], theme);
+    if app.view == ViewState::SessionMenu {
+        draw_session_browser(frame, app, area, theme);
+        return;
+    }
+    draw_chat(frame, app, area, theme);
 }
 
 #[allow(clippy::too_many_lines)]
-fn draw_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let sessions_title = match app.mode {
-        AppMode::Chat => "kim chat sessions",
-        AppMode::Code => "project code sessions",
+fn draw_session_browser(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(8)])
+        .split(area);
+    let mode_line = Line::from(vec![
+        Span::styled(
+            if app.mode == AppMode::Chat {
+                "  Chat  "
+            } else {
+                "  chat  "
+            },
+            if app.mode == AppMode::Chat {
+                Style::default()
+                    .fg(theme.accent_ink)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_dim)
+            },
+        ),
+        Span::raw("  "),
+        Span::styled(
+            if app.mode == AppMode::Code {
+                "  Code  "
+            } else {
+                "  code  "
+            },
+            if app.mode == AppMode::Code {
+                Style::default()
+                    .fg(theme.accent_ink)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_dim)
+            },
+        ),
+        Span::raw("  "),
+        Span::styled(
+            "Press Tab to switch Chat/Code · ↑/↓ selects · Enter opens · type /commands below",
+            Style::default().fg(theme.text_dimmer),
+        ),
+    ]);
+    let scope = if app.mode == AppMode::Code {
+        "Code shows conversations for this folder/project. New code chat starts here."
+    } else {
+        "Chat shows your Kim conversations. New Kim chat starts a general assistant thread."
     };
-    let mut items = vec![ListItem::new(Line::styled(
-        sessions_title,
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD),
-    ))];
-    items.push(ListItem::new(Line::styled(
-        "↑/↓ select · Enter opens",
-        Style::default().fg(theme.text_dimmer),
-    )));
-    let new_chat_style = if app.selected_session == 0 {
+    frame.render_widget(
+        Paragraph::new(vec![
+            mode_line,
+            Line::raw(""),
+            Line::styled(scope, Style::default().fg(theme.text_dim)),
+        ])
+        .block(
+            Block::default()
+                .title(" Choose Mode ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border))
+                .style(Style::default().bg(theme.panel)),
+        ),
+        rows[0],
+    );
+
+    let mut items = Vec::new();
+    let new_label = match app.mode {
+        AppMode::Chat => "New Kim chat",
+        AppMode::Code => "New code chat in this folder",
+    };
+    items.push(session_row(
+        new_label,
+        "start fresh",
+        app.selected_session == 0,
+        theme,
+    ));
+    for (index, session) in app.sessions.iter().take(40).enumerate() {
+        items.push(session_row(
+            &session.label,
+            &session.preview,
+            app.selected_session == index + 1,
+            theme,
+        ));
+    }
+    if app.sessions.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            if app.mode == AppMode::Code {
+                "No saved code conversations in this folder yet."
+            } else {
+                "No saved Kim chats found yet."
+            },
+            Style::default().fg(theme.text_dimmer),
+        )));
+    }
+    let list = List::new(items).block(
+        Block::default()
+            .title(if app.mode == AppMode::Code {
+                " Code Conversations "
+            } else {
+                " Kim Chats "
+            })
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border))
+            .style(Style::default().bg(theme.bg)),
+    );
+    frame.render_widget(list, rows[1]);
+}
+
+fn session_row<'a>(title: &'a str, preview: &'a str, selected: bool, theme: Theme) -> ListItem<'a> {
+    let style = if selected {
         Style::default()
             .fg(theme.accent_ink)
             .bg(theme.accent)
@@ -99,103 +195,33 @@ fn draw_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     } else {
         Style::default().fg(theme.text)
     };
-    let new_chat_label = match app.mode {
-        AppMode::Chat => "› New Kim chat",
-        AppMode::Code => "› New code chat",
-    };
-    items.push(ListItem::new(Line::styled(
-        if app.selected_session == 0 {
-            new_chat_label.to_string()
-        } else {
-            new_chat_label.replacen('›', " ", 1)
-        },
-        new_chat_style,
-    )));
-    items.push(ListItem::new(Line::styled(
-        if app.mode == AppMode::Code {
-            "  in this project"
-        } else {
-            "  general assistant"
-        },
-        Style::default().fg(theme.text_dimmer),
-    )));
-    if app.sessions.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            if app.mode == AppMode::Code {
-                "no sessions in this project"
-            } else {
-                "no sessions found"
-            },
+    let marker = if selected { "›" } else { " " };
+    ListItem::new(vec![
+        Line::styled(format!("{marker} {title}"), style),
+        Line::styled(
+            format!("  {preview}"),
             Style::default().fg(theme.text_dimmer),
-        )));
-    } else {
-        for (index, session) in app.sessions.iter().take(18).enumerate() {
-            let selected = index + 1 == app.selected_session;
-            let marker = if selected { "› " } else { "  " };
-            let style = if selected {
-                Style::default()
-                    .fg(theme.accent_ink)
-                    .bg(theme.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text)
-            };
-            items.push(ListItem::new(Line::styled(
-                format!("{marker}{}", session.label),
-                style,
-            )));
-            items.push(ListItem::new(Line::styled(
-                format!("  {}", session.preview),
-                Style::default().fg(theme.text_dimmer),
-            )));
-        }
-    }
-    items.push(ListItem::new(""));
-    items.push(ListItem::new(Line::styled(
-        "commands",
-        Style::default().fg(theme.accent),
-    )));
-    for command in [
-        "/login",
-        "/sessions",
-        "/provider",
-        "/model",
-        "/chat",
-        "/code",
-        "/theme",
-        "/help",
-    ] {
-        items.push(ListItem::new(Line::styled(
-            command,
-            Style::default().fg(theme.text_dim),
-        )));
-    }
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Kim ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border))
-            .style(Style::default().bg(theme.panel)),
-    );
-    frame.render_widget(list, area);
+        ),
+    ])
 }
 
 fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let mut lines = Vec::new();
-    if app.view == ViewState::SessionMenu {
-        lines.push(Line::styled(
-            "Choose a session on the left, or select New chat.",
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Esc ",
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
-        ));
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "Quick keys: Enter opens · /login signs in · /chat and /code switch modes · /model picks Ollama model.",
-            Style::default().fg(theme.text_dim),
-        ));
-        lines.push(Line::raw(""));
-    }
+        ),
+        Span::styled("returns to chat list", Style::default().fg(theme.text_dim)),
+        Span::styled(" · ", Style::default().fg(theme.text_dimmer)),
+        Span::styled(
+            "Press Tab to switch Chat/Code from the list",
+            Style::default().fg(theme.text_dimmer),
+        ),
+    ]));
+    lines.push(Line::raw(""));
     for message in app.visible_messages() {
         let (label, color) = match message.role {
             MessageRole::User => ("you", theme.accent),
@@ -217,7 +243,7 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             if app.view == ViewState::SessionMenu {
                 "Message box accepts slash commands here. Open New chat before sending prompts."
             } else {
-                "Type a message, or /help. Use /login first if this is a fresh machine."
+                "Type a message, or /help. Esc returns to the chat list."
             },
             Style::default().fg(theme.text_dim),
         ));
@@ -234,9 +260,9 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         .block(
             Block::default()
                 .title(if app.view == ViewState::SessionMenu {
-                    " Session Menu "
+                    " Chat List "
                 } else {
-                    " Chat "
+                    " Chat · Esc returns to chat list "
                 })
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.border))
@@ -302,7 +328,7 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let title = if app.view == ViewState::SessionMenu {
         " Slash command / open a chat first "
     } else {
-        " Message "
+        " Message · drag/drop PNG or file to paste path "
     };
     let input = Paragraph::new(app.input.as_str())
         .style(Style::default().fg(theme.text).bg(theme.panel_alt))
@@ -368,10 +394,17 @@ fn draw_slash_palette(frame: &mut Frame<'_>, app: &App, body_area: Rect, theme: 
 }
 
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let status = format!(
-        "  Enter opens selected · New chat starts typing · /chat /code switch modes · /sessions menu · {}",
-        app.status
-    );
+    let status = if app.view == ViewState::SessionMenu {
+        format!(
+            "  Enter opens selected · Press Tab to switch Chat/Code · /login /model /help · {}",
+            app.status
+        )
+    } else {
+        format!(
+            "  Esc returns to chat list · type /sessions for chat list · Ctrl-C twice exits · {}",
+            app.status
+        )
+    };
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(theme.text_dim).bg(theme.status)),
         area,

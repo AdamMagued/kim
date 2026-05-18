@@ -7,11 +7,15 @@ mod ui;
 
 use std::io::{self, stdout};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use commands::{handle_command, CommandOutcome, SUPPORTED_COMMANDS};
 use config::KimConfig;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -19,6 +23,10 @@ use crossterm::terminal::{
 use provider::{send_chat, ChatMessage};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use runtime::{
+    compact_session, ContentBlock, ConversationMessage, MessageRole as RuntimeMessageRole,
+    Session as RuntimeSession,
+};
 use sessions::{
     discover_project_sessions, discover_sessions, find_session_by_id, load_session_messages,
     SessionEntry,
@@ -336,7 +344,7 @@ impl App {
         if self.sessions.is_empty() {
             self.selected_session = 0;
         } else {
-            self.selected_session = self.selected_session.min(self.sessions.len() - 1);
+            self.selected_session = self.selected_session.min(self.sessions.len());
         }
     }
 
@@ -424,6 +432,50 @@ impl App {
         self.input.clear();
         self.status = "session menu · choose New chat or a saved session".to_string();
     }
+
+    fn return_to_session_menu(&mut self) {
+        self.show_session_menu();
+        self.status =
+            "chat list · ↑/↓ select · Enter open · press Tab to switch Chat/Code".to_string();
+    }
+
+    fn paste_text(&mut self, text: &str) {
+        self.reset_ctrl_c();
+        self.allow_empty_session_open = false;
+        // Always try file-path detection first (drag/drop PNG, etc.)
+        let file_paths = prompt_file_references(text);
+        if !file_paths.is_empty() {
+            let paths_text = file_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !self.input.is_empty() && !self.input.ends_with(char::is_whitespace) {
+                self.input.push(' ');
+            }
+            self.input.push_str(&paths_text);
+            self.sync_slash_selection();
+            self.status = "attached file path · press Enter to send".to_string();
+            return;
+        }
+        // In chat view: allow pasting normal text (prompts, API keys, URLs).
+        // In session menu: ignore non-path paste to prevent accidental input.
+        if self.view == ViewState::InChat {
+            let safe = text.replace(['\r', '\n'], " ");
+            let safe = safe.trim();
+            if !safe.is_empty() {
+                if !self.input.is_empty() && !self.input.ends_with(char::is_whitespace) {
+                    self.input.push(' ');
+                }
+                self.input.push_str(safe);
+                self.sync_slash_selection();
+                self.status = "pasted text · press Enter to send".to_string();
+                return;
+            }
+        }
+        self.status =
+            "paste ignored · open a chat first, or drag/drop a real file path".to_string();
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -447,6 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .windows(2)
         .find_map(|window| (window[0] == "--resume").then_some(window[1].as_str()));
 
+    install_panic_hook();
     let mut terminal = enter_terminal()?;
     let result = run_app(&mut terminal, resume_id).await;
     leave_terminal(&mut terminal)?;
@@ -472,13 +525,48 @@ async fn run_app(
         "Kim CLI v1. Pick New chat or a session. /login signs into Ollama; /mode switches chat/code.",
     );
 
-    loop {
+    'main: loop {
         terminal.draw(|frame| ui::draw(frame, &app))?;
+
+        // Block until at least one event arrives (or 60 ms for busy redraws).
         if !event::poll(Duration::from_millis(60))? {
             continue;
         }
-        if let Event::Key(key) = event::read()? {
-            if handle_key(key, &mut app, terminal).await? {
+
+        // Windows legacy console (cmd.exe / conhost) queues both the keydown
+        // and an extra keyup-translated-as-Press for the same physical key.
+        // Both events are already in the OS queue when we first poll, so
+        // draining them back-to-back (no draw in between) keeps the gap
+        // under 1 ms — well within the 20 ms dedup window.
+        // last_key is LOCAL to this drain cycle so it never suppresses a
+        // legitimate repeated keypress that arrives in the NEXT cycle.
+        let mut last_key: Option<(KeyCode, KeyModifiers, KeyEventKind, Instant)> = None;
+
+        // Inner drain: process all queued events without an intervening draw.
+        loop {
+            match event::read()? {
+                Event::Key(key) => {
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                        let now = Instant::now();
+                        let is_dup = last_key.as_ref().is_some_and(|(c, m, k, t)| {
+                            *c == key.code
+                                && *m == key.modifiers
+                                && *k == key.kind
+                                && now.duration_since(*t).as_millis() < 20
+                        });
+                        last_key = Some((key.code, key.modifiers, key.kind, now));
+                        if !is_dup && handle_key(key, &mut app, terminal).await? {
+                            break 'main;
+                        }
+                    }
+                }
+                Event::Paste(text) => {
+                    app.paste_text(&text);
+                }
+                _ => {}
+            }
+            // Stop draining when the queue is empty (non-blocking check).
+            if !event::poll(Duration::from_millis(0))? {
                 break;
             }
         }
@@ -497,20 +585,20 @@ async fn handle_key(
     }
     match key.code {
         KeyCode::Enter => {
+            if key.kind != KeyEventKind::Press {
+                return Ok(false);
+            }
             app.reset_ctrl_c();
             if app.complete_slash_selection() {
                 return Ok(false);
             }
             let input = std::mem::take(&mut app.input);
             if input.trim().is_empty() {
-                if app.view == ViewState::SessionMenu || app.allow_empty_session_open {
+                if app.view == ViewState::SessionMenu {
                     app.open_selected_session();
                     app.allow_empty_session_open = false;
                 } else {
-                    app.status =
-                        "type a message, /command, or use ↑/↓ then Enter to open a session"
-                            .to_string();
-                    app.allow_empty_session_open = true;
+                    app.status = "type a message or /command".to_string();
                 }
                 return Ok(false);
             }
@@ -526,11 +614,13 @@ async fn handle_key(
             if input.trim() == "/clear" {
                 app.messages.clear();
             }
-            if input.trim().eq_ignore_ascii_case("/login") {
-                app.push(MessageRole::System, "Checking Ollama sign-in…");
-                app.status = "running ollama signin".to_string();
+            if is_interactive_login(&input) {
+                if input.trim().eq_ignore_ascii_case("/login") {
+                    app.push(MessageRole::System, "Opening Ollama sign-in…");
+                    app.status = "opening Ollama sign-in".to_string();
+                }
             }
-            if is_interactive_secret_login(&input) {
+            if is_interactive_login(&input) {
                 suspend_terminal(terminal)?;
                 println!("Kim login\n");
                 let outcome = handle_command(&input, &mut app.config).await;
@@ -540,6 +630,7 @@ async fn handle_key(
                 resume_terminal(terminal)?;
                 return apply_outcome(app, outcome).await;
             }
+            let input = prompt_with_file_references(&input);
             let outcome = handle_command(&input, &mut app.config).await;
             apply_outcome(app, outcome).await
         }
@@ -552,6 +643,15 @@ async fn handle_key(
                 return Ok(false);
             }
             Ok(app.arm_or_exit_with_ctrl_c())
+        }
+        KeyCode::Tab => {
+            if key.kind != KeyEventKind::Press {
+                return Ok(false);
+            }
+            app.reset_ctrl_c();
+            app.allow_empty_session_open = false;
+            app.toggle_mode();
+            Ok(false)
         }
         KeyCode::Backspace => {
             app.reset_ctrl_c();
@@ -590,7 +690,7 @@ async fn handle_key(
             app.reset_ctrl_c();
             if app.input.starts_with('/') {
                 app.move_slash_selection(-1);
-            } else if app.view == ViewState::SessionMenu {
+            } else if app.view == ViewState::SessionMenu && app.input.is_empty() {
                 app.allow_empty_session_open = true;
                 app.move_session_selection(-1);
             } else {
@@ -602,7 +702,7 @@ async fn handle_key(
             app.reset_ctrl_c();
             if app.input.starts_with('/') {
                 app.move_slash_selection(1);
-            } else if app.view == ViewState::SessionMenu {
+            } else if app.view == ViewState::SessionMenu && app.input.is_empty() {
                 app.allow_empty_session_open = true;
                 app.move_session_selection(1);
             } else {
@@ -661,6 +761,10 @@ async fn apply_outcome(
             app.open_model_picker(options);
             Ok(false)
         }
+        CommandOutcome::Compact => {
+            compact_app_messages(app);
+            Ok(false)
+        }
         CommandOutcome::SendPrompt(prompt) => {
             if app.view == ViewState::SessionMenu {
                 app.status = "choose New chat or open a session before sending".to_string();
@@ -693,6 +797,174 @@ async fn apply_outcome(
             app.busy = false;
             Ok(false)
         }
+    }
+}
+
+fn compact_app_messages(app: &mut App) {
+    let mut session = RuntimeSession::new();
+    session.session_id.clone_from(&app.current_session_id);
+    session.messages = app
+        .messages
+        .iter()
+        .filter_map(ui_message_to_runtime)
+        .collect::<Vec<_>>();
+    let result = compact_session(
+        &session,
+        runtime::CompactionConfig {
+            preserve_recent_messages: 6,
+            max_estimated_tokens: 1,
+        },
+    );
+    if result.removed_message_count == 0 {
+        app.push(
+            MessageRole::System,
+            "Nothing to compact yet; keeping the current conversation as-is.",
+        );
+        app.status = "compact skipped".to_string();
+        return;
+    }
+    app.messages = result
+        .compacted_session
+        .messages
+        .iter()
+        .filter_map(runtime_message_to_ui)
+        .collect();
+    app.push(
+        MessageRole::System,
+        format!(
+            "Compacted {} earlier messages with Claw-style local compaction.",
+            result.removed_message_count
+        ),
+    );
+    app.status = "context compacted".to_string();
+}
+
+fn prompt_with_file_references(input: &str) -> String {
+    let file_paths = prompt_file_references(input);
+    if file_paths.is_empty() {
+        return input.to_string();
+    }
+    let mut prompt = input.trim().to_string();
+    prompt.push_str("\n\nReferenced local files Kim may access:");
+    for path in file_paths {
+        prompt.push_str("\n- ");
+        prompt.push_str(&path.display().to_string());
+    }
+    prompt.push_str("\n\nUse these file paths directly when reading or inspecting attachments.");
+    prompt
+}
+
+fn prompt_file_references(input: &str) -> Vec<PathBuf> {
+    let mut paths = split_shellish_tokens(input)
+        .into_iter()
+        .filter_map(|token| normalize_existing_path(&token))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn normalize_existing_path(token: &str) -> Option<PathBuf> {
+    let trimmed = token
+        .trim()
+        .trim_matches(|ch| matches!(ch, '\'' | '"' | '`' | ',' | ';'));
+    if trimmed.is_empty() {
+        return None;
+    }
+    let expanded = if trimmed == "~" {
+        dirs::home_dir()?
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        dirs::home_dir()?.join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir().ok()?.join(expanded)
+    };
+    candidate
+        .exists()
+        .then(|| std::fs::canonicalize(candidate).ok())
+        .flatten()
+}
+
+fn split_shellish_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if quote == Some(ch) {
+            quote = None;
+            continue;
+        }
+        if quote.is_none() && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            continue;
+        }
+        if quote.is_none() && ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn ui_message_to_runtime(message: &UiMessage) -> Option<ConversationMessage> {
+    let role = match message.role {
+        MessageRole::User => RuntimeMessageRole::User,
+        MessageRole::Assistant => RuntimeMessageRole::Assistant,
+        MessageRole::System => RuntimeMessageRole::System,
+        MessageRole::Error => return None,
+    };
+    Some(ConversationMessage {
+        role,
+        blocks: vec![ContentBlock::Text {
+            text: message.content.clone(),
+        }],
+        usage: None,
+    })
+}
+
+fn runtime_message_to_ui(message: &ConversationMessage) -> Option<UiMessage> {
+    let role = match message.role {
+        RuntimeMessageRole::User => MessageRole::User,
+        RuntimeMessageRole::Assistant => MessageRole::Assistant,
+        RuntimeMessageRole::System => MessageRole::System,
+        RuntimeMessageRole::Tool => return None,
+    };
+    let content = message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if content.trim().is_empty() {
+        None
+    } else {
+        Some(UiMessage { role, content })
     }
 }
 
@@ -737,37 +1009,68 @@ fn handle_model_picker_key(key: KeyEvent, app: &mut App) -> bool {
     }
 }
 
-fn is_interactive_secret_login(input: &str) -> bool {
+fn is_interactive_login(input: &str) -> bool {
     let trimmed = input.trim().to_ascii_lowercase();
     trimmed.starts_with("/login ")
-        && !matches!(
-            trimmed.trim_start_matches("/login").trim(),
-            "" | "ollama" | "desktop"
-        )
+        && !matches!(trimmed.trim_start_matches("/login").trim(), "desktop")
+        || trimmed == "/login"
+}
+
+/// Track whether raw mode was enabled so the panic hook knows what to undo.
+static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn install_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if RAW_MODE_ACTIVE.load(Ordering::SeqCst) {
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                stdout(),
+                DisableBracketedPaste,
+                LeaveAlternateScreen,
+                crossterm::cursor::Show,
+            );
+        }
+        original(info);
+    }));
 }
 
 fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
+    RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
+    execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout());
     Terminal::new(backend)
 }
 
 fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
+    RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()
 }
 
 fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()
 }
 
 fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableBracketedPaste
+    )?;
     terminal.clear()
 }
 
@@ -792,5 +1095,45 @@ fn truncate_for_sidebar(text: &str) -> String {
         "New conversation".to_string()
     } else {
         title
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{prompt_file_references, prompt_with_file_references, split_shellish_tokens};
+
+    #[test]
+    fn splits_dragged_paths_with_escaped_spaces() {
+        let tokens = split_shellish_tokens(r#"please inspect /tmp/my\ file.png "and this.txt""#);
+        assert_eq!(
+            tokens,
+            vec!["please", "inspect", "/tmp/my file.png", "and this.txt"]
+        );
+    }
+
+    #[test]
+    fn prompt_adds_existing_file_references() {
+        let path = std::env::temp_dir().join(format!(
+            "kim-cli-attach-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        fs::write(&path, "hello").expect("fixture should write");
+        let prompt = prompt_with_file_references(&format!("read {}", path.display()));
+        let _ = fs::remove_file(&path);
+
+        assert!(prompt.contains("Referenced local files Kim may access:"));
+        assert!(prompt.contains("kim-cli-attach-"));
+    }
+
+    #[test]
+    fn ignores_missing_file_references() {
+        let paths = prompt_file_references("/definitely/not/a/kim/file.png");
+        assert!(paths.is_empty());
     }
 }

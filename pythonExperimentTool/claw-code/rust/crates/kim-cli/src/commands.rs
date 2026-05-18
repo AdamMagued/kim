@@ -1,7 +1,9 @@
 use std::fs;
+#[cfg(not(windows))]
 use std::time::Duration;
 
 use tokio::process::Command;
+#[cfg(not(windows))]
 use tokio::time::timeout;
 
 use crate::config::{config_path, KimConfig, ThemeName};
@@ -12,6 +14,7 @@ pub enum CommandOutcome {
     Message(String),
     SendPrompt(String),
     OpenModelPicker(Vec<String>),
+    Compact,
     Exit,
 }
 
@@ -63,7 +66,7 @@ pub async fn handle_command(input: &str, config: &mut KimConfig) -> CommandOutco
         "/logout" => logout(args, config),
         "/sessions" | "/resume" => CommandOutcome::Message("__KIM_REFRESH_SESSIONS__".to_string()),
         "/usage" => CommandOutcome::Message("Usage tracking is local-only in this v1 shell; provider billing remains in provider dashboards.".to_string()),
-        "/compact" => CommandOutcome::Message("__KIM_COMPACT__".to_string()),
+        "/compact" => CommandOutcome::Compact,
         "/diff" => shell("git", &["diff", "--stat"], "git diff --stat").await,
         "/git" => run_project_command("git", args).await,
         "/run" => run_shell(args).await,
@@ -180,10 +183,10 @@ pub async fn model_options(config: &KimConfig) -> Vec<String> {
 }
 
 async fn ollama_models() -> Vec<String> {
-    let mut models = vec![
-        "gpt-oss:120b-cloud".to_string(),
-        "gpt-oss:20b-cloud".to_string(),
-    ];
+    let mut models = known_ollama_cloud_models()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
     if let Ok(output) = Command::new("ollama").arg("list").output().await {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
@@ -201,6 +204,22 @@ async fn ollama_models() -> Vec<String> {
     models
 }
 
+fn known_ollama_cloud_models() -> &'static [&'static str] {
+    &[
+        "gpt-oss:20b-cloud",
+        "gpt-oss:120b-cloud",
+        "llama3.3:70b-cloud",
+        "llama3.1:405b-cloud",
+        "qwen2.5:72b-cloud",
+        "qwen2.5-coder:32b-cloud",
+        "deepseek-r1:671b-cloud",
+        "deepseek-v3:685b-cloud",
+        "deepseek-coder-v4:cloud",
+        "mistral-large:latest-cloud",
+        "gemma3:27b-cloud",
+    ]
+}
+
 fn set_theme(args: &str, config: &mut KimConfig) -> CommandOutcome {
     if args.is_empty() {
         return CommandOutcome::Message(format!("Current theme: {}", config.theme.label()));
@@ -215,36 +234,7 @@ fn set_theme(args: &str, config: &mut KimConfig) -> CommandOutcome {
 async fn login(args: &str, config: &mut KimConfig) -> CommandOutcome {
     let provider = if args.is_empty() { "ollama" } else { args }.to_ascii_lowercase();
     match provider.as_str() {
-        "ollama" => {
-            let output = timeout(
-                Duration::from_secs(20),
-                Command::new("ollama").arg("signin").output(),
-            )
-            .await;
-            match output {
-                Ok(Ok(output)) if output.status.success() => {
-                    config.provider = "ollama".to_string();
-                    let detail = command_output_text(&output);
-                    let message = if detail.trim().is_empty() {
-                        "Ollama sign-in completed.".to_string()
-                    } else {
-                        format!("Ollama sign-in completed.\n{detail}")
-                    };
-                    save_notice(config, message)
-                }
-                Ok(Ok(output)) => CommandOutcome::Message(format!(
-                    "`ollama signin` exited with {}.\n{}",
-                    output.status,
-                    command_output_text(&output)
-                )),
-                Ok(Err(error)) => {
-                    CommandOutcome::Message(format!("Could not run `ollama signin`: {error}"))
-                }
-                Err(_) => CommandOutcome::Message(
-                    "`ollama signin` is still waiting for the terminal/browser flow. Try running `ollama signin` in a normal shell, then return to Kim and use /provider ollama.".to_string(),
-                ),
-            }
-        }
+        "ollama" => ollama_login(config).await,
         "desktop" => {
             config.provider = "desktop".to_string();
             save_notice(
@@ -271,6 +261,125 @@ async fn login(args: &str, config: &mut KimConfig) -> CommandOutcome {
                 Err(error) => CommandOutcome::Message(format!("Could not read API key: {error}")),
             }
         }
+    }
+}
+
+async fn ollama_login(config: &mut KimConfig) -> CommandOutcome {
+    // On Windows, `ollama signin` is interactive and will hang when piped.
+    // Skip straight to the browser flow; it's more reliable on all Windows versions.
+    #[cfg(windows)]
+    {
+        // First probe whether ollama is even present.
+        match Command::new("ollama").arg("--version").output().await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return CommandOutcome::Message(
+                    "Ollama is not installed or not on PATH.\nInstall Ollama for Windows, open it once, then run /login again.\nhttps://ollama.com/download/windows".to_string(),
+                );
+            }
+            _ => {}
+        }
+        return ollama_browser_login(config).await;
+    }
+    // macOS / Linux: attempt `ollama signin` non-interactively, fall back to browser.
+    #[cfg(not(windows))]
+    {
+        let output = timeout(
+            Duration::from_secs(15),
+            Command::new("ollama").arg("signin").output(),
+        )
+        .await;
+        match output {
+            Ok(Ok(output)) if output.status.success() => {
+                config.provider = "ollama".to_string();
+                let detail = command_output_text(&output);
+                let message = if detail.trim().is_empty() {
+                    "Ollama sign-in completed.".to_string()
+                } else {
+                    format!("Ollama sign-in completed.\n{detail}")
+                };
+                save_notice(config, message)
+            }
+            Ok(Ok(output)) if signin_is_missing(&command_output_text(&output)) => {
+                ollama_browser_login(config).await
+            }
+            Ok(Ok(output)) => {
+                let detail = command_output_text(&output);
+                let browser = open_ollama_signin_page().await;
+                config.provider = "ollama".to_string();
+                save_notice(
+                    config,
+                    format!(
+                        "`ollama signin` exited with {}.\n{}\n\n{}\nAfter the browser finishes, return to Kim and use /provider ollama or /model to confirm.",
+                        output.status,
+                        detail.trim(),
+                        browser_message(browser)
+                    ),
+                )
+            }
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                CommandOutcome::Message(
+                    "Ollama is not installed or not on PATH.\nInstall Ollama, open it once, then run /login again.\nhttps://ollama.com/download".to_string(),
+                )
+            }
+            Ok(Err(_)) => ollama_browser_login(config).await,
+            Err(_) => ollama_browser_login(config).await,
+        }
+    }
+}
+
+async fn ollama_browser_login(config: &mut KimConfig) -> CommandOutcome {
+    let browser = open_ollama_signin_page().await;
+    config.provider = "ollama".to_string();
+    save_notice(
+        config,
+        format!(
+            "{}\n\nIf cloud models still say unauthorized, update Ollama for Windows and run /login again. Older Ollama builds do not expose terminal sign-in.",
+            browser_message(browser)
+        ),
+    )
+}
+
+#[cfg(not(windows))]
+fn signin_is_missing(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    normalized.contains("unknown command")
+        || normalized.contains("unrecognized command")
+        || normalized.contains("invalid command")
+        || normalized.contains("unknown shorthand")
+        || normalized.contains("signin")
+            && (normalized.contains("did you mean")
+                || normalized.contains("not found")
+                || normalized.contains("is not recognized"))
+}
+
+async fn open_ollama_signin_page() -> Result<(), String> {
+    let url = "https://ollama.com/signin";
+    #[cfg(windows)]
+    let result = Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .status()
+        .await;
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(url).status().await;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(url).status().await;
+
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("browser opener exited with {status}")),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn browser_message(result: Result<(), String>) -> String {
+    match result {
+        Ok(()) => {
+            "Opened Ollama sign-in in your browser. Finish signing in there, then return to Kim."
+                .to_string()
+        }
+        Err(error) => format!(
+            "Open this page to sign in to Ollama: https://ollama.com/signin\nCould not open browser automatically: {error}"
+        ),
     }
 }
 
@@ -372,6 +481,7 @@ fn format_output(
     }
 }
 
+#[cfg(not(windows))]
 fn command_output_text(output: &std::process::Output) -> String {
     let mut text = String::new();
     if !output.stdout.is_empty() {
@@ -419,6 +529,39 @@ mod tests {
         let outcome = handle_command("/provider openai", &mut config).await;
         assert!(matches!(outcome, CommandOutcome::Message(_)));
         assert_eq!(config.provider, "openai");
+    }
+
+    #[tokio::test]
+    async fn compact_returns_real_compaction_outcome() {
+        let mut config = KimConfig::default();
+        let outcome = handle_command("/compact", &mut config).await;
+        assert_eq!(outcome, CommandOutcome::Compact);
+    }
+
+    #[tokio::test]
+    async fn openai_models_are_current_picker_options() {
+        let config = KimConfig {
+            provider: "openai".to_string(),
+            ..KimConfig::default()
+        };
+        let models = super::model_options(&config).await;
+        assert!(models.iter().any(|model| model == "gpt-4o"));
+        assert!(models.iter().any(|model| model == "o3-mini"));
+        assert!(!models.iter().any(|model| model == "gpt-5.4"));
+    }
+
+    #[tokio::test]
+    async fn ollama_models_include_kim_cloud_catalog() {
+        let config = KimConfig {
+            provider: "ollama".to_string(),
+            ..KimConfig::default()
+        };
+        let models = super::model_options(&config).await;
+        assert!(models.iter().any(|model| model == "deepseek-v3:685b-cloud"));
+        assert!(models.iter().any(|model| model == "llama3.1:405b-cloud"));
+        assert!(models
+            .iter()
+            .any(|model| model == "qwen2.5-coder:32b-cloud"));
     }
 
     #[test]
