@@ -20,7 +20,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use provider::{send_chat, ChatMessage};
+use provider::{send_chat, send_code_chat, ChatMessage};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use runtime::{
@@ -784,10 +784,19 @@ async fn apply_outcome(
                 app.ensure_current_session_listed(&last_user);
             }
             app.busy = true;
-            app.status = "thinking".to_string();
+            app.status = if app.mode == AppMode::Code {
+                "kim code · thinking…".to_string()
+            } else {
+                "thinking…".to_string()
+            };
             let started = Instant::now();
             let history = app.chat_history();
-            match send_chat(&app.config, &history).await {
+            let send_result = if app.mode == AppMode::Code {
+                send_code_chat(&app.config, &history).await
+            } else {
+                send_chat(&app.config, &history).await
+            };
+            match send_result {
                 Ok(reply) => {
                     app.push(MessageRole::Assistant, reply);
                     app.status = format!("worked for {:.1}s", started.elapsed().as_secs_f32());

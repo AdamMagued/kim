@@ -82,6 +82,35 @@ pub async fn send_chat(config: &KimConfig, messages: &[ChatMessage]) -> Result<S
     }
 }
 
+pub async fn send_code_chat(config: &KimConfig, messages: &[ChatMessage]) -> Result<String, String> {
+    let system = ChatMessage {
+        role: "system".to_string(),
+        content: CODE_SYSTEM_PROMPT.to_string(),
+    };
+    let mut full = vec![system];
+    full.extend_from_slice(messages);
+    match config.provider.as_str() {
+        "desktop" => send_desktop_bridge(config, messages).await,
+        "claude" => send_anthropic(config, &full).await,
+        _ => send_openai_compatible(config, &full).await,
+    }
+}
+
+const CODE_SYSTEM_PROMPT: &str = "\
+You are Kim Code, an expert coding agent. You help with programming, debugging, \
+code review, refactoring, and project architecture.
+
+When working through a problem:
+1. Think step by step — show your reasoning before giving code.
+2. If the user mentions a file path, assume you can read it and discuss its contents \
+   (they may have drag-dropped it). Ask for file content if you need it.
+3. Write complete, runnable code — no placeholders or TODOs.
+4. For shell commands, prefix them with `$ ` so they're easy to copy.
+5. If you notice a bug or improvement beyond what was asked, briefly mention it.
+
+You do not have live screen or file access in this session — for that, the user \
+can start Kim desktop. Focus on code quality, clear explanations, and useful output.";
+
 async fn send_openai_compatible(
     config: &KimConfig,
     messages: &[ChatMessage],

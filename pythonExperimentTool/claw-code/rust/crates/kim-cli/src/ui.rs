@@ -263,14 +263,14 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         lines.push(Line::raw(""));
     }
     if app.messages.is_empty() {
-        lines.push(Line::styled(
-            if app.view == ViewState::SessionMenu {
-                "Message box accepts slash commands here. Open New chat before sending prompts."
-            } else {
-                "Type a message, or /help. Esc returns to the chat list."
-            },
-            Style::default().fg(theme.text_dim),
-        ));
+        let hint = if app.view == ViewState::SessionMenu {
+            "Message box accepts slash commands here. Open New chat before sending prompts."
+        } else if app.mode == AppMode::Code {
+            "Kim Code · coding agent mode. Ask about code, bugs, refactors, or drop a file path."
+        } else {
+            "Kim Chat · type a message, or /help. Esc returns to the chat list."
+        };
+        lines.push(Line::styled(hint, Style::default().fg(theme.text_dim)));
     }
     if app.busy {
         lines.push(Line::styled(
