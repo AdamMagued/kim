@@ -775,9 +775,7 @@ async fn apply_outcome(
                 app.status = "choose New chat or open a session before sending".to_string();
                 return Ok(false);
             }
-            let prompt_lines = prompt.lines().count() as u16;
             app.push(MessageRole::User, prompt);
-            app.scroll = app.scroll.saturating_add(prompt_lines + 4);
             if let Some(last_user) = app
                 .messages
                 .iter()
@@ -795,17 +793,13 @@ async fn apply_outcome(
             match send_kim_request(&app.config, &history, code_mode).await {
                 Ok((reply, bridge_used)) => {
                     app.bridge_connected = bridge_used;
-                    let reply_lines = reply.lines().count() as u16;
                     app.push(MessageRole::Assistant, reply);
-                    app.scroll = app.scroll.saturating_add(reply_lines + 4);
                     let via = if bridge_used { " · via Kim desktop" } else { "" };
                     app.status = format!("done in {:.1}s{via}", started.elapsed().as_secs_f32());
                 }
                 Err(error) => {
                     app.bridge_connected = false;
-                    let err_lines = error.lines().count() as u16;
                     app.push(MessageRole::Error, error);
-                    app.scroll = app.scroll.saturating_add(err_lines + 4);
                     app.status = "error".to_string();
                 }
             }
