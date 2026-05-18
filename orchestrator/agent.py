@@ -369,7 +369,7 @@ async def mcp_session_context(config: dict):
     ]
     extra_env = {k: os.environ[k] for k in _EXTRA_ENV_KEYS if k in os.environ}
     merged_env = {**os.environ, **extra_env} if extra_env else None
-    
+
     # 1. Prepare internal Kim server
     server_list = [
         StdioServerParameters(
@@ -379,7 +379,7 @@ async def mcp_session_context(config: dict):
             env=merged_env,
         )
     ]
-    
+
     # 2. Add extra servers from config.yaml
     extra_servers = config.get("mcp_servers", {})
     if isinstance(extra_servers, dict):
@@ -416,7 +416,7 @@ async def mcp_session_context(config: dict):
             await asyncio.wait_for(multi_client.initialize(), timeout=30.0)
         except asyncio.TimeoutError:
             raise RuntimeError("One or more MCP servers timed out during initialization.")
-        
+
         logger.info(f"Initialized {len(sessions)} MCP sessions")
         yield multi_client
 
@@ -1602,7 +1602,6 @@ Rules:
         self.memory.load_from_messages(compacted)
 
         # Persist: save the summary sentinel and reset context meter
-        summary_content = compacted[0].get("content", "") if compacted else ""
         compacted_at = datetime.now(timezone.utc).isoformat()
         snapshot = self._context_meter.reset_after_compact(compacted_at=compacted_at)
         self._log("INFO", snapshot.to_log_line())
@@ -1637,7 +1636,6 @@ Rules:
             self._session_store.save_summary(summary_text)
         except Exception as e:
             logger.warning(f"Failed to save session summary: {e}")
-
 
 
 def _provider_accepts_kwarg(fn: Any, name: str) -> bool:

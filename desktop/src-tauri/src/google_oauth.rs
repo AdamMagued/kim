@@ -4,10 +4,10 @@
 //! - Rust owns the refresh token and stores it in OS secure storage.
 //! - Before spawning the Python agent with provider=gemini, Rust refreshes and
 //!   injects only short-lived env vars:
-//!     KIM_GEMINI_AUTH_MODE=oauth
-//!     KIM_GOOGLE_ACCESS_TOKEN=<redacted in logs>
-//!     KIM_GOOGLE_ACCESS_TOKEN_EXPIRES_AT=<epoch seconds>
-//!     KIM_GOOGLE_CLOUD_PROJECT=<optional quota project>
+//!   KIM_GEMINI_AUTH_MODE=oauth
+//!   KIM_GOOGLE_ACCESS_TOKEN=<redacted in logs>
+//!   KIM_GOOGLE_ACCESS_TOKEN_EXPIRES_AT=<epoch seconds>
+//!   KIM_GOOGLE_CLOUD_PROJECT=<optional quota project>
 //! - Python never receives refresh tokens or client secrets.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -300,6 +300,7 @@ async fn fetch_userinfo(access_token: &str) -> Result<UserInfoResponse, String> 
         .map_err(|e| format!("Could not parse Google account email: {e}"))
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct GcpProject {
     name: Option<String>,
@@ -313,11 +314,13 @@ struct CreateProjectRequest {
     name: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct CreateProjectResponse {
     name: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct ServiceEnablementRequest {
     service_ids: Vec<String>,

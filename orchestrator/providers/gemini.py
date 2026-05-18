@@ -6,7 +6,7 @@ Supports three authentication modes:
 1. API key (legacy/dev): GOOGLE_API_KEY or config["api_key"].
 2. Kim Google OAuth (shared quota): a short-lived bearer token passed by Tauri
    in KIM_GOOGLE_ACCESS_TOKEN, using Kim's shared project quota via x-goog-user-project.
-3. User-owned free-tier project (oauth_user_project): OAuth bearer token + 
+3. User-owned free-tier project (oauth_user_project): OAuth bearer token +
    user-created Google Cloud project ID, so usage counts against the user's free tier,
    not Kim's shared project.
 
@@ -85,7 +85,7 @@ class EnvOAuthAccessTokenProvider:
             except ValueError as exc:
                 raise EnvironmentError(f"Invalid {OAUTH_TOKEN_EXPIRY_ENV}; expected epoch seconds.") from exc
             if expires_at <= time.time() + 60:
-                raise EnvironmentError("Google access token is expired or too close to expiry. Please reconnect Google for Kim.")
+                raise EnvironmentError("Google access token is expired or too close to expiry. Please reconnect Google for Kim.")  # noqa: E501
 
         return _OAuthAccessToken(token=token, expires_at=expires_at)
 
@@ -95,7 +95,7 @@ class GeminiProvider(BaseProvider):
         models = config.get("model", {})
         self._model_name = models.get("gemini", "gemini-2.0-flash")
         self._max_tokens = int(config.get("max_tokens", 4096))
-        self._api_version = str(config.get("gemini_api_version") or os.environ.get("KIM_GEMINI_API_VERSION") or "v1beta")
+        self._api_version = str(config.get("gemini_api_version") or os.environ.get("KIM_GEMINI_API_VERSION") or "v1beta")  # noqa: E501
         self._quota_project = str(
             config.get("google_cloud_project")
             or os.environ.get(OAUTH_QUOTA_PROJECT_ENV)
@@ -110,7 +110,7 @@ class GeminiProvider(BaseProvider):
             or ""
         ).strip()
 
-        explicit_mode = str(config.get("gemini_auth_mode") or os.environ.get("KIM_GEMINI_AUTH_MODE") or "auto").lower().strip()
+        explicit_mode = str(config.get("gemini_auth_mode") or os.environ.get("KIM_GEMINI_AUTH_MODE") or "auto").lower().strip()  # noqa: E501
         api_key = str(config.get("api_key") or os.environ.get("GOOGLE_API_KEY", "")).strip()
         oauth_token = str(config.get("oauth_access_token") or os.environ.get(OAUTH_TOKEN_ENV, "")).strip()
         oauth_provider = config.get("oauth_access_token_provider")
@@ -162,11 +162,11 @@ class GeminiProvider(BaseProvider):
                 raise TypeError("oauth_access_token_provider must be callable")
             if oauth_provider is None:
                 if oauth_token:
-                    expires_at = _parse_optional_expiry(config.get("oauth_access_token_expires_at") or os.environ.get(OAUTH_TOKEN_EXPIRY_ENV))
+                    expires_at = _parse_optional_expiry(config.get("oauth_access_token_expires_at") or os.environ.get(OAUTH_TOKEN_EXPIRY_ENV))  # noqa: E501
 
                     def _static_provider_user_project() -> _OAuthAccessToken:
                         if expires_at is not None and expires_at <= time.time() + 60:
-                            raise EnvironmentError("Google access token is expired or too close to expiry. Please reconnect Google for Kim.")
+                            raise EnvironmentError("Google access token is expired or too close to expiry. Please reconnect Google for Kim.")  # noqa: E501
                         return _OAuthAccessToken(token=oauth_token, expires_at=expires_at)
 
                     self._oauth_access_token_provider = _static_provider_user_project
@@ -182,11 +182,11 @@ class GeminiProvider(BaseProvider):
             if oauth_provider is None:
                 # If config supplied oauth_access_token directly, expose it via env-compatible closure.
                 if oauth_token:
-                    expires_at = _parse_optional_expiry(config.get("oauth_access_token_expires_at") or os.environ.get(OAUTH_TOKEN_EXPIRY_ENV))
+                    expires_at = _parse_optional_expiry(config.get("oauth_access_token_expires_at") or os.environ.get(OAUTH_TOKEN_EXPIRY_ENV))  # noqa: E501
 
                     def _static_provider() -> _OAuthAccessToken:
                         if expires_at is not None and expires_at <= time.time() + 60:
-                            raise EnvironmentError("Google access token is expired or too close to expiry. Please reconnect Google for Kim.")
+                            raise EnvironmentError("Google access token is expired or too close to expiry. Please reconnect Google for Kim.")  # noqa: E501
                         return _OAuthAccessToken(token=oauth_token, expires_at=expires_at)
 
                     self._oauth_access_token_provider = _static_provider
@@ -239,7 +239,7 @@ class GeminiProvider(BaseProvider):
     async def _complete_oauth(self, messages: list[dict], tools: list[dict], system: str) -> dict:
         assert self._oauth_access_token_provider is not None
         token = self._oauth_access_token_provider()
-        
+
         # Strict validation for user-project mode
         if self._auth_mode == "oauth_user_project":
             if not self._quota_project:
@@ -247,7 +247,7 @@ class GeminiProvider(BaseProvider):
                     "oauth_user_project mode requires a valid Google Cloud project ID. "
                     f"Please set {OAUTH_USER_PROJECT_ENV} or reconfigure in Settings."
                 )
-        
+
         body = self._to_rest_request(messages, tools, system)
         url = self._generate_content_url()
 
@@ -267,7 +267,7 @@ class GeminiProvider(BaseProvider):
                 raw = exc.read().decode("utf-8", errors="replace")
                 # Redact body enough for logs; never include bearer token.
                 logger.error("Gemini OAuth API error: HTTP %s: %s", exc.code, _truncate(raw, 2000))
-                
+
                 # Enhanced error message for user-project mode
                 if self._auth_mode == "oauth_user_project":
                     if exc.code == 429:
@@ -280,7 +280,7 @@ class GeminiProvider(BaseProvider):
                             f"Your Google Cloud project {self._quota_project} is not properly configured. "
                             f"Ensure the Gemini API is enabled and billing is set up if using paid models."
                         ) from exc
-                
+
                 raise RuntimeError(f"Gemini OAuth API error: HTTP {exc.code}: {_safe_google_error(raw)}") from exc
 
         try:
