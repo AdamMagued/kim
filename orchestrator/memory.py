@@ -72,13 +72,31 @@ class ConversationMemory:
     # Public read API
     # ------------------------------------------------------------------
 
+    @property
+    def compact_summary(self) -> str | None:
+        """Return the compact summary text if one is pinned, else None."""
+        if self._messages and self._messages[0].get("role") == "compact_summary":
+            content = self._messages[0].get("content", "")
+            return str(content) if content else None
+        return None
+
     def get_messages(self) -> list[dict]:
         """
         Return messages in canonical format, with screenshots already pruned
         from older turns.  The returned list is a deep copy — safe to modify.
+
+        The leading compact_summary sentinel (if present) is excluded from the
+        returned list — callers that need it should read ``compact_summary``
+        and merge it into the system prompt instead.
         """
         pruned = self._apply_screenshot_policy()
-        return [{"role": m["role"], "content": m["content"]} for m in pruned]
+        result = []
+        for m in pruned:
+            role = m["role"]
+            if role == "compact_summary":
+                continue  # exposed via self.compact_summary instead
+            result.append({"role": role, "content": m["content"]})
+        return result
 
     def __len__(self) -> int:
         return len(self._messages)
@@ -88,8 +106,28 @@ class ConversationMemory:
     # ------------------------------------------------------------------
 
     def _enforce_limits(self) -> None:
-        """Trim to max_messages, keeping a coherent user/assistant sequence."""
+        """Trim to max_messages, keeping a coherent user/assistant sequence.
+
+        A leading compact_summary sentinel is always pinned — it is never
+        dropped regardless of the message limit.
+        """
+        has_summary = bool(self._messages and self._messages[0].get("role") == "compact_summary")
         if len(self._messages) <= self.max_messages:
+            return
+
+        # Pin the summary at index 0 and trim the rest
+        if has_summary:
+            summary = self._messages[0]
+            rest = self._messages[1:]
+            max_rest = self.max_messages - 1
+            if len(rest) <= max_rest:
+                return
+            excess = len(rest) - max_rest
+            for i in range(excess, len(rest)):
+                if rest[i]["role"] == "user":
+                    self._messages = [summary] + rest[i:]
+                    return
+            self._messages = [summary] + rest[-1:]
             return
 
         excess = len(self._messages) - self.max_messages

@@ -6,8 +6,8 @@ import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock, ToolUseB
 import { MessageBubble } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
 import { toast } from './Toast';
-import { ConnectorsPanel, ThinkingWithPlan } from './kim-ui';
-import type { Connector, TraceItem } from './kim-ui';
+import { ConnectorsPanel, ThinkingWithPlan, WorkedForPill } from './kim-ui';
+import type { Connector, TraceItem, WorkedForTraceItem, WorkedForToolKind } from './kim-ui';
 import { ProviderPicker } from './ProviderPicker';
 
 const MAX_ACTIVITY_ITEMS = 300;
@@ -249,6 +249,56 @@ function isTextOnlyAssistant(msg: KimMessage): boolean {
   return false;
 }
 
+/**
+ * Returns true if this is an intermediate Ollama tool-call message — an
+ * assistant message whose entire content is a JSON `{"type":"tool_call",...}`
+ * string. These are invisible in the chat; they appear in the WorkedForPill.
+ */
+function isIntermediateToolCall(msg: KimMessage): boolean {
+  if (msg.role !== 'assistant' || typeof msg.content !== 'string') return false;
+  const raw = msg.content.trim();
+  if (!raw.startsWith('{')) return false;
+  try {
+    const p = JSON.parse(raw) as Record<string, unknown>;
+    return p.type === 'tool_call' || p.type === 'tool_use';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Synthesize activity items for the exchange that starts at the (userIdx+1)-th
+ * real user message. Scans messages in that window and collects tool calls /
+ * thoughts, excluding the last assistant message (the final answer).
+ */
+function synthesizeExchangeActivity(
+  allMsgs: KimMessage[],
+  userIdx: number,
+): ActivityItem[] {
+  // Locate the start of this exchange (the (userIdx+1)-th real user message)
+  let seen = -1;
+  let start = -1;
+  for (let i = 0; i < allMsgs.length; i++) {
+    if (isRealUserMessage(allMsgs[i])) {
+      seen++;
+      if (seen === userIdx) { start = i; break; }
+    }
+  }
+  if (start === -1) return [];
+
+  // Collect messages until the next real user message
+  const slice: KimMessage[] = [];
+  for (let i = start; i < allMsgs.length; i++) {
+    if (i > start && isRealUserMessage(allMsgs[i])) break;
+    slice.push(allMsgs[i]);
+  }
+
+  // Exclude the last assistant message (it's the visible answer, not the trace)
+  const lastAsstIdx = slice.reduce((acc, m, i) => m.role === 'assistant' ? i : acc, -1);
+  const actSlice = lastAsstIdx > 0 ? slice.slice(0, lastAsstIdx) : slice;
+  return synthesizeActivityFromMessages(actSlice, TOOL_MAP);
+}
+
 function clawBridgeFiller(text: string): boolean {
   return /^Calling\s+[A-Za-z_][\w-]*\.$/.test(text.trim());
 }
@@ -391,10 +441,40 @@ function synthesizeActivityFromMessages(messages: KimMessage[], toolMap: typeof 
   for (const msg of messages) {
     if (typeof msg.content === 'string') {
       if (msg.role === 'assistant') {
-        const rawT = msg.content.trim().replace(/^TASK_COMPLETE:\s*/i, '');
-        if (rawT) {
-          const t = cleanActivityText(rawT);
-          items.push({ id: ++id, kind: 'status', icon: '›', text: t.length > 120 ? t.slice(0, 120) + '…' : t });
+        const rawT = msg.content.trim();
+        // Ollama stores tool calls as JSON strings: {"type":"tool_call","tool":"...","args":{...},"content":"..."}
+        if (rawT.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(rawT) as Record<string, unknown>;
+            if (parsed.type === 'tool_call' && typeof parsed.tool === 'string') {
+              const toolName = parsed.tool;
+              const def = toolMap[toolName];
+              const args = parsed.args && typeof parsed.args === 'object' ? parsed.args as Record<string, unknown> : {};
+              items.push({ id: ++id, kind: 'tool', icon: def?.icon ?? '›', text: def ? def.label(args) : `Using \`${toolName}\`` });
+              // Also emit thinking content if present and non-empty
+              const thinking = typeof parsed.content === 'string' ? parsed.content.trim() : '';
+              if (thinking) {
+                const t = cleanActivityText(thinking);
+                if (t) items.push({ id: ++id, kind: 'status', icon: '›', text: t.length > 120 ? t.slice(0, 120) + '…' : t });
+              }
+            } else if (typeof parsed.text === 'string' && parsed.text.trim()) {
+              const t = cleanActivityText(parsed.text);
+              if (t) items.push({ id: ++id, kind: 'status', icon: '›', text: t.length > 120 ? t.slice(0, 120) + '…' : t });
+            }
+          } catch {
+            // Not JSON — fall through to text handling
+            const cleaned = rawT.replace(/^TASK_COMPLETE:\s*/i, '');
+            if (cleaned) {
+              const t = cleanActivityText(cleaned);
+              if (t) items.push({ id: ++id, kind: 'status', icon: '›', text: t.length > 120 ? t.slice(0, 120) + '…' : t });
+            }
+          }
+          continue;
+        }
+        const cleaned = rawT.replace(/^TASK_COMPLETE:\s*/i, '');
+        if (cleaned) {
+          const t = cleanActivityText(cleaned);
+          if (t) items.push({ id: ++id, kind: 'status', icon: '›', text: t.length > 120 ? t.slice(0, 120) + '…' : t });
         }
       }
       continue;
@@ -551,6 +631,8 @@ function isNoiseLine(raw: string): boolean {
   // Never suppress user-facing response lines regardless of summary content.
   if (raw.startsWith('[STATUS]') || raw.includes('[STATUS]') || raw.startsWith('[ANSWER]') || raw.includes('[ANSWER]')) return false;
   if (raw.includes('[SUCCESS]') || raw.includes('[FAILED]') || raw.includes('[ERROR]')) return false;
+  // Never suppress explicit [TOOL] lines emitted by agent.py to stdout.
+  if (raw.startsWith('[TOOL]')) return false;
   // Strip the [err] prefix that appendRaw prepends before pattern-matching,
   // otherwise regex anchors like /^\s*\|/ never fire.
   const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
@@ -605,7 +687,13 @@ const TOOL_MAP: Record<string, { icon: string; label: (args: Record<string, unkn
   // Clipboard
   read_clipboard:     { icon: '›', label: _a => 'Reading clipboard' },
   write_clipboard:    { icon: '›', label: _a => 'Writing to clipboard' },
-  // Screen reading
+  // Screen / UI
+  take_screenshot:    { icon: '›', label: _a => 'Capturing screen' },
+  take_annotated_screenshot: { icon: '›', label: _a => 'Capturing annotated screen' },
+  observe_ui:         { icon: '›', label: a => `Reading UI${a.window_title ? ` · ${String(a.window_title)}` : ''}` },
+  click_ui:           { icon: '›', label: a => `Clicking \`${String(a.element_id ?? 'element')}\`` },
+  focus_window:       { icon: '›', label: a => `Focusing ${String(a.window_title ?? a.app ?? 'window')}` },
+  web_open:           { icon: '›', label: a => `Opening ${String(a.url ?? 'page')}` },
   get_screen_text:    { icon: '›', label: _a => 'Reading screen text' },
   // Web
   web_search:         { icon: '›', label: a => `Searching the web for "${String(a.query ?? '')}"` },
@@ -1028,12 +1116,7 @@ function BlobLoader({ which }: { which: 3 | 6 | 12 | 15 | 20 }) {
   );
 }
 
-function formatElapsed(s: number): string {
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const sec = s % 60;
-  return `${m}m ${sec}s`;
-}
+
 
 function formatNsDuration(ns?: number): string | null {
   if (!ns || ns <= 0) return null;
@@ -1140,7 +1223,6 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
   // one entry; rendered as a collapsible "Worked for Xm Ys" badge before the
   // corresponding assistant turn in liveHistory.
   const [runHistory, setRunHistory] = useState<{ activity: ActivityItem[]; durationSec: number }[]>([]);
-  const [expandedRunIdx, setExpandedRunIdx] = useState<number | null>(null);
   const [clawRuns, setClawRuns] = useState<ClawRunGroup[]>([]);
   const [taskError, setTaskError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
@@ -1381,7 +1463,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
       setLiveHistory([]);
       // Reset run history and re-hydrate from the sidecar `<id>.runs.json` file.
       setRunHistory([]);
-      setExpandedRunIdx(null);
+
       setClawRuns([]); 
       invoke<{ activity: ActivityItem[]; durationSec: number }[]>('load_run_history', {
         sessionId: session.session_id,
@@ -1427,8 +1509,9 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
         } else {
           setNewestMsgIdx(null);
         }
-        prevMsgCountRef.current = msgs.length;
-        setMessages(msgs);
+        const displayMsgs = msgs.filter(m => m.role !== 'compact_summary');
+        prevMsgCountRef.current = displayMsgs.length;
+        setMessages(displayMsgs);
         // Group Claw session messages into per-run structures so intermediate
         // tool calls are hidden behind "Worked on this" disclosures.
         if (session.session_type === 'claw') {
@@ -1493,7 +1576,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     if (newChatMode) {
       clearActivityNow();
       setRunHistory([]);
-      setExpandedRunIdx(null);
+
       setClawRuns([]);
       setTaskError(null);
       setTokenStats(null);
@@ -2362,6 +2445,28 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
 
   // ── Activity feed render ─────────────────────────────────────────────────────
 
+  function traceToWorkedFor(trace: TraceItem[]): WorkedForTraceItem[] {
+    const result: WorkedForTraceItem[] = [];
+    for (const item of trace) {
+      if (item.kind === 'plan') continue;
+      if (item.kind === 'thought') {
+        result.push({ kind: 'think', text: item.text });
+      } else {
+        const verb = item.verb.toLowerCase();
+        let kind: WorkedForToolKind = 'run';
+        if (verb === 'reading' || verb === 'checking') kind = 'read';
+        else if (verb === 'writing' || verb === 'creating') kind = 'write';
+        else if (verb === 'editing' || verb === 'updating' || verb === 'appending' || verb === 'moving' || verb === 'copying' || verb === 'renaming') kind = 'edit';
+        else if (verb === 'listing') kind = 'ls';
+        else if (verb === 'searching') kind = 'grep';
+        else if (verb === 'fetching' || verb === 'navigating' || verb === 'opening') kind = 'fetch';
+        else if (verb === 'viewing') kind = 'screenshot';
+        result.push({ kind, target: item.target });
+      }
+    }
+    return result;
+  }
+
   function renderActivityFeed() {
     if (activity.length === 0) return null;
     const livePlan = parsePlanFromActivity(activity);
@@ -2382,38 +2487,13 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     );
   }
 
-  function renderWorkedFor(idx: number, run: { activity: ActivityItem[]; durationSec: number }) {
-    const expanded = expandedRunIdx === idx;
-    const durationLabel = run.durationSec > 0
-      ? `Thought for ${formatDuration(run.durationSec)}`
-      : 'Thought about this';
+  function renderWorkedFor(_idx: number, run: { activity: ActivityItem[]; durationSec: number }) {
     const historyTrace = buildThinkingTrace(run.activity, parsePlanFromActivity(run.activity));
+    const workedForTrace = traceToWorkedFor(historyTrace);
+    const duration = run.durationSec > 0 ? formatDuration(run.durationSec) : '…';
     return (
       <div className="kim-msg-row kim-msg-row--assistant">
-        <div className="kim-worked-for">
-          <button
-            type="button"
-            className={`kim-worked-for__chip${expanded ? ' is-expanded' : ''}`}
-            onClick={() => setExpandedRunIdx(expanded ? null : idx)}
-            aria-expanded={expanded}
-          >
-            <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="kim-worked-for__chevron">
-              <path d="M5 3l5 5-5 5" />
-            </svg>
-            <span>{durationLabel}</span>
-          </button>
-          {expanded && historyTrace.length > 0 && (
-            <div className="kim-worked-for__panel">
-              <ThinkingWithPlan
-                trace={historyTrace}
-                duration={run.durationSec > 0 ? formatDuration(run.durationSec) : undefined}
-                planLook="card"
-                live={false}
-                style={{ marginTop: 8 }}
-              />
-            </div>
-          )}
-        </div>
+        <WorkedForPill trace={workedForTrace} duration={duration} />
       </div>
     );
   }
@@ -3193,14 +3273,21 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
           {/* Live conversation history */}
           {(() => {
             const collapsed = collapseMessages(liveHistory);
-            let assistantIdx = -1;
+            let liveUserIdx = -1;
+            let liveAsstRunIdx = -1;
             return collapsed.map(({msg, retries}, i) => {
-              if (msg.role === 'assistant') assistantIdx += 1;
-              const workedRun = msg.role === 'assistant' ? runHistory[assistantIdx] : null;
-              const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
+              if (msg.role === 'user' && isRealUserMessage(msg)) liveUserIdx += 1;
+              if (isIntermediateToolCall(msg)) return null;
+              const showActivityAfter = msg.role === 'user' && isRealUserMessage(msg) &&
+                !collapsed.slice(i + 1).some(({msg: m}) => m.role === 'assistant' && !isIntermediateToolCall(m));
+              let workedRun: { activity: ActivityItem[]; durationSec: number } | null = null;
+              if (msg.role === 'assistant') {
+                liveAsstRunIdx += 1;
+                workedRun = runHistory[liveAsstRunIdx] ?? null;
+              }
               return (
                 <div key={`live-${i}`}>
-                  {workedRun && renderWorkedFor(assistantIdx, workedRun)}
+                  {workedRun && renderWorkedFor(liveUserIdx, workedRun)}
                   <MessageBubble
                     message={msg}
                     animate={i === liveHistory.length - 1}
@@ -3248,34 +3335,6 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
               {interruptTask
                 ? 'Interrupt pending. Current task will be replaced when cancellation completes.'
                 : `${queuedTasks.length} queued message${queuedTasks.length === 1 ? '' : 's'} waiting.`}
-            </div>
-          )}
-
-          {/* Working indicator with blobby loader */}
-          {isRunning && (
-            <div className="kim-working-indicator">
-              {/* Goo filter used by loaders 6, 15, 20 */}
-              <svg width="0" height="0" style={{ position: 'absolute' }}>
-                <defs>
-                  <filter id="kim-goo">
-                    <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur" />
-                    <feColorMatrix in="blur" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 20 -9" result="goo" />
-                    <feComposite in="SourceGraphic" in2="goo" operator="atop" />
-                  </filter>
-                </defs>
-              </svg>
-              <BlobLoader which={cancelling ? 3 : 15} />
-              <span className="kim-working-indicator__text">
-                {cancelling ? 'Stopping Kim…' : 'Kim is working…'}
-              </span>
-              {!cancelling && tokenStats && (
-                <span className="kim-working-indicator__tokens" title={`Input: ${tokenStats.input.toLocaleString()} · Output: ${tokenStats.output.toLocaleString()}`}>
-                  {tokenStats.total.toLocaleString()} tokens
-                </span>
-              )}
-              {!cancelling && elapsed > 0 && (
-                <span className="kim-working-indicator__timer">{formatElapsed(elapsed)}</span>
-              )}
             </div>
           )}
 
@@ -3357,13 +3416,35 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
               /* ── Normal (Kim) message view ── */
               (() => {
                 const collapsed = collapseMessages(messages);
-                let assistantIdx = -1;
+                let userMsgIdx = -1;
+                // Offset: liveHistory also has entries mapped to runHistory.
+                // Saved messages are the first N entries; live history appends on top.
+                const liveAsstCount = collapseMessages(liveHistory)
+                  .filter(({msg}) => msg.role === 'assistant' && !isIntermediateToolCall(msg)).length;
                 return collapsed.map(({msg, retries}, i) => {
-                  if (msg.role === 'assistant') assistantIdx += 1;
-                  const workedRun = msg.role === 'assistant' ? runHistory[assistantIdx] : null;
+                  // Track which real user message we're under
+                  if (msg.role === 'user' && isRealUserMessage(msg)) userMsgIdx += 1;
+
+                  // Suppress intermediate Ollama tool-call-only messages
+                  // (they surface via WorkedForPill instead)
+                  if (isIntermediateToolCall(msg)) return null;
+
+                  // Show WorkedForPill before the final assistant answer in each exchange.
+                  // A final answer is any non-intermediate assistant message.
+                  let workedRun: { activity: ActivityItem[]; durationSec: number } | null = null;
+                  if (msg.role === 'assistant') {
+                    const savedIdx = userMsgIdx - liveAsstCount;
+                    workedRun = runHistory[savedIdx] ?? null;
+                    // Fall back to synthesis when runHistory has no entry for this exchange
+                    if (!workedRun) {
+                      const synth = synthesizeExchangeActivity(messages, userMsgIdx);
+                      if (synth.length > 0) workedRun = { activity: synth, durationSec: 0 };
+                    }
+                  }
+
                   return (
                     <div key={i}>
-                      {workedRun && renderWorkedFor(assistantIdx, workedRun)}
+                      {workedRun && renderWorkedFor(userMsgIdx, workedRun)}
                       <MessageBubble
                         message={msg}
                         animate={i === newestMsgIdx}
@@ -3380,14 +3461,25 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
             {/* Newly added messages in this session */}
             {(() => {
               const collapsed = collapseMessages(liveHistory);
-              let assistantIdx = -1;
+              // Saved messages precede live ones; count saved assistant turns as offset
+              const savedAsstCount = collapseMessages(messages)
+                .filter(({msg}) => msg.role === 'assistant' && !isIntermediateToolCall(msg)).length;
+              const savedUserCount = messages.filter(isRealUserMessage).length;
+              let liveUserMsgIdx = savedUserCount - 1;
+              let liveAsstIdx = savedAsstCount;
               return collapsed.map(({msg, retries}, i) => {
-                if (msg.role === 'assistant') assistantIdx += 1;
-                const workedRun = msg.role === 'assistant' ? runHistory[assistantIdx] : null;
-                const showActivityAfter = msg.role === 'user' && !liveHistory.slice(i + 1).some(m => m.role === 'assistant');
+                if (msg.role === 'user' && isRealUserMessage(msg)) liveUserMsgIdx += 1;
+                if (isIntermediateToolCall(msg)) return null;
+                const showActivityAfter = msg.role === 'user' && isRealUserMessage(msg) &&
+                  !collapsed.slice(i + 1).some(({msg: m}) => m.role === 'assistant' && !isIntermediateToolCall(m));
+                let workedRun: { activity: ActivityItem[]; durationSec: number } | null = null;
+                if (msg.role === 'assistant') {
+                  workedRun = runHistory[liveAsstIdx] ?? null;
+                  liveAsstIdx += 1;
+                }
                 return (
                   <div key={`live-${i}`}>
-                    {workedRun && renderWorkedFor(assistantIdx, workedRun)}
+                    {workedRun && renderWorkedFor(liveUserMsgIdx, workedRun)}
                     <MessageBubble
                       message={msg}
                       animate={i === liveHistory.length - 1}
@@ -3401,34 +3493,6 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
                 );
               });
             })()}
-
-            {/* Working indicator with blobby loader */}
-            {isRunning && (
-              <div className="kim-working-indicator">
-                {/* Goo filter used by loaders 6, 15, 20 */}
-                <svg width="0" height="0" style={{ position: 'absolute' }}>
-                  <defs>
-                    <filter id="kim-goo">
-                      <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur" />
-                      <feColorMatrix in="blur" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 20 -9" result="goo" />
-                      <feComposite in="SourceGraphic" in2="goo" operator="atop" />
-                    </filter>
-                  </defs>
-                </svg>
-                <BlobLoader which={cancelling ? 3 : 15} />
-                <span className="kim-working-indicator__text">
-                  {cancelling ? 'Stopping Kim…' : 'Kim is working…'}
-                </span>
-                {!cancelling && tokenStats && (
-                  <span className="kim-working-indicator__tokens" title={`Input: ${tokenStats.input.toLocaleString()} · Output: ${tokenStats.output.toLocaleString()}`}>
-                    {tokenStats.total.toLocaleString()} tokens
-                  </span>
-                )}
-                {!cancelling && elapsed > 0 && (
-                  <span className="kim-working-indicator__timer">{formatElapsed(elapsed)}</span>
-                )}
-              </div>
-            )}
 
             {taskError && (
               <div className="kim-msg-row kim-msg-row--assistant">
