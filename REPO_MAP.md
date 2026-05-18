@@ -26,7 +26,8 @@
    - 2.5 [`tray/`](#25-tray--legacy-system-tray-ui)
    - 2.6 [`extension/`](#26-extension--chrome-mv3-extension)
    - 2.7 [`kimctl/`](#27-kimctl--cli-controller)
-   - 2.8 [`tests/`](#28-tests)
+   - 2.8 [`CLI`](#28-cli--terminal-kim)
+   - 2.9 [`tests/`](#29-tests)
 3. [Method / Function Map](#3-method--function-map)
 4. [Reference / Dependency Map](#4-reference--dependency-map)
 5. [Feature Map](#5-feature-map)
@@ -295,7 +296,7 @@ Simple light/system/dark cycler used in older sidebar.
 | File | Purpose |
 |---|---|
 | `index.ts` | Barrel exports |
-| `RevampSidebar.tsx` | New sidebar — session list (grouped Today/Yesterday/Week/Earlier), account chip, project list (Code tab), theme cycler. ~ |
+| `RevampSidebar.tsx` | New sidebar — resizable width (drag handle, persisted in `localStorage`), session list (grouped Today/Yesterday/Week/Earlier), account chip, project list (Code tab), theme cycler. |
 | `RevampSettings.tsx` | New settings modal — nav: appearance/ai/voice/paths/data/account/mcp/feedback/about. Tabs map to `PaneId`. |
 | `ContextRing.tsx` | The circular context-budget indicator shown next to the composer; opens a popover to compact context. |
 | `CollapsiblePlan.tsx` | Renders the agent's plan as a checklist with `done/active/pending/todo` statuses. |
@@ -850,7 +851,55 @@ fallbacks unless they're the primary. **Hume is never added as a fallback.**
 
 ---
 
-## 2.8 `tests/`
+## 2.8 `CLI` — terminal Kim
+
+Kim has two terminal surfaces now:
+
+| Tool | Location | Purpose |
+|---|---|---|
+| `python -m kimctl` | `kimctl/` | Thin remote-control CLI for the desktop app's local HTTP bridge. |
+| `kim` | `pythonExperimentTool/claw-code/rust/crates/kim-cli/` | Lightweight standalone terminal UI that feels like Kim in a terminal. |
+
+### `kim-cli` crate
+
+| File | Purpose |
+|---|---|
+| `Cargo.toml` | Binary crate named `kim`; deps are `ratatui`, `crossterm`, `tokio`, `reqwest`, `serde`, `dirs`, `rpassword`. |
+| `src/main.rs` | App loop, terminal lifecycle, keyboard handling, Chat/Code mode switching, model picker state, Ctrl-C clear/exit flow, session resume IDs, single-thread Tokio runtime, `--help` / `--version` / `--resume`. |
+| `src/ui.rs` | Ratatui layout: header, Chat/Code mode badge, sidebar/session rail, chat transcript, slash-command picker, model picker, input bar, status/footer. |
+| `src/theme.rs` | Merged TUI palettes from the ZIP mocks: default `dark-neovim` and soft muted novel `quiet-light`. |
+| `src/config.rs` | Persists provider/model/theme/API keys at `~/.kim/cli-config.json`. |
+| `src/provider.rs` | Provider adapters for Ollama/OpenAI-compatible APIs, Claude Messages API, and optional Kim desktop bridge. |
+| `src/commands.rs` | Kim-ready slash command subset and focused unit tests. |
+| `src/sessions.rs` | Discovers repo/home Kim, Claw, desktop, and project-only session roots; humanizes JSONL titles/previews and filters raw tool/usage blobs before loading sessions into the TUI. |
+
+### Supported slash commands
+
+Core: `/login`, `/logout`, `/provider`, `/model`, `/status`, `/help`, `/clear`, `/exit`.
+Sessions: `/sessions`, `/resume`, `/usage`, `/compact`.
+UI: `/theme`, `/mode`, `/chat`, `/code`.
+Coding helpers: `/diff`, `/run`, `/git`, `/search`, `/files`, `/init`.
+
+Claw commands that are placeholders or not backed by current Kim behavior are intentionally hidden from `kim`.
+
+### Provider and login behavior
+
+- Default provider is `ollama` with `http://127.0.0.1:11434/v1` compatibility.
+- `/login` defaults to Ollama and runs `ollama signin`; API key login requires an explicit `/login claude|openai|gemini|deepseek`.
+- `/login claude|openai|gemini|deepseek` prompts for an API key and saves it in `~/.kim/cli-config.json`.
+- `/provider desktop` posts to Kim desktop's bridge at `http://127.0.0.1:18991/v1/task`; this requires the desktop app to be running.
+- The CLI does not embed a browser/webview and does not spawn Node/Electron, preserving a low memory profile.
+- The sidebar is a real session selector: `/sessions` refreshes it, `↑` / `↓` select entries when the input is empty, and empty `Enter` opens the selected JSONL.
+
+### Installer / release flow
+
+`scripts/install-kim.sh` is the one-command installer scaffold. It detects OS/arch, downloads a private GitHub Release asset named like `kim-aarch64-apple-darwin.tar.gz`, installs it to `~/.kim/bin/kim`, and supports private release downloads through `GITHUB_TOKEN`.
+
+Known v1 limitation: macOS is the polished target. Linux and Windows asset names are stubbed in the installer, but full platform QA still needs release binaries and smoke testing on those systems.
+
+---
+
+## 2.9 `tests/`
 
 | File | Style | Coverage |
 |---|---|---|

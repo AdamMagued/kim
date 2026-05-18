@@ -32,6 +32,13 @@ The Ollama model selector no longer forces every cloud model into a dropdown. Cl
 
 The Ollama lean system prompt now explicitly tells the model to call `take_screenshot` rather than `get_windows` for screen awareness, and to use `observe_ui` before any click when exact coordinates are uncertain. This reduces wasted tool-call turns on vision-capable Ollama models.
 
+### Improvement: Resizable Chat Sidebar
+
+The ChatView sidebar can now be resized by dragging its right edge; the chosen width persists across app restarts.
+
+- **`desktop/src/components/kim-ui/RevampSidebar.tsx`**: Added a pointer-driven resize handle and persisted width in `localStorage` (`kim-revamp-sidebar-width`).
+- **`desktop/src/index.css`**: Added `.kr-sidebar__resize-handle` styling (hover/active affordance, `touch-action: none`).
+
 ---
 
 ## File Attachments, Blank Response Fixes & Agent Polish (2026-05-16)

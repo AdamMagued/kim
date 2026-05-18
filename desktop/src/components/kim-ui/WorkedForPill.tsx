@@ -34,18 +34,18 @@ export interface WorkedForPillProps {
 }
 
 const tokens = {
-  "--wf-bg":          "#0d0a08",
-  "--wf-bg-2":        "#131010",
-  "--wf-surface":     "#1a1614",
-  "--wf-surface-2":   "#221c19",
-  "--wf-border":      "#2a2320",
-  "--wf-text":        "#ece3dc",
-  "--wf-text-2":      "#a89d94",
-  "--wf-text-3":      "#6b625b",
-  "--wf-text-4":      "#4a423d",
-  "--wf-accent":      "#e8b89a",
-  "--wf-accent-soft": "#e8b89a22",
-  "--wf-accent-line": "#e8b89a55",
+  "--wf-bg":          "var(--kim-bg)",
+  "--wf-bg-2":        "var(--kim-bg-2)",
+  "--wf-surface":     "var(--kim-surface)",
+  "--wf-surface-2":   "var(--kim-surface-2)",
+  "--wf-border":      "var(--kim-border)",
+  "--wf-text":        "var(--kim-text)",
+  "--wf-text-2":      "var(--kim-text-2)",
+  "--wf-text-3":      "var(--kim-text-3)",
+  "--wf-text-4":      "var(--kim-text-4)",
+  "--wf-accent":      "var(--kim-accent)",
+  "--wf-accent-soft": "var(--kim-accent-soft)",
+  "--wf-accent-line": "var(--kim-accent-line)",
   "--wf-mono":        '"JetBrains Mono", "SF Mono", ui-monospace, monospace',
   "--wf-sans":        'Inter, -apple-system, BlinkMacSystemFont, system-ui, sans-serif',
 } as React.CSSProperties;
@@ -402,7 +402,7 @@ const CSS = `
   overflow: auto;
 }
 .wf-body::-webkit-scrollbar { width: 6px; }
-.wf-body::-webkit-scrollbar-thumb { background: #2a2320; border-radius: 3px; }
+.wf-body::-webkit-scrollbar-thumb { background: var(--wf-border); border-radius: 3px; }
 .wf-body::-webkit-scrollbar-track { background: transparent; }
 
 .wf-rail {

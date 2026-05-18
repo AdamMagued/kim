@@ -722,11 +722,39 @@ kbd {
   z-index: 30;
   background: transparent;
   transition: background 0.12s ease;
+  touch-action: none;
   -webkit-app-region: no-drag;
 }
 .kim-sidebar__resize-handle:hover,
 .kim-sidebar--resizing .kim-sidebar__resize-handle {
   background: color-mix(in srgb, var(--accent) 42%, transparent);
+}
+
+/* RevampSidebar resize handle (RevampSidebar is inline-styled, so this is the only
+   shared styling knob). */
+.kr-sidebar__resize-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 40;
+  background: transparent;
+  transition: background 0.12s ease, box-shadow 0.12s ease;
+  touch-action: none;
+  -webkit-app-region: no-drag;
+}
+.kr-sidebar__resize-handle:hover,
+.kr-sidebar__resize-handle--active {
+  /* Subtle cue (avoid the loud accent wash). */
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--kim-border) 70%, transparent) 55%,
+    transparent 100%
+  );
+  box-shadow: inset -1px 0 0 color-mix(in srgb, var(--kim-border) 86%, transparent);
 }
 
 .kim-sidebar__top {
