@@ -1305,7 +1305,10 @@ fn write_text_prompt_to_clipboard(prompt: &str) -> bool {
     let wrote = child
         .stdin
         .take()
-        .map(|mut stdin| stdin.write_all(&bytes).is_ok())
+        .map(|mut stdin| {
+            use std::io::Write;
+            stdin.write_all(&bytes).is_ok()
+        })
         .unwrap_or(false);
     let ok = wrote && child.wait().map(|s| s.success()).unwrap_or(false);
     let _ = std::fs::remove_file(&temp_path);
