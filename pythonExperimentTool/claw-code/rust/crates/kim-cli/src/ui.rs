@@ -233,13 +233,33 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             MessageRole::System => ("note", theme.text_dim),
             MessageRole::Error => ("error", theme.danger),
         };
-        lines.push(Line::from(vec![
-            Span::styled(
+        let cleaned = clean_for_display(&message.content);
+        let indent = " ".repeat(label.len() + 1);
+        let mut first = true;
+        for text_line in cleaned.lines() {
+            if first {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{label} "),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(text_line.to_string(), Style::default().fg(theme.text)),
+                ]));
+                first = false;
+            } else {
+                lines.push(Line::styled(
+                    format!("{indent}{text_line}"),
+                    Style::default().fg(theme.text),
+                ));
+            }
+        }
+        if first {
+            // empty message — emit the label at minimum
+            lines.push(Line::from(vec![Span::styled(
                 format!("{label} "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(message.content.as_str(), Style::default().fg(theme.text)),
-        ]));
+            )]));
+        }
         lines.push(Line::raw(""));
     }
     if app.messages.is_empty() {
@@ -395,6 +415,45 @@ fn draw_slash_palette(frame: &mut Frame<'_>, app: &App, body_area: Rect, theme: 
             .style(Style::default().bg(theme.panel)),
     );
     frame.render_widget(list, area);
+}
+
+fn clean_for_display(text: &str) -> String {
+    let mut output: Vec<String> = Vec::new();
+    let mut in_code_block = false;
+    for line in text.lines() {
+        let trimmed_start = line.trim_start();
+        if trimmed_start.starts_with("```") {
+            in_code_block = !in_code_block;
+            output.push("  ─────".to_string());
+            continue;
+        }
+        if in_code_block {
+            output.push(format!("  {line}"));
+            continue;
+        }
+        // Strip leading # header markers and > blockquote markers
+        let line = trimmed_start.trim_start_matches('#').trim_start();
+        let line = line.strip_prefix("> ").unwrap_or(line);
+        output.push(strip_inline_md(line));
+    }
+    output.join("\n")
+}
+
+fn strip_inline_md(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' | '`' => {
+                // consume all consecutive identical marker chars, emit nothing
+                while chars.peek() == Some(&ch) {
+                    chars.next();
+                }
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
 }
 
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
