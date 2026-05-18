@@ -1,9 +1,9 @@
-"""Claw-style local compaction for Kim agent sessions.
+"""Local compaction for Kim agent sessions.
 
-Ports the deterministic, no-LLM compaction logic from Claw's compact.rs to
-Python.  This is used for API-style providers (Ollama, Claude, OpenAI, etc.)
-that are stateless — the full history is sent each call, so we replace old
-messages with a compact summary + verbatim recent tail.
+Deterministic, no-LLM compaction logic for API-style providers (Ollama,
+Claude, OpenAI, Codex, etc.) that are stateless — the full history is sent
+each call, so we replace old messages with a compact summary + verbatim
+recent tail.
 
 Browser providers use a different (LLM-based) compact path in agent.py.
 """

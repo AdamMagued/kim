@@ -4,7 +4,7 @@ import type { SessionInfo, Settings } from '../types';
 
 interface UseSessionsReturn {
   kimSessions: SessionInfo[];
-  clawSessions: SessionInfo[];
+  codexSessions: SessionInfo[];
   loading: boolean;
   error: string | null;
   refresh: () => void;
@@ -12,7 +12,7 @@ interface UseSessionsReturn {
 
 export function useSessions(settings: Settings): UseSessionsReturn {
   const [kimSessions, setKimSessions] = useState<SessionInfo[]>([]);
-  const [clawSessions, setClawSessions] = useState<SessionInfo[]>([]);
+  const [codexSessions, setCodexSessions] = useState<SessionInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -22,20 +22,20 @@ export function useSessions(settings: Settings): UseSessionsReturn {
     try {
       const all = await invoke<SessionInfo[]>('list_sessions', {
         kimDir: settings.kim_sessions_dir || null,
-        clawDir: settings.claw_sessions_dir || null,
+        codexDir: settings.codex_sessions_dir || null,
       });
       setKimSessions(all.filter(s => s.session_type === 'kim'));
-      setClawSessions(all.filter(s => s.session_type === 'claw'));
+      setCodexSessions(all.filter(s => s.session_type === 'codex'));
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
     }
-  }, [settings.kim_sessions_dir, settings.claw_sessions_dir]);
+  }, [settings.kim_sessions_dir, settings.codex_sessions_dir]);
 
   useEffect(() => {
     load();
   }, [load]);
 
-  return { kimSessions, clawSessions, loading, error, refresh: load };
+  return { kimSessions, codexSessions, loading, error, refresh: load };
 }

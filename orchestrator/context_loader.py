@@ -1,5 +1,5 @@
 """
-KIM.md project context loader — mirrors Claw's CLAUDE.md discovery.
+KIM.md project context loader — discovers project instruction files.
 
 Walks from the current working directory upward to the filesystem root,
 collecting instruction files at each level:
@@ -49,7 +49,7 @@ def discover_instruction_files(cwd: Optional[Path] = None) -> list[dict]:
 
     Returns:
         List of ``{"path": str, "content": str}`` dicts, ordered from
-        root-most to deepest (matching Claw's convention).
+        root-most to deepest.
     """
     cwd = (cwd or Path.cwd()).resolve()
 

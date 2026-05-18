@@ -2041,15 +2041,15 @@ class BrowserProvider(BaseProvider):
                 _os_hint = f"You are running on Windows. Home is {_home}. Use 'start' to launch apps and Windows paths."
 
             system_lower = system.lower()
-            is_claw_bridge = (
-                "you are answering claw" in system_lower
-                or "you are claw" in system_lower
-                or "claw bridge json" in system_lower
-                or "claw, a coding agent" in system_lower
-                or "available claw tools" in system_lower
+            is_codex_bridge = (
+                "you are answering codex" in system_lower
+                or "you are codex" in system_lower
+                or "codex bridge json" in system_lower
+                or "codex, a coding agent" in system_lower
+                or "available codex tools" in system_lower
             )
 
-            if is_claw_bridge:
+            if is_codex_bridge:
                 prompt = (
                     f"[SYSTEM]\n{system}\n"
                     f"{_os_hint}\n\n"

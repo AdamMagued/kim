@@ -1510,7 +1510,7 @@ Rules:
         Kim's in-process memory and context meter; the next normal browser task
         should be sent with a fresh browser thread via the desktop bridge.
 
-        API providers (Ollama, Claude, OpenAI, etc.): use Claw-style local
+        API providers (Ollama, Claude, OpenAI, etc.): use Codex-style local
         deterministic compaction — no LLM call, no browser-specific flags.  Old
         messages are summarised locally and injected as a system sentinel; the
         verbatim recent tail is kept.
@@ -1582,7 +1582,7 @@ Rules:
         return {"success": True, "summary": done, "screenshot": "", "compact_artifact": str(artifact_path)}
 
     async def _compact_api_provider(self) -> dict:
-        """Claw-style local compaction for stateless API providers (Ollama, Claude, etc.)."""
+        """Codex-style local compaction for stateless API providers (Ollama, Claude, etc.)."""
         # Use the raw internal messages (with compact_summary sentinel preserved) so
         # _split_existing_summary can detect a prior compaction and merge summaries.
         messages = list(self.memory._messages)

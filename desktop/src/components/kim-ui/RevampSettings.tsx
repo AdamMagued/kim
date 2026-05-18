@@ -1155,10 +1155,10 @@ function PanePaths({ settings, onChange }: { settings: Settings; onChange: (s: S
       />
       <PathRow
         label="Code sessions directory"
-        value={settings.claw_sessions_dir}
-        hint="Path where Claw stores its JSONL session files."
-        onPick={() => pick('claw_sessions_dir')}
-        onChange={(v) => update('claw_sessions_dir', v)}
+        value={settings.codex_sessions_dir}
+        hint="Path where Codex stores its session files."
+        onPick={() => pick('codex_sessions_dir')}
+        onChange={(v) => update('codex_sessions_dir', v)}
       />
       <PathRow
         label="Project root"

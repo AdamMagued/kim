@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { KimLogo } from './KimLogo';
-import type { SessionInfo, KimAccount, ClawProject } from '../types';
+import type { SessionInfo, KimAccount, CodexProject } from '../types';
 
 const SIDEBAR_MIN_WIDTH = 200;
 const SIDEBAR_MAX_WIDTH = 420;
@@ -28,7 +28,7 @@ interface Props {
   onRefreshSessions: () => void;
   sessionRefreshNonce: number;
   kimSessionsDir: string | null;
-  clawSessionsDir: string | null;
+  codexSessionsDir: string | null;
   appVersion: string;
 }
 
@@ -199,14 +199,14 @@ function SessionItem({ session, active, onClick, editMode, selected, onToggleSel
   );
 }
 
-// ── Claw session item (no onSelectSession needed yet) ─────────────────────────
+// ── Codex session item ────────────────────────────────────────────────────────
 
-function ClawSessionItem({ session, onSelectSession }: { session: { session_id: string; message_count: number; summary?: string | null; date?: string }, onSelectSession: (s: SessionInfo) => void }) {
+function CodexSessionItem({ session, onSelectSession }: { session: { session_id: string; message_count: number; summary?: string | null; date?: string }, onSelectSession: (s: SessionInfo) => void }) {
   const preview = session.summary
     ? session.summary.slice(0, 55) + (session.summary.length > 55 ? '…' : '')
     : `${session.message_count} message${session.message_count !== 1 ? 's' : ''}`;
   return (
-    <button className="kim-session-item" title={session.summary ?? session.session_id} onClick={() => onSelectSession({ session_id: session.session_id, session_key: `claw:${session.date}:${session.session_id}`, session_type: 'claw', message_count: session.message_count, has_summary: !!session.summary, summary: session.summary ?? undefined, date: session.date || new Date().toISOString() })}>
+    <button className="kim-session-item" title={session.summary ?? session.session_id} onClick={() => onSelectSession({ session_id: session.session_id, session_key: `codex:${session.date}:${session.session_id}`, session_type: 'codex', message_count: session.message_count, has_summary: !!session.summary, summary: session.summary ?? undefined, date: session.date || new Date().toISOString() })}>
       <div className="kim-session-item__title">{session.session_id.slice(0, 18)}</div>
       <div className="kim-session-item__preview">{preview}</div>
     </button>
@@ -215,8 +215,8 @@ function ClawSessionItem({ session, onSelectSession }: { session: { session_id: 
 
 // ── Project tree in Code tab ───────────────────────────────────────────────────
 
-function ClawProjectTree({ project, onRemove, isActive, onSelect, onNewChat, onSelectSession }: {
-  project: ClawProject;
+function CodexProjectTree({ project, onRemove, isActive, onSelect, onNewChat, onSelectSession }: {
+  project: CodexProject;
   onRemove: (path: string) => void;
   isActive: boolean;
   onSelect: () => void;
@@ -257,7 +257,7 @@ function ClawProjectTree({ project, onRemove, isActive, onSelect, onNewChat, onS
         <div className="kim-project-item__sessions">
           {totalSessions === 0 ? (
             <div className="kim-empty-section" style={{ paddingLeft: 28 }}>
-              No Claw sessions yet.
+              No Codex sessions yet.
             </div>
           ) : (
             project.branches.map(branch => (
@@ -267,7 +267,7 @@ function ClawProjectTree({ project, onRemove, isActive, onSelect, onNewChat, onS
                 )}
                 {branch.sessions.map(s => (
                   <div key={s.session_id} style={{ paddingLeft: 12 }}>
-                    <ClawSessionItem session={s} onSelectSession={(session) => onSelectSession({ ...session, project_path: project.path })} />
+                    <CodexSessionItem session={s} onSelectSession={(session) => onSelectSession({ ...session, project_path: project.path })} />
                   </div>
                 ))}
               </div>
@@ -313,10 +313,10 @@ function SidebarImpl({
   collapsed, onToggle, onOpenSettings, loading,
   account, onAccountChange, activeTab, onTabChange,
   activeProjectPath, onSelectProject, onNewChatInProject, onRefreshSessions,
-  sessionRefreshNonce, kimSessionsDir, clawSessionsDir, appVersion,
+  sessionRefreshNonce, kimSessionsDir, codexSessionsDir, appVersion,
 }: Props) {
   const [kimExpanded, setKimExpanded] = useState(true);
-  const [clawProjects, setClawProjects] = useState<ClawProject[]>([]);
+  const [codexProjects, setCodexProjects] = useState<CodexProject[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(false);
   const [projectsAdding, setProjectsAdding] = useState(false);
   const [projectsErr, setProjectsErr] = useState('');
@@ -415,13 +415,13 @@ function SidebarImpl({
 
   const loadProjects = useCallback(() => {
     if (projectPaths.length === 0) {
-      setClawProjects([]);
+      setCodexProjects([]);
       return;
     }
     setProjectsLoading(true);
-    invoke<ClawProject[]>('list_claw_projects', { projectPaths })
-      .then(p => setClawProjects(p))
-      .catch(() => setClawProjects([]))
+    invoke<CodexProject[]>('list_codex_projects', { projectPaths })
+      .then(p => setCodexProjects(p))
+      .catch(() => setCodexProjects([]))
       .finally(() => setProjectsLoading(false));
   }, [projectPaths, projectPathsKey]);
 
@@ -441,7 +441,7 @@ function SidebarImpl({
   async function handleRemoveProject(path: string) {
     const newPaths = await invoke<string[]>('remove_code_project', { path });
     await onAccountChange({ ...account, code_projects: newPaths });
-    setClawProjects(prev => prev.filter(p => p.path !== path));
+    setCodexProjects(prev => prev.filter(p => p.path !== path));
   }
 
   const initials = account.display_name
@@ -636,10 +636,10 @@ function SidebarImpl({
               ) : (
                 // Merge: show all added project paths, use loaded project data where available
                 projectPaths.map(path => {
-                  const loaded = clawProjects.find(p => p.path === path);
+                  const loaded = codexProjects.find(p => p.path === path);
                   if (loaded) {
                     return (
-                      <ClawProjectTree
+                      <CodexProjectTree
                         key={path}
                         project={loaded}
                         onRemove={handleRemoveProject}
@@ -650,7 +650,7 @@ function SidebarImpl({
                       />
                     );
                   }
-                  // Project path exists but no .claw/sessions/ yet
+                  // Project path exists but no .codex/ sessions yet
                   const name = path.split('/').filter(Boolean).pop() ?? path;
                   return (
                     <div key={path} className={`kim-project-item${activeProjectPath === path ? ' kim-project-item--active' : ''}`}>
@@ -676,7 +676,7 @@ function SidebarImpl({
                         </button>
                       </div>
                       <div className="kim-empty-section" style={{ paddingLeft: 28, fontSize: 11 }}>
-                        No Claw sessions yet
+                        No Codex sessions yet
                       </div>
                     </div>
                   );
@@ -825,7 +825,7 @@ function SidebarImpl({
                         await invoke('delete_sessions', { 
                           sessionIds: selectedSessionIds,
                           kimDir: kimSessionsDir,
-                          clawDir: clawSessionsDir,
+                          codexDir: codexSessionsDir,
                         });
                         setEditMode(false);
                         setSelectedSessions(new Set());
@@ -859,7 +859,7 @@ function areSidebarPropsEqual(prev: Props, next: Props): boolean {
     prev.activeProjectPath === next.activeProjectPath &&
     prev.sessionRefreshNonce === next.sessionRefreshNonce &&
     prev.kimSessionsDir === next.kimSessionsDir &&
-    prev.clawSessionsDir === next.clawSessionsDir &&
+    prev.codexSessionsDir === next.codexSessionsDir &&
     prev.appVersion === next.appVersion
   );
 }

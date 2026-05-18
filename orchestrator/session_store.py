@@ -1,7 +1,7 @@
 """
 Session persistence — JSONL session files + AI-generated summaries.
 
-Mirrors Claw's session storage pattern:
+Session storage pattern (also used by Codex code sessions):
     kim_sessions/<date>/<session-id>.jsonl   — incremental JSONL messages
     kim_sessions/<date>/<session-id>.summary.txt — 1-paragraph AI summary
 
