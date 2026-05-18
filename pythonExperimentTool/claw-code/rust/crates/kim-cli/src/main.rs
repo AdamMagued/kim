@@ -20,7 +20,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use provider::{send_chat, send_code_chat, ChatMessage};
+use provider::{send_kim_request, ChatMessage};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use runtime::{
@@ -88,6 +88,7 @@ pub struct App {
     pub model_picker_open: bool,
     pub allow_empty_session_open: bool,
     pub view: ViewState,
+    pub bridge_connected: bool,
 }
 
 impl App {
@@ -110,6 +111,7 @@ impl App {
             model_picker_open: false,
             allow_empty_session_open: false,
             view: ViewState::SessionMenu,
+            bridge_connected: false,
         };
         if let Some(resume_id) = resume_id {
             app.resume_session(resume_id);
@@ -784,26 +786,21 @@ async fn apply_outcome(
                 app.ensure_current_session_listed(&last_user);
             }
             app.busy = true;
-            app.status = if app.mode == AppMode::Code {
-                "kim code · thinking…".to_string()
-            } else {
-                "thinking…".to_string()
-            };
+            app.status = "thinking…".to_string();
             let started = Instant::now();
             let history = app.chat_history();
-            let send_result = if app.mode == AppMode::Code {
-                send_code_chat(&app.config, &history).await
-            } else {
-                send_chat(&app.config, &history).await
-            };
-            match send_result {
-                Ok(reply) => {
+            let code_mode = app.mode == AppMode::Code;
+            match send_kim_request(&app.config, &history, code_mode).await {
+                Ok((reply, bridge_used)) => {
+                    app.bridge_connected = bridge_used;
                     app.push(MessageRole::Assistant, reply);
-                    app.status = format!("worked for {:.1}s", started.elapsed().as_secs_f32());
+                    let via = if bridge_used { " · via Kim desktop" } else { "" };
+                    app.status = format!("done in {:.1}s{via}", started.elapsed().as_secs_f32());
                 }
                 Err(error) => {
+                    app.bridge_connected = false;
                     app.push(MessageRole::Error, error);
-                    app.status = "provider error".to_string();
+                    app.status = "error".to_string();
                 }
             }
             app.busy = false;

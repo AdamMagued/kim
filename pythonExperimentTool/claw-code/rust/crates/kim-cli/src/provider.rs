@@ -74,42 +74,70 @@ pub fn provider_info(name: &str) -> Option<ProviderInfo> {
         .find(|provider| provider.name == name.trim().to_ascii_lowercase())
 }
 
-pub async fn send_chat(config: &KimConfig, messages: &[ChatMessage]) -> Result<String, String> {
-    match config.provider.as_str() {
-        "desktop" => send_desktop_bridge(config, messages).await,
-        "claude" => send_anthropic(config, messages).await,
-        _ => send_openai_compatible(config, messages).await,
+/// Returns `(reply, bridge_was_used)`.
+/// Tries the Kim desktop bridge first — identical to the desktop app experience.
+/// Falls back to a direct LLM call with the appropriate Kim system prompt.
+pub async fn send_kim_request(
+    config: &KimConfig,
+    messages: &[ChatMessage],
+    code_mode: bool,
+) -> Result<(String, bool), String> {
+    if is_bridge_available(&config.desktop_bridge_url).await {
+        let reply = send_desktop_bridge(config, messages).await?;
+        return Ok((reply, true));
     }
-}
-
-pub async fn send_code_chat(config: &KimConfig, messages: &[ChatMessage]) -> Result<String, String> {
-    let system = ChatMessage {
-        role: "system".to_string(),
-        content: CODE_SYSTEM_PROMPT.to_string(),
+    let system_prompt = if code_mode {
+        KIM_CODE_SYSTEM_PROMPT
+    } else {
+        KIM_CHAT_SYSTEM_PROMPT
     };
-    let mut full = vec![system];
+    let mut full = vec![ChatMessage {
+        role: "system".to_string(),
+        content: system_prompt.to_string(),
+    }];
     full.extend_from_slice(messages);
-    match config.provider.as_str() {
-        "desktop" => send_desktop_bridge(config, messages).await,
-        "claude" => send_anthropic(config, &full).await,
-        _ => send_openai_compatible(config, &full).await,
-    }
+    let reply = match config.provider.as_str() {
+        "desktop" => {
+            return Err(
+                "Kim desktop bridge is not running. Start Kim desktop, or switch provider with /provider ollama."
+                    .to_string(),
+            )
+        }
+        "claude" => send_anthropic(config, &full).await?,
+        _ => send_openai_compatible(config, &full).await?,
+    };
+    Ok((reply, false))
 }
 
-const CODE_SYSTEM_PROMPT: &str = "\
-You are Kim Code, an expert coding agent. You help with programming, debugging, \
-code review, refactoring, and project architecture.
+async fn is_bridge_available(base_url: &str) -> bool {
+    let url = format!("{}/health", base_url.trim_end_matches('/'));
+    reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_millis(400))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+const KIM_CHAT_SYSTEM_PROMPT: &str = "\
+You are Kim, a personal AI assistant. Help with any task: questions, research, \
+writing, coding, planning, or analysis. Be direct and conversational. \
+Remember the conversation context and build on it. When you write code, format it clearly.";
+
+const KIM_CODE_SYSTEM_PROMPT: &str = "\
+You are Kim Code, an expert coding agent. Help with programming, debugging, \
+code review, refactoring, and architecture.
 
 When working through a problem:
-1. Think step by step — show your reasoning before giving code.
-2. If the user mentions a file path, assume you can read it and discuss its contents \
-   (they may have drag-dropped it). Ask for file content if you need it.
+1. Think step by step — show reasoning before giving code.
+2. If the user mentions a file path, ask for its content or work with what they share.
 3. Write complete, runnable code — no placeholders or TODOs.
-4. For shell commands, prefix them with `$ ` so they're easy to copy.
-5. If you notice a bug or improvement beyond what was asked, briefly mention it.
+4. Format shell commands with a $ prefix so they are easy to copy.
+5. Note any bugs or improvements you notice beyond what was asked.
 
-You do not have live screen or file access in this session — for that, the user \
-can start Kim desktop. Focus on code quality, clear explanations, and useful output.";
+You do not have live screen or file access here — start Kim desktop for that. \
+Focus on code quality, clear explanations, and useful output.";
 
 async fn send_openai_compatible(
     config: &KimConfig,

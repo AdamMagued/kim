@@ -60,6 +60,11 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             app.config.model.as_str(),
             Style::default().fg(theme.text_dim),
         ),
+        Span::raw("  "),
+        Span::styled(
+            if app.bridge_connected { "[bridge]" } else { "[direct]" },
+            Style::default().fg(if app.bridge_connected { theme.success } else { theme.text_dimmer }),
+        ),
     ]);
     let paragraph = Paragraph::new(title).block(
         Block::default()
