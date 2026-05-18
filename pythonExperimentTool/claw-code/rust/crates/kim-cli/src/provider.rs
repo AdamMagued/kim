@@ -196,7 +196,8 @@ async fn send_desktop_bridge(
         ))
         .json(&json!({
             "task": prompt,
-            "provider": "ollama",
+            "provider": config.provider,
+            "model": config.model,
         }))
         .send()
         .await

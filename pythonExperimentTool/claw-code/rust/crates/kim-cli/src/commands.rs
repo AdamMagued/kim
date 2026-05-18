@@ -61,12 +61,9 @@ pub async fn handle_command(input: &str, config: &mut KimConfig) -> CommandOutco
         "/theme" => set_theme(args, config),
         "/login" => login(args, config).await,
         "/logout" => logout(args, config),
-        "/sessions" => CommandOutcome::Message("__KIM_REFRESH_SESSIONS__".to_string()),
-        "/resume" => CommandOutcome::Message(
-            "Session resume UI is scaffolded; saved Kim CLI sessions will appear in /sessions as v1 history lands.".to_string(),
-        ),
+        "/sessions" | "/resume" => CommandOutcome::Message("__KIM_REFRESH_SESSIONS__".to_string()),
         "/usage" => CommandOutcome::Message("Usage tracking is local-only in this v1 shell; provider billing remains in provider dashboards.".to_string()),
-        "/compact" => CommandOutcome::Message("Compacted display context for this terminal session.".to_string()),
+        "/compact" => CommandOutcome::Message("__KIM_COMPACT__".to_string()),
         "/diff" => shell("git", &["diff", "--stat"], "git diff --stat").await,
         "/git" => run_project_command("git", args).await,
         "/run" => run_shell(args).await,
@@ -162,9 +159,11 @@ pub async fn model_options(config: &KimConfig) -> Vec<String> {
             "claude-3-5-sonnet-latest".to_string(),
         ],
         "openai" => vec![
-            "gpt-5.2".to_string(),
-            "gpt-5.4".to_string(),
+            "gpt-4o".to_string(),
             "gpt-4o-mini".to_string(),
+            "o1".to_string(),
+            "o1-mini".to_string(),
+            "o3-mini".to_string(),
         ],
         "gemini" => vec![
             "gemini-2.5-pro".to_string(),
