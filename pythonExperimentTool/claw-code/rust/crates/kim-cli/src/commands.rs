@@ -1,10 +1,6 @@
 use std::fs;
-#[cfg(not(windows))]
-use std::time::Duration;
 
 use tokio::process::Command;
-#[cfg(not(windows))]
-use tokio::time::timeout;
 
 use crate::config::{config_path, KimConfig, ThemeName};
 use crate::provider::{provider_info, PROVIDERS};
@@ -265,66 +261,23 @@ async fn login(args: &str, config: &mut KimConfig) -> CommandOutcome {
 }
 
 async fn ollama_login(config: &mut KimConfig) -> CommandOutcome {
-    // On Windows, `ollama signin` is interactive and will hang when piped.
-    // Skip straight to the browser flow; it's more reliable on all Windows versions.
-    #[cfg(windows)]
-    {
-        // First probe whether ollama is even present.
-        match Command::new("ollama").arg("--version").output().await {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return CommandOutcome::Message(
-                    "Ollama is not installed or not on PATH.\nInstall Ollama for Windows, open it once, then run /login again.\nhttps://ollama.com/download/windows".to_string(),
-                );
-            }
-            _ => {}
+    // `ollama signin` is unreliable across platforms and versions — it can return
+    // exit 0 without actually opening any browser or prompting the user.
+    // The browser flow is the only path that reliably gets the user signed in.
+    match Command::new("ollama").arg("--version").output().await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(windows)]
+            return CommandOutcome::Message(
+                "Ollama is not installed or not on PATH.\nInstall Ollama for Windows, open it once, then run /login again.\nhttps://ollama.com/download/windows".to_string(),
+            );
+            #[cfg(not(windows))]
+            return CommandOutcome::Message(
+                "Ollama is not installed or not on PATH.\nInstall Ollama, open it once, then run /login again.\nhttps://ollama.com/download".to_string(),
+            );
         }
-        return ollama_browser_login(config).await;
+        _ => {}
     }
-    // macOS / Linux: attempt `ollama signin` non-interactively, fall back to browser.
-    #[cfg(not(windows))]
-    {
-        let output = timeout(
-            Duration::from_secs(15),
-            Command::new("ollama").arg("signin").output(),
-        )
-        .await;
-        match output {
-            Ok(Ok(output)) if output.status.success() => {
-                config.provider = "ollama".to_string();
-                let detail = command_output_text(&output);
-                let message = if detail.trim().is_empty() {
-                    "Ollama sign-in completed.".to_string()
-                } else {
-                    format!("Ollama sign-in completed.\n{detail}")
-                };
-                save_notice(config, message)
-            }
-            Ok(Ok(output)) if signin_is_missing(&command_output_text(&output)) => {
-                ollama_browser_login(config).await
-            }
-            Ok(Ok(output)) => {
-                let detail = command_output_text(&output);
-                let browser = open_ollama_signin_page().await;
-                config.provider = "ollama".to_string();
-                save_notice(
-                    config,
-                    format!(
-                        "`ollama signin` exited with {}.\n{}\n\n{}\nAfter the browser finishes, return to Kim and use /provider ollama or /model to confirm.",
-                        output.status,
-                        detail.trim(),
-                        browser_message(browser)
-                    ),
-                )
-            }
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                CommandOutcome::Message(
-                    "Ollama is not installed or not on PATH.\nInstall Ollama, open it once, then run /login again.\nhttps://ollama.com/download".to_string(),
-                )
-            }
-            Ok(Err(_)) => ollama_browser_login(config).await,
-            Err(_) => ollama_browser_login(config).await,
-        }
-    }
+    ollama_browser_login(config).await
 }
 
 async fn ollama_browser_login(config: &mut KimConfig) -> CommandOutcome {
@@ -337,19 +290,6 @@ async fn ollama_browser_login(config: &mut KimConfig) -> CommandOutcome {
             browser_message(browser)
         ),
     )
-}
-
-#[cfg(not(windows))]
-fn signin_is_missing(text: &str) -> bool {
-    let normalized = text.to_ascii_lowercase();
-    normalized.contains("unknown command")
-        || normalized.contains("unrecognized command")
-        || normalized.contains("invalid command")
-        || normalized.contains("unknown shorthand")
-        || normalized.contains("signin")
-            && (normalized.contains("did you mean")
-                || normalized.contains("not found")
-                || normalized.contains("is not recognized"))
 }
 
 async fn open_ollama_signin_page() -> Result<(), String> {
@@ -479,21 +419,6 @@ fn format_output(
         }
         Err(error) => CommandOutcome::Message(format!("Could not run `{label}`: {error}")),
     }
-}
-
-#[cfg(not(windows))]
-fn command_output_text(output: &std::process::Output) -> String {
-    let mut text = String::new();
-    if !output.stdout.is_empty() {
-        text.push_str(&String::from_utf8_lossy(&output.stdout));
-    }
-    if !output.stderr.is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-    }
-    text
 }
 
 fn save_notice(config: &KimConfig, message: String) -> CommandOutcome {

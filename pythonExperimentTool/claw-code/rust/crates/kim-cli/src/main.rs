@@ -624,7 +624,10 @@ async fn handle_key(
                 suspend_terminal(terminal)?;
                 println!("Kim login\n");
                 let outcome = handle_command(&input, &mut app.config).await;
-                println!("\nPress enter to return to Kim…");
+                if let CommandOutcome::Message(ref msg) = outcome {
+                    println!("{msg}");
+                }
+                println!("\nPress Enter to return to Kim…");
                 let mut pause = String::new();
                 let _ = io::stdin().read_line(&mut pause);
                 resume_terminal(terminal)?;
