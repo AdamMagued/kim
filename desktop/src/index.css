@@ -2608,13 +2608,14 @@ kbd {
   cursor: not-allowed;
 }
 
-/* Dropdown panel — anchored under the pill. */
+/* Dropdown panel — anchored above the pill (opens upward, away from bottom edge). */
 .kim-provider-picker__panel {
   position: absolute;
-  top: calc(100% + 6px);
+  bottom: calc(100% + 6px);
+  top: auto;
   left: 0;
   right: 0;
-  z-index: 60;
+  z-index: 200;
   background: var(--kim-surface, var(--bg-secondary, #1a1a1a));
   border: 1px solid var(--kim-border, var(--border));
   border-radius: 12px;

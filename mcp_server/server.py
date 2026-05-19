@@ -74,9 +74,11 @@ from mcp_server.tools.web import (
     handle_web_observe,
     handle_web_open,
     handle_web_press,
+    handle_web_resolve,
     handle_web_screenshot,
     handle_web_text,
     handle_web_wait_for,
+    handle_web_wait_for_url,
 )
 from mcp_server.tools.windows import (
     handle_focus_window,
@@ -92,6 +94,7 @@ from mcp_server.tools.git import (
     handle_git_log,
     handle_git_checkout,
 )
+from mcp_server.tools.github import handle_github_create_repo
 from mcp_server.tools.code import (
     handle_run_python,
     handle_run_node,
@@ -289,6 +292,52 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="web_resolve",
+        description=(
+            "Resolve a semantic browser intent, such as 'repository name textbox' or "
+            "'create repository button', to the best element_id from the most recent "
+            "web_observe result. Use this after web_observe and before web_click/web_fill "
+            "when the target element is described by purpose rather than a known ID."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "intent": {"type": "string", "description": "Semantic target description."},
+                "preferred_roles": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional preferred roles/tags such as textbox, button, radio, input.",
+                },
+                "text_hints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional visible text/value hints to prefer.",
+                },
+                "label_hints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional label/aria/name/placeholder hints to prefer.",
+                },
+                "require_visible": {"type": "boolean", "default": True},
+                "require_enabled": {"type": "boolean", "default": False},
+                "mode": {
+                    "type": "string",
+                    "enum": ["loose", "normal", "strict"],
+                    "description": "Resolver strictness. Use strict for final submit/destructive actions.",
+                    "default": "normal",
+                },
+                "scope": {
+                    "type": "object",
+                    "description": (
+                        "Optional resolve scope, e.g. {'same_form_as': 'w12'}, "
+                        "{'form_id': '...'}, {'same_container_as': 'w12'}, or {'after_element': 'w12'}."
+                    ),
+                },
+            },
+            "required": ["intent"],
+        },
+    ),
+    Tool(
         name="web_click",
         description=(
             "Click a web element by ID returned from the most recent web_observe call. "
@@ -375,6 +424,21 @@ _TOOLS: list[Tool] = [
                 "text": {"type": "string", "description": "Substring of visible text to wait for."},
                 "selector": {"type": "string", "description": "CSS selector instead of text."},
                 "timeout_ms": {"type": "integer", "description": "Timeout in ms", "default": 10000},
+            },
+        },
+    ),
+    Tool(
+        name="web_wait_for_url",
+        description=(
+            "Wait until the controlled browser URL matches url_contains or url_regex. "
+            "Use this after navigation or form submission when verifying the destination URL."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "url_contains": {"type": "string", "description": "Substring expected in the URL."},
+                "url_regex": {"type": "string", "description": "Regular expression expected to match the URL."},
+                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds", "default": 10000},
             },
         },
     ),
@@ -652,6 +716,43 @@ _TOOLS: list[Tool] = [
             "required": ["target"],
         },
     ),
+    Tool(
+        name="github_create_repo",
+        description=(
+            "Create a GitHub repository deterministically. Tries authenticated gh CLI first "
+            "unless prefer_browser is true, then falls back to the controlled browser using "
+            "web_observe + semantic element resolution. Defaults to private visibility."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Repository name to create."},
+                "description": {"type": "string", "description": "Optional repository description."},
+                "visibility": {
+                    "type": "string",
+                    "enum": ["public", "private"],
+                    "description": "Repository visibility. Defaults to private.",
+                    "default": "private",
+                },
+                "prefer_browser": {
+                    "type": "boolean",
+                    "description": "Skip gh CLI and use browser flow first.",
+                    "default": False,
+                },
+                "open_in_browser": {
+                    "type": "boolean",
+                    "description": "Open the created repository in Kim's controlled browser when using gh CLI.",
+                    "default": False,
+                },
+                "debug": {
+                    "type": "boolean",
+                    "description": "Include full attempts/candidates/diagnostics in the tool result.",
+                    "default": False,
+                },
+            },
+            "required": ["name"],
+        },
+    ),
     # ── Code execution ───────────────────────────────────────────────────────
     Tool(
         name="run_python",
@@ -738,12 +839,14 @@ _DISPATCH = {
     "click_ui": handle_click_ui,
     "web_open": handle_web_open,
     "web_observe": handle_web_observe,
+    "web_resolve": handle_web_resolve,
     "web_click": handle_web_click,
     "web_fill": handle_web_fill,
     "web_press": handle_web_press,
     "web_text": handle_web_text,
     "web_screenshot": handle_web_screenshot,
     "web_wait_for": handle_web_wait_for,
+    "web_wait_for_url": handle_web_wait_for_url,
     "web_back": handle_web_back,
     "web_close": handle_web_close,
     "take_annotated_screenshot": handle_take_annotated_screenshot,
@@ -766,6 +869,7 @@ _DISPATCH = {
     "git_commit": handle_git_commit,
     "git_log": handle_git_log,
     "git_checkout": handle_git_checkout,
+    "github_create_repo": handle_github_create_repo,
     # Code
     "run_python": handle_run_python,
     "run_node": handle_run_node,

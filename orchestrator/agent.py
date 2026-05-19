@@ -66,6 +66,7 @@ from orchestrator.providers.base import BaseProvider, create_provider
 from orchestrator.session_store import SessionStore
 from orchestrator.context_loader import discover_instruction_files, build_instruction_prompt
 from orchestrator import compaction as _compaction
+from orchestrator.interaction_policy import InteractionPolicy
 
 if TYPE_CHECKING:
     from tray.voice import VoiceEngine
@@ -457,6 +458,7 @@ class KimAgent:
         self._voice = voice_engine
         self._session_store = session_store or SessionStore()
         self._resume_session_id = resume_session_id
+        self._interaction_policy = InteractionPolicy()
         # Retry configuration for LLM API calls
         self._max_retries: int = int(config.get("max_retries", 5))
         self._retry_base_delay: float = float(config.get("retry_base_delay", 1.0))
@@ -1077,6 +1079,13 @@ class KimAgent:
     async def _execute_tool(self, name: str, args: dict) -> str:
         import time as _time
 
+        decision = self._interaction_policy.before_tool(name, args or {})
+        if decision.message:
+            level = "WARN" if not decision.allowed or "WARNING" in decision.message else "INFO"
+            self._log(level, f"[POLICY] {decision.message}")
+        if not decision.allowed:
+            return decision.message
+
         # ── Pre-execution: capture file state for diff ───────────────────
         _file_path: Optional[str] = None
         _before_lines: int = 0
@@ -1123,6 +1132,8 @@ class KimAgent:
                         await self._ui_bridge.show_after_screenshot()
                     except Exception:
                         pass
+
+        self._interaction_policy.after_tool(name, args or {}, output)
 
         duration_ms = int((_time.monotonic() - t0) * 1000)
 
@@ -1324,6 +1335,11 @@ You MUST respond in EXACTLY one of these formats on every turn:
 - Use take_screenshot or take_annotated_screenshot only when the user asks a visual
   question ("what's on my screen", image/color/layout inspection) or observe_ui is
   empty/ambiguous and keyboard/accessibility actions are insufficient.
+- For browser form tasks, use web_open, then web_observe, then web_resolve for the
+  semantic target, then web_fill/web_click by element_id, then web_observe again
+  after state-changing actions. Prefer web_resolve over guessing from long lists.
+  Use web_wait_for_url for URL verification. Do not press Enter to submit forms
+  when a submit/create button can be resolved and clicked.
 - Prefer run_command for launching apps (e.g. {_LAUNCH_EXAMPLE}).
 - For shell commands, prefer single quotes over double quotes inside the cmd string.
   Example: `grep -E 'mcp|playwright'` instead of `grep -E "mcp|playwright"`.
@@ -1474,6 +1490,7 @@ Rules:
 - **Visual questions** ("what's on my screen?", "what do you see?", "describe my screen", "what's open?"): call `take_screenshot` FIRST, then look at the image and describe in detail what you actually see — apps, windows, text, UI elements, colors, layout. Do NOT say "I captured a screenshot" or list window titles from `get_windows`. The user wants visual description from a real screenshot.
 - **Window management tasks** ("list my windows", "switch to X", "close Y", "resize Z"): use `get_windows` to enumerate windows, then `focus_window` or other tools.
 - **Clicking / interacting with an app**: use `observe_ui` to read the accessibility tree, then `click_ui` or `type_text`. Take a screenshot only when `observe_ui` returns empty or for visual confirmation.
+- **Browser forms**: use `web_observe` before `web_click`/`web_fill`; call `web_resolve` for targets like "repository name textbox" or "submit button"; observe again after fills/clicks that change state. Use `web_wait_for_url` for URL verification and do not press Enter to submit when a submit/create button can be resolved.
 - Use `focus_window` before typing into any application.
 - Use {_PATH_STYLE}.
 - Maximum {self.max_iterations} tool calls allowed. If you exceed this, the task will be cancelled.

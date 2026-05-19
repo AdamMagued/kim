@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -48,6 +50,10 @@ _playwright: Any = None
 _browser_ctx: Any = None
 _active_page: Any = None
 _element_map: dict[str, str] = {}
+_element_data_map: dict[str, dict[str, Any]] = {}
+_last_observation: dict[str, Any] | None = None
+_last_form_diagnostics: dict[str, Any] = {}
+_observe_generation: int = 0
 _is_real_browser: bool = False
 _last_connection_error: str = ""
 _DEDICATED_CDP_PORT = int(os.environ.get("KIM_DEDICATED_BROWSER_CDP_PORT", "9333"))
@@ -263,10 +269,14 @@ async def _ensure_browser() -> None:
 
 
 def _on_context_closed() -> None:
-    global _browser_ctx, _active_page, _element_map
+    global _browser_ctx, _active_page, _last_observation, _last_form_diagnostics, _observe_generation
     _browser_ctx = None
     _active_page = None
     _element_map.clear()
+    _element_data_map.clear()
+    _last_observation = None
+    _last_form_diagnostics = {}
+    _observe_generation = 0
 
 
 async def _page():
@@ -350,16 +360,25 @@ async def handle_web_open(args: dict) -> str:
 # what the user sees.
 _OBSERVE_JS = r"""
 () => {
-  const isVisible = el => {
-    if (!el || !el.getBoundingClientRect) return false;
-    const r = el.getBoundingClientRect();
-    if (r.width <= 1 || r.height <= 1) return false;
-    const s = window.getComputedStyle(el);
-    if (s.visibility === 'hidden' || s.display === 'none') return false;
-    if (parseFloat(s.opacity || '1') < 0.05) return false;
-    if (r.bottom < 0 || r.top > (window.innerHeight + 200)) return false;
-    return true;
+  const elementState = el => {
+    const r = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+    const s = el ? window.getComputedStyle(el) : null;
+    const hidden = !el || !r || r.width <= 1 || r.height <= 1 ||
+      !s || s.visibility === 'hidden' || s.display === 'none' ||
+      parseFloat(s.opacity || '1') < 0.05;
+    const visible = !hidden;
+    const inViewport = visible &&
+      r.bottom >= 0 && r.top <= window.innerHeight &&
+      r.right >= 0 && r.left <= window.innerWidth;
+    return {
+      hidden,
+      visible,
+      in_viewport: inViewport,
+      bbox: r ? [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)] : [0, 0, 0, 0],
+    };
   };
+
+  const cleanText = value => (value || '').replace(/\s+/g, ' ').trim();
 
   const labelOf = el => {
     const al = el.getAttribute && el.getAttribute('aria-label');
@@ -370,15 +389,47 @@ _OBSERVE_JS = r"""
     if (el.value && el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'button')) return el.value.trim();
     const lid = el.getAttribute && el.getAttribute('aria-labelledby');
     if (lid) {
-      const r = document.getElementById(lid);
-      if (r) return (r.textContent || '').trim();
+      const labelled = lid.split(/\s+/).map(id => {
+        const r = document.getElementById(id);
+        return r ? cleanText(r.textContent) : '';
+      }).filter(Boolean).join(' ');
+      if (labelled) return labelled;
+    }
+    if (el.labels && el.labels.length) {
+      const labels = Array.from(el.labels).map(l => cleanText(l.textContent)).filter(Boolean);
+      if (labels.length) return labels.join(' ');
     }
     if (el.id) {
       const lab = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
-      if (lab) return (lab.textContent || '').trim();
+      if (lab) return cleanText(lab.textContent);
     }
-    const inner = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+    const parentLabel = el.closest && el.closest('label');
+    if (parentLabel) {
+      const parentText = cleanText(parentLabel.textContent);
+      if (parentText) return parentText;
+    }
+    const inner = cleanText(el.innerText || el.textContent || '');
     return inner.slice(0, 120);
+  };
+
+  const visibleTextOf = el => cleanText(el.innerText || el.textContent || '').slice(0, 180);
+
+  const nearbyTextOf = el => {
+    const parts = [];
+    const previous = el.previousElementSibling;
+    const next = el.nextElementSibling;
+    if (previous) parts.push(cleanText(previous.innerText || previous.textContent || ''));
+    if (next) parts.push(cleanText(next.innerText || next.textContent || ''));
+    const parent = el.parentElement;
+    if (parent) parts.push(cleanText(parent.innerText || parent.textContent || ''));
+    return parts.filter(Boolean).join(' | ').slice(0, 260);
+  };
+
+  const containerOf = el => {
+    const container = el.closest && el.closest(
+      'form, main, [role="main"], section, article, dialog, [data-testid], [aria-label], .Box, .Layout-main'
+    );
+    return container || el.parentElement || document.body;
   };
 
   const cssPath = el => {
@@ -417,29 +468,742 @@ _OBSERVE_JS = r"""
   const out = [];
   let i = 0;
   for (const el of document.querySelectorAll(SEL)) {
-    if (seen.has(el) || !isVisible(el)) continue;
+    if (seen.has(el)) continue;
     seen.add(el);
+    const state = elementState(el);
     const r = el.getBoundingClientRect();
     const tag = el.tagName.toLowerCase();
     const role = el.getAttribute('role') || tag;
+    const form = el.form || el.closest('form');
+    const container = containerOf(el);
+    const disabled = el.disabled === true || (el.getAttribute && el.getAttribute('aria-disabled') === 'true');
+    const required = el.required === true || (el.getAttribute && el.getAttribute('aria-required') === 'true');
+    const checked = el.checked === true ||
+      (el.getAttribute && el.getAttribute('aria-checked') === 'true') ||
+      (el.getAttribute && el.getAttribute('aria-pressed') === 'true') ||
+      (el.getAttribute && el.getAttribute('aria-selected') === 'true');
     out.push({
       id: 'w' + (++i),
       tag,
       role,
       label: labelOf(el).slice(0, 140),
+      text: visibleTextOf(el),
+      aria_label: (el.getAttribute && (el.getAttribute('aria-label') || '')).slice(0, 140),
+      placeholder: (el.placeholder || '').slice(0, 140),
+      name: (el.getAttribute && (el.getAttribute('name') || '')).slice(0, 140),
+      title: (el.getAttribute && (el.getAttribute('title') || '')).slice(0, 140),
+      nearby_text: nearbyTextOf(el),
       value: (el.value || '').slice(0, 120),
       href: (tag === 'a' && el.href) ? el.href.slice(0, 120) : '',
       type: el.type || '',
-      checked: el.checked === true,
-      disabled: el.disabled === true,
-      bbox: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+      checked,
+      disabled,
+      required,
+      visible: state.visible,
+      hidden: state.hidden,
+      in_viewport: state.in_viewport,
+      form_id: form ? (form.id || form.getAttribute('name') || cssPath(form)) : '',
+      container_id: container ? cssPath(container) : '',
+      container_text: container ? cleanText(container.innerText || container.textContent || '').slice(0, 320) : '',
+      bbox: state.bbox,
       selector: cssPath(el),
     });
-    if (out.length >= 300) break;
+    if (out.length >= 500) break;
   }
   return { url: location.href, title: document.title, elements: out };
 }
 """
+
+
+_GENERIC_INTENT_TOKENS = {
+    "a",
+    "an",
+    "and",
+    "button",
+    "field",
+    "input",
+    "textbox",
+    "text",
+    "box",
+    "select",
+    "dropdown",
+    "control",
+    "element",
+    "the",
+}
+
+_ACTION_INTENT_TOKENS = {
+    "click",
+    "confirm",
+    "continue",
+    "create",
+    "finish",
+    "open",
+    "press",
+    "publish",
+    "save",
+    "send",
+    "submit",
+}
+
+_RESOLVE_THRESHOLDS = {
+    "loose": 0.20,
+    "normal": 0.25,
+    "strict": 0.58,
+}
+
+
+def _norm(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _tokens(value: Any) -> list[str]:
+    return [t for t in re.split(r"[^a-z0-9]+", _norm(value)) if len(t) > 1]
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value if str(v).strip()]
+    return [str(value)]
+
+
+def _strip_placeholder_prefix(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower().startswith("placeholder:"):
+        return text.split(":", 1)[1].strip()
+    return text
+
+
+def _role_candidates(el: dict[str, Any]) -> set[str]:
+    role = _norm(el.get("role"))
+    tag = _norm(el.get("tag"))
+    typ = _norm(el.get("type"))
+    candidates = {v for v in (role, tag, typ) if v}
+    if tag == "textarea":
+        candidates.add("textbox")
+    if tag == "select":
+        candidates.add("combobox")
+        candidates.add("listbox")
+    if tag == "button":
+        candidates.add("button")
+    if tag == "input":
+        if typ in {"button", "submit", "reset"}:
+            candidates.add("button")
+        elif typ == "checkbox":
+            candidates.add("checkbox")
+        elif typ == "radio":
+            candidates.add("radio")
+        elif typ in {"email", "search", "tel", "text", "url", "password", "number"} or not typ:
+            candidates.add("textbox")
+            if typ:
+                candidates.add(f"{typ}box")
+    if role in {"searchbox", "textbox"}:
+        candidates.add("textbox")
+    if role == "link":
+        candidates.add("a")
+    return candidates
+
+
+def _infer_preferred_roles(intent: str) -> list[str]:
+    toks = set(_tokens(intent))
+    roles: list[str] = []
+    if toks & {"button", "submit", "create", "save", "send", "continue", "publish"}:
+        roles.append("button")
+    if toks & {"radio", "visibility", "public", "private"}:
+        roles.append("radio")
+    if toks & {"checkbox", "check"}:
+        roles.append("checkbox")
+    if toks & {
+        "textbox",
+        "input",
+        "field",
+        "email",
+        "recipient",
+        "name",
+        "description",
+        "search",
+        "text",
+    }:
+        roles.append("textbox")
+    return roles
+
+
+def _intent_focus(intent: str) -> str:
+    keep = [t for t in _tokens(intent) if t not in _GENERIC_INTENT_TOKENS]
+    return " ".join(keep) or intent
+
+
+def _important_tokens(intent: str) -> list[str]:
+    return [
+        t for t in _tokens(intent)
+        if t not in _GENERIC_INTENT_TOKENS and t not in _ACTION_INTENT_TOKENS
+    ]
+
+
+def _match_score(needle: str, haystack: str) -> float:
+    needle_norm = _norm(needle)
+    hay_norm = _norm(haystack)
+    if not needle_norm or not hay_norm:
+        return 0.0
+    if needle_norm == hay_norm:
+        return 1.0
+    if needle_norm in hay_norm:
+        return 0.88
+    hay_tokens = set(_tokens(hay_norm))
+    needle_tokens = [t for t in _tokens(needle_norm) if t not in _GENERIC_INTENT_TOKENS]
+    if not needle_tokens or not hay_tokens:
+        return 0.0
+    overlap = sum(1 for t in needle_tokens if t in hay_tokens)
+    if overlap == len(needle_tokens):
+        return 0.74
+    if overlap:
+        return 0.36 + (0.28 * overlap / max(len(needle_tokens), 1))
+    compact_hay = hay_norm.replace("-", " ").replace("_", " ")
+    return 0.55 if needle_norm.replace("-", " ").replace("_", " ") in compact_hay else 0.0
+
+
+def _best_match(needles: list[str], haystacks: list[str]) -> tuple[float, str]:
+    best = 0.0
+    best_reason = ""
+    for needle in needles:
+        for hay in haystacks:
+            score = _match_score(needle, hay)
+            if score > best:
+                best = score
+                best_reason = f"{needle!r} matched {hay!r}"
+    return best, best_reason
+
+
+def _is_visible_element(el: dict[str, Any]) -> bool:
+    if el.get("visible") is False:
+        return False
+    if el.get("hidden") is True:
+        return False
+    bbox = el.get("bbox")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return False
+    try:
+        return float(bbox[2]) > 1 and float(bbox[3]) > 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _debug_label(el: dict[str, Any]) -> str:
+    for key in ("label", "aria_label", "placeholder", "name", "text", "title", "value"):
+        value = _strip_placeholder_prefix(el.get(key))
+        if value:
+            return str(value)
+    return f"<{el.get('tag', '?')} role={el.get('role', '?')}>"
+
+
+def _candidate_metadata(el: dict[str, Any], confidence: float, reason: str) -> dict[str, Any]:
+    return {
+        "element_id": el.get("id"),
+        "confidence": round(confidence, 3),
+        "reason": reason,
+        "tag": el.get("tag", ""),
+        "role": el.get("role", ""),
+        "type": el.get("type", ""),
+        "label": el.get("label", ""),
+        "text": el.get("text", ""),
+        "aria_label": el.get("aria_label", ""),
+        "placeholder": el.get("placeholder", ""),
+        "name": el.get("name", ""),
+        "value": el.get("value", ""),
+        "title": el.get("title", ""),
+        "nearby_text": el.get("nearby_text", ""),
+        "disabled": bool(el.get("disabled")),
+        "required": bool(el.get("required")),
+        "visible": _is_visible_element(el),
+        "hidden": bool(el.get("hidden")),
+        "in_viewport": bool(el.get("in_viewport")),
+        "form_id": el.get("form_id", ""),
+        "container_id": el.get("container_id", ""),
+        "bbox": el.get("bbox"),
+    }
+
+
+def _scope_for_element(element_id: str | None) -> dict[str, Any]:
+    if not element_id:
+        return {}
+    el = _element_data_map.get(str(element_id))
+    if not el:
+        return {}
+    scope: dict[str, Any] = {"same_container_as": str(element_id)}
+    if el.get("form_id"):
+        scope["same_form_as"] = str(element_id)
+        scope["form_id"] = el.get("form_id")
+    if el.get("container_id"):
+        scope["container_id"] = el.get("container_id")
+    return scope
+
+
+def _scope_value(scope: Any, key: str) -> str:
+    if not isinstance(scope, dict):
+        return ""
+    value = scope.get(key)
+    return str(value or "").strip()
+
+
+def _element_scope_matches(el: dict[str, Any], scope: Any) -> tuple[bool, str]:
+    if not isinstance(scope, dict) or not scope:
+        return True, ""
+
+    same_form_as = _scope_value(scope, "same_form_as")
+    if same_form_as:
+        ref = _element_data_map.get(same_form_as)
+        ref_form = str((ref or {}).get("form_id") or "")
+        if not ref_form or str(el.get("form_id") or "") != ref_form:
+            return False, f"outside form of {same_form_as}"
+
+    form_id = _scope_value(scope, "form_id")
+    if form_id and str(el.get("form_id") or "") != form_id:
+        return False, f"outside form {form_id!r}"
+
+    same_container_as = _scope_value(scope, "same_container_as")
+    if same_container_as:
+        ref = _element_data_map.get(same_container_as)
+        ref_container = str((ref or {}).get("container_id") or "")
+        if ref_container and str(el.get("container_id") or "") != ref_container:
+            return False, f"outside container of {same_container_as}"
+
+    container_id = _scope_value(scope, "container_id")
+    if container_id and str(el.get("container_id") or "") != container_id:
+        return False, f"outside container {container_id!r}"
+
+    after_element = _scope_value(scope, "after_element")
+    if after_element:
+        ref = _element_data_map.get(after_element)
+        ref_bbox = (ref or {}).get("bbox")
+        bbox = el.get("bbox")
+        try:
+            if isinstance(ref_bbox, list) and isinstance(bbox, list) and float(bbox[1]) < float(ref_bbox[1]):
+                return False, f"before {after_element}"
+        except (TypeError, ValueError):
+            pass
+
+    return True, "scope matched"
+
+
+def _searchable_text(el: dict[str, Any]) -> str:
+    return " ".join(
+        str(el.get(k, ""))
+        for k in (
+            "label",
+            "text",
+            "aria_label",
+            "placeholder",
+            "name",
+            "value",
+            "title",
+            "nearby_text",
+            "container_text",
+            "type",
+        )
+    )
+
+
+def _missing_strict_tokens(el: dict[str, Any], intent: str) -> list[str]:
+    hay_tokens = set(_tokens(_searchable_text(el)))
+    return [token for token in _important_tokens(intent) if token not in hay_tokens]
+
+
+def _is_global_nav_candidate(el: dict[str, Any]) -> bool:
+    form_id = str(el.get("form_id") or "")
+    container = _norm(el.get("container_id"))
+    text = _norm(_searchable_text(el))
+    if form_id:
+        return False
+    if any(part in container for part in ("header", "nav", "toolbar", "menu")):
+        return True
+    return bool(re.search(r"\b(create new|open menu|navigation|notifications|search or jump)\b", text))
+
+
+def _resolve_element(
+    intent: str,
+    preferred_roles: list[str] | None = None,
+    text_hints: list[str] | None = None,
+    label_hints: list[str] | None = None,
+    require_visible: bool = True,
+    require_enabled: bool = False,
+    elements: list[dict[str, Any]] | None = None,
+    mode: str = "normal",
+    scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve a semantic browser intent to the best known observed element."""
+    intent = str(intent or "").strip()
+    if elements is None:
+        elements = list(_element_data_map.values())
+
+    mode = _norm(mode) or "normal"
+    if mode not in _RESOLVE_THRESHOLDS:
+        mode = "normal"
+    preferred_input = _as_str_list(preferred_roles) or _infer_preferred_roles(intent)
+    preferred = [_norm(r) for r in preferred_input if _norm(r)]
+    focus = _intent_focus(intent)
+    label_needles = _as_str_list(label_hints) or [focus]
+    text_needles = _as_str_list(text_hints) or [focus]
+    intent_needles = [intent, focus]
+
+    candidates: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    skipped = 0
+    for el in elements:
+        if require_visible and not _is_visible_element(el):
+            skipped += 1
+            rejected.append(_candidate_metadata(el, 0.0, "not visible"))
+            continue
+        if require_enabled and el.get("disabled"):
+            skipped += 1
+            rejected.append(_candidate_metadata(el, 0.0, "disabled"))
+            continue
+        scope_ok, scope_reason = _element_scope_matches(el, scope or {})
+        if not scope_ok:
+            skipped += 1
+            rejected.append(_candidate_metadata(el, 0.0, scope_reason))
+            continue
+
+        roles = _role_candidates(el)
+        score = 0.0
+        reasons: list[str] = []
+
+        if preferred:
+            if roles.intersection(preferred):
+                score += 0.24
+                reasons.append(f"role matched {sorted(roles.intersection(preferred))[0]}")
+            elif "input" in preferred and el.get("tag") == "input":
+                score += 0.14
+                reasons.append("tag matched input")
+            else:
+                if mode == "strict":
+                    skipped += 1
+                    rejected.append(_candidate_metadata(el, 0.0, f"role {sorted(roles)} did not match {preferred}"))
+                    continue
+                score -= 0.08
+
+        if mode == "strict":
+            missing = _missing_strict_tokens(el, intent)
+            if missing:
+                skipped += 1
+                rejected.append(_candidate_metadata(el, 0.0, f"missing strict token(s): {', '.join(missing)}"))
+                continue
+            if _is_global_nav_candidate(el):
+                skipped += 1
+                rejected.append(_candidate_metadata(el, 0.0, "global navigation/menu candidate"))
+                continue
+
+        label_score, label_reason = _best_match(
+            label_needles,
+            [
+                _strip_placeholder_prefix(el.get("label")),
+                el.get("aria_label", ""),
+                el.get("name", ""),
+                el.get("title", ""),
+            ],
+        )
+        if label_score:
+            score += 0.42 * label_score
+            reasons.append(f"label {label_reason}")
+
+        placeholder_score, placeholder_reason = _best_match(label_needles, [el.get("placeholder", "")])
+        if placeholder_score:
+            score += 0.28 * placeholder_score
+            reasons.append(f"placeholder {placeholder_reason}")
+
+        text_score, text_reason = _best_match(
+            text_needles,
+            [el.get("text", ""), el.get("value", ""), el.get("nearby_text", "")],
+        )
+        if text_score:
+            score += 0.30 * text_score
+            reasons.append(f"text {text_reason}")
+
+        intent_score, intent_reason = _best_match(
+            intent_needles,
+            [
+                _strip_placeholder_prefix(el.get("label")),
+                el.get("aria_label", ""),
+                el.get("placeholder", ""),
+                el.get("name", ""),
+                el.get("text", ""),
+                el.get("nearby_text", ""),
+            ],
+        )
+        if intent_score:
+            score += 0.22 * intent_score
+            reasons.append(f"intent {intent_reason}")
+
+        if _is_visible_element(el):
+            score += 0.04
+        else:
+            score -= 0.20
+            reasons.append("not visible")
+
+        if el.get("in_viewport"):
+            score += 0.02
+        elif _is_visible_element(el):
+            reasons.append("offscreen")
+
+        if el.get("disabled"):
+            score -= 0.18
+            reasons.append("disabled")
+        else:
+            score += 0.03
+
+        if el.get("required") and "required" in _tokens(intent):
+            score += 0.04
+            reasons.append("required")
+
+        if scope_reason:
+            score += 0.04
+            reasons.append(scope_reason)
+
+        confidence = max(0.0, min(score, 0.99))
+        candidates.append(_candidate_metadata(el, confidence, "; ".join(reasons) or "weak metadata match"))
+
+    candidates.sort(key=lambda c: c["confidence"], reverse=True)
+    best = candidates[0] if candidates else None
+    ok = bool(best and best["confidence"] >= _RESOLVE_THRESHOLDS[mode])
+    if best:
+        reason = best["reason"]
+        element_id = str(best.get("element_id") or "")
+        confidence = float(best["confidence"])
+    else:
+        reason = "No observed element matched the resolver constraints."
+        element_id = ""
+        confidence = 0.0
+
+    if rejected:
+        logger.info(
+            "web_resolve rejected intent=%r mode=%s rejected=%s",
+            intent,
+            mode,
+            rejected[:5],
+        )
+    return {
+        "ok": ok,
+        "element_id": element_id or None,
+        "confidence": round(confidence, 3),
+        "reason": reason,
+        "intent": intent,
+        "preferred_roles": preferred,
+        "require_visible": require_visible,
+        "require_enabled": require_enabled,
+        "mode": mode,
+        "scope": scope or {},
+        "candidate_count": len(candidates),
+        "skipped_count": skipped,
+        "candidates": candidates[:8],
+        "observation_generation": _observe_generation,
+        "url": (_last_observation or {}).get("url", ""),
+        "title": (_last_observation or {}).get("title", ""),
+    }
+
+
+def _is_field(el: dict[str, Any]) -> bool:
+    roles = _role_candidates(el)
+    return bool(roles & {"textbox", "searchbox", "combobox", "listbox", "checkbox", "radio"}) or el.get("tag") in {
+        "input",
+        "textarea",
+        "select",
+    }
+
+
+def _is_submit_or_create_button(el: dict[str, Any]) -> bool:
+    roles = _role_candidates(el)
+    if "button" not in roles:
+        return False
+    text = " ".join(
+        str(el.get(k, ""))
+        for k in ("label", "text", "value", "aria_label", "name", "title", "type")
+    ).lower()
+    return bool(re.search(r"\b(submit|create|save|send|publish|continue|confirm|finish)\b", text)) or _norm(el.get("type")) == "submit"
+
+
+def _field_display_name(el: dict[str, Any]) -> str:
+    label = _debug_label(el).strip()
+    roles = _role_candidates(el)
+    if "radio" in roles:
+        kind = "radio"
+    elif "checkbox" in roles:
+        kind = "checkbox"
+    elif "combobox" in roles or "listbox" in roles:
+        kind = "select"
+    else:
+        kind = "textbox"
+    if kind in label.lower():
+        return label
+    return f"{label} {kind}".strip()
+
+
+def _button_display_name(el: dict[str, Any]) -> str:
+    label = _debug_label(el).strip()
+    if "button" in label.lower():
+        return label
+    return f"{label} button".strip()
+
+
+def _required_field_empty(el: dict[str, Any]) -> bool:
+    roles = _role_candidates(el)
+    if roles & {"checkbox", "radio"}:
+        return not bool(el.get("checked"))
+    return not str(el.get("value") or "").strip()
+
+
+def _build_form_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    elements = list(result.get("elements") or [])
+    forms_by_id: dict[str, dict[str, Any]] = {}
+    fields: list[dict[str, Any]] = []
+    required_fields: list[dict[str, Any]] = []
+    empty_required_fields: list[dict[str, Any]] = []
+    disabled_submit_buttons: list[dict[str, Any]] = []
+
+    for el in elements:
+        if not _is_visible_element(el):
+            continue
+        form_id = str(el.get("form_id") or "page")
+        form = forms_by_id.setdefault(form_id, {"form_id": form_id, "fields": [], "buttons": []})
+        summary = {
+            "element_id": el.get("id"),
+            "name": _debug_label(el),
+            "label": _strip_placeholder_prefix(el.get("label")),
+            "role": el.get("role", ""),
+            "tag": el.get("tag", ""),
+            "type": el.get("type", ""),
+            "required": bool(el.get("required")),
+            "empty": _required_field_empty(el) if _is_field(el) else False,
+            "disabled": bool(el.get("disabled")),
+            "visible": _is_visible_element(el),
+            "in_viewport": bool(el.get("in_viewport")),
+            "form_id": el.get("form_id", ""),
+            "container_id": el.get("container_id", ""),
+            "bbox": el.get("bbox"),
+        }
+        if _is_field(el):
+            fields.append(summary)
+            form["fields"].append(summary)
+            if el.get("required"):
+                required_fields.append(summary)
+                if _required_field_empty(el):
+                    empty_required_fields.append(summary)
+        if "button" in _role_candidates(el):
+            form["buttons"].append(summary)
+            if el.get("disabled") and _is_submit_or_create_button(el):
+                disabled_submit_buttons.append(summary)
+
+    empty_names = [f.get("name") or f.get("label") or str(f.get("element_id")) for f in empty_required_fields]
+    messages: list[str] = []
+    for field in empty_required_fields:
+        element = _element_data_map.get(str(field.get("element_id"))) or next(
+            (el for el in elements if el.get("id") == field.get("element_id")),
+            {},
+        )
+        messages.append(f"{_field_display_name(element)} is required and empty.")
+
+    for button in disabled_submit_buttons:
+        element = _element_data_map.get(str(button.get("element_id"))) or next(
+            (el for el in elements if el.get("id") == button.get("element_id")),
+            {},
+        )
+        button_name = _button_display_name(element)
+        if empty_names:
+            reason = ", ".join(empty_names[:3])
+            if len(empty_names) > 3:
+                reason += f", and {len(empty_names) - 3} more"
+            messages.append(f"{button_name} is disabled, likely because {reason} is empty.")
+        else:
+            messages.append(f"{button_name} is disabled; likely required fields or validation are incomplete.")
+
+    return {
+        "page_title": result.get("title", ""),
+        "url": result.get("url", ""),
+        "forms": list(forms_by_id.values()),
+        "visible_interactive_element_count": len([el for el in elements if _is_visible_element(el)]),
+        "fields": fields,
+        "required_fields": required_fields,
+        "empty_required_fields": empty_required_fields,
+        "disabled_submit_buttons": disabled_submit_buttons,
+        "messages": messages,
+    }
+
+
+def _remember_observation(result: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    global _last_observation, _last_form_diagnostics, _observe_generation
+    elements = list(result.get("elements") or [])
+    _observe_generation += 1
+    _element_map.clear()
+    _element_data_map.clear()
+    for el in elements:
+        element_id = str(el.get("id") or "")
+        selector = str(el.get("selector") or "")
+        if element_id and selector:
+            _element_map[element_id] = selector
+            _element_data_map[element_id] = dict(el)
+    _last_form_diagnostics = _build_form_diagnostics(result)
+    _last_observation = {
+        "url": result.get("url", ""),
+        "title": result.get("title", ""),
+        "generation": _observe_generation,
+        "elements": elements,
+        "form_diagnostics": _last_form_diagnostics,
+    }
+    logger.info(
+        "web_observe generation=%s url=%r elements=%s required=%s empty_required=%s disabled_submit=%s",
+        _observe_generation,
+        result.get("url", ""),
+        len(elements),
+        len(_last_form_diagnostics.get("required_fields", [])),
+        len(_last_form_diagnostics.get("empty_required_fields", [])),
+        len(_last_form_diagnostics.get("disabled_submit_buttons", [])),
+    )
+    return elements, _last_form_diagnostics
+
+
+def _structured_observation_payload(
+    result: dict[str, Any],
+    elements: list[dict[str, Any]],
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    def public_element(el: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "element_id": el.get("id"),
+            "tag": el.get("tag", ""),
+            "role": el.get("role", ""),
+            "type": el.get("type", ""),
+            "label": el.get("label", ""),
+            "text": el.get("text", ""),
+            "aria_label": el.get("aria_label", ""),
+            "placeholder": el.get("placeholder", ""),
+            "name": el.get("name", ""),
+            "value": el.get("value", ""),
+            "title": el.get("title", ""),
+            "nearby_text": el.get("nearby_text", ""),
+            "disabled": bool(el.get("disabled")),
+            "required": bool(el.get("required")),
+            "visible": _is_visible_element(el),
+            "hidden": bool(el.get("hidden")),
+            "in_viewport": bool(el.get("in_viewport")),
+            "form_id": el.get("form_id", ""),
+            "container_id": el.get("container_id", ""),
+            "bbox": el.get("bbox"),
+        }
+
+    return {
+        "observation_generation": _observe_generation,
+        "page_title": result.get("title", ""),
+        "url": result.get("url", ""),
+        "interactive_elements": [public_element(el) for el in elements],
+        "visible_interactive_elements": [public_element(el) for el in elements if _is_visible_element(el)],
+        "forms": diagnostics.get("forms", []),
+        "required_fields": diagnostics.get("required_fields", []),
+        "empty_required_fields": diagnostics.get("empty_required_fields", []),
+        "disabled_submit_buttons": diagnostics.get("disabled_submit_buttons", []),
+        "diagnostic_messages": diagnostics.get("messages", []),
+    }
 
 
 async def handle_web_observe(args: dict) -> str:
@@ -454,10 +1218,8 @@ async def handle_web_observe(args: dict) -> str:
     except Exception as e:
         return f"ERROR: observe failed: {e}"
 
-    elements = result.get("elements", [])
-    _element_map.clear()
-    for el in elements:
-        _element_map[el["id"]] = el["selector"]
+    elements, diagnostics = _remember_observation(result)
+    shown_elements = [el for el in elements if _is_visible_element(el)]
 
     limit = int(args.get("limit", 80))
     lines = [
@@ -465,24 +1227,34 @@ async def handle_web_observe(args: dict) -> str:
         f"URL: {result.get('url', '')}",
         f"Title: {result.get('title', '')}",
         f"Found {len(elements)} interactive elements"
-        + (f" (showing first {limit})" if len(elements) > limit else "")
+        + (f" ({len(shown_elements)} visible/offscreen)")
+        + (f" (showing first {limit})" if len(shown_elements) > limit else "")
         + ".",
         "Use web_click(element_id) and web_fill(element_id, text). "
         "Use web_press for Enter/Tab on the focused field.",
         "",
     ]
 
-    if not elements:
+    if not shown_elements:
         lines.append("- No interactive elements found. The page may still be loading; "
                      "call web_wait_for or web_observe again.")
+        lines.append("")
+        lines.append("WEB_OBSERVATION_JSON:")
+        lines.append(json.dumps(_structured_observation_payload(result, elements, diagnostics), indent=2))
         return "\n".join(lines)
 
-    for el in elements[:limit]:
+    for el in shown_elements[:limit]:
         flags = []
         if el.get("disabled"):
             flags.append("disabled")
+        if el.get("required"):
+            flags.append("required")
         if el.get("checked"):
             flags.append("checked")
+        if el.get("hidden"):
+            flags.append("hidden")
+        elif not el.get("in_viewport"):
+            flags.append("offscreen")
         flag_str = f" [{','.join(flags)}]" if flags else ""
 
         label = el.get("label") or "(no label)"
@@ -501,9 +1273,42 @@ async def handle_web_observe(args: dict) -> str:
             f"{label!r}{extra_str} bbox=({bx},{by},{bw},{bh})"
         )
 
-    if len(elements) > limit:
-        lines.append(f"... {len(elements) - limit} more — re-run with limit higher if needed.")
+    if len(shown_elements) > limit:
+        lines.append(f"... {len(shown_elements) - limit} more — re-run with limit higher if needed.")
+    if diagnostics.get("messages"):
+        lines.append("")
+        lines.append("Form diagnostics:")
+        for message in diagnostics["messages"]:
+            lines.append(f"- {message}")
+    lines.append("")
+    lines.append("WEB_OBSERVATION_JSON:")
+    lines.append(json.dumps(_structured_observation_payload(result, elements, diagnostics), indent=2))
     return "\n".join(lines)
+
+
+async def handle_web_resolve(args: dict) -> str:
+    intent = str(args.get("intent", "")).strip()
+    if not intent:
+        return "ERROR: intent is required"
+    result = _resolve_element(
+        intent=intent,
+        preferred_roles=args.get("preferred_roles") or None,
+        text_hints=args.get("text_hints") or None,
+        label_hints=args.get("label_hints") or None,
+        require_visible=bool(args.get("require_visible", True)),
+        require_enabled=bool(args.get("require_enabled", False)),
+        mode=str(args.get("mode") or "normal"),
+        scope=args.get("scope") if isinstance(args.get("scope"), dict) else None,
+    )
+    logger.info(
+        "web_resolve intent=%r element_id=%r confidence=%s reason=%r generation=%s",
+        intent,
+        result.get("element_id"),
+        result.get("confidence"),
+        result.get("reason"),
+        result.get("observation_generation"),
+    )
+    return json.dumps(result, indent=2)
 
 
 async def _resolve_selector(element_id: str) -> tuple[str | None, str]:
@@ -523,7 +1328,9 @@ async def handle_web_click(args: dict) -> str:
         return err
     page = await _page()
     try:
-        await page.locator(selector).first.click(timeout=6000)
+        locator = page.locator(selector).first
+        await locator.scroll_into_view_if_needed(timeout=6000)
+        await locator.click(timeout=6000)
     except Exception as e:
         return f"ERROR: click failed for {el_id} ({selector}): {e}"
     return f"Clicked {el_id}"
@@ -601,6 +1408,26 @@ async def handle_web_wait_for(args: dict) -> str:
         return f"Text appeared: {target!r}"
     except Exception as e:
         return f"Timeout waiting for {target!r}: {e}"
+
+
+async def handle_web_wait_for_url(args: dict) -> str:
+    contains = str(args.get("url_contains") or "").strip()
+    regex = str(args.get("url_regex") or "").strip()
+    timeout = int(args.get("timeout_ms", 10000))
+    if not contains and not regex:
+        return "ERROR: 'url_contains' or 'url_regex' is required"
+    page = await _page()
+    try:
+        if regex:
+            pattern = re.compile(regex)
+            await page.wait_for_url(lambda url: bool(pattern.search(str(url))), timeout=timeout)
+            return f"URL matched regex: {page.url}"
+        await page.wait_for_url(lambda url: contains in str(url), timeout=timeout)
+        return f"URL contains {contains!r}: {page.url}"
+    except Exception as e:
+        current = getattr(page, "url", "")
+        target = regex or contains
+        return f"Timeout waiting for URL {target!r}; current URL is {current!r}: {e}"
 
 
 async def handle_web_back(args: dict) -> str:

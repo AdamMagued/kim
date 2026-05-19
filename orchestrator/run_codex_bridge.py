@@ -118,6 +118,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             cwd=args.cwd,
             codex_binary=codex_bin_env,
             model=args.model,
+            provider_name=args.provider,
         )
     except Exception as e:  # noqa: BLE001
         logger.exception("Codex bridge crashed")
