@@ -3,7 +3,7 @@ import type { PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import type { SessionInfo, KimAccount, ClawProject, Theme } from '../../types';
+import type { SessionInfo, KimAccount, CodexProject, Theme } from '../../types';
 
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_MAX_WIDTH = 520;
@@ -92,7 +92,7 @@ function formatTime(date: string): string {
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-function clawSessionLabel(title?: string | null, sessionId?: string | null): string {
+function codexSessionLabel(title?: string | null, sessionId?: string | null): string {
   const t = (title ?? '').trim();
   if (t) return t;
   const sid = (sessionId ?? '').trim().replace(/^session-/, '');
@@ -126,7 +126,7 @@ export function RevampSidebar({
   onCycleTheme,
 }: Props) {
   const grouped = useMemo(() => groupByDate(kimSessions), [kimSessions]);
-  const [clawProjects, setClawProjects] = useState<ClawProject[]>([]);
+  const [codexProjects, setCodexProjects] = useState<CodexProject[]>([]);
   const projectPaths = useMemo(() => account.code_projects ?? [], [account.code_projects]);
   const [openProjects, setOpenProjects] = useState<string[]>([]);
   const [acctMenuOpen, setAcctMenuOpen] = useState(false);
@@ -230,12 +230,12 @@ export function RevampSidebar({
   useEffect(() => {
     if (activeTab !== 'code') return;
     if (projectPaths.length === 0) {
-      setClawProjects([]);
+      setCodexProjects([]);
       return;
     }
-    invoke<ClawProject[]>('list_claw_projects', { projectPaths })
-      .then((p) => setClawProjects(p))
-      .catch(() => setClawProjects([]));
+    invoke<CodexProject[]>('list_codex_projects', { projectPaths })
+      .then((p) => setCodexProjects(p))
+      .catch(() => setCodexProjects([]));
   }, [activeTab, projectPaths, sessionRefreshNonce]);
 
   async function handleAddProject() {
@@ -488,7 +488,7 @@ export function RevampSidebar({
             </button>
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-            {clawProjects.length === 0 ? (
+            {codexProjects.length === 0 ? (
               <div
                 style={{
                   fontSize: 12,
@@ -502,7 +502,7 @@ export function RevampSidebar({
                 No projects yet
               </div>
             ) : (
-              clawProjects.map((p) => {
+              codexProjects.map((p) => {
                 const open = openProjects.includes(p.path);
                 return (
                   <div key={p.path} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -588,15 +588,15 @@ export function RevampSidebar({
                             const updatedAtById = new Map(flat.map(s => [s.session_id, s.updated_at] as const));
                             const infos: SessionInfo[] = flat.map((s) => ({
                               session_id: s.session_id,
-                              session_type: 'claw',
-                              // For Claw sessions, `date` must be the YYYY-MM-DD bucket so the
+                              session_type: 'codex',
+                              // For Codex sessions, `date` must be the YYYY-MM-DD bucket so the
                               // message loader can locate <bucket>/<id>.jsonl on disk.
                               date: s.date || new Date().toISOString(),
                               message_count: s.message_count,
                               has_summary: !!s.summary,
                               summary: s.summary ?? undefined,
                               title: s.title,
-                              session_key: `claw:${s.date}:${s.session_id}`,
+                              session_key: `codex:${s.date}:${s.session_id}`,
                               project_path: p.path,
                             }));
                             infos.sort((a, b) => {
@@ -613,7 +613,7 @@ export function RevampSidebar({
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
                                   {grp.items.map((info) => {
                                     const isActive = activeSessionId === sessionKey(info);
-                                    const title = clawSessionLabel(info.title, info.session_id);
+                                    const title = codexSessionLabel(info.title, info.session_id);
                                     return (
                                       <div
                                         key={sessionKey(info)}

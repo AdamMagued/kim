@@ -240,7 +240,7 @@ export default function App() {
     // ChatView's key continues to use the same id so transitioning from
     // newChatMode → loaded does not remount.
     if (completedSession) {
-      // Code-tab (Claw) completion: Claw always creates a NEW session file
+      // Code-tab (Codex) completion: Codex always creates a NEW session file
       // (it doesn't support --resume). If the user was already viewing an
       // OLD session, navigating to the new session replaces the old messages
       // with just the latest turn — causing the "chat reset" bug. Fix: stay

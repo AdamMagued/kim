@@ -534,7 +534,7 @@ function PathsSection({ settings, onChange }: { settings: Settings; onChange: (s
     <div className="kim-settings-content">
       <div className="kim-settings-content__title">Paths</div>
       <PathField label="Kim sessions directory" settingsKey="kim_sessions_dir" hint="Leave empty to use the default (~/Desktop/kim/kim_sessions or ~/.kim/sessions)" placeholder="/path/to/kim_sessions" />
-      <PathField label="Code sessions directory" settingsKey="claw_sessions_dir" hint="Path where Claw stores its JSONL session files" placeholder="/path/to/claw/sessions" />
+      <PathField label="Code sessions directory" settingsKey="codex_sessions_dir" hint="Path where Codex stores its session files" placeholder="/path/to/codex/sessions" />
       <PathField label="Project root" settingsKey="project_root" hint="Root of your Kim installation (where orchestrator/ lives). Leave empty for auto-detect." placeholder="/path/to/kim" />
     </div>
   );
@@ -1345,7 +1345,7 @@ mcp_servers:
         After editing <code>config.yaml</code>, restart Kim for the changes to take effect. Popular servers: <strong>Puppeteer</strong>, <strong>Filesystem</strong>, <strong>GitHub</strong>, <strong>Slack</strong> — browse more at <strong>21st.dev/mcp</strong>.
       </div>
 
-      {/* Can browser/Claw use MCP? */}
+      {/* Can browser/Codex use MCP? */}
       <div className="kim-settings-section__header" style={{ marginTop: 24, marginBottom: 10 }}>
         <span className="kim-settings-section__title" style={{ fontSize: 13 }}>Browser providers & MCP</span>
       </div>

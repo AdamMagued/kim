@@ -8,7 +8,7 @@ export interface SessionInfo {
   message_count: number;
   has_summary: boolean;
   summary?: string;
-  session_type: 'kim' | 'claw';
+  session_type: 'kim' | 'codex';
   project_path?: string;
   browser_threads?: Record<string, string>;
   browser_last_site?: string;
@@ -101,7 +101,7 @@ export interface KimAccount {
   github_avatar_url?: string;
   gist_id?: string;
   created_at: string;
-  /** Explicit project roots shown in the Code tab — scans .claw/sessions/ inside each */
+  /** Explicit project roots shown in the Code tab — scans .codex/ inside each */
   code_projects?: string[];
   /** Google accounts used for Gemini browser sign-in. */
   google_accounts?: GoogleAccount[];
@@ -111,11 +111,11 @@ export interface KimAccount {
   google_api_account?: GoogleApiAccount;
 }
 
-// ── Claw (Code) project types ────────────────────────────────────────────────
+// ── Codex (Code) project types ───────────────────────────────────────────────
 
-export interface ClawSession {
+export interface CodexSession {
   session_id: string;
-  /** YYYY-MM-DD bucket folder name under .claw/sessions (used to locate file). */
+  /** YYYY-MM-DD bucket folder name under .codex/ (used to locate file). */
   date: string;
   /** ISO timestamp (UTC) based on file modified time (used for sorting/display). */
   updated_at: string;
@@ -124,16 +124,16 @@ export interface ClawSession {
   title: string;
 }
 
-export interface ClawBranch {
+export interface CodexBranch {
   name: string;
-  sessions: ClawSession[];
+  sessions: CodexSession[];
 }
 
-export interface ClawProject {
+export interface CodexProject {
   path: string;
   name: string;
   current_branch: string;
-  branches: ClawBranch[];
+  branches: CodexBranch[];
 }
 
 // ── Settings ─────────────────────────────────────────────────────────────────
@@ -162,7 +162,7 @@ export interface VoiceSettings {
 
 export interface Settings {
   kim_sessions_dir: string;
-  claw_sessions_dir: string;
+  codex_sessions_dir: string;
   project_root: string;
   provider: Provider;
   allow_message_queue: boolean;
@@ -178,7 +178,7 @@ export interface Settings {
 
 export const DEFAULT_SETTINGS: Settings = {
   kim_sessions_dir: '',
-  claw_sessions_dir: '',
+  codex_sessions_dir: '',
   project_root: '',
   provider: 'ollama',
   allow_message_queue: false,

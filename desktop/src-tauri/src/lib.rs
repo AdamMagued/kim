@@ -55,8 +55,8 @@ struct BridgeCompleteRequest {
     #[serde(default)]
     completion_hash: Option<String>,
     /// When true, navigate the provider webview to a fresh chat page before
-    /// injecting the prompt. BrowserProvider uses this for Claw bridge relays
-    /// because each relay prompt already contains the full Claw conversation;
+    /// injecting the prompt. BrowserProvider uses this for Codex bridge relays
+    /// because each relay prompt already contains the full Codex conversation;
     /// keeping the provider page history can make the scraper read stale bubbles.
     #[serde(default)]
     clear_chat: bool,
@@ -147,7 +147,7 @@ pub struct SessionInfo {
     pub message_count: usize,
     pub has_summary: bool,
     pub summary: Option<String>,
-    pub session_type: String, // "kim" or "claw"
+    pub session_type: String, // "kim" or "codex"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_threads: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -160,7 +160,7 @@ pub struct SessionInfo {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CompletedClawSession {
+pub struct CompletedCodexSession {
     pub session_id: String,
     pub session_key: String,
     pub title: String,
@@ -418,9 +418,9 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn session_base_dir(session_type: &str, kim_dir: Option<String>, claw_dir: Option<String>) -> PathBuf {
-    if session_type == "claw" {
-        claw_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir)
+fn session_base_dir(session_type: &str, kim_dir: Option<String>, codex_dir: Option<String>) -> PathBuf {
+    if session_type == "codex" {
+        codex_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir)
     } else {
         kim_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir)
     }
@@ -717,7 +717,7 @@ fn parse_jsonl(path: &Path) -> Result<Vec<KimMessage>, String> {
             Err(e) => {
                 match serde_json::from_str::<serde_json::Value>(trimmed)
                     .ok()
-                    .and_then(claw_jsonl_line_to_kim_message)
+                    .and_then(codex_jsonl_line_to_kim_message)
                 {
                     Some(msg) => messages.push(msg),
                     None => eprintln!("Skipping malformed JSONL line {}: {}", i + 1, e),
@@ -729,7 +729,7 @@ fn parse_jsonl(path: &Path) -> Result<Vec<KimMessage>, String> {
     Ok(messages)
 }
 
-fn claw_jsonl_line_to_kim_message(value: serde_json::Value) -> Option<KimMessage> {
+fn codex_jsonl_line_to_kim_message(value: serde_json::Value) -> Option<KimMessage> {
     if value.get("type").and_then(|v| v.as_str()) != Some("message") {
         return None;
     }
@@ -739,7 +739,7 @@ fn claw_jsonl_line_to_kim_message(value: serde_json::Value) -> Option<KimMessage
     let content = message
         .get("blocks")
         .cloned()
-        .map(normalize_claw_blocks)
+        .map(normalize_codex_blocks)
         .or_else(|| message.get("content").cloned())
         .unwrap_or_else(|| serde_json::Value::String(String::new()));
 
@@ -752,7 +752,7 @@ fn claw_jsonl_line_to_kim_message(value: serde_json::Value) -> Option<KimMessage
     })
 }
 
-fn normalize_claw_blocks(blocks: serde_json::Value) -> serde_json::Value {
+fn normalize_codex_blocks(blocks: serde_json::Value) -> serde_json::Value {
     let serde_json::Value::Array(items) = blocks else {
         return blocks;
     };
@@ -1305,7 +1305,10 @@ fn write_text_prompt_to_clipboard(prompt: &str) -> bool {
     let wrote = child
         .stdin
         .take()
-        .map(|mut stdin| stdin.write_all(&bytes).is_ok())
+        .map(|mut stdin| {
+            use std::io::Write;
+            stdin.write_all(&bytes).is_ok()
+        })
         .unwrap_or(false);
     let ok = wrote && child.wait().map(|s| s.success()).unwrap_or(false);
     let _ = std::fs::remove_file(&temp_path);
@@ -4558,8 +4561,8 @@ fn handle_webview_bridge_request(
             let session_type = query_param(&raw_url, "session_type").unwrap_or_else(|| "kim".to_string());
             let session_date = query_param(&raw_url, "session_date");
             let kim_dir = query_param(&raw_url, "kim_dir");
-            let claw_dir = query_param(&raw_url, "claw_dir");
-            let base = session_base_dir(&session_type, kim_dir, claw_dir);
+            let codex_dir = query_param(&raw_url, "codex_dir");
+            let base = session_base_dir(&session_type, kim_dir, codex_dir);
             match resolve_session_date_dir(&base, &session_id, session_date.as_deref()) {
                 Ok(date_dir) => {
                     let meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
@@ -4593,7 +4596,7 @@ fn handle_webview_bridge_request(
                 #[serde(default)]
                 kim_dir: Option<String>,
                 #[serde(default)]
-                claw_dir: Option<String>,
+                codex_dir: Option<String>,
             }
 
             let parsed: BrowserMetaWriteRequest = match serde_json::from_str(&body) {
@@ -4609,7 +4612,7 @@ fn handle_webview_bridge_request(
             }
 
             let stype = parsed.session_type.unwrap_or_else(|| "kim".to_string());
-            let base = session_base_dir(&stype, parsed.kim_dir, parsed.claw_dir);
+            let base = session_base_dir(&stype, parsed.kim_dir, parsed.codex_dir);
             let date_dir = match resolve_session_date_dir(&base, &parsed.session_id, parsed.session_date.as_deref()) {
                 Ok(v) => v,
                 Err(e) => {
@@ -4654,7 +4657,7 @@ fn handle_webview_bridge_request(
                 #[serde(default)]
                 kim_dir: Option<String>,
                 #[serde(default)]
-                claw_dir: Option<String>,
+                codex_dir: Option<String>,
             }
 
             let parsed: BrowserCommitRequest = match serde_json::from_str(&body) {
@@ -4682,7 +4685,7 @@ fn handle_webview_bridge_request(
                 .unwrap_or_else(|| "claude".to_string());
 
             let stype = parsed.session_type.unwrap_or_else(|| "kim".to_string());
-            let base = session_base_dir(&stype, parsed.kim_dir, parsed.claw_dir);
+            let base = session_base_dir(&stype, parsed.kim_dir, parsed.codex_dir);
             let date_dir = match resolve_session_date_dir(&base, &parsed.session_id, parsed.session_date.as_deref()) {
                 Ok(v) => v,
                 Err(e) => {
@@ -4728,7 +4731,7 @@ fn handle_webview_bridge_request(
                 #[serde(default)]
                 kim_dir: Option<String>,
                 #[serde(default)]
-                claw_dir: Option<String>,
+                codex_dir: Option<String>,
             }
 
             let parsed: BrowserRestoreRequest = match serde_json::from_str(&body) {
@@ -4751,7 +4754,7 @@ fn handle_webview_bridge_request(
             }
 
             let stype = parsed.session_type.unwrap_or_else(|| "kim".to_string());
-            let base = session_base_dir(&stype, parsed.kim_dir, parsed.claw_dir);
+            let base = session_base_dir(&stype, parsed.kim_dir, parsed.codex_dir);
             let date_dir = match resolve_session_date_dir(&base, &parsed.session_id, parsed.session_date.as_deref()) {
                 Ok(v) => v,
                 Err(e) => {
@@ -5327,19 +5330,19 @@ fn handle_bridge_result_request(
 }
 
 // ---------------------------------------------------------------------------
-// Claw file-bridge command watcher (Tasks 4/5/7 of the browser-parity work)
+// Codex file-bridge command watcher (Tasks 4/5/7 of the browser-parity work)
 // ---------------------------------------------------------------------------
 
-const CLAW_BRIDGE_DIR: &str = "/tmp/claw_bridge";
+const CODEX_BRIDGE_DIR: &str = "/tmp/codex_bridge";
 
 /// Spawn a background thread that:
-///  - Polls `/tmp/claw_bridge/browser_cmd.json` every 500 ms and dispatches
+///  - Polls `/tmp/codex_bridge/browser_cmd.json` every 500 ms and dispatches
 ///    show/hide/switch_site actions to the Kim webview window.
-///  - Writes `/tmp/claw_bridge/bridge_status.json` every 5 s so Claw's
+///  - Writes `/tmp/codex_bridge/bridge_status.json` every 5 s so Codex's
 ///    `/browser status` command can report the current bridge state.
 fn start_bridge_file_watcher(app_handle: tauri::AppHandle) {
     std::thread::spawn(move || {
-        let bridge_dir = std::path::Path::new(CLAW_BRIDGE_DIR);
+        let bridge_dir = std::path::Path::new(CODEX_BRIDGE_DIR);
         let cmd_path = bridge_dir.join("browser_cmd.json");
         let status_path = bridge_dir.join("bridge_status.json");
 
@@ -5601,7 +5604,7 @@ fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Result<(), Strin
 #[tauri::command]
 async fn list_sessions(
     kim_dir: Option<String>,
-    claw_dir: Option<String>,
+    codex_dir: Option<String>,
 ) -> Result<Vec<SessionInfo>, String> {
     let kim_base = kim_dir
         .map(PathBuf::from)
@@ -5609,10 +5612,10 @@ async fn list_sessions(
 
     let mut sessions = read_sessions_from_dir(&kim_base, "kim")?;
 
-    if let Some(claw_path) = claw_dir {
-        let claw_base = PathBuf::from(claw_path);
-        let claw_sessions = read_sessions_from_dir(&claw_base, "claw")?;
-        sessions.extend(claw_sessions);
+    if let Some(codex_path) = codex_dir {
+        let codex_base = PathBuf::from(codex_path);
+        let codex_sessions = read_sessions_from_dir(&codex_base, "codex")?;
+        sessions.extend(codex_sessions);
     }
 
     Ok(sessions)
@@ -5622,7 +5625,7 @@ async fn list_sessions(
 async fn delete_sessions(
     session_ids: Vec<String>,
     kim_dir: Option<String>,
-    claw_dir: Option<String>,
+    codex_dir: Option<String>,
 ) -> Result<(), String> {
     for session_id in session_ids {
         validate_session_id(&session_id)?;
@@ -5634,8 +5637,8 @@ async fn delete_sessions(
                 .as_deref()
                 .map(PathBuf::from)
                 .unwrap_or_else(default_sessions_dir)];
-            if let Some(claw_path) = &claw_dir {
-                v.push(PathBuf::from(claw_path));
+            if let Some(codex_path) = &codex_dir {
+                v.push(PathBuf::from(codex_path));
             }
             v
         };
@@ -5693,11 +5696,11 @@ async fn summarize_session(
 
     // Build the list of directories to search, same logic as load_session_messages
     let mut dirs_to_search: Vec<PathBuf> = vec![default_sessions_dir()];
-    if session_type == "claw" {
+    if session_type == "codex" {
         if let Some(ref pr) = project_root {
-            let claw_dir = PathBuf::from(pr).join(".claw").join("sessions");
-            if claw_dir.exists() {
-                dirs_to_search.push(claw_dir);
+            let codex_dir = PathBuf::from(pr).join(".codex").join("sessions");
+            if codex_dir.exists() {
+                dirs_to_search.push(codex_dir);
             }
         }
     }
@@ -5741,7 +5744,7 @@ async fn summarize_session(
             Err(_) => continue,
         };
 
-        // Handle both Kim format (role at top level) and Claw format (type: "message")
+        // Handle both Kim format (role at top level) and Codex format (type: "message")
         let (role, content) = if let Some(r) = value.get("role").and_then(|v| v.as_str()) {
             (r.to_string(), value.get("content").cloned())
         } else if value.get("type").and_then(|v| v.as_str()) == Some("message") {
@@ -5787,7 +5790,7 @@ async fn summarize_session(
                     if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
                         let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         if matches!(name, "write_file" | "edit_file" | "create_file") {
-                            // In Claw JSONL, input is often a JSON string rather than an object.
+                            // In Codex JSONL, input is often a JSON string rather than an object.
                             let mut path_str = None;
                             if let Some(input_val) = block.get("input") {
                                 if let Some(s) = input_val.as_str() {
@@ -5855,17 +5858,17 @@ async fn load_session_messages(
     session_id: String,
     session_date: Option<String>,
     kim_dir: Option<String>,
-    claw_dir: Option<String>,
+    codex_dir: Option<String>,
 ) -> Result<Vec<KimMessage>, String> {
     // Reject path-traversal attempts on the session_id.
     validate_session_id(&session_id)?;
-    // Search kim dir first, then claw dir
+    // Search kim dir first, then codex dir
     let dirs_to_search: Vec<PathBuf> = {
         let mut v = vec![kim_dir
             .map(PathBuf::from)
             .unwrap_or_else(default_sessions_dir)];
-        if let Some(claw_path) = claw_dir {
-            v.push(PathBuf::from(claw_path));
+        if let Some(codex_path) = codex_dir {
+            v.push(PathBuf::from(codex_path));
         }
         v
     };
@@ -5940,12 +5943,12 @@ fn find_session_date_dir(
     session_id: &str,
     session_date: Option<&str>,
     kim_dir: Option<&str>,
-    claw_dir: Option<&str>,
+    codex_dir: Option<&str>,
 ) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = vec![
         kim_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir),
     ];
-    if let Some(p) = claw_dir { dirs.push(PathBuf::from(p)); }
+    if let Some(p) = codex_dir { dirs.push(PathBuf::from(p)); }
     for base in &dirs {
         if !base.exists() { continue; }
         if let Some(date) = session_date {
@@ -5971,13 +5974,13 @@ async fn save_run_history(
     session_id: String,
     session_date: Option<String>,
     kim_dir: Option<String>,
-    claw_dir: Option<String>,
+    codex_dir: Option<String>,
     runs: serde_json::Value,
 ) -> Result<(), String> {
     validate_session_id(&session_id)?;
     if let Some(d) = session_date.as_deref() { validate_session_id(d)?; }
 
-    let dir = find_session_date_dir(&session_id, session_date.as_deref(), kim_dir.as_deref(), claw_dir.as_deref())
+    let dir = find_session_date_dir(&session_id, session_date.as_deref(), kim_dir.as_deref(), codex_dir.as_deref())
         .or_else(|| {
             // Fallback: write into today's directory under the kim sessions dir.
             let base = kim_dir.as_deref().map(PathBuf::from).unwrap_or_else(default_sessions_dir);
@@ -5999,12 +6002,12 @@ async fn load_run_history(
     session_id: String,
     session_date: Option<String>,
     kim_dir: Option<String>,
-    claw_dir: Option<String>,
+    codex_dir: Option<String>,
 ) -> Result<serde_json::Value, String> {
     validate_session_id(&session_id)?;
     if let Some(d) = session_date.as_deref() { validate_session_id(d)?; }
 
-    let dir = match find_session_date_dir(&session_id, session_date.as_deref(), kim_dir.as_deref(), claw_dir.as_deref()) {
+    let dir = match find_session_date_dir(&session_id, session_date.as_deref(), kim_dir.as_deref(), codex_dir.as_deref()) {
         Some(d) => d,
         None => return Ok(serde_json::json!([])),
     };
@@ -6356,11 +6359,11 @@ async fn session_browser_meta_read(
     session_date: Option<String>,
     session_type: Option<String>,
     kim_dir: Option<String>,
-    claw_dir: Option<String>,
+    codex_dir: Option<String>,
 ) -> Result<BrowserSessionMeta, String> {
     validate_session_id(&session_id)?;
     let stype = session_type.unwrap_or_else(|| "kim".to_string());
-    let base = session_base_dir(&stype, kim_dir, claw_dir);
+    let base = session_base_dir(&stype, kim_dir, codex_dir);
     let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
     Ok(read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default())
 }
@@ -6376,11 +6379,11 @@ async fn session_browser_meta_write(
     browser_last_site: Option<String>,
     last_llm_provider: Option<String>,
     kim_dir: Option<String>,
-    claw_dir: Option<String>,
+    codex_dir: Option<String>,
 ) -> Result<BrowserSessionMeta, String> {
     validate_session_id(&session_id)?;
     let stype = session_type.unwrap_or_else(|| "kim".to_string());
-    let base = session_base_dir(&stype, kim_dir, claw_dir);
+    let base = session_base_dir(&stype, kim_dir, codex_dir);
     let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
     let mut meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
 
@@ -6402,12 +6405,12 @@ async fn session_browser_url_commit(
     session_type: Option<String>,
     preferred_site: Option<String>,
     kim_dir: Option<String>,
-    claw_dir: Option<String>,
+    codex_dir: Option<String>,
     app_handle: tauri::AppHandle,
 ) -> Result<BrowserSessionMeta, String> {
     validate_session_id(&session_id)?;
     let Some(win) = app_handle.get_webview_window("kim-browser-signin") else {
-        return session_browser_meta_read(session_id, session_date, session_type, kim_dir, claw_dir).await;
+        return session_browser_meta_read(session_id, session_date, session_type, kim_dir, codex_dir).await;
     };
     let current_url = webview_current_href(&win);
     let site = preferred_site
@@ -6421,7 +6424,7 @@ async fn session_browser_url_commit(
         // Preserve good previous metadata. Generic homes, login pages, and
         // provider auth redirects must never overwrite the last useful thread.
         let stype = session_type.clone().unwrap_or_else(|| "kim".to_string());
-        let base = session_base_dir(&stype, kim_dir, claw_dir);
+        let base = session_base_dir(&stype, kim_dir, codex_dir);
         let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
         let mut meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
         if meta.browser_last_site.as_deref() != Some(site.as_str()) {
@@ -6441,7 +6444,7 @@ async fn session_browser_url_commit(
         None,
         None,
         kim_dir,
-        claw_dir,
+        codex_dir,
     ).await
 }
 
@@ -6452,7 +6455,7 @@ async fn restore_browser_for_session(
     session_type: Option<String>,
     preferred_site: Option<String>,
     kim_dir: Option<String>,
-    claw_dir: Option<String>,
+    codex_dir: Option<String>,
     app_handle: tauri::AppHandle,
 ) -> Result<BrowserRestoreResult, String> {
     validate_session_id(&session_id)?;
@@ -6461,7 +6464,7 @@ async fn restore_browser_for_session(
     }
 
     let stype = session_type.unwrap_or_else(|| "kim".to_string());
-    let base = session_base_dir(&stype, kim_dir, claw_dir);
+    let base = session_base_dir(&stype, kim_dir, codex_dir);
     let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
     let meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
 
@@ -6932,7 +6935,7 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
 }
 
 /// Read a single value from `<kim_root>/.env` (best-effort, no dependency).
-/// Real env vars take priority over file values; `claw` and `python` already
+/// Real env vars take priority over file values; `codex` and `python` already
 /// inherit the parent process env, so this only acts as a fallback.
 fn read_env_file_var(kim_root: &Path, key: &str) -> Option<String> {
     if let Ok(v) = std::env::var(key) {
@@ -6976,7 +6979,7 @@ fn ollama_openai_base_url(base_url: Option<&str>) -> String {
     }
 }
 
-async fn selected_ollama_claw_model(
+async fn selected_ollama_codex_model(
     mode: Option<&str>,
     base_url: Option<&str>,
     local_model: Option<&str>,
@@ -6997,7 +7000,7 @@ async fn selected_ollama_claw_model(
                 return Ok(first.to_string());
             }
         }
-        return Err("Pick or pull an Ollama local model before running Claw with Ollama Local.".to_string());
+        return Err("Pick or pull an Ollama local model before running Codex with Ollama Local.".to_string());
     }
     Ok(cloud_model
         .map(str::trim)
@@ -7006,7 +7009,7 @@ async fn selected_ollama_claw_model(
         .to_string())
 }
 
-async fn configure_claw_direct_provider(
+async fn configure_codex_direct_provider(
     cmd: &mut tokio::process::Command,
     provider_arg: &str,
     kim_root: &Path,
@@ -7018,7 +7021,7 @@ async fn configure_claw_direct_provider(
     let provider = provider_arg.trim().to_ascii_lowercase();
     match provider.as_str() {
         "ollama" => {
-            let model = selected_ollama_claw_model(
+            let model = selected_ollama_codex_model(
                 ollama_mode,
                 ollama_base_url,
                 ollama_local_model,
@@ -7032,8 +7035,8 @@ async fn configure_claw_direct_provider(
         }
         "openai" => {
             let key = read_env_file_var(kim_root, "OPENAI_API_KEY")
-                .ok_or_else(|| "Claw with OpenAI needs OPENAI_API_KEY in the environment or Kim's .env.".to_string())?;
-            let model = read_first_env_file_var(kim_root, &["CLAW_OPENAI_MODEL", "OPENAI_MODEL"])
+                .ok_or_else(|| "Codex with OpenAI needs OPENAI_API_KEY in the environment or Kim's .env.".to_string())?;
+            let model = read_first_env_file_var(kim_root, &["CODEX_OPENAI_MODEL", "OPENAI_MODEL"])
                 .unwrap_or_else(|| "openai/gpt-4o".to_string());
             cmd.arg("--model").arg(&model)
                 .env("OPENAI_API_KEY", key);
@@ -7044,8 +7047,8 @@ async fn configure_claw_direct_provider(
         }
         "deepseek" => {
             let key = read_env_file_var(kim_root, "DEEPSEEK_API_KEY")
-                .ok_or_else(|| "Claw with DeepSeek needs DEEPSEEK_API_KEY in the environment or Kim's .env.".to_string())?;
-            let model = read_first_env_file_var(kim_root, &["CLAW_DEEPSEEK_MODEL", "DEEPSEEK_MODEL"])
+                .ok_or_else(|| "Codex with DeepSeek needs DEEPSEEK_API_KEY in the environment or Kim's .env.".to_string())?;
+            let model = read_first_env_file_var(kim_root, &["CODEX_DEEPSEEK_MODEL", "DEEPSEEK_MODEL"])
                 .unwrap_or_else(|| "deepseek-chat".to_string());
             let base = read_env_file_var(kim_root, "DEEPSEEK_BASE_URL")
                 .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
@@ -7056,8 +7059,8 @@ async fn configure_claw_direct_provider(
         }
         "gemini" => {
             let key = read_env_file_var(kim_root, "GOOGLE_API_KEY")
-                .ok_or_else(|| "Claw with Gemini direct API needs GOOGLE_API_KEY in the environment or Kim's .env. Kim's Google OAuth token is only wired into the Chat provider path.".to_string())?;
-            let model = read_first_env_file_var(kim_root, &["CLAW_GEMINI_MODEL", "GEMINI_MODEL"])
+                .ok_or_else(|| "Codex with Gemini direct API needs GOOGLE_API_KEY in the environment or Kim's .env. Kim's Google OAuth token is only wired into the Chat provider path.".to_string())?;
+            let model = read_first_env_file_var(kim_root, &["CODEX_GEMINI_MODEL", "GEMINI_MODEL"])
                 .unwrap_or_else(|| "gemini-2.0-flash".to_string());
             let base = read_env_file_var(kim_root, "GEMINI_OPENAI_BASE_URL")
                 .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta/openai".to_string());
@@ -7068,9 +7071,9 @@ async fn configure_claw_direct_provider(
         }
         _ => {
             let key = read_first_env_file_var(kim_root, &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"])
-                .ok_or_else(|| "Claw needs an Anthropic API key for Claude direct mode. Add ANTHROPIC_API_KEY to Kim's .env, or switch the provider dropdown to Ollama/Browser.".to_string())?;
+                .ok_or_else(|| "Codex needs an Anthropic API key for Claude direct mode. Add ANTHROPIC_API_KEY to Kim's .env, or switch the provider dropdown to Ollama/Browser.".to_string())?;
             cmd.env("ANTHROPIC_API_KEY", key);
-            for key in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAW_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
+            for key in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CODEX_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
                 if let Some(value) = read_env_file_var(kim_root, key) {
                     cmd.env(key, value);
                 }
@@ -7080,44 +7083,98 @@ async fn configure_claw_direct_provider(
     }
 }
 
-/// Locate the `claw` binary. Search order:
-/// 1. CLAW_BIN env var (explicit override)
-/// 2. <kim_root>/pythonExperimentTool/... (nested layout — pythonExperimentTool inside kim-pro)
-/// 3. <kim_root.parent()>/pythonExperimentTool/... (sibling layout — classic fork structure)
-/// 4. `claw` on PATH
-fn find_claw_binary(kim_root: &Path) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CLAW_BIN") {
-        let path = PathBuf::from(p);
-        if path.is_file() {
-            return Some(path);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeBackendKind {
+    Codex,
+    Claw,
+}
+
+impl CodeBackendKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claw => "Claw compatibility",
         }
     }
-    // Search both the kim_root itself and its parent so the binary is found
-    // regardless of whether pythonExperimentTool is nested inside kim-pro
-    // (e.g. kim-pro/pythonExperimentTool/...) or lives alongside it as a
-    // sibling (e.g. <fork>/kim-pro + <fork>/pythonExperimentTool/...).
+
+    fn binary_label(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claw => "claw",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CodeBackend {
+    kind: CodeBackendKind,
+    binary: PathBuf,
+}
+
+fn executable_from_env(key: &str, kind: CodeBackendKind) -> Option<CodeBackend> {
+    let path = PathBuf::from(std::env::var(key).ok()?);
+    if path.is_file() {
+        Some(CodeBackend { kind, binary: path })
+    } else {
+        None
+    }
+}
+
+fn executable_on_path(name: &str, kind: CodeBackendKind) -> Option<CodeBackend> {
+    let out = std::process::Command::new("which").arg(name).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(CodeBackend { kind, binary: PathBuf::from(s) })
+    }
+}
+
+fn bundled_code_backend(kim_root: &Path, kind: CodeBackendKind) -> Option<CodeBackend> {
     let mut roots: Vec<PathBuf> = vec![kim_root.to_path_buf()];
     if let Some(parent) = kim_root.parent() {
         roots.push(parent.to_path_buf());
     }
+    let relative = match kind {
+        CodeBackendKind::Codex => "pythonExperimentTool/codex-code/rust/target",
+        CodeBackendKind::Claw => "pythonExperimentTool/claw-code/rust/target",
+    };
+    let binary_name = kind.binary_label();
     for root in &roots {
         for sub in &["release", "debug"] {
-            let p = root.join(format!("pythonExperimentTool/claw-code/rust/target/{}/claw", sub));
+            let p = root.join(relative).join(sub).join(binary_name);
             if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    // Fall back to PATH
-    if let Ok(out) = std::process::Command::new("which").arg("claw").output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Some(PathBuf::from(s));
+                return Some(CodeBackend { kind, binary: p });
             }
         }
     }
     None
+}
+
+/// Locate the code-agent binary. Prefer the post-migration `codex` binary,
+/// but fall back to the bundled `claw` binary while this branch still carries
+/// the old Rust workspace layout.
+fn find_code_backend(kim_root: &Path) -> Option<CodeBackend> {
+    if let Ok(p) = std::env::var("CODEX_BIN") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            let kind = if filename == "claw" {
+                CodeBackendKind::Claw
+            } else {
+                CodeBackendKind::Codex
+            };
+            return Some(CodeBackend { kind, binary: path });
+        }
+    }
+    executable_from_env("CLAW_BIN", CodeBackendKind::Claw)
+        .or_else(|| bundled_code_backend(kim_root, CodeBackendKind::Codex))
+        .or_else(|| executable_on_path("codex", CodeBackendKind::Codex))
+        .or_else(|| bundled_code_backend(kim_root, CodeBackendKind::Claw))
+        .or_else(|| executable_on_path("claw", CodeBackendKind::Claw))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7155,7 +7212,7 @@ async fn send_task(
     // and as the working directory so `python -m orchestrator.agent` resolves.
     let kim_root = default_project_root();
 
-    // The target project the user wants Kim/Claw to work on.  For the normal
+    // The target project the user wants Kim/Codex to work on.  For the normal
     // Chat tab this is typically the Kim repo itself.  For the Code tab it is
     // the user's external code project.  MCP tools use PROJECT_ROOT to know
     // which directory to operate in (file reads/writes, git, search, etc.).
@@ -7164,15 +7221,15 @@ async fn send_task(
         .filter(|p| p.exists())
         .unwrap_or_else(|| kim_root.clone());
 
-    // Claw mode is ONLY when the target project is a real external project,
+    // Codex mode is ONLY when the target project is a real external project,
     // i.e. distinct from the Kim repo itself. The Chat tab passes the Kim
     // repo as project_root (so MCP tools know the workspace), but those
-    // sessions must still land in kim_sessions/, not .claw/sessions/.
-    let is_claw = target_root.canonicalize().ok()
+    // sessions must still land in kim_sessions/, not .codex/sessions/.
+    let is_codex = target_root.canonicalize().ok()
         != kim_root.canonicalize().ok();
 
-    let session_dir = if is_claw {
-        target_root.join(".claw").join("sessions")
+    let session_dir = if is_codex {
+        target_root.join(".codex").join("sessions")
     } else {
         kim_root.join("kim_sessions")
     };
@@ -7184,43 +7241,56 @@ async fn send_task(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "ollama".to_string());
     // Whether the user picked a browser-backed provider in the composer (e.g.
-    // "browser:gemini"). For Code-tab tasks this routes Claw through Kim's
+    // "browser:gemini"). For Code-tab tasks this routes Codex through Kim's
     // BrowserProvider via the file-bridge instead of calling Anthropic.
     let is_browser_provider = provider_arg == "browser" || provider_arg.starts_with("browser:");
 
-    // Code (Claw) sessions run the `claw` binary directly against the user's
-    // project, with Claw's own coding-agent system prompt. Chat (Kim) sessions
+    let code_backend = if is_codex {
+        Some(find_code_backend(&kim_root).ok_or_else(|| {
+            "Code agent binary not found. Build `pythonExperimentTool/codex-code/rust` for Codex, build `pythonExperimentTool/claw-code/rust` for the bundled compatibility backend, or set CODEX_BIN/CLAW_BIN to the binary path.".to_string()
+        })?)
+    } else {
+        None
+    };
+
+    // Code sessions run the coding-agent binary directly against the user's
+    // project, with its own coding-agent system prompt. Chat (Kim) sessions
     // continue to run `python -m orchestrator.agent` with the desktop-control
     // system prompt. Routing them through different binaries is what keeps the
     // two personas separate end-to-end.
-    let mut cmd = if is_claw {
-        let claw_bin = find_claw_binary(&kim_root)
-            .ok_or_else(|| "Claw binary not found. Build it with `cargo build --release` in pythonExperimentTool/claw-code/rust, or set CLAW_BIN to the binary path.".to_string())?;
+    let mut cmd = if is_codex {
+        let code_backend = code_backend
+            .as_ref()
+            .expect("code backend resolved for code mode");
+        let code_bin = &code_backend.binary;
 
         if is_browser_provider {
+            if code_backend.kind == CodeBackendKind::Claw {
+                return Err("Browser-backed Code mode needs the Codex binary. This checkout only has the bundled Claw compatibility binary, so switch the provider to Ollama/OpenAI or build/set CODEX_BIN.".to_string());
+            }
             // ── Browser-bridge mode ──────────────────────────────────────
-            // Spawn `python -m orchestrator.run_claw_bridge`, which spawns
-            // Claw with CLAW_FILE_BRIDGE=1 and relays each LLM request
+            // Spawn `python -m orchestrator.run_codex_bridge`, which spawns
+            // Codex with CODEX_FILE_BRIDGE=1 and relays each LLM request
             // through Kim's BrowserProvider. No Anthropic key required.
             let python = find_python_interpreter(&kim_root)?;
             let _ = app_handle.emit(
                 "kim-agent-output",
-                format!("[STATUS] Routing to Claw via Kim's browser provider ({})", provider_arg),
+                format!("[STATUS] Routing to Codex via Kim's browser provider ({})", provider_arg),
             );
             let _ = app_handle.emit(
                 "kim-agent-output",
-                format!("[STATUS] claw binary: {}", claw_bin.display()),
+                format!("[STATUS] codex binary: {}", code_bin.display()),
             );
             let mut c = Command::new(&python);
-            c.args(["-m", "orchestrator.run_claw_bridge"])
+            c.args(["-m", "orchestrator.run_codex_bridge"])
                 .arg("--task").arg(&task)
                 .arg("--cwd").arg(target_root.to_string_lossy().to_string())
                 .arg("--provider").arg(&provider_arg)
                 .current_dir(&kim_root)
                 .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
-                // Tell run_claw_subtask exactly which claw binary to spawn,
+                // Tell run_codex_subtask exactly which codex binary to spawn,
                 // so it doesn't have to repeat the search dance.
-                .env("CLAW_BIN", claw_bin.to_string_lossy().to_string())
+                .env("CODEX_BIN", code_bin.to_string_lossy().to_string())
                 // Forward webview-bridge creds so BrowserProvider can drive
                 // the in-app sign-in window in headless mode if configured.
                 .stdout(Stdio::piped())
@@ -7228,25 +7298,76 @@ async fn send_task(
             c
         } else {
             // ── Direct API mode ──────────────────────────────────────────
-            let mut c = Command::new(&claw_bin);
-            c.arg("--output-format").arg("json")
-                .current_dir(&target_root)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let route = configure_claw_direct_provider(
-                &mut c,
-                &provider_arg,
-                &kim_root,
-                ollama_base_url.as_deref(),
-                ollama_mode.as_deref(),
-                ollama_local_model.as_deref(),
-                ollama_cloud_model.as_deref(),
-            ).await?;
-            let _ = app_handle.emit(
-                "kim-agent-output",
-                format!("[STATUS] Routing unchanged task to Claw via {}: {}", route, claw_bin.display()),
-            );
-            c.arg("prompt").arg(&task);
+            let mut c = Command::new(code_bin);
+            if code_backend.kind == CodeBackendKind::Codex {
+                // New OpenAI Codex CLI: uses `exec --json` subcommand.
+                // When the provider is Ollama, use --oss --local-provider ollama
+                // so Codex bypasses its own ChatGPT account auth entirely and
+                // routes through the local Ollama daemon instead.
+                c.arg("exec")
+                    .arg("--json")
+                    .arg("--dangerously-bypass-approvals-and-sandbox")
+                    .arg("-C").arg(target_root.to_string_lossy().to_string())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let route = if provider_arg.trim().eq_ignore_ascii_case("ollama") {
+                    let model = selected_ollama_codex_model(
+                        ollama_mode.as_deref(),
+                        ollama_base_url.as_deref(),
+                        ollama_local_model.as_deref(),
+                        ollama_cloud_model.as_deref(),
+                    ).await?;
+                    c.arg("--oss")
+                        .arg("--local-provider").arg("ollama")
+                        .arg("--model").arg(&model);
+                    format!("Ollama via local daemon ({model})")
+                } else {
+                    configure_codex_direct_provider(
+                        &mut c,
+                        &provider_arg,
+                        &kim_root,
+                        ollama_base_url.as_deref(),
+                        ollama_mode.as_deref(),
+                        ollama_local_model.as_deref(),
+                        ollama_cloud_model.as_deref(),
+                    ).await?
+                };
+                let _ = app_handle.emit(
+                    "kim-agent-output",
+                    format!(
+                        "[STATUS] ✓ Using Codex CLI via {}: {}",
+                        route,
+                        code_bin.display(),
+                    ),
+                );
+                c.arg(&task);
+            } else {
+                // Claw compatibility binary: uses old --output-format json interface.
+                c.arg("--output-format").arg("json")
+                    .current_dir(&target_root)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let route = configure_codex_direct_provider(
+                    &mut c,
+                    &provider_arg,
+                    &kim_root,
+                    ollama_base_url.as_deref(),
+                    ollama_mode.as_deref(),
+                    ollama_local_model.as_deref(),
+                    ollama_cloud_model.as_deref(),
+                ).await?;
+                let _ = app_handle.emit(
+                    "kim-agent-output",
+                    format!(
+                        "[STATUS] Routing code task to {} via {}: {}",
+                        code_backend.kind.label(),
+                        route,
+                        code_bin.display(),
+                    ),
+                );
+                c.arg("prompt").arg(&task);
+            }
             c
         }
     } else {
@@ -7272,8 +7393,8 @@ async fn send_task(
     let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();
     // The webview-bridge creds let BrowserProvider drive the in-app sign-in
     // window. Forward them whenever a browser provider is in play, including
-    // Claw-via-browser-bridge runs, so headless flows stay consistent.
-    if !is_claw || is_browser_provider {
+    // Codex-via-browser-bridge runs, so headless flows stay consistent.
+    if !is_codex || is_browser_provider {
         if let Some(cfg) = &bridge_cfg {
             cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
                 .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
@@ -7290,7 +7411,7 @@ async fn send_task(
         cmd.env("KIM_BROWSER_RESTORE_STATUS", restore_status);
     }
 
-    if !is_claw && provider_arg.trim().eq_ignore_ascii_case("gemini") {
+    if !is_codex && provider_arg.trim().eq_ignore_ascii_case("gemini") {
         let google_env = google_oauth::google_oauth_env_for_agent().await.map_err(|err| {
             format!(
                 "Google for Kim is not connected. Open Settings → Account → Google for Kim (API), then Continue with Google. {}",
@@ -7303,8 +7424,8 @@ async fn send_task(
     }
 
     // Chrome CDP launch is needed whenever a browser provider is in play —
-    // both for Kim's Chat-tab tasks and for Claw running in browser-bridge
-    // mode (which calls into BrowserProvider via run_claw_bridge).
+    // both for Kim's Chat-tab tasks and for Codex running in browser-bridge
+    // mode (which calls into BrowserProvider via run_codex_bridge).
     if is_browser_provider {
         if bridge_cfg.is_none() {
             let root_for_chrome = kim_root.clone();
@@ -7325,7 +7446,7 @@ async fn send_task(
         }
     }
 
-    let resume_arg = if is_claw {
+    let resume_arg = if is_codex {
         None
     } else {
         resume_session_id
@@ -7338,11 +7459,11 @@ async fn send_task(
         cmd.arg("--resume").arg(resume_id);
     }
 
-    if !is_claw {
+    if !is_codex {
         cmd.arg("--provider").arg(&provider_arg);
     }
 
-    if !is_claw && provider_arg.trim().eq_ignore_ascii_case("ollama") {
+    if !is_codex && provider_arg.trim().eq_ignore_ascii_case("ollama") {
         if let Some(base_url) = ollama_base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             cmd.env("KIM_OLLAMA_BASE_URL", base_url);
         }
@@ -7364,7 +7485,7 @@ async fn send_task(
         cmd.env("KIM_GEMINI_AUTHUSER", idx.to_string());
     }
 
-    if !is_claw {
+    if !is_codex {
         if let Some(budget) = context_budget_tokens.filter(|b| *b > 0) {
             cmd.env("KIM_CONTEXT_BUDGET_TOKENS", budget.to_string());
         }
@@ -7461,8 +7582,14 @@ async fn send_task(
         let _ = flash_win.close();
     }
 
-    if is_claw {
-        if let Some(session) = newest_claw_session(&target_root) {
+    if is_codex {
+        if code_backend
+            .as_ref()
+            .is_some_and(|backend| backend.kind == CodeBackendKind::Claw)
+        {
+            let _ = mirror_latest_claw_session_to_codex(&target_root);
+        }
+        if let Some(session) = newest_codex_session(&target_root) {
             let _ = app_handle.emit("kim-agent-code-session", session);
         }
     }
@@ -8135,7 +8262,7 @@ pub struct KimAccount {
     pub gist_id: Option<String>,
     pub created_at: String,
     /// Explicit project root paths the user has added to the Code tab.
-    /// Kim scans <path>/.claw/sessions/ for each — never ~/.claude/projects/.
+    /// Kim scans <path>/.codex/sessions/ for each — never ~/.claude/projects/.
     #[serde(default)]
     pub code_projects: Vec<String>,
     /// Google accounts with their authuser indices for Gemini browser sign-in.
@@ -9298,13 +9425,13 @@ async fn restore_from_gist(
 }
 
 // ---------------------------------------------------------------------------
-// Claw (Code) projects — grouped by project directory + git branch
+// Codex (Code) projects — grouped by project directory + git branch
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ClawSession {
+pub struct CodexSession {
     pub session_id: String,
-    /// YYYY-MM-DD bucket under <project>/.claw/sessions. Used to locate the file on disk.
+    /// YYYY-MM-DD bucket under <project>/.codex/sessions. Used to locate the file on disk.
     pub date: String,
     /// ISO timestamp (UTC) derived from file modified time. Used for sorting/display.
     pub updated_at: String,
@@ -9314,17 +9441,17 @@ pub struct ClawSession {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ClawBranch {
+pub struct CodexBranch {
     pub name: String,           // git branch name, or "main" / "unknown"
-    pub sessions: Vec<ClawSession>,
+    pub sessions: Vec<CodexSession>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ClawProject {
+pub struct CodexProject {
     pub path: String,           // decoded project path
     pub name: String,           // last path component (display name)
     pub current_branch: String, // current git branch in that dir
-    pub branches: Vec<ClawBranch>,
+    pub branches: Vec<CodexBranch>,
 }
 
 fn read_git_branch(project_path: &Path) -> String {
@@ -9341,12 +9468,12 @@ fn read_git_branch(project_path: &Path) -> String {
     "main".to_string()
 }
 
-/// List Claw sessions for explicitly-added project paths.
-/// Scans <project>/.claw/sessions/ — NEVER ~/.claude/projects/.
-/// Claw and Claude Code must never mix.
+/// List Codex sessions for explicitly-added project paths.
+/// Scans <project>/.codex/sessions/ — NEVER ~/.claude/projects/.
+/// Codex and Claude Code must never mix.
 #[tauri::command]
-async fn list_claw_projects(project_paths: Vec<String>) -> Result<Vec<ClawProject>, String> {
-    let mut result: Vec<ClawProject> = Vec::new();
+async fn list_codex_projects(project_paths: Vec<String>) -> Result<Vec<CodexProject>, String> {
+    let mut result: Vec<CodexProject> = Vec::new();
 
     for raw_path in project_paths {
         let project_path = PathBuf::from(&raw_path);
@@ -9361,11 +9488,11 @@ async fn list_claw_projects(project_paths: Vec<String>) -> Result<Vec<ClawProjec
 
         let current_branch = read_git_branch(&project_path);
 
-        // Claw stores sessions at <project>/.claw/sessions/ — this is the
+        // Codex stores sessions at <project>/.codex/sessions/ — this is the
         // ONLY place we look. ~/.claude/projects is off-limits.
-        let claw_sessions_dir = project_path.join(".claw").join("sessions");
-        let sessions = if claw_sessions_dir.exists() {
-            read_project_sessions(&claw_sessions_dir)
+        let codex_sessions_dir = project_path.join(".codex").join("sessions");
+        let sessions = if codex_sessions_dir.exists() {
+            read_project_sessions(&codex_sessions_dir)
         } else {
             vec![]
         };
@@ -9375,13 +9502,13 @@ async fn list_claw_projects(project_paths: Vec<String>) -> Result<Vec<ClawProjec
         let branches = if sessions.is_empty() {
             vec![]
         } else {
-            vec![ClawBranch {
+            vec![CodexBranch {
                 name: current_branch.clone(),
                 sessions,
             }]
         };
 
-        result.push(ClawProject {
+        result.push(CodexProject {
             path: raw_path,
             name,
             current_branch,
@@ -9470,8 +9597,8 @@ async fn open_in_finder(path: String) -> Result<(), String> {
     }
 }
 
-fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
-    // Claw stores sessions bucketed by date: <dir>/<YYYY-MM-DD>/<session_id>.jsonl.
+fn read_project_sessions(dir: &Path) -> Vec<CodexSession> {
+    // Codex stores sessions bucketed by date: <dir>/<YYYY-MM-DD>/<session_id>.jsonl.
     // Walk each date subdirectory, then collect the .jsonl files inside.
     let mut sessions = Vec::new();
     let Ok(date_entries) = fs::read_dir(dir) else { return sessions };
@@ -9525,7 +9652,7 @@ fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
                 None
             };
             let title = infer_session_title(&fe.path(), summary.as_ref(), &session_id);
-            sessions.push(ClawSession {
+            sessions.push(CodexSession {
                 session_id,
                 date: date.clone(),
                 updated_at: modified_at,
@@ -9538,8 +9665,87 @@ fn read_project_sessions(dir: &Path) -> Vec<ClawSession> {
     sessions
 }
 
-fn newest_claw_session(project_path: &Path) -> Option<CompletedClawSession> {
-    let sessions_dir = project_path.join(".claw").join("sessions");
+fn newest_claw_session_file(project_path: &Path) -> Option<(PathBuf, SystemTime)> {
+    let sessions_root = project_path.join(".claw").join("sessions");
+    let entries = fs::read_dir(&sessions_root).ok()?;
+    let mut newest: Option<(PathBuf, SystemTime)> = None;
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            let Ok(files) = fs::read_dir(&path) else { continue };
+            for file_entry in files.filter_map(|e| e.ok()) {
+                let file_path = file_entry.path();
+                let Some(name) = file_path.file_name().and_then(|n| n.to_str()) else { continue };
+                if !name.ends_with(".jsonl") || name.contains(".summary") {
+                    continue;
+                }
+                let modified = file_entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let is_newest = newest
+                    .as_ref()
+                    .map(|(_, previous)| modified > *previous)
+                    .unwrap_or(true);
+                if is_newest {
+                    newest = Some((file_path, modified));
+                }
+            }
+        } else {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if !name.ends_with(".jsonl") || name.contains(".summary") {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let is_newest = newest
+                .as_ref()
+                .map(|(_, previous)| modified > *previous)
+                .unwrap_or(true);
+            if is_newest {
+                newest = Some((path, modified));
+            }
+        }
+    }
+
+    newest
+}
+
+fn date_for_system_time(time: SystemTime) -> String {
+    let secs = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    unix_secs_to_utc_iso(secs)
+        .get(0..10)
+        .map(str::to_string)
+        .unwrap_or_else(chrono_like_today)
+}
+
+fn mirror_latest_claw_session_to_codex(project_path: &Path) -> Option<PathBuf> {
+    let (src, modified) = newest_claw_session_file(project_path)?;
+    let filename = src.file_name()?.to_os_string();
+    let date = date_for_system_time(modified);
+    let dest_dir = project_path.join(".codex").join("sessions").join(date);
+    fs::create_dir_all(&dest_dir).ok()?;
+    let dest = dest_dir.join(filename);
+
+    let should_copy = match fs::metadata(&dest).and_then(|m| m.modified()) {
+        Ok(dest_modified) => modified > dest_modified,
+        Err(_) => true,
+    };
+    if should_copy {
+        fs::copy(&src, &dest).ok()?;
+    }
+
+    Some(dest)
+}
+
+fn newest_codex_session(project_path: &Path) -> Option<CompletedCodexSession> {
+    let sessions_dir = project_path.join(".codex").join("sessions");
     let date_entries = fs::read_dir(&sessions_dir).ok()?;
     let mut newest: Option<(SystemTime, PathBuf, String, String)> = None;
 
@@ -9589,15 +9795,15 @@ fn newest_claw_session(project_path: &Path) -> Option<CompletedClawSession> {
     let title = infer_session_title(&path, summary.as_ref(), &session_id);
     let project_path_str = project_path.to_string_lossy().to_string();
 
-    Some(CompletedClawSession {
-        session_key: format!("claw:{}:{}", date, session_id),
+    Some(CompletedCodexSession {
+        session_key: format!("codex:{}:{}", date, session_id),
         session_id,
         title,
         date,
         message_count,
         has_summary: summary.is_some(),
         summary,
-        session_type: "claw".to_string(),
+        session_type: "codex".to_string(),
         project_path: project_path_str,
     })
 }
@@ -9797,7 +10003,7 @@ pub fn run() {
             import_data,
             backup_to_gist,
             restore_from_gist,
-            list_claw_projects,
+            list_codex_projects,
             add_code_project,
             remove_code_project,
             open_in_finder,
