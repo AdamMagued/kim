@@ -3,13 +3,21 @@ use std::fs;
 use tokio::process::Command;
 
 use crate::config::{config_path, KimConfig, ThemeName};
-use crate::provider::{provider_info, PROVIDERS};
+use crate::provider::provider_info;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandOutcome {
+    /// Important — pushed to chat as a "note" the user should read.
     Message(String),
+    /// Routine confirmation — shown in the status bar only, no chat bubble.
+    Info(String),
+    /// Login succeeded — push message to chat AND mark provider as ready.
+    ProviderConnected(String),
+    /// Provider needs an API key — activate secure input mode inside the TUI.
+    NeedApiKey(String),
     SendPrompt(String),
     OpenModelPicker(Vec<String>),
+    OpenProviderPicker,
     Compact,
     Exit,
 }
@@ -60,7 +68,14 @@ pub async fn handle_command(input: &str, config: &mut KimConfig) -> CommandOutco
         "/theme" => set_theme(args, config),
         "/login" => login(args, config).await,
         "/logout" => logout(args, config),
-        "/sessions" | "/resume" => CommandOutcome::Message("__KIM_REFRESH_SESSIONS__".to_string()),
+        "/sessions" => CommandOutcome::Message("__KIM_REFRESH_SESSIONS__".to_string()),
+        "/resume" => {
+            if args.is_empty() {
+                CommandOutcome::Message("__KIM_REFRESH_SESSIONS__".to_string())
+            } else {
+                CommandOutcome::Message(format!("__KIM_RESUME_SESSION__:{args}"))
+            }
+        }
         "/usage" => CommandOutcome::Message("Usage tracking is local-only in this v1 shell; provider billing remains in provider dashboards.".to_string()),
         "/compact" => CommandOutcome::Compact,
         "/diff" => shell("git", &["diff", "--stat"], "git diff --stat").await,
@@ -115,30 +130,18 @@ fn status(config: &KimConfig) -> String {
 
 fn set_provider(args: &str, config: &mut KimConfig) -> CommandOutcome {
     if args.is_empty() {
-        let names = PROVIDERS
-            .iter()
-            .map(|provider| {
-                if provider.name == config.provider {
-                    format!("* {}", provider.name)
-                } else {
-                    format!("  {}", provider.name)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        return CommandOutcome::Message(format!(
-            "Available providers:\n{names}\n\nPick one with /provider ollama, /provider claude, /provider openai, /provider gemini, /provider deepseek, or /provider desktop."
-        ));
+        return CommandOutcome::OpenProviderPicker;
     }
     let name = args.to_ascii_lowercase();
     let Some(provider) = provider_info(&name) else {
         return CommandOutcome::Message(format!("Unknown provider: {args}"));
     };
+    let provider_changed = config.provider != provider.name;
     config.provider = provider.name.to_string();
-    if config.model.trim().is_empty() || config.model == "llama3.2" {
+    if provider_changed || config.model.trim().is_empty() {
         config.model = provider.default_model.to_string();
     }
-    save_notice(config, format!("Provider set to {}.", provider.name))
+    config_notice(config, format!("provider → {}  model → {}", provider.name, config.model))
 }
 
 async fn set_model(args: &str, config: &mut KimConfig) -> CommandOutcome {
@@ -146,16 +149,17 @@ async fn set_model(args: &str, config: &mut KimConfig) -> CommandOutcome {
         return CommandOutcome::OpenModelPicker(model_options(config).await);
     }
     config.model = args.to_string();
-    save_notice(config, format!("Model set to {}.", config.model))
+    config_notice(config, format!("model → {}", config.model))
 }
 
 pub async fn model_options(config: &KimConfig) -> Vec<String> {
     let mut models = match config.provider.as_str() {
         "ollama" => ollama_models().await,
         "claude" => vec![
+            "claude-opus-4-7".to_string(),
             "claude-opus-4-6".to_string(),
-            "claude-sonnet-4-5".to_string(),
-            "claude-3-5-sonnet-latest".to_string(),
+            "claude-sonnet-4-6".to_string(),
+            "claude-haiku-4-5-20251001".to_string(),
         ],
         "openai" => vec![
             "gpt-4o".to_string(),
@@ -224,11 +228,16 @@ fn set_theme(args: &str, config: &mut KimConfig) -> CommandOutcome {
         return CommandOutcome::Message("Use /theme dark or /theme light.".to_string());
     };
     config.theme = theme;
-    save_notice(config, format!("Theme set to {}.", theme.label()))
+    config_notice(config, format!("theme → {}", theme.label()))
 }
 
 async fn login(args: &str, config: &mut KimConfig) -> CommandOutcome {
-    let provider = if args.is_empty() { "ollama" } else { args }.to_ascii_lowercase();
+    if args.is_empty() {
+        return CommandOutcome::Message(
+            "Choose a provider to sign in to:\n  /login ollama    — local Ollama server (free)\n  /login claude    — Anthropic API key\n  /login openai    — OpenAI API key\n  /login gemini    — Google Gemini API key\n  /login deepseek  — DeepSeek API key".to_string()
+        );
+    }
+    let provider = args.to_ascii_lowercase();
     match provider.as_str() {
         "ollama" => ollama_login(config).await,
         "desktop" => {
@@ -241,86 +250,158 @@ async fn login(args: &str, config: &mut KimConfig) -> CommandOutcome {
         other => {
             if !KEY_PROVIDERS.contains(&other) {
                 return CommandOutcome::Message(format!(
-                    "Unknown login provider: {other}\nUse /login for Ollama, or /login claude, /login openai, /login gemini, /login deepseek for API keys."
+                    "Unknown login provider: {other}\nUse /login ollama, claude, openai, gemini, or deepseek."
                 ));
             }
-            let prompt = format!("Enter {other} API key: ");
-            match rpassword::prompt_password(prompt) {
-                Ok(key) if !key.trim().is_empty() => {
-                    config
-                        .api_keys
-                        .insert(other.to_string(), key.trim().to_string());
-                    config.provider = other.to_string();
-                    save_notice(config, format!("{other} API key saved."))
-                }
-                Ok(_) => CommandOutcome::Message("No key entered.".to_string()),
-                Err(error) => CommandOutcome::Message(format!("Could not read API key: {error}")),
-            }
+            // Signal the TUI to enter secure input mode — key entry stays inside Kim.
+            CommandOutcome::NeedApiKey(other.to_string())
+        }
+    }
+}
+
+/// Called by the TUI after the user finishes typing an API key in secure input mode.
+pub async fn login_with_key(provider: &str, key: &str, config: &mut KimConfig) -> CommandOutcome {
+    if key.trim().is_empty() {
+        return CommandOutcome::Message("No key entered.".to_string());
+    }
+    let key = key.trim().to_string();
+    let validation = validate_api_key(provider, &key).await;
+    config.api_keys.insert(provider.to_string(), key);
+    config.provider = provider.to_string();
+    if let Some(info) = provider_info(provider) {
+        config.model = info.default_model.to_string();
+    }
+    match validation {
+        Ok(()) => {
+            let save_err = config
+                .save()
+                .err()
+                .map(|e| format!("\nWarning: config not saved: {e}"))
+                .unwrap_or_default();
+            CommandOutcome::ProviderConnected(format!(
+                "Signed in to {provider} · key validated · ready to chat.{save_err}"
+            ))
+        }
+        Err(e) => {
+            let _ = config.save();
+            CommandOutcome::Message(format!(
+                "Key saved for {provider} but validation failed: {e}\nIf the key is correct, Kim will use it anyway."
+            ))
         }
     }
 }
 
 async fn ollama_login(config: &mut KimConfig) -> CommandOutcome {
-    // `ollama signin` is unreliable across platforms and versions — it can return
-    // exit 0 without actually opening any browser or prompting the user.
-    // The browser flow is the only path that reliably gets the user signed in.
-    match Command::new("ollama").arg("--version").output().await {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            #[cfg(windows)]
-            return CommandOutcome::Message(
-                "Ollama is not installed or not on PATH.\nInstall Ollama for Windows, open it once, then run /login again.\nhttps://ollama.com/download/windows".to_string(),
-            );
-            #[cfg(not(windows))]
-            return CommandOutcome::Message(
-                "Ollama is not installed or not on PATH.\nInstall Ollama, open it once, then run /login again.\nhttps://ollama.com/download".to_string(),
-            );
-        }
-        _ => {}
+    if !ollama_is_available().await {
+        #[cfg(windows)]
+        return CommandOutcome::Message(
+            "Ollama is not installed.\nDownload and install it, then run 'ollama serve' in a terminal, then /login ollama again.\nhttps://ollama.com/download/windows".to_string(),
+        );
+        #[cfg(not(windows))]
+        return CommandOutcome::Message(
+            "Ollama is not installed.\nInstall it, run 'ollama serve', then /login ollama again.\nhttps://ollama.com/download".to_string(),
+        );
     }
-    ollama_browser_login(config).await
-}
-
-async fn ollama_browser_login(config: &mut KimConfig) -> CommandOutcome {
-    let browser = open_ollama_signin_page().await;
-    config.provider = "ollama".to_string();
-    save_notice(
-        config,
-        format!(
-            "{}\n\nIf cloud models still say unauthorized, update Ollama for Windows and run /login again. Older Ollama builds do not expose terminal sign-in.",
-            browser_message(browser)
+    match ollama_check_server().await {
+        Some(n) => {
+            config.provider = "ollama".to_string();
+            let model_info = if n == 0 {
+                "No local models found. Pull one with: ollama pull llama3.2".to_string()
+            } else {
+                format!("{n} model(s) available locally")
+            };
+            let save_err = config.save().err().map(|e| format!("\nWarning: config not saved: {e}")).unwrap_or_default();
+            CommandOutcome::ProviderConnected(format!(
+                "Connected to Ollama · {model_info} · provider set to ollama · ready to chat.{save_err}"
+            ))
+        }
+        None => CommandOutcome::Message(
+            "Ollama is installed but the server is not running.\nStart it with: ollama serve\nThen run /login ollama again.".to_string(),
         ),
-    )
+    }
 }
 
-async fn open_ollama_signin_page() -> Result<(), String> {
-    let url = "https://ollama.com/signin";
+async fn ollama_is_available() -> bool {
+    // Try the process PATH first.
+    if Command::new("ollama").arg("--version").output().await.is_ok() {
+        return true;
+    }
+    // Fall back to common Windows install locations — handles the case where
+    // Ollama was installed after this process started (PATH not yet inherited).
     #[cfg(windows)]
-    let result = Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .status()
-        .await;
-    #[cfg(target_os = "macos")]
-    let result = Command::new("open").arg(url).status().await;
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let result = Command::new("xdg-open").arg(url).status().await;
-
-    match result {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!("browser opener exited with {status}")),
-        Err(error) => Err(error.to_string()),
+    {
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let candidates = [
+            format!("{local}\\Programs\\Ollama\\ollama.exe"),
+            "D:\\Ollama\\ollama.exe".to_string(),
+            "C:\\Program Files\\Ollama\\ollama.exe".to_string(),
+        ];
+        if candidates.iter().any(|p| std::path::Path::new(p).exists()) {
+            return true;
+        }
     }
+    false
 }
 
-fn browser_message(result: Result<(), String>) -> String {
-    match result {
-        Ok(()) => {
-            "Opened Ollama sign-in in your browser. Finish signing in there, then return to Kim."
-                .to_string()
-        }
-        Err(error) => format!(
-            "Open this page to sign in to Ollama: https://ollama.com/signin\nCould not open browser automatically: {error}"
-        ),
+async fn ollama_check_server() -> Option<usize> {
+    let resp = reqwest::Client::new()
+        .get("http://127.0.0.1:11434/api/tags")
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
     }
+    let text = resp.text().await.unwrap_or_default();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    Some(json["models"].as_array().map_or(0, |a| a.len()))
+}
+
+async fn validate_api_key(provider: &str, key: &str) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let status = match provider {
+        "claude" => client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::json!({
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .status(),
+        "openai" => client
+            .get("https://api.openai.com/v1/models")
+            .bearer_auth(key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .status(),
+        "deepseek" => client
+            .get("https://api.deepseek.com/v1/models")
+            .bearer_auth(key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .status(),
+        "gemini" => client
+            .get(format!(
+                "https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+            ))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .status(),
+        _ => return Ok(()),
+    };
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(format!("key rejected (HTTP {status})"));
+    }
+    Ok(())
 }
 
 fn logout(args: &str, config: &mut KimConfig) -> CommandOutcome {
@@ -329,10 +410,26 @@ fn logout(args: &str, config: &mut KimConfig) -> CommandOutcome {
     } else {
         args.to_ascii_lowercase()
     };
+    // Keyless providers (ollama, desktop) have no stored API key.
+    let keyless = provider_info(&provider).is_some_and(|p| p.key_env.is_none());
+    if keyless {
+        return CommandOutcome::Info(format!(
+            "{provider} uses a local server — no API key to remove. Use /provider to switch."
+        ));
+    }
     if config.api_keys.remove(&provider).is_some() {
-        save_notice(config, format!("Removed saved key for {provider}."))
+        if config.provider == provider {
+            config.provider = "ollama".to_string();
+            config.model = "llama3.2".to_string();
+        }
+        save_notice(
+            config,
+            format!("Logged out from {provider} · switched to ollama. Run /login {provider} to reconnect."),
+        )
     } else {
-        CommandOutcome::Message(format!("No saved API key for {provider}."))
+        CommandOutcome::Message(format!(
+            "No saved key for {provider}. Use /login {provider} to add one."
+        ))
     }
 }
 
@@ -359,17 +456,51 @@ async fn search(args: &str) -> CommandOutcome {
     if args.trim().is_empty() {
         return CommandOutcome::Message("Usage: /search <query>".to_string());
     }
-    shell(
-        "rg",
-        &["--line-number", "--hidden", args],
-        &format!("rg {args}"),
-    )
-    .await
+    let output = Command::new("rg")
+        .args(["--line-number", "--hidden", args])
+        .output()
+        .await;
+    match &output {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(windows)]
+            {
+                let output = Command::new("cmd")
+                    .args(["/C", &format!("findstr /r /s /n /p \"{}\" *", args.replace('"', ""))])
+                    .output()
+                    .await;
+                return format_output(&format!("findstr {args}"), output);
+            }
+            #[cfg(not(windows))]
+            return CommandOutcome::Message(
+                "ripgrep (rg) not found. Install: brew install ripgrep  or  apt install ripgrep"
+                    .to_string(),
+            );
+        }
+        _ => format_output(&format!("rg {args}"), output),
+    }
 }
 
 async fn files(args: &str) -> CommandOutcome {
     let path = if args.trim().is_empty() { "." } else { args };
-    shell("rg", &["--files", path], &format!("rg --files {path}")).await
+    let output = Command::new("rg").args(["--files", path]).output().await;
+    match &output {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(windows)]
+            {
+                let output = Command::new("cmd")
+                    .args(["/C", &format!("dir /s /b \"{}\"", path.replace('"', ""))])
+                    .output()
+                    .await;
+                return format_output(&format!("dir {path}"), output);
+            }
+            #[cfg(not(windows))]
+            return CommandOutcome::Message(
+                "ripgrep (rg) not found. Install: brew install ripgrep  or  apt install ripgrep"
+                    .to_string(),
+            );
+        }
+        _ => format_output(&format!("rg --files {path}"), output),
+    }
 }
 
 fn init_project() -> CommandOutcome {
@@ -424,6 +555,16 @@ fn format_output(
 fn save_notice(config: &KimConfig, message: String) -> CommandOutcome {
     match config.save() {
         Ok(()) => CommandOutcome::Message(message),
+        Err(error) => {
+            CommandOutcome::Message(format!("{message}\nWarning: config was not saved: {error}"))
+        }
+    }
+}
+
+/// Like save_notice but for routine UI config changes — shows in status bar only.
+fn config_notice(config: &KimConfig, message: String) -> CommandOutcome {
+    match config.save() {
+        Ok(()) => CommandOutcome::Info(message),
         Err(error) => {
             CommandOutcome::Message(format!("{message}\nWarning: config was not saved: {error}"))
         }

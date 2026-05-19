@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::provider::PROVIDERS;
 use crate::theme::Theme;
 use crate::{thinking, App, AppMode, MessageRole, ViewState};
 
@@ -28,6 +29,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_input(frame, app, root[2], theme);
     draw_slash_palette(frame, app, root[1], theme);
     draw_model_picker(frame, app, root[1], theme);
+    draw_provider_picker(frame, app, root[1], theme);
     draw_status(frame, app, root[3], theme);
 }
 
@@ -52,7 +54,13 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         Span::raw("  "),
         Span::styled(
             app.config.provider.as_str(),
-            Style::default().fg(theme.text),
+            Style::default()
+                .fg(if app.provider_ready { theme.success } else { theme.danger })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if app.provider_ready { " ✓" } else { " ✗" },
+            Style::default().fg(if app.provider_ready { theme.success } else { theme.danger }),
         ),
         Span::styled(" / ", Style::default().fg(theme.text_dimmer)),
         Span::styled(
@@ -108,82 +116,13 @@ fn draw_body(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     draw_chat(frame, app, area, theme);
 }
 
-#[allow(clippy::too_many_lines)]
 fn draw_session_browser(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(8)])
-        .split(area);
-    let mode_line = Line::from(vec![
-        Span::styled(
-            if app.mode == AppMode::Chat {
-                "  Chat  "
-            } else {
-                "  chat  "
-            },
-            if app.mode == AppMode::Chat {
-                Style::default()
-                    .fg(theme.accent_ink)
-                    .bg(theme.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text_dim)
-            },
-        ),
-        Span::raw("  "),
-        Span::styled(
-            if app.mode == AppMode::Code {
-                "  Code  "
-            } else {
-                "  code  "
-            },
-            if app.mode == AppMode::Code {
-                Style::default()
-                    .fg(theme.accent_ink)
-                    .bg(theme.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text_dim)
-            },
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "Press Tab to switch Chat/Code · ↑/↓ selects · Enter opens · type /commands below",
-            Style::default().fg(theme.text_dimmer),
-        ),
-    ]);
-    let scope = if app.mode == AppMode::Code {
-        "Code shows conversations for this folder/project. New code chat starts here."
-    } else {
-        "Chat shows your Kim conversations. New Kim chat starts a general assistant thread."
-    };
-    frame.render_widget(
-        Paragraph::new(vec![
-            mode_line,
-            Line::raw(""),
-            Line::styled(scope, Style::default().fg(theme.text_dim)),
-        ])
-        .block(
-            Block::default()
-                .title(" Choose Mode ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.border))
-                .style(Style::default().bg(theme.panel)),
-        ),
-        rows[0],
-    );
-
     let mut items = Vec::new();
     let new_label = match app.mode {
         AppMode::Chat => "New Kim chat",
         AppMode::Code => "New code chat in this folder",
     };
-    items.push(session_row(
-        new_label,
-        "start fresh",
-        app.selected_session == 0,
-        theme,
-    ));
+    items.push(session_row(new_label, "start fresh", app.selected_session == 0, theme));
     for (index, session) in app.sessions.iter().take(40).enumerate() {
         items.push(session_row(
             &session.label,
@@ -202,22 +141,37 @@ fn draw_session_browser(frame: &mut Frame<'_>, app: &App, area: Rect, theme: The
             Style::default().fg(theme.text_dimmer),
         )));
     }
+
+    // Mode indicator in title: active mode is accented, inactive is dimmed.
+    let (chat_style, code_style) = if app.mode == AppMode::Chat {
+        (
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text_dimmer),
+        )
+    } else {
+        (
+            Style::default().fg(theme.text_dimmer),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )
+    };
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("Chat", chat_style),
+        Span::styled("  /  ", Style::default().fg(theme.text_dimmer)),
+        Span::styled("Code", code_style),
+        Span::styled("  ·  Tab to switch  ", Style::default().fg(theme.text_dimmer)),
+    ]);
+
     let list = List::new(items).block(
         Block::default()
-            .title(if app.mode == AppMode::Code {
-                " Code Conversations "
-            } else {
-                " Kim Chats "
-            })
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border))
             .style(Style::default().bg(theme.bg)),
     );
-    // Use ListState so ratatui auto-scrolls the viewport when the selection
-    // moves beyond the visible area. Each row is 2 lines tall.
     let mut list_state = ListState::default();
     list_state.select(Some(app.selected_session));
-    frame.render_stateful_widget(list, rows[1], &mut list_state);
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn session_row<'a>(title: &'a str, preview: &'a str, selected: bool, theme: Theme) -> ListItem<'a> {
@@ -241,21 +195,6 @@ fn session_row<'a>(title: &'a str, preview: &'a str, selected: bool, theme: Them
 
 fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            "Esc ",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("returns to chat list", Style::default().fg(theme.text_dim)),
-        Span::styled(" · ", Style::default().fg(theme.text_dimmer)),
-        Span::styled(
-            "Press Tab to switch Chat/Code from the list",
-            Style::default().fg(theme.text_dimmer),
-        ),
-    ]));
-    lines.push(Line::raw(""));
     for message in app.visible_messages() {
         let (label, color) = match message.role {
             MessageRole::User => ("you", theme.accent),
@@ -314,8 +253,16 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     }
     // Compute scroll. Publish max_scroll so the event loop can reason about
     // when to re-engage follow-mode without needing access to the terminal size.
+    // Use visual line count (accounting for word wrap) rather than logical line
+    // count so long command outputs (e.g. /help) don't clip at the bottom.
     let visible_height = area.height.saturating_sub(2);
-    let max_scroll = (lines.len() as u16).saturating_sub(visible_height);
+    let inner_width = area.width.saturating_sub(2);
+    let total_visual: u16 = lines.iter().map(|l| {
+        let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
+        if inner_width == 0 || w == 0 { 1u16 }
+        else { ((w as u16) + inner_width - 1) / inner_width }
+    }).fold(0u16, |a, b| a.saturating_add(b));
+    let max_scroll = total_visual.saturating_sub(visible_height);
     app.last_max_scroll.set(max_scroll);
     let effective_scroll = if app.follow {
         max_scroll
@@ -362,16 +309,15 @@ fn draw_model_picker(frame: &mut Frame<'_>, app: &App, body_area: Rect, theme: T
         height,
     };
     frame.render_widget(Clear, area);
+    let selected_idx = app
+        .selected_model
+        .min(app.model_options.len().saturating_sub(1));
     let items = app
         .model_options
         .iter()
-        .take(11)
         .enumerate()
         .map(|(index, model)| {
-            let selected = index
-                == app
-                    .selected_model
-                    .min(app.model_options.len().saturating_sub(1));
+            let selected = index == selected_idx;
             let style = if selected {
                 Style::default()
                     .fg(theme.accent_ink)
@@ -393,28 +339,83 @@ fn draw_model_picker(frame: &mut Frame<'_>, app: &App, body_area: Rect, theme: T
             .border_style(Style::default().fg(theme.border))
             .style(Style::default().bg(theme.panel)),
     );
-    frame.render_widget(list, area);
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected_idx));
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let title = if app.view == ViewState::SessionMenu {
-        " Slash command / open a chat first "
+    let (title, display_text, border_color) = if app.secure_input {
+        let masked = "•".repeat(app.input.chars().count());
+        let t = format!(" {} API key · Enter to submit · Esc to cancel ", app.secure_input_provider);
+        (t, masked, theme.accent)
+    } else if app.view == ViewState::SessionMenu {
+        (" Slash command / open a chat first ".to_string(), app.input.clone(), theme.border)
     } else {
-        " Message · drag/drop PNG or file to paste path "
+        (" Message · drag/drop PNG or file to paste path ".to_string(), app.input.clone(), theme.border)
     };
-    let input = Paragraph::new(app.input.as_str())
+    let input = Paragraph::new(display_text.as_str())
         .style(Style::default().fg(theme.text).bg(theme.panel_alt))
         .block(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.border)),
+                .border_style(Style::default().fg(border_color)),
         );
     frame.render_widget(input, area);
-    let input_width = u16::try_from(app.input.len()).unwrap_or(u16::MAX);
+    let input_width = u16::try_from(app.input.chars().count()).unwrap_or(u16::MAX);
     let cursor_x = area.x.saturating_add(1).saturating_add(input_width);
     let cursor_y = area.y.saturating_add(1);
     frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(2)), cursor_y));
+}
+
+fn draw_provider_picker(frame: &mut Frame<'_>, app: &App, body_area: Rect, theme: Theme) {
+    if !app.provider_picker_open {
+        return;
+    }
+    let width = 30.min(body_area.width.saturating_sub(4));
+    let height = (PROVIDERS.len() as u16).saturating_add(2).min(12);
+    if width < 18 || height < 4 {
+        return;
+    }
+    let area = Rect {
+        x: body_area.x + (body_area.width.saturating_sub(width)) / 2,
+        y: body_area.y + (body_area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let selected_idx = app.selected_provider.min(PROVIDERS.len().saturating_sub(1));
+    let items = PROVIDERS
+        .iter()
+        .enumerate()
+        .map(|(index, p)| {
+            let is_cursor = index == selected_idx;
+            let is_active = p.name == app.config.provider;
+            let style = if is_cursor {
+                Style::default()
+                    .fg(theme.accent_ink)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_active {
+                Style::default().fg(theme.success)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            let marker = if is_cursor { "› " } else if is_active { "✓ " } else { "  " };
+            ListItem::new(Line::styled(format!("{marker}{}", p.name), style))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items).block(
+        Block::default()
+            .title(" choose provider ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border))
+            .style(Style::default().bg(theme.panel)),
+    );
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected_idx));
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn draw_slash_palette(frame: &mut Frame<'_>, app: &App, body_area: Rect, theme: Theme) {
@@ -437,12 +438,12 @@ fn draw_slash_palette(frame: &mut Frame<'_>, app: &App, body_area: Rect, theme: 
         height,
     };
     frame.render_widget(Clear, area);
+    let selected_idx = app.slash_selected.min(matches.len().saturating_sub(1));
     let items = matches
         .iter()
-        .take(8)
         .enumerate()
         .map(|(index, command)| {
-            let selected = index == app.slash_selected.min(matches.len().saturating_sub(1));
+            let selected = index == selected_idx;
             let style = if selected {
                 Style::default()
                     .fg(theme.accent_ink)
@@ -462,7 +463,9 @@ fn draw_slash_palette(frame: &mut Frame<'_>, app: &App, body_area: Rect, theme: 
             .border_style(Style::default().fg(theme.border))
             .style(Style::default().bg(theme.panel)),
     );
-    frame.render_widget(list, area);
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected_idx));
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn clean_for_display(text: &str) -> String {

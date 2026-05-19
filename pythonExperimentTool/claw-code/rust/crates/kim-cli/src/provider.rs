@@ -54,7 +54,7 @@ pub const PROVIDERS: &[ProviderInfo] = &[
     },
     ProviderInfo {
         name: "claude",
-        default_model: "claude-3-5-sonnet-latest",
+        default_model: "claude-sonnet-4-6",
         key_env: Some("ANTHROPIC_API_KEY"),
         default_base_url: "https://api.anthropic.com/v1",
     },
@@ -116,11 +116,6 @@ pub async fn stream_kim_request(
     full.extend_from_slice(messages);
 
     match config.provider.as_str() {
-        "desktop" => {
-            let _ = tx.send(AppEvent::Err(
-                "Kim desktop bridge is not running. Start Kim desktop, or switch provider with /provider ollama.".to_string(),
-            ));
-        }
         "claude" => stream_anthropic(config, &full, tx).await,
         _ => stream_openai_compatible(config, &full, tx).await,
     }
