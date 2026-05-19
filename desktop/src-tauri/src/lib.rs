@@ -7237,9 +7237,27 @@ async fn send_task(
     // Default to Ollama (no API key in Kim) when the caller omits a provider.
     // The frontend normally sends an explicit provider, but keeping this
     // fallback aligned with Settings avoids surprise Browser runs.
-    let provider_arg = provider
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "ollama".to_string());
+    let provider_arg = {
+        let raw = provider
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "ollama".to_string());
+        // In Code-tab (Codex) mode, bare "gemini" / "claude" / "chatgpt" etc.
+        // have no direct API key path in Kim — promote them to "browser:<name>"
+        // so they route through the browser bridge automatically.
+        if is_codex {
+            let lower = raw.trim().to_ascii_lowercase();
+            match lower.as_str() {
+                "gemini" | "claude" | "chatgpt" | "grok" | "deepseek-browser"
+                    if !raw.starts_with("browser:") =>
+                {
+                    format!("browser:{}", lower)
+                }
+                _ => raw,
+            }
+        } else {
+            raw
+        }
+    };
     // Whether the user picked a browser-backed provider in the composer (e.g.
     // "browser:gemini"). For Code-tab tasks this routes Codex through Kim's
     // BrowserProvider via the file-bridge instead of calling Anthropic.
