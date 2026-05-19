@@ -7083,44 +7083,98 @@ async fn configure_codex_direct_provider(
     }
 }
 
-/// Locate the `codex` binary. Search order:
-/// 1. CODEX_BIN env var (explicit override)
-/// 2. <kim_root>/pythonExperimentTool/... (nested layout — pythonExperimentTool inside kim-pro)
-/// 3. <kim_root.parent()>/pythonExperimentTool/... (sibling layout — classic fork structure)
-/// 4. `codex` on PATH
-fn find_codex_binary(kim_root: &Path) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CODEX_BIN") {
-        let path = PathBuf::from(p);
-        if path.is_file() {
-            return Some(path);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeBackendKind {
+    Codex,
+    Claw,
+}
+
+impl CodeBackendKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claw => "Claw compatibility",
         }
     }
-    // Search both the kim_root itself and its parent so the binary is found
-    // regardless of whether pythonExperimentTool is nested inside kim-pro
-    // (e.g. kim-pro/pythonExperimentTool/...) or lives alongside it as a
-    // sibling (e.g. <fork>/kim-pro + <fork>/pythonExperimentTool/...).
+
+    fn binary_label(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claw => "claw",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CodeBackend {
+    kind: CodeBackendKind,
+    binary: PathBuf,
+}
+
+fn executable_from_env(key: &str, kind: CodeBackendKind) -> Option<CodeBackend> {
+    let path = PathBuf::from(std::env::var(key).ok()?);
+    if path.is_file() {
+        Some(CodeBackend { kind, binary: path })
+    } else {
+        None
+    }
+}
+
+fn executable_on_path(name: &str, kind: CodeBackendKind) -> Option<CodeBackend> {
+    let out = std::process::Command::new("which").arg(name).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(CodeBackend { kind, binary: PathBuf::from(s) })
+    }
+}
+
+fn bundled_code_backend(kim_root: &Path, kind: CodeBackendKind) -> Option<CodeBackend> {
     let mut roots: Vec<PathBuf> = vec![kim_root.to_path_buf()];
     if let Some(parent) = kim_root.parent() {
         roots.push(parent.to_path_buf());
     }
+    let relative = match kind {
+        CodeBackendKind::Codex => "pythonExperimentTool/codex-code/rust/target",
+        CodeBackendKind::Claw => "pythonExperimentTool/claw-code/rust/target",
+    };
+    let binary_name = kind.binary_label();
     for root in &roots {
         for sub in &["release", "debug"] {
-            let p = root.join(format!("pythonExperimentTool/codex-code/rust/target/{}/codex", sub));
+            let p = root.join(relative).join(sub).join(binary_name);
             if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    // Fall back to PATH
-    if let Ok(out) = std::process::Command::new("which").arg("codex").output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Some(PathBuf::from(s));
+                return Some(CodeBackend { kind, binary: p });
             }
         }
     }
     None
+}
+
+/// Locate the code-agent binary. Prefer the post-migration `codex` binary,
+/// but fall back to the bundled `claw` binary while this branch still carries
+/// the old Rust workspace layout.
+fn find_code_backend(kim_root: &Path) -> Option<CodeBackend> {
+    if let Ok(p) = std::env::var("CODEX_BIN") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            let kind = if filename == "claw" {
+                CodeBackendKind::Claw
+            } else {
+                CodeBackendKind::Codex
+            };
+            return Some(CodeBackend { kind, binary: path });
+        }
+    }
+    executable_from_env("CLAW_BIN", CodeBackendKind::Claw)
+        .or_else(|| bundled_code_backend(kim_root, CodeBackendKind::Codex))
+        .or_else(|| executable_on_path("codex", CodeBackendKind::Codex))
+        .or_else(|| bundled_code_backend(kim_root, CodeBackendKind::Claw))
+        .or_else(|| executable_on_path("claw", CodeBackendKind::Claw))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7191,16 +7245,29 @@ async fn send_task(
     // BrowserProvider via the file-bridge instead of calling Anthropic.
     let is_browser_provider = provider_arg == "browser" || provider_arg.starts_with("browser:");
 
-    // Code (Codex) sessions run the `codex` binary directly against the user's
-    // project, with Codex's own coding-agent system prompt. Chat (Kim) sessions
+    let code_backend = if is_codex {
+        Some(find_code_backend(&kim_root).ok_or_else(|| {
+            "Code agent binary not found. Build `pythonExperimentTool/codex-code/rust` for Codex, build `pythonExperimentTool/claw-code/rust` for the bundled compatibility backend, or set CODEX_BIN/CLAW_BIN to the binary path.".to_string()
+        })?)
+    } else {
+        None
+    };
+
+    // Code sessions run the coding-agent binary directly against the user's
+    // project, with its own coding-agent system prompt. Chat (Kim) sessions
     // continue to run `python -m orchestrator.agent` with the desktop-control
     // system prompt. Routing them through different binaries is what keeps the
     // two personas separate end-to-end.
     let mut cmd = if is_codex {
-        let codex_bin = find_codex_binary(&kim_root)
-            .ok_or_else(|| "Codex binary not found. Build it with `cargo build --release` in pythonExperimentTool/codex-code/rust, or set CODEX_BIN to the binary path.".to_string())?;
+        let code_backend = code_backend
+            .as_ref()
+            .expect("code backend resolved for code mode");
+        let code_bin = &code_backend.binary;
 
         if is_browser_provider {
+            if code_backend.kind == CodeBackendKind::Claw {
+                return Err("Browser-backed Code mode needs the Codex binary. This checkout only has the bundled Claw compatibility binary, so switch the provider to Ollama/OpenAI or build/set CODEX_BIN.".to_string());
+            }
             // ── Browser-bridge mode ──────────────────────────────────────
             // Spawn `python -m orchestrator.run_codex_bridge`, which spawns
             // Codex with CODEX_FILE_BRIDGE=1 and relays each LLM request
@@ -7212,7 +7279,7 @@ async fn send_task(
             );
             let _ = app_handle.emit(
                 "kim-agent-output",
-                format!("[STATUS] codex binary: {}", codex_bin.display()),
+                format!("[STATUS] codex binary: {}", code_bin.display()),
             );
             let mut c = Command::new(&python);
             c.args(["-m", "orchestrator.run_codex_bridge"])
@@ -7223,7 +7290,7 @@ async fn send_task(
                 .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
                 // Tell run_codex_subtask exactly which codex binary to spawn,
                 // so it doesn't have to repeat the search dance.
-                .env("CODEX_BIN", codex_bin.to_string_lossy().to_string())
+                .env("CODEX_BIN", code_bin.to_string_lossy().to_string())
                 // Forward webview-bridge creds so BrowserProvider can drive
                 // the in-app sign-in window in headless mode if configured.
                 .stdout(Stdio::piped())
@@ -7231,25 +7298,76 @@ async fn send_task(
             c
         } else {
             // ── Direct API mode ──────────────────────────────────────────
-            let mut c = Command::new(&codex_bin);
-            c.arg("--output-format").arg("json")
-                .current_dir(&target_root)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let route = configure_codex_direct_provider(
-                &mut c,
-                &provider_arg,
-                &kim_root,
-                ollama_base_url.as_deref(),
-                ollama_mode.as_deref(),
-                ollama_local_model.as_deref(),
-                ollama_cloud_model.as_deref(),
-            ).await?;
-            let _ = app_handle.emit(
-                "kim-agent-output",
-                format!("[STATUS] Routing unchanged task to Codex via {}: {}", route, codex_bin.display()),
-            );
-            c.arg("prompt").arg(&task);
+            let mut c = Command::new(code_bin);
+            if code_backend.kind == CodeBackendKind::Codex {
+                // New OpenAI Codex CLI: uses `exec --json` subcommand.
+                // When the provider is Ollama, use --oss --local-provider ollama
+                // so Codex bypasses its own ChatGPT account auth entirely and
+                // routes through the local Ollama daemon instead.
+                c.arg("exec")
+                    .arg("--json")
+                    .arg("--dangerously-bypass-approvals-and-sandbox")
+                    .arg("-C").arg(target_root.to_string_lossy().to_string())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let route = if provider_arg.trim().eq_ignore_ascii_case("ollama") {
+                    let model = selected_ollama_codex_model(
+                        ollama_mode.as_deref(),
+                        ollama_base_url.as_deref(),
+                        ollama_local_model.as_deref(),
+                        ollama_cloud_model.as_deref(),
+                    ).await?;
+                    c.arg("--oss")
+                        .arg("--local-provider").arg("ollama")
+                        .arg("--model").arg(&model);
+                    format!("Ollama via local daemon ({model})")
+                } else {
+                    configure_codex_direct_provider(
+                        &mut c,
+                        &provider_arg,
+                        &kim_root,
+                        ollama_base_url.as_deref(),
+                        ollama_mode.as_deref(),
+                        ollama_local_model.as_deref(),
+                        ollama_cloud_model.as_deref(),
+                    ).await?
+                };
+                let _ = app_handle.emit(
+                    "kim-agent-output",
+                    format!(
+                        "[STATUS] ✓ Using Codex CLI via {}: {}",
+                        route,
+                        code_bin.display(),
+                    ),
+                );
+                c.arg(&task);
+            } else {
+                // Claw compatibility binary: uses old --output-format json interface.
+                c.arg("--output-format").arg("json")
+                    .current_dir(&target_root)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let route = configure_codex_direct_provider(
+                    &mut c,
+                    &provider_arg,
+                    &kim_root,
+                    ollama_base_url.as_deref(),
+                    ollama_mode.as_deref(),
+                    ollama_local_model.as_deref(),
+                    ollama_cloud_model.as_deref(),
+                ).await?;
+                let _ = app_handle.emit(
+                    "kim-agent-output",
+                    format!(
+                        "[STATUS] Routing code task to {} via {}: {}",
+                        code_backend.kind.label(),
+                        route,
+                        code_bin.display(),
+                    ),
+                );
+                c.arg("prompt").arg(&task);
+            }
             c
         }
     } else {
@@ -7465,6 +7583,12 @@ async fn send_task(
     }
 
     if is_codex {
+        if code_backend
+            .as_ref()
+            .is_some_and(|backend| backend.kind == CodeBackendKind::Claw)
+        {
+            let _ = mirror_latest_claw_session_to_codex(&target_root);
+        }
         if let Some(session) = newest_codex_session(&target_root) {
             let _ = app_handle.emit("kim-agent-code-session", session);
         }
@@ -9539,6 +9663,85 @@ fn read_project_sessions(dir: &Path) -> Vec<CodexSession> {
         }
     }
     sessions
+}
+
+fn newest_claw_session_file(project_path: &Path) -> Option<(PathBuf, SystemTime)> {
+    let sessions_root = project_path.join(".claw").join("sessions");
+    let entries = fs::read_dir(&sessions_root).ok()?;
+    let mut newest: Option<(PathBuf, SystemTime)> = None;
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            let Ok(files) = fs::read_dir(&path) else { continue };
+            for file_entry in files.filter_map(|e| e.ok()) {
+                let file_path = file_entry.path();
+                let Some(name) = file_path.file_name().and_then(|n| n.to_str()) else { continue };
+                if !name.ends_with(".jsonl") || name.contains(".summary") {
+                    continue;
+                }
+                let modified = file_entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let is_newest = newest
+                    .as_ref()
+                    .map(|(_, previous)| modified > *previous)
+                    .unwrap_or(true);
+                if is_newest {
+                    newest = Some((file_path, modified));
+                }
+            }
+        } else {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if !name.ends_with(".jsonl") || name.contains(".summary") {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let is_newest = newest
+                .as_ref()
+                .map(|(_, previous)| modified > *previous)
+                .unwrap_or(true);
+            if is_newest {
+                newest = Some((path, modified));
+            }
+        }
+    }
+
+    newest
+}
+
+fn date_for_system_time(time: SystemTime) -> String {
+    let secs = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    unix_secs_to_utc_iso(secs)
+        .get(0..10)
+        .map(str::to_string)
+        .unwrap_or_else(chrono_like_today)
+}
+
+fn mirror_latest_claw_session_to_codex(project_path: &Path) -> Option<PathBuf> {
+    let (src, modified) = newest_claw_session_file(project_path)?;
+    let filename = src.file_name()?.to_os_string();
+    let date = date_for_system_time(modified);
+    let dest_dir = project_path.join(".codex").join("sessions").join(date);
+    fs::create_dir_all(&dest_dir).ok()?;
+    let dest = dest_dir.join(filename);
+
+    let should_copy = match fs::metadata(&dest).and_then(|m| m.modified()) {
+        Ok(dest_modified) => modified > dest_modified,
+        Err(_) => true,
+    };
+    if should_copy {
+        fs::copy(&src, &dest).ok()?;
+    }
+
+    Some(dest)
 }
 
 fn newest_codex_session(project_path: &Path) -> Option<CompletedCodexSession> {

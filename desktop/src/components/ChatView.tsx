@@ -604,7 +604,7 @@ const HIDDEN_SUBSTRINGS = [
   'CODEX_PROXY', 'codex binary:', 'codex-config',
   // Provider internal noise
   'sending to gemini', 'sending to claude', 'sending to chatgpt',
-  'Routing to Codex', 'Routing Codex',
+  // 'Routing to Codex', 'Routing Codex', // temporarily visible for debugging
   'getattr(logger, level.lower(), logger.info)(message)',
 ];
 
@@ -874,6 +874,9 @@ function parseLogLine(raw: string, id: number): ActivityItem | null {
     // Drop lines that look like code / paths / stack frames
     if (/[/\\].+\.py/.test(msg)) return null;
     if (/^\s*at\s/.test(msg)) return null;
+    if (/^(?:error|fatal):/i.test(msg) || /\b(?:codex|claw|kim) (?:encountered|ran into) an error\b/i.test(msg)) {
+      return { id, kind: 'error', icon: '⚠', text: friendlyError(msg) };
+    }
     return { id, kind: 'status', icon: '·', text: msg };
   }
 
@@ -1425,20 +1428,6 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
   //      no spinner, don't wipe liveHistory until new disk messages arrive,
   //      don't re-animate the latest bubble (liveHistory already animated it).
   const lastLoadedSessionIdRef = useRef<string | null>(null);
-  
-  // "Codex continuation": In Code tab, each follow-up task creates a new
-  // Codex session (Codex doesn't support --resume). When the task completes,
-  // the Tauri side emits `code-session-completed` and ChatView auto-loads
-  // that new session. We detect this case (the session changed via the
-  // sidebar item) and the session is a codex session.
-  //
-  // In this case we keep the live activity / messages so the user sees
-  // a seamless conversation even though the backend started a new session.
-  const isCodexContinuation =
-    session &&
-    lastSessionRef.current &&
-    session.session_id !== lastSessionRef.current.session_id &&
-    session.session_type === 'codex';
 
   useEffect(() => {
     if (!session) {
@@ -1696,15 +1685,82 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
       return;
     }
 
-    // Surface Codex's structured JSON error output as a real error banner
-    // instead of silently dropping the line and showing only "Agent Error".
-    // Codex emits e.g. {"error":"missing Anthropic credentials …","type":"error"}
-    // on stdout right before exiting non-zero.
+    // Surface structured one-shot coding-agent JSON as chat/error UI instead
+    // of dropping it and letting kim-agent-done show the generic failure copy.
     const stdoutLine = line.startsWith('[err]') ? line.slice(5).trimStart() : line;
-    if (stdoutLine.startsWith('{') && stdoutLine.includes('"error"')) {
+    if (stdoutLine.startsWith('{')) {
       try {
-        const parsed = JSON.parse(stdoutLine) as { error?: string; type?: string; message?: string };
-        const msg = (parsed.error ?? parsed.message ?? '').trim();
+        const parsed = JSON.parse(stdoutLine) as {
+          error?: string;
+          type?: string;
+          message?: string;
+          tool_uses?: unknown[];
+          tool_results?: unknown[];
+          iterations?: number;
+          item?: { type?: string; text?: string; action?: { command?: string } };
+        };
+
+        // New Codex CLI JSONL format (codex exec --json)
+        if (parsed.type === 'item.completed' && parsed.item) {
+          const item = parsed.item;
+          if (item.type === 'agent_message' && item.text?.trim()) {
+            answerReceivedThisRunRef.current = true;
+            setLiveHistory(prev => {
+              const last = prev[prev.length - 1];
+              if (last?.role === 'assistant' && last.content.trim() === item.text!.trim()) return prev;
+              return [...prev, { role: 'assistant', content: item.text!.trim() }];
+            });
+          } else if (item.type === 'reasoning' && item.text?.trim()) {
+            const short = item.text.trim().split('\n')[0].slice(0, 120);
+            enqueueActivityUpdate(prev => {
+              const next = [...prev, { id, kind: 'tool' as const, icon: '💭', text: short }];
+              if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
+              return next;
+            });
+          } else if (item.type === 'local_shell_call' && item.action?.command) {
+            enqueueActivityUpdate(prev => {
+              const next = [...prev, { id, kind: 'tool' as const, icon: '⚡', text: item.action!.command! }];
+              if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
+              return next;
+            });
+          }
+          return;
+        }
+        if (parsed.type === 'thread.started' || parsed.type === 'turn.started' || parsed.type === 'turn.completed') {
+          return; // internal Codex lifecycle events — drop silently
+        }
+
+        const errorMsg = (parsed.error ?? '').trim();
+        if (errorMsg) {
+          const friendly = friendlyError(errorMsg);
+          setTaskError(friendly);
+          if (lastRunTaskRef.current) setLastFailedTask(lastRunTaskRef.current);
+          needHelpFlagRef.current = true;
+          enqueueActivityUpdate(prev => {
+            const next = [...prev, { id, kind: 'error' as const, icon: '⚠', text: friendly }];
+            if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
+            return next;
+          });
+          return;
+        }
+
+        const msg = (parsed.message ?? '').trim();
+        const looksLikeResult =
+          msg &&
+          (typeof parsed.iterations === 'number' ||
+            Array.isArray(parsed.tool_uses) ||
+            Array.isArray(parsed.tool_results) ||
+            parsed.type === 'result');
+        if (looksLikeResult) {
+          answerReceivedThisRunRef.current = true;
+          setLiveHistory(prev => {
+            const last = prev[prev.length - 1];
+            if (last?.role === 'assistant' && last.content.trim() === msg.trim()) return prev;
+            return [...prev, { role: 'assistant', content: msg }];
+          });
+          return;
+        }
+
         if (msg && (parsed.type === 'error' || /credential|api[_ ]?key|unauthorized/i.test(msg))) {
           setTaskError(friendlyError(msg));
           if (lastRunTaskRef.current) setLastFailedTask(lastRunTaskRef.current);
@@ -1795,6 +1851,14 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
         setLastFailedTask(lastRunTaskRef.current);
       }
       return; // Skip adding to activity feed to avoid duplicate error messages
+    }
+
+    if (item.kind === 'error') {
+      needHelpFlagRef.current = true;
+      setTaskError(item.text);
+      if (lastRunTaskRef.current) {
+        setLastFailedTask(lastRunTaskRef.current);
+      }
     }
 
     enqueueActivityUpdate(prev => {
@@ -2065,6 +2129,10 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     lastRunTaskRef.current = pending;
     setIsRunning(true);
     clearActivityNow();
+    // Clear stale liveHistory from a prior failed run. Without this, a retry
+    // after a failure that wrote nothing to disk leaves an orphaned user message
+    // in liveHistory, causing two ThinkingWithPlan panels to render simultaneously.
+    setLiveHistory([]);
     setTaskError(null);
     setTokenStats(null);
     setCancelling(false);

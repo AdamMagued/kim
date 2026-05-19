@@ -3,6 +3,7 @@ mod config;
 mod provider;
 mod sessions;
 mod theme;
+mod thinking;
 mod ui;
 
 use std::io::{self, stdout};
@@ -13,14 +14,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use commands::{handle_command, CommandOutcome, SUPPORTED_COMMANDS};
 use config::KimConfig;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use provider::{send_kim_request, ChatMessage};
+use provider::{stream_kim_request, AppEvent, ChatMessage};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use runtime::{
@@ -31,6 +32,9 @@ use sessions::{
     discover_project_sessions, discover_sessions, find_session_by_id, load_session_messages,
     SessionEntry,
 };
+use thinking::TraceItem;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRole {
@@ -68,14 +72,18 @@ pub struct UiMessage {
     pub content: String,
 }
 
-#[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub config: KimConfig,
     pub messages: Vec<UiMessage>,
     pub input: String,
     pub status: String,
+    /// Current scroll offset (lines from top). Only meaningful when `follow = false`.
     pub scroll: u16,
+    /// When true, always pin the view to the bottom of content (auto-scroll mode).
+    pub follow: bool,
+    /// Actual max scroll computed by draw_chat each frame, published via interior mutability.
+    pub last_max_scroll: std::cell::Cell<u16>,
     pub busy: bool,
     pub sessions: Vec<SessionEntry>,
     pub selected_session: usize,
@@ -89,6 +97,11 @@ pub struct App {
     pub allow_empty_session_open: bool,
     pub view: ViewState,
     pub bridge_connected: bool,
+    // streaming / thinking panel state
+    pub trace: Vec<TraceItem>,
+    pub thinking_start: Option<Instant>,
+    pub event_rx: Option<UnboundedReceiver<AppEvent>>,
+    pub task_handle: Option<JoinHandle<()>>,
 }
 
 impl App {
@@ -100,6 +113,8 @@ impl App {
             input: String::new(),
             status: "ready".to_string(),
             scroll: 0,
+            follow: true,
+            last_max_scroll: std::cell::Cell::new(0),
             busy: false,
             sessions: discover_sessions(),
             selected_session: 0,
@@ -112,6 +127,10 @@ impl App {
             allow_empty_session_open: false,
             view: ViewState::SessionMenu,
             bridge_connected: false,
+            trace: Vec::new(),
+            thinking_start: None,
+            event_rx: None,
+            task_handle: None,
         };
         if let Some(resume_id) = resume_id {
             app.resume_session(resume_id);
@@ -128,11 +147,7 @@ impl App {
             return;
         };
         self.current_session_id.clone_from(&session.id);
-        if let Some(index) = self
-            .sessions
-            .iter()
-            .position(|entry| entry.path == session.path)
-        {
+        if let Some(index) = self.sessions.iter().position(|e| e.path == session.path) {
             self.selected_session = index;
         }
         match load_session_messages(&session.path) {
@@ -140,6 +155,7 @@ impl App {
                 self.messages = messages;
                 self.view = ViewState::InChat;
                 self.scroll = 0;
+                self.follow = true;
                 self.status = format!("resumed {}", session.label);
             }
             Err(error) => {
@@ -162,7 +178,7 @@ impl App {
         SUPPORTED_COMMANDS
             .iter()
             .copied()
-            .filter(|command| command.starts_with(typed))
+            .filter(|c| c.starts_with(typed))
             .collect()
     }
 
@@ -231,6 +247,17 @@ impl App {
         self.ctrl_c_armed = false;
     }
 
+    fn cancel_in_flight(&mut self) {
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
+        self.event_rx = None;
+        self.busy = false;
+        self.thinking_start = None;
+        self.follow = true;
+        self.status = "cancelled".to_string();
+    }
+
     fn toggle_mode(&mut self) {
         let next = match self.mode {
             AppMode::Chat => AppMode::Code,
@@ -259,7 +286,7 @@ impl App {
         self.selected_model = self
             .model_options
             .iter()
-            .position(|model| model == &self.config.model)
+            .position(|m| m == &self.config.model)
             .unwrap_or(0);
         self.model_picker_open = true;
         self.status = "choose model with ↑/↓, Enter confirms, Esc closes".to_string();
@@ -303,7 +330,7 @@ impl App {
         false
     }
 
-    fn visible_messages(&self) -> impl Iterator<Item = &UiMessage> {
+    pub fn visible_messages(&self) -> impl Iterator<Item = &UiMessage> {
         self.messages
             .iter()
             .skip(self.messages.len().saturating_sub(120))
@@ -319,14 +346,14 @@ impl App {
     fn chat_history(&self) -> Vec<ChatMessage> {
         self.messages
             .iter()
-            .filter_map(|message| match message.role {
+            .filter_map(|m| match m.role {
                 MessageRole::User => Some(ChatMessage {
                     role: "user".to_string(),
-                    content: message.content.clone(),
+                    content: m.content.clone(),
                 }),
                 MessageRole::Assistant => Some(ChatMessage {
                     role: "assistant".to_string(),
-                    content: message.content.clone(),
+                    content: m.content.clone(),
                 }),
                 MessageRole::System | MessageRole::Error => None,
             })
@@ -388,6 +415,7 @@ impl App {
                 self.messages = messages;
                 self.view = ViewState::InChat;
                 self.scroll = 0;
+                self.follow = true;
                 self.current_session_id.clone_from(&session.id);
                 self.status = format!("opened {}", session.label);
             }
@@ -403,7 +431,7 @@ impl App {
         if self
             .sessions
             .iter()
-            .any(|session| session.id == self.current_session_id)
+            .any(|s| s.id == self.current_session_id)
         {
             return;
         }
@@ -424,6 +452,7 @@ impl App {
         self.messages.clear();
         self.input.clear();
         self.scroll = 0;
+        self.follow = true;
         self.view = ViewState::InChat;
         self.status = format!("new Kim {} chat · type your message", self.mode.label());
     }
@@ -435,6 +464,7 @@ impl App {
         self.status = "session menu · choose New chat or a saved session".to_string();
     }
 
+    #[allow(dead_code)]
     fn return_to_session_menu(&mut self) {
         self.show_session_menu();
         self.status =
@@ -444,12 +474,11 @@ impl App {
     fn paste_text(&mut self, text: &str) {
         self.reset_ctrl_c();
         self.allow_empty_session_open = false;
-        // Always try file-path detection first (drag/drop PNG, etc.)
         let file_paths = prompt_file_references(text);
         if !file_paths.is_empty() {
             let paths_text = file_paths
                 .iter()
-                .map(|path| path.display().to_string())
+                .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join(" ");
             if !self.input.is_empty() && !self.input.ends_with(char::is_whitespace) {
@@ -460,8 +489,6 @@ impl App {
             self.status = "attached file path · press Enter to send".to_string();
             return;
         }
-        // In chat view: allow pasting normal text (prompts, API keys, URLs).
-        // In session menu: ignore non-path paste to prevent accidental input.
         if self.view == ViewState::InChat {
             let safe = text.replace(['\r', '\n'], " ");
             let safe = safe.trim();
@@ -480,35 +507,34 @@ impl App {
     }
 }
 
+/* ===========================================================
+entry point
+=========================================================== */
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
-    {
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         println!("{}", help_text());
         return Ok(());
     }
     if args
         .iter()
-        .any(|arg| matches!(arg.as_str(), "--version" | "-V"))
+        .any(|a| matches!(a.as_str(), "--version" | "-V"))
     {
         println!("kim {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     let resume_id = args
         .windows(2)
-        .find_map(|window| (window[0] == "--resume").then_some(window[1].as_str()));
+        .find_map(|w| (w[0] == "--resume").then_some(w[1].as_str()));
 
     install_panic_hook();
     let mut terminal = enter_terminal()?;
     let result = run_app(&mut terminal, resume_id).await;
     leave_terminal(&mut terminal)?;
     match result {
-        Ok(session_id) => {
-            println!("Resume this Kim session with: kim --resume {session_id}");
-        }
+        Ok(session_id) => println!("Resume this Kim session with: kim --resume {session_id}"),
         Err(error) => {
             eprintln!("kim error: {error}");
             std::process::exit(1);
@@ -516,6 +542,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+/* ===========================================================
+main loop — non-blocking so the streaming task can run
+=========================================================== */
 
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
@@ -528,24 +558,13 @@ async fn run_app(
     );
 
     'main: loop {
+        drain_events(&mut app);
+
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
-        // Block until at least one event arrives (or 60 ms for busy redraws).
-        if !event::poll(Duration::from_millis(60))? {
-            continue;
-        }
-
-        // Windows legacy console (cmd.exe / conhost) queues both the keydown
-        // and an extra keyup-translated-as-Press for the same physical key.
-        // Both events are already in the OS queue when we first poll, so
-        // draining them back-to-back (no draw in between) keeps the gap
-        // under 1 ms — well within the 20 ms dedup window.
-        // last_key is LOCAL to this drain cycle so it never suppresses a
-        // legitimate repeated keypress that arrives in the NEXT cycle.
+        // Non-blocking terminal event drain.
         let mut last_key: Option<(KeyCode, KeyModifiers, KeyEventKind, Instant)> = None;
-
-        // Inner drain: process all queued events without an intervening draw.
-        loop {
+        while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Key(key) => {
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -562,19 +581,127 @@ async fn run_app(
                         }
                     }
                 }
-                Event::Paste(text) => {
-                    app.paste_text(&text);
+                Event::Paste(text) => app.paste_text(&text),
+                Event::Mouse(mouse) => {
+                    if app.view == ViewState::InChat {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                if app.follow {
+                                    app.follow = false;
+                                    app.scroll = app.last_max_scroll.get();
+                                }
+                                app.scroll = app.scroll.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                if !app.follow {
+                                    app.scroll = app.scroll.saturating_add(3);
+                                    if app.scroll >= app.last_max_scroll.get() {
+                                        app.follow = true;
+                                        app.scroll = 0;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 _ => {}
             }
-            // Stop draining when the queue is empty (non-blocking check).
-            if !event::poll(Duration::from_millis(0))? {
-                break;
-            }
         }
+
+        // Yield to let the streaming task produce more chunks.
+        tokio::time::sleep(Duration::from_millis(if app.busy { 33 } else { 60 })).await;
     }
     Ok(app.current_session_id)
 }
+
+/// Drain all pending `AppEvent`s from the channel into the App state.
+fn drain_events(app: &mut App) {
+    loop {
+        let event = match app.event_rx.as_mut() {
+            None => break,
+            Some(rx) => match rx.try_recv() {
+                Ok(e) => e,
+                Err(_) => break,
+            },
+        };
+        apply_app_event(app, event);
+    }
+}
+
+fn apply_app_event(app: &mut App, event: AppEvent) {
+    match event {
+        AppEvent::TextChunk(chunk) => {
+            // Append to the last assistant message, or start a new one.
+            if let Some(last) = app.messages.last_mut() {
+                if last.role == MessageRole::Assistant {
+                    last.content.push_str(&chunk);
+                    if app.follow {
+                        app.scroll = 0;
+                    }
+                    return;
+                }
+            }
+            app.push(MessageRole::Assistant, chunk);
+            if app.follow {
+                app.scroll = 0;
+            }
+        }
+        AppEvent::ThoughtChunk(chunk) => {
+            // Accumulate into the last Thought trace item, or push a new one.
+            match app.trace.last_mut() {
+                Some(TraceItem::Thought(ref mut text)) => text.push_str(&chunk),
+                _ => app.trace.push(TraceItem::Thought(chunk)),
+            }
+        }
+        AppEvent::ToolEvent { verb, target } => {
+            app.trace.push(TraceItem::Tool { verb, target });
+        }
+        AppEvent::Done(bridge_used) => {
+            let elapsed = app
+                .thinking_start
+                .take()
+                .map_or(0.0, |t| t.elapsed().as_secs_f32());
+            app.bridge_connected = bridge_used;
+            app.busy = false;
+            app.task_handle = None;
+            app.event_rx = None;
+            if matches!(app.messages.last(), Some(message) if message.role == MessageRole::Assistant && message.content.trim().is_empty())
+            {
+                app.messages.pop();
+            }
+            if app.follow {
+                app.scroll = 0;
+            }
+            let via = if bridge_used {
+                " · via Kim desktop"
+            } else {
+                ""
+            };
+            app.status = format!("done in {:.1}s{via}", elapsed);
+        }
+        AppEvent::Err(error) => {
+            app.thinking_start = None;
+            app.bridge_connected = false;
+            app.busy = false;
+            app.task_handle = None;
+            app.event_rx = None;
+            if matches!(app.messages.last(), Some(message) if message.role == MessageRole::Assistant && message.content.trim().is_empty())
+            {
+                app.messages.pop();
+            }
+            app.push(MessageRole::Error, error);
+            if app.follow {
+                app.scroll = 0;
+            }
+            app.status = "error".to_string();
+        }
+    }
+}
+
+/* ===========================================================
+key handler
+=========================================================== */
 
 #[allow(clippy::too_many_lines)]
 async fn handle_key(
@@ -621,8 +748,6 @@ async fn handle_key(
                     app.push(MessageRole::System, "Opening Ollama sign-in…");
                     app.status = "opening Ollama sign-in".to_string();
                 }
-            }
-            if is_interactive_login(&input) {
                 suspend_terminal(terminal)?;
                 println!("Kim login\n");
                 let outcome = handle_command(&input, &mut app.config).await;
@@ -640,6 +765,11 @@ async fn handle_key(
             apply_outcome(app, outcome).await
         }
         KeyCode::Esc => {
+            // Cancel an in-flight request first.
+            if app.busy {
+                app.cancel_in_flight();
+                return Ok(false);
+            }
             if app.close_overlays() {
                 return Ok(false);
             }
@@ -666,6 +796,10 @@ async fn handle_key(
             Ok(false)
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.busy {
+                app.cancel_in_flight();
+                return Ok(false);
+            }
             Ok(app.arm_or_exit_with_ctrl_c())
         }
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -699,6 +833,11 @@ async fn handle_key(
                 app.allow_empty_session_open = true;
                 app.move_session_selection(-1);
             } else {
+                // Disengage follow-mode and scroll up into history.
+                if app.follow {
+                    app.follow = false;
+                    app.scroll = app.last_max_scroll.get();
+                }
                 app.scroll = app.scroll.saturating_sub(3);
             }
             Ok(false)
@@ -710,14 +849,23 @@ async fn handle_key(
             } else if app.view == ViewState::SessionMenu && app.input.is_empty() {
                 app.allow_empty_session_open = true;
                 app.move_session_selection(1);
-            } else {
+            } else if !app.follow {
                 app.scroll = app.scroll.saturating_add(3);
+                // Re-engage follow-mode when we reach the bottom.
+                if app.scroll >= app.last_max_scroll.get() {
+                    app.follow = true;
+                    app.scroll = 0;
+                }
             }
             Ok(false)
         }
         _ => Ok(false),
     }
 }
+
+/* ===========================================================
+outcome dispatch
+=========================================================== */
 
 async fn apply_outcome(
     app: &mut App,
@@ -775,39 +923,48 @@ async fn apply_outcome(
                 app.status = "choose New chat or open a session before sending".to_string();
                 return Ok(false);
             }
-            app.push(MessageRole::User, prompt);
+            app.push(MessageRole::User, prompt.clone());
             if let Some(last_user) = app
                 .messages
                 .iter()
                 .rev()
-                .find(|message| message.role == MessageRole::User)
-                .map(|message| message.content.clone())
+                .find(|m| m.role == MessageRole::User)
+                .map(|m| m.content.clone())
             {
                 app.ensure_current_session_listed(&last_user);
             }
-            app.busy = true;
-            app.status = "thinking…".to_string();
-            let started = Instant::now();
             let history = app.chat_history();
+            app.push(MessageRole::Assistant, String::new());
+            app.follow = true; // snap to bottom
+            app.scroll = 0;
+            app.busy = true;
+            app.trace.clear();
+            app.trace.push(TraceItem::Tool {
+                verb: "Thinking".to_string(),
+                target: format!("{} stream", app.config.model),
+            });
+            app.thinking_start = Some(Instant::now());
+            app.status = "working".to_string();
+
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+            app.event_rx = Some(rx);
+
+            let config = app.config.clone();
             let code_mode = app.mode == AppMode::Code;
-            match send_kim_request(&app.config, &history, code_mode).await {
-                Ok((reply, bridge_used)) => {
-                    app.bridge_connected = bridge_used;
-                    app.push(MessageRole::Assistant, reply);
-                    let via = if bridge_used { " · via Kim desktop" } else { "" };
-                    app.status = format!("done in {:.1}s{via}", started.elapsed().as_secs_f32());
-                }
-                Err(error) => {
-                    app.bridge_connected = false;
-                    app.push(MessageRole::Error, error);
-                    app.status = "error".to_string();
-                }
-            }
-            app.busy = false;
+
+            let handle = tokio::spawn(async move {
+                stream_kim_request(&config, &history, code_mode, tx).await;
+            });
+            app.task_handle = Some(handle);
+
             Ok(false)
         }
     }
 }
+
+/* ===========================================================
+compaction
+=========================================================== */
 
 fn compact_app_messages(app: &mut App) {
     let mut session = RuntimeSession::new();
@@ -847,6 +1004,10 @@ fn compact_app_messages(app: &mut App) {
     );
     app.status = "context compacted".to_string();
 }
+
+/* ===========================================================
+file reference helpers
+=========================================================== */
 
 fn prompt_with_file_references(input: &str) -> String {
     let file_paths = prompt_file_references(input);
@@ -938,6 +1099,10 @@ fn split_shellish_tokens(input: &str) -> Vec<String> {
     tokens
 }
 
+/* ===========================================================
+message converters
+=========================================================== */
+
 fn ui_message_to_runtime(message: &UiMessage) -> Option<ConversationMessage> {
     let role = match message.role {
         MessageRole::User => RuntimeMessageRole::User,
@@ -964,7 +1129,7 @@ fn runtime_message_to_ui(message: &ConversationMessage) -> Option<UiMessage> {
     let content = message
         .blocks
         .iter()
-        .filter_map(|block| match block {
+        .filter_map(|b| match b {
             ContentBlock::Text { text } => Some(text.as_str()),
             ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
         })
@@ -977,9 +1142,12 @@ fn runtime_message_to_ui(message: &ConversationMessage) -> Option<UiMessage> {
     }
 }
 
+/* ===========================================================
+misc helpers
+=========================================================== */
+
 fn apply_mode_input(input: &str, app: &mut App) -> bool {
-    let trimmed = input.trim().to_ascii_lowercase();
-    match trimmed.as_str() {
+    match input.trim().to_ascii_lowercase().as_str() {
         "/mode chat" | "/chat" => {
             app.set_mode(AppMode::Chat);
             true
@@ -1025,7 +1193,10 @@ fn is_interactive_login(input: &str) -> bool {
         || trimmed == "/login"
 }
 
-/// Track whether raw mode was enabled so the panic hook knows what to undo.
+/* ===========================================================
+terminal lifecycle
+=========================================================== */
+
 static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn install_panic_hook() {
@@ -1035,9 +1206,10 @@ fn install_panic_hook() {
             let _ = disable_raw_mode();
             let _ = execute!(
                 stdout(),
+                DisableMouseCapture,
                 DisableBracketedPaste,
                 LeaveAlternateScreen,
-                crossterm::cursor::Show,
+                crossterm::cursor::Show
             );
         }
         original(info);
@@ -1047,9 +1219,13 @@ fn install_panic_hook() {
 fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
     RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
-    execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
-    let backend = CrosstermBackend::new(stdout());
-    Terminal::new(backend)
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
+    Terminal::new(CrosstermBackend::new(stdout()))
 }
 
 fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
@@ -1057,6 +1233,7 @@ fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) ->
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;
@@ -1067,6 +1244,7 @@ fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) 
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;
@@ -1078,7 +1256,8 @@ fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        EnableMouseCapture
     )?;
     terminal.clear()
 }
@@ -1090,7 +1269,7 @@ fn help_text() -> &'static str {
 fn new_session_id() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis());
+        .map_or(0, |d| d.as_millis());
     format!("session-{millis}")
 }
 
@@ -1106,6 +1285,10 @@ fn truncate_for_sidebar(text: &str) -> String {
         title
     }
 }
+
+/* ===========================================================
+tests
+=========================================================== */
 
 #[cfg(test)]
 mod tests {
@@ -1135,7 +1318,6 @@ mod tests {
         fs::write(&path, "hello").expect("fixture should write");
         let prompt = prompt_with_file_references(&format!("read {}", path.display()));
         let _ = fs::remove_file(&path);
-
         assert!(prompt.contains("Referenced local files Kim may access:"));
         assert!(prompt.contains("kim-cli-attach-"));
     }
