@@ -103,7 +103,7 @@ async def _main_async(args: argparse.Namespace) -> int:
     # cwd is accurate.
     os.environ["PROJECT_ROOT"] = args.cwd
 
-    print("[STATUS] Kim is working on your task…", flush=True)
+    print(f"[STATUS] ✓ Using Codex via browser bridge ({args.provider})", flush=True)
 
     provider = create_provider(args.provider, config)
 
@@ -124,13 +124,12 @@ async def _main_async(args: argparse.Namespace) -> int:
         print(f"[FAILED] Codex bridge error: {e}", flush=True)
         return 1
 
+    # JSONL output is already streamed to stdout line-by-line by run_codex_subtask.
+    # Only emit a [FAILED] line if Codex itself exited with an error, so Tauri
+    # can surface a user-facing message.
     msg = result.get("message", "")
-    final_answer = str(result.get("final_answer") or "").strip()
     if result.get("success"):
         logger.info(msg)
-        if final_answer and not result.get("answer_emitted"):
-            print(f"[ANSWER] {json.dumps(final_answer, ensure_ascii=False)}", flush=True)
-        print("[SUCCESS] Task completed", flush=True)
         return 0
 
     logger.error(msg)

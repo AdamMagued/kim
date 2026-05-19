@@ -106,82 +106,95 @@ async def run_codex_subtask(
     logger.info(f"  binary: {binary_path}")
     logger.info(f"  cwd: {working_dir}")
 
-    # Start the local proxy server
+    # Start the local proxy server — Codex's LLM calls go here instead of OpenAI.
     proxy = _CodexProxy(browser_provider)
     proxy_port = await proxy.start()
 
     logger.info(f"  proxy: http://127.0.0.1:{proxy_port}")
 
-    # Write a temporary Codex config that points to our proxy
+    # Write a temp Codex config pointing model_provider at our proxy.
     config_dir = Path(tempfile.mkdtemp(prefix="kim-codex-config-"))
     config_file = config_dir / "config.toml"
     _write_codex_config(config_file, proxy_port, model)
 
-    final_answer: Optional[str] = None
+    process: Optional[asyncio.subprocess.Process] = None  # type: ignore[name-defined]
     try:
         env = {
             **os.environ,
+            # Tell Codex where to find its config (our temp dir with proxy config).
             "CODEX_HOME": str(config_dir),
-            # Disable Codex's own login flow — we handle auth via proxy
+            # Dummy keys so Codex skips its account-auth flow.
             "CODEX_API_KEY": "kim-proxy-key",
-            # Tell Codex to use our proxy provider
             "OPENAI_API_KEY": "kim-proxy-key",
-            # Quiet mode for non-interactive subprocess use
-            "CODEX_QUIET_MODE": "1",
+            # Also set base_url so even fallback paths hit our proxy.
+            "OPENAI_BASE_URL": f"http://127.0.0.1:{proxy_port}/v1",
         }
 
-        cmd = [str(binary_path)]
-        if model:
-            cmd.extend(["-m", model])
-        # Run in full-auto approval mode so Codex doesn't prompt for confirmation
-        cmd.extend(["--full-auto", "--quiet", task])
+        # Use the new `exec --json` subcommand — the old --full-auto --quiet
+        # interface is not supported by @openai/codex v0.x.
+        cmd = [
+            str(binary_path),
+            "exec", "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--oss",
+            "-C", working_dir,
+            task,
+        ]
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
             env=env,
-            cwd=working_dir,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Read stdout/stderr concurrently
-        stdout_data, stderr_data = await asyncio.wait_for(
-            process.communicate(),
-            timeout=600,  # 10 minute timeout
-        )
+        # Stream JSONL lines to stdout in real-time so Tauri picks them up.
+        stderr_lines: list[str] = []
 
-        stdout_text = stdout_data.decode("utf-8", errors="replace") if stdout_data else ""
-        stderr_text = stderr_data.decode("utf-8", errors="replace") if stderr_data else ""
+        async def _stream_stdout() -> None:
+            assert process and process.stdout
+            async for raw in process.stdout:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    print(line, flush=True)
 
-        # Surface Codex tool calls in Kim's activity feed
-        _surface_codex_output(stdout_text)
+        async def _drain_stderr() -> None:
+            assert process and process.stderr
+            async for raw in process.stderr:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    stderr_lines.append(line)
+                    logger.debug("codex stderr: %s", line)
 
-        exit_code = process.returncode or 0
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(_stream_stdout(), _drain_stderr()),
+                timeout=600,
+            )
+        except asyncio.TimeoutError:
+            logger.error("Codex subprocess timed out after 600s")
+            try:
+                process.kill()
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except Exception:
+                pass
+            return {
+                "success": False,
+                "exit_code": -1,
+                "message": "Codex task timed out after 10 minutes.",
+            }
+
+        exit_code = await process.wait()
         success = exit_code == 0
-
-        # Extract the final answer from Codex's output
-        final_answer = _extract_final_answer(stdout_text)
+        stderr_text = "\n".join(stderr_lines[-10:])  # last 10 lines for diagnostics
 
         result_msg = (
-            final_answer.strip()
-            if success and final_answer and final_answer.strip()
-            else "Task completed successfully."
+            "Task completed successfully."
             if success
-            else f"Codex encountered an error: {stderr_text[:200]}"
+            else f"Codex exited with code {exit_code}: {stderr_text[:300]}"
         )
 
-    except asyncio.TimeoutError:
-        logger.error("Codex subprocess timed out after 600s")
-        try:
-            process.kill()
-            await asyncio.wait_for(process.wait(), timeout=5)
-        except Exception:
-            pass
-        return {
-            "success": False,
-            "exit_code": -1,
-            "message": "Codex task timed out after 10 minutes.",
-        }
     except Exception as e:
         logger.error(f"Codex bridge error: {e}", exc_info=True)
         return {
@@ -375,31 +388,18 @@ def _extract_prompt_from_responses_request(body: dict) -> str:
 
 def _codex_browser_system_prompt() -> str:
     return (
-        "You are a coding assistant running on the user's Mac. You help with software "
-        "engineering tasks by using the tools available to you. Every tool call you emit "
-        "is executed locally on the user's machine.\n\n"
-        "If the user asks to read, list, or edit files, immediately use the matching tool.\n\n"
-        "Use the tools below to complete tasks. For filesystem questions, use bash or "
-        "read_file directly rather than asking the user to provide files.\n\n"
-        "Available tools (use ONLY these exact names):\n"
-        "  - shell(command)                            run a shell command\n"
-        "  - read_file(path, offset?, limit?)          read a file's content\n"
-        "  - write_file(path, content)                 create or overwrite a file\n"
-        "  - edit_file(path, old_string, new_string)   edit a file\n"
-        "  - list_dir(path)                            list directory contents\n"
-        "  - grep_search(pattern, path?)               search files by pattern\n"
-        "  - glob_search(pattern, path?)               find files by glob\n\n"
-        "IMPORTANT: Ignore any nested Kim desktop instructions that ask for "
-        '{"tool":"...","args":{}}, TASK_COMPLETE, NEED_HELP, or KIM_* suffixes. '
-        "Those formats are for a different agent layer.\n\n"
-        "Your response MUST be raw JSON in one of these exact shapes:\n"
-        '{"text":"brief reasoning","tool_calls":[{"name":"tool","input":{}}]}\n'
-        '{"text":"final answer"}\n\n'
+        "You are a coding assistant. The conversation below contains a [SYSTEM PROMPT] "
+        "section from Codex that defines the available tools — use those exact tool names.\n\n"
+        "CRITICAL: Your entire response MUST be raw JSON only. No markdown, no prose, "
+        "no code fences. Use exactly one of these two shapes:\n\n"
+        '  Tool call:    {"text": "brief reasoning", "tool_calls": [{"name": "TOOL_NAME", "input": {...}}]}\n'
+        '  Final answer: {"text": "your answer"}\n\n'
         "Rules:\n"
-        "- For a tool turn, tool_calls MUST contain at least one tool call.\n"
-        "- For a final text answer, omit the tool_calls key entirely.\n"
-        "- Do not include markdown fences, code blocks, or any text outside JSON.\n"
-        "- ALL file content must go in a write_file tool_call, never in the text field.\n"
+        "- Use ONLY the tool names defined in the [SYSTEM PROMPT] from Codex.\n"
+        "- For a tool turn: include tool_calls with at least one entry.\n"
+        "- For a final answer: omit tool_calls entirely.\n"
+        "- File content always goes in a tool call — never embed it in the text field.\n"
+        "- Do NOT output anything outside the JSON object.\n"
     )
 
 
