@@ -7,6 +7,7 @@ python-dotenv>=1.0.0
 PyYAML>=6.0.1
 httpx>=0.27.0
 aiofiles>=23.0.0
+aiohttp>=3.9.0
 aiosqlite>=0.20.0
 json5>=0.10.0
 json-repair>=0.30.0

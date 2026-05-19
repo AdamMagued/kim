@@ -2150,14 +2150,29 @@ class BrowserProvider(BaseProvider):
             if m:
                 parsed = self._try_parse_tool_json(m.group(1))
                 if parsed:
-                    return parsed
+                    return self._with_surrounding_content(parsed, text, *m.span(0))
 
         # Bare JSON object scan (outermost braces only)
+        match = self._scan_for_json_match(text)
+        if match:
+            parsed, start, end = match
+            return self._with_surrounding_content(parsed, text, start, end)
+
         parsed = self._scan_for_json(text)
         if parsed:
             return parsed
 
         return {"type": "text", "content": text}
+
+    def _with_surrounding_content(self, parsed: dict, text: str, start: int, end: int) -> dict:
+        """Attach non-JSON prose so PLAN/STEP markers are not lost."""
+        before = text[:start].strip()
+        after = text[end:].strip()
+        content = "\n".join(part for part in (before, after) if part).strip()
+        if content:
+            parsed = dict(parsed)
+            parsed["content"] = content
+        return parsed
 
     def _try_parse_tool_json(self, s: str) -> Optional[dict]:
         # Safe imports: these packages are optional (#28)
@@ -2195,9 +2210,8 @@ class BrowserProvider(BaseProvider):
             }
         return None
 
-    def _scan_for_json(self, text: str) -> Optional[dict]:
-        """Find the first balanced JSON object in text that has a 'tool' key.
-        String-aware: braces inside JSON strings are not counted (#26, #27)."""
+    def _scan_for_json_match(self, text: str) -> Optional[tuple[dict, int, int]]:
+        """Find the first balanced tool JSON object and return parsed + span."""
         depth = 0
         start = -1
         in_str = False
@@ -2224,6 +2238,12 @@ class BrowserProvider(BaseProvider):
                         candidate = text[start: i + 1]
                         parsed = self._try_parse_tool_json(candidate)
                         if parsed:
-                            return parsed
+                            return parsed, start, i + 1
                         start = -1
         return None
+
+    def _scan_for_json(self, text: str) -> Optional[dict]:
+        """Find the first balanced JSON object in text that has a 'tool' key.
+        String-aware: braces inside JSON strings are not counted (#26, #27)."""
+        match = self._scan_for_json_match(text)
+        return match[0] if match else None

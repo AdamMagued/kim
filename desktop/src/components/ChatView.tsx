@@ -2270,6 +2270,10 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
   async function handleCancel() {
     if (!isRunning || cancelling) return;
     setCancelling(true);
+    // Clear the activity feed immediately so the thinking panel disappears as
+    // soon as the user stops — don't wait for kim-agent-done which may be
+    // delayed when the Python process is blocked on a browser response.
+    clearActivityNow();
     // Set the cancel flag BEFORE sending the signal. kim-agent-done fires
     // ~100ms before kim-agent-cancelled (Rust emits done in child.wait()),
     // so the flag must be true when done arrives or the error banner appears.
