@@ -1,15 +1,14 @@
 """
-Spawn `claw` and relay its LLM calls through Kim's BrowserProvider so users
-can run Code-tab tasks without an Anthropic API key.
+Spawn `codex` and relay its LLM calls through Kim's BrowserProvider so users
+can run Code-tab tasks without an API key.
 
-This wraps the file-bridge protocol Claw already supports (`CLAW_FILE_BRIDGE=1`).
-Claw writes each LLM request to <CLAW_BRIDGE_DIR>/bridge_request.json; we read
-it, hand it to BrowserProvider.complete(), and write bridge_response.json back.
-The relay loop lives in `mcp_server/tools/claw_bridge.run_claw_subtask`.
+This uses Codex's native HTTP proxy approach to relay LLM calls through
+Codex talks to a local HTTP server that Kim starts, which translates requests
+through BrowserProvider.complete().
 
 Usage (invoked by the Tauri shell, not by humans):
 
-    python -m orchestrator.run_claw_bridge \
+    python -m orchestrator.run_codex_bridge \
         --task "write fibonacci.py and test it" \
         --cwd  /path/to/project \
         --provider browser:gemini
@@ -29,13 +28,13 @@ import sys
 from pathlib import Path
 
 # Make `import orchestrator.…` and `import mcp_server.…` resolve when we are
-# launched via `python -m orchestrator.run_claw_bridge` from the kim-pro root.
+# launched via `python -m orchestrator.run_codex_bridge` from the kim-pro root.
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from mcp_server.tools.claw_bridge import run_claw_subtask  # noqa: E402
+from mcp_server.tools.codex_bridge import run_codex_subtask  # noqa: E402
 from orchestrator.providers.base import create_provider  # noqa: E402
 
 
@@ -61,18 +60,19 @@ def _load_config(path: str | None) -> dict:
         return {}
 
 
-logger = logging.getLogger("kim.run_claw_bridge")
+logger = logging.getLogger("kim.run_codex_bridge")
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run a Claw task via Kim's browser provider.")
-    p.add_argument("--task", required=True, help="The coding task to hand to Claw.")
-    p.add_argument("--cwd", required=True, help="Working directory Claw should run in (the user's project).")
+    p = argparse.ArgumentParser(description="Run a Codex task via Kim's browser provider.")
+    p.add_argument("--task", required=True, help="The coding task to hand to Codex.")
+    p.add_argument("--cwd", required=True, help="Working directory Codex should run in (the user's project).")
     p.add_argument(
         "--provider",
         default=os.environ.get("KIM_PROVIDER", "browser"),
         help="Browser provider identifier, e.g. 'browser:gemini' or 'browser:claude'.",
     )
+    p.add_argument("--model", default=None, help="Model name to pass to Codex.")
     p.add_argument("--config", default=None, help="Optional path to config.yaml.")
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
@@ -87,10 +87,10 @@ async def _main_async(args: argparse.Namespace) -> int:
 
     if not args.provider.lower().startswith("browser"):
         # Defensive: this script only makes sense for browser-backed runs.
-        # If the user picked an API provider, the Tauri side should call Claw
+        # If the user picked an API provider, the Tauri side should call Codex
         # directly with the API key, not through us.
         print(
-            f"[ERROR] run_claw_bridge requires a browser provider; got {args.provider!r}.",
+            f"[ERROR] run_codex_bridge requires a browser provider; got {args.provider!r}.",
             file=sys.stderr,
         )
         return 2
@@ -100,38 +100,33 @@ async def _main_async(args: argparse.Namespace) -> int:
 
     # Make sure BrowserProvider's project_root resolution stays anchored to
     # the user's *project* (not the Kim repo) so any logging that references
-    # cwd is accurate. PROJECT_ROOT for the bridge is intentionally the user
-    # project — the relay never executes tools itself, Claw does.
+    # cwd is accurate.
     os.environ["PROJECT_ROOT"] = args.cwd
 
     print("[STATUS] Kim is working on your task…", flush=True)
 
     provider = create_provider(args.provider, config)
 
-    # Honor CLAW_BIN so the Tauri side can hand us the exact binary path it
-    # already resolved via find_claw_binary, instead of relay_subtask repeating
-    # the search dance with a different default. Empty string falls through
-    # to run_claw_subtask's own default.
-    claw_bin_env = os.environ.get("CLAW_BIN", "").strip() or None
+    # Honor CODEX_BIN so the Tauri side can hand us the exact binary path it
+    # already resolved, instead of run_codex_subtask repeating the search.
+    codex_bin_env = os.environ.get("CODEX_BIN", "").strip() or None
 
     try:
-        result = await run_claw_subtask(
+        result = await run_codex_subtask(
             task=args.task,
             browser_provider=provider,  # type: ignore[arg-type]
             cwd=args.cwd,
-            claw_binary=claw_bin_env,
+            codex_binary=codex_bin_env,
+            model=args.model,
         )
     except Exception as e:  # noqa: BLE001
-        logger.exception("Claw bridge crashed")
-        print(f"[FAILED] Claw bridge error: {e}", flush=True)
+        logger.exception("Codex bridge crashed")
+        print(f"[FAILED] Codex bridge error: {e}", flush=True)
         return 1
 
     msg = result.get("message", "")
     final_answer = str(result.get("final_answer") or "").strip()
     if result.get("success"):
-        # The relay emits final text-only model responses as [ANSWER] before the
-        # success marker. Keep this fallback for older relay implementations or
-        # unusual paths where a final answer was returned but not emitted.
         logger.info(msg)
         if final_answer and not result.get("answer_emitted"):
             print(f"[ANSWER] {json.dumps(final_answer, ensure_ascii=False)}", flush=True)

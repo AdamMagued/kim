@@ -14,12 +14,13 @@ base64 = "0.22"
 crossterm = { version = "0.28", features = ["bracketed-paste"] }
 dirs = "5"
 ratatui = "0.29"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rpassword = "7"
 runtime = { path = "../runtime" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
-tokio = { version = "1", features = ["macros", "process", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time"] }
 
 [lints]
 workspace = true

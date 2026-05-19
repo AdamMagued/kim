@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -5,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::theme::Theme;
-use crate::{App, AppMode, MessageRole, ViewState};
+use crate::{thinking, App, AppMode, MessageRole, ViewState};
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let theme = Theme::for_name(app.config.theme);
@@ -38,10 +40,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("terminal", Style::default().fg(theme.text_dim)),
-        Span::styled(
-            " v1.192",
-            Style::default().fg(theme.text_dimmer),
-        ),
+        Span::styled(" v1.192", Style::default().fg(theme.text_dimmer)),
         Span::raw("  "),
         Span::styled(
             format!("[{}]", app.mode.label()),
@@ -62,8 +61,16 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         ),
         Span::raw("  "),
         Span::styled(
-            if app.bridge_connected { "[bridge]" } else { "[direct]" },
-            Style::default().fg(if app.bridge_connected { theme.success } else { theme.text_dimmer }),
+            if app.bridge_connected {
+                "[bridge]"
+            } else {
+                "[direct]"
+            },
+            Style::default().fg(if app.bridge_connected {
+                theme.success
+            } else {
+                theme.text_dimmer
+            }),
         ),
     ]);
     let paragraph = Paragraph::new(title).block(
@@ -79,6 +86,24 @@ fn draw_body(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     if app.view == ViewState::SessionMenu {
         draw_session_browser(frame, app, area, theme);
         return;
+    }
+    if app.busy {
+        let elapsed = app.thinking_start.map_or(Duration::ZERO, |t| t.elapsed());
+        // Dock thinking panel at the bottom so streaming text is always visible above.
+        // It needs enough room for border + padding + header/body/keybar; below that it
+        // looks broken, so fall back to the inline spinner.
+        if area.height >= 12 {
+            let trace_rows = (app.trace.len() as u16).min(6);
+            let max_panel_h = (area.height / 2).max(8).min(area.height.saturating_sub(4));
+            let panel_h = (trace_rows + 7).clamp(8, max_panel_h);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(4), Constraint::Length(panel_h)])
+                .split(area);
+            draw_chat(frame, app, chunks[0], theme);
+            thinking::draw_thinking_panel(frame, chunks[1], &app.trace, elapsed, theme);
+            return;
+        }
     }
     draw_chat(frame, app, area, theme);
 }
@@ -278,21 +303,39 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         lines.push(Line::styled(hint, Style::default().fg(theme.text_dim)));
     }
     if app.busy {
-        lines.push(Line::styled(
-            "kim is thinking…",
-            Style::default().fg(theme.accent),
-        ));
+        let elapsed = app.thinking_start.map_or(Duration::ZERO, |t| t.elapsed());
+        lines.push(Line::from(vec![
+            thinking::spinner_span(elapsed, thinking::SpinnerStyle::Braille, theme.accent),
+            ratatui::text::Span::styled(
+                "  thinking…",
+                ratatui::style::Style::default().fg(theme.accent),
+            ),
+        ]));
     }
+    // Compute scroll. Publish max_scroll so the event loop can reason about
+    // when to re-engage follow-mode without needing access to the terminal size.
+    let visible_height = area.height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(visible_height);
+    app.last_max_scroll.set(max_scroll);
+    let effective_scroll = if app.follow {
+        max_scroll
+    } else {
+        app.scroll.min(max_scroll)
+    };
+    let scrolled_up = !app.follow && effective_scroll < max_scroll;
+    let chat_title = if app.view == ViewState::SessionMenu {
+        " Chat List ".to_string()
+    } else if scrolled_up {
+        " Chat · ↓ scroll to bottom · Esc returns to list ".to_string()
+    } else {
+        " Chat · Esc returns to chat list ".to_string()
+    };
     let chat = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0))
+        .scroll((effective_scroll, 0))
         .block(
             Block::default()
-                .title(if app.view == ViewState::SessionMenu {
-                    " Chat List "
-                } else {
-                    " Chat · Esc returns to chat list "
-                })
+                .title(chat_title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.border))
                 .style(Style::default().bg(theme.bg)),
@@ -462,19 +505,34 @@ fn strip_inline_md(text: &str) -> String {
 }
 
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+    let current_status = if app.busy {
+        let elapsed = app.thinking_start.map_or(Duration::ZERO, |t| t.elapsed());
+        format!("{} · worked for {}", app.status, format_elapsed(elapsed))
+    } else {
+        app.status.clone()
+    };
     let status = if app.view == ViewState::SessionMenu {
         format!(
             "  Enter opens selected · Press Tab to switch Chat/Code · /login /model /help · {}",
-            app.status
+            current_status
         )
     } else {
         format!(
             "  Esc returns to chat list · type /sessions for chat list · Ctrl-C twice exits · {}",
-            app.status
+            current_status
         )
     };
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(theme.text_dim).bg(theme.status)),
         area,
     );
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
 }
