@@ -281,17 +281,15 @@ pub fn draw_thinking_panel(
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(1),
             Constraint::Min(0),
-            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(body);
 
     draw_header(f, rows[0], elapsed, items.len(), theme);
     draw_rule(f, rows[1], theme);
-    draw_stream(f, rows[3], items, elapsed, theme);
-    draw_keybar(f, rows[5], theme);
+    draw_stream(f, rows[2], items, elapsed, theme);
+    draw_keybar(f, rows[3], theme);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, elapsed: Duration, step_count: usize, theme: Theme) {

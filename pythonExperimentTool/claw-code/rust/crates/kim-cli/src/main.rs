@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use commands::{handle_command, CommandOutcome, SUPPORTED_COMMANDS};
+use commands::{handle_command, login_with_key, CommandOutcome, SUPPORTED_COMMANDS};
 use config::KimConfig;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -94,9 +94,21 @@ pub struct App {
     pub model_options: Vec<String>,
     pub selected_model: usize,
     pub model_picker_open: bool,
+    pub provider_picker_open: bool,
+    pub selected_provider: usize,
     pub allow_empty_session_open: bool,
     pub view: ViewState,
     pub bridge_connected: bool,
+    /// True when the current provider has a saved key (or is keyless like ollama/desktop
+    /// and was successfully connected via /login).
+    pub provider_ready: bool,
+    // input history (Up/Down arrow recall, like a terminal shell)
+    pub input_history: Vec<String>,
+    pub history_cursor: Option<usize>,
+    pub input_before_history: String,
+    // secure input mode: API key entry rendered as • inside the TUI
+    pub secure_input: bool,
+    pub secure_input_provider: String,
     // streaming / thinking panel state
     pub trace: Vec<TraceItem>,
     pub thinking_start: Option<Instant>,
@@ -124,9 +136,17 @@ impl App {
             model_options: Vec::new(),
             selected_model: 0,
             model_picker_open: false,
+            provider_picker_open: false,
+            selected_provider: 0,
             allow_empty_session_open: false,
             view: ViewState::SessionMenu,
             bridge_connected: false,
+            provider_ready: false,
+            input_history: Vec::new(),
+            history_cursor: None,
+            input_before_history: String::new(),
+            secure_input: false,
+            secure_input_provider: String::new(),
             trace: Vec::new(),
             thinking_start: None,
             event_rx: None,
@@ -206,6 +226,41 @@ impl App {
         if self.slash_selected >= matches.len() {
             self.slash_selected = 0;
         }
+    }
+
+    fn push_history(&mut self, input: String) {
+        if self.input_history.last().map_or(true, |last| last != &input) {
+            self.input_history.push(input);
+        }
+    }
+
+    fn history_up(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let new_idx = match self.history_cursor {
+            None => {
+                self.input_before_history = self.input.clone();
+                self.input_history.len() - 1
+            }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_cursor = Some(new_idx);
+        self.input = self.input_history[new_idx].clone();
+        self.sync_slash_selection();
+    }
+
+    fn history_down(&mut self) {
+        let Some(i) = self.history_cursor else { return };
+        if i + 1 < self.input_history.len() {
+            self.history_cursor = Some(i + 1);
+            self.input = self.input_history[i + 1].clone();
+        } else {
+            self.history_cursor = None;
+            self.input = self.input_before_history.clone();
+        }
+        self.sync_slash_selection();
     }
 
     fn complete_slash_selection(&mut self) -> bool {
@@ -327,7 +382,43 @@ impl App {
             self.status = "model picker closed".to_string();
             return true;
         }
+        if self.provider_picker_open {
+            self.provider_picker_open = false;
+            self.status = "provider picker closed".to_string();
+            return true;
+        }
         false
+    }
+
+    fn open_provider_picker(&mut self) {
+        self.selected_provider = provider::PROVIDERS
+            .iter()
+            .position(|p| p.name == self.config.provider)
+            .unwrap_or(0);
+        self.provider_picker_open = true;
+        self.status = "choose provider · ↑/↓ navigate · Enter confirm · Esc close".to_string();
+    }
+
+    fn move_provider_selection(&mut self, delta: isize) {
+        let max = isize::try_from(provider::PROVIDERS.len().saturating_sub(1)).unwrap_or(0);
+        let current = isize::try_from(self.selected_provider).unwrap_or(0);
+        self.selected_provider =
+            usize::try_from(current.saturating_add(delta).clamp(0, max)).unwrap_or(0);
+    }
+
+    fn confirm_provider_selection(&mut self) {
+        let Some(p) = provider::PROVIDERS.get(self.selected_provider) else {
+            self.provider_picker_open = false;
+            return;
+        };
+        let changed = self.config.provider != p.name;
+        self.config.provider = p.name.to_string();
+        if changed {
+            self.config.model = p.default_model.to_string();
+        }
+        let _ = self.config.save();
+        self.status = format!("provider → {}  model → {}", p.name, self.config.model);
+        self.provider_picker_open = false;
     }
 
     pub fn visible_messages(&self) -> impl Iterator<Item = &UiMessage> {
@@ -547,15 +638,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 main loop — non-blocking so the streaming task can run
 =========================================================== */
 
+fn provider_is_ready(config: &KimConfig) -> bool {
+    match config.provider.as_str() {
+        // Keyless providers: considered ready only after explicit /login check.
+        // We can't know at startup if the server is running without a network call,
+        // so we only set ready=true via ProviderConnected. However, if user already
+        // had ollama/desktop set and there's no key to check, we optimistically
+        // return true so existing sessions don't show "not signed in" every launch.
+        "ollama" | "desktop" => true,
+        p => config.api_keys.contains_key(p),
+    }
+}
+
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     resume_id: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut app = App::new(KimConfig::load(), resume_id);
-    app.push(
-        MessageRole::System,
-        "Kim CLI v1. Pick New chat or a session. /login signs into Ollama; /mode switches chat/code.",
-    );
+    app.provider_ready = provider_is_ready(&app.config);
+    let welcome = if app.provider_ready {
+        format!(
+            "Kim CLI v1. Signed in as {} · {}. Pick New chat or a session.",
+            app.config.provider, app.config.model
+        )
+    } else {
+        "Kim CLI v1. Not signed in yet. Run /login to connect to a provider, then start chatting.".to_string()
+    };
+    app.push(MessageRole::System, welcome);
 
     'main: loop {
         drain_events(&mut app);
@@ -583,7 +692,19 @@ async fn run_app(
                 }
                 Event::Paste(text) => app.paste_text(&text),
                 Event::Mouse(mouse) => {
-                    if app.view == ViewState::InChat {
+                    if app.model_picker_open {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => app.move_model_selection(-1),
+                            MouseEventKind::ScrollDown => app.move_model_selection(1),
+                            _ => {}
+                        }
+                    } else if app.provider_picker_open {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => app.move_provider_selection(-1),
+                            MouseEventKind::ScrollDown => app.move_provider_selection(1),
+                            _ => {}
+                        }
+                    } else if app.view == ViewState::InChat {
                         match mouse.kind {
                             MouseEventKind::ScrollUp => {
                                 if app.follow {
@@ -707,10 +828,13 @@ key handler
 async fn handle_key(
     key: KeyEvent,
     app: &mut App,
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    _terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if app.model_picker_open {
         return Ok(handle_model_picker_key(key, app));
+    }
+    if app.provider_picker_open {
+        return Ok(handle_provider_picker_key(key, app));
     }
     match key.code {
         KeyCode::Enter => {
@@ -718,10 +842,25 @@ async fn handle_key(
                 return Ok(false);
             }
             app.reset_ctrl_c();
+            // Secure input mode: submit API key without leaving the TUI.
+            if app.secure_input {
+                let key_text = std::mem::take(&mut app.input);
+                app.secure_input = false;
+                let provider = std::mem::take(&mut app.secure_input_provider);
+                app.status = format!("validating {provider} key…");
+                let outcome = login_with_key(&provider, &key_text, &mut app.config).await;
+                let result = apply_outcome(app, outcome).await;
+                app.provider_ready = provider_is_ready(&app.config);
+                return result;
+            }
             if app.complete_slash_selection() {
                 return Ok(false);
             }
             let input = std::mem::take(&mut app.input);
+            app.history_cursor = None;
+            if !input.trim().is_empty() {
+                app.push_history(input.clone());
+            }
             if input.trim().is_empty() {
                 if app.view == ViewState::SessionMenu {
                     app.open_selected_session();
@@ -743,28 +882,25 @@ async fn handle_key(
             if input.trim() == "/clear" {
                 app.messages.clear();
             }
-            if is_interactive_login(&input) {
-                if input.trim().eq_ignore_ascii_case("/login") {
-                    app.push(MessageRole::System, "Opening Ollama sign-in…");
-                    app.status = "opening Ollama sign-in".to_string();
-                }
-                suspend_terminal(terminal)?;
-                println!("Kim login\n");
-                let outcome = handle_command(&input, &mut app.config).await;
-                if let CommandOutcome::Message(ref msg) = outcome {
-                    println!("{msg}");
-                }
-                println!("\nPress Enter to return to Kim…");
-                let mut pause = String::new();
-                let _ = io::stdin().read_line(&mut pause);
-                resume_terminal(terminal)?;
-                return apply_outcome(app, outcome).await;
-            }
-            let input = prompt_with_file_references(&input);
+            let input = if input.trim_start().starts_with('/') {
+                input
+            } else {
+                prompt_with_file_references(&input)
+            };
             let outcome = handle_command(&input, &mut app.config).await;
-            apply_outcome(app, outcome).await
+            let result = apply_outcome(app, outcome).await;
+            app.provider_ready = provider_is_ready(&app.config);
+            result
         }
         KeyCode::Esc => {
+            // Cancel secure input mode.
+            if app.secure_input {
+                app.secure_input = false;
+                app.secure_input_provider = String::new();
+                app.input.clear();
+                app.status = "login cancelled".to_string();
+                return Ok(false);
+            }
             // Cancel an in-flight request first.
             if app.busy {
                 app.cancel_in_flight();
@@ -791,6 +927,7 @@ async fn handle_key(
         KeyCode::Backspace => {
             app.reset_ctrl_c();
             app.allow_empty_session_open = false;
+            app.history_cursor = None;
             app.input.pop();
             app.sync_slash_selection();
             Ok(false)
@@ -818,6 +955,7 @@ async fn handle_key(
         KeyCode::Char(char) => {
             app.reset_ctrl_c();
             app.allow_empty_session_open = false;
+            app.history_cursor = None;
             app.input.push(char);
             app.sync_slash_selection();
             if app.view == ViewState::SessionMenu && !app.input.starts_with('/') {
@@ -827,13 +965,17 @@ async fn handle_key(
         }
         KeyCode::Up => {
             app.reset_ctrl_c();
-            if app.input.starts_with('/') {
+            if app.history_cursor.is_some() {
+                // Already in history — keep going regardless of what input contains.
+                app.history_up();
+            } else if app.input.starts_with('/') && !app.slash_matches().is_empty() {
                 app.move_slash_selection(-1);
             } else if app.view == ViewState::SessionMenu && app.input.is_empty() {
                 app.allow_empty_session_open = true;
                 app.move_session_selection(-1);
+            } else if app.view == ViewState::InChat && !app.input_history.is_empty() {
+                app.history_up();
             } else {
-                // Disengage follow-mode and scroll up into history.
                 if app.follow {
                     app.follow = false;
                     app.scroll = app.last_max_scroll.get();
@@ -844,14 +986,16 @@ async fn handle_key(
         }
         KeyCode::Down => {
             app.reset_ctrl_c();
-            if app.input.starts_with('/') {
+            if app.history_cursor.is_some() {
+                // Already in history — keep going regardless of what input contains.
+                app.history_down();
+            } else if app.input.starts_with('/') && !app.slash_matches().is_empty() {
                 app.move_slash_selection(1);
             } else if app.view == ViewState::SessionMenu && app.input.is_empty() {
                 app.allow_empty_session_open = true;
                 app.move_session_selection(1);
             } else if !app.follow {
                 app.scroll = app.scroll.saturating_add(3);
-                // Re-engage follow-mode when we reach the bottom.
                 if app.scroll >= app.last_max_scroll.get() {
                     app.follow = true;
                     app.scroll = 0;
@@ -873,9 +1017,29 @@ async fn apply_outcome(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match outcome {
         CommandOutcome::Exit => Ok(true),
+        CommandOutcome::Info(message) => {
+            app.status = message;
+            Ok(false)
+        }
+        CommandOutcome::NeedApiKey(provider) => {
+            app.secure_input = true;
+            app.secure_input_provider = provider.clone();
+            app.input.clear();
+            app.status = format!("enter {provider} API key and press Enter · Esc to cancel");
+            Ok(false)
+        }
+        CommandOutcome::ProviderConnected(message) => {
+            app.provider_ready = true;
+            app.push(MessageRole::System, message);
+            app.status = format!("signed in · {}", app.config.provider);
+            Ok(false)
+        }
         CommandOutcome::Message(message) => {
             if message == "Conversation cleared." {
                 app.messages.clear();
+            } else if let Some(session_id) = message.strip_prefix("__KIM_RESUME_SESSION__:") {
+                app.resume_session(session_id);
+                return Ok(false);
             } else if message == "__KIM_REFRESH_SESSIONS__" {
                 app.show_session_menu();
                 app.push(
@@ -912,6 +1076,10 @@ async fn apply_outcome(
         }
         CommandOutcome::OpenModelPicker(options) => {
             app.open_model_picker(options);
+            Ok(false)
+        }
+        CommandOutcome::OpenProviderPicker => {
+            app.open_provider_picker();
             Ok(false)
         }
         CommandOutcome::Compact => {
@@ -978,7 +1146,7 @@ fn compact_app_messages(app: &mut App) {
         &session,
         runtime::CompactionConfig {
             preserve_recent_messages: 6,
-            max_estimated_tokens: 1,
+            max_estimated_tokens: 10_000,
         },
     );
     if result.removed_message_count == 0 {
@@ -1160,6 +1328,32 @@ fn apply_mode_input(input: &str, app: &mut App) -> bool {
     }
 }
 
+fn handle_provider_picker_key(key: KeyEvent, app: &mut App) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            app.close_overlays();
+            false
+        }
+        KeyCode::Enter => {
+            app.confirm_provider_selection();
+            false
+        }
+        KeyCode::Up => {
+            app.move_provider_selection(-1);
+            false
+        }
+        KeyCode::Down => {
+            app.move_provider_selection(1);
+            false
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.close_overlays();
+            false
+        }
+        _ => false,
+    }
+}
+
 fn handle_model_picker_key(key: KeyEvent, app: &mut App) -> bool {
     match key.code {
         KeyCode::Esc => {
@@ -1186,12 +1380,6 @@ fn handle_model_picker_key(key: KeyEvent, app: &mut App) -> bool {
     }
 }
 
-fn is_interactive_login(input: &str) -> bool {
-    let trimmed = input.trim().to_ascii_lowercase();
-    trimmed.starts_with("/login ")
-        && !matches!(trimmed.trim_start_matches("/login").trim(), "desktop")
-        || trimmed == "/login"
-}
 
 /* ===========================================================
 terminal lifecycle
@@ -1238,28 +1426,6 @@ fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) ->
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()
-}
-
-fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()
-}
-
-fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
-    enable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
-    terminal.clear()
 }
 
 fn help_text() -> &'static str {
