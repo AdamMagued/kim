@@ -77,6 +77,7 @@ pub struct App {
     pub config: KimConfig,
     pub messages: Vec<UiMessage>,
     pub input: String,
+    pub input_cursor: usize,
     pub status: String,
     /// Current scroll offset (lines from top). Only meaningful when `follow = false`.
     pub scroll: u16,
@@ -121,12 +122,21 @@ pub struct App {
 }
 
 impl App {
+    pub fn clamp_cursor(&mut self) {
+        self.input_cursor = self.input_cursor.min(self.input.chars().count());
+    }
+
+    pub fn cursor_byte_idx(&self) -> usize {
+        self.input.char_indices().nth(self.input_cursor).map_or(self.input.len(), |(i, _)| i)
+    }
+
     fn new(config: KimConfig, resume_id: Option<&str>) -> Self {
         let mut app = Self {
             current_session_id: new_session_id(),
             config,
             messages: Vec::new(),
             input: String::new(),
+            input_cursor: 0,
             status: "ready".to_string(),
             scroll: 0,
             follow: true,
@@ -259,6 +269,7 @@ impl App {
         };
         self.history_cursor = Some(new_idx);
         self.input = self.input_history[new_idx].clone();
+        self.input_cursor = self.input.chars().count();
         self.sync_slash_selection();
     }
 
@@ -271,6 +282,7 @@ impl App {
             self.history_cursor = None;
             self.input = self.input_before_history.clone();
         }
+        self.input_cursor = self.input.chars().count();
         self.sync_slash_selection();
     }
 
@@ -1005,11 +1017,44 @@ async fn handle_key(
             app.toggle_mode();
             Ok(false)
         }
+        KeyCode::Left => {
+            app.reset_ctrl_c();
+            app.clamp_cursor();
+            if app.input_cursor > 0 {
+                app.input_cursor -= 1;
+            }
+            Ok(false)
+        }
+        KeyCode::Right => {
+            app.reset_ctrl_c();
+            app.clamp_cursor();
+            if app.input_cursor < app.input.chars().count() {
+                app.input_cursor += 1;
+            }
+            Ok(false)
+        }
         KeyCode::Backspace => {
             app.reset_ctrl_c();
             app.allow_empty_session_open = false;
             app.history_cursor = None;
-            app.input.pop();
+            app.clamp_cursor();
+            if app.input_cursor > 0 {
+                app.input_cursor -= 1;
+                let byte_idx = app.cursor_byte_idx();
+                app.input.remove(byte_idx);
+            }
+            app.sync_slash_selection();
+            Ok(false)
+        }
+        KeyCode::Delete => {
+            app.reset_ctrl_c();
+            app.allow_empty_session_open = false;
+            app.history_cursor = None;
+            app.clamp_cursor();
+            if app.input_cursor < app.input.chars().count() {
+                let byte_idx = app.cursor_byte_idx();
+                app.input.remove(byte_idx);
+            }
             app.sync_slash_selection();
             Ok(false)
         }
@@ -1037,7 +1082,10 @@ async fn handle_key(
             app.reset_ctrl_c();
             app.allow_empty_session_open = false;
             app.history_cursor = None;
-            app.input.push(char);
+            app.clamp_cursor();
+            let byte_idx = app.cursor_byte_idx();
+            app.input.insert(byte_idx, char);
+            app.input_cursor += 1;
             app.sync_slash_selection();
             if app.view == ViewState::SessionMenu && !app.input.starts_with('/') {
                 app.status = "press Enter on New chat first, or type /command".to_string();
