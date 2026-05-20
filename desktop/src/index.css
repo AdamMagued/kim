@@ -409,6 +409,18 @@ kbd {
   from { opacity: 0; transform: translateY(8px); }
   to   { opacity: 1; transform: translateY(0); }
 }
+@keyframes kim-surface-enter {
+  from { opacity: 0; transform: translateY(10px) scale(0.992); filter: blur(2px); }
+  to   { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+@keyframes kim-soft-rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes kim-soft-pop {
+  from { opacity: 0; transform: translateY(6px) scale(0.985); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
 @keyframes kim-scale-in {
   from { opacity: 0; transform: scale(0.96); }
   to   { opacity: 1; transform: scale(1); }
@@ -489,6 +501,7 @@ kbd {
   align-items: center;
   gap: 10px;
   overflow: hidden;
+  animation: kim-soft-pop 0.24s cubic-bezier(.2,.8,.2,1) both;
 }
 .kim-topbar__title-text {
   font-size: 14px;
@@ -1178,6 +1191,8 @@ kbd {
   min-height: 0;
   position: relative;
   isolation: isolate;
+  animation: kim-surface-enter 0.28s cubic-bezier(.2,.8,.2,1) both;
+  transform-origin: 50% 42%;
 }
 
 /* ── Chrome shader backdrop inside the chat pane ───────────────────────── */
@@ -1565,6 +1580,10 @@ kbd {
   overflow-y: auto;
   padding: 32px 24px 20px;
   min-height: 0;
+}
+
+.kim-chat__output > * {
+  animation: kim-soft-rise 0.26s cubic-bezier(.2,.8,.2,1) both;
 }
 
 .kim-provider-switch-wrap {
@@ -2120,6 +2139,7 @@ kbd {
   background: var(--bg);
   border-top: 1px solid transparent;
   flex-shrink: 0;
+  animation: kim-soft-rise 0.24s cubic-bezier(.2,.8,.2,1) both;
 }
 .kim-composer--drag-over {
   background: var(--kim-accent-soft, rgba(100, 160, 255, 0.06));
@@ -5631,6 +5651,19 @@ kbd {
 
 /* Reduced motion: pause all blob animations */
 @media (prefers-reduced-motion: reduce) {
+  .kim-chat,
+  .kim-chat__output > *,
+  .kim-composer,
+  .kim-topbar__title {
+    animation: none !important;
+  }
+  .kr-row-hover {
+    transition: none !important;
+  }
+  .kr-row-hover:hover,
+  .kr-row-hover:active {
+    transform: none !important;
+  }
   .kim-blob-l3 path,
   .kim-blob-l6__a, .kim-blob-l6__b,
   .kim-blob-l12__pill,
@@ -6446,8 +6479,16 @@ kbd {
 .kr-danger { border-left: 2px solid var(--kim-red); }
 
 /* row-hover utility */
-.kr-row-hover { transition: background .12s; }
-.kr-row-hover:hover { background: var(--kim-surface); }
+.kr-row-hover {
+  transition: background .14s ease, border-color .14s ease, transform .14s ease, box-shadow .14s ease;
+}
+.kr-row-hover:hover {
+  background: var(--kim-surface);
+  transform: translateX(2px);
+}
+.kr-row-hover:active {
+  transform: translateX(2px) scale(0.995);
+}
 
 /* glass shell (settings) */
 .kr-glass {

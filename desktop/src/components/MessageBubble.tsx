@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import type { KimMessage, ContentBlock, ToolUseBlock, ToolResultBlock, TypingAnimation } from '../types';
 import { ToolUseCard, ToolResultCard, SignalCard } from './ToolCallCard';
 import { friendlyError } from './ChatView';
@@ -190,7 +191,7 @@ function renderText(text: string) {
               return (
                 <span key={j}>
                   {lines.map((line, k) => (
-                    <span key={k}>{line}{k < lines.length - 1 && <br />}</span>
+                    <span key={k}>{renderInlineMarkdown(line, `${j}-${k}`)}{k < lines.length - 1 && <br />}</span>
                   ))}
                 </span>
               );
@@ -200,6 +201,34 @@ function renderText(text: string) {
       })}
     </div>
   );
+}
+
+function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const pattern = /(\*\*([^*]+)\*\*|\*([^*]+)\*|`([^`]+)`)/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > last) {
+      nodes.push(text.slice(last, match.index));
+    }
+
+    const key = `${keyPrefix}-${match.index}`;
+    if (match[2]) {
+      nodes.push(<strong key={key}>{match[2]}</strong>);
+    } else if (match[3]) {
+      nodes.push(<em key={key}>{match[3]}</em>);
+    } else if (match[4]) {
+      nodes.push(<code key={key}>{match[4]}</code>);
+    }
+    last = match.index + match[0].length;
+  }
+
+  if (last < text.length) {
+    nodes.push(text.slice(last));
+  }
+  return nodes.length ? nodes : [text];
 }
 
 // ── Typing animation engines ──────────────────────────────────────────────────

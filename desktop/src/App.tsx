@@ -86,7 +86,7 @@ export default function App() {
   const { setTheme } = useTheme(settings.theme);
   const { account, loading: accountLoading, setAccount } = useAccount();
 
-  const { kimSessions, refresh } = useSessions(settings);
+  const { kimSessions, codexSessions, refresh } = useSessions(settings);
 
   const [activeSession, setActiveSession] = useState<SessionInfo | null>(null);
   const [newChatMode, setNewChatMode] = useState(false);
@@ -228,6 +228,22 @@ export default function App() {
     // active project context for subsequent "New session" actions.
   }
 
+  function handleNewChatInProject(path: string) {
+    setActiveTab('code');
+    setActiveProjectPath(path);
+    setActiveSession(null);
+    setNewChatMode(true);
+    setChatSerial(s => s + 1);
+  }
+
+  function handleRemoveProject(path: string) {
+    if (activeProjectPath === path) {
+      setActiveProjectPath(null);
+      setActiveSession(null);
+      setNewChatMode(false);
+    }
+  }
+
   function handleHeaderMouseDown(e: React.MouseEvent<HTMLElement>) {
     if (e.button !== 0 || isNoDragTarget(e.target)) return;
     void getCurrentWindow().startDragging();
@@ -347,6 +363,8 @@ export default function App() {
         onTabChange={handleTabChange}
         activeProjectPath={activeProjectPath}
         onSelectProject={handleSelectProject}
+        onRemoveProject={handleRemoveProject}
+        onNewChatInProject={handleNewChatInProject}
         sessionRefreshNonce={sessionRefreshNonce}
         appVersion={appVersion}
         theme={settings.theme}
@@ -444,7 +462,7 @@ export default function App() {
         </header>
 
         <ChatView
-          key={`chat-${chatSerial}`}
+          key={`chat-${activeTab}-${chatSerial}`}
           session={activeSession}
           newChatMode={newChatMode}
           settings={settings}
@@ -461,7 +479,8 @@ export default function App() {
           reloadSessions={refresh}
           onNewChat={handleNewChat}
           onNewCodeSession={() => { setActiveTab('code'); handleNewChat(); }}
-          recentSessions={kimSessions}
+          onSelectProject={handleSelectProject}
+          recentSessions={activeTab === 'code' ? codexSessions : kimSessions}
           onSelectSession={handleSelectSession}
         />
       </main>
