@@ -21,7 +21,7 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use provider::{stream_kim_request, AppEvent, ChatMessage};
 use ratatui::backend::CrosstermBackend;
-use ratatui::style::Style;
+
 use ratatui::Terminal;
 use runtime::{
     compact_session, ContentBlock, ConversationMessage, MessageRole as RuntimeMessageRole,
