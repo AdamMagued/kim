@@ -489,24 +489,27 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 
     // Compute the inner width available for text (minus 2 for the left/right borders).
     let inner_w = area.width.saturating_sub(2) as usize;
+    let chars_count = app.input.chars().count();
+    let cursor = app.input_cursor.min(chars_count);
 
-    // Build what we actually render: show only the tail of the input that fits
-    // inside the box, so the cursor is always visible at the right edge.
+    let start = if chars_count <= inner_w {
+        0
+    } else if cursor < inner_w {
+        0
+    } else {
+        cursor.saturating_sub(inner_w).saturating_add(1)
+    };
+
+    // Build what we actually render
     let display_text: String = if app.secure_input {
-        let masked: String = "•".repeat(app.input.chars().count());
-        if inner_w == 0 || masked.chars().count() <= inner_w {
-            masked
-        } else {
-            masked.chars().rev().take(inner_w).collect::<String>().chars().rev().collect()
-        }
+        let masked: String = "•".repeat(chars_count);
+        let chars: Vec<char> = masked.chars().collect();
+        let end = (start + inner_w).min(chars.len());
+        chars[start..end].iter().collect()
     } else {
         let chars: Vec<char> = app.input.chars().collect();
-        if inner_w == 0 || chars.len() <= inner_w {
-            app.input.clone()
-        } else {
-            // Show the rightmost `inner_w` chars so the cursor stays visible.
-            chars[chars.len() - inner_w..].iter().collect()
-        }
+        let end = (start + inner_w).min(chars.len());
+        chars[start..end].iter().collect()
     };
 
     let input = Paragraph::new(display_text.as_str())
@@ -519,9 +522,9 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         );
     frame.render_widget(input, area);
 
-    // Place cursor at the end of the visible display text.
-    let visible_len = display_text.chars().count() as u16;
-    let cursor_x = area.x.saturating_add(1).saturating_add(visible_len);
+    // Place cursor at its relative position in the visible window.
+    let cursor_pos_in_window = cursor.saturating_sub(start) as u16;
+    let cursor_x = area.x.saturating_add(1).saturating_add(cursor_pos_in_window);
     let cursor_y = area.y.saturating_add(1);
     frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(2)), cursor_y));
 }
