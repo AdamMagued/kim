@@ -92,7 +92,8 @@ class InteractionPolicy:
                 if self.web_state_dirty:
                     return self._block(
                         "POLICY_WARNING",
-                        "The browser state changed after the last observation; Enter/Space could submit the wrong state.",
+                        "The browser state changed after the last observation; "
+                        "Enter/Space could submit the wrong state.",
                         "Call web_observe again before pressing Enter or Space.",
                     )
                 if key in {"enter", "return"} and self.web_submit_may_exist:
