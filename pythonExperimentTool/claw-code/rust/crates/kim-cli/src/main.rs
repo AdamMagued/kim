@@ -780,10 +780,9 @@ fn desired_inline_viewport_height(app: &App) -> u16 {
 }
 
 fn uses_compact_chat_viewport(app: &App) -> bool {
-    app.view == ViewState::InChat
-        && !app.model_picker_open
-        && !app.provider_picker_open
-        && app.slash_matches().is_empty()
+    // Disabled: The compact inline scrollback mode conflicts with the full-screen UI
+    // (slash palette, model picker, thinking panel) and squashes the layout.
+    false
 }
 
 fn insert_rows_before_viewport(
