@@ -15,13 +15,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
 
-    // In compact inline mode (e.g. sync_inline_scrollback), the viewport is shrunk
-    // to 3 rows. We only have space to draw the input box.
-    if area.height <= 3 {
-        draw_input(frame, app, area, theme);
-        return;
-    }
-
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
