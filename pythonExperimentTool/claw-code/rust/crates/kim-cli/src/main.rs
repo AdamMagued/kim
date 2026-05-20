@@ -14,15 +14,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use commands::{handle_command, login_with_key, CommandOutcome, SUPPORTED_COMMANDS};
 use config::KimConfig;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
 };
 use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use provider::{stream_kim_request, AppEvent, ChatMessage};
 use ratatui::backend::CrosstermBackend;
+use ratatui::style::Style;
 use ratatui::Terminal;
 use runtime::{
     compact_session, ContentBlock, ConversationMessage, MessageRole as RuntimeMessageRole,
@@ -42,6 +41,7 @@ pub enum MessageRole {
     Assistant,
     System,
     Error,
+    Reasoning,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +84,10 @@ pub struct App {
     pub follow: bool,
     /// Actual max scroll computed by draw_chat each frame, published via interior mutability.
     pub last_max_scroll: std::cell::Cell<u16>,
+    /// Number of wrapped transcript rows already copied into terminal scrollback.
+    pub scrollback_committed_rows: usize,
+    pub scrollback_width: u16,
+    pub scrollback_session_id: String,
     pub busy: bool,
     pub sessions: Vec<SessionEntry>,
     pub selected_session: usize,
@@ -127,6 +131,9 @@ impl App {
             scroll: 0,
             follow: true,
             last_max_scroll: std::cell::Cell::new(0),
+            scrollback_committed_rows: 0,
+            scrollback_width: 0,
+            scrollback_session_id: String::new(),
             busy: false,
             sessions: discover_sessions(),
             selected_session: 0,
@@ -229,7 +236,11 @@ impl App {
     }
 
     fn push_history(&mut self, input: String) {
-        if self.input_history.last().map_or(true, |last| last != &input) {
+        if self
+            .input_history
+            .last()
+            .map_or(true, |last| last != &input)
+        {
             self.input_history.push(input);
         }
     }
@@ -446,7 +457,7 @@ impl App {
                     role: "assistant".to_string(),
                     content: m.content.clone(),
                 }),
-                MessageRole::System | MessageRole::Error => None,
+                MessageRole::System | MessageRole::Error | MessageRole::Reasoning => None,
             })
             .rev()
             .take(24)
@@ -655,6 +666,7 @@ async fn run_app(
     resume_id: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut app = App::new(KimConfig::load(), resume_id);
+    let mut viewport_height = terminal_height();
     app.provider_ready = provider_is_ready(&app.config);
     let welcome = if app.provider_ready {
         format!(
@@ -662,13 +674,21 @@ async fn run_app(
             app.config.provider, app.config.model
         )
     } else {
-        "Kim CLI v1. Not signed in yet. Run /login to connect to a provider, then start chatting.".to_string()
+        "Kim CLI v1. Not signed in yet. Run /login to connect to a provider, then start chatting."
+            .to_string()
     };
     app.push(MessageRole::System, welcome);
 
     'main: loop {
         drain_events(&mut app);
 
+        let desired_viewport_height = desired_inline_viewport_height(&app);
+        if desired_viewport_height != viewport_height {
+            *terminal = enter_terminal_with_height(desired_viewport_height)?;
+            viewport_height = desired_viewport_height;
+        }
+
+        sync_inline_scrollback(&mut app, terminal, viewport_height)?;
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
         // Non-blocking terminal event drain.
@@ -691,41 +711,6 @@ async fn run_app(
                     }
                 }
                 Event::Paste(text) => app.paste_text(&text),
-                Event::Mouse(mouse) => {
-                    if app.model_picker_open {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => app.move_model_selection(-1),
-                            MouseEventKind::ScrollDown => app.move_model_selection(1),
-                            _ => {}
-                        }
-                    } else if app.provider_picker_open {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => app.move_provider_selection(-1),
-                            MouseEventKind::ScrollDown => app.move_provider_selection(1),
-                            _ => {}
-                        }
-                    } else if app.view == ViewState::InChat {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                if app.follow {
-                                    app.follow = false;
-                                    app.scroll = app.last_max_scroll.get();
-                                }
-                                app.scroll = app.scroll.saturating_sub(3);
-                            }
-                            MouseEventKind::ScrollDown => {
-                                if !app.follow {
-                                    app.scroll = app.scroll.saturating_add(3);
-                                    if app.scroll >= app.last_max_scroll.get() {
-                                        app.follow = true;
-                                        app.scroll = 0;
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
                 _ => {}
             }
         }
@@ -734,6 +719,88 @@ async fn run_app(
         tokio::time::sleep(Duration::from_millis(if app.busy { 33 } else { 60 })).await;
     }
     Ok(app.current_session_id)
+}
+
+fn sync_inline_scrollback(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    viewport_height: u16,
+) -> io::Result<()> {
+    if !uses_compact_chat_viewport(app) {
+        return Ok(());
+    }
+
+    terminal.autoresize()?;
+    let size = terminal.size()?;
+    let visible_height = usize::from(viewport_height.saturating_sub(2));
+    if size.width == 0 || visible_height == 0 {
+        return Ok(());
+    }
+
+    if app.scrollback_session_id != app.current_session_id {
+        app.scrollback_session_id
+            .clone_from(&app.current_session_id);
+        app.scrollback_committed_rows = 0;
+        app.scrollback_width = 0;
+    }
+
+    let rows = ui::chat_visual_rows(app, size.width);
+    let overflow_rows = rows.len().saturating_sub(visible_height);
+
+    if app.scrollback_width != size.width {
+        if app.scrollback_width != 0 {
+            app.scrollback_committed_rows = overflow_rows;
+            app.scrollback_width = size.width;
+            return Ok(());
+        }
+        app.scrollback_width = size.width;
+    }
+
+    if overflow_rows < app.scrollback_committed_rows {
+        app.scrollback_committed_rows = overflow_rows;
+        return Ok(());
+    }
+
+    if !app.follow || overflow_rows == app.scrollback_committed_rows {
+        return Ok(());
+    }
+
+    let rows_to_insert = &rows[app.scrollback_committed_rows..overflow_rows];
+    insert_rows_before_viewport(terminal, rows_to_insert)?;
+    app.scrollback_committed_rows = overflow_rows;
+    Ok(())
+}
+
+fn desired_inline_viewport_height(app: &App) -> u16 {
+    if uses_compact_chat_viewport(app) {
+        3.min(terminal_height().max(1))
+    } else {
+        terminal_height()
+    }
+}
+
+fn uses_compact_chat_viewport(app: &App) -> bool {
+    app.view == ViewState::InChat
+        && !app.model_picker_open
+        && !app.provider_picker_open
+        && app.slash_matches().is_empty()
+}
+
+fn insert_rows_before_viewport(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    rows: &[String],
+) -> io::Result<()> {
+    for chunk in rows.chunks(usize::from(u16::MAX)) {
+        let height = u16::try_from(chunk.len()).unwrap_or(u16::MAX);
+        terminal.insert_before(height, |buffer| {
+            let max_width = usize::from(buffer.area.width);
+            for (row_index, row) in chunk.iter().enumerate() {
+                let y = u16::try_from(row_index).unwrap_or(u16::MAX);
+                buffer.set_stringn(0, y, row.as_str(), max_width, Style::default());
+            }
+        })?;
+    }
+    Ok(())
 }
 
 /// Drain all pending `AppEvent`s from the channel into the App state.
@@ -769,14 +836,29 @@ fn apply_app_event(app: &mut App, event: AppEvent) {
             }
         }
         AppEvent::ThoughtChunk(chunk) => {
-            // Accumulate into the last Thought trace item, or push a new one.
-            match app.trace.last_mut() {
-                Some(TraceItem::Thought(ref mut text)) => text.push_str(&chunk),
-                _ => app.trace.push(TraceItem::Thought(chunk)),
+            if let Some(last) = app.messages.last_mut() {
+                if last.role == MessageRole::Reasoning {
+                    last.content.push_str(&chunk);
+                    if app.follow {
+                        app.scroll = 0;
+                    }
+                    return;
+                }
+            }
+            app.push(MessageRole::Reasoning, chunk);
+            if app.follow {
+                app.scroll = 0;
             }
         }
         AppEvent::ToolEvent { verb, target } => {
-            app.trace.push(TraceItem::Tool { verb, target });
+            let line = format!("\n→ {verb}: {target}");
+            if let Some(last) = app.messages.last_mut() {
+                if last.role == MessageRole::Reasoning {
+                    last.content.push_str(&line);
+                    return;
+                }
+            }
+            app.push(MessageRole::Reasoning, format!("→ {verb}: {target}"));
         }
         AppEvent::Done(bridge_used) => {
             let elapsed = app
@@ -1003,6 +1085,30 @@ async fn handle_key(
             }
             Ok(false)
         }
+        KeyCode::PageUp => {
+            app.reset_ctrl_c();
+            if app.view == ViewState::InChat {
+                let step = app.last_max_scroll.get().min(20).max(5);
+                if app.follow {
+                    app.follow = false;
+                    app.scroll = app.last_max_scroll.get();
+                }
+                app.scroll = app.scroll.saturating_sub(step);
+            }
+            Ok(false)
+        }
+        KeyCode::PageDown => {
+            app.reset_ctrl_c();
+            if app.view == ViewState::InChat && !app.follow {
+                let step = app.last_max_scroll.get().min(20).max(5);
+                app.scroll = app.scroll.saturating_add(step);
+                if app.scroll >= app.last_max_scroll.get() {
+                    app.follow = true;
+                    app.scroll = 0;
+                }
+            }
+            Ok(false)
+        }
         _ => Ok(false),
     }
 }
@@ -1107,10 +1213,6 @@ async fn apply_outcome(
             app.scroll = 0;
             app.busy = true;
             app.trace.clear();
-            app.trace.push(TraceItem::Tool {
-                verb: "Thinking".to_string(),
-                target: format!("{} stream", app.config.model),
-            });
             app.thinking_start = Some(Instant::now());
             app.status = "working".to_string();
 
@@ -1276,7 +1378,7 @@ fn ui_message_to_runtime(message: &UiMessage) -> Option<ConversationMessage> {
         MessageRole::User => RuntimeMessageRole::User,
         MessageRole::Assistant => RuntimeMessageRole::Assistant,
         MessageRole::System => RuntimeMessageRole::System,
-        MessageRole::Error => return None,
+        MessageRole::Error | MessageRole::Reasoning => return None,
     };
     Some(ConversationMessage {
         role,
@@ -1380,7 +1482,6 @@ fn handle_model_picker_key(key: KeyEvent, app: &mut App) -> bool {
     }
 }
 
-
 /* ===========================================================
 terminal lifecycle
 =========================================================== */
@@ -1392,39 +1493,39 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         if RAW_MODE_ACTIVE.load(Ordering::SeqCst) {
             let _ = disable_raw_mode();
-            let _ = execute!(
-                stdout(),
-                DisableMouseCapture,
-                DisableBracketedPaste,
-                LeaveAlternateScreen,
-                crossterm::cursor::Show
-            );
+            let _ = execute!(stdout(), DisableBracketedPaste, crossterm::cursor::Show);
         }
         original(info);
     }));
 }
 
 fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
+    enter_terminal_with_height(terminal_height())
+}
+
+fn enter_terminal_with_height(
+    viewport_height: u16,
+) -> io::Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
     RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
-    execute!(
-        stdout(),
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
-    Terminal::new(CrosstermBackend::new(stdout()))
+    execute!(stdout(), EnableBracketedPaste)?;
+    Terminal::with_options(
+        CrosstermBackend::new(stdout()),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Inline(viewport_height),
+        },
+    )
+}
+
+fn terminal_height() -> u16 {
+    let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    height
 }
 
 fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
     RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    )?;
+    execute!(terminal.backend_mut(), DisableBracketedPaste)?;
     terminal.show_cursor()
 }
 

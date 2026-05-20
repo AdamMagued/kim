@@ -207,6 +207,7 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             MessageRole::Assistant => ("kim",   theme.text),
             MessageRole::System    => ("note",  theme.text_dim),
             MessageRole::Error     => ("error", theme.danger),
+            MessageRole::Reasoning => ("⁚",     theme.text_dimmer),
         };
 
         // While the assistant message is still empty (streaming not started yet),
@@ -219,6 +220,11 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 
         let cleaned = clean_for_display(&message.content);
         let indent   = " ".repeat(label.len() + 1);
+        let content_color = if message.role == MessageRole::Reasoning {
+            theme.text_dimmer
+        } else {
+            theme.text
+        };
         let mut first = true;
 
         for text_line in cleaned.lines() {
@@ -228,13 +234,13 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
                         format!("{label} "),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(text_line.to_string(), Style::default().fg(theme.text)),
+                    Span::styled(text_line.to_string(), Style::default().fg(content_color)),
                 ]));
                 first = false;
             } else {
                 lines.push(Line::styled(
                     format!("{indent}{text_line}"),
-                    Style::default().fg(theme.text),
+                    Style::default().fg(content_color),
                 ));
             }
         }
@@ -640,6 +646,81 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         Paragraph::new(status).style(Style::default().fg(theme.text_dim).bg(theme.status)),
         area,
     );
+}
+
+pub fn chat_visual_rows(app: &App, width: u16) -> Vec<String> {
+    chat_plain_lines(app)
+        .into_iter()
+        .flat_map(|line| wrap_plain_line(&line, width))
+        .collect()
+}
+
+fn chat_plain_lines(app: &App) -> Vec<String> {
+    let mut lines = Vec::new();
+    for message in app.visible_messages() {
+        if message.role == MessageRole::Assistant && message.content.trim().is_empty() && app.busy {
+            continue;
+        }
+        let label = match message.role {
+            MessageRole::User => "you",
+            MessageRole::Assistant => "kim",
+            MessageRole::System => "note",
+            MessageRole::Error => "error",
+            MessageRole::Reasoning => "⁚",
+        };
+        let cleaned = clean_for_display(&message.content);
+        let indent = " ".repeat(label.len() + 1);
+        let mut first = true;
+        for text_line in cleaned.lines() {
+            if first {
+                lines.push(format!("{label} {text_line}"));
+                first = false;
+            } else {
+                lines.push(format!("{indent}{text_line}"));
+            }
+        }
+        if first {
+            lines.push(format!("{label} "));
+        }
+        lines.push(String::new());
+    }
+    if app.messages.is_empty() {
+        let hint = if app.view == ViewState::SessionMenu {
+            "Message box accepts slash commands here. Open New chat before sending prompts."
+        } else if app.mode == AppMode::Code {
+            "Kim Code · coding agent mode. Ask about code, bugs, refactors, or drop a file path."
+        } else {
+            "Kim Chat · type a message, or /help. Esc returns to the chat list."
+        };
+        lines.push(hint.to_string());
+    }
+    if app.busy {
+        lines.push("•  generating…".to_string());
+    }
+    lines
+}
+
+fn wrap_plain_line(line: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width);
+    if width == 0 || line.is_empty() {
+        return vec![line.to_string()];
+    }
+
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    for ch in line.chars() {
+        current.push(ch);
+        if current.chars().count() >= width {
+            rows.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
 }
 
 fn format_elapsed(duration: Duration) -> String {
