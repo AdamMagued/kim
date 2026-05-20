@@ -205,10 +205,6 @@ fn session_row<'a>(title: &'a str, preview: &'a str, selected: bool, theme: Them
 /// This function is `pub` so that `main.rs` can call it from
 /// `sync_inline_scrollback` to calculate how many rows overflow the viewport
 /// and need to be committed to the terminal scrollback buffer.
-pub fn chat_visual_rows(app: &App, total_width: u16) -> Vec<String> {
-    let inner_width = total_width.saturating_sub(2) as usize;
-    build_chat_rows(app, inner_width, false)
-}
 
 /// Core pre-wrap engine shared by both the styled draw path and the plain-text
 /// scrollback measurement path.
