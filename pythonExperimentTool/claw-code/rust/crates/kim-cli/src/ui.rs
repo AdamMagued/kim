@@ -196,17 +196,31 @@ fn session_row<'a>(title: &'a str, preview: &'a str, selected: bool, theme: Them
 }
 
 fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let mut lines = Vec::new();
+    let visible_height = area.height.saturating_sub(2); // minus top+bottom border
+    let inner_width = area.width.saturating_sub(2);     // minus left+right border
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
     for message in app.visible_messages() {
         let (label, color) = match message.role {
-            MessageRole::User => ("you", theme.accent),
-            MessageRole::Assistant => ("kim", theme.text),
-            MessageRole::System => ("note", theme.text_dim),
-            MessageRole::Error => ("error", theme.danger),
+            MessageRole::User      => ("you",   theme.accent),
+            MessageRole::Assistant => ("kim",   theme.text),
+            MessageRole::System    => ("note",  theme.text_dim),
+            MessageRole::Error     => ("error", theme.danger),
         };
+
+        // While the assistant message is still empty (streaming not started yet),
+        // skip it entirely — the spinner line below acts as the placeholder.
+        // This prevents the empty body from inflating max_scroll and jumping the
+        // viewport away from the user's own message on Enter.
+        if message.role == MessageRole::Assistant && message.content.trim().is_empty() && app.busy {
+            continue;
+        }
+
         let cleaned = clean_for_display(&message.content);
-        let indent = " ".repeat(label.len() + 1);
+        let indent   = " ".repeat(label.len() + 1);
         let mut first = true;
+
         for text_line in cleaned.lines() {
             if first {
                 lines.push(Line::from(vec![
@@ -225,14 +239,17 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             }
         }
         if first {
-            // empty message — emit the label at minimum
+            // Non-empty message that rendered as zero lines (shouldn't happen,
+            // but guard anyway).
             lines.push(Line::from(vec![Span::styled(
                 format!("{label} "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )]));
         }
+        // Blank separator between messages.
         lines.push(Line::raw(""));
     }
+
     if app.messages.is_empty() {
         let hint = if app.view == ViewState::SessionMenu {
             "Message box accepts slash commands here. Open New chat before sending prompts."
@@ -241,44 +258,59 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         } else {
             "Kim Chat · type a message, or /help. Esc returns to the chat list."
         };
-        lines.push(Line::styled(hint, Style::default().fg(theme.text_dim)));
+        lines.push(Line::styled(hint.to_string(), Style::default().fg(theme.text_dim)));
     }
+
+    // Spinner shown while the LLM is generating, immediately after the user
+    // message.  Shown whether or not the assistant message has content yet.
     if app.busy {
         let elapsed = app.thinking_start.map_or(Duration::ZERO, |t| t.elapsed());
         lines.push(Line::from(vec![
             thinking::spinner_span(elapsed, thinking::SpinnerStyle::Braille, theme.accent),
-            ratatui::text::Span::styled(
-                "  thinking…",
-                ratatui::style::Style::default().fg(theme.accent),
+            Span::styled(
+                "  generating…".to_string(),
+                Style::default().fg(theme.accent),
             ),
         ]));
     }
-    // Compute scroll. Publish max_scroll so the event loop can reason about
-    // when to re-engage follow-mode without needing access to the terminal size.
-    // Use visual line count (accounting for word wrap) rather than logical line
-    // count so long command outputs (e.g. /help) don't clip at the bottom.
-    let visible_height = area.height.saturating_sub(2);
-    let inner_width = area.width.saturating_sub(2);
-    let total_visual: u16 = lines.iter().map(|l| {
-        let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
-        if inner_width == 0 || w == 0 { 1u16 }
-        else { ((w as u16) + inner_width - 1) / inner_width }
-    }).fold(0u16, |a, b| a.saturating_add(b));
+
+    // -----------------------------------------------------------------------
+    // Correct visual-line count for scroll calculation.
+    //
+    // ratatui's Wrap renders each Line as one or more rows depending on the
+    // total char-width of all its spans combined.  An empty Line (blank
+    // separator) always occupies exactly 1 row.
+    // -----------------------------------------------------------------------
+    let total_visual: u16 = lines
+        .iter()
+        .map(|l| {
+            let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
+            if inner_width == 0 || w == 0 {
+                1u16
+            } else {
+                ((w as u16).saturating_add(inner_width - 1)) / inner_width
+            }
+        })
+        .fold(0u16, |acc, rows| acc.saturating_add(rows));
+
     let max_scroll = total_visual.saturating_sub(visible_height);
     app.last_max_scroll.set(max_scroll);
+
     let effective_scroll = if app.follow {
         max_scroll
     } else {
         app.scroll.min(max_scroll)
     };
+
     let scrolled_up = !app.follow && effective_scroll < max_scroll;
     let chat_title = if app.view == ViewState::SessionMenu {
         " Chat List ".to_string()
     } else if scrolled_up {
-        " Chat · ↓ scroll to bottom · Esc returns to list ".to_string()
+        " Chat  ↓ scroll to latest ".to_string()
     } else {
-        " Chat · Esc returns to chat list ".to_string()
+        " Chat ".to_string()
     };
+
     let chat = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((effective_scroll, 0))
