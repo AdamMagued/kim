@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 base64 = "0.22"
-crossterm = { version = "0.28", features = ["bracketed-paste"] }
+crossterm = { version = "0.28", features = ["bracketed-paste", "event-stream"] }
 dirs = "5"
 ratatui = "0.29"
 futures-util = "0.3"
@@ -20,7 +20,7 @@ rpassword = "7"
 runtime = { path = "../runtime" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
-tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 
 [lints]
 workspace = true

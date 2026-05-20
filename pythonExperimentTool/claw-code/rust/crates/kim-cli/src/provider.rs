@@ -104,14 +104,24 @@ pub async fn stream_kim_request(
         return;
     }
 
-    let system_prompt = if code_mode {
-        KIM_CODE_SYSTEM_PROMPT
-    } else {
-        KIM_CHAT_SYSTEM_PROMPT
-    };
+    if code_mode {
+        let prompt = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or_default();
+        if prompt.trim().is_empty() {
+            let _ = tx.send(AppEvent::Err("Nothing to send.".to_string()));
+            return;
+        }
+        stream_codex_subprocess(config, prompt, tx).await;
+        return;
+    }
+
     let mut full = vec![ChatMessage {
         role: "system".to_string(),
-        content: system_prompt.to_string(),
+        content: KIM_CHAT_SYSTEM_PROMPT.to_string(),
     }];
     full.extend_from_slice(messages);
 
@@ -944,6 +954,337 @@ When working through a problem:
 
 You do not have live screen or file access here — start Kim desktop for that. \
 Focus on code quality, clear explanations, and useful output.";
+
+/* ===========================================================
+codex subprocess (Code mode)
+=========================================================== */
+
+async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: UnboundedSender<AppEvent>) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    // CRITICAL: never route Code mode through OpenAI to protect gpt-5.5 quota
+    if config.provider == "openai" {
+        let _ = tx.send(AppEvent::Err(
+            "Code mode with OpenAI is disabled. Use /provider ollama or a browser provider."
+                .to_string(),
+        ));
+        return;
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let is_browser = config.provider.to_ascii_lowercase().starts_with("browser");
+
+    let mut child = if is_browser {
+        match Command::new("python3")
+            .args([
+                "-m",
+                "orchestrator.run_codex_bridge",
+                "--task",
+                prompt,
+                "--cwd",
+                &cwd.to_string_lossy(),
+                "--provider",
+                &config.provider,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(AppEvent::Err(format!("Failed to start codex bridge: {e}")));
+                return;
+            }
+        }
+    } else {
+        // Start a local Responses API → Chat Completions proxy so codex can
+        // talk to ollama (which only speaks Chat Completions).
+        let proxy_port = match start_responses_proxy(config, &tx).await {
+            Some(p) => p,
+            None => return, // error already sent via tx
+        };
+        if let Err(e) = write_codex_config(proxy_port, &config.model) {
+            let _ = tx.send(AppEvent::Err(format!("Failed to write codex config: {e}")));
+            return;
+        }
+        let kim_codex_home = std::env::temp_dir().join("kim_codex_home");
+        match Command::new("codex")
+            .args([
+                "exec",
+                "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C",
+                &cwd.to_string_lossy(),
+                prompt,
+            ])
+            .env("OPENAI_API_KEY", "ollama")
+            .env("CODEX_HOME", &kim_codex_home)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(AppEvent::Err(format!(
+                    "Failed to start codex: {e}. Install with: npm install -g @openai/codex"
+                )));
+                return;
+            }
+        }
+    };
+
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = tx.send(AppEvent::Err("Failed to capture codex stdout.".to_string()));
+            return;
+        }
+    };
+    let stderr_pipe = child.stderr.take();
+
+    let mut lines = BufReader::new(stdout).lines();
+    let mut had_output = false;
+    while let Ok(Some(line)) = lines.next_line().await {
+        had_output = true;
+        process_codex_line(&line, &tx, is_browser);
+    }
+
+    let exit_ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
+
+    if !had_output || !exit_ok {
+        // Collect stderr to surface the real error
+        let mut stderr_msg = String::new();
+        if let Some(pipe) = stderr_pipe {
+            let mut err_lines = BufReader::new(pipe).lines();
+            while let Ok(Some(line)) = err_lines.next_line().await {
+                if !stderr_msg.is_empty() {
+                    stderr_msg.push('\n');
+                }
+                stderr_msg.push_str(line.trim());
+            }
+        }
+        if !stderr_msg.trim().is_empty() {
+            let _ = tx.send(AppEvent::Err(format!("codex: {}", stderr_msg.trim())));
+        } else if !had_output {
+            let _ = tx.send(AppEvent::Err(
+                "codex produced no output. Check that ollama is running and the model name is correct. Switch to Chat mode with /chat for regular AI chat.".to_string(),
+            ));
+        }
+        return;
+    }
+    let _ = tx.send(AppEvent::Done(true));
+}
+
+fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: bool) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    if is_bridge {
+        if let Some(rest) = line.strip_prefix("[STATUS] ") {
+            let _ = tx.send(AppEvent::ThoughtChunk(rest.to_string()));
+        } else if let Some(rest) = line.strip_prefix("[SUCCESS] ") {
+            let _ = tx.send(AppEvent::TextChunk(rest.to_string()));
+        } else if let Some(rest) = line.strip_prefix("[FAILED] ") {
+            let _ = tx.send(AppEvent::Err(rest.to_string()));
+        } else {
+            let _ = tx.send(AppEvent::TextChunk(format!("{line}\n")));
+        }
+        return;
+    }
+    let Ok(json) = serde_json::from_str::<Value>(line) else {
+        let _ = tx.send(AppEvent::TextChunk(format!("{line}\n")));
+        return;
+    };
+    match json.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            if let Some(blocks) = json.get("content").and_then(Value::as_array) {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                let _ = tx.send(AppEvent::TextChunk(text.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some("reasoning") => {
+            let text = json
+                .get("summary")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|v| v.get("text"))
+                .and_then(Value::as_str)
+                .or_else(|| json.get("text").and_then(Value::as_str))
+                .unwrap_or_default();
+            if !text.is_empty() {
+                let _ = tx.send(AppEvent::ThoughtChunk(text.to_string()));
+            }
+        }
+        Some("function_call") => {
+            let name = json.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let _ = tx.send(AppEvent::ToolEvent {
+                verb: "Running".to_string(),
+                target: name.to_string(),
+            });
+        }
+        Some("function_call_output") => {
+            if let Some(output) = json.get("output").and_then(Value::as_str) {
+                let trimmed = output.trim();
+                if !trimmed.is_empty() {
+                    let display = if trimmed.len() > 300 {
+                        format!("{}…", &trimmed[..300])
+                    } else {
+                        trimmed.to_string()
+                    };
+                    let _ = tx.send(AppEvent::ThoughtChunk(display));
+                }
+            }
+        }
+        Some("item.completed") => {
+            if let Some(item) = json.get("item") {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("agent_message") => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                let _ = tx.send(AppEvent::TextChunk(text.to_string()));
+                            }
+                        }
+                    }
+                    Some("function_call") => {
+                        let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let _ = tx.send(AppEvent::ToolEvent {
+                            verb: "Running".to_string(),
+                            target: name.to_string(),
+                        });
+                    }
+                    Some("function_call_output") => {
+                        if let Some(output) = item.get("output").and_then(Value::as_str) {
+                            let trimmed = output.trim();
+                            if !trimmed.is_empty() {
+                                let display = if trimmed.len() > 300 {
+                                    format!("{}…", &trimmed[..300])
+                                } else {
+                                    trimmed.to_string()
+                                };
+                                let _ = tx.send(AppEvent::ThoughtChunk(display));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some("error") => {
+            let msg = json
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("codex error");
+            // Suppress WebSocket reconnect noise — codex falls back to HTTP automatically
+            if !msg.contains("Reconnecting") && !msg.contains("stream disconnected") {
+                let _ = tx.send(AppEvent::Err(msg.to_string()));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Embeds the proxy script so it's always available at runtime.
+const RESPONSES_PROXY_PY: &str = include_str!("responses_proxy.py");
+
+/// Writes the proxy script to a temp file, spawns it, reads back the port it
+/// bound to, and returns that port. The proxy process dies with the task because
+/// it's spawned with `kill_on_drop(true)`.
+async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent>) -> Option<u16> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    // Write proxy script to a temp file
+    let tmp_path = std::env::temp_dir().join("kim_responses_proxy.py");
+    if let Err(e) = std::fs::write(&tmp_path, RESPONSES_PROXY_PY) {
+        let _ = tx.send(AppEvent::Err(format!("Failed to write proxy script: {e}")));
+        return None;
+    }
+
+    let ollama_base = trim_base_url(&config.ollama_base_url);
+    let mut child = match Command::new("python3")
+        .args([tmp_path.to_string_lossy().as_ref(), ollama_base.as_str()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(AppEvent::Err(format!(
+                "Failed to start responses proxy (python3 required): {e}"
+            )));
+            return None;
+        }
+    };
+
+    let stdout = child.stdout.take()?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    // Proxy prints its port on the first line
+    let port_line =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line()).await {
+            Ok(Ok(Some(line))) => line,
+            _ => {
+                let _ = tx.send(AppEvent::Err(
+                    "Responses proxy did not start in time.".to_string(),
+                ));
+                return None;
+            }
+        };
+
+    let port: u16 = match port_line.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = tx.send(AppEvent::Err(format!(
+                "Responses proxy returned unexpected output: {port_line}"
+            )));
+            return None;
+        }
+    };
+
+    // Keep child alive in a background task so kill_on_drop fires when the
+    // task is cancelled.  We don't care about its exit status.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Some(port)
+}
+
+fn write_codex_config(proxy_port: u16, model: &str) -> Result<(), String> {
+    // Use an isolated temp directory so we never touch the user's real ~/.codex config.
+    let codex_home = std::env::temp_dir().join("kim_codex_home");
+    std::fs::create_dir_all(&codex_home)
+        .map_err(|e| format!("Cannot create kim codex home {}: {e}", codex_home.display()))?;
+    let config_path = codex_home.join("config.toml");
+    let content = format!(
+        "model = \"{model}\"\n\
+         model_provider = \"kim-proxy\"\n\
+         \n\
+         [model_providers.kim-proxy]\n\
+         name = \"Kim Proxy\"\n\
+         base_url = \"http://127.0.0.1:{proxy_port}/v1\"\n\
+         wire_api = \"responses\"\n\
+         env_key = \"OPENAI_API_KEY\"\n"
+    );
+    std::fs::write(&config_path, content).map_err(|e| {
+        format!(
+            "Cannot write codex config to {}: {e}",
+            config_path.display()
+        )
+    })?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
