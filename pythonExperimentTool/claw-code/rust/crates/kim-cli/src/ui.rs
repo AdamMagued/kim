@@ -3,7 +3,7 @@ use std::time::Duration;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::provider::PROVIDERS;
@@ -197,8 +197,17 @@ fn session_row<'a>(title: &'a str, preview: &'a str, selected: bool, theme: Them
 
 fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let visible_height = area.height.saturating_sub(2); // minus top+bottom border
-    let inner_width = area.width.saturating_sub(2);     // minus left+right border
+    let inner_width = area.width.saturating_sub(2) as usize; // minus left+right border
 
+    // -----------------------------------------------------------------------
+    // Build a flat list of pre-wrapped display lines.
+    //
+    // We do the word-wrap ourselves so the total count of Lines we push is
+    // exactly equal to the number of terminal rows the Paragraph will occupy.
+    // This makes the scroll offset math exact — no estimation needed.
+    // Paragraph is rendered WITHOUT Wrap so ratatui doesn't re-wrap and
+    // produce a different line count than we calculated.
+    // -----------------------------------------------------------------------
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     for message in app.visible_messages() {
@@ -207,55 +216,91 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             MessageRole::Assistant => ("kim",   theme.text),
             MessageRole::System    => ("note",  theme.text_dim),
             MessageRole::Error     => ("error", theme.danger),
-            MessageRole::Reasoning => ("⁚",     theme.text_dimmer),
         };
 
-        // While the assistant message is still empty (streaming not started yet),
-        // skip it entirely — the spinner line below acts as the placeholder.
-        // This prevents the empty body from inflating max_scroll and jumping the
-        // viewport away from the user's own message on Enter.
+        // While streaming and the assistant message is still empty, skip it;
+        // the spinner line below handles the "waiting" visual.
         if message.role == MessageRole::Assistant && message.content.trim().is_empty() && app.busy {
             continue;
         }
 
+        let label_str = format!("{label} ");
+        let label_w   = label_str.chars().count();
+        let indent_w  = label_w; // continuation lines indented to align with text
+        let indent_str = " ".repeat(indent_w);
+
+        // Available width for the text part on the first line and continuations.
+        let first_text_w = if inner_width > label_w { inner_width - label_w } else { 1 };
+        let cont_text_w  = if inner_width > indent_w { inner_width - indent_w } else { 1 };
+
         let cleaned = clean_for_display(&message.content);
-        let indent   = " ".repeat(label.len() + 1);
-        let content_color = if message.role == MessageRole::Reasoning {
-            theme.text_dimmer
-        } else {
-            theme.text
-        };
-        let mut first = true;
+        let mut is_first_line_of_message = true;
 
         for text_line in cleaned.lines() {
-            if first {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{label} "),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(text_line.to_string(), Style::default().fg(content_color)),
-                ]));
-                first = false;
-            } else {
-                lines.push(Line::styled(
-                    format!("{indent}{text_line}"),
-                    Style::default().fg(content_color),
-                ));
+            // Determine the available width for this logical line.
+            let avail = if is_first_line_of_message { first_text_w } else { cont_text_w };
+
+            // Split the logical line into visual chunks that fit in `avail`.
+            let mut remaining = text_line;
+            let mut first_chunk = true;
+            loop {
+                if remaining.is_empty() && !first_chunk {
+                    break;
+                }
+                // Take up to `avail` chars.
+                let take = if inner_width == 0 { remaining.len() }
+                           else { remaining.chars().count().min(avail) };
+                // Find a safe byte boundary.
+                let byte_end = remaining
+                    .char_indices()
+                    .nth(take)
+                    .map_or(remaining.len(), |(i, _)| i);
+                let chunk = &remaining[..byte_end];
+                remaining = &remaining[byte_end..];
+
+                if is_first_line_of_message && first_chunk {
+                    // Very first chunk: prefix with the colored label.
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            label_str.clone(),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            chunk.to_string(),
+                            Style::default().fg(theme.text),
+                        ),
+                    ]));
+                } else {
+                    lines.push(Line::styled(
+                        format!("{indent_str}{chunk}"),
+                        Style::default().fg(theme.text),
+                    ));
+                }
+
+                first_chunk = false;
+                if remaining.is_empty() {
+                    break;
+                }
+                // For the next wrapped chunk of the same logical line, use cont width.
+                is_first_line_of_message = false;
             }
+            is_first_line_of_message = false;
         }
-        if first {
-            // Non-empty message that rendered as zero lines (shouldn't happen,
-            // but guard anyway).
+
+        // If the message had zero lines (empty content that's not the busy
+        // assistant placeholder), emit just the label so it's visible.
+        if cleaned.is_empty() || cleaned.lines().next().is_none() {
             lines.push(Line::from(vec![Span::styled(
-                format!("{label} "),
+                label_str.clone(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )]));
         }
-        // Blank separator between messages.
+
+        // Blank separator line between messages.
         lines.push(Line::raw(""));
     }
 
+    // Empty-conversation hint.
     if app.messages.is_empty() {
         let hint = if app.view == ViewState::SessionMenu {
             "Message box accepts slash commands here. Open New chat before sending prompts."
@@ -267,8 +312,7 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         lines.push(Line::styled(hint.to_string(), Style::default().fg(theme.text_dim)));
     }
 
-    // Spinner shown while the LLM is generating, immediately after the user
-    // message.  Shown whether or not the assistant message has content yet.
+    // Spinner while the LLM is generating.
     if app.busy {
         let elapsed = app.thinking_start.map_or(Duration::ZERO, |t| t.elapsed());
         lines.push(Line::from(vec![
@@ -281,25 +325,11 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     }
 
     // -----------------------------------------------------------------------
-    // Correct visual-line count for scroll calculation.
-    //
-    // ratatui's Wrap renders each Line as one or more rows depending on the
-    // total char-width of all its spans combined.  An empty Line (blank
-    // separator) always occupies exactly 1 row.
+    // Scroll calculation — exact because we pre-wrapped.
+    // Every element of `lines` corresponds to exactly 1 terminal row.
     // -----------------------------------------------------------------------
-    let total_visual: u16 = lines
-        .iter()
-        .map(|l| {
-            let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
-            if inner_width == 0 || w == 0 {
-                1u16
-            } else {
-                ((w as u16).saturating_add(inner_width - 1)) / inner_width
-            }
-        })
-        .fold(0u16, |acc, rows| acc.saturating_add(rows));
-
-    let max_scroll = total_visual.saturating_sub(visible_height);
+    let total_lines = lines.len() as u16;
+    let max_scroll   = total_lines.saturating_sub(visible_height);
     app.last_max_scroll.set(max_scroll);
 
     let effective_scroll = if app.follow {
@@ -309,7 +339,7 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     };
 
     let scrolled_up = !app.follow && effective_scroll < max_scroll;
-    let chat_title = if app.view == ViewState::SessionMenu {
+    let chat_title  = if app.view == ViewState::SessionMenu {
         " Chat List ".to_string()
     } else if scrolled_up {
         " Chat  ↓ scroll to latest ".to_string()
@@ -317,8 +347,8 @@ fn draw_chat(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         " Chat ".to_string()
     };
 
+    // No Wrap — we already wrapped manually above.
     let chat = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
         .scroll((effective_scroll, 0))
         .block(
             Block::default()
@@ -646,81 +676,6 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         Paragraph::new(status).style(Style::default().fg(theme.text_dim).bg(theme.status)),
         area,
     );
-}
-
-pub fn chat_visual_rows(app: &App, width: u16) -> Vec<String> {
-    chat_plain_lines(app)
-        .into_iter()
-        .flat_map(|line| wrap_plain_line(&line, width))
-        .collect()
-}
-
-fn chat_plain_lines(app: &App) -> Vec<String> {
-    let mut lines = Vec::new();
-    for message in app.visible_messages() {
-        if message.role == MessageRole::Assistant && message.content.trim().is_empty() && app.busy {
-            continue;
-        }
-        let label = match message.role {
-            MessageRole::User => "you",
-            MessageRole::Assistant => "kim",
-            MessageRole::System => "note",
-            MessageRole::Error => "error",
-            MessageRole::Reasoning => "⁚",
-        };
-        let cleaned = clean_for_display(&message.content);
-        let indent = " ".repeat(label.len() + 1);
-        let mut first = true;
-        for text_line in cleaned.lines() {
-            if first {
-                lines.push(format!("{label} {text_line}"));
-                first = false;
-            } else {
-                lines.push(format!("{indent}{text_line}"));
-            }
-        }
-        if first {
-            lines.push(format!("{label} "));
-        }
-        lines.push(String::new());
-    }
-    if app.messages.is_empty() {
-        let hint = if app.view == ViewState::SessionMenu {
-            "Message box accepts slash commands here. Open New chat before sending prompts."
-        } else if app.mode == AppMode::Code {
-            "Kim Code · coding agent mode. Ask about code, bugs, refactors, or drop a file path."
-        } else {
-            "Kim Chat · type a message, or /help. Esc returns to the chat list."
-        };
-        lines.push(hint.to_string());
-    }
-    if app.busy {
-        lines.push("•  generating…".to_string());
-    }
-    lines
-}
-
-fn wrap_plain_line(line: &str, width: u16) -> Vec<String> {
-    let width = usize::from(width);
-    if width == 0 || line.is_empty() {
-        return vec![line.to_string()];
-    }
-
-    let mut rows = Vec::new();
-    let mut current = String::new();
-    for ch in line.chars() {
-        current.push(ch);
-        if current.chars().count() >= width {
-            rows.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        rows.push(current);
-    }
-    if rows.is_empty() {
-        rows.push(String::new());
-    }
-    rows
 }
 
 fn format_elapsed(duration: Duration) -> String {
