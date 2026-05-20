@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type { SessionInfo, KimMessage, Settings, KimAccount, TextBlock, ToolUseBlock, ToolResultBlock, BrowserRestoreResult } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { SignalCard } from './ToolCallCard';
@@ -1132,6 +1133,12 @@ function formatNsDuration(ns?: number): string | null {
   return `${minutes}m ${rem}s`;
 }
 
+function projectLabel(path?: string): string {
+  if (!path) return 'Unknown project';
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? path;
+}
+
 // ── Props ─────────────────────────────────────────────────────────────────────
 
 interface Props {
@@ -1151,6 +1158,7 @@ interface Props {
   reloadSessions: () => void;
   onNewChat?: () => void;
   onNewCodeSession?: () => void;
+  onSelectProject?: (path: string) => void;
   /** Recent sessions for the launch screen's "pick up where you left off" list. */
   recentSessions?: SessionInfo[];
   onSelectSession?: (s: SessionInfo) => void;
@@ -1158,7 +1166,7 @@ interface Props {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function ChatView({ session, newChatMode, settings, onSettingsChange, onTaskDone, account, activeTab, activeProjectPath, onOpenSettings, onNewChat, onNewCodeSession, recentSessions, onSelectSession }: Props) {
+export function ChatView({ session, newChatMode, settings, onSettingsChange, onTaskDone, account, onAccountChange, activeTab, activeProjectPath, onOpenSettings, onNewChat, onNewCodeSession, onSelectProject, recentSessions, onSelectSession }: Props) {
   const activityCounterRef = useRef(0);
   const [messages, setMessages] = useState<KimMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
@@ -1711,9 +1719,9 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
               return [...prev, { role: 'assistant', content: item.text!.trim() }];
             });
           } else if (item.type === 'reasoning' && item.text?.trim()) {
-            const short = item.text.trim().split('\n')[0].slice(0, 120);
+            const reasoning = cleanActivityText(item.text.trim());
             enqueueActivityUpdate(prev => {
-              const next = [...prev, { id, kind: 'tool' as const, icon: '💭', text: short }];
+              const next = [...prev, { id, kind: 'tool' as const, icon: '💭', text: reasoning }];
               if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
               return next;
             });
@@ -2287,6 +2295,29 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     }
   }
 
+  async function handlePickCodeProject(mode: 'create' | 'open') {
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        canCreateDirectories: true,
+        title: mode === 'create'
+          ? 'Create a new project folder'
+          : 'Open a project folder',
+      });
+      if (typeof selected !== 'string' || !selected) return;
+
+      const projectPaths = account.code_projects ?? [];
+      if (!projectPaths.includes(selected)) {
+        await onAccountChange({ ...account, code_projects: [...projectPaths, selected] });
+      }
+      onSelectProject?.(selected);
+      onNewCodeSession?.();
+    } catch {
+      toast('Could not open the folder picker.', 'error', 2500);
+    }
+  }
+
   // Edit a previously-sent live-history user message and resend. The edited
   // message replaces the original (and drops everything after it). If a task
   // is currently running we cancel it first; the new task then runs.
@@ -2309,6 +2340,10 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     e.preventDefault();
     const rawTask = taskInput.trim();
     if (!rawTask && attachedFiles.length === 0) return;
+    if (activeTab === 'code' && !activeProjectPath) {
+      toast('Create a new project or open a project folder first.', 'warning', 4000);
+      return;
+    }
 
     const prefix = buildAttachmentPrefix(attachedFiles);
     const task = prefix + (rawTask || 'Please look at the attached file(s).');
@@ -2732,6 +2767,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
 
   function renderComposer(heroMode = false) {
     const resolvedProvider = resolveProvider();
+    const codeNeedsProject = activeTab === 'code' && !activeProjectPath;
     return (
       <form
         className={`kim-composer${isDragOver ? ' kim-composer--drag-over' : ''}`}
@@ -2784,7 +2820,10 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
             ref={textareaRef}
             value={taskInput}
             onChange={handleTextareaInput}
-            placeholder={isRunning
+            disabled={codeNeedsProject}
+            placeholder={codeNeedsProject
+              ? 'Create a new project or open a project folder first.'
+              : isRunning
               ? (queueEnabled ? 'Kim is working — type now, Send adds to queue' : 'Kim is working — Send interrupts current task')
               : attachedFiles.length > 0 ? 'Add a message or just send…'
               : (activeTab === 'code' && activeProjectPath)
@@ -2860,7 +2899,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
             )}
             <button
               type="submit"
-              disabled={!taskInput.trim() && attachedFiles.length === 0}
+              disabled={codeNeedsProject || (!taskInput.trim() && attachedFiles.length === 0)}
               className={'kim-btn kim-btn--send' + (heroMode ? ' kim-btn--send-hero' : '')}
               aria-label="Send"
             >
@@ -3085,7 +3124,9 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
         />
         <div className="kim-composer__hint">
           <span>
-            {isRunning
+            {codeNeedsProject
+              ? 'Choose a project before sending'
+              : isRunning
               ? (queueEnabled ? 'Send queues this message' : 'Send interrupts current task')
               : <><kbd>↵</kbd> to send</>}
           </span>
@@ -3112,7 +3153,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
     const greeting = activeTab === 'code' ? 'What are we building?' : getGreeting(firstName);
     const subtitle =
       activeTab === 'code'
-        ? "Pick a project, or describe what you'd like to build."
+        ? 'Create a new project or open an existing project folder.'
         : 'Pick up where you left off, or start fresh.';
     return (
       <div className="kim-chat">
@@ -3153,44 +3194,77 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
             {subtitle}
           </p>
 
-          <div style={{ display: 'flex', gap: 10, marginBottom: 36 }}>
-            <button
-              type="button"
-              className="kr-btn kr-btn-primary"
-              onClick={() => onNewChat?.()}
-              style={{ padding: '10px 18px' }}
-            >
-              <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
-                <path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-              </svg>
-              New chat
-              <span
-                className="kr-kbd"
-                style={{ background: 'rgba(0,0,0,0.15)', borderColor: 'rgba(0,0,0,0.2)', color: 'var(--kim-on-accent)' }}
+          {activeTab === 'code' ? (
+            <div style={{ display: 'flex', gap: 10, marginBottom: 36 }}>
+              <button
+                type="button"
+                className="kr-btn kr-btn-primary"
+                onClick={() => void handlePickCodeProject('create')}
+                style={{ padding: '10px 18px' }}
               >
-                ⌘N
-              </span>
-            </button>
-            <button
-              type="button"
-              className="kr-btn"
-              onClick={() => onNewCodeSession?.()}
-              style={{ padding: '10px 16px' }}
-            >
-              <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
-                <path d="M4 3l-3 3 3 3m4-6l3 3-3 3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              New code session
-            </button>
-          </div>
+                <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
+                  <path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                </svg>
+                Create new project
+              </button>
+              <button
+                type="button"
+                className="kr-btn"
+                onClick={() => void handlePickCodeProject('open')}
+                style={{ padding: '10px 16px' }}
+              >
+                <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
+                  <path d="M2 3.5h3l1 1h4a1 1 0 011 1V9a1 1 0 01-1 1H2a1 1 0 01-1-1V4.5a1 1 0 011-1z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+                </svg>
+                Open project folder
+              </button>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', gap: 10, marginBottom: 36 }}>
+              <button
+                type="button"
+                className="kr-btn kr-btn-primary"
+                onClick={() => onNewChat?.()}
+                style={{ padding: '10px 18px' }}
+              >
+                <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
+                  <path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                </svg>
+                New chat
+                <span
+                  className="kr-kbd"
+                  style={{ background: 'rgba(0,0,0,0.15)', borderColor: 'rgba(0,0,0,0.2)', color: 'var(--kim-on-accent)' }}
+                >
+                  ⌘N
+                </span>
+              </button>
+              <button
+                type="button"
+                className="kr-btn"
+                onClick={() => onNewCodeSession?.()}
+                style={{ padding: '10px 16px' }}
+              >
+                <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
+                  <path d="M4 3l-3 3 3 3m4-6l3 3-3 3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                New code session
+              </button>
+            </div>
+          )}
 
-          {(recentSessions ?? []).length > 0 && (
+          {(() => {
+            const pickupSessions = (recentSessions ?? [])
+              .filter(s => activeTab === 'code' ? s.session_type === 'codex' : s.session_type === 'kim')
+              .slice(0, 3);
+            if (pickupSessions.length === 0) return null;
+            return (
             <div style={{ width: 'min(560px, 90%)', display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 36 }}>
               <span className="kr-eyebrow" style={{ marginBottom: 4, paddingLeft: 4 }}>
                 pick up where you left off
               </span>
-              {(recentSessions ?? []).slice(0, 3).map((s, i) => {
+              {pickupSessions.map((s, i) => {
                 const t = s.title?.trim() || s.session_id;
+                const project = activeTab === 'code' ? projectLabel(s.project_path) : null;
                 return (
                   <div
                     key={i}
@@ -3214,17 +3288,33 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
                         strokeWidth="1.2"
                       />
                     </svg>
-                    <span
-                      style={{
-                        flex: 1,
-                        fontSize: 13.5,
-                        color: 'var(--kim-text)',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {t}
+                    <span style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                      <span
+                        style={{
+                          fontSize: 13.5,
+                          color: 'var(--kim-text)',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {t}
+                      </span>
+                      {project && (
+                        <span
+                          style={{
+                            fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
+                            fontSize: 11,
+                            color: 'var(--kim-text-3)',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}
+                          title={s.project_path}
+                        >
+                          {project}
+                        </span>
+                      )}
                     </span>
                     <svg width="12" height="12" viewBox="0 0 12 12" fill="none" style={{ color: 'var(--kim-text-4)' }}>
                       <path
@@ -3239,7 +3329,8 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
                 );
               })}
             </div>
-          )}
+            );
+          })()}
 
           <div
             style={{
@@ -3345,7 +3436,9 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
                 }}
               >
                 {activeTab === 'code'
-                  ? "Describe a feature, hand me a bug, or point me at a file. I'll read first, plan, then write."
+                  ? activeProjectPath
+                    ? "Describe a feature, hand me a bug, or point me at a file. I'll read first, plan, then write."
+                    : 'Create a new project or open a project folder before typing.'
                   : 'Pick up where you left off, or start fresh.'}
               </p>
 
@@ -3366,6 +3459,7 @@ export function ChatView({ session, newChatMode, settings, onSettingsChange, onT
                     key={t}
                     type="button"
                     className="kr-btn"
+                    disabled={activeTab === 'code' && !activeProjectPath}
                     onClick={() => {
                       setTaskInput(t);
                       textareaRef.current?.focus();

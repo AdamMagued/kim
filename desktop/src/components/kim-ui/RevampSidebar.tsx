@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { confirm, open as openDialog } from '@tauri-apps/plugin-dialog';
 import type { SessionInfo, KimAccount, CodexProject, Theme } from '../../types';
 
 const SIDEBAR_MIN_WIDTH = 220;
@@ -35,6 +35,8 @@ interface Props {
   showSessionMeta?: boolean;
   activeProjectPath?: string | null;
   onSelectProject?: (path: string) => void;
+  onRemoveProject?: (path: string) => void;
+  onNewChatInProject?: (path: string) => void;
   onAddProject?: () => void;
   /** Called when user adds a project via the dialog. */
   onAccountChange?: (a: KimAccount) => Promise<void>;
@@ -119,6 +121,8 @@ export function RevampSidebar({
   showSessionMeta = true,
   activeProjectPath,
   onSelectProject,
+  onRemoveProject,
+  onNewChatInProject,
   onAddProject,
   onAccountChange,
   sessionRefreshNonce,
@@ -254,6 +258,20 @@ export function RevampSidebar({
     } catch {
       // silently ignore — dialog cancelled or backend unavailable
     }
+  }
+
+  async function handleRemoveProject(path: string) {
+    const ok = await confirm(
+      'Remove this project from the sidebar? This will not delete the folder or any files.',
+      { title: 'Remove project?', kind: 'warning' },
+    );
+    if (!ok) return;
+
+    const next = projectPaths.filter(p => p !== path);
+    if (onAccountChange) {
+      await onAccountChange({ ...account, code_projects: next });
+    }
+    onRemoveProject?.(path);
   }
 
   if (collapsed) {
@@ -576,6 +594,26 @@ export function RevampSidebar({
                       >
                         {p.current_branch}
                       </span>
+                      <button
+                        type="button"
+                        className="kr-icon-btn"
+                        aria-label={`New chat in ${p.name}`}
+                        title={`New chat in ${p.name}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onNewChatInProject?.(p.path);
+                        }}
+                        style={{
+                          width: 22,
+                          height: 22,
+                          flexShrink: 0,
+                          color: 'var(--kim-text-3)',
+                        }}
+                      >
+                        <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
+                          <path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+                        </svg>
+                      </button>
                     </div>
 
                     {open && (
@@ -696,6 +734,18 @@ export function RevampSidebar({
               role="menuitem"
             >
               Open in Finder
+            </button>
+            <button
+              type="button"
+              className="kim-context-menu__item"
+              onClick={() => {
+                const path = projectMenu.path;
+                setProjectMenu(null);
+                void handleRemoveProject(path);
+              }}
+              role="menuitem"
+            >
+              Remove from sidebar
             </button>
           </div>,
           document.body,
