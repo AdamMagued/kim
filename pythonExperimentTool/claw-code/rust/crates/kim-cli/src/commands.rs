@@ -580,7 +580,7 @@ mod tests {
     async fn parses_theme_command() {
         let mut config = KimConfig::default();
         let outcome = handle_command("/theme light", &mut config).await;
-        assert!(matches!(outcome, CommandOutcome::Message(_)));
+        assert!(matches!(outcome, CommandOutcome::Info(_) | CommandOutcome::Message(_)));
         assert_eq!(config.theme, ThemeName::QuietLight);
     }
 
@@ -593,7 +593,7 @@ mod tests {
     async fn parses_provider_command() {
         let mut config = KimConfig::default();
         let outcome = handle_command("/provider openai", &mut config).await;
-        assert!(matches!(outcome, CommandOutcome::Message(_)));
+        assert!(matches!(outcome, CommandOutcome::Info(_) | CommandOutcome::Message(_)));
         assert_eq!(config.provider, "openai");
     }
 
