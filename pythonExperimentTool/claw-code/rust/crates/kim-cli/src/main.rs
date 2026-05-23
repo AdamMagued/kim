@@ -678,6 +678,7 @@ async fn run_app(
     resume_id: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut app = App::new(KimConfig::load(), resume_id);
+    let mut viewport_height = terminal_height();
     app.provider_ready = provider_is_ready(&app.config);
     let welcome = if app.provider_ready {
         format!(
@@ -692,6 +693,14 @@ async fn run_app(
 
     'main: loop {
         drain_events(&mut app);
+
+        let desired_viewport_height = desired_inline_viewport_height(&app);
+        if desired_viewport_height != viewport_height {
+            *terminal = enter_terminal_with_height(desired_viewport_height)?;
+            viewport_height = desired_viewport_height;
+        }
+
+        sync_inline_scrollback(&mut app, terminal, viewport_height)?;
 
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
@@ -746,6 +755,88 @@ async fn run_app(
         tokio::time::sleep(Duration::from_millis(if app.busy { 33 } else { 60 })).await;
     }
     Ok(app.current_session_id)
+}
+
+fn sync_inline_scrollback(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    viewport_height: u16,
+) -> io::Result<()> {
+    if !uses_compact_chat_viewport(app) {
+        return Ok(());
+    }
+
+    terminal.autoresize()?;
+    let size = terminal.size()?;
+    let visible_height = usize::from(viewport_height.saturating_sub(2));
+    if size.width == 0 || visible_height == 0 {
+        return Ok(());
+    }
+
+    if app.scrollback_session_id != app.current_session_id {
+        app.scrollback_session_id
+            .clone_from(&app.current_session_id);
+        app.scrollback_committed_rows = 0;
+        app.scrollback_width = 0;
+    }
+
+    let rows = ui::chat_visual_rows(app, size.width);
+    let overflow_rows = rows.len().saturating_sub(visible_height);
+
+    if app.scrollback_width != size.width {
+        if app.scrollback_width != 0 {
+            app.scrollback_committed_rows = overflow_rows;
+            app.scrollback_width = size.width;
+            return Ok(());
+        }
+        app.scrollback_width = size.width;
+    }
+
+    if overflow_rows < app.scrollback_committed_rows {
+        app.scrollback_committed_rows = overflow_rows;
+        return Ok(());
+    }
+
+    if !app.follow || overflow_rows == app.scrollback_committed_rows {
+        return Ok(());
+    }
+
+    let rows_to_insert = &rows[app.scrollback_committed_rows..overflow_rows];
+    insert_rows_before_viewport(terminal, rows_to_insert)?;
+    app.scrollback_committed_rows = overflow_rows;
+    Ok(())
+}
+
+fn desired_inline_viewport_height(app: &App) -> u16 {
+    if uses_compact_chat_viewport(app) {
+        3.min(terminal_height().max(1))
+    } else {
+        terminal_height()
+    }
+}
+
+fn uses_compact_chat_viewport(app: &App) -> bool {
+    app.view == ViewState::InChat
+        && !app.model_picker_open
+        && !app.provider_picker_open
+        && app.slash_matches().is_empty()
+}
+
+fn insert_rows_before_viewport(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    rows: &[String],
+) -> io::Result<()> {
+    for chunk in rows.chunks(usize::from(u16::MAX)) {
+        let height = u16::try_from(chunk.len()).unwrap_or(u16::MAX);
+        terminal.insert_before(height, |buffer| {
+            let max_width = usize::from(buffer.area.width);
+            for (row_index, row) in chunk.iter().enumerate() {
+                let y = u16::try_from(row_index).unwrap_or(u16::MAX);
+                buffer.set_stringn(0, y, row.as_str(), max_width, ratatui::style::Style::default());
+            }
+        })?;
+    }
+    Ok(())
 }
 
 /// Drain all pending `AppEvent`s from the channel into the App state.
@@ -1503,15 +1594,30 @@ fn install_panic_hook() {
 }
 
 fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
+    enter_terminal_with_height(terminal_height())
+}
+
+fn enter_terminal_with_height(
+    viewport_height: u16,
+) -> io::Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
     RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
     execute!(
         stdout(),
-        crossterm::terminal::EnterAlternateScreen,
         EnableBracketedPaste,
         crossterm::event::EnableMouseCapture
     )?;
-    Terminal::new(CrosstermBackend::new(stdout()))
+    Terminal::with_options(
+        CrosstermBackend::new(stdout()),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Inline(viewport_height),
+        },
+    )
+}
+
+fn terminal_height() -> u16 {
+    let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    height
 }
 
 fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
@@ -1519,7 +1625,6 @@ fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) ->
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        crossterm::terminal::LeaveAlternateScreen,
         DisableBracketedPaste,
         crossterm::event::DisableMouseCapture
     )?;
