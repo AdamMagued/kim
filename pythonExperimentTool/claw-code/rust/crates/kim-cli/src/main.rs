@@ -15,7 +15,7 @@ use commands::{handle_command, login_with_key, CommandOutcome, SUPPORTED_COMMAND
 use config::KimConfig;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -714,6 +714,29 @@ async fn run_app(
                         }
                     }
                 }
+                Event::Mouse(mouse) => {
+                    if app.view == ViewState::InChat {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                if app.follow {
+                                    app.follow = false;
+                                    app.scroll = app.last_max_scroll.get();
+                                }
+                                app.scroll = app.scroll.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                if !app.follow {
+                                    app.scroll = app.scroll.saturating_add(3);
+                                    if app.scroll >= app.last_max_scroll.get() {
+                                        app.follow = true;
+                                        app.scroll = 0;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 Event::Paste(text) => app.paste_text(&text),
                 _ => {}
             }
@@ -1005,7 +1028,17 @@ async fn handle_key(
         }
         KeyCode::Up => {
             app.reset_ctrl_c();
-            if app.history_cursor.is_some() {
+            let is_scroll_modifier = key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::ALT);
+
+            if is_scroll_modifier {
+                if app.follow {
+                    app.follow = false;
+                    app.scroll = app.last_max_scroll.get();
+                }
+                app.scroll = app.scroll.saturating_sub(3);
+            } else if app.history_cursor.is_some() {
                 // Already in history — keep going regardless of what input contains.
                 app.history_up();
             } else if app.input.starts_with('/') && !app.slash_matches().is_empty() {
@@ -1026,7 +1059,19 @@ async fn handle_key(
         }
         KeyCode::Down => {
             app.reset_ctrl_c();
-            if app.history_cursor.is_some() {
+            let is_scroll_modifier = key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::ALT);
+
+            if is_scroll_modifier {
+                if !app.follow {
+                    app.scroll = app.scroll.saturating_add(3);
+                    if app.scroll >= app.last_max_scroll.get() {
+                        app.follow = true;
+                        app.scroll = 0;
+                    }
+                }
+            } else if app.history_cursor.is_some() {
                 // Already in history — keep going regardless of what input contains.
                 app.history_down();
             } else if app.input.starts_with('/') && !app.slash_matches().is_empty() {
