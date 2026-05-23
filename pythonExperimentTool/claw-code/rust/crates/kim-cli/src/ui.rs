@@ -16,9 +16,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(Clear, area);
 
     // In compact inline mode (e.g. sync_inline_scrollback), the viewport is shrunk
-    // to 3 rows. We only have space to draw the input box.
-    if area.height <= 3 {
-        draw_input(frame, app, area, theme);
+    // to 1 row. We only have space to draw the compact borderless input.
+    if area.height <= 1 {
+        draw_compact_input(frame, app, area, theme);
         return;
     }
 
@@ -532,6 +532,53 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(2)), cursor_y));
 }
 
+fn draw_compact_input(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+    let prompt = if app.secure_input {
+        format!("🔑 {} key > ", app.secure_input_provider)
+    } else {
+        "you > ".to_string()
+    };
+    let prompt_w = prompt.chars().count();
+    let inner_w = (area.width as usize).saturating_sub(prompt_w);
+
+    let chars_count = app.input.chars().count();
+    let cursor = app.input_cursor.min(chars_count);
+
+    let start = if chars_count <= inner_w {
+        0
+    } else if cursor < inner_w {
+        0
+    } else {
+        cursor.saturating_sub(inner_w).saturating_add(1)
+    };
+
+    let display_text: String = if app.secure_input {
+        let masked: String = "•".repeat(chars_count);
+        let chars: Vec<char> = masked.chars().collect();
+        let end = (start + inner_w).min(chars.len());
+        chars[start..end].iter().collect()
+    } else {
+        let chars: Vec<char> = app.input.chars().collect();
+        let end = (start + inner_w).min(chars.len());
+        chars[start..end].iter().collect()
+    };
+
+    let full_line = Line::from(vec![
+        Span::styled(prompt, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(display_text, Style::default().fg(theme.text)),
+    ]);
+
+    let input = Paragraph::new(full_line)
+        .style(Style::default().bg(theme.bg));
+    frame.render_widget(input, area);
+
+    // Position the cursor at the correct position
+    let cursor_pos_in_window = cursor.saturating_sub(start) as u16;
+    let cursor_x = area.x.saturating_add(prompt_w as u16).saturating_add(cursor_pos_in_window);
+    let cursor_y = area.y;
+    frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(1)), cursor_y));
+}
+
 fn draw_provider_picker(frame: &mut Frame<'_>, app: &App, body_area: Rect, theme: Theme) {
     if !app.provider_picker_open {
         return;
@@ -757,6 +804,5 @@ fn format_elapsed(duration: Duration) -> String {
 }
 
 pub fn chat_visual_rows(app: &App, total_width: u16) -> Vec<String> {
-    let inner_width = usize::from(total_width.saturating_sub(2));
-    build_chat_rows(app, inner_width, false)
+    build_chat_rows(app, usize::from(total_width), false)
 }

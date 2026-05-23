@@ -760,7 +760,7 @@ async fn run_app(
 fn sync_inline_scrollback(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    viewport_height: u16,
+    _viewport_height: u16,
 ) -> io::Result<()> {
     if !uses_compact_chat_viewport(app) {
         return Ok(());
@@ -768,8 +768,7 @@ fn sync_inline_scrollback(
 
     terminal.autoresize()?;
     let size = terminal.size()?;
-    let visible_height = usize::from(viewport_height.saturating_sub(2));
-    if size.width == 0 || visible_height == 0 {
+    if size.width == 0 {
         return Ok(());
     }
 
@@ -781,7 +780,7 @@ fn sync_inline_scrollback(
     }
 
     let rows = ui::chat_visual_rows(app, size.width);
-    let overflow_rows = rows.len().saturating_sub(visible_height);
+    let overflow_rows = rows.len();
 
     if app.scrollback_width != size.width {
         if app.scrollback_width != 0 {
@@ -809,7 +808,7 @@ fn sync_inline_scrollback(
 
 fn desired_inline_viewport_height(app: &App) -> u16 {
     if uses_compact_chat_viewport(app) {
-        3.min(terminal_height().max(1))
+        1
     } else {
         terminal_height()
     }
