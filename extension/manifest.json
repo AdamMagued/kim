@@ -1,0 +1,63 @@
+{
+  "manifest_version": 3,
+  "name": "Kim Bridge",
+  "version": "2.0.0",
+  "description": "Syncs ## FILE: / ## CMD: blocks from AI chat UIs to the local Kim MCP server. Supports Claude, ChatGPT, Gemini, and DeepSeek.",
+
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://localhost/*",
+    "https://claude.ai/*",
+    "https://chatgpt.com/*",
+    "https://gemini.google.com/*",
+    "https://chat.deepseek.com/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Kim Bridge",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["content_claude.js", "overlay.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content_chatgpt.js", "overlay.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["content_gemini.js", "overlay.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content_deepseek.js", "overlay.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

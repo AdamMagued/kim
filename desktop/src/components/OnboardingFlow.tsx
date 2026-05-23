@@ -1,0 +1,272 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import type { KimAccount } from '../types';
+// ── Icons ─────────────────────────────────────────────────────────────────────
+
+function ArrowIcon() {
+  return (
+    <svg viewBox="0 0 15 15" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ width: 15, height: 15 }}>
+      <path d="M2 7.5h11M9 3.5l4 4-4 4" stroke="#0c0c0c" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function GitHubIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+      <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" width="14" height="14">
+      <circle cx="8" cy="8" r="6.5" stroke="rgba(100,220,120,.8)" strokeWidth="1.3" />
+      <path d="M5 8.5l2 2 4-4" stroke="rgba(100,220,120,.9)" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+// ── KimLogoMark ───────────────────────────────────────────────────────────────
+
+// function KimAsterisk() {
+//   return (
+//     <div className="kim-ob__logo-mark" style={{ marginBottom: '16px' }}>
+//       <KimLogo layout="stacked" size={80} />
+//     </div>
+//   );
+// }
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
+interface Props {
+  onComplete: (account: KimAccount) => void;
+}
+
+export function OnboardingFlow({ onComplete }: Props) {
+
+  // Step: 'name' → 'github' → 'done'
+  const [step, setStep] = useState<'name' | 'github'>('name');
+  const [leaving, setLeaving] = useState(false); // triggers exit animation before step change
+
+  // Name step
+  const [name, setName] = useState('');
+  const nameReady = name.trim().length >= 1;
+
+  // GitHub step
+  const [token, setToken] = useState('');
+  const [verifying, setVerifying] = useState(false);
+  const [githubUser, setGithubUser] = useState<{ login: string; name: string | null; avatar_url: string } | null>(null);
+  const [tokenError, setTokenError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [ollamaSigning, setOllamaSigning] = useState(false);
+  const [ollamaMessage, setOllamaMessage] = useState('');
+
+  const nameInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const t = setTimeout(() => nameInputRef.current?.focus(), 900);
+    return () => clearTimeout(t);
+  }, []);
+
+  function goToGithub() {
+    if (!nameReady) return;
+    setLeaving(true);
+    setTimeout(() => {
+      setStep('github');
+      setLeaving(false);
+    }, 380);
+  }
+
+  async function verifyToken() {
+    if (!token.trim()) return;
+    setVerifying(true);
+    setTokenError('');
+    try {
+      const user = await invoke<{ login: string; name: string | null; avatar_url: string }>(
+        'verify_github_pat',
+        { token: token.trim() }
+      );
+      setGithubUser(user);
+    } catch (err) {
+      setTokenError(typeof err === 'string' ? err : 'Could not verify token.');
+    } finally {
+      setVerifying(false);
+    }
+  }
+
+  const handleFinish = useCallback(async () => {
+    if (!nameReady || saving) return;
+    setSaving(true);
+    const account: KimAccount = {
+      display_name: name.trim(),
+      github_username: githubUser?.login,
+      github_token: githubUser ? token.trim() : undefined,
+      github_avatar_url: githubUser?.avatar_url,
+      gist_id: undefined,
+      created_at: new Date().toISOString(),
+      google_accounts: [],
+      google_active_account: undefined,
+    };
+    try {
+      await invoke('save_account', { account });
+      // Exit animation before calling onComplete
+      setLeaving(true);
+      setTimeout(() => onComplete(account), 500);
+    } catch {
+      setSaving(false);
+    }
+  }, [nameReady, saving, name, githubUser, token, onComplete]);
+
+  function skipGitHub() {
+    handleFinish();
+  }
+
+  async function signInWithOllama() {
+    setOllamaSigning(true);
+    setOllamaMessage('');
+    try {
+      await invoke('ollama_signin');
+      setOllamaMessage('Ollama sign-in opened. Finish it there, then come back to Kim.');
+    } catch (err) {
+      setOllamaMessage(typeof err === 'string' ? err : 'Could not open Ollama sign-in.');
+    } finally {
+      setOllamaSigning(false);
+    }
+  }
+
+  const screenClass = `kim-ob__screen${leaving ? ' kim-ob__screen--out' : ' kim-ob__screen--in'}`;
+
+  return (
+    <div className="kim-ob">
+
+      {/* Content */}
+      {step === 'name' && (
+        <div className={screenClass} key="name">
+          <div className="kim-ob__inner">
+
+
+            <div className="kim-ob__wordmark">Kim</div>
+            <div className="kim-ob__tagline">What should I call you?</div>
+
+            <div className="kim-ob__input-shell">
+              <div className="kim-ob__input-row">
+                <input
+                  ref={nameInputRef}
+                  type="text"
+                  placeholder="Your name…"
+                  autoComplete="given-name"
+                  spellCheck={false}
+                  value={name}
+                  onChange={e => setName(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && nameReady) goToGithub(); }}
+                  className="kim-ob__input"
+                />
+                <button
+                  className={`kim-ob__send-btn${nameReady ? ' kim-ob__send-btn--ready' : ''}`}
+                  onClick={goToGithub}
+                  disabled={!nameReady}
+                  aria-label="Continue"
+                >
+                  <ArrowIcon />
+                </button>
+              </div>
+            </div>
+
+            <div className="kim-ob__footer">Kim · your data stays private</div>
+          </div>
+        </div>
+      )}
+
+      {step === 'github' && (
+        <div className={screenClass} key="github">
+          <div className="kim-ob__inner">
+            <div className="kim-ob__github-title">
+              <GitHubIcon />
+              Connect GitHub <span style={{ opacity: 0.45, fontWeight: 400 }}>— optional</span>
+            </div>
+            <div className="kim-ob__github-desc">
+              Link a personal access token to back up your Kim account to a private Gist.
+              Create one at <strong>github.com/settings/tokens</strong> with{' '}
+              <code>gist</code> + <code>read:user</code> scopes.
+            </div>
+
+            <div
+              style={{
+                width: '100%',
+                maxWidth: 520,
+                margin: '18px auto 16px',
+                padding: '14px 16px',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 14,
+                background: 'rgba(255,255,255,0.04)',
+                textAlign: 'left',
+              }}
+            >
+              <div style={{ fontSize: 13, fontWeight: 650, marginBottom: 5 }}>Ollama for Kim</div>
+              <div style={{ fontSize: 12, opacity: 0.68, lineHeight: 1.45, marginBottom: 11 }}>
+                Use local or cloud Ollama models through the signed-in local daemon. No API key needed in Kim.
+              </div>
+              <button
+                className="kim-ob__verify-btn"
+                onClick={signInWithOllama}
+                disabled={ollamaSigning}
+              >
+                {ollamaSigning ? 'Opening…' : 'Sign in with Ollama'}
+              </button>
+              {ollamaMessage && (
+                <div style={{ fontSize: 11.5, opacity: 0.7, marginTop: 9, lineHeight: 1.4 }}>
+                  {ollamaMessage}
+                </div>
+              )}
+            </div>
+
+            <div className="kim-ob__token-row">
+              <input
+                type="password"
+                placeholder="ghp_…"
+                spellCheck={false}
+                value={token}
+                onChange={e => { setToken(e.target.value); setGithubUser(null); setTokenError(''); }}
+                onKeyDown={e => { if (e.key === 'Enter' && token.trim() && !githubUser) verifyToken(); }}
+                className="kim-ob__token-input"
+                autoFocus
+              />
+              <button
+                className={`kim-ob__verify-btn${githubUser ? ' kim-ob__verify-btn--done' : ''}`}
+                onClick={verifyToken}
+                disabled={!token.trim() || verifying || !!githubUser}
+              >
+                {verifying ? 'Checking…' : githubUser ? <><CheckIcon /> Connected</> : 'Verify'}
+              </button>
+            </div>
+
+            {tokenError && <div className="kim-ob__token-error">{tokenError}</div>}
+            {githubUser && (
+              <div className="kim-ob__token-success">
+                <CheckIcon />
+                Signed in as <strong>{githubUser.name ?? githubUser.login}</strong>
+              </div>
+            )}
+
+            <div className="kim-ob__github-actions">
+              <button className="kim-ob__skip-btn" onClick={skipGitHub} disabled={saving}>
+                {saving ? 'Setting up…' : 'Skip for now'}
+              </button>
+              <button
+                className={`kim-ob__send-btn kim-ob__send-btn--wide${githubUser && !saving ? ' kim-ob__send-btn--ready' : ''}`}
+                onClick={handleFinish}
+                disabled={saving}
+              >
+                {saving ? 'Setting up…' : 'Get started →'}
+              </button>
+            </div>
+
+            <div className="kim-ob__footer">Hi, {name} — welcome to Kim</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
