@@ -15,7 +15,7 @@ use commands::{handle_command, login_with_key, CommandOutcome, SUPPORTED_COMMAND
 use config::KimConfig;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -720,29 +720,6 @@ async fn run_app(
                         last_key = Some((key.code, key.modifiers, key.kind, now));
                         if !is_dup && handle_key(key, &mut app, terminal).await? {
                             break 'main;
-                        }
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    if app.view == ViewState::InChat {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                if app.follow {
-                                    app.follow = false;
-                                    app.scroll = app.last_max_scroll.get();
-                                }
-                                app.scroll = app.scroll.saturating_sub(3);
-                            }
-                            MouseEventKind::ScrollDown => {
-                                if !app.follow {
-                                    app.scroll = app.scroll.saturating_add(3);
-                                    if app.scroll >= app.last_max_scroll.get() {
-                                        app.follow = true;
-                                        app.scroll = 0;
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -1604,8 +1581,7 @@ fn enter_terminal_with_height(
     RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
     execute!(
         stdout(),
-        EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture
+        EnableBracketedPaste
     )?;
     Terminal::with_options(
         CrosstermBackend::new(stdout()),
@@ -1625,8 +1601,7 @@ fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) ->
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        DisableBracketedPaste,
-        crossterm::event::DisableMouseCapture
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()
 }
