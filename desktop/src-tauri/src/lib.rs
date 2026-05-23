@@ -4877,7 +4877,7 @@ fn handle_webview_bridge_request(
                 });
             let session_dir = kim_root.join("kim_sessions");
             let provider = parsed.provider
-                .filter(|s| !s.trim().is_empty())
+                .filter(|s| !s.trim().is_empty() && s != "desktop")
                 .unwrap_or_else(|| "browser".to_string());
 
             let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();

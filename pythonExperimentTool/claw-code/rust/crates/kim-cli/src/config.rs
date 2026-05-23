@@ -81,5 +81,17 @@ impl KimConfig {
 }
 
 pub fn config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
+    #[cfg(test)]
+    {
+        Some(
+            std::env::temp_dir()
+                .join(format!("kim-cli-test-{}", std::process::id()))
+                .join(CONFIG_FILE_NAME),
+        )
+    }
+
+    #[cfg(not(test))]
+    {
+        dirs::home_dir().map(|home| home.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
+    }
 }
