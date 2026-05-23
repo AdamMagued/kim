@@ -1,3 +1,4 @@
 target/
 .omx/
 .clawd-agents/
+__pycache__/
