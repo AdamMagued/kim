@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::json;
 use serde_json::Value;
 
 use crate::{MessageRole, UiMessage};
@@ -71,9 +73,68 @@ pub fn discover_project_sessions() -> Vec<SessionEntry> {
 }
 
 pub fn find_session_by_id(id: &str) -> Option<SessionEntry> {
-    discover_sessions()
+    let sessions = discover_sessions();
+    if matches!(id, "latest" | "last" | "recent") {
+        return sessions.into_iter().next();
+    }
+    sessions
         .into_iter()
         .find(|session| session.id == id || session.label.ends_with(id))
+}
+
+pub fn save_session_messages(session_id: &str, messages: &[UiMessage]) -> Result<PathBuf, String> {
+    let root = dirs::home_dir()
+        .ok_or_else(|| "Could not find a home directory for Kim sessions.".to_string())?
+        .join(".kim")
+        .join("sessions");
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("Could not create {}: {error}", root.display()))?;
+
+    let safe_id = sanitize_session_id(session_id);
+    let path = root.join(format!("{safe_id}.jsonl"));
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let mut raw = String::new();
+    for message in messages {
+        let Some(role) = persisted_role(message.role) else {
+            continue;
+        };
+        let value = json!({
+            "type": "message",
+            "role": role,
+            "content": message.content,
+            "timestamp_ms": now_ms,
+        });
+        let line = serde_json::to_string(&value)
+            .map_err(|error| format!("Could not encode session message: {error}"))?;
+        raw.push_str(&line);
+        raw.push('\n');
+    }
+    fs::write(&path, raw)
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+fn persisted_role(role: MessageRole) -> Option<&'static str> {
+    match role {
+        MessageRole::User => Some("user"),
+        MessageRole::Assistant => Some("assistant"),
+        MessageRole::System => Some("system"),
+        MessageRole::Error | MessageRole::Reasoning => None,
+    }
+}
+
+fn sanitize_session_id(session_id: &str) -> String {
+    let cleaned = session_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .collect::<String>();
+    if cleaned.is_empty() {
+        "session".to_string()
+    } else {
+        cleaned
+    }
 }
 
 pub fn load_session_messages(path: &Path) -> Result<Vec<UiMessage>, String> {
@@ -227,7 +288,27 @@ fn clean_message_text(text: &str) -> Option<String> {
 }
 
 pub fn display_message_text(text: &str) -> Option<String> {
-    clean_message_text(text)
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("[Tool result:")
+        || trimmed.starts_with('{')
+    {
+        return None;
+    }
+
+    let cleaned = if let Some(stripped) = trimmed.strip_prefix("TASK_COMPLETE:") {
+        stripped.trim().to_string()
+    } else if let Some(stripped) = trimmed.strip_prefix("task_complete:") {
+        stripped.trim().to_string()
+    } else {
+        trimmed.to_string()
+    };
+
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
 }
 
 fn session_context(path: &Path, _id: &str) -> String {
@@ -272,10 +353,7 @@ fn readable_modified_time(path: &Path) -> String {
     let day = day_of_year - month_starts[month_idx] + 1;
     let hour = hours % 24;
     let min = minutes % 60;
-    format!(
-        "{} {} {:02}:{:02}",
-        month_names[month_idx], day, hour, min
-    )
+    format!("{} {} {:02}:{:02}", month_names[month_idx], day, hour, min)
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -288,16 +366,69 @@ fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn find_kim_repo_root() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        if dir.join("kim_sessions").exists() && dir.join("orchestrator").exists() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
+pub(crate) fn find_kim_repo_root() -> Option<PathBuf> {
+    // 1. Environment override wins (explicit user intent).
+    if let Ok(env_root) = std::env::var("KIM_PROJECT_ROOT") {
+        let p = PathBuf::from(env_root);
+        if p.exists() && p.join("orchestrator").join("agent.py").exists() {
+            return Some(p);
         }
     }
+
+    // 2. Compile-time baked path walk-up from CARGO_MANIFEST_DIR.
+    // Since we are compiling/running on the same machine/source-tree, this is extremely reliable.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let mut manifest_path = PathBuf::from(manifest_dir);
+    loop {
+        if manifest_path.join("orchestrator").join("agent.py").exists() {
+            return Some(manifest_path);
+        }
+        if !manifest_path.pop() {
+            break;
+        }
+    }
+
+    // 3. ~/.kim_root — written by install.sh
+    if let Some(home) = dirs::home_dir() {
+        let root_file = home.join(".kim_root");
+        if let Ok(contents) = std::fs::read_to_string(&root_file) {
+            let p = PathBuf::from(contents.trim());
+            if p.exists() && p.join("orchestrator").join("agent.py").exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    // 4. Walk up from current executable
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            if ancestor.join("orchestrator").join("agent.py").exists() {
+                return Some(ancestor.to_path_buf());
+            }
+        }
+    }
+
+    // 5. Walk up from the current working directory
+    if let Ok(mut dir) = std::env::current_dir() {
+        loop {
+            if dir.join("orchestrator").join("agent.py").exists() {
+                return Some(dir);
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+
+    // 6. ~/.kim
+    if let Some(home) = dirs::home_dir() {
+        let p = home.join(".kim");
+        if p.exists() && p.join("orchestrator").join("agent.py").exists() {
+            return Some(p);
+        }
+    }
+
+    None
 }
 
 fn add_ancestor_session_roots(start: &Path, roots: &mut Vec<PathBuf>) {

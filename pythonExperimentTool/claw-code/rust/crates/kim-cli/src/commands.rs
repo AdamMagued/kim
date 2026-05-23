@@ -29,6 +29,7 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "/model",
     "/status",
     "/help",
+    "/commands",
     "/clear",
     "/exit",
     "/sessions",
@@ -59,7 +60,7 @@ pub async fn handle_command(input: &str, config: &mut KimConfig) -> CommandOutco
     let args = parts.next().unwrap_or_default().trim();
 
     match command {
-        "/help" => CommandOutcome::Message(help()),
+        "/" | "/help" | "/commands" => CommandOutcome::Message(commands_menu(args)),
         "/exit" => CommandOutcome::Exit,
         "/clear" => CommandOutcome::Message("Conversation cleared.".to_string()),
         "/status" => CommandOutcome::Message(status(config)),
@@ -92,6 +93,199 @@ pub async fn handle_command(input: &str, config: &mut KimConfig) -> CommandOutco
 }
 
 pub fn help() -> String {
+    commands_menu("")
+}
+
+pub fn commands_menu(filter: &str) -> String {
+    let filter = filter.trim().to_ascii_lowercase();
+    let mut lines = ["Kim CLI commands", ""].map(str::to_string).to_vec();
+    let mut current_group = "";
+
+    for spec in COMMAND_SPECS {
+        if !filter.is_empty()
+            && !spec.name.contains(&filter)
+            && !spec.usage.contains(&filter)
+            && !spec.summary.to_ascii_lowercase().contains(&filter)
+        {
+            continue;
+        }
+        if current_group != spec.group {
+            current_group = spec.group;
+            lines.push(current_group.to_string());
+        }
+        lines.push(format!("  {:<28} {}", spec.usage, spec.summary));
+    }
+
+    if lines.len() == 2 {
+        lines.push(format!("No commands matched `{filter}`."));
+    }
+
+    lines.extend([
+        "".to_string(),
+        "Tip: type / then press Tab to complete commands.".to_string(),
+        "Modes: /chat for general chat, /code for project coding, /mode toggles.".to_string(),
+    ]);
+    lines.join("\n")
+}
+
+pub fn command_summary(command: &str) -> &'static str {
+    COMMAND_SPECS
+        .iter()
+        .find(|spec| spec.name == command)
+        .map_or("", |spec| spec.summary)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommandSpec {
+    group: &'static str,
+    name: &'static str,
+    usage: &'static str,
+    summary: &'static str,
+}
+
+const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        group: "Core",
+        name: "/commands",
+        usage: "/commands [filter]",
+        summary: "Show this command menu.",
+    },
+    CommandSpec {
+        group: "Core",
+        name: "/help",
+        usage: "/help",
+        summary: "Show command help.",
+    },
+    CommandSpec {
+        group: "Core",
+        name: "/status",
+        usage: "/status",
+        summary: "Show provider, model, theme, and config path.",
+    },
+    CommandSpec {
+        group: "Core",
+        name: "/clear",
+        usage: "/clear",
+        summary: "Clear the current conversation.",
+    },
+    CommandSpec {
+        group: "Core",
+        name: "/exit",
+        usage: "/exit",
+        summary: "Quit Kim.",
+    },
+    CommandSpec {
+        group: "Provider",
+        name: "/login",
+        usage: "/login [provider]",
+        summary: "Connect Ollama or add an API key.",
+    },
+    CommandSpec {
+        group: "Provider",
+        name: "/logout",
+        usage: "/logout [provider]",
+        summary: "Remove a saved API key.",
+    },
+    CommandSpec {
+        group: "Provider",
+        name: "/provider",
+        usage: "/provider [name]",
+        summary: "Switch provider or list providers.",
+    },
+    CommandSpec {
+        group: "Provider",
+        name: "/model",
+        usage: "/model [name]",
+        summary: "Switch model or list model options.",
+    },
+    CommandSpec {
+        group: "Sessions",
+        name: "/sessions",
+        usage: "/sessions",
+        summary: "List saved sessions.",
+    },
+    CommandSpec {
+        group: "Sessions",
+        name: "/resume",
+        usage: "/resume [id|latest]",
+        summary: "Resume a saved session.",
+    },
+    CommandSpec {
+        group: "Sessions",
+        name: "/usage",
+        usage: "/usage",
+        summary: "Explain local usage tracking.",
+    },
+    CommandSpec {
+        group: "Sessions",
+        name: "/compact",
+        usage: "/compact",
+        summary: "Compact older conversation context.",
+    },
+    CommandSpec {
+        group: "Mode",
+        name: "/mode",
+        usage: "/mode",
+        summary: "Toggle between chat and code mode.",
+    },
+    CommandSpec {
+        group: "Mode",
+        name: "/chat",
+        usage: "/chat",
+        summary: "General assistant mode.",
+    },
+    CommandSpec {
+        group: "Mode",
+        name: "/code",
+        usage: "/code",
+        summary: "Project coding agent mode.",
+    },
+    CommandSpec {
+        group: "Mode",
+        name: "/theme",
+        usage: "/theme [dark|light]",
+        summary: "Switch the terminal color theme.",
+    },
+    CommandSpec {
+        group: "Coding",
+        name: "/diff",
+        usage: "/diff",
+        summary: "Show git diff stats.",
+    },
+    CommandSpec {
+        group: "Coding",
+        name: "/run",
+        usage: "/run <command>",
+        summary: "Run a shell command.",
+    },
+    CommandSpec {
+        group: "Coding",
+        name: "/git",
+        usage: "/git <args>",
+        summary: "Run git with arguments.",
+    },
+    CommandSpec {
+        group: "Coding",
+        name: "/search",
+        usage: "/search <query>",
+        summary: "Search files with ripgrep.",
+    },
+    CommandSpec {
+        group: "Coding",
+        name: "/files",
+        usage: "/files [path]",
+        summary: "List files with ripgrep.",
+    },
+    CommandSpec {
+        group: "Coding",
+        name: "/init",
+        usage: "/init",
+        summary: "Create a KIM.md project note file.",
+    },
+];
+
+#[allow(dead_code)]
+pub fn legacy_help() -> String {
     let mut lines = [
         "Kim CLI commands",
         "",
@@ -141,7 +335,10 @@ fn set_provider(args: &str, config: &mut KimConfig) -> CommandOutcome {
     if provider_changed || config.model.trim().is_empty() {
         config.model = provider.default_model.to_string();
     }
-    config_notice(config, format!("provider → {}  model → {}", provider.name, config.model))
+    config_notice(
+        config,
+        format!("provider → {}  model → {}", provider.name, config.model),
+    )
 }
 
 async fn set_model(args: &str, config: &mut KimConfig) -> CommandOutcome {
@@ -302,15 +499,24 @@ async fn ollama_login(config: &mut KimConfig) -> CommandOutcome {
             "Ollama is not installed.\nInstall it, run 'ollama serve', then /login ollama again.\nhttps://ollama.com/download".to_string(),
         );
     }
-    match ollama_check_server().await {
-        Some(n) => {
+    match ollama_server_models().await {
+        Some(local_models) => {
             config.provider = "ollama".to_string();
-            let model_info = if n == 0 {
+            config.model = choose_ollama_model(&config.model, &local_models);
+            let model_info = if local_models.is_empty() {
                 "No local models found. Pull one with: ollama pull llama3.2".to_string()
             } else {
-                format!("{n} model(s) available locally")
+                format!(
+                    "{} model(s) available locally · model set to {}",
+                    local_models.len(),
+                    config.model
+                )
             };
-            let save_err = config.save().err().map(|e| format!("\nWarning: config not saved: {e}")).unwrap_or_default();
+            let save_err = config
+                .save()
+                .err()
+                .map(|e| format!("\nWarning: config not saved: {e}"))
+                .unwrap_or_default();
             CommandOutcome::ProviderConnected(format!(
                 "Connected to Ollama · {model_info} · provider set to ollama · ready to chat.{save_err}"
             ))
@@ -323,7 +529,12 @@ async fn ollama_login(config: &mut KimConfig) -> CommandOutcome {
 
 async fn ollama_is_available() -> bool {
     // Try the process PATH first.
-    if Command::new("ollama").arg("--version").output().await.is_ok() {
+    if Command::new("ollama")
+        .arg("--version")
+        .output()
+        .await
+        .is_ok()
+    {
         return true;
     }
     // Fall back to common Windows install locations — handles the case where
@@ -343,7 +554,7 @@ async fn ollama_is_available() -> bool {
     false
 }
 
-async fn ollama_check_server() -> Option<usize> {
+async fn ollama_server_models() -> Option<Vec<String>> {
     let resp = reqwest::Client::new()
         .get("http://127.0.0.1:11434/api/tags")
         .timeout(std::time::Duration::from_secs(2))
@@ -355,7 +566,30 @@ async fn ollama_check_server() -> Option<usize> {
     }
     let text = resp.text().await.unwrap_or_default();
     let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-    Some(json["models"].as_array().map_or(0, |a| a.len()))
+    let models = json["models"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["name"].as_str())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(models)
+}
+
+fn choose_ollama_model(current: &str, local_models: &[String]) -> String {
+    if local_models.iter().any(|model| model == current)
+        || known_ollama_cloud_models().contains(&current)
+    {
+        return current.to_string();
+    }
+    local_models.first().cloned().unwrap_or_else(|| {
+        provider_info("ollama")
+            .map_or("llama3.2", |info| info.default_model)
+            .to_string()
+    })
 }
 
 async fn validate_api_key(provider: &str, key: &str) -> Result<(), String> {
@@ -465,7 +699,10 @@ async fn search(args: &str) -> CommandOutcome {
             #[cfg(windows)]
             {
                 let output = Command::new("cmd")
-                    .args(["/C", &format!("findstr /r /s /n /p \"{}\" *", args.replace('"', ""))])
+                    .args([
+                        "/C",
+                        &format!("findstr /r /s /n /p \"{}\" *", args.replace('"', "")),
+                    ])
                     .output()
                     .await;
                 return format_output(&format!("findstr {args}"), output);
@@ -580,7 +817,10 @@ mod tests {
     async fn parses_theme_command() {
         let mut config = KimConfig::default();
         let outcome = handle_command("/theme light", &mut config).await;
-        assert!(matches!(outcome, CommandOutcome::Info(_) | CommandOutcome::Message(_)));
+        assert!(matches!(
+            outcome,
+            CommandOutcome::Info(_) | CommandOutcome::Message(_)
+        ));
         assert_eq!(config.theme, ThemeName::QuietLight);
     }
 
@@ -593,7 +833,10 @@ mod tests {
     async fn parses_provider_command() {
         let mut config = KimConfig::default();
         let outcome = handle_command("/provider openai", &mut config).await;
-        assert!(matches!(outcome, CommandOutcome::Info(_) | CommandOutcome::Message(_)));
+        assert!(matches!(
+            outcome,
+            CommandOutcome::Info(_) | CommandOutcome::Message(_)
+        ));
         assert_eq!(config.provider, "openai");
     }
 
@@ -628,6 +871,19 @@ mod tests {
         assert!(models
             .iter()
             .any(|model| model == "qwen2.5-coder:32b-cloud"));
+    }
+
+    #[test]
+    fn ollama_login_replaces_non_ollama_model_with_local_model() {
+        let local_models = vec!["llama3.2:latest".to_string()];
+        assert_eq!(
+            super::choose_ollama_model("gpt-4o-mini", &local_models),
+            "llama3.2:latest"
+        );
+        assert_eq!(
+            super::choose_ollama_model("gpt-oss:20b-cloud", &local_models),
+            "gpt-oss:20b-cloud"
+        );
     }
 
     #[test]

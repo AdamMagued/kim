@@ -91,6 +91,7 @@ pub async fn stream_kim_request(
     config: &KimConfig,
     messages: &[ChatMessage],
     code_mode: bool,
+    session_id: &str,
     tx: UnboundedSender<AppEvent>,
 ) {
     if config.provider == "desktop" {
@@ -104,31 +105,25 @@ pub async fn stream_kim_request(
         return;
     }
 
+    let prompt = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .unwrap_or_default();
+    if prompt.trim().is_empty() {
+        let _ = tx.send(AppEvent::Err("Nothing to send.".to_string()));
+        return;
+    }
+
     if code_mode {
-        let prompt = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .map(|m| m.content.as_str())
-            .unwrap_or_default();
-        if prompt.trim().is_empty() {
-            let _ = tx.send(AppEvent::Err("Nothing to send.".to_string()));
-            return;
-        }
         stream_codex_subprocess(config, prompt, tx).await;
         return;
     }
 
-    let mut full = vec![ChatMessage {
-        role: "system".to_string(),
-        content: KIM_CHAT_SYSTEM_PROMPT.to_string(),
-    }];
-    full.extend_from_slice(messages);
-
-    match config.provider.as_str() {
-        "claude" => stream_anthropic(config, &full, tx).await,
-        _ => stream_openai_compatible(config, &full, tx).await,
-    }
+    // Standalone Chat Mode: spawn the local Python orchestrator agent
+    // to run the task locally with all MCP tools and OS control!
+    stream_local_agent_subprocess(config, prompt, session_id, tx).await;
 }
 
 /// Non-streaming fallback kept for commands that need a blocking reply.
@@ -616,8 +611,7 @@ impl ThinkParser {
                         self.state = ThinkState::InThink;
                     } else {
                         // Keep last 6 chars (len("<think>") - 1) to catch split tags
-                        let keep = self.buf.len().min(6);
-                        let flush_up_to = self.buf.len() - keep;
+                        let flush_up_to = split_before_tail_chars(&self.buf, 6);
                         if flush_up_to > 0 {
                             let to_flush = self.buf[..flush_up_to].to_string();
                             let _ = tx.send(AppEvent::TextChunk(to_flush));
@@ -636,8 +630,7 @@ impl ThinkParser {
                         self.state = ThinkState::Normal;
                     } else {
                         // Keep last 7 chars (len("</think>") - 1) to catch split tags
-                        let keep = self.buf.len().min(7);
-                        let flush_up_to = self.buf.len() - keep;
+                        let flush_up_to = split_before_tail_chars(&self.buf, 7);
                         if flush_up_to > 0 {
                             let to_flush = self.buf[..flush_up_to].to_string();
                             let _ = tx.send(AppEvent::ThoughtChunk(to_flush));
@@ -660,6 +653,13 @@ impl ThinkParser {
             ThinkState::InThink => tx.send(AppEvent::ThoughtChunk(text)),
         };
     }
+}
+
+fn split_before_tail_chars(text: &str, keep_chars: usize) -> usize {
+    text.char_indices()
+        .rev()
+        .nth(keep_chars.saturating_sub(1))
+        .map_or(0, |(index, _)| index)
 }
 
 /* ===========================================================
@@ -1286,6 +1286,236 @@ fn write_codex_config(proxy_port: u16, model: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn command_exists(cmd: &str) -> bool {
+    std::process::Command::new(cmd)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|mut child| {
+            let _ = child.kill();
+            true
+        })
+        .unwrap_or(false)
+}
+
+fn find_python_interpreter(project_root: &Path) -> Result<String, String> {
+    let candidates = [
+        project_root.join("venv").join("bin").join("python"),
+        project_root.join(".venv").join("bin").join("python"),
+        project_root.join("venv").join("Scripts").join("python.exe"),
+        project_root.join(".venv").join("Scripts").join("python.exe"),
+    ];
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    let cmd_candidates = ["py", "python", "python3"];
+    #[cfg(not(target_os = "windows"))]
+    let cmd_candidates = ["python3", "python"];
+
+    for cmd in cmd_candidates {
+        if command_exists(cmd) {
+            return Ok(cmd.to_string());
+        }
+    }
+
+    Err(
+        "No Python interpreter found. Install Python 3 or create a project venv (venv/.venv)."
+            .to_string(),
+    )
+}
+
+async fn stream_local_agent_subprocess(
+    config: &KimConfig,
+    prompt: &str,
+    session_id: &str,
+    tx: UnboundedSender<AppEvent>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let kim_root = crate::sessions::find_kim_repo_root().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    });
+    let python = match find_python_interpreter(&kim_root) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tx.send(AppEvent::Err(e));
+            return;
+        }
+    };
+
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => {
+            let _ = tx.send(AppEvent::Err("Could not find home directory".to_string()));
+            return;
+        }
+    };
+    let session_dir = home.join(".kim").join("sessions");
+    if let Err(e) = std::fs::create_dir_all(&session_dir) {
+        let _ = tx.send(AppEvent::Err(format!("Failed to create sessions directory: {e}")));
+        return;
+    }
+
+    let mut cmd = Command::new(&python);
+    cmd.args(["-m", "orchestrator.agent"])
+        .arg("--task")
+        .arg(prompt)
+        .arg("--session-dir")
+        .arg(session_dir.to_string_lossy().to_string())
+        .arg("--resume")
+        .arg(session_id)
+        .arg("--provider")
+        .arg(&config.provider)
+        .current_dir(&kim_root)
+        .env("PROJECT_ROOT", kim_root.to_str().unwrap_or(""))
+        .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    if let Some(key) = config.api_keys.get("openai") {
+        cmd.env("OPENAI_API_KEY", key);
+    }
+    if let Some(key) = config.api_keys.get("claude") {
+        cmd.env("ANTHROPIC_API_KEY", key);
+    }
+    if let Some(key) = config.api_keys.get("gemini") {
+        cmd.env("GEMINI_API_KEY", key);
+    }
+    if let Some(key) = config.api_keys.get("deepseek") {
+        cmd.env("DEEPSEEK_API_KEY", key);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(AppEvent::Err(format!("Failed to start agent: {e}")));
+            return;
+        }
+    };
+
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = tx.send(AppEvent::Err("Failed to capture stdout.".to_string()));
+            return;
+        }
+    };
+    let stderr_pipe = child.stderr.take();
+
+    let mut lines = BufReader::new(stdout).lines();
+    let mut had_output = false;
+    while let Ok(Some(line)) = lines.next_line().await {
+        had_output = true;
+        process_agent_line(&line, &tx);
+    }
+
+    let exit_ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
+
+    if !had_output || !exit_ok {
+        let mut stderr_msg = String::new();
+        if let Some(pipe) = stderr_pipe {
+            let mut err_lines = BufReader::new(pipe).lines();
+            while let Ok(Some(line)) = err_lines.next_line().await {
+                if !stderr_msg.is_empty() {
+                    stderr_msg.push('\n');
+                }
+                stderr_msg.push_str(line.trim());
+            }
+        }
+        if !stderr_msg.trim().is_empty() {
+            let _ = tx.send(AppEvent::Err(format!("agent: {}", stderr_msg.trim())));
+        } else if !had_output {
+            let _ = tx.send(AppEvent::Err("agent produced no output.".to_string()));
+        } else {
+            let _ = tx.send(AppEvent::Err("agent subprocess failed.".to_string()));
+        }
+        return;
+    }
+    let _ = tx.send(AppEvent::Done(true));
+}
+
+fn process_agent_line(line: &str, tx: &UnboundedSender<AppEvent>) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+
+    if let Some(success_idx) = line.find("[SUCCESS]") {
+        let summary = line[success_idx + "[SUCCESS]".len()..].trim();
+        let _ = tx.send(AppEvent::TextChunk(format!("✓ {summary}\n")));
+        return;
+    }
+    if let Some(failed_idx) = line.find("[FAILED]") {
+        let err = line[failed_idx + "[FAILED]".len()..].trim();
+        let _ = tx.send(AppEvent::Err(err.to_string()));
+        return;
+    }
+    if let Some(err_idx) = line.find("[ERROR]") {
+        let err = line[err_idx + "[ERROR]".len()..].trim();
+        let _ = tx.send(AppEvent::Err(err.to_string()));
+        return;
+    }
+
+    if let Some(status_idx) = line.find("[STATUS]") {
+        let text = line[status_idx + "[STATUS]".len()..].trim();
+        if !text.is_empty() {
+            if text.starts_with("[PLAN]") {
+                if let Ok(val) = serde_json::from_str::<Value>(&text["[PLAN]".len()..]) {
+                    if let Some(steps) = val.get("steps").and_then(Value::as_array) {
+                        let mut plan_text = "Plan:\n".to_string();
+                        for (i, step) in steps.iter().enumerate() {
+                            if let Some(s) = step.as_str() {
+                                plan_text.push_str(&format!("  {}. {}\n", i + 1, s));
+                            }
+                        }
+                        let _ = tx.send(AppEvent::ThoughtChunk(plan_text));
+                        return;
+                    }
+                }
+            } else if text.starts_with("[STEP]") {
+                if let Ok(val) = serde_json::from_str::<Value>(&text["[STEP]".len()..]) {
+                    let idx = val.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let name = val.get("name").and_then(Value::as_str).unwrap_or("");
+                    let _ = tx.send(AppEvent::ThoughtChunk(format!("Step {idx}: {name}\n")));
+                    return;
+                }
+            } else if text.starts_with("[DONE]") {
+                if let Ok(val) = serde_json::from_str::<Value>(&text["[DONE]".len()..]) {
+                    let idx = val.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let summary = val.get("summary").and_then(Value::as_str).unwrap_or("");
+                    let _ = tx.send(AppEvent::ThoughtChunk(format!("Step {idx} complete: {summary}\n")));
+                    return;
+                }
+            }
+            let _ = tx.send(AppEvent::ThoughtChunk(format!("{text}\n")));
+        }
+        return;
+    }
+
+    if let Some(tool_idx) = line.find("[TOOL]") {
+        let rest = line[tool_idx + "[TOOL]".len()..].trim();
+        let (verb, target) = if let Some(paren_idx) = rest.find('(') {
+            let tool_name = rest[..paren_idx].trim().to_string();
+            ("Using tool".to_string(), tool_name)
+        } else {
+            ("Using tool".to_string(), rest.to_string())
+        };
+        let _ = tx.send(AppEvent::ToolEvent { verb, target });
+        return;
+    }
+
+    // Generic lines can be forwarded as status/thought info
+    let _ = tx.send(AppEvent::ThoughtChunk(format!("{line}\n")));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,5 +1584,23 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, AppEvent::TextChunk(text) if text == "done")));
+    }
+
+    #[test]
+    fn think_parser_keeps_utf8_boundaries_when_flushing_tail() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+
+        parser.feed("for—news", &tx);
+        parser.flush(&tx);
+
+        let mut text = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::TextChunk(chunk) = event {
+                text.push_str(&chunk);
+            }
+        }
+
+        assert_eq!(text, "for—news");
     }
 }

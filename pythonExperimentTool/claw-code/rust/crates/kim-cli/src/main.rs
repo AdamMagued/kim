@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod commands;
 mod config;
 mod provider;
@@ -6,19 +8,23 @@ mod theme;
 mod thinking;
 mod ui;
 
-use std::io::{self, stdout};
+use std::io::{self, stdout, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use commands::{handle_command, login_with_key, CommandOutcome, SUPPORTED_COMMANDS};
+use commands::{
+    command_summary, handle_command, login_with_key, CommandOutcome, SUPPORTED_COMMANDS,
+};
 use config::KimConfig;
+use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::style::{Color as TerminalColor, Stylize};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use provider::{stream_kim_request, AppEvent, ChatMessage};
 use ratatui::backend::CrosstermBackend;
 
@@ -27,9 +33,15 @@ use runtime::{
     compact_session, ContentBlock, ConversationMessage, MessageRole as RuntimeMessageRole,
     Session as RuntimeSession,
 };
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::{ValidationContext, ValidationResult, Validator};
+use rustyline::{Context, Helper};
 use sessions::{
     discover_project_sessions, discover_sessions, find_session_by_id, load_session_messages,
-    SessionEntry,
+    save_session_messages, SessionEntry,
 };
 use thinking::TraceItem;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -127,7 +139,10 @@ impl App {
     }
 
     pub fn cursor_byte_idx(&self) -> usize {
-        self.input.char_indices().nth(self.input_cursor).map_or(self.input.len(), |(i, _)| i)
+        self.input
+            .char_indices()
+            .nth(self.input_cursor)
+            .map_or(self.input.len(), |(i, _)| i)
     }
 
     fn new(config: KimConfig, resume_id: Option<&str>) -> Self {
@@ -306,8 +321,13 @@ impl App {
     fn arm_or_exit_with_ctrl_c(&mut self) -> bool {
         if !self.input.is_empty() {
             self.input.clear();
-            self.ctrl_c_armed = false;
-            self.status = "cleared input".to_string();
+            self.input_cursor = 0;
+            self.sync_slash_selection();
+            self.ctrl_c_armed = true;
+            self.status = format!(
+                "cleared input · press Ctrl-C again to exit · resume with kim --resume {}",
+                self.current_session_id
+            );
             return false;
         }
         if self.ctrl_c_armed {
@@ -347,14 +367,14 @@ impl App {
     fn set_mode(&mut self, mode: AppMode) {
         self.mode = mode;
         self.refresh_sessions();
-        self.view = ViewState::SessionMenu;
+        self.view = ViewState::InChat;
         self.status = format!(
             "kim {} mode · {}",
             self.mode.label(),
             if self.mode == AppMode::Code {
-                "sessions are limited to this project"
+                "type here or use /sessions to choose a project session"
             } else {
-                "showing Kim chat sessions"
+                "type here or use /sessions to choose a saved chat"
             }
         );
     }
@@ -642,12 +662,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resume_id = args
         .windows(2)
         .find_map(|w| (w[0] == "--resume").then_some(w[1].as_str()));
-
-    install_panic_hook();
-    let mut terminal = enter_terminal()?;
-    let result = run_app(&mut terminal, resume_id).await;
-    leave_terminal(&mut terminal)?;
-    match result {
+    match run_repl(resume_id).await {
         Ok(session_id) => println!("Resume this Kim session with: kim --resume {session_id}"),
         Err(error) => {
             eprintln!("kim error: {error}");
@@ -655,6 +670,898 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/* ===========================================================
+Claude-style prompt loop
+=========================================================== */
+
+async fn run_repl(resume_id: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let mut app = App::new(KimConfig::load(), resume_id);
+    app.provider_ready = provider_is_ready(&app.config);
+    app.view = ViewState::InChat;
+
+    if resume_id.is_none() && io::stdin().is_terminal() {
+        choose_start_mode(&mut app)?;
+    }
+
+    print_repl_header(&app);
+    if resume_id.is_some() && !app.messages.is_empty() {
+        println!("Resumed {}.", app.current_session_id);
+        print_recent_transcript(&app);
+    }
+
+    if io::stdin().is_terminal() {
+        run_repl_readline(&mut app).await?;
+    } else {
+        run_repl_stdio(&mut app).await?;
+    }
+
+    Ok(app.current_session_id)
+}
+
+fn choose_start_mode(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", paint_bold("Choose a mode", kim_accent_color()));
+    println!(
+        "  {}  {}",
+        paint_bold("c / code", kim_accent_color()),
+        paint_text("Coding agent mode. Best for repo work, bugs, files, commands, and diffs.")
+    );
+    println!(
+        "  {}  {}",
+        paint_bold("h / chat", kim_accent_color()),
+        paint_text("General chat mode. Best for normal questions, writing, and lightweight help.")
+    );
+    println!(
+        "{}",
+        paint_dim("Switch later with /mode, /code, or /chat. Press Enter for chat.")
+    );
+
+    loop {
+        print!("{}", paint_bold("mode [c/h]> ", kim_accent_color()));
+        stdout().flush()?;
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            println!();
+            app.set_mode(AppMode::Chat);
+            app.view = ViewState::InChat;
+            return Ok(());
+        }
+        match input.trim().to_ascii_lowercase().as_str() {
+            "" | "h" | "chat" | "2" => {
+                app.set_mode(AppMode::Chat);
+                break;
+            }
+            "c" | "code" | "1" => {
+                app.set_mode(AppMode::Code);
+                break;
+            }
+            _ => println!("{}", paint_dim("Press c for code or h for chat.")),
+        }
+    }
+    app.view = ViewState::InChat;
+    println!();
+    Ok(())
+}
+
+async fn run_repl_stdio(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        print_repl_prompt(&app)?;
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            println!();
+            break;
+        }
+        let input = input.trim_end_matches(['\r', '\n']).to_string();
+        if input.trim().is_empty() {
+            continue;
+        }
+        if handle_repl_input(app, input).await? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn run_repl_readline(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+    let mut editor = rustyline::Editor::<SlashHelper, rustyline::history::DefaultHistory>::new()?;
+    editor.set_helper(Some(SlashHelper));
+    loop {
+        let prompt = repl_prompt(app);
+        match editor.readline(&prompt) {
+            Ok(input) => {
+                app.ctrl_c_armed = false;
+                let input = input.trim_end_matches(['\r', '\n']).to_string();
+                if input.trim().is_empty() {
+                    continue;
+                }
+                let _ = editor.add_history_entry(input.as_str());
+                if handle_repl_input(app, input).await? {
+                    break;
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                if app.ctrl_c_armed {
+                    break;
+                }
+                app.ctrl_c_armed = true;
+                println!("press Ctrl-C again to exit");
+            }
+            Err(ReadlineError::Eof) => {
+                println!();
+                break;
+            }
+            Err(error) => return Err(Box::new(error)),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SlashHelper;
+
+impl Helper for SlashHelper {}
+
+impl Completer for SlashHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> Result<(usize, Vec<Pair>), ReadlineError> {
+        let prefix = &line[..pos.min(line.len())];
+        if !prefix.starts_with('/') || prefix.contains(char::is_whitespace) {
+            return Ok((0, Vec::new()));
+        }
+        let candidates = SUPPORTED_COMMANDS
+            .iter()
+            .copied()
+            .filter(|command| command.starts_with(prefix))
+            .map(|command| Pair {
+                display: format!("{:<12} {}", command, command_summary(command)),
+                replacement: command.to_string(),
+            })
+            .collect::<Vec<_>>();
+        Ok((0, candidates))
+    }
+}
+
+impl Hinter for SlashHelper {
+    type Hint = String;
+}
+
+impl Highlighter for SlashHelper {}
+
+impl Validator for SlashHelper {
+    fn validate(
+        &self,
+        _ctx: &mut ValidationContext<'_>,
+    ) -> Result<ValidationResult, ReadlineError> {
+        Ok(ValidationResult::Valid(None))
+    }
+}
+
+fn print_repl_header(app: &App) {
+    println!("{}", paint_bold("Kim CLI", kim_accent_color()));
+    println!(
+        "{} {}  {} {}  {} {}",
+        paint_dim("Provider:"),
+        paint_text(&app.config.provider),
+        paint_dim("Model:"),
+        paint_text(&app.config.model),
+        paint_dim("Mode:"),
+        paint_bold(app.mode.label(), kim_accent_color())
+    );
+    if app.provider_ready {
+        println!(
+            "{}",
+            paint_dim(
+                "Type /commands for the command menu. Type /mode, /code, or /chat to switch."
+            )
+        );
+    } else {
+        println!(
+            "{}",
+            paint_dim("Not signed in yet. Run /login ollama, /login claude, or /provider <name>.")
+        );
+    }
+    println!();
+}
+
+fn print_repl_prompt(app: &App) -> io::Result<()> {
+    print!("{}", repl_prompt(app));
+    stdout().flush()
+}
+
+fn repl_prompt(app: &App) -> String {
+    if app.mode == AppMode::Code {
+        paint_bold("code> ", kim_accent_color())
+    } else {
+        paint_bold("> ", kim_accent_color())
+    }
+}
+
+fn colors_enabled() -> bool {
+    stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn kim_accent_color() -> TerminalColor {
+    TerminalColor::Rgb {
+        r: 0xe8,
+        g: 0xb8,
+        b: 0x9a,
+    }
+}
+
+#[allow(dead_code)]
+fn kim_text_color() -> TerminalColor {
+    TerminalColor::Rgb {
+        r: 0x35,
+        g: 0x30,
+        b: 0x2a,
+    }
+}
+
+fn kim_dim_color() -> TerminalColor {
+    TerminalColor::Grey
+}
+
+fn paint_text(text: &str) -> String {
+    text.to_string()
+}
+
+fn paint_dim(text: &str) -> String {
+    paint(text, kim_dim_color())
+}
+
+fn paint_bold(text: &str, color: TerminalColor) -> String {
+    if colors_enabled() {
+        format!("{}", text.with(color).bold())
+    } else {
+        text.to_string()
+    }
+}
+
+fn paint(text: &str, color: TerminalColor) -> String {
+    if colors_enabled() {
+        format!("{}", text.with(color))
+    } else {
+        text.to_string()
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn choose_model_interactively(
+    app: &mut App,
+    options: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if options.is_empty() {
+        print_model_options(&app.config.model, options);
+        return Ok(());
+    }
+
+    let mut selected = options
+        .iter()
+        .position(|model| model == &app.config.model)
+        .unwrap_or(0);
+    let mut out = stdout();
+    let _raw_mode = RawModeGuard::enter()?;
+    let mut rendered_lines = render_model_picker(&mut out, options, selected, &app.config.model)?;
+
+    loop {
+        match event::read()? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                match key.code {
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        rendered_lines = rerender_model_picker(
+                            &mut out,
+                            rendered_lines,
+                            options,
+                            selected,
+                            &app.config.model,
+                        )?;
+                    }
+                    KeyCode::Down => {
+                        selected = selected
+                            .saturating_add(1)
+                            .min(options.len().saturating_sub(1));
+                        rendered_lines = rerender_model_picker(
+                            &mut out,
+                            rendered_lines,
+                            options,
+                            selected,
+                            &app.config.model,
+                        )?;
+                    }
+                    KeyCode::Enter => {
+                        clear_rendered_lines(&mut out, rendered_lines)?;
+                        let model = options[selected].clone();
+                        app.config.model = model.clone();
+                        let note = match app.config.save() {
+                            Ok(()) => format!("model -> {model}"),
+                            Err(error) => {
+                                format!("model -> {model}\nWarning: config was not saved: {error}")
+                            }
+                        };
+                        drop(_raw_mode);
+                        print_note(&note);
+                        return Ok(());
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        clear_rendered_lines(&mut out, rendered_lines)?;
+                        drop(_raw_mode);
+                        print_note("model unchanged");
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn rerender_model_picker(
+    out: &mut impl Write,
+    rendered_lines: u16,
+    options: &[String],
+    selected: usize,
+    current: &str,
+) -> io::Result<u16> {
+    clear_rendered_lines(out, rendered_lines)?;
+    render_model_picker(out, options, selected, current)
+}
+
+fn clear_rendered_lines(out: &mut impl Write, rendered_lines: u16) -> io::Result<()> {
+    if rendered_lines > 0 {
+        execute!(
+            out,
+            MoveUp(rendered_lines),
+            MoveToColumn(0),
+            Clear(ClearType::FromCursorDown)
+        )?;
+    }
+    out.flush()
+}
+
+fn raw_writeln(out: &mut impl Write, line: &str) -> io::Result<()> {
+    write!(out, "{line}\r\n")
+}
+
+fn render_model_picker(
+    out: &mut impl Write,
+    options: &[String],
+    selected: usize,
+    current: &str,
+) -> io::Result<u16> {
+    let max_visible = 12usize;
+    let half = max_visible / 2;
+    let start = selected
+        .saturating_sub(half)
+        .min(options.len().saturating_sub(max_visible));
+    let end = options.len().min(start + max_visible);
+    let mut lines = 0u16;
+
+    raw_writeln(
+        out,
+        &paint_bold("Choose model (Up/Down, Enter, Esc)", kim_accent_color()),
+    )?;
+    lines += 1;
+
+    if start > 0 {
+        raw_writeln(out, &format!("  {}", paint_dim("...")))?;
+        lines += 1;
+    }
+
+    for (index, model) in options.iter().enumerate().take(end).skip(start) {
+        let pointer = if index == selected { ">" } else { " " };
+        let active = if model == current { " current" } else { "" };
+        let line = format!("{pointer} {model}{active}");
+        if index == selected {
+            raw_writeln(out, &paint_bold(&line, kim_accent_color()))?;
+        } else {
+            raw_writeln(out, &line)?;
+        }
+        lines += 1;
+    }
+
+    if end < options.len() {
+        raw_writeln(out, &format!("  {}", paint_dim("...")))?;
+        lines += 1;
+    }
+
+    raw_writeln(out, &paint_dim("q or Esc cancels"))?;
+    lines += 1;
+    out.flush()?;
+    Ok(lines)
+}
+
+fn choose_session_interactively(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+    app.refresh_sessions();
+    if app.sessions.is_empty() {
+        print_note("No saved sessions yet. Keep typing to chat here.");
+        return Ok(());
+    }
+
+    let mut selected = 0usize;
+    let mut out = stdout();
+    let _raw_mode = RawModeGuard::enter()?;
+    let mut rendered_lines = render_session_picker(&mut out, app, selected)?;
+
+    loop {
+        match event::read()? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                match key.code {
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        rendered_lines =
+                            rerender_session_picker(&mut out, rendered_lines, app, selected)?;
+                    }
+                    KeyCode::Down => {
+                        selected = selected.saturating_add(1).min(app.sessions.len());
+                        rendered_lines =
+                            rerender_session_picker(&mut out, rendered_lines, app, selected)?;
+                    }
+                    KeyCode::Enter => {
+                        clear_rendered_lines(&mut out, rendered_lines)?;
+                        if selected == 0 {
+                            drop(_raw_mode);
+                            print_note("staying in current chat");
+                            return Ok(());
+                        }
+                        let session = app.sessions[selected - 1].clone();
+                        drop(_raw_mode);
+                        match load_session_messages(&session.path) {
+                            Ok(messages) => {
+                                app.messages = messages;
+                                app.current_session_id = session.id.clone();
+                                app.view = ViewState::InChat;
+                                print_note(&format!("opened {}", session.label));
+                                print_recent_transcript(app);
+                            }
+                            Err(error) => print_message(&UiMessage {
+                                role: MessageRole::Error,
+                                content: error,
+                            }),
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        clear_rendered_lines(&mut out, rendered_lines)?;
+                        drop(_raw_mode);
+                        print_note("staying in current chat");
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn rerender_session_picker(
+    out: &mut impl Write,
+    rendered_lines: u16,
+    app: &App,
+    selected: usize,
+) -> io::Result<u16> {
+    clear_rendered_lines(out, rendered_lines)?;
+    render_session_picker(out, app, selected)
+}
+
+fn render_session_picker(out: &mut impl Write, app: &App, selected: usize) -> io::Result<u16> {
+    let max_visible = 12usize;
+    let half = max_visible / 2;
+    let item_count = app.sessions.len().saturating_add(1);
+    let start = selected
+        .saturating_sub(half)
+        .min(item_count.saturating_sub(max_visible));
+    let end = item_count.min(start + max_visible);
+    let mut lines = 0u16;
+
+    raw_writeln(
+        out,
+        &paint_bold("Choose session (Up/Down, Enter, Esc)", kim_accent_color()),
+    )?;
+    lines += 1;
+    raw_writeln(out, &paint_dim("Esc or q keeps you in the current chat."))?;
+    lines += 1;
+
+    if start > 0 {
+        raw_writeln(out, &format!("  {}", paint_dim("...")))?;
+        lines += 1;
+    }
+
+    for index in start..end {
+        let pointer = if index == selected { ">" } else { " " };
+        let line = if index == 0 {
+            format!("{pointer} Continue current chat")
+        } else {
+            let session = &app.sessions[index - 1];
+            format!("{pointer} {} ({})", session.label, session.id)
+        };
+        if index == selected {
+            raw_writeln(out, &paint_bold(&line, kim_accent_color()))?;
+        } else {
+            raw_writeln(out, &line)?;
+        }
+        lines += 1;
+    }
+
+    if end < item_count {
+        raw_writeln(out, &format!("  {}", paint_dim("...")))?;
+        lines += 1;
+    }
+
+    out.flush()?;
+    Ok(lines)
+}
+
+async fn handle_repl_input(
+    app: &mut App,
+    input: String,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if apply_mode_input(&input, app) {
+        app.view = ViewState::InChat;
+        print_note(&app.status);
+        return Ok(false);
+    }
+
+    let input = if input.trim_start().starts_with('/') {
+        input
+    } else {
+        prompt_with_file_references(&input)
+    };
+    let outcome = handle_command(&input, &mut app.config).await;
+    app.provider_ready = provider_is_ready(&app.config);
+    apply_repl_outcome(app, outcome).await
+}
+
+async fn apply_repl_outcome(
+    app: &mut App,
+    outcome: CommandOutcome,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    match outcome {
+        CommandOutcome::Exit => Ok(true),
+        CommandOutcome::Info(message) => {
+            print_note(&message);
+            Ok(false)
+        }
+        CommandOutcome::NeedApiKey(provider) => {
+            let prompt = format!("{provider} API key: ");
+            let key = rpassword::prompt_password(prompt)?;
+            let outcome = login_with_key(&provider, &key, &mut app.config).await;
+            app.provider_ready = provider_is_ready(&app.config);
+            Box::pin(apply_repl_outcome(app, outcome)).await
+        }
+        CommandOutcome::ProviderConnected(message) => {
+            app.provider_ready = true;
+            app.push(MessageRole::System, message.clone());
+            print_note(&message);
+            save_current_session(app);
+            Ok(false)
+        }
+        CommandOutcome::Message(message) => handle_repl_message(app, message),
+        CommandOutcome::OpenModelPicker(options) => {
+            if io::stdin().is_terminal() {
+                choose_model_interactively(app, &options)?;
+            } else {
+                print_model_options(&app.config.model, &options);
+            }
+            Ok(false)
+        }
+        CommandOutcome::OpenProviderPicker => {
+            print_provider_options(&app.config.provider);
+            Ok(false)
+        }
+        CommandOutcome::Compact => {
+            compact_app_messages(app);
+            if let Some(last) = app.messages.last() {
+                print_message(last);
+            }
+            save_current_session(app);
+            Ok(false)
+        }
+        CommandOutcome::SendPrompt(prompt) => stream_repl_turn(app, prompt).await,
+    }
+}
+
+fn handle_repl_message(app: &mut App, message: String) -> Result<bool, Box<dyn std::error::Error>> {
+    if message == "Conversation cleared." {
+        app.messages.clear();
+        save_current_session_allow_empty(app);
+        print_note("Conversation cleared.");
+        return Ok(false);
+    }
+    if let Some(session_id) = message.strip_prefix("__KIM_RESUME_SESSION__:") {
+        app.resume_session(session_id);
+        app.view = ViewState::InChat;
+        print_recent_transcript(app);
+        return Ok(false);
+    }
+    match message.as_str() {
+        "__KIM_REFRESH_SESSIONS__" => {
+            app.refresh_sessions();
+            if io::stdin().is_terminal() {
+                choose_session_interactively(app)?;
+            } else {
+                print_session_list(&app.sessions);
+            }
+        }
+        "__KIM_TOGGLE_MODE__" => {
+            app.toggle_mode();
+            app.view = ViewState::InChat;
+            print_note(&format!("mode -> {}", app.mode.label()));
+        }
+        "__KIM_COMPACT__" => {
+            compact_app_messages(app);
+            if let Some(last) = app.messages.last() {
+                print_message(last);
+            }
+            save_current_session(app);
+        }
+        _ => {
+            app.push(MessageRole::System, message.clone());
+            print_message(&UiMessage {
+                role: MessageRole::System,
+                content: message,
+            });
+            save_current_session(app);
+        }
+    }
+    Ok(false)
+}
+
+async fn stream_repl_turn(
+    app: &mut App,
+    prompt: String,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    app.view = ViewState::InChat;
+    app.push(MessageRole::User, prompt.clone());
+    let is_local_agent = app.config.provider != "desktop" && app.mode != AppMode::Code;
+    if !is_local_agent {
+        save_current_session(app);
+    }
+
+    let history = app.chat_history();
+    let config = app.config.clone();
+    let code_mode = app.mode == AppMode::Code;
+    let session_id = app.current_session_id.clone();
+    let spawn_session_id = session_id.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+    tokio::spawn(async move {
+        stream_kim_request(&config, &history, code_mode, &spawn_session_id, tx).await;
+    });
+
+    let started = Instant::now();
+    let mut assistant = String::new();
+    let mut printed_answer_label = false;
+    let mut printed_thinking = false;
+    let mut last_tool_line = String::new();
+    let mut bridge_used = false;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            AppEvent::TextChunk(chunk) => {
+                if !printed_answer_label {
+                    if printed_thinking {
+                        println!();
+                    }
+                    print!("{}", paint_bold("Kim: ", kim_accent_color()));
+                    stdout().flush()?;
+                    printed_answer_label = true;
+                }
+                print!("{}", paint_text(&chunk));
+                stdout().flush()?;
+                assistant.push_str(&chunk);
+            }
+            AppEvent::ThoughtChunk(chunk) => {
+                if !printed_thinking && !printed_answer_label {
+                    printed_thinking = true;
+                }
+                print!("{}", paint_dim(&chunk));
+                stdout().flush()?;
+            }
+            AppEvent::ToolEvent { verb, target } => {
+                let line = format!("{verb}: {target}");
+                if line != last_tool_line {
+                    if printed_answer_label && !assistant.ends_with('\n') {
+                        println!();
+                    }
+                    print_note(&line);
+                    last_tool_line = line;
+                }
+            }
+            AppEvent::Done(used_bridge) => {
+                bridge_used = used_bridge;
+                break;
+            }
+            AppEvent::Err(error) => {
+                if printed_answer_label && !assistant.ends_with('\n') {
+                    println!();
+                }
+                app.push(MessageRole::Error, error.clone());
+                print_message(&UiMessage {
+                    role: MessageRole::Error,
+                    content: error,
+                });
+                save_current_session(app);
+                return Ok(false);
+            }
+        }
+    }
+
+    if is_local_agent {
+        if let Some(home) = dirs::home_dir() {
+            let session_file = home.join(".kim").join("sessions").join(format!("{}.jsonl", session_id));
+            if session_file.exists() {
+                if let Ok(new_messages) = sessions::load_session_messages(&session_file) {
+                    let old_len = app.messages.len();
+                    app.messages = new_messages;
+                    for msg in app.messages.iter().skip(old_len) {
+                        if msg.role == MessageRole::Assistant {
+                            if !printed_answer_label {
+                                if printed_thinking {
+                                    println!();
+                                }
+                                print!("{}", paint_bold("Kim: ", kim_accent_color()));
+                                stdout().flush()?;
+                                printed_answer_label = true;
+                            }
+                            println!("{}", msg.content);
+                        }
+                    }
+                }
+            }
+        }
+        if !printed_answer_label {
+            println!("Kim: (no response)");
+        }
+    } else {
+        if printed_answer_label {
+            if !assistant.ends_with('\n') {
+                println!();
+            }
+        } else {
+            println!("Kim: (no response)");
+        }
+
+        if !assistant.trim().is_empty() {
+            app.push(MessageRole::Assistant, assistant);
+            save_current_session(app);
+        }
+    }
+
+    let via = if bridge_used { " via Kim desktop" } else { "" };
+    print_note(&format!(
+        "done in {}{via}",
+        format_repl_elapsed(started.elapsed())
+    ));
+    Ok(false)
+}
+
+fn format_repl_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
+}
+
+fn print_recent_transcript(app: &App) {
+    let visible = app.messages.iter().rev().take(12).collect::<Vec<_>>();
+    for message in visible.into_iter().rev() {
+        print_message(message);
+    }
+    if !app.messages.is_empty() {
+        println!();
+    }
+}
+
+fn print_message(message: &UiMessage) {
+    let label = match message.role {
+        MessageRole::User => "You",
+        MessageRole::Assistant => "Kim",
+        MessageRole::System => "Note",
+        MessageRole::Error => "Error",
+        MessageRole::Reasoning => "Thinking",
+    };
+    for (index, line) in message.content.lines().enumerate() {
+        if index == 0 {
+            println!(
+                "{} {}",
+                paint_bold(&format!("{label}:"), kim_accent_color()),
+                paint_text(line)
+            );
+        } else {
+            println!("{}  {}", " ".repeat(label.len()), paint_text(line));
+        }
+    }
+    if message.content.lines().next().is_none() {
+        println!("{}", paint_bold(&format!("{label}:"), kim_accent_color()));
+    }
+}
+
+fn print_note(message: &str) {
+    println!("{}", paint_dim(message));
+}
+
+fn print_session_list(sessions: &[SessionEntry]) {
+    if sessions.is_empty() {
+        println!("{}", paint_dim("No saved sessions yet."));
+        return;
+    }
+    println!("{}", paint_bold("Saved sessions:", kim_accent_color()));
+    for (index, session) in sessions.iter().enumerate() {
+        println!(
+            "  {:>2}. {}  {}",
+            index + 1,
+            paint_text(&session.label),
+            paint_dim(&format!("({})", session.id))
+        );
+    }
+    println!("{}", paint_dim("Resume with: /resume <session-id>"));
+}
+
+fn print_model_options(current: &str, options: &[String]) {
+    if options.is_empty() {
+        println!(
+            "{}",
+            paint_dim("No model options found. Set one with /model <name>.")
+        );
+        return;
+    }
+    println!("{}", paint_bold("Available models:", kim_accent_color()));
+    for model in options {
+        let marker = if model == current { "*" } else { " " };
+        println!("  {marker} {}", paint_text(model));
+    }
+    println!("{}", paint_dim("Set one with: /model <name>"));
+}
+
+fn print_provider_options(current: &str) {
+    println!("{}", paint_bold("Providers:", kim_accent_color()));
+    for provider in provider::PROVIDERS {
+        let marker = if provider.name == current { "*" } else { " " };
+        println!("  {marker} {}", paint_text(provider.name));
+    }
+    println!("{}", paint_dim("Set one with: /provider <name>"));
+}
+
+fn save_current_session(app: &App) {
+    if !app
+        .messages
+        .iter()
+        .any(|message| matches!(message.role, MessageRole::User | MessageRole::Assistant))
+    {
+        return;
+    }
+    save_current_session_allow_empty(app);
+}
+
+fn save_current_session_allow_empty(app: &App) {
+    if let Err(error) = save_session_messages(&app.current_session_id, &app.messages) {
+        eprintln!("Could not save session: {error}");
+    }
 }
 
 /* ===========================================================
@@ -792,11 +1699,8 @@ fn desired_inline_viewport_height(app: &App) -> u16 {
 }
 
 fn uses_compact_chat_viewport(app: &App) -> bool {
-    app.view == ViewState::InChat
-        && !app.busy
-        && !app.model_picker_open
-        && !app.provider_picker_open
-        && app.slash_matches().is_empty()
+    let _ = app;
+    false
 }
 
 fn insert_rows_before_viewport(
@@ -809,7 +1713,13 @@ fn insert_rows_before_viewport(
             let max_width = usize::from(buffer.area.width);
             for (row_index, row) in chunk.iter().enumerate() {
                 let y = u16::try_from(row_index).unwrap_or(u16::MAX);
-                buffer.set_stringn(0, y, row.as_str(), max_width, ratatui::style::Style::default());
+                buffer.set_stringn(
+                    0,
+                    y,
+                    row.as_str(),
+                    max_width,
+                    ratatui::style::Style::default(),
+                );
             }
         })?;
     }
@@ -852,15 +1762,68 @@ fn apply_app_event(app: &mut App, event: AppEvent) {
             if let Some(last) = app.messages.last_mut() {
                 if last.role == MessageRole::Reasoning {
                     last.content.push_str(&chunk);
-                    if app.follow {
-                        app.scroll = 0;
-                    }
-                    return;
+                } else {
+                    app.push(MessageRole::Reasoning, chunk.clone());
                 }
+            } else {
+                app.push(MessageRole::Reasoning, chunk.clone());
             }
-            app.push(MessageRole::Reasoning, chunk);
             if app.follow {
                 app.scroll = 0;
+            }
+
+            // Update app.trace for TUI panel
+            let trimmed = chunk.trim();
+            if trimmed.starts_with("[PLAN]") {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&trimmed["[PLAN]".len()..]) {
+                    if let Some(steps) = val.get("steps").and_then(serde_json::Value::as_array) {
+                        let items = steps.iter().filter_map(|s| s.as_str().map(|t| thinking::PlanItem {
+                            text: t.to_string(),
+                            status: thinking::Status::Pending,
+                        })).collect::<Vec<_>>();
+                        app.trace.push(TraceItem::Plan(thinking::Plan {
+                            title: "Plan".to_string(),
+                            items,
+                        }));
+                    }
+                }
+            } else if trimmed.starts_with("[STEP]") {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&trimmed["[STEP]".len()..]) {
+                    let idx = val.get("index").and_then(serde_json::Value::as_u64).unwrap_or(1) as usize;
+                    if let Some(TraceItem::Plan(plan)) = app.trace.iter_mut().rev().find(|it| matches!(it, TraceItem::Plan(_))) {
+                        for (i, item) in plan.items.iter_mut().enumerate() {
+                            if i + 1 < idx {
+                                item.status = thinking::Status::Done;
+                            } else if i + 1 == idx {
+                                item.status = thinking::Status::Active;
+                            } else {
+                                item.status = thinking::Status::Pending;
+                            }
+                        }
+                    }
+                }
+            } else if trimmed.starts_with("[DONE]") {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&trimmed["[DONE]".len()..]) {
+                    let idx = val.get("index").and_then(serde_json::Value::as_u64).unwrap_or(1) as usize;
+                    if let Some(TraceItem::Plan(plan)) = app.trace.iter_mut().rev().find(|it| matches!(it, TraceItem::Plan(_))) {
+                        if let Some(item) = plan.items.get_mut(idx - 1) {
+                            item.status = thinking::Status::Done;
+                        }
+                    }
+                }
+            } else {
+                let clean_chunk = if trimmed.starts_with("[STATUS]") {
+                    trimmed["[STATUS]".len()..].trim().to_string()
+                } else {
+                    chunk.clone()
+                };
+                if !clean_chunk.is_empty() {
+                    if let Some(TraceItem::Thought(last)) = app.trace.last_mut() {
+                        last.push_str(&clean_chunk);
+                    } else {
+                        app.trace.push(TraceItem::Thought(clean_chunk));
+                    }
+                }
             }
         }
         AppEvent::ToolEvent { verb, target } => {
@@ -868,10 +1831,21 @@ fn apply_app_event(app: &mut App, event: AppEvent) {
             if let Some(last) = app.messages.last_mut() {
                 if last.role == MessageRole::Reasoning {
                     last.content.push_str(&line);
-                    return;
+                } else {
+                    app.push(MessageRole::Reasoning, format!("→ {verb}: {target}"));
                 }
+            } else {
+                app.push(MessageRole::Reasoning, format!("→ {verb}: {target}"));
             }
-            app.push(MessageRole::Reasoning, format!("→ {verb}: {target}"));
+            if app.follow {
+                app.scroll = 0;
+            }
+
+            // Update app.trace for TUI panel
+            app.trace.push(TraceItem::Tool {
+                verb: verb.clone(),
+                target: target.clone(),
+            });
         }
         AppEvent::Done(bridge_used) => {
             let elapsed = app
@@ -1293,8 +2267,9 @@ async fn apply_outcome(
             let config = app.config.clone();
             let code_mode = app.mode == AppMode::Code;
 
+            let session_id = app.current_session_id.clone();
             let handle = tokio::spawn(async move {
-                stream_kim_request(&config, &history, code_mode, tx).await;
+                stream_kim_request(&config, &history, code_mode, &session_id, tx).await;
             });
             app.task_handle = Some(handle);
 
@@ -1579,10 +2554,7 @@ fn enter_terminal_with_height(
 ) -> io::Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
     RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
-    execute!(
-        stdout(),
-        EnableBracketedPaste
-    )?;
+    execute!(stdout(), EnableBracketedPaste)?;
     Terminal::with_options(
         CrosstermBackend::new(stdout()),
         ratatui::TerminalOptions {
@@ -1599,15 +2571,12 @@ fn terminal_height() -> u16 {
 fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
     RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste
-    )?;
+    execute!(terminal.backend_mut(), DisableBracketedPaste)?;
     terminal.show_cursor()
 }
 
 fn help_text() -> &'static str {
-    "Kim terminal CLI\n\nUsage:\n  kim                    Launch the terminal UI\n  kim --resume <id>      Resume a Kim session\n  kim --help             Show this help\n\nInside Kim, type /help for commands and /login to connect Ollama."
+    "Kim terminal CLI\n\nUsage:\n  kim                    Launch the Claude-style prompt UI\n  kim --resume <id>      Resume a Kim session\n  kim --resume latest    Resume the newest saved session\n  kim --help             Show this help\n\nInside Kim, type /help for commands and /login to connect a provider."
 }
 
 fn new_session_id() -> String {

@@ -20,6 +20,15 @@ def _log(*args):
     print(datetime.datetime.now().isoformat(), *args, file=_LOG, flush=True)
 
 
+def clean_image_data(text):
+    if not isinstance(text, str):
+        return text
+    if "data:image/" in text:
+        import re
+        text = re.sub(r'data:image/[a-zA-Z0-9.-]+;base64,[A-Za-z0-9+/=]+', '[Image content stripped]', text)
+    return text
+
+
 def input_to_messages(input_items):
     msgs = []
     for item in (input_items or []):
@@ -31,7 +40,7 @@ def input_to_messages(input_items):
             msgs.append({
                 "role": "tool",
                 "tool_call_id": item.get("call_id", ""),
-                "content": str(item.get("output", "")),
+                "content": clean_image_data(str(item.get("output", ""))),
             })
             continue
         if t == "function_call":
@@ -56,8 +65,10 @@ def input_to_messages(input_items):
                 if bt in ("input_text", "output_text", "text"):
                     parts.append(block.get("text", ""))
                 elif bt == "tool_result":
-                    parts.append(str(block.get("output", "")))
+                    parts.append(clean_image_data(str(block.get("output", ""))))
             content = "\n".join(parts)
+        else:
+            content = clean_image_data(str(content))
         msgs.append({"role": role, "content": content})
     return msgs
 
