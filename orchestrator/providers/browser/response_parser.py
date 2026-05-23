@@ -145,8 +145,4 @@ def parse_response(text: str, completion_hash: str) -> dict:
         parsed, start, end = match
         return _with_surrounding_content(parsed, text, start, end)
 
-    scan_result = scan_for_json_match(text)
-    if scan_result:
-        return scan_result[0]
-
     return {"type": "text", "content": text}
