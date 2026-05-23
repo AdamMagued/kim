@@ -796,7 +796,7 @@ fn sync_inline_scrollback(
         return Ok(());
     }
 
-    if !app.follow || overflow_rows == app.scrollback_committed_rows {
+    if overflow_rows == app.scrollback_committed_rows {
         return Ok(());
     }
 
@@ -816,6 +816,7 @@ fn desired_inline_viewport_height(app: &App) -> u16 {
 
 fn uses_compact_chat_viewport(app: &App) -> bool {
     app.view == ViewState::InChat
+        && !app.busy
         && !app.model_picker_open
         && !app.provider_picker_open
         && app.slash_matches().is_empty()
