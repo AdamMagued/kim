@@ -13,15 +13,17 @@ use tokio::sync::Mutex;
 
 mod google_oauth;
 pub mod account;
+pub mod codex_projects;
 pub mod data_io;
+pub mod feedback;
 pub mod ollama;
 pub mod relay;
 pub mod voice_config;
 
 // Re-export commonly used types/helpers from submodules so remaining lib.rs
-// code (codex projects, feedback) can use them unqualified.
-use account::{KimAccount, account_path};
-use data_io::{chrono_now, unix_secs_to_utc_iso};
+// code (session listing, run history, codex file-bridge) can use them unqualified.
+use codex_projects::{mirror_latest_claw_session_to_codex, newest_codex_session};
+use data_io::chrono_now;
 use ollama::ollama_tags;
 
 // ---------------------------------------------------------------------------
@@ -477,7 +479,7 @@ fn resolve_session_date_dir(
     Ok(base.join(today))
 }
 
-fn chrono_like_today() -> String {
+pub(crate) fn chrono_like_today() -> String {
     // Avoid adding a new dependency. Good enough for naming a fallback date dir;
     // most existing call sites pass the real session date.
     let secs = SystemTime::now()
@@ -699,7 +701,7 @@ fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<Session
     Ok(sessions)
 }
 
-fn count_lines(path: &Path) -> std::io::Result<usize> {
+pub(crate) fn count_lines(path: &Path) -> std::io::Result<usize> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     Ok(reader
@@ -834,7 +836,7 @@ fn extract_title_from_content(content: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn infer_session_title(session_file: &Path, summary: Option<&String>, session_id: &str) -> String {
+pub(crate) fn infer_session_title(session_file: &Path, summary: Option<&String>, session_id: &str) -> String {
     if let Ok(file) = fs::File::open(session_file) {
         let reader = BufReader::new(file);
         for line in reader.lines().map_while(Result::ok).take(80) {
@@ -7820,494 +7822,6 @@ pub(crate) fn config_yaml_path(project_root: Option<String>) -> PathBuf {
 // Codex (Code) projects — grouped by project directory + git branch
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CodexSession {
-    pub session_id: String,
-    /// YYYY-MM-DD bucket under <project>/.codex/sessions. Used to locate the file on disk.
-    pub date: String,
-    /// ISO timestamp (UTC) derived from file modified time. Used for sorting/display.
-    pub updated_at: String,
-    pub message_count: usize,
-    pub summary: Option<String>,
-    pub title: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CodexBranch {
-    pub name: String,           // git branch name, or "main" / "unknown"
-    pub sessions: Vec<CodexSession>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CodexProject {
-    pub path: String,           // decoded project path
-    pub name: String,           // last path component (display name)
-    pub current_branch: String, // current git branch in that dir
-    pub branches: Vec<CodexBranch>,
-}
-
-fn read_git_branch(project_path: &Path) -> String {
-    let head = project_path.join(".git").join("HEAD");
-    if let Ok(content) = fs::read_to_string(&head) {
-        let s = content.trim();
-        if let Some(branch) = s.strip_prefix("ref: refs/heads/") {
-            return branch.to_string();
-        }
-        if s.len() >= 8 {
-            return s[..8].to_string();
-        }
-    }
-    "main".to_string()
-}
-
-/// List Codex sessions for explicitly-added project paths.
-/// Scans <project>/.codex/sessions/ — NEVER ~/.claude/projects/.
-/// Codex and Claude Code must never mix.
-#[tauri::command]
-async fn list_codex_projects(project_paths: Vec<String>) -> Result<Vec<CodexProject>, String> {
-    let mut result: Vec<CodexProject> = Vec::new();
-
-    for raw_path in project_paths {
-        let project_path = PathBuf::from(&raw_path);
-        if !project_path.exists() {
-            continue;
-        }
-
-        let name = project_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| raw_path.clone());
-
-        let current_branch = read_git_branch(&project_path);
-
-        // Codex stores sessions at <project>/.codex/sessions/ — this is the
-        // ONLY place we look. ~/.claude/projects is off-limits.
-        let codex_sessions_dir = project_path.join(".codex").join("sessions");
-        let sessions = if codex_sessions_dir.exists() {
-            read_project_sessions(&codex_sessions_dir)
-        } else {
-            vec![]
-        };
-
-        // Build branch list. For now we group all sessions under the current
-        // branch. Future: walk git log to bucket sessions by branch.
-        let branches = if sessions.is_empty() {
-            vec![]
-        } else {
-            vec![CodexBranch {
-                name: current_branch.clone(),
-                sessions,
-            }]
-        };
-
-        result.push(CodexProject {
-            path: raw_path,
-            name,
-            current_branch,
-            branches,
-        });
-    }
-
-    Ok(result)
-}
-
-/// Add a project root path to the account's code_projects list.
-#[tauri::command]
-async fn add_code_project(path: String) -> Result<Vec<String>, String> {
-    let account_path = account_path();
-    let mut account: KimAccount = if account_path.exists() {
-        let raw = fs::read_to_string(&account_path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&raw).map_err(|e| e.to_string())?
-    } else {
-        return Err("No account found".to_string());
-    };
-
-    let canonical = PathBuf::from(&path)
-        .canonicalize()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or(path);
-
-    if !account.code_projects.contains(&canonical) {
-        account.code_projects.push(canonical);
-    }
-
-    let json = serde_json::to_string_pretty(&account).map_err(|e| e.to_string())?;
-    fs::write(&account_path, json).map_err(|e| e.to_string())?;
-    Ok(account.code_projects)
-}
-
-/// Remove a project root path from the account's code_projects list.
-#[tauri::command]
-async fn remove_code_project(path: String) -> Result<Vec<String>, String> {
-    let account_path = account_path();
-    let mut account: KimAccount = if account_path.exists() {
-        let raw = fs::read_to_string(&account_path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&raw).map_err(|e| e.to_string())?
-    } else {
-        return Err("No account found".to_string());
-    };
-
-    account.code_projects.retain(|p| p != &path);
-
-    let json = serde_json::to_string_pretty(&account).map_err(|e| e.to_string())?;
-    fs::write(&account_path, json).map_err(|e| e.to_string())?;
-    Ok(account.code_projects)
-}
-
-/// Open a filesystem path in the OS file manager.
-/// On macOS this opens Finder (equivalent to "Open in Finder").
-#[tauri::command]
-async fn open_in_finder(path: String) -> Result<(), String> {
-    let p = PathBuf::from(&path);
-    if !p.exists() {
-        return Err(format!("Path does not exist: {path}"));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("explorer")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-}
-
-fn read_project_sessions(dir: &Path) -> Vec<CodexSession> {
-    // Codex stores sessions bucketed by date: <dir>/<YYYY-MM-DD>/<session_id>.jsonl.
-    // Walk each date subdirectory, then collect the .jsonl files inside.
-    let mut sessions = Vec::new();
-    let Ok(date_entries) = fs::read_dir(dir) else { return sessions };
-
-    let mut date_dirs: Vec<_> = date_entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .collect();
-    date_dirs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
-
-    for date_entry in date_dirs {
-        let date = date_entry.file_name().to_string_lossy().to_string();
-        let date_path = date_entry.path();
-        let Ok(file_entries) = fs::read_dir(&date_path) else { continue };
-
-        let mut files: Vec<_> = file_entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let n = e.file_name();
-                let s = n.to_string_lossy();
-                s.ends_with(".jsonl") && !s.contains(".summary")
-            })
-            .collect();
-        files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
-
-        for fe in files {
-            if sessions.len() >= 50 {
-                return sessions;
-            }
-            let session_id = fe.path()
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let modified_secs = fe
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let modified_at = unix_secs_to_utc_iso(modified_secs);
-            let message_count = count_lines(&fe.path()).unwrap_or(0);
-            let summary_path = date_path.join(format!("{}.summary.txt", session_id));
-            let summary = if summary_path.exists() {
-                fs::read_to_string(&summary_path)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            } else {
-                None
-            };
-            let title = infer_session_title(&fe.path(), summary.as_ref(), &session_id);
-            sessions.push(CodexSession {
-                session_id,
-                date: date.clone(),
-                updated_at: modified_at,
-                message_count,
-                summary,
-                title,
-            });
-        }
-    }
-    sessions
-}
-
-fn newest_claw_session_file(project_path: &Path) -> Option<(PathBuf, SystemTime)> {
-    let sessions_root = project_path.join(".claw").join("sessions");
-    let entries = fs::read_dir(&sessions_root).ok()?;
-    let mut newest: Option<(PathBuf, SystemTime)> = None;
-
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_dir() {
-            let Ok(files) = fs::read_dir(&path) else { continue };
-            for file_entry in files.filter_map(|e| e.ok()) {
-                let file_path = file_entry.path();
-                let Some(name) = file_path.file_name().and_then(|n| n.to_str()) else { continue };
-                if !name.ends_with(".jsonl") || name.contains(".summary") {
-                    continue;
-                }
-                let modified = file_entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                let is_newest = newest
-                    .as_ref()
-                    .map(|(_, previous)| modified > *previous)
-                    .unwrap_or(true);
-                if is_newest {
-                    newest = Some((file_path, modified));
-                }
-            }
-        } else {
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-            if !name.ends_with(".jsonl") || name.contains(".summary") {
-                continue;
-            }
-            let modified = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            let is_newest = newest
-                .as_ref()
-                .map(|(_, previous)| modified > *previous)
-                .unwrap_or(true);
-            if is_newest {
-                newest = Some((path, modified));
-            }
-        }
-    }
-
-    newest
-}
-
-fn date_for_system_time(time: SystemTime) -> String {
-    let secs = time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    unix_secs_to_utc_iso(secs)
-        .get(0..10)
-        .map(str::to_string)
-        .unwrap_or_else(chrono_like_today)
-}
-
-fn mirror_latest_claw_session_to_codex(project_path: &Path) -> Option<PathBuf> {
-    let (src, modified) = newest_claw_session_file(project_path)?;
-    let filename = src.file_name()?.to_os_string();
-    let date = date_for_system_time(modified);
-    let dest_dir = project_path.join(".codex").join("sessions").join(date);
-    fs::create_dir_all(&dest_dir).ok()?;
-    let dest = dest_dir.join(filename);
-
-    let should_copy = match fs::metadata(&dest).and_then(|m| m.modified()) {
-        Ok(dest_modified) => modified > dest_modified,
-        Err(_) => true,
-    };
-    if should_copy {
-        fs::copy(&src, &dest).ok()?;
-    }
-
-    Some(dest)
-}
-
-fn newest_codex_session(project_path: &Path) -> Option<CompletedCodexSession> {
-    let sessions_dir = project_path.join(".codex").join("sessions");
-    let date_entries = fs::read_dir(&sessions_dir).ok()?;
-    let mut newest: Option<(SystemTime, PathBuf, String, String)> = None;
-
-    for date_entry in date_entries.filter_map(|e| e.ok()) {
-        let date_path = date_entry.path();
-        if !date_path.is_dir() {
-            continue;
-        }
-        let date = date_entry.file_name().to_string_lossy().to_string();
-        let Ok(file_entries) = fs::read_dir(&date_path) else { continue };
-        for file_entry in file_entries.filter_map(|e| e.ok()) {
-            let path = file_entry.path();
-            let name = file_entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".jsonl") || name.contains(".summary") {
-                continue;
-            }
-            let modified = file_entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            let is_newest = newest
-                .as_ref()
-                .map(|(prev, _, _, _)| modified > *prev)
-                .unwrap_or(true);
-            if is_newest {
-                let session_id = path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                newest = Some((modified, path, date.clone(), session_id));
-            }
-        }
-    }
-
-    let (_, path, date, session_id) = newest?;
-    let summary_path = sessions_dir.join(&date).join(format!("{}.summary.txt", session_id));
-    let summary = if summary_path.exists() {
-        fs::read_to_string(summary_path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    } else {
-        None
-    };
-    let message_count = count_lines(&path).unwrap_or(0);
-    let title = infer_session_title(&path, summary.as_ref(), &session_id);
-    let project_path_str = project_path.to_string_lossy().to_string();
-
-    Some(CompletedCodexSession {
-        session_key: format!("codex:{}:{}", date, session_id),
-        session_id,
-        title,
-        date,
-        message_count,
-        has_summary: summary.is_some(),
-        summary,
-        session_type: "codex".to_string(),
-        project_path: project_path_str,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Feedback — POST to a private Discord webhook (URL never exposed to frontend)
-// ---------------------------------------------------------------------------
-
-/// The Discord webhook URL is embedded at compile time from the
-/// KIM_DISCORD_WEBHOOK environment variable.  Set it before `cargo build`:
-///   export KIM_DISCORD_WEBHOOK="https://discord.com/api/webhooks/..."
-/// Leave unset (or empty) to silently no-op — the user sees a success message
-/// so they're not confused, but nothing is transmitted.
-const DISCORD_WEBHOOK_URL: &str = match option_env!("KIM_DISCORD_WEBHOOK") {
-    Some(url) => url,
-    None => "",
-};
-
-#[tauri::command]
-async fn save_attachment(filename: String, data_base64: String) -> Result<String, String> {
-    use std::path::PathBuf;
-    let dir = std::env::temp_dir().join("kim_attachments");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // Sanitise filename — strip any path components
-    let safe_name = PathBuf::from(&filename)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("attachment")
-        .to_string();
-    let dest = dir.join(&safe_name);
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data_base64.trim())
-        .map_err(|e| format!("base64 decode error: {e}"))?;
-    fs::write(&dest, bytes).map_err(|e| e.to_string())?;
-    Ok(dest.to_string_lossy().into_owned())
-}
-
-#[derive(serde::Deserialize)]
-pub struct FeedbackPayload {
-    pub category: String,    // "bug" | "feature" | "general" | "praise" | "other"
-    pub message: String,
-    pub contact: Option<String>, // optional email the user chose to share
-}
-
-#[tauri::command]
-async fn send_feedback(payload: FeedbackPayload) -> Result<(), String> {
-    if DISCORD_WEBHOOK_URL.is_empty() {
-        // Webhook not configured — silently succeed so UX is clean.
-        return Ok(());
-    }
-
-    let category_label = match payload.category.as_str() {
-        "bug"     => "🐛 Bug Report",
-        "feature" => "✨ Feature Request",
-        "praise"  => "🙏 Praise",
-        "general" => "💬 General Feedback",
-        _         => "📝 Feedback",
-    };
-
-    let contact_field = payload.contact
-        .filter(|s| !s.trim().is_empty())
-        .map(|email| serde_json::json!({
-            "name": "Contact",
-            "value": email,
-            "inline": true,
-        }));
-
-    let mut fields = vec![
-        serde_json::json!({
-            "name": "Category",
-            "value": category_label,
-            "inline": true,
-        }),
-        serde_json::json!({
-            "name": "Message",
-            "value": &payload.message,
-            "inline": false,
-        }),
-    ];
-    if let Some(cf) = contact_field {
-        fields.push(cf);
-    }
-
-    let color = match payload.category.as_str() {
-        "bug"     => 0xef4444u32, // red
-        "feature" => 0x6366f1,    // indigo
-        "praise"  => 0x22c55e,    // green
-        _         => 0x64748b,    // slate
-    };
-
-    let body = serde_json::json!({
-        "embeds": [{
-            "title": format!("{} — Kim Desktop", category_label),
-            "color": color,
-            "fields": fields,
-            "footer": { "text": format!("Kim Desktop — {}", chrono_now()) },
-        }]
-    });
-
-    let client = reqwest::Client::new();
-    client
-        .post(DISCORD_WEBHOOK_URL)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?
-        .error_for_status()
-        .map_err(|e| format!("Webhook error: {}", e))?;
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -8395,13 +7909,13 @@ pub fn run() {
             data_io::import_data,
             data_io::backup_to_gist,
             data_io::restore_from_gist,
-            list_codex_projects,
-            add_code_project,
-            remove_code_project,
-            open_in_finder,
-            send_feedback,
+            codex_projects::list_codex_projects,
+            codex_projects::add_code_project,
+            codex_projects::remove_code_project,
+            codex_projects::open_in_finder,
+            feedback::send_feedback,
             show_screenshot_flash,
-            save_attachment,
+            feedback::save_attachment,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
