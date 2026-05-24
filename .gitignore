@@ -1,4 +1,54 @@
+# ── Rust / Tauri build output ─────────────────────────────────────────────────
 target/
+
+# ── Python bytecode ───────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Python virtual environments ───────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ── Environment secrets (never commit) ───────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Node.js dependencies ──────────────────────────────────────────────────────
+node_modules/
+
+# ── Frontend build output ─────────────────────────────────────────────────────
+desktop/dist/
+desktop/.vite/
+
+# ── Runtime: logs ─────────────────────────────────────────────────────────────
+logs/
+*.log
+*.jsonl
+
+# ── Runtime: browser session persistence ──────────────────────────────────────
+sessions/
+
+# ── Runtime: SQLite databases ─────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── OS artifacts ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Kim internal tool dirs (not user code) ────────────────────────────────────
 .omx/
 .clawd-agents/
-__pycache__/
