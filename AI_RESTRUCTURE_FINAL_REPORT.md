@@ -2,7 +2,7 @@
 
 **Branch:** `ai-architecture-restructure`  
 **Completed:** 2026-05-24  
-**Total commits:** 17 (excluding baseline)
+**Total commits:** 22 (excluding baseline)
 
 ---
 
@@ -18,7 +18,7 @@
 | 5 | ✅ COMPLETE | `8bb3ff0`–`16a3f6e` | Split agent.py → cli.py, ui_bridge.py, tool_utils.py, mcp_client.py |
 | 6 | ✅ COMPLETE | `7dba6dc` | Extract MCP tool registry from server.py → tool_registry.py |
 | 7 | ✅ COMPLETE | `8a79ee0`, `e6f2cc8` | Split web.py → web_observe_js.py + web_element_scoring.py |
-| 8 | ✅ COMPLETE | see below | lib.rs split — `commands/`, `state/`, `ipc/` modules extracted; CARGO_HOME fix documented |
+| 8 | ✅ COMPLETE | `dd5852f`–`f603dce` | lib.rs split — 10,058 → 7,421 lines; extracted voice_config, relay, account, ollama, data_io, feedback, codex_projects, session_commands, run_history; JS bridge (~4000 lines) deferred (OnceLock statics) |
 | 9 | ✅ COMPLETE | `209e785` | Split SettingsPanel.tsx → settings/constants.ts + settings/icons.tsx |
 | 10 | ✅ COMPLETE | `d869afb` | Explicit AgentTermination enum + make_run_result() helper |
 | 11 | ✅ COMPLETE | `34f4795` | Expand .gitignore with runtime/build boundaries |
@@ -59,7 +59,7 @@
 
 ## Phase 8 — lib.rs Split
 
-`desktop/src-tauri/src/lib.rs` (~10,058 lines) split into focused modules.
+`desktop/src-tauri/src/lib.rs` (~10,058 lines) split into focused modules. Final: **7,421 lines** (−2,637 lines extracted). JS bridge (~4,000 lines) kept in lib.rs — OnceLock statics make it too risky to split.
 
 ### Windows CARGO_HOME Fix (document for all contributors)
 
@@ -130,6 +130,15 @@ desktop/src/components/chat/types.ts
 desktop/src/components/chat/utils.ts
 desktop/src/components/settings/constants.ts
 desktop/src/components/settings/icons.tsx
+desktop/src-tauri/src/voice_config.rs
+desktop/src-tauri/src/relay.rs
+desktop/src-tauri/src/account.rs
+desktop/src-tauri/src/ollama.rs
+desktop/src-tauri/src/data_io.rs
+desktop/src-tauri/src/feedback.rs
+desktop/src-tauri/src/codex_projects.rs
+desktop/src-tauri/src/session_commands.rs
+desktop/src-tauri/src/run_history.rs
 ```
 
 ## Files Significantly Modified
