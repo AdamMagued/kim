@@ -66,6 +66,7 @@ from orchestrator.session_store import SessionStore
 from orchestrator.context_loader import discover_instruction_files, build_instruction_prompt
 from orchestrator import compaction as _compaction
 from orchestrator.interaction_policy import InteractionPolicy
+from orchestrator.agent_states import AgentTermination, make_run_result
 
 if TYPE_CHECKING:
     from tray.voice import VoiceEngine
@@ -484,7 +485,7 @@ class KimAgent:
             # ── Cancellation check ──────────────────────────────────────
             if self._is_cancelled():
                 self._log("WARN", "Task cancelled by user")
-                return {"success": False, "summary": "Cancelled by user", "screenshot": last_screenshot_b64}
+                return make_run_result(AgentTermination.CANCELLED, "Cancelled by user", last_screenshot_b64)
 
             self._log("INFO", f"--- Iteration {iteration}/{self.max_iterations} ---")
 
@@ -509,7 +510,7 @@ class KimAgent:
                 need_help = f"NEED_HELP: LLM provider call failed after retries: {e}"
                 self.memory.add_assistant(need_help)
                 self._session_store.append_message({"role": "assistant", "content": need_help})
-                return {"success": False, "summary": need_help, "screenshot": last_screenshot_b64}
+                return make_run_result(AgentTermination.PROVIDER_FAILED, need_help, last_screenshot_b64)
 
             # ── Track token/context usage ────────────────────────────────
             self._track_context_usage(
@@ -651,11 +652,11 @@ class KimAgent:
                     if self._is_stuck(screenshot_b64) and iteration > 3:
                         self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
                         await self._voice_speak("I appear to be stuck. The screen is not changing.")
-                        return {
-                            "success": False,
-                            "summary": "STUCK: Screen not changing after repeated actions.",
-                            "screenshot": screenshot_b64,
-                        }
+                        return make_run_result(
+                            AgentTermination.STUCK,
+                            "STUCK: Screen not changing after repeated actions.",
+                            screenshot_b64,
+                        )
 
                     user_content = [
                         {"type": "text", "text": f"[Tool result: {tool_name}]\nScreenshot captured."},
@@ -750,13 +751,13 @@ class KimAgent:
                     summary = _tc.group(1).strip()
                     self._log("DEBUG", f"TASK_COMPLETE: {summary}")
                     await self._generate_and_save_summary(task, summary)
-                    return {"success": True, "summary": summary, "screenshot": last_screenshot_b64}
+                    return make_run_result(AgentTermination.TASK_COMPLETE, summary, last_screenshot_b64)
 
                 _nh = re.search(r"\bNEED_HELP:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
                 if _nh:
                     reason = _nh.group(1).strip()
                     self._log("DEBUG", f"NEED_HELP: {reason}")
-                    return {"success": False, "summary": f"NEED_HELP: {reason}", "screenshot": last_screenshot_b64}
+                    return make_run_result(AgentTermination.NEED_HELP, f"NEED_HELP: {reason}", last_screenshot_b64)
 
                 self._log("DEBUG", f"Text (continuing): {content[:120]}")
 
@@ -764,7 +765,7 @@ class KimAgent:
                 if consecutive_continues >= 3:
                     msg = "NEED_HELP: Model is stuck in a conversational loop without calling tools."
                     self._log("WARN", msg)
-                    return {"success": False, "summary": msg, "screenshot": last_screenshot_b64}
+                    return make_run_result(AgentTermination.CONVERSATIONAL_LOOP, msg, last_screenshot_b64)
 
                 # Remind the model to emit TASK_COMPLETE if the task is done,
                 # or call a tool if more work is needed. Never allow a bare conversational reply.
@@ -776,11 +777,11 @@ class KimAgent:
                 continue
 
         self._log("WARN", f"Max iterations ({self.max_iterations}) reached")
-        return {
-            "success": False,
-            "summary": f"Reached maximum iterations ({self.max_iterations}) without completing.",
-            "screenshot": last_screenshot_b64,
-        }
+        return make_run_result(
+            AgentTermination.MAX_ITERATIONS,
+            f"Reached maximum iterations ({self.max_iterations}) without completing.",
+            last_screenshot_b64,
+        )
 
     # ------------------------------------------------------------------
     # MCP helpers
