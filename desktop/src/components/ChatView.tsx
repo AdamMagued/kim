@@ -10,17 +10,14 @@ import { toast } from './Toast';
 import { ConnectorsPanel, ThinkingWithPlan, WorkedForPill } from './kim-ui';
 import type { Connector, TraceItem, WorkedForTraceItem, WorkedForToolKind } from './kim-ui';
 import { ProviderPicker } from './ProviderPicker';
+import type { ActivityItem, LivePlanParsed, TouchedFile, CodexRunGroup, AttachedFile, PendingTask, ProviderUsageState } from './chat/types';
+export type { TouchedFile, CodexRunGroup } from './chat/types';
 
 const MAX_ACTIVITY_ITEMS = 300;
 
 // ── Activity feed ─────────────────────────────────────────────────────────────
 
-interface ActivityItem {
-  id: number;
-  kind: 'tool' | 'info' | 'error' | 'success' | 'cancelled' | 'status';
-  icon: string;
-  text: string;
-}
+// ActivityItem interface moved to ./chat/types
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -29,21 +26,7 @@ function formatDuration(seconds: number): string {
   return s === 0 ? `${m}m` : `${m}m ${s}s`;
 }
 
-interface LivePlanParsed {
-  steps: string[];
-  /** 1-based index of the step currently in progress (0 = no step started yet,
-   *  but the plan is known). Derived from the most recent `STEP n:` marker.
-   *  Steps with index < activeStep are complete; step at activeStep is in
-   *  flight; steps > activeStep are pending. */
-  activeStep: number;
-  /** 1-based indexes explicitly marked complete by `[DONE]{json}`. */
-  doneSteps: number[];
-  /** True when the plan came from the new structured `[PLAN]{json}` event
-   *  emitted by the agent (vs the older heuristic phrase-detection). When
-   *  structured, we trust the step count exactly; otherwise we treat it as
-   *  best-effort. */
-  structured: boolean;
-}
+// LivePlanParsed interface moved to ./chat/types
 
 /**
  * Extract a checklist-style plan from streamed status lines.
@@ -208,21 +191,7 @@ export function collapseMessages(msgs: KimMessage[]) {
 }
 
 // ── Codex session grouping ────────────────────────────────────────────────────
-
-export interface TouchedFile {
-  path: string;
-  added: number;
-  removed: number;
-}
-
-export interface CodexRunGroup {
-  userMessage: KimMessage;
-  intermediateMessages: KimMessage[];
-  intermediateActivity: ActivityItem[];
-  finalAssistantMessage: KimMessage | null;
-  touchedFiles: TouchedFile[];
-  durationSec: number;
-}
+// TouchedFile and CodexRunGroup interfaces moved to ./chat/types (re-exported above)
 
 /** A real user message has text content that isn't just tool results. */
 function isRealUserMessage(msg: KimMessage): boolean {
@@ -901,38 +870,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   'browser:custom': 'Browser Custom',
 };
 
-interface AttachedFile {
-  name: string;
-  kind: 'text' | 'image' | 'binary';
-  content?: string;   // text files: raw text; binary: unused
-  savedPath?: string; // images: temp path on disk
-  previewUrl?: string; // images: object URL for thumbnail
-  sizeLabel: string;
-}
-
-interface PendingTask {
-  id: number;
-  text: string;
-  provider: string;
-}
-
-interface ProviderUsageState {
-  provider: string;
-  model?: string;
-  mode?: string;
-  input?: number;
-  output?: number;
-  total?: number;
-  usage_available?: boolean;
-  tokens_per_second?: number;
-  context_limit?: number;
-  context_limit_source?: string;
-  billing?: string;
-  total_duration?: number;
-  load_duration?: number;
-  prompt_eval_duration?: number;
-  eval_duration?: number;
-}
+// AttachedFile, PendingTask, ProviderUsageState interfaces moved to ./chat/types
 
 const CONNECTORS: Connector[] = [
   {
