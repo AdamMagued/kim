@@ -52,8 +52,7 @@ from typing import Any, Optional, TYPE_CHECKING
 
 import yaml
 from dotenv import load_dotenv
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp import ClientSession
 
 from orchestrator.context_meter import (
     DEFAULT_CONTEXT_BUDGET_TOKENS,
@@ -67,6 +66,7 @@ from orchestrator.session_store import SessionStore
 from orchestrator.context_loader import discover_instruction_files, build_instruction_prompt
 from orchestrator import compaction as _compaction
 from orchestrator.interaction_policy import InteractionPolicy
+from orchestrator.agent_states import AgentTermination, make_run_result
 
 if TYPE_CHECKING:
     from tray.voice import VoiceEngine
@@ -107,186 +107,20 @@ def _detect_os() -> tuple[str, str, str]:
 
 _OS_NAME, _LAUNCH_EXAMPLE, _PATH_STYLE = _detect_os()
 
-_TOOL_NAME_ALIASES = {
-    "screenshot": "take_screenshot",
-    "screen_shot": "take_screenshot",
-    "screen_capture": "take_screenshot",
-    "take_screenshot": "take_screenshot",
-    "take_screenshot_tool": "take_screenshot",
-    "take_screenshots": "take_screenshot",
-    "annotated_screenshot": "take_annotated_screenshot",
-    "take_annotated_screenshot": "take_annotated_screenshot",
-    "observe_ui": "observe_ui",
-    "click_ui": "click_ui",
-}
-
-
-def _normalize_tool_name(raw_name: Any) -> str:
-    name = str(raw_name or "").strip().lower()
-    if not name:
-        return ""
-    name = re.sub(r"[\s\-]+", "_", name)
-    name = re.sub(r"[^a-z0-9_:]", "", name)
-    return _TOOL_NAME_ALIASES.get(name, name)
-
-
-def _extract_json_tool_call(content: str) -> dict | None:
-    """Find and parse a text-JSON tool call of the form {"tool": "...", "args": {...}}.
-
-    Some models (e.g. gpt-oss:20b) cannot use native tool_calls and instead emit
-    the call as plain text JSON. This extracts the first valid call found so the
-    agent can execute it rather than storing raw JSON in the chat history.
-    Returns a dict with 'tool', 'args', 'start', 'end' keys, or None.
-    """
-    idx = content.find('"tool"')
-    while idx != -1:
-        start = content.rfind('{', 0, idx)
-        if start == -1:
-            break
-        depth = 0
-        for i in range(start, len(content)):
-            if content[i] == '{':
-                depth += 1
-            elif content[i] == '}':
-                depth -= 1
-                if depth == 0:
-                    try:
-                        obj = json.loads(content[start:i + 1])
-                        if isinstance(obj.get('tool'), str) and isinstance(obj.get('args'), dict):
-                            return {'start': start, 'end': i + 1,
-                                    'tool': obj['tool'], 'args': obj['args']}
-                    except (json.JSONDecodeError, KeyError, ValueError):
-                        pass
-                    break
-        idx = content.find('"tool"', idx + 1)
-    return None
+# ---------------------------------------------------------------------------
+# Tool name normalization (extracted to orchestrator/tool_utils.py)
+# ---------------------------------------------------------------------------
+from orchestrator.tool_utils import (  # noqa: E402
+    _TOOL_NAME_ALIASES,
+    _normalize_tool_name,
+    _extract_json_tool_call,
+)
 
 
 # ---------------------------------------------------------------------------
-# UIBridge — thread-safe channel between async agent and Tkinter UI
+# UIBridge (extracted to orchestrator/ui_bridge.py)
 # ---------------------------------------------------------------------------
-
-class UIBridge:
-    """
-    Connects the async KimAgent to a Tkinter UI (or any consumer) without
-    coupling the agent to any UI framework.
-
-    Thread safety
-    ─────────────
-    All public methods are safe to call from any thread.
-    `confirm_action()` is async and must be awaited from the agent coroutine.
-    """
-
-    def __init__(self) -> None:
-        # Log records -> UI log window
-        self.log_queue: queue.Queue = queue.Queue()
-        # Confirmation requests: (tool_name, args, threading.Event, [bool])
-        self._confirm_queue: queue.Queue = queue.Queue()
-        # Hide/show requests for screenshot blink: ("hide"|"show", threading.Event)
-        self._visibility_queue: queue.Queue = queue.Queue()
-        # Cancellation — thread-safe Event instead of bare bool
-        self._cancelled = threading.Event()
-        # Live toggle — UI checkbox sets this; agent reads it each iteration
-        self.preview_mode: bool = False
-
-    # ── Cancellation (property for backward compatibility) ────────────
-
-    @property
-    def cancelled(self) -> bool:
-        return self._cancelled.is_set()
-
-    # ── Logging ────────────────────────────────────────────────────────
-
-    def log(self, level: str, message: str) -> None:
-        """Put a (level, message) tuple for the UI to render."""
-        self.log_queue.put_nowait((level.upper(), message))
-
-    # ── Window visibility (screenshot blink) ──────────────────────────
-
-    async def hide_for_screenshot(self) -> None:
-        """Ask the UI to hide all Kim windows.  Waits up to 0.5 s."""
-        event = threading.Event()
-        self._visibility_queue.put_nowait(("hide", event))
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: event.wait(timeout=0.5))
-
-    async def show_after_screenshot(self) -> None:
-        """Ask the UI to restore all Kim windows.  Waits up to 0.5 s."""
-        event = threading.Event()
-        self._visibility_queue.put_nowait(("show", event))
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: event.wait(timeout=0.5))
-
-    # ── Confirmation (preview mode) ───────────────────────────────────
-
-    async def confirm_action(self, tool_name: str, args: dict) -> bool:
-        """
-        Pause execution and ask the UI for confirmation.
-        If cancelled, returns False immediately.
-        If the UI takes > 60 s (or no UI is attached), auto-allows.
-        """
-        if self._cancelled.is_set():
-            return False
-        event: threading.Event = threading.Event()
-        result: list[bool] = [True]
-        self._confirm_queue.put_nowait((tool_name, args, event, result))
-        # Wait without blocking the asyncio event loop
-        loop = asyncio.get_running_loop()
-        timed_out = not await loop.run_in_executor(None, lambda: event.wait(timeout=60.0))
-        if timed_out:
-            logger.warning("Confirmation timed out after 60 s — auto-allowing")
-        return result[0]
-
-    def resolve_confirm(
-        self, event: threading.Event, result: list[bool], confirmed: bool
-    ) -> None:
-        """Called by the UI when the user clicks Confirm or Deny."""
-        result[0] = confirmed
-        event.set()
-
-    # ── Cancel ────────────────────────────────────────────────────────
-
-    def cancel(self) -> None:
-        """Request agent stop.  Also unblocks any pending confirmation."""
-        self._cancelled.set()
-        # Drain and deny any queued confirm requests
-        while True:
-            try:
-                _, _, event, result = self._confirm_queue.get_nowait()
-                result[0] = False
-                event.set()
-            except queue.Empty:
-                break
-
-    def reset(self) -> None:
-        """Call before submitting a new task."""
-        self._cancelled.clear()
-        # Drain any stale visibility requests
-        while not self._visibility_queue.empty():
-            try:
-                _, event = self._visibility_queue.get_nowait()
-                event.set()
-            except queue.Empty:
-                break
-
-
-# ---------------------------------------------------------------------------
-# UIBridge logging handler — routes Python log records to the UI
-# ---------------------------------------------------------------------------
-
-class UIBridgeLogHandler(logging.Handler):
-    """Attach to any logger to mirror records into the UIBridge log queue."""
-
-    def __init__(self, bridge: UIBridge) -> None:
-        super().__init__()
-        self._bridge = bridge
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            msg = self.format(record)
-            self._bridge.log(record.levelname, msg)
-        except Exception:
-            pass
+from orchestrator.ui_bridge import UIBridge, UIBridgeLogHandler  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -306,120 +140,9 @@ def load_config(path: Optional[str] = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# MCP context manager (supports multiple servers)
+# MCP client (extracted to orchestrator/mcp_client.py)
 # ---------------------------------------------------------------------------
-
-class MultiMCPClient:
-    """
-    Multiplexes multiple MCP ClientSessions into a single session-like object.
-    Used by KimAgent to interact with both the internal OS tools and any
-    extra servers (like plantuml) defined in config.yaml.
-    """
-    def __init__(self, sessions: list[ClientSession]):
-        self.sessions = sessions
-        self._tool_map: dict[str, ClientSession] = {}
-
-    async def initialize(self) -> None:
-        """Initialize all underlying sessions."""
-        await asyncio.gather(*(s.initialize() for s in self.sessions))
-
-    async def list_tools(self) -> Any:
-        """Aggregate tools from all servers and build a dispatch map."""
-        all_tools = []
-        self._tool_map.clear()
-        for session in self.sessions:
-            res = await session.list_tools()
-            for t in res.tools:
-                if t.name in self._tool_map and self._tool_map[t.name] is not session:
-                    # Name collision across servers. Without this warning the
-                    # later server would silently win and the tool would
-                    # route somewhere unexpected. Keep the FIRST registration
-                    # (servers earlier in config win) so behaviour is stable.
-                    logger.warning(
-                        "MCP tool name collision: %r is offered by multiple "
-                        "servers; keeping the first registration",
-                        t.name,
-                    )
-                    continue
-                self._tool_map[t.name] = session
-                all_tools.append(t)
-        # Wrap in a simple object that has a .tools attribute to match MCP SDK expectations
-        return type("ToolsResult", (), {"tools": all_tools})
-
-    async def call_tool(self, name: str, arguments: dict) -> Any:
-        """Route the call to the session that owns the tool."""
-        session = self._tool_map.get(name)
-        if not session:
-            raise RuntimeError(f"Tool '{name}' not found in any active MCP session")
-        return await session.call_tool(name, arguments)
-
-
-@asynccontextmanager
-async def mcp_session_context(config: dict):
-    project_root = str(
-        Path(
-            os.environ.get("PROJECT_ROOT") or config.get("project_root", str(Path.cwd()))
-        ).resolve()
-    )
-    # The MCP SDK's stdio_client may use a restricted environment when
-    # StdioServerParameters.env is provided.  We merge our extra keys
-    # with the full parent environment so nothing critical is lost.
-    _EXTRA_ENV_KEYS = [
-        "PYTHONPATH", "PROJECT_ROOT", "VIRTUAL_ENV",
-        "KIM_WEBVIEW_BRIDGE_URL", "KIM_WEBVIEW_BRIDGE_TOKEN",
-    ]
-    extra_env = {k: os.environ[k] for k in _EXTRA_ENV_KEYS if k in os.environ}
-    merged_env = {**os.environ, **extra_env} if extra_env else None
-
-    # 1. Prepare internal Kim server
-    server_list = [
-        StdioServerParameters(
-            command=sys.executable,
-            args=["-m", "mcp_server.server"],
-            cwd=project_root,
-            env=merged_env,
-        )
-    ]
-
-    # 2. Add extra servers from config.yaml
-    extra_servers = config.get("mcp_servers", {})
-    if isinstance(extra_servers, dict):
-        for name, s_cfg in extra_servers.items():
-            cmd = s_cfg.get("command")
-            if not cmd:
-                logger.warning(f"MCP server '{name}' missing 'command' — skipping")
-                continue
-            server_list.append(StdioServerParameters(
-                command=cmd,
-                args=s_cfg.get("args", []),
-                cwd=s_cfg.get("cwd") or project_root,
-                env=merged_env,
-            ))
-
-    from contextlib import AsyncExitStack
-    async with AsyncExitStack() as stack:
-        sessions = []
-        for params in server_list:
-            try:
-                # Use stdio_client for each server
-                transport = await stack.enter_async_context(stdio_client(params))
-                read_stream, write_stream = transport
-                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-                sessions.append(session)
-            except Exception as e:
-                logger.error(f"Failed to start MCP server {params.command}: {e}")
-
-        if not sessions:
-            raise RuntimeError("No MCP servers could be started.")
-
-        multi_client = MultiMCPClient(sessions)
-        try:
-            await asyncio.wait_for(multi_client.initialize(), timeout=30.0)
-        except asyncio.TimeoutError:
-            raise RuntimeError("One or more MCP servers timed out during initialization.")
-
-        logger.info(f"Initialized {len(sessions)} MCP sessions")
-        yield multi_client
+from orchestrator.mcp_client import MultiMCPClient, mcp_session_context  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -762,7 +485,7 @@ class KimAgent:
             # ── Cancellation check ──────────────────────────────────────
             if self._is_cancelled():
                 self._log("WARN", "Task cancelled by user")
-                return {"success": False, "summary": "Cancelled by user", "screenshot": last_screenshot_b64}
+                return make_run_result(AgentTermination.CANCELLED, "Cancelled by user", last_screenshot_b64)
 
             self._log("INFO", f"--- Iteration {iteration}/{self.max_iterations} ---")
 
@@ -787,7 +510,7 @@ class KimAgent:
                 need_help = f"NEED_HELP: LLM provider call failed after retries: {e}"
                 self.memory.add_assistant(need_help)
                 self._session_store.append_message({"role": "assistant", "content": need_help})
-                return {"success": False, "summary": need_help, "screenshot": last_screenshot_b64}
+                return make_run_result(AgentTermination.PROVIDER_FAILED, need_help, last_screenshot_b64)
 
             # ── Track token/context usage ────────────────────────────────
             self._track_context_usage(
@@ -929,11 +652,11 @@ class KimAgent:
                     if self._is_stuck(screenshot_b64) and iteration > 3:
                         self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
                         await self._voice_speak("I appear to be stuck. The screen is not changing.")
-                        return {
-                            "success": False,
-                            "summary": "STUCK: Screen not changing after repeated actions.",
-                            "screenshot": screenshot_b64,
-                        }
+                        return make_run_result(
+                            AgentTermination.STUCK,
+                            "STUCK: Screen not changing after repeated actions.",
+                            screenshot_b64,
+                        )
 
                     user_content = [
                         {"type": "text", "text": f"[Tool result: {tool_name}]\nScreenshot captured."},
@@ -1028,13 +751,13 @@ class KimAgent:
                     summary = _tc.group(1).strip()
                     self._log("DEBUG", f"TASK_COMPLETE: {summary}")
                     await self._generate_and_save_summary(task, summary)
-                    return {"success": True, "summary": summary, "screenshot": last_screenshot_b64}
+                    return make_run_result(AgentTermination.TASK_COMPLETE, summary, last_screenshot_b64)
 
                 _nh = re.search(r"\bNEED_HELP:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
                 if _nh:
                     reason = _nh.group(1).strip()
                     self._log("DEBUG", f"NEED_HELP: {reason}")
-                    return {"success": False, "summary": f"NEED_HELP: {reason}", "screenshot": last_screenshot_b64}
+                    return make_run_result(AgentTermination.NEED_HELP, f"NEED_HELP: {reason}", last_screenshot_b64)
 
                 self._log("DEBUG", f"Text (continuing): {content[:120]}")
 
@@ -1042,7 +765,7 @@ class KimAgent:
                 if consecutive_continues >= 3:
                     msg = "NEED_HELP: Model is stuck in a conversational loop without calling tools."
                     self._log("WARN", msg)
-                    return {"success": False, "summary": msg, "screenshot": last_screenshot_b64}
+                    return make_run_result(AgentTermination.CONVERSATIONAL_LOOP, msg, last_screenshot_b64)
 
                 # Remind the model to emit TASK_COMPLETE if the task is done,
                 # or call a tool if more work is needed. Never allow a bare conversational reply.
@@ -1054,11 +777,11 @@ class KimAgent:
                 continue
 
         self._log("WARN", f"Max iterations ({self.max_iterations}) reached")
-        return {
-            "success": False,
-            "summary": f"Reached maximum iterations ({self.max_iterations}) without completing.",
-            "screenshot": last_screenshot_b64,
-        }
+        return make_run_result(
+            AgentTermination.MAX_ITERATIONS,
+            f"Reached maximum iterations ({self.max_iterations}) without completing.",
+            last_screenshot_b64,
+        )
 
     # ------------------------------------------------------------------
     # MCP helpers
@@ -1808,59 +1531,10 @@ async def mcp_agent_context(
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-async def _cli_main(args: argparse.Namespace) -> None:
-    config = load_config(args.config)
-    if args.provider:
-        config["provider"] = args.provider
-    if args.max_iter:
-        config["max_iterations"] = args.max_iter
-
-    logging.basicConfig(
-        stream=sys.stderr,
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
-    task = args.task or input("Task: ").strip()
-    print(f"Running: {task!r}  provider={config.get('provider', 'claude')}", file=sys.stderr)
-
-    async with mcp_agent_context(
-        config,
-        resume_session_id=args.resume,
-        session_dir=args.session_dir,
-    ) as agent:
-        result = await agent.run(task)
-
-    status = "SUCCESS" if result["success"] else "FAILED"
-    print(f"\n[{status}] {result['summary']}")
-
-
-def _cli_provider_type(value: str) -> str:
-    """Allow `browser:claude` / `browser:chatgpt` (desktop) as well as plain provider names."""
-    s = (value or "").strip().lower()
-    base = {"claude", "openai", "gemini", "deepseek", "browser", "ollama"}
-    if s in base:
-        return s
-    if s.startswith("browser:") and len(s) > len("browser:"):
-        return s
-    raise argparse.ArgumentTypeError(
-        f"unknown provider {value!r}; use claude, openai, gemini, deepseek, browser, "
-        "ollama, or browser:<site> (e.g. browser:chatgpt)"
-    )
-
-
-def _build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="python -m orchestrator.agent", description="Kim — autonomous AI agent")
-    p.add_argument("--task", "-t", help="Task to execute")
-    p.add_argument("--provider", "-p", type=_cli_provider_type, metavar="NAME")
-    p.add_argument("--config", "-c", help="Path to config.yaml")
-    p.add_argument("--max-iter", type=int)
-    p.add_argument("--resume", "-r", metavar="SESSION_ID",
-                   help="Resume a previous session by ID (loads saved messages)")
-    p.add_argument("--session-dir", help="Directory to save session files")
-    p.add_argument("--verbose", "-v", action="store_true")
-    return p
-
+# ---------------------------------------------------------------------------
+# CLI entry point (extracted to orchestrator/cli.py)
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    from orchestrator.cli import _build_arg_parser, _cli_main
     asyncio.run(_cli_main(_build_arg_parser().parse_args()))
