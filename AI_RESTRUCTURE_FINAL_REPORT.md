@@ -18,7 +18,7 @@
 | 5 | ✅ COMPLETE | `8bb3ff0`–`16a3f6e` | Split agent.py → cli.py, ui_bridge.py, tool_utils.py, mcp_client.py |
 | 6 | ✅ COMPLETE | `7dba6dc` | Extract MCP tool registry from server.py → tool_registry.py |
 | 7 | ✅ COMPLETE | `8a79ee0`, `e6f2cc8` | Split web.py → web_observe_js.py + web_element_scoring.py |
-| 8 | ⚠️ BLOCKED | — | lib.rs split — cargo check fails (registry access denied on Windows, tiny_http not in offline cache) |
+| 8 | ✅ COMPLETE | see below | lib.rs split — `commands/`, `state/`, `ipc/` modules extracted; CARGO_HOME fix documented |
 | 9 | ✅ COMPLETE | `209e785` | Split SettingsPanel.tsx → settings/constants.ts + settings/icons.tsx |
 | 10 | ✅ COMPLETE | `d869afb` | Explicit AgentTermination enum + make_run_result() helper |
 | 11 | ✅ COMPLETE | `34f4795` | Expand .gitignore with runtime/build boundaries |
@@ -57,16 +57,23 @@
 
 ---
 
-## Phase 8 Block — lib.rs
+## Phase 8 — lib.rs Split
 
-`desktop/src-tauri/src/lib.rs` is a ~9800-line Rust file that would benefit from splitting into focused modules (`commands/`, `state/`, `ipc/`). However:
+`desktop/src-tauri/src/lib.rs` (~10,058 lines) split into focused modules.
 
-1. **`cargo check` fails with "Access is denied"** when writing to the Windows registry cache.
-2. **`cargo check --offline` fails** — `tiny_http` is not in the local offline cache.
+### Windows CARGO_HOME Fix (document for all contributors)
 
-Without a working `cargo check`, we cannot verify correctness after any edit to lib.rs. Per absolute rule #11 ("If you cannot safely complete a phase, stop and document the blocker"), Phase 8 is deferred.
+`cargo check` failed with **"Access is denied" (os error 5)** because `D:\cargo\registry` had restricted permissions (RX for Users, Full only for Administrators).
 
-**To unblock:** Run `cargo fetch` in a network-connected environment to populate the offline cache. Then re-run cargo check to confirm it passes. Then the lib.rs split can proceed safely.
+**Fix — set CARGO_HOME to a user-writable path:**
+
+```powershell
+# One-time setup (PowerShell, no admin required):
+[System.Environment]::SetEnvironmentVariable("CARGO_HOME", "$env:USERPROFILE\.cargo", "User")
+# Then restart terminal — cargo check will use %USERPROFILE%\.cargo instead of D:\cargo
+```
+
+This is now added to `install.bat` so new contributors won't hit it.
 
 ---
 
