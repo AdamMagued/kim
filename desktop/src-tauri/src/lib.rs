@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
@@ -18,12 +18,13 @@ pub mod data_io;
 pub mod feedback;
 pub mod ollama;
 pub mod relay;
+pub mod run_history;
+pub mod session_commands;
 pub mod voice_config;
 
 // Re-export commonly used types/helpers from submodules so remaining lib.rs
 // code (session listing, run history, codex file-bridge) can use them unqualified.
 use codex_projects::{mirror_latest_claw_session_to_codex, newest_codex_session};
-use data_io::chrono_now;
 use ollama::ollama_tags;
 
 // ---------------------------------------------------------------------------
@@ -317,7 +318,7 @@ fn command_exists(cmd: &str) -> bool {
         .is_ok()
 }
 
-fn find_python_interpreter(project_root: &Path) -> Result<String, String> {
+pub(crate) fn find_python_interpreter(project_root: &Path) -> Result<String, String> {
     let candidates = [
         project_root.join("venv").join("bin").join("python"),
         project_root.join(".venv").join("bin").join("python"),
@@ -351,7 +352,7 @@ fn find_python_interpreter(project_root: &Path) -> Result<String, String> {
 /// Validate that a user-supplied `session_id` is a safe file-stem:
 /// no path separators, no `..`, printable ASCII-ish. Prevents a caller
 /// from escaping the per-date directory via `../../etc/passwd` etc.
-fn validate_session_id(session_id: &str) -> Result<(), String> {
+pub(crate) fn validate_session_id(session_id: &str) -> Result<(), String> {
     if session_id.is_empty() {
         return Err("session_id is empty".to_string());
     }
@@ -376,7 +377,7 @@ fn validate_session_id(session_id: &str) -> Result<(), String> {
 }
 
 
-fn browser_session_meta_filename(session_id: &str) -> String {
+pub(crate) fn browser_session_meta_filename(session_id: &str) -> String {
     format!("{}.browser.json", session_id)
 }
 
@@ -623,7 +624,7 @@ fn browser_restore_status_for_session(
     }
 }
 
-fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<SessionInfo>, String> {
+pub(crate) fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<SessionInfo>, String> {
     if !base.exists() {
         return Ok(vec![]);
     }
@@ -714,7 +715,7 @@ pub(crate) fn count_lines(path: &Path) -> std::io::Result<usize> {
         .count())
 }
 
-fn parse_jsonl(path: &Path) -> Result<Vec<KimMessage>, String> {
+pub(crate) fn parse_jsonl(path: &Path) -> Result<Vec<KimMessage>, String> {
     let file = fs::File::open(path).map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
     let mut messages = vec![];
@@ -5614,532 +5615,6 @@ fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Result<(), Strin
 // Tauri commands
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-async fn list_sessions(
-    kim_dir: Option<String>,
-    codex_dir: Option<String>,
-) -> Result<Vec<SessionInfo>, String> {
-    let kim_base = kim_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(default_sessions_dir);
-
-    let mut sessions = read_sessions_from_dir(&kim_base, "kim")?;
-
-    if let Some(codex_path) = codex_dir {
-        let codex_base = PathBuf::from(codex_path);
-        let codex_sessions = read_sessions_from_dir(&codex_base, "codex")?;
-        sessions.extend(codex_sessions);
-    }
-
-    Ok(sessions)
-}
-
-#[tauri::command]
-async fn delete_sessions(
-    session_ids: Vec<String>,
-    kim_dir: Option<String>,
-    codex_dir: Option<String>,
-) -> Result<(), String> {
-    for session_id in session_ids {
-        validate_session_id(&session_id)?;
-
-        let mut deleted = false;
-
-        let dirs_to_search: Vec<PathBuf> = {
-            let mut v = vec![kim_dir
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(default_sessions_dir)];
-            if let Some(codex_path) = &codex_dir {
-                v.push(PathBuf::from(codex_path));
-            }
-            v
-        };
-
-        // Sessions are stored as <base>/<date_dir>/<session_id>.jsonl
-        // We need to search all date subdirectories
-        for base in &dirs_to_search {
-            if !base.exists() {
-                continue;
-            }
-            // Search date subdirectories (e.g., 2026-04-23/)
-            if let Ok(entries) = std::fs::read_dir(base) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let date_dir = entry.path();
-                    if !date_dir.is_dir() {
-                        continue;
-                    }
-                    // Look for <session_id>.jsonl
-                    let jsonl_path = date_dir.join(format!("{}.jsonl", session_id));
-                    if jsonl_path.exists() {
-                        if let Err(e) = std::fs::remove_file(&jsonl_path) {
-                            eprintln!("Failed to delete session file {}: {}", session_id, e);
-                        } else {
-                            deleted = true;
-                            // Also delete companion summary file if it exists
-                            let summary_path = date_dir.join(format!("{}.summary.txt", session_id));
-                            if summary_path.exists() {
-                                let _ = std::fs::remove_file(&summary_path);
-                            }
-                            let browser_meta_path = date_dir.join(browser_session_meta_filename(&session_id));
-                            if browser_meta_path.exists() {
-                                let _ = std::fs::remove_file(&browser_meta_path);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !deleted {
-            eprintln!("Session {} not found for deletion.", session_id);
-        }
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn summarize_session(
-    session_id: String,
-    session_type: String,
-    project_root: Option<String>,
-) -> Result<(), String> {
-    validate_session_id(&session_id)?;
-
-    // Build the list of directories to search, same logic as load_session_messages
-    let mut dirs_to_search: Vec<PathBuf> = vec![default_sessions_dir()];
-    if session_type == "codex" {
-        if let Some(ref pr) = project_root {
-            let codex_dir = PathBuf::from(pr).join(".codex").join("sessions");
-            if codex_dir.exists() {
-                dirs_to_search.push(codex_dir);
-            }
-        }
-    }
-
-    // Find the JSONL file
-    let mut jsonl_path: Option<PathBuf> = None;
-    for base in &dirs_to_search {
-        if !base.exists() { continue; }
-        if let Ok(entries) = fs::read_dir(base) {
-            let mut date_dirs: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .collect();
-            date_dirs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
-            for entry in date_dirs {
-                let candidate = entry.path().join(format!("{}.jsonl", session_id));
-                if candidate.exists() {
-                    jsonl_path = Some(candidate);
-                    break;
-                }
-            }
-        }
-        if jsonl_path.is_some() { break; }
-    }
-
-    let path = jsonl_path.ok_or_else(|| format!("Session file not found: {}", session_id))?;
-
-    // Read the JSONL and extract summary components
-    let file = fs::File::open(&path).map_err(|e| e.to_string())?;
-    let reader = BufReader::new(file);
-
-    let mut first_user_text: Option<String> = None;
-    let mut last_assistant_text: Option<String> = None;
-    let mut touched_files: Vec<String> = Vec::new();
-
-    for line in reader.lines().map_while(Result::ok) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
-        let value: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Handle both Kim format (role at top level) and Codex format (type: "message")
-        let (role, content) = if let Some(r) = value.get("role").and_then(|v| v.as_str()) {
-            (r.to_string(), value.get("content").cloned())
-        } else if value.get("type").and_then(|v| v.as_str()) == Some("message") {
-            let msg = value.get("message").unwrap_or(&serde_json::Value::Null);
-            let r = msg.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let c = msg.get("blocks").or_else(|| msg.get("content")).cloned();
-            (r, c)
-        } else {
-            continue;
-        };
-
-        let text = match &content {
-            Some(serde_json::Value::String(s)) => Some(s.clone()),
-            Some(serde_json::Value::Array(items)) => {
-                let texts: Vec<String> = items.iter()
-                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
-                    .filter_map(|b| b.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                    .collect();
-                if texts.is_empty() { None } else { Some(texts.join("\n")) }
-            }
-            _ => None,
-        };
-
-        if role == "user" {
-            if let Some(ref t) = text {
-                let clean = t.trim();
-                // Skip tool result pseudo-user messages
-                if !clean.starts_with("[Tool result:") && !clean.is_empty() && first_user_text.is_none() {
-                    first_user_text = Some(clean.strip_prefix("Task: ").unwrap_or(clean).to_string());
-                }
-            }
-        } else if role == "assistant" {
-            if let Some(ref t) = text {
-                let clean = t.trim()
-                    .trim_start_matches("TASK_COMPLETE:")
-                    .trim();
-                if !clean.is_empty() {
-                    last_assistant_text = Some(clean.to_string());
-                }
-            }
-            if let Some(serde_json::Value::Array(items)) = &content {
-                for block in items {
-                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        if matches!(name, "write_file" | "edit_file" | "create_file") {
-                            // In Codex JSONL, input is often a JSON string rather than an object.
-                            let mut path_str = None;
-                            if let Some(input_val) = block.get("input") {
-                                if let Some(s) = input_val.as_str() {
-                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                                        path_str = parsed.get("path").or_else(|| parsed.get("file_path"))
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string());
-                                    }
-                                } else if let Some(obj) = input_val.as_object() {
-                                    path_str = obj.get("path").or_else(|| obj.get("file_path"))
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string());
-                                }
-                            }
-                            if let Some(p) = path_str {
-                                let fname = p.rsplit('/').next().unwrap_or(&p);
-                                if !touched_files.contains(&fname.to_string()) {
-                                    touched_files.push(fname.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Build summary text
-    let mut summary_parts: Vec<String> = Vec::new();
-    if let Some(ref task) = first_user_text {
-        let truncated = if task.chars().count() > 100 {
-            format!("{}…", task.chars().take(100).collect::<String>())
-        } else {
-            task.clone()
-        };
-        summary_parts.push(format!("Task: {}", truncated));
-    }
-    if let Some(ref result) = last_assistant_text {
-        let truncated = if result.chars().count() > 200 {
-            format!("{}…", result.chars().take(200).collect::<String>())
-        } else {
-            result.clone()
-        };
-        summary_parts.push(format!("Result: {}", truncated));
-    }
-    if !touched_files.is_empty() {
-        summary_parts.push(format!("Files: {}", touched_files.join(", ")));
-    }
-
-    let summary = if summary_parts.is_empty() {
-        "No summary available.".to_string()
-    } else {
-        summary_parts.join("\n")
-    };
-
-    // Write summary file next to the JSONL: abc.jsonl → abc.summary.txt
-    let summary_path = path.with_file_name(format!("{}.summary.txt", session_id));
-    fs::write(&summary_path, &summary).map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn load_session_messages(
-    session_id: String,
-    session_date: Option<String>,
-    kim_dir: Option<String>,
-    codex_dir: Option<String>,
-) -> Result<Vec<KimMessage>, String> {
-    // Reject path-traversal attempts on the session_id.
-    validate_session_id(&session_id)?;
-    // Search kim dir first, then codex dir
-    let dirs_to_search: Vec<PathBuf> = {
-        let mut v = vec![kim_dir
-            .map(PathBuf::from)
-            .unwrap_or_else(default_sessions_dir)];
-        if let Some(codex_path) = codex_dir {
-            v.push(PathBuf::from(codex_path));
-        }
-        v
-    };
-
-    for base in &dirs_to_search {
-        if !base.exists() {
-            continue;
-        }
-        if let Some(date) = session_date.as_deref() {
-            validate_session_id(date)?;
-            let date_dir = base.join(date);
-            let candidate = date_dir.join(format!("{}.jsonl", session_id));
-            if candidate.exists() {
-                let (canon_candidate, canon_dir) = match (
-                    candidate.canonicalize(),
-                    date_dir.canonicalize(),
-                ) {
-                    (Ok(c), Ok(d)) => (c, d),
-                    _ => continue,
-                };
-                if !canon_candidate.starts_with(&canon_dir) {
-                    return Err("Resolved session path escapes its date directory".to_string());
-                }
-                return parse_jsonl(&canon_candidate);
-            }
-            continue;
-        }
-        let mut date_dirs: Vec<_> = fs::read_dir(base)
-            .map_err(|e| e.to_string())?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .collect();
-        date_dirs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
-
-        for date_entry in date_dirs {
-            let date_dir = date_entry.path();
-            let candidate = date_dir.join(format!("{}.jsonl", session_id));
-            if !candidate.exists() {
-                continue;
-            }
-            // Defense in depth: canonicalize and assert the resolved path is
-            // still inside its intended date directory.
-            let (canon_candidate, canon_dir) = match (
-                candidate.canonicalize(),
-                date_dir.canonicalize(),
-            ) {
-                (Ok(c), Ok(d)) => (c, d),
-                _ => continue,
-            };
-            if !canon_candidate.starts_with(&canon_dir) {
-                return Err("Resolved session path escapes its date directory".to_string());
-            }
-            return parse_jsonl(&canon_candidate);
-        }
-    }
-
-    Err(format!("Session not found: {}", session_id))
-}
-
-#[tauri::command]
-async fn get_app_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
-}
-
-// ---------------------------------------------------------------------------
-// Worked-for run history persistence — stores the activity-feed snapshot for
-// each completed task as a sidecar `<session_id>.runs.json` next to the
-// session JSONL file. Survives chat reloads.
-// ---------------------------------------------------------------------------
-
-fn find_session_date_dir(
-    session_id: &str,
-    session_date: Option<&str>,
-    kim_dir: Option<&str>,
-    codex_dir: Option<&str>,
-) -> Option<PathBuf> {
-    let mut dirs: Vec<PathBuf> = vec![
-        kim_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir),
-    ];
-    if let Some(p) = codex_dir { dirs.push(PathBuf::from(p)); }
-    for base in &dirs {
-        if !base.exists() { continue; }
-        if let Some(date) = session_date {
-            let dd = base.join(date);
-            if dd.join(format!("{}.jsonl", session_id)).exists() {
-                return Some(dd);
-            }
-        }
-        if let Ok(entries) = fs::read_dir(base) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let dd = entry.path();
-                if dd.is_dir() && dd.join(format!("{}.jsonl", session_id)).exists() {
-                    return Some(dd);
-                }
-            }
-        }
-    }
-    None
-}
-
-#[tauri::command]
-async fn save_run_history(
-    session_id: String,
-    session_date: Option<String>,
-    kim_dir: Option<String>,
-    codex_dir: Option<String>,
-    runs: serde_json::Value,
-) -> Result<(), String> {
-    validate_session_id(&session_id)?;
-    if let Some(d) = session_date.as_deref() { validate_session_id(d)?; }
-
-    let dir = find_session_date_dir(&session_id, session_date.as_deref(), kim_dir.as_deref(), codex_dir.as_deref())
-        .or_else(|| {
-            // Fallback: write into today's directory under the kim sessions dir.
-            let base = kim_dir.as_deref().map(PathBuf::from).unwrap_or_else(default_sessions_dir);
-            let today = chrono_now().get(0..10).map(|s| s.to_string()).unwrap_or_default();
-            let dd = base.join(today);
-            fs::create_dir_all(&dd).ok()?;
-            Some(dd)
-        })
-        .ok_or_else(|| "Could not locate a session directory to save runs.json into".to_string())?;
-
-    let path = dir.join(format!("{}.runs.json", session_id));
-    let body = serde_json::to_string(&runs).map_err(|e| e.to_string())?;
-    fs::write(&path, body).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-async fn load_run_history(
-    session_id: String,
-    session_date: Option<String>,
-    kim_dir: Option<String>,
-    codex_dir: Option<String>,
-) -> Result<serde_json::Value, String> {
-    validate_session_id(&session_id)?;
-    if let Some(d) = session_date.as_deref() { validate_session_id(d)?; }
-
-    let dir = match find_session_date_dir(&session_id, session_date.as_deref(), kim_dir.as_deref(), codex_dir.as_deref()) {
-        Some(d) => d,
-        None => return Ok(serde_json::json!([])),
-    };
-    let path = dir.join(format!("{}.runs.json", session_id));
-    if !path.exists() {
-        return Ok(serde_json::json!([]));
-    }
-    let body = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&body).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn get_platform_info() -> String {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    match (os, arch) {
-        ("macos",   "aarch64") => "macOS (Apple Silicon)".into(),
-        ("macos",   _        ) => "macOS (Intel)".into(),
-        ("windows", "x86_64" ) => "Windows x64".into(),
-        ("windows", "x86"    ) => "Windows x86".into(),
-        ("linux",   "aarch64") => "Linux ARM64".into(),
-        ("linux",   _        ) => "Linux x64".into(),
-        (os, arch)             => format!("{os} ({arch})"),
-    }
-}
-
-/// Pull the latest source from git, refresh Python deps, then restart the app.
-/// Progress lines are emitted as "kim-update-progress" events.
-#[tauri::command]
-async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
-    let kim_root = default_project_root();
-
-    // ── Step 1: git pull ──────────────────────────────────────────────────
-    let _ = app_handle.emit("kim-update-progress", "Pulling latest source from GitHub…");
-
-    // Try to find git
-    let git_cmd = if cfg!(target_os = "windows") { "git.exe" } else { "git" };
-    let git_out = std::process::Command::new(git_cmd)
-        .args(["pull", "--ff-only"])
-        .current_dir(&kim_root)
-        .output()
-        .map_err(|e| format!("git not found — make sure Git is installed: {e}"))?;
-
-    if !git_out.status.success() {
-        let stderr = String::from_utf8_lossy(&git_out.stderr);
-        return Err(format!("git pull failed: {stderr}"));
-    }
-    let git_stdout = String::from_utf8_lossy(&git_out.stdout).trim().to_string();
-    let already_latest = git_stdout.contains("Already up to date") || git_stdout.contains("Already up-to-date");
-    let _ = app_handle.emit(
-        "kim-update-progress",
-        if git_stdout.is_empty() { "Source updated.".to_string() } else { git_stdout.clone() },
-    );
-
-    if already_latest {
-        let _ = app_handle.emit("kim-update-progress", "Source is already up to date — no restart needed.");
-        return Ok(());
-    }
-
-    // ── Step 2: pip install ───────────────────────────────────────────────
-    let _ = app_handle.emit("kim-update-progress", "Updating Python dependencies…");
-
-    let python = find_python_interpreter(&kim_root)
-        .map_err(|e| format!("Python not found: {e}"))?;
-
-    let pip_out = std::process::Command::new(&python)
-        .args(["-m", "pip", "install", "-r", "requirements.txt", "-q", "--disable-pip-version-check"])
-        .current_dir(&kim_root)
-        .output();
-
-    match pip_out {
-        Ok(out) if out.status.success() => {
-            let _ = app_handle.emit("kim-update-progress", "Python dependencies updated.");
-        }
-        Ok(out) => {
-            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let _ = app_handle.emit("kim-update-progress", format!("Warning (pip): {msg}"));
-        }
-        Err(e) => {
-            let _ = app_handle.emit("kim-update-progress", format!("Warning: pip update skipped ({e})."));
-        }
-    }
-
-    // ── Step 3: Restart ───────────────────────────────────────────────────
-    let _ = app_handle.emit("kim-update-progress", "Update complete — restarting Kim…");
-    tokio::time::sleep(Duration::from_millis(800)).await;
-
-    // app_handle.restart() closes the process but doesn't reliably reopen the
-    // .app bundle on macOS. Use `open -a Kim` then exit instead.
-    #[cfg(target_os = "macos")]
-    {
-        // Try to reopen by app bundle name first, fall back to exe path.
-        let reopened = std::process::Command::new("open")
-            .args(["-a", "Kim"])
-            .spawn()
-            .is_ok();
-        if !reopened {
-            if let Ok(exe) = std::env::current_exe() {
-                // Walk up to find the .app bundle and open it.
-                let mut path = exe.as_path();
-                loop {
-                    if path.extension().is_some_and(|e| e == "app") {
-                        let _ = std::process::Command::new("open").arg(path).spawn();
-                        break;
-                    }
-                    match path.parent() {
-                        Some(p) => path = p,
-                        None => break,
-                    }
-                }
-            }
-        }
-        std::process::exit(0);
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        app_handle.restart();
-    }
-}
 
 #[tauri::command]
 async fn open_browser_signin_window(
@@ -7856,15 +7331,15 @@ pub fn run() {
         })
         .manage(task_state)
         .invoke_handler(tauri::generate_handler![
-            list_sessions,
-            delete_sessions,
-            load_session_messages,
-            summarize_session,
-            save_run_history,
-            load_run_history,
-            get_app_version,
-            get_platform_info,
-            run_update,
+            session_commands::list_sessions,
+            session_commands::delete_sessions,
+            session_commands::load_session_messages,
+            session_commands::summarize_session,
+            run_history::save_run_history,
+            run_history::load_run_history,
+            session_commands::get_app_version,
+            run_history::get_platform_info,
+            run_history::run_update,
             add_custom_provider_capability,
             open_browser_signin_window,
             navigate_browser_window_if_open,
