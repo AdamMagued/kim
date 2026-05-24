@@ -67,7 +67,7 @@ Plus two convenience tools:
 | Tool | Purpose |
 |---|---|
 | `python -m kimctl …` | Talks to the desktop app's local HTTP bridge from the terminal |
-| `claw` *(separate Rust binary in `pythonExperimentTool/claw-code/`)* | Anthropic-CLI-style coding agent. Can run direct (with an Anthropic API key) or via a file bridge that relays through Kim's `BrowserProvider` |
+| `kim` / Codex bridge | Code-mode execution. Browser-backed Code mode goes through `orchestrator.run_codex_bridge` and `mcp_server/tools/codex_bridge.py`; the historical `claw-code` tree is retained under `pythonExperimentTool/` for CLI/runtime work. |
 
 ## 1.3 The two flow paths
 
@@ -161,7 +161,7 @@ Root component. State:
 - `settings: Settings` — persisted to `localStorage('kim-settings')`
 - `account: KimAccount | null` — loaded via `invoke('load_account')`
 - `activeSession`, `newChatMode`, `chatSerial` — chat view state
-- `activeTab: 'chat' | 'code'` — switches between Kim and Claw (Code) mode
+- `activeTab: 'chat' | 'code'` — switches between Kim Chat and Code mode
 - `showSettings`, `settingsInitialPane` — settings modal control
 - `appVersion`, `updateInfo`, `showUpdate` — silent GitHub release check on startup
 
@@ -174,13 +174,13 @@ Renders: `RevampSidebar` + `kim-main` (topbar + `ChatView`) + `RevampSettings` m
 
 If `!account`, shows `OnboardingFlow` instead of the main UI.
 
-#### `components/ChatView.tsx` (~3,600 lines — the biggest TSX file)
+#### `components/ChatView.tsx` (~2,750 lines)
 The main chat surface. Owns:
 - **Activity feed** — `ActivityItem[]` derived from `[STATUS]/[TOOL]/[DIFF]/[USAGE]/[CONTEXT]/[PLAN]/[STEP]/[DONE]` lines streamed from the agent's stdout via Tauri events.
 - **Plan parser** — `parsePlanFromActivity()` reads structured `[PLAN]{json}` / `[STEP]{json}` / `[DONE]{json}` envelopes (preferred) or falls back to heuristic phrase detection. Drives the `CollapsiblePlan` widget.
 - **Touched-files extractor** — `extractTouchedFiles()` walks tool calls to find `write_file/edit_file/create_file` and surfaces filenames in the UI.
-- **Run-history persistence** — `invoke('save_run_history')` per task (used to show "Worked for 12s" badges on past Claw runs).
-- **Message rendering** — `collapseMessages()` merges adjacent tool-use + tool-result; `groupClawMessages()` clusters Claw subtasks per user turn. `isIntermediateToolCall()` identifies pure-tool-call assistant messages (suppressed as bubbles; surfaced via WorkedForPill instead). `synthesizeExchangeActivity()` reconstructs `WorkedForTraceItem[]` from saved Ollama sessions where no `runHistory` entry exists.
+- **Run-history persistence** — `invoke('save_run_history')` per task (used to show "Worked for 12s" badges on past Code runs).
+- **Message rendering** — `collapseMessages()` merges adjacent tool-use + tool-result; `groupCodexMessages()` clusters Codex subtasks per user turn. `isIntermediateToolCall()` identifies pure-tool-call assistant messages (suppressed as bubbles; surfaced via WorkedForPill instead). `synthesizeExchangeActivity()` reconstructs `WorkedForTraceItem[]` from saved Ollama sessions where no `runHistory` entry exists.
 - **Compact summary filter** — `compact_summary` role messages are stripped at `setMessages()` time and never shown as chat bubbles; the sentinel is injected into the system prompt by the orchestrator instead.
 - **Composer** — input bar with attachments, screenshot drop, provider switcher, context ring.
 
@@ -208,8 +208,13 @@ The first 1,200 lines are helpers; the React component proper starts at the
 - The mutable `ActivityFeed` reducer
 - The "live plan" extraction
 - Provider switching with race-guarded `restoreSeq`
-- Claw-run grouping (`groupClawMessages`)
+- Codex-run grouping (`groupCodexMessages`)
 - The composer's attachment / drag-and-drop handling
+
+Refactor note: pure chat helpers now live in `components/chat/utils.ts`
+(message grouping, plan parsing, formatting, error normalization) and shared
+interfaces live in `components/chat/types.ts`. Add new pure helpers there
+instead of growing `ChatView.tsx`.
 
 #### `components/MessageBubble.tsx` (545 lines)
 Renders one chat message. Handles text, tool-use card, tool-result card, image
@@ -226,10 +231,12 @@ Original sidebar implementation. **Superseded by `kim-ui/RevampSidebar.tsx`**
 but kept around — `App.tsx` only imports `RevampSidebar`. Treat this file as
 dead unless it's referenced elsewhere (verify with `rg "from './Sidebar'"`).
 
-#### `components/SettingsPanel.tsx` (1,680 lines, legacy)
+#### `components/SettingsPanel.tsx` (~1,490 lines, legacy)
 Original settings UI. **Superseded by `kim-ui/RevampSettings.tsx`** but still
 present. `App.tsx` imports `RevampSettings`, not this one. Likely dead, but
 some helpers may be re-imported.
+Provider/model constants now live in `components/settings/constants.ts`; inline
+icon components now live in `components/settings/icons.tsx`.
 
 #### `components/PairingModal.tsx` (195 lines, NEW)
 Phone-relay pairing flow. Three phases: `loading → ready → claimed | expired |
@@ -342,10 +349,15 @@ class on `<html>`, glassmorphism, screenshot flash overlay animation,
 #### `main.rs` (4 lines)
 Calls `desktop_lib::run()`.
 
-#### `lib.rs` (9,798 lines — THE most important file)
+#### `lib.rs` (~7,420 lines — still the central Tauri bridge)
 
 The Rust shell. Owns four very distinct responsibilities, mashed into one
 file:
+
+Refactor note: account, Codex project, data import/export, feedback, Ollama,
+relay, run-history, session-command, and voice-config commands now live in
+their own `desktop/src-tauri/src/*.rs` modules and are registered from
+`lib.rs`.
 
 **(a) Tauri command handlers** — 54 commands registered in `generate_handler!`
 (line 9711-9771):
@@ -376,7 +388,7 @@ delete_all_sessions,
 ollama_get_status, ollama_test_model, ollama_signin, ollama_pull_model,
 verify_github_pat,
 export_data, import_data, backup_to_gist, restore_from_gist,
-list_claw_projects, add_code_project, remove_code_project,
+list_codex_projects, add_code_project, remove_code_project,
 open_in_finder, send_feedback, show_screenshot_flash,
 ```
 
@@ -384,10 +396,10 @@ Source-line anchors for key commands:
 
 | Command | Line | What it does |
 |---|---|---|
-| `list_sessions` | 5600 | Walks `kim_sessions/<date>/*.jsonl` and `.claw/sessions/<date>/*.jsonl` |
+| `list_sessions` | session_commands.rs | Walks Kim and Code session stores |
 | `delete_sessions` | 5620 | Bulk delete by `[{session_id, session_type}]` list |
 | `summarize_session` | 5685 | Generates `.summary.txt` via the orchestrator's compact prompt |
-| `load_session_messages` | 5852 | Parses JSONL into `KimMessage[]`; handles Claw's nested-content shape via `claw_jsonl_line_to_kim_message` |
+| `load_session_messages` | session_commands.rs | Parses JSONL into `KimMessage[]`; handles Code/Codex nested-content shapes |
 | `get_app_version` | 5927 | Returns `env!("CARGO_PKG_VERSION")` |
 | `open_browser_signin_window` | 6127 | Creates the hidden `kim-browser-signin` WebviewWindow with `PERSISTENT_BRIDGE_JS` injected |
 | `show_browser_window` / `hide_browser_window` | 6192 / 6278 | Toggles visibility; offscreen-positioning when hidden |
@@ -406,13 +418,13 @@ Source-line anchors for key commands:
 | `relay_pair_init` | 7955 | `POST /pair/init` to the configured relay using `RELAY_PC_API_KEY` from `.env` |
 | `relay_pair_status` | 8004 | `GET /pair/status/<code>` polling |
 | `load_account` / `save_account` | 8159 / 8170 | Read/write `~/.kim/account.json` (or platform-specific equivalent) |
-| `delete_all_sessions` | 8193 | Nukes both `kim_sessions/` and `.claw/sessions/` |
+| `delete_all_sessions` | account.rs | Deletes Kim session artifacts under the configured sessions dir |
 | `ollama_get_status` | 8487 | Probes `/api/version`, `/api/tags`; merges known cloud models |
 | `ollama_pull_model` | 8733 | `POST /api/pull` with streaming progress emitted via Tauri events |
 | `verify_github_pat` | 8822 | `GET https://api.github.com/user` with Bearer token; returns `GitHubUser` |
 | `export_data` / `import_data` | 8846 / 9034 | Sessions zip/json/markdown export and zip/json import |
 | `backup_to_gist` / `restore_from_gist` | 9175 / 9244 | GitHub Gist round-trip using `account.github_token` |
-| `list_claw_projects` | 9332 | Scans each path's `.claw/sessions/<date>/*.jsonl`; groups by git branch |
+| `list_codex_projects` | codex_projects.rs | Scans configured Code project paths and recent Codex sessions |
 | `add_code_project` / `remove_code_project` | 9381 / 9406 | Mutates `account.code_projects` |
 | `open_in_finder` | 9425 | macOS `open`, Windows `explorer`, Linux `xdg-open` |
 | `send_feedback` | 9611 | POSTs to a feedback endpoint (`FeedbackPayload`) |
@@ -449,7 +461,7 @@ WebviewWindow at `initialization_script` time. The script:
 - Detects which AI site is loaded (host match).
 - Finds the input editor / send button / stop button / response containers
   per site (selector map embedded in the JS, in sync with
-  `orchestrator/providers/browser_provider.py:SITE_CONFIGS`).
+  `orchestrator/providers/browser/site_configs.py:SITE_CONFIGS`).
 - Listens for `__kimBridge.send(prompt, reqId, site, attachments)`:
   - Clears editor
   - Pastes prompt (with attachments via clipboard for Gemini, file upload
@@ -504,7 +516,12 @@ Scopes requested:
 | File | Lines | Role |
 |---|---|---|
 | `__init__.py` | 0 | Package marker |
-| `agent.py` | ~1,780 | Main loop, `KimAgent`, `UIBridge`, `MultiMCPClient`, `mcp_*_context` |
+| `agent.py` | ~1,540 | Main loop and `KimAgent`; delegates CLI, MCP client, UI bridge, and state helpers |
+| `agent_states.py` | 40 | Explicit `AgentTermination` enum + `make_run_result()` |
+| `cli.py` | 72 | CLI parser and `_cli_main()` extracted from `agent.py` |
+| `mcp_client.py` | 137 | `MultiMCPClient` and `mcp_session_context()` |
+| `ui_bridge.py` | 135 | `UIBridge` and `UIBridgeLogHandler` |
+| `tool_utils.py` | 76 | Tool-name normalization and text JSON tool-call extraction |
 | `memory.py` | ~190 | Sliding-window conversation memory with screenshot pruning; compact-summary sentinel support |
 | `compaction.py` | ~220 | NEW: Claw-style local compaction (no LLM call); `compact_messages()`, `should_compact()`, `_fix_tool_boundary()`, `_summarize_messages()`, `_merge_summaries()` |
 | `task_queue.py` | 138 | Local+relay async task queue (dormant by default) |
@@ -512,8 +529,8 @@ Scopes requested:
 | `context_meter.py` | 261 | Token-budget tracker; emits `[CONTEXT]` log lines |
 | `context_loader.py` | 151 | Discovers `KIM.md` / `KIM.local.md` / `.kim/KIM.md` walking upward |
 | `session_store.py` | 332 | JSONL session persistence + summaries + compact artifacts |
-| `run_claw_bridge.py` | 156 | CLI entry that spawns the `claw` Rust binary with file-bridge relaying through `BrowserProvider` |
-| `run_claw_relay.py` | 175 | Standalone relay watcher for `bridge_request.json` files |
+| `run_codex_bridge.py` | 156 | CLI entry that spawns Codex with a local proxy relaying through `BrowserProvider` |
+| `run_codex_relay.py` | 95 | Relay helper for Codex browser bridge traffic |
 | `providers/__init__.py` | 0 | — |
 | `providers/base.py` | 93 | `BaseProvider` ABC + `create_provider` factory |
 | `providers/claude.py` | 138 | Anthropic Claude (native tool-use, `batch` for multi-tool) |
@@ -521,7 +538,12 @@ Scopes requested:
 | `providers/deepseek.py` | 36 | Thin `OpenAIProvider` subclass with `_BASE_URL = api.deepseek.com/v1`. **Does not call `super().__init__`** |
 | `providers/gemini.py` | 518 | Three auth modes: `api_key`, `oauth`, `oauth_user_project` |
 | `providers/ollama.py` | 538 | Local/cloud Ollama with native tool-calling, streaming, ctx-limit detection |
-| `providers/browser_provider.py` | 2,221 | Largest provider. CDP + in-app bridge transports; DOM scraping |
+| `providers/browser_provider.py` | 25 | Backward-compatible shim that lazily re-exports `BrowserProvider` and `SITE_CONFIGS` |
+| `providers/browser/provider.py` | 1,090 | BrowserProvider implementation: CDP/in-app bridge, injection, wait/scrape |
+| `providers/browser/bridge_client.py` | 289 | In-app webview bridge HTTP client |
+| `providers/browser/prompt_builder.py` | 366 | Browser prompt formatting, history recap, data URI extraction |
+| `providers/browser/response_parser.py` | 148 | DOM text → canonical provider response parsing |
+| `providers/browser/site_configs.py` | 159 | Per-site selector maps and browser-provider constants |
 
 ### Key class detail
 
@@ -606,7 +628,8 @@ Compliance matrix:
 | File | Lines | Role |
 |---|---|---|
 | `__init__.py` | 0 | — |
-| `server.py` | 823 | `Server("kim")` over stdio; `_TOOLS` list + `_DISPATCH` map + merged site connectors |
+| `server.py` | 134 | `Server("kim")` over stdio; imports tool definitions/dispatch from `tool_registry.py` and merges site connectors |
+| `tool_registry.py` | 922 | MCP tool schemas plus dispatch map |
 | `config.py` | 146 | Loads `config.yaml` + `.env`; `validate_path()`; constants for all options |
 | `logger.py` | 174 | `JSONLineHandler` + `setup_structured_logging()` writing `logs/kim_<date>.jsonl`. **Not auto-wired** — see [§7](#7-risks-and-unclear-areas) |
 | `os_utils.py` | 265 | OS detection; `translate_command()`; app mapping dicts (`_APP_MAP_MAC`, `_APP_MAP_LINUX`, `_BUILTIN_MAP_UNIX`) |
@@ -621,9 +644,11 @@ Compliance matrix:
 | `tools/git.py` | 186 | git_status, git_diff, git_add, git_commit, git_log, git_checkout |
 | `tools/code.py` | 269 | run_python, run_node, lint_file; inline-code blocklist |
 | `tools/search.py` | 250 | search_in_files (rg→grep→findstr), find_files |
-| `tools/web.py` | 620 | Playwright-driven web_* tools; module-level browser singleton |
+| `tools/web.py` | ~1,060 | Playwright-driven web_* tools; module-level browser singleton |
+| `tools/web_element_scoring.py` | 264 | Pure element-scoring helpers for `web_resolve` |
+| `tools/web_observe_js.py` | 166 | JavaScript blob used by `web_observe` |
 | `tools/ui_observe.py` | 338 | macOS AX accessibility tree via AppleScript; `observe_ui`, `click_ui` |
-| `tools/claw_bridge.py` | 1,198 | `run_claw_subtask()` library function (NOT an MCP tool — see bugs) |
+| `tools/codex_bridge.py` | ~1,160 | `run_codex_subtask()` library function and local OpenAI-compatible proxy for Codex browser mode |
 | `tools/test_extract.py` | 29 | **Dev scratch file** that runs at import time |
 | `sites/__init__.py` | — | Exports `SiteConnector`, `register_site`, `enabled_connectors`, `load_builtin_connectors` |
 | `sites/base.py` | — | Dataclass + global registry |
@@ -925,7 +950,7 @@ Known v1 limitation: macOS is the polished target. Linux and Windows installers 
 | File | Style | Coverage |
 |---|---|---|
 | `test_ollama_provider.py` | unittest | 8 tests — context-limit parsing, env override, image normalization, tool-call format round-trip |
-| `test_browser_protocol.py` | unittest | 7 tests — Claw prompt markers, lighter recap for stored threads, BrowserProvider tests skip without playwright |
+| `test_browser_protocol.py` | unittest | Codex bridge response mapping, dynamic transport markers, lighter recap for stored threads; BrowserProvider tests skip without playwright |
 | `test_context_meter.py` | pytest fns | 5 tests — phase thresholds, budget coercion, fallback estimation |
 | `test_gemini_oauth_provider.py` | pytest fns | 3 tests — auth-mode disambiguation, REST contract, response parsing. Uses `install_google_stubs()` to mock the SDK |
 | `test_gemini_user_project_mode.py` | unittest classes (4) | 14 tests — `oauth_user_project` strict validation, error messages, no-fallback, mode transitions |
@@ -943,13 +968,13 @@ where it's called from, what it returns, and what would break if it changed.
 
 - **Called from**: ChatView's `handleSend` (via `invoke('send_task')`), `/v1/task` HTTP route (kimctl).
 - **Spawns**: a Python subprocess. Branch:
-  - If `provider` starts with `browser` AND `cwd` is a Claw project → `python -m orchestrator.run_claw_bridge --task … --cwd … --provider browser:gemini`.
-  - Else if `is_claw` and direct API → spawns Claw binary directly with `ANTHROPIC_API_KEY`.
+  - If `provider` starts with `browser` and the task is in Code mode → `python -m orchestrator.run_codex_bridge --task … --cwd … --provider browser:gemini`.
+  - Else if direct Code mode → spawns the configured Codex/backend process directly.
   - Else → `python -m orchestrator.agent --task …`.
 - **Env injection**: `KIM_WEBVIEW_BRIDGE_URL`, `KIM_WEBVIEW_BRIDGE_TOKEN`, `PROJECT_ROOT`, `KIM_PREFERRED_SITE`, `KIM_BROWSER_RESTORE_STATUS` (if a sidecar was restored), Google OAuth pairs from `google_oauth::AgentGoogleOAuthEnv::as_env_pairs()`.
 - **Returns**: nothing (streams stdout via `agent-output` event; ends with `kim-agent-done`).
-- **Depends on**: `find_python_interpreter`, `default_project_root`, `validate_session_id`, `find_claw_binary`, `selected_ollama_claw_model`, `configure_claw_direct_provider`.
-- **Breaks if changed**: every UI task path, all kimctl `send` calls, the Claw integration.
+- **Depends on**: `find_python_interpreter`, `default_project_root`, `validate_session_id`, Codex/backend resolution helpers.
+- **Breaks if changed**: every UI task path, all kimctl `send` calls, and Code-mode integration.
 
 ## 3.2 `agent.py:KimAgent.run` (line 646)
 
@@ -967,11 +992,11 @@ where it's called from, what it returns, and what would break if it changed.
 - **Depends on**: numerous globals (`WEBVIEW_BRIDGE_RESULTS`, `WEBVIEW_BRIDGE_NOTIFY`, `BRIDGE_TASK_PID`, …) and the JS bridge running in the hidden webview.
 - **Breaks if changed**: every browser-provider task. The kimctl CLI also depends on `/v1/task`, `/v1/cancel`.
 
-## 3.4 `browser_provider.py:BrowserProvider.complete` (line ~507)
+## 3.4 `providers/browser/provider.py:BrowserProvider.complete` (line ~270)
 
 - **Two transports**: in-app webview bridge OR direct Playwright CDP. Selected at init by env vars (`KIM_WEBVIEW_BRIDGE_URL`).
 - **State**: `_sent_system_prompt`, `_last_provider_url`, `_active_conversation_id`. Reset on URL change or provider change.
-- **Depends on**: `httpx` (bridge mode), `playwright` (CDP mode), `SITE_CONFIGS` (per-site selectors).
+- **Depends on**: `bridge_client.py` (bridge mode), `playwright` (CDP mode), `SITE_CONFIGS` from `providers/browser/site_configs.py`.
 - **Returns**: same shape as other providers (`tool_call` | `text`).
 - **Side effects in CDP mode**: opens a new Playwright context **on every call** — very expensive (25 LLM iterations = 25 CDP handshakes).
 
@@ -1044,7 +1069,7 @@ where it's called from, what it returns, and what would break if it changed.
 | `App.tsx` | `get_app_version`, `summarize_session` |
 | `ChatView.tsx` | `set_task_active_mode`, `show_screenshot_flash`, `save_run_history`, `load_run_history`, `load_session_messages`, `send_task`, `cancel_task`, `set_browser_keep_visible`, `session_browser_meta_*`, `session_browser_url_commit`, `restore_browser_for_session`, `navigate_browser_window_if_open`, `open_browser_signin_window` |
 | `RevampSettings.tsx` | `read_voice_config`, `write_voice_config`, `read_relay_config`, `write_relay_url`, `ollama_get_status`, `ollama_test_model`, `ollama_pull_model`, `verify_github_pat`, `export_data`, `import_data`, `backup_to_gist`, `restore_from_gist`, `delete_all_sessions`, `clear_account`, `reset_onboarding`, `add_code_project`, `remove_code_project`, `open_in_finder`, `send_feedback`, `google_oauth_*` |
-| `RevampSidebar.tsx` | `list_sessions` (via hook), `delete_sessions`, `list_claw_projects` |
+| `RevampSidebar.tsx` | `list_sessions` (via hook), `delete_sessions`, `list_codex_projects` |
 | `OnboardingFlow.tsx` | `verify_github_pat`, `open_browser_signin_window`, `provider_signin`, `save_account` |
 | `ProviderPicker.tsx` | `ollama_get_status`, `ollama_pull_model`, `provider_signin`, `provider_signout` |
 | `BrowserProviderPicker.tsx` | `open_browser_signin_window` |
@@ -1074,9 +1099,9 @@ where it's called from, what it returns, and what would break if it changed.
 | `KIM_GOOGLE_ACCESS_TOKEN` | injected by `lib.rs` from `google_oauth.rs` | `providers/gemini.py` |
 | `KIM_GOOGLE_USER_PROJECT_ID` | injected by `lib.rs` | `providers/gemini.py` |
 | `KIM_GEMINI_AUTH_MODE` | injected by `lib.rs` | `providers/gemini.py` |
-| `KIM_WEBVIEW_BRIDGE_URL` / `_TOKEN` | injected by `lib.rs:send_task` | `providers/browser_provider.py`, `kimctl` |
-| `KIM_PREFERRED_SITE` | `lib.rs` | `providers/browser_provider.py` |
-| `KIM_BROWSER_RESTORE_STATUS` | `lib.rs:restore_browser_for_session` | `providers/browser_provider.py` (lighter recap) |
+| `KIM_WEBVIEW_BRIDGE_URL` / `_TOKEN` | injected by `lib.rs:send_task` | `providers/browser/provider.py`, `kimctl` |
+| `KIM_PREFERRED_SITE` | `lib.rs` | `providers/browser/provider.py` |
+| `KIM_BROWSER_RESTORE_STATUS` | `lib.rs:restore_browser_for_session` | `providers/browser/prompt_builder.py` (lighter recap) |
 | `KIM_OLLAMA_BASE_URL` / `_MODE` / `_LOCAL_MODEL` / `_CLOUD_MODEL` | `.env` or settings | `providers/ollama.py` |
 | `RELAY_PC_API_KEY` | `.env` | `relay_worker.py`, `task_queue.py`, `lib.rs:relay_pair_*` |
 | `RELAY_PHONE_API_KEY` | `.env` | `relay_server/auth.py` |
@@ -1150,7 +1175,7 @@ where it's called from, what it returns, and what would break if it changed.
 | 4. User reopens session | `ChatView.tsx:loadSession` → `invoke('restore_browser_for_session')` |
 | 5. Rust reads `.browser.json`, validates URL, navigates webview | `lib.rs:6446` |
 | 6. `KIM_BROWSER_RESTORE_STATUS=stored_thread` set for next task | `lib.rs:send_task` (8158) |
-| 7. `BrowserProvider._format_prompt` uses lighter recap when restored | `browser_provider.py` (around 1997) |
+| 7. `BrowserProvider._format_prompt` uses lighter recap when restored | `providers/browser/prompt_builder.py` |
 
 ## 5.6 Context budget + compaction
 
@@ -1194,7 +1219,7 @@ where it's called from, what it returns, and what would break if it changed.
 - **Browser mode**: bridge env vars (`KIM_WEBVIEW_BRIDGE_URL`, `KIM_WEBVIEW_BRIDGE_TOKEN`); webview signed in (`show_browser_window`); `bridge_debug.log` in sessions dir; selector drift in `SITE_CONFIGS`.
 
 ### "Browser provider returns empty / old response"
-- Selectors changed: check `SITE_CONFIGS` in `browser_provider.py` and `PERSISTENT_BRIDGE_JS` in `lib.rs`.
+- Selectors changed: check `SITE_CONFIGS` in `providers/browser/site_configs.py` and `PERSISTENT_BRIDGE_JS` in `lib.rs`.
 - Stale completion hash: `lib.rs` URL-change observer should clear `_lastHash` when path changes.
 - Race: ensure `_send_and_wait` is waiting for new response element BEFORE polling completion (fixed in 47-bug sweep — see CHANGELOG 2026-05-11).
 
@@ -1268,23 +1293,20 @@ where it's called from, what it returns, and what would break if it changed.
 | `relay_server/queue.list_devices` / `revoke_device` | No HTTP endpoint exposes them. |
 | `extension/*` (whole directory) | POSTs to `localhost:3000` which has no server. Desktop runs on `:18991`. Extension and Tauri app are disconnected. |
 | Extension `content_*.js`'s initial `chrome.storage.local.get([\`loop_${chrome.runtime.id}\`, ...])` | Uses wrong key (extension ID instead of tab ID); is a no-op. |
-| `mcp_server/tools/claw_bridge.py` | Lives in `tools/` (implies MCP tool) but is never registered — it's a library imported by `orchestrator/`. |
 
 ## 7.2 Duplicate / parallel logic
 
 | Pair | Note |
 |---|---|
 | `SettingsPanel.tsx` vs `kim-ui/RevampSettings.tsx` | The "Settings → Voice" pane lives in both. Voice catalog is in `types/index.ts`. |
-| Selector maps in `browser_provider.py:SITE_CONFIGS` vs `lib.rs:PERSISTENT_BRIDGE_JS` | Must be kept in sync manually. |
+| Selector maps in `providers/browser/site_configs.py:SITE_CONFIGS` vs `lib.rs:PERSISTENT_BRIDGE_JS` | Must be kept in sync manually. |
 | `mcp_server/tools/shell.py:_DENY_COMMANDS` vs `config.BLOCKED_COMMANDS` | Two parallel deny lists; only the hardcoded one is enforced. |
 | `tray/voice.py` providers vs voice catalog in `desktop/src/types/index.ts:VOICES_BY_ENGINE` | Engine names must match. |
-| `mcp_server/tools/test_extract.py:_extract_first_bridge_json` vs `claw_bridge.py:_extract_first_bridge_json` | Two versions; the scratch file's version is buggier (doesn't handle braces in strings). |
 
 ## 7.3 Confusing naming
 
 - `open_url` MCP tool actually means "open in the controlled Playwright browser", not the system default browser. The tool description still says "system default browser".
 - `tools/test_extract.py` looks like a pytest file but isn't a test.
-- `tools/claw_bridge.py` is in `tools/` but is not an MCP tool.
 - `desktop/src/components/Sidebar.tsx` and `desktop/src/components/kim-ui/RevampSidebar.tsx` — only the second is active.
 - `mcp_server/tools/windows.py` is named after the *platform* but contains cross-platform window-management code (not platform-specific).
 - `voice.backend` and `voice.engine` config keys both exist; `voice.py` checks `voice.engine` first, falls back to `voice.backend`.
@@ -1489,9 +1511,6 @@ as CSS selectors. Pass `as_selector` explicitly instead.
 ⚪ **`test_extract.py` ships in `mcp_server/tools/`** — scratch file with a
 hardcoded `/Users/adammaged/Desktop/Personal/pongTEST` path that executes
 at import. Move or delete.
-
-⚪ **`claw_bridge.py` is not registered but lives in `tools/`** — looks
-like an MCP tool, isn't. Move to a `lib/` subdir.
 
 ⚪ **`windows.py:_run_cmd` Linux branch doesn't catch `asyncio.TimeoutError`** —
 `windows.py:198-210`. macOS branch (`_run_osascript`) properly kills on

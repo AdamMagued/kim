@@ -50,15 +50,21 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 ## desktop/src-tauri/src (Rust Tauri backend)
 
 - `main.rs` — Tauri app entry point and configuration
-- `lib.rs` — ~9800-line Rust shell; key Tauri IPC commands: `set_task_active_mode`, `show_main_window`, `hide_main_window`, `send_task`, `cancel_task`, `load_session_messages`, `save_run_history`, `load_run_history`, `ollama_get_status`, `session_browser_meta_write`; webview bridge for browser-backed LLM providers; Google OAuth flow
+- `lib.rs` — ~7420-line Rust shell; central webview bridge, browser sign-in lifecycle, task spawning, and remaining shared Tauri commands
 - `google_oauth.rs` — Google OAuth 2.0 handler for Gemini authentication via system keychain
+- `account.rs`, `codex_projects.rs`, `data_io.rs`, `feedback.rs`, `ollama.rs`, `relay.rs`, `run_history.rs`, `session_commands.rs`, `voice_config.rs` — extracted Tauri command modules registered by `lib.rs`
 
 ---
 
 ## orchestrator (Python agent engine)
 
 **Agent core:**
-- `agent.py` — Main async agent loop: task execution, LLM provider calls, MCP tool dispatch, screenshot capture, stuck detection, context budgeting, `[UI] SCREENSHOT_FLASH` / `[UI] SHOW` handling, `_build_system_prompt`, `_build_lean_system_prompt`
+- `agent.py` — Main async agent loop: task execution, LLM provider calls, MCP tool dispatch, screenshot capture, stuck detection, context budgeting, `_build_system_prompt`, `_build_lean_system_prompt`
+- `agent_states.py` — Explicit run-loop termination enum and result helper
+- `cli.py` — CLI parser/entrypoint extracted from `agent.py`
+- `mcp_client.py` — `MultiMCPClient` and MCP stdio session startup
+- `ui_bridge.py` — UI bridge/log handler extracted from `agent.py`
+- `tool_utils.py` — Tool-name normalization and JSON tool-call extraction
 - `task_queue.py` — Local task queue with relay server poller
 
 **LLM providers:**
@@ -68,7 +74,12 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 - `providers/gemini.py` — Google Gemini API with OAuth support
 - `providers/deepseek.py` — DeepSeek API integration
 - `providers/ollama.py` — Local Ollama with native tool calls, vision-error retry, image stripping
-- `providers/browser_provider.py` — Playwright/CDP browser automation for API-free LLM access (Claude.ai, ChatGPT, Gemini, DeepSeek in-app webview)
+- `providers/browser_provider.py` — 25-line compatibility shim
+- `providers/browser/provider.py` — Playwright/CDP and in-app webview bridge BrowserProvider implementation
+- `providers/browser/bridge_client.py` — HTTP client for the Rust in-app bridge
+- `providers/browser/prompt_builder.py` — Prompt/history formatting and attachment extraction
+- `providers/browser/response_parser.py` — Scraped response parsing
+- `providers/browser/site_configs.py` — Site selector maps
 
 **Memory & context:**
 - `memory.py` — Conversation history + compression, sliding window, automatic screenshot pruning
@@ -84,7 +95,8 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 
 ## mcp_server (Model Context Protocol server — 31 tools)
 
-- `server.py` — Main MCP server (stdio transport); registers all 31 tools; Claude Desktop / Claude Code compatible
+- `server.py` — Main MCP server (stdio transport); imports tools/dispatch from `tool_registry.py`; Claude Desktop / Claude Code compatible
+- `tool_registry.py` — MCP tool definitions and dispatch map
 - `config.py` — Configuration loading from config.yaml and environment variables
 - `logger.py` — JSON Lines structured logging to logs/kim_{date}.jsonl
 - `os_utils.py` — Cross-platform OS detection and command translation (Windows / macOS / Linux)
@@ -97,7 +109,10 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 - `tools/windows.py` — get_windows, focus_window, resize_window (pygetwindow / osascript / wmctrl)
 - `tools/screen.py` — take_screenshot, take_annotated_screenshot, get_screen_info
 - `tools/screen_annotator.py` — Screenshot annotation with bounding boxes
-- `tools/web.py` — open_url, browser_click, fill_form, get_page_text (Playwright)
+- `tools/web.py` — web_open, web_observe, web_click, web_fill, web_press, web_text, web_screenshot, web_wait_for, web_wait_for_url, web_back, web_close, web_resolve
+- `tools/web_element_scoring.py` — Element scoring helpers for web resolver
+- `tools/web_observe_js.py` — DOM observation JavaScript blob
+- `tools/codex_bridge.py` — Browser-backed Codex proxy bridge library
 - `tools/git.py` — git_status, git_diff, git_add, git_commit, git_log, git_checkout
 - `tools/code.py` — run_python, run_node, lint_file (ruff / flake8)
 - `tools/search.py` — search_in_files (grep/ripgrep), find_files (glob)

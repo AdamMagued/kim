@@ -1,59 +1,76 @@
-# Secret Keys (CRITICAL)
-.env
-.env.*
-!.env.example
+# ── Rust / Tauri build output ─────────────────────────────────────────────────
+target/
 
-# Python specific
+# ── Python bytecode ───────────────────────────────────────────────────────────
 __pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-dist/
-build/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Python virtual environments ───────────────────────────────────────────────
 venv/
-env/
 .venv/
+env/
+.env/
+*.egg-info/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
 
-# Project Specific
-logs/
-sessions/
-kim_sessions/
-data/*.sqlite
-temp/
-screenshots/
-# Chrome CDP user-data directory created at runtime by the browser provider
-chrome_data/
-# Playwright browser cache
-.playwright/
-
-# Node / Frontend
-node_modules/
-desktop/node_modules/
-desktop/dist/
-
-# Rust / Tauri
-target/
-desktop/src-tauri/target/
-desktop/src-tauri/gen/
-*.orig
-
-# OS specific
-.DS_Store
-Thumbs.db
-desktop/.DS_Store
-
-# Project config that might contain paths specific to your PC
-# (Only ignore this if you want to keep your PROJECT_ROOT path private)
+# ── Environment secrets (never commit) ───────────────────────────────────────
+.env
+.env.*
+.env.local
+.env.*.local
+!.env.example
 config.yaml
 
-# Relay database
+# ── Node.js dependencies ──────────────────────────────────────────────────────
+node_modules/
+
+# ── Frontend build output ─────────────────────────────────────────────────────
+dist/
+build/
+desktop/dist/
+desktop/.vite/
+
+# ── Runtime: logs ─────────────────────────────────────────────────────────────
+logs/
+*.log
+*.jsonl
+
+# ── Runtime: browser session persistence ──────────────────────────────────────
+sessions/
+kim_sessions/
+chrome_data/
+.playwright/
+
+# ── Runtime: SQLite databases ─────────────────────────────────────────────────
+data/*.sqlite
+*.db
+*.sqlite
+*.sqlite3
 relay_server/relay.db
 
-# Local agent scratch/worktree artifacts
-.claude/worktrees/
+# ── Runtime: scratch / local agent artifacts ──────────────────────────────────
+temp/
+screenshots/
 scratch/
 debug_playwright.py
 scratch_test_json.py
+.claude/worktrees/
+
+# ── OS artifacts ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Kim internal tool dirs (not user code) ────────────────────────────────────
+.omx/
+.clawd-agents/
