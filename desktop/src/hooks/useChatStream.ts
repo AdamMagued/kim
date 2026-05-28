@@ -276,6 +276,69 @@ export function useChatStream({
     let unlistenDone: (() => void) | undefined;
     let unlistenCodeSession: (() => void) | undefined;
     let unlistenCancelled: (() => void) | undefined;
+    let unlistenTypedStatus: (() => void) | undefined;
+    let unlistenTypedPlan: (() => void) | undefined;
+    let unlistenTypedStep: (() => void) | undefined;
+    let unlistenTypedDone: (() => void) | undefined;
+    let unlistenTypedContext: (() => void) | undefined;
+    let unlistenTypedStats: (() => void) | undefined;
+    let unlistenTypedUi: (() => void) | undefined;
+
+    // Typed IPC listeners (kim:* events) — update parallel state only, never push activity items.
+    // These fire when ipc_protocol == "typed" in Rust config; the legacy kim-agent-output
+    // path continues to run in parallel (dual-emit) so no data is lost.
+    listen<{ message: string }>('kim:status', _e => {
+      // Status messages drive activity via legacy [STATUS] stderr parsing.
+      // Nothing extra needed here.
+    }).then(fn => { unlistenTypedStatus = fn; });
+
+    listen<{ steps: string[] }>('kim:plan', _e => {
+      // Plan state is derived via parsePlanFromActivity on the activity array.
+      // No direct state mutation needed here.
+    }).then(fn => { unlistenTypedPlan = fn; });
+
+    listen<{ n: number; data: Record<string, unknown> }>('kim:step', _e => {
+      // Step transitions drive plan state via legacy activity parsing.
+    }).then(fn => { unlistenTypedStep = fn; });
+
+    listen<{ n: number }>('kim:done', _e => {
+      // Done markers drive plan state via legacy activity parsing.
+    }).then(fn => { unlistenTypedDone = fn; });
+
+    listen<{
+      cumulative_input: number;
+      budget: number;
+      phase: string;
+      percent: number;
+      last_input: number;
+      last_output: number;
+      source: string;
+      estimate: boolean;
+    }>('kim:context', e => {
+      setContextState({
+        cumulative_input: e.payload.cumulative_input,
+        budget: e.payload.budget,
+        phase: e.payload.phase,
+        percent: e.payload.percent,
+        last_input: e.payload.last_input,
+        last_output: e.payload.last_output,
+        source: e.payload.source,
+        estimate: e.payload.estimate,
+      });
+    }).then(fn => { unlistenTypedContext = fn; });
+
+    listen<{ input: number; output: number; total: number }>('kim:stats', e => {
+      setTokenStats({ input: e.payload.input, output: e.payload.output, total: e.payload.total });
+    }).then(fn => { unlistenTypedStats = fn; });
+
+    listen<{ action: 'screenshot_flash' | 'show' }>('kim:ui', e => {
+      if (e.payload.action === 'screenshot_flash' && isRunningRef.current) {
+        invoke('show_screenshot_flash').catch(() => {});
+        invoke('set_task_active_mode', { active: true }).catch(() => {});
+      } else if (e.payload.action === 'show' && isRunningRef.current) {
+        invoke('show_main_window').catch(() => {});
+      }
+    }).then(fn => { unlistenTypedUi = fn; });
 
     listen<string>('kim-agent-output', event => {
       appendRaw(event.payload);
@@ -362,6 +425,13 @@ export function useChatStream({
       unlistenDone?.();
       unlistenCodeSession?.();
       unlistenCancelled?.();
+      unlistenTypedStatus?.();
+      unlistenTypedPlan?.();
+      unlistenTypedStep?.();
+      unlistenTypedDone?.();
+      unlistenTypedContext?.();
+      unlistenTypedStats?.();
+      unlistenTypedUi?.();
     };
   }, [appendRaw, flushActivityNow, clearActivityNow, setMessageReloadNonce, commitCurrentBrowserUrl]);
 
