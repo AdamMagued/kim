@@ -1,0 +1,435 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
+import type { ActivityItem, ProviderUsageState, PendingTask } from '../components/chat/types';
+import type { SessionInfo, Settings } from '../types';
+import { parseAgentLine, buildThinkingTrace } from '../components/chat/parsers';
+import { parsePlanFromActivity, browserSiteFromProvider } from '../components/chat/utils';
+
+const MAX_ACTIVITY_ITEMS = 300;
+
+export interface UseChatStreamProps {
+  session: SessionInfo | null;
+  settings: Settings;
+  onTaskDone: (sessionId?: string, completedSession?: SessionInfo) => void;
+  commitCurrentBrowserUrl: (preferredSite?: string | null, targetSession?: SessionInfo | null, overrideSessionId?: string | null) => Promise<void>;
+  setMessageReloadNonce: React.Dispatch<React.SetStateAction<number>>;
+}
+
+export function useChatStream({
+  session,
+  settings,
+  onTaskDone,
+  commitCurrentBrowserUrl,
+  setMessageReloadNonce,
+}: UseChatStreamProps) {
+  const [isRunning, setIsRunning] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [activity, setActivity] = useState<ActivityItem[]>([]);
+  const [runHistory, setRunHistory] = useState<{ activity: ActivityItem[]; durationSec: number }[]>([]);
+  const [taskError, setTaskError] = useState<string | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
+  const [providerUsage, setProviderUsage] = useState<ProviderUsageState | null>(null);
+  const [contextState, setContextState] = useState<{ cumulative_input: number; budget: number; phase: string; percent: number; last_input: number; last_output: number; source: string; estimate: boolean } | null>(null);
+  const [liveHistory, setLiveHistory] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
+
+  // Refs for tracking streams
+  const activityCounterRef = useRef(0);
+  const activityRef = useRef<ActivityItem[]>([]);
+  const activityFlushTimerRef = useRef<number | null>(null);
+  const startTimeRef = useRef<number | null>(null);
+  const currentTaskRef = useRef<PendingTask | null>(null);
+  const lastRunTaskRef = useRef<PendingTask | null>(null);
+  const cancelFlagRef = useRef(false);
+  const needHelpFlagRef = useRef(false);
+  const completedCodeSessionRef = useRef<SessionInfo | null>(null);
+  const answerReceivedThisRunRef = useRef(false);
+  const doneHandledRef = useRef(false);
+  const hasSentMessageRef = useRef(false);
+
+  // Deduplication maps
+  const recentRawRef = useRef<Map<string, number>>(new Map());
+  const recentActivityItemRef = useRef<Map<string, number>>(new Map());
+
+  // Keep stable refs for options that change to avoid event listener rebuilds
+  const isRunningRef = useRef(isRunning);
+  useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
+
+  const onTaskDoneRef = useRef(onTaskDone);
+  useEffect(() => { onTaskDoneRef.current = onTaskDone; }, [onTaskDone]);
+
+  const sessionRef = useRef(session);
+  useEffect(() => { sessionRef.current = session; }, [session]);
+
+  const settingsRef = useRef(settings);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+
+
+
+  const activeResumeSessionId = session?.session_id ?? '';
+  const activeResumeSessionIdRef = useRef(activeResumeSessionId);
+  useEffect(() => { activeResumeSessionIdRef.current = activeResumeSessionId; }, [activeResumeSessionId]);
+
+  // Deduplication functions
+  const isDuplicate = useCallback((raw: string): boolean => {
+    const map = recentRawRef.current;
+    const now = Date.now();
+    const canonical = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
+    const last = map.get(canonical);
+    if (last !== undefined && now - last < 800) return true;
+    map.set(canonical, now);
+    if (map.size > 200) {
+      const cutoff = now - 1600;
+      for (const [k, v] of map) if (v < cutoff) map.delete(k);
+    }
+    return false;
+  }, []);
+
+  const isDuplicateActivityItem = useCallback((item: ActivityItem): boolean => {
+    const map = recentActivityItemRef.current;
+    const now = Date.now();
+    const key = `${item.kind}:${item.text}`;
+    const last = map.get(key);
+    if (last !== undefined && now - last < 2000) return true;
+    map.set(key, now);
+    if (map.size > 200) {
+      const cutoff = now - 4000;
+      for (const [k, v] of map) if (v < cutoff) map.delete(k);
+    }
+    return false;
+  }, []);
+
+  // Activity flushing
+  const scheduleActivityFlush = useCallback(() => {
+    if (activityFlushTimerRef.current !== null) return;
+    activityFlushTimerRef.current = window.setTimeout(() => {
+      activityFlushTimerRef.current = null;
+      setActivity(activityRef.current);
+    }, 50);
+  }, []);
+
+  const flushActivityNow = useCallback(() => {
+    if (activityFlushTimerRef.current !== null) {
+      window.clearTimeout(activityFlushTimerRef.current);
+      activityFlushTimerRef.current = null;
+    }
+    setActivity(activityRef.current);
+  }, []);
+
+  const enqueueActivityUpdate = useCallback((updater: (prev: ActivityItem[]) => ActivityItem[]) => {
+    activityRef.current = updater(activityRef.current);
+    scheduleActivityFlush();
+  }, [scheduleActivityFlush]);
+
+  const clearActivityNow = useCallback(() => {
+    if (activityFlushTimerRef.current !== null) {
+      window.clearTimeout(activityFlushTimerRef.current);
+      activityFlushTimerRef.current = null;
+    }
+    activityRef.current = [];
+    setActivity([]);
+  }, []);
+
+  // Clean activity timer on unmount
+  useEffect(() => {
+    return () => {
+      if (activityFlushTimerRef.current !== null) {
+        window.clearTimeout(activityFlushTimerRef.current);
+      }
+    };
+  }, []);
+
+  // ── Timer Effect ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!isRunning) return;
+    startTimeRef.current = Date.now();
+    setElapsed(0);
+    const id = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - (startTimeRef.current ?? Date.now())) / 1000));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isRunning]);
+
+  // Defensive isRunning guard
+  useEffect(() => {
+    if (!isRunning) {
+      invoke('set_task_active_mode', { active: false }).catch(() => {});
+    }
+  }, [isRunning]);
+
+  // ── Append stdout/stderr raw line ─────────────────────────────────────────
+  const appendRaw = useCallback((line: string) => {
+    if (isDuplicate(line)) return;
+    const id = ++activityCounterRef.current;
+
+    const parsed = parseAgentLine(line, id);
+
+    switch (parsed.type) {
+      case 'stats':
+        setTokenStats(parsed.payload);
+        break;
+      case 'context':
+        setContextState(parsed.payload);
+        break;
+      case 'usage':
+        setProviderUsage(parsed.payload);
+        break;
+      case 'answer':
+      case 'codex_agent_message':
+        answerReceivedThisRunRef.current = true;
+        setLiveHistory(prev => {
+          const last = prev[prev.length - 1];
+          if (last?.role === 'assistant' && last.content.trim() === parsed.payload.trim()) return prev;
+          return [...prev, { role: 'assistant', content: parsed.payload }];
+        });
+        break;
+      case 'codex_reasoning':
+        enqueueActivityUpdate(prev => {
+          const next = [...prev, { id, kind: 'tool' as const, icon: '💭', text: parsed.payload }];
+          if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
+          return next;
+        });
+        break;
+      case 'codex_shell_call':
+        enqueueActivityUpdate(prev => {
+          const next = [...prev, { id, kind: 'tool' as const, icon: '⚡', text: parsed.payload }];
+          if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
+          return next;
+        });
+        break;
+      case 'codex_ignored':
+        break;
+      case 'error':
+        setTaskError(parsed.payload);
+        if (lastRunTaskRef.current) setLastFailedTask(lastRunTaskRef.current);
+        needHelpFlagRef.current = true;
+        enqueueActivityUpdate(prev => {
+          const next = [...prev, { id, kind: 'error' as const, icon: '⚠', text: parsed.payload }];
+          if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
+          return next;
+        });
+        break;
+      case 'diff': {
+        const { added, removed } = parsed.payload;
+        enqueueActivityUpdate(prev => {
+          if (prev.length === 0) return prev;
+          const last = prev[prev.length - 1];
+          if (last.kind === 'tool' && (last.text.includes('Editing') || last.text.includes('Writing') || last.text.includes('Creating'))) {
+            const annotated = { ...last, text: last.text + ` +${added} -${removed}` };
+            return [...prev.slice(0, -1), annotated];
+          }
+          return prev;
+        });
+        break;
+      }
+      case 'screenshot_flash':
+        if (isRunningRef.current) {
+          invoke('show_screenshot_flash').catch(() => {});
+          invoke('set_task_active_mode', { active: true }).catch(() => {});
+        }
+        break;
+      case 'show_window':
+        if (isRunningRef.current) {
+          invoke('show_main_window').catch(() => {});
+        }
+        break;
+      case 'need_help':
+        needHelpFlagRef.current = true;
+        setTaskError(parsed.payload);
+        if (lastRunTaskRef.current) {
+          setLastFailedTask(lastRunTaskRef.current);
+        }
+        break;
+      case 'activity_item':
+        if (isDuplicateActivityItem(parsed.payload)) return;
+
+        enqueueActivityUpdate(prev => {
+          if (parsed.payload.kind === 'success') return prev; // Skip success inside activity feed to prevent duplicate assistant bubble
+          if (parsed.payload.kind === 'status' && prev.length > 0 && prev[prev.length - 1].kind === 'status') {
+            return [...prev.slice(0, -1), parsed.payload];
+          }
+          const next = [...prev, parsed.payload];
+          if (next.length > MAX_ACTIVITY_ITEMS) return next.slice(next.length - MAX_ACTIVITY_ITEMS);
+          return next;
+        });
+
+        // Success bubble creation
+        if (parsed.payload.kind === 'success') {
+          const genericSuccess = /^Task completed(?: successfully)?$/i.test(parsed.payload.text.trim());
+          if (!answerReceivedThisRunRef.current && !genericSuccess) {
+            setLiveHistory(prev => [...prev, { role: 'assistant', content: parsed.payload.text }]);
+          }
+        }
+        break;
+      case 'none':
+      default:
+        break;
+    }
+  }, [isDuplicate, isDuplicateActivityItem, enqueueActivityUpdate]);
+
+  // ── Event Listener Wiring ─────────────────────────────────────────────────
+  useEffect(() => {
+    let unlistenOutput: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+    let unlistenDone: (() => void) | undefined;
+    let unlistenCodeSession: (() => void) | undefined;
+    let unlistenCancelled: (() => void) | undefined;
+
+    listen<string>('kim-agent-output', event => {
+      appendRaw(event.payload);
+    }).then(fn => { unlistenOutput = fn; });
+
+    listen<string>('kim-agent-error', event => {
+      appendRaw(`[err] ${event.payload}`);
+    }).then(fn => { unlistenError = fn; });
+
+    listen<boolean>('kim-agent-done', event => {
+      invoke('set_task_active_mode', { active: false }).catch(() => {});
+      const wasCancelled = cancelFlagRef.current;
+      const hadNeedHelp = needHelpFlagRef.current;
+      doneHandledRef.current = true;
+      cancelFlagRef.current = false;
+      needHelpFlagRef.current = false;
+      setIsRunning(false);
+      setCancelling(false);
+
+      const startedAt = startTimeRef.current;
+      const durationSec = startedAt ? Math.max(1, Math.round((Date.now() - startedAt) / 1000)) : 0;
+      flushActivityNow();
+      const activitySnapshot = activityRef.current;
+
+      if (event.payload && !wasCancelled && activitySnapshot.length > 0) {
+        setRunHistory(prev => {
+          const next = [...prev, { activity: activitySnapshot, durationSec }];
+          const completedCodeSession = completedCodeSessionRef.current;
+          const sid = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
+          if (sid) {
+            invoke('save_run_history', {
+              sessionId: sid,
+              sessionDate: completedCodeSession?.date ?? sessionRef.current?.date ?? null,
+              kimDir: settingsRef.current.kim_sessions_dir || null,
+              codexDir: completedCodeSession?.project_path
+                ? `${completedCodeSession.project_path}/.codex/sessions`
+                : settingsRef.current.codex_sessions_dir || null,
+              runs: next,
+            }).catch(() => {});
+          }
+          return next;
+        });
+      }
+      clearActivityNow();
+      setMessageReloadNonce(v => v + 1);
+
+      const completedCodeSession = completedCodeSessionRef.current ?? undefined;
+      const completedSessionId = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
+      const runProviderSite = browserSiteFromProvider(currentTaskRef.current?.provider);
+      void commitCurrentBrowserUrl(runProviderSite, completedCodeSession ?? sessionRef.current, completedSessionId);
+
+      onTaskDoneRef.current(completedSessionId, completedCodeSession);
+      completedCodeSessionRef.current = null;
+
+      if (!event.payload && !wasCancelled) {
+        if (!hadNeedHelp) {
+          setTaskError('agent-error');
+        }
+        if (lastRunTaskRef.current) {
+          setLastFailedTask(lastRunTaskRef.current);
+        }
+      } else if (event.payload && !hadNeedHelp) {
+        setLastFailedTask(null);
+      }
+      currentTaskRef.current = null;
+    }).then(fn => { unlistenDone = fn; });
+
+    listen<SessionInfo>('kim-agent-code-session', event => {
+      completedCodeSessionRef.current = event.payload;
+    }).then(fn => { unlistenCodeSession = fn; });
+
+    listen<boolean>('kim-agent-cancelled', () => {
+      invoke('set_task_active_mode', { active: false }).catch(() => {});
+      cancelFlagRef.current = true;
+      appendRaw('⏹ Task cancelled');
+      setIsRunning(false);
+      setCancelling(false);
+      currentTaskRef.current = null;
+    }).then(fn => { unlistenCancelled = fn; });
+
+    return () => {
+      unlistenOutput?.();
+      unlistenError?.();
+      unlistenDone?.();
+      unlistenCodeSession?.();
+      unlistenCancelled?.();
+    };
+  }, [appendRaw, flushActivityNow, clearActivityNow, setMessageReloadNonce, commitCurrentBrowserUrl]);
+
+  // Derived state to satisfy Prompt 8 explicit signature
+  const traceItems = buildThinkingTrace(activity, parsePlanFromActivity(activity));
+  const livePlan = parsePlanFromActivity(activity);
+  const planSteps = livePlan?.steps ?? [];
+  const activityEntries = activity;
+  const lastStatus = activity.filter(a => a.kind === 'status').slice(-1)[0]?.text ?? '';
+  const contextUsage = contextState?.percent ?? 0;
+  const isDone = !isRunning;
+  const isCancelled = cancelFlagRef.current;
+
+  return {
+    // Explicit Prompt 8 properties
+    traceItems,
+    planSteps,
+    activityEntries,
+    lastStatus,
+    contextUsage,
+    isDone,
+    isCancelled,
+
+    // Additional state & refs needed by ChatView
+    isRunning,
+    setIsRunning,
+    cancelling,
+    setCancelling,
+    activity,
+    setActivity,
+    runHistory,
+    setRunHistory,
+    taskError,
+    setTaskError,
+    elapsed,
+    setElapsed,
+    tokenStats,
+    setTokenStats,
+    providerUsage,
+    setProviderUsage,
+    contextState,
+    setContextState,
+    liveHistory,
+    setLiveHistory,
+    lastFailedTask,
+    setLastFailedTask,
+
+    // Refs
+    currentTaskRef,
+    lastRunTaskRef,
+    cancelFlagRef,
+    needHelpFlagRef,
+    completedCodeSessionRef,
+    answerReceivedThisRunRef,
+    doneHandledRef,
+    hasSentMessageRef,
+    activityCounterRef,
+    activityRef,
+    activityFlushTimerRef,
+    startTimeRef,
+
+    // Deduplication Maps
+    recentRawRef,
+    recentActivityItemRef,
+
+    // Operations
+    clearActivityNow,
+    flushActivityNow,
+    enqueueActivityUpdate,
+  };
+}
