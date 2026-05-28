@@ -1,0 +1,53 @@
+import type { Connector } from '../kim-ui';
+
+export const CONNECTORS: Connector[] = [
+  {
+    id: 'linear',
+    name: 'Linear',
+    brand: '#5e6ad2',
+    initials: 'L',
+    category: 'Productivity',
+    desc: 'Read and update tickets, projects, and cycles.',
+    tools: 14,
+    scopes: ['read:issues', 'write:issues', 'read:projects'],
+    lastUsed: '12 min ago',
+    state: 'connected',
+    activity: [
+      { text: 'Updated KIM-218 → In Review', time: '12m' },
+      { text: 'Created KIM-241', time: '1h' },
+      { text: 'Fetched current cycle', time: '3h' },
+    ],
+  },
+  {
+    id: 'github',
+    name: 'GitHub',
+    brand: '#8b949e',
+    initials: 'GH',
+    category: 'Dev',
+    desc: 'Issues, PRs, code review, file edits across your repos.',
+    tools: 22,
+    scopes: ['repo', 'gist', 'read:user'],
+    lastUsed: '2 hours ago',
+    state: 'available',
+  },
+  {
+    id: 'slack',
+    name: 'Slack',
+    brand: '#4a154b',
+    initials: 'S',
+    category: 'Productivity',
+    desc: 'Send DMs, post in channels, and react to messages.',
+    tools: 12,
+    state: 'soon',
+  },
+  {
+    id: 'gcal',
+    name: 'Google Calendar',
+    brand: '#a9c8e8',
+    initials: 'G',
+    category: 'Productivity',
+    desc: 'List events, schedule, and reschedule meetings.',
+    tools: 7,
+    state: 'soon',
+  },
+];

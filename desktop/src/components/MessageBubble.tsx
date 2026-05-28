@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { KimMessage, ContentBlock, ToolUseBlock, ToolResultBlock, TypingAnimation } from '../types';
 import { ToolUseCard, ToolResultCard, SignalCard } from './ToolCallCard';
-import { friendlyError } from './ChatView';
+import { friendlyError } from './chat/utils';
 import { toast } from './Toast';
 
 // ── Inline action buttons (copy / edit) ───────────────────────────────────────
