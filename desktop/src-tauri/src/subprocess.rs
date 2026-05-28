@@ -158,6 +158,7 @@ pub(crate) async fn send_task(
             return Err("A task is already running. Stop it before starting a new one.".to_string());
         }
     }
+    let app_config = app_handle.state::<config::AppConfig>();
 
     // The Kim repo root (where orchestrator/, mcp_server/, and venv/ live).
     // This is ALWAYS used for finding the Python interpreter, setting PYTHONPATH,
@@ -287,6 +288,7 @@ pub(crate) async fn send_task(
                         ollama_base_url.as_deref(),
                         ollama_local_model.as_deref(),
                         ollama_cloud_model.as_deref(),
+                        &app_config,
                     ).await?;
                     c.arg("--oss")
                         .arg("--local-provider").arg("ollama")
@@ -301,6 +303,7 @@ pub(crate) async fn send_task(
                         ollama_mode.as_deref(),
                         ollama_local_model.as_deref(),
                         ollama_cloud_model.as_deref(),
+                        &app_config,
                     ).await?
                 };
                 let _ = app_handle.emit(
@@ -326,6 +329,7 @@ pub(crate) async fn send_task(
                     ollama_mode.as_deref(),
                     ollama_local_model.as_deref(),
                     ollama_cloud_model.as_deref(),
+                    &app_config,
                 ).await?;
                 let _ = app_handle.emit(
                     "kim-agent-output",
