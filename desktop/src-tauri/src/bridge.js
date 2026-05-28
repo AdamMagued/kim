@@ -1,0 +1,886 @@
+(() => {
+  // Guard: only install once per page load.
+  if (window.__kimBridge && window.__kimBridge._v >= 10) return;
+
+  const SITE_CONFIGS = {
+    claude: {
+      input_selectors: ["div[contenteditable='true'].ProseMirror", "div[contenteditable='true']"],
+      send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']", "button[aria-label*='send']"],
+      stop_selectors: ["button[aria-label*='Stop']"],
+      response_selectors: ["[data-testid^='conversation-turn']", ".font-claude-message"],
+      upload_button_selectors: ["button[aria-label*='Attach']", "button[aria-label*='Upload']"],
+      file_input_selectors: ["input[type='file']"],
+    },
+    chatgpt: {
+      input_selectors: ["div#prompt-textarea", "div[contenteditable='true']"],
+      send_selectors: ["button[data-testid='send-button']", "button[aria-label*='Send']"],
+      stop_selectors: ["button[data-testid='stop-button']", "button[aria-label*='Stop']"],
+      response_selectors: ["div.markdown", "article div.prose"],
+      upload_button_selectors: ["button[aria-label*='Attach']", "button[data-testid*='upload']"],
+      file_input_selectors: ["input[type='file']"],
+    },
+    gemini: {
+      input_selectors: ["rich-textarea div[contenteditable]", "rich-textarea [contenteditable='true']", "div[contenteditable='true']"],
+      send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']", "button[data-testid*='send']", "button[mattooltip*='Send']", "button[aria-label*='Submit prompt']", "button[aria-label*='Submit']"],
+      stop_selectors: ["button[aria-label*='Stop']", "button[aria-label*='Stop generating']", "button[data-testid*='stop']"],
+      response_selectors: ["model-response", "model-response message-content", "model-response .response-content", "message-content", "div.response-content", "div.markdown"],
+      upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Add image']"],
+      file_input_selectors: ["input[type='file']"],
+    },
+    deepseek: {
+      input_selectors: ["textarea#chat-input", "textarea"],
+      send_selectors: ["button[aria-label*='Send']", "button[type='submit']"],
+      stop_selectors: ["button[aria-label*='Stop']", "div[role='button'][class*='stop']"],
+      response_selectors: ["div.ds-markdown"],
+      upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']"],
+      file_input_selectors: ["input[type='file']"],
+    },
+    grok: {
+      input_selectors: ["textarea", "div[contenteditable='true']"],
+      send_selectors: ["button[aria-label*='Send']", "button[type='submit']"],
+      stop_selectors: ["button[aria-label*='Stop']"],
+      response_selectors: ["article", "div.markdown", "[data-testid*='message']"],
+      upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']"],
+      file_input_selectors: ["input[type='file']"],
+    },
+  };
+
+  // ── Helpers ──────────────────────────────────────────────────────────
+  const normalizeText = (v) => String(v || '').replace(/\u00a0/g, ' ').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/[—–]/g, '--').replace(/…/g, '...').trim();
+
+  const isVisible = (el) => {
+    if (!el) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') === 0) return false;
+    if (el.offsetParent !== null) return true;
+    return style.position === 'fixed';
+  };
+
+  const isEnabled = (el) => {
+    if (!el) return false;
+    if ('disabled' in el && el.disabled) return false;
+    if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return false;
+    return true;
+  };
+
+  const findElement = (selectors, opts = {}) => {
+    for (const sel of selectors || []) {
+      let nodes = [];
+      try { nodes = Array.from(document.querySelectorAll(sel)); } catch (_) { continue; }
+      for (const el of nodes) {
+        if (opts.visible && !isVisible(el)) continue;
+        if (opts.enabled && !isEnabled(el)) continue;
+        return el;
+      }
+    }
+    return null;
+  };
+
+  // Shadow-DOM-aware input finder for Gemini's rich-textarea component.
+  // document.querySelectorAll cannot pierce shadow roots, so we check both
+  // the light DOM children and the shadow root of each rich-textarea host.
+  const findGeminiInput = () => {
+    for (const host of Array.from(document.querySelectorAll('rich-textarea'))) {
+      if (!isVisible(host)) continue;
+      let inner = host.querySelector('[contenteditable]');
+      if (inner && isVisible(inner)) return inner;
+      if (host.shadowRoot) {
+        inner = host.shadowRoot.querySelector('[contenteditable]');
+        if (inner) return inner;
+      }
+    }
+    // Broad fallback: any visible contenteditable on the page
+    for (const el of Array.from(document.querySelectorAll('[contenteditable]'))) {
+      if (isVisible(el)) return el;
+    }
+    return null;
+  };
+
+  const dismissPopups = async () => {
+    const labels = ['i agree', 'agree', 'got it', 'continue', 'accept', 'ok', 'dismiss', 'close', 'no thanks'];
+    for (const btn of document.querySelectorAll('button')) {
+      if (!isVisible(btn)) continue;
+      const text = normalizeText(btn.textContent).toLowerCase();
+      if (labels.includes(text)) {
+        try { btn.click(); await new Promise(r => setTimeout(r, 200)); } catch (_) {}
+      }
+    }
+  };
+
+  const hasStopSemantics = (el) => {
+    const label = String((el && el.getAttribute && el.getAttribute('aria-label')) || (el && el.textContent) || '').toLowerCase().trim();
+    if (!label) return false;
+    return /(^|\b)stop(\b|$)/i.test(label) || label.includes('stop generating');
+  };
+
+  const isAnyStopVisible = (cfg) => {
+    for (const sel of cfg.stop_selectors || []) {
+      try {
+        const nodes = Array.from(document.querySelectorAll(sel));
+        for (const el of nodes) {
+          if (el && isVisible(el) && hasStopSemantics(el)) return true;
+        }
+      } catch (_) {}
+    }
+    return false;
+  };
+
+  const isLikelyUserNode = (node) => {
+    if (!node) return false;
+    try {
+      if (node.closest(
+        'user-query, [data-message-author-role="user"], [data-role="user"], [data-author="user"], '
+        + '.user-message, .from-user, .query-content, .prompt-bubble, [data-testid*="user-message"]'
+      )) return true;
+    } catch (_) {}
+    try {
+      const author = String(node.getAttribute?.('data-message-author-role') || node.getAttribute?.('data-role') || node.getAttribute?.('data-author') || '').toLowerCase();
+      if (author === 'user') return true;
+    } catch (_) {}
+    return false;
+  };
+
+  const readInputText = (inputEl) => {
+    if (!inputEl) return '';
+    if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
+      return normalizeText(inputEl.value || '');
+    }
+    return normalizeText(inputEl.innerText || inputEl.textContent || '');
+  };
+
+  const promptMatchesInput = (inputEl, promptText) => {
+    const expectedRaw = String(promptText || '');
+    const actual = readInputText(inputEl);
+    const expected = normalizeText(expectedRaw);
+    if (!expected) return true;
+    if (actual === expected) return true;
+    if (expected.length < 500) return false;
+    if (actual.length < Math.floor(expected.length * 0.98)) return false;
+    
+    const fuzzyMatch = (a, b) => a.replace(/\W+/g, '') === b.replace(/\W+/g, '');
+    return fuzzyMatch(actual.slice(0, 220), expected.slice(0, 220))
+      && fuzzyMatch(actual.slice(-220), expected.slice(-220));
+  };
+
+  // ── IPC emit (Tauri native) ──────────────────────────────────────────
+  const ipcEmit = (payload) => {
+    try {
+      if (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) {
+        window.__TAURI_INTERNALS__.invoke('plugin:event|emit', {
+          event: 'kim-bridge-ipc',
+          payload: payload,
+        });
+        return true;
+      }
+    } catch (_) {}
+
+    try {
+      // Direct WebKit IPC fallback for external domains where __TAURI_INTERNALS__ is not injected
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) {
+        window.webkit.messageHandlers.ipc.postMessage({
+          cmd: "plugin:event|emit",
+          callback: 0,
+          error: 0,
+          payload: {
+            event: "kim-bridge-ipc",
+            payload: payload
+          }
+        });
+        return true;
+      }
+    } catch (e) {
+      console.warn('[KimBridge] WebKit IPC emit failed:', e);
+    }
+
+    return false;
+  };
+
+  // ── Response extraction ──────────────────────────────────────────────
+  const getLatestResponseText = (cfg, siteKey) => {
+    if (siteKey === 'gemini') {
+        const modelResponses = Array.from(document.querySelectorAll('model-response')).filter(node => {
+            return !!node && isVisible(node) && !isLikelyUserNode(node);
+        });
+
+        let bestText = '';
+        let bestModelNode = null;
+        let bestModelIndex = -1;
+
+        const chooseBest = (text, modelNode, modelIndex) => {
+            if (!text) return;
+            if (modelIndex > bestModelIndex) {
+                bestText = text;
+                bestModelNode = modelNode;
+                bestModelIndex = modelIndex;
+                return;
+            }
+            if (modelIndex === bestModelIndex && text.length > bestText.length) {
+                bestText = text;
+                bestModelNode = modelNode;
+                bestModelIndex = modelIndex;
+            }
+        };
+
+        for (const sel of [
+            'model-response',
+            'model-response message-content',
+            'model-response .response-content',
+            'message-content',
+            'div.response-content',
+        ]) {
+            let nodes = [];
+            try {
+                nodes = Array.from(document.querySelectorAll(sel));
+            } catch (_) {
+                continue;
+            }
+            for (const node of nodes) {
+                if (!node || !isVisible(node) || isLikelyUserNode(node)) continue;
+
+                const modelNode = (node.matches && node.matches('model-response'))
+                    ? node
+                    : (node.closest ? node.closest('model-response') : null);
+                if (!modelNode || !isVisible(modelNode) || isLikelyUserNode(modelNode)) continue;
+
+                const modelIndex = modelResponses.indexOf(modelNode);
+                if (modelIndex < 0) continue;
+
+                const text = normalizeText(node.innerText || node.textContent || '');
+                chooseBest(text, modelNode, modelIndex);
+            }
+        }
+
+        if (!bestText && modelResponses.length > 0) {
+            const lastIndex = modelResponses.length - 1;
+            const lastNode = modelResponses[lastIndex];
+            bestText = normalizeText(lastNode.innerText || lastNode.textContent || '');
+        }
+
+        return bestText;
+    }
+
+    // Generic: find last visible non-user response node
+    for (const sel of cfg.response_selectors || []) {
+      try {
+        const nodes = Array.from(document.querySelectorAll(sel));
+        // Iterate backwards to get the most recent message bubble
+        for (let i = nodes.length - 1; i >= 0; i--) {
+          const node = nodes[i];
+          if (!node || !isVisible(node) || isLikelyUserNode(node)) continue;
+          const text = normalizeText(node.innerText || node.textContent || '');
+          if (text) return text;
+        }
+      } catch (_) {}
+    }
+    return '';
+  };
+
+  const countResponseNodes = (cfg, siteKey) => {
+    if (siteKey === 'gemini') {
+      return Array.from(document.querySelectorAll('model-response')).filter(n => !!n && isVisible(n) && !isLikelyUserNode(n)).length;
+    }
+    let count = 0;
+    const seen = new Set();
+    for (const sel of cfg.response_selectors || []) {
+      try {
+        const nodes = Array.from(document.querySelectorAll(sel));
+        for (const n of nodes) {
+          if (!n || seen.has(n) || !isVisible(n) || isLikelyUserNode(n)) continue;
+          seen.add(n);
+          count++;
+        }
+      } catch (_) {}
+    }
+    return count;
+  };
+
+  // ── Prompt injection ─────────────────────────────────────────────────
+  const injectPromptText = async (inputEl, promptText) => {
+    const target = String(promptText || '');
+    try {
+      inputEl.focus();
+      document.execCommand('selectAll', false);
+    } catch (_) {}
+    if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
+      const proto = Object.getPrototypeOf(inputEl);
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) setter.call(inputEl, ''); else inputEl.value = '';
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      if (setter) setter.call(inputEl, target); else inputEl.value = target;
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+      return readInputText(inputEl).length;
+    }
+    let inserted = false;
+    try {
+      inputEl.focus();
+      document.execCommand('selectAll', false);
+      inserted = document.execCommand('insertText', false, target);
+    } catch (_) {}
+    const currentText = readInputText(inputEl);
+    if (!inserted || currentText.length < Math.min(8, target.length)) {
+      // Strategy 3: Synthetic ClipboardEvent for ProseMirror (Claude)
+      try {
+        const dt = new DataTransfer();
+        dt.setData('text/plain', target);
+        const pasteEvent = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
+        inputEl.dispatchEvent(pasteEvent);
+      } catch (e) {
+        console.warn('[KimBridge] Synthetic paste failed:', e);
+      }
+    }
+    // Gemini rich-textarea mirror sync
+    try {
+      const rich = inputEl.closest('rich-textarea');
+      if (rich) {
+        const mirror = rich.querySelector('textarea, input') || (rich.shadowRoot && rich.shadowRoot.querySelector('textarea, input'));
+        if (mirror && (mirror instanceof HTMLTextAreaElement || mirror instanceof HTMLInputElement)) {
+          const proto = Object.getPrototypeOf(mirror);
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(mirror, target); else mirror.value = target;
+          mirror.dispatchEvent(new Event('input', { bubbles: true }));
+          mirror.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+    } catch (_) {}
+    try {
+      inputEl.dispatchEvent(new InputEvent('input', { data: target, inputType: 'insertText', bubbles: true, cancelable: true }));
+    } catch (_) {}
+    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+    inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+    return readInputText(inputEl).length;
+  };
+
+  // ── Attachment injection ──────────────────────────────────────────────
+  const decodeBase64 = (b64) => {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  };
+
+  const inferExtension = (mime) => {
+    const m = String(mime || '').toLowerCase();
+    const map = { 'image/png':'png', 'image/jpeg':'jpg', 'image/webp':'webp', 'image/gif':'gif', 'application/pdf':'pdf', 'text/plain':'txt' };
+    return map[m] || (m.includes('/') ? m.split('/')[1].split('+')[0] : 'bin');
+  };
+
+  const injectAttachments = async (cfg, inputEl, attachments) => {
+    if (!attachments || !attachments.length) return 0;
+    const files = [];
+    for (let i = 0; i < attachments.length; i++) {
+      try {
+        const att = attachments[i];
+        const mime = String(att?.mime_type || 'application/octet-stream');
+        const b64 = String(att?.data_base64 || '');
+        if (!b64) continue;
+        const bytes = decodeBase64(b64);
+        const blob = new Blob([bytes], { type: mime });
+        const name = String(att?.name || `attachment_${i+1}.${inferExtension(mime)}`).trim();
+        files.push(new File([blob], name, { type: mime }));
+      } catch (_) {}
+    }
+    if (!files.length) return 0;
+
+    // Find file input
+    let fileInput = null;
+    for (const sel of cfg.file_input_selectors || []) {
+      try {
+        const el = document.querySelector(sel);
+        if (el && el instanceof HTMLInputElement && el.type === 'file') { fileInput = el; break; }
+      } catch (_) {}
+    }
+    if (!fileInput) {
+      for (const sel of cfg.upload_button_selectors || []) {
+        try {
+          const btn = document.querySelector(sel);
+          if (btn) { btn.click(); await new Promise(r => setTimeout(r, 100)); }
+          for (const fsel of cfg.file_input_selectors || []) {
+            const fi = document.querySelector(fsel);
+            if (fi && fi instanceof HTMLInputElement && fi.type === 'file') { fileInput = fi; break; }
+          }
+          if (fileInput) break;
+        } catch (_) {}
+      }
+    }
+    if (fileInput) {
+      const dt = new DataTransfer();
+      for (const f of files) dt.items.add(f);
+      try { fileInput.files = dt.files; } catch (_) {
+        try { Object.defineProperty(fileInput, 'files', { value: dt.files, configurable: true }); } catch (_) {}
+      }
+      fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise(r => setTimeout(r, 250));
+      return files.length;
+    }
+
+    // Fallback: image paste. Two strategies in order:
+    //
+    // 1. document.execCommand('paste') — reads from the REAL system clipboard that
+    //    the Rust bridge pre-populated via osascript before evaluating this script.
+    //    This triggers a TRUSTED paste event (isTrusted: true) that Gemini's editor
+    //    accepts.  Synthetic ClipboardEvent is always isTrusted: false and is silently
+    //    rejected by Gemini's React/Lit frontend.
+    //
+    // 2. ClipboardEvent fallback — kept for sites (Claude, ChatGPT) that do honour
+    //    synthetic paste events.
+    //
+    // Returns 1 only when a thumbnail appears, 0 when all methods fail.
+    const imageFile = files.find(f => String(f.type || '').startsWith('image/'));
+    if (imageFile && inputEl) {
+      try {
+        inputEl.focus();
+        await new Promise(r => setTimeout(r, 100));
+
+        // Strategy 1: synthetic ClipboardEvent (isTrusted: false — may be ignored by some editors)
+        const dt = new DataTransfer();
+        dt.items.add(imageFile);
+        const pasteEvent = new ClipboardEvent('paste', {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: dt,
+        });
+        inputEl.dispatchEvent(pasteEvent);
+        console.log('[KimBridge] ClipboardEvent paste dispatched:', imageFile.name);
+
+        let waited = 0;
+        let thumbnailFound = false;
+        while (waited < 1000) {
+          await new Promise(r => setTimeout(r, 100));
+          waited += 100;
+          if (document.querySelector('img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view')) {
+            thumbnailFound = true;
+            break;
+          }
+        }
+        if (thumbnailFound) {
+          await dismissPopups();
+          console.log('[KimBridge] ClipboardEvent paste succeeded');
+          return 1;
+        }
+
+        // All methods failed — return 0 so send() can append a fallback note
+        console.warn('[KimBridge] All paste strategies failed after 2.5s — returning 0');
+        return 0;
+      } catch (e) {
+        console.warn('[KimBridge] injectAttachments error:', e);
+      }
+    }
+    return 0;
+  };
+
+  // ── Main send function ───────────────────────────────────────────────
+  const send = async (prompt, reqId, site, attachments, callbackUrl, completionHash, modelTier) => {
+    window.__kimModelTier = modelTier;
+    const siteKey = SITE_CONFIGS[site] ? site : 'claude';
+    const cfg = SITE_CONFIGS[siteKey];
+    const baselineResponseCount = countResponseNodes(cfg, siteKey);
+    const baselineResponseText = getLatestResponseText(cfg, siteKey) || '';
+    const HARD_TIMEOUT = 120000;
+    const hardDeadlineAt = Date.now() + HARD_TIMEOUT;
+
+    const reportResult = (payload) => {
+      // 1. Try Tauri/WebKit IPC
+      if (!ipcEmit(payload)) {
+        // 2. Fallback: Image Ping to the Rust bridge orchestrator (CSP-safe)
+        if (callbackUrl) {
+          try {
+            const pingUrl = callbackUrl.replace('/callback', '/ping');
+            const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+            const img = new Image();
+            img.src = `${pingUrl}?req_id=${encodeURIComponent(reqId)}&data=${encodeURIComponent(encoded)}`;
+          } catch (e) {
+            console.warn('[KimBridge] ping fallback failed:', e);
+          }
+        }
+      }
+
+      // 3. Fallback: Legacy store (for title polling). Only final payloads
+      // go here; live progress is display-only and must never satisfy Rust's
+      // completion collector.
+      if (!payload.event || payload.event === 'done' || payload.event === 'error') {
+        try {
+          const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+          if (typeof window.__kimBridgeStore !== 'object' || window.__kimBridgeStore === null) window.__kimBridgeStore = {};
+          window.__kimBridgeStore[reqId] = { ready: true, data: encoded, err: null, ts: Date.now() };
+        } catch (_) {}
+      }
+    };
+
+    const decodeJsonString = (value) => {
+      try { return JSON.parse('"' + String(value || '').replace(/"/g, '\\"') + '"'); } catch (_) {}
+      return String(value || '').replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    };
+
+    // extractBridgeTextField removed (was dead code returning empty string)
+
+    const cleanProgressText = (raw) => {
+      let text = String(raw || '');
+      if (completionHash) text = text.replace(completionHash, '');
+      text = text.replace(/KIM_[a-f0-9]{8}/gi, '').trim();
+      return text;
+    };
+
+    let lastProgressText = '';
+    let lastProgressAt = 0;
+    const reportProgress = (raw) => {
+      const text = cleanProgressText(raw);
+      if (!text || text === lastProgressText) return;
+      const now = Date.now();
+      if (now - lastProgressAt < 800 && text.length <= lastProgressText.length + 12) return;
+      lastProgressText = text;
+      lastProgressAt = now;
+      const payload = { ok: true, event: 'progress', req_id: reqId, site: siteKey, text };
+      ipcEmit(payload);
+    };
+
+    // Mark this as the current in-flight request. Any earlier send() call
+    // still running will detect that it's been superseded and bail out
+    // before clobbering shared state (input box, _lastHash, response polling).
+    window.__kimBridge._currentReqId = reqId;
+    const isSuperseded = () => window.__kimBridge._currentReqId !== reqId;
+
+    try {
+      // 0. Auto-enable DeepThink (R1) expert mode for DeepSeek
+      if (siteKey === 'deepseek') {
+        try {
+          if (!window.__kimBridge._expertToggled) {
+            const allEls = Array.from(document.querySelectorAll('*'));
+            const expertText = allEls.find(el => {
+              // Ensure we get the actual leaf element (like the span), not a giant wrapper div
+              if (el.children.length > 0) return false;
+              const text = el.textContent ? el.textContent.trim().toLowerCase() : '';
+              return text === 'expert' || text === 'deepthink' || text === 'deepthink (r1)';
+            });
+            
+            if (expertText) {
+              console.log('[KimBridge] Enabling Expert Mode (first turn)...');
+              
+              // Many React/Vue apps ignore raw .click() in favor of pointer events
+              const rect = expertText.getBoundingClientRect();
+              const evOpts = { 
+                bubbles: true, cancelable: true, 
+                clientX: rect.x + rect.width/2, 
+                clientY: rect.y + rect.height/2 
+              };
+              
+              expertText.dispatchEvent(new PointerEvent('pointerdown', evOpts));
+              expertText.dispatchEvent(new MouseEvent('mousedown', evOpts));
+              expertText.dispatchEvent(new PointerEvent('pointerup', evOpts));
+              expertText.dispatchEvent(new MouseEvent('mouseup', evOpts));
+              expertText.click();
+              
+              window.__kimBridge._expertToggled = true;
+              // Brief pause to let UI react
+              await new Promise(r => setTimeout(r, 300));
+            }
+          }
+        } catch (e) {
+          console.warn('[KimBridge] Error toggling Expert mode:', e);
+        }
+      }
+
+      if (siteKey === 'gemini') {
+        const rawTier = (window.__kimModelTier == null ? '' : String(window.__kimModelTier)).trim().toLowerCase();
+        const tier = rawTier === 'advanced' ? 'pro' : (rawTier === 'fast' ? 'flash' : rawTier);
+        const hasExplicitTier = tier === 'flash' || tier === 'pro' || tier === 'thinking';
+        if (!hasExplicitTier) {
+          console.log('[KimBridge] Gemini model auto-switch skipped (no explicit model tier)');
+        } else {
+        const selectGeminiPro = async () => {
+            let modelBtn = null;
+            const walker1 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+            while (walker1.nextNode()) {
+                const node = walker1.currentNode;
+                const txt = (node.textContent || '').replace(/[\\s\\u00A0]+/g, ' ').toLowerCase().trim();
+                const words = txt.split(' ');
+                
+                if (words.includes('gemini') || words.includes('flash') || words.includes('fast') || words.includes('pro') || words.includes('advanced') || words.includes('thinking')) {
+                    if (!txt.includes('upgrade') && !txt.includes('try') && !txt.includes('learn') && !txt.includes('help') && !txt.includes('chat')) {
+                        const el = node.parentElement;
+                        if (el && isVisible(el)) {
+                            const clickable = el.closest('button, [role="button"], [role="combobox"], [aria-haspopup], .mat-mdc-button, .mat-mdc-menu-trigger');
+                            if (clickable) {
+                                modelBtn = clickable;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (modelBtn) {
+                const currentTxt = (modelBtn.textContent || '').replace(/[\\s\\u00A0]+/g, ' ').toLowerCase();
+                const isTargetFlash = tier === 'flash' || tier === 'fast';
+                const isTargetPro = tier === 'pro' || tier === 'advanced';
+                const isTargetThinking = tier === 'thinking';
+                
+                let needsSwitch = false;
+                if (isTargetFlash && !currentTxt.includes('flash') && !currentTxt.includes('fast')) {
+                    if (currentTxt !== 'gemini') needsSwitch = true;
+                }
+                if (isTargetPro && !currentTxt.includes('advanced') && !currentTxt.includes('pro')) needsSwitch = true;
+                if (isTargetThinking && !currentTxt.includes('thinking')) needsSwitch = true;
+                
+                if (needsSwitch) {
+                    console.log(`[KimBridge] Switching Gemini Model Tier to ${tier}`);
+                    modelBtn.click();
+                    await new Promise(r => setTimeout(r, 700));
+                    
+                    let targetClicked = false;
+                    const targetTerms = isTargetThinking ? ['thinking'] : (isTargetFlash ? ['flash', 'fast', 'gemini'] : ['advanced', 'pro']);
+                    
+                    const overlays = document.querySelectorAll('.cdk-overlay-container, [role="menu"], [role="listbox"], [role="dialog"]');
+                    const menuRoot = Array.from(overlays).find(o => isVisible(o)) || document.body;
+                    
+                    const walker2 = document.createTreeWalker(menuRoot, NodeFilter.SHOW_TEXT, null, false);
+                    let targetNode = null;
+                    while (walker2.nextNode()) {
+                        const node = walker2.currentNode;
+                        const txt = (node.textContent || '').replace(/[\\s\\u00A0]+/g, ' ').toLowerCase();
+                        if (targetTerms.some(t => txt.includes(t)) && !txt.includes('upgrade') && !txt.includes('learn')) {
+                            if (isTargetFlash && (txt.includes('advanced') || txt.includes('pro') || txt.includes('thinking'))) continue;
+                            const el = node.parentElement;
+                            if (el && isVisible(el)) {
+                                targetNode = el;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (targetNode) {
+                        const clickable = targetNode.closest('button, [role="button"], [role="menuitem"], [role="option"], a, li, mat-option') || targetNode;
+                        clickable.click();
+                        targetClicked = true;
+                        await new Promise(r => setTimeout(r, 1200));
+                    }
+
+                    if (!targetClicked) {
+                        console.warn(`[KimBridge] Failed to find target Gemini model '${tier}' in menu`);
+                        document.body.click();
+                        await new Promise(r => setTimeout(r, 200));
+                    }
+                } else {
+                    console.log(`[KimBridge] Gemini Model already correct (${tier})`);
+                }
+            } else {
+                console.warn('[KimBridge] Gemini Model selector button not found');
+            }
+        };
+        await selectGeminiPro();
+        }
+      }
+
+      // 1. Find input (use shadow-DOM-aware finder for Gemini)
+      const inputEl = (siteKey === 'gemini' ? findGeminiInput() : null) || findElement(cfg.input_selectors, { visible: true });
+      if (!inputEl) {
+        throw new Error(`Could not find input selector for ${siteKey}`);
+      }
+      inputEl.focus();
+
+      const uploadedCount = await injectAttachments(cfg, inputEl, attachments);
+
+      // 3. Inject text — verify with rAF loop instead of hardcoded sleep.
+      // When attachments were expected but couldn't be injected (uploadedCount === 0),
+      // append an explanatory note so the model can respond gracefully instead of
+      // looping with repeated take_screenshot calls.
+      const effectivePrompt = (attachments && attachments.length > 0 && uploadedCount === 0)
+        ? prompt + '\n[System note: The screenshot could not be attached to this message (image upload unavailable in current interface). Please respond with what you can based on text context, or NEED_HELP if you truly cannot proceed without the image.]'
+        : prompt;
+      const injectedLen = await injectPromptText(inputEl, effectivePrompt);
+      if (injectedLen < Math.min(8, normalizeText(effectivePrompt).length) || !promptMatchesInput(inputEl, effectivePrompt)) {
+        console.warn('[KimBridge] Prompt text may not have been fully accepted by the chat input. Proceeding anyway.');
+      }
+
+      // Allow UI framework to sync state before sending
+      await new Promise(r => setTimeout(r, 80));
+
+      // 4a. Wait for the PREVIOUS request's completion hash to appear in the
+      //     DOM before clicking Send.  This ensures we never interrupt an
+      //     in-progress generation.  The hash is provider-agnostic — it lives
+      //     in the response text itself, so it works regardless of UI changes.
+      {
+        const prevHash = window.__kimBridge._lastHash;
+        if (prevHash) {
+          const PRE_SEND_TIMEOUT = 120000; // up to 120s for long responses
+          const preDeadline = Date.now() + PRE_SEND_TIMEOUT;
+          let noStopCount = 0;
+          while (Date.now() < preDeadline) {
+            if (isSuperseded()) { console.log('[KimBridge] send superseded during pre-send wait, bailing'); ipcEmit({ ok: false, event: 'error', req_id: reqId, error: 'Request superseded by newer send', site: siteKey }); return; }
+            const pageText = getLatestResponseText(cfg, siteKey) || '';
+            if (pageText.includes(prevHash)) break;
+
+            if (!isAnyStopVisible(cfg)) {
+              noStopCount++;
+              // If stop button is missing for ~1.5 seconds, assume done
+              if (noStopCount >= 5) {
+                console.log('[KimBridge] prevHash not found, but stop button is gone. Proceeding.');
+                break;
+              }
+            } else {
+              noStopCount = 0;
+            }
+            await new Promise(r => setTimeout(r, 300));
+          }
+          // Short settle delay removed for latency
+        }
+      }
+
+      if (!promptMatchesInput(inputEl, effectivePrompt)) {
+        throw new Error('Prompt changed after injection. Refusing to send a partial prompt.');
+      }
+
+      // 4b. Submit via send button (preferred) or synthetic Enter (fallback).
+      inputEl.focus();
+      let sendClicked = false;
+      for (let attempt = 0; attempt < 15; attempt++) {
+        const sendBtn = findElement(cfg.send_selectors || [], { visible: true, enabled: true });
+        if (sendBtn) {
+          sendBtn.click();
+          sendClicked = true;
+          break;
+        }
+        await new Promise(r => setTimeout(r, 100));
+      }
+      if (!sendClicked) {
+        // Fallback: synthetic Enter
+        inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      }
+      console.log('[KimBridge] Message submitted via', sendClicked ? 'send button' : 'synthetic Enter');
+
+      // 4c. Record THIS request's hash AFTER submit so the NEXT request can wait for it
+      if (completionHash) {
+        window.__kimBridge._lastHash = completionHash;
+      }
+
+      // 5. Emit "sent" immediately via IPC only — NOT via the legacy store,
+      //    because the store is used by Rust's title-pull fallback which can't
+      //    distinguish 'sent' from 'done' (BridgeCompleteResponse has no event
+      //    field).  Writing 'sent' to the store would cause the collector to
+      //    return response=null before the LLM has finished.
+      ipcEmit({ ok: true, event: 'sent', req_id: reqId, site: siteKey });
+
+      // 6. Poll DOM for the completion hash
+      //    The LLM was instructed to append the hash at the very end of its
+      //    response.  When we see it in the page text, the response is complete
+      //    and we know exactly which text belongs to this request.
+      const POLL_MS = 300;
+      let responseText = '';
+      let lastTextLength = 0;
+      let idleCount = 0;
+      let sawNewResponse = false;
+
+      while (Date.now() < hardDeadlineAt) {
+        await new Promise(r => setTimeout(r, POLL_MS));
+        if (isSuperseded()) { console.log('[KimBridge] send superseded during response wait, bailing'); ipcEmit({ ok: false, event: 'error', req_id: reqId, error: 'Request superseded by newer send', site: siteKey }); return; }
+
+        const latestText = getLatestResponseText(cfg, siteKey) || '';
+        const latestCount = countResponseNodes(cfg, siteKey);
+        if (
+          latestCount > baselineResponseCount
+          || (latestText && latestText !== baselineResponseText)
+        ) {
+          sawNewResponse = true;
+        }
+        reportProgress(latestText);
+        if (completionHash && latestText.includes(completionHash)) {
+          responseText = latestText.replace(completionHash, '').trim();
+          break;
+        }
+
+        if (latestText.length > lastTextLength) {
+          idleCount = 0;
+          lastTextLength = latestText.length;
+        } else if (latestText.length > 0) {
+          idleCount++;
+        }
+
+        if (latestText && latestText.length > 0 && !isAnyStopVisible(cfg)) {
+          if (sawNewResponse && idleCount >= 10) { // 3 seconds of no text growth
+            console.log('[KimBridge] stop button gone and text idle. Falling back to latest text.');
+            responseText = latestText;
+            break;
+          }
+        }
+      }
+
+      if (!responseText) {
+        // Last-ditch: try to grab whatever text is on the page
+        const lastTry = getLatestResponseText(cfg, siteKey) || '';
+        const lastTryCount = countResponseNodes(cfg, siteKey);
+        const hasNewTurn =
+          lastTryCount > baselineResponseCount
+          || (lastTry && lastTry !== baselineResponseText);
+        if (completionHash && lastTry.includes(completionHash)) {
+          responseText = lastTry.replace(completionHash, '').trim();
+        } else if (lastTry.length > 0 && hasNewTurn) {
+          responseText = lastTry;
+        } else {
+          throw new Error(`Timed out waiting for completion hash in response (${HARD_TIMEOUT}ms); no new response turn detected`);
+        }
+      }
+
+      // 7. Emit "done" with full response
+      reportResult({ ok: true, event: 'done', req_id: reqId, response: responseText, site: siteKey, attachments_uploaded: uploadedCount || 0 });
+
+    } catch (err) {
+      const message = (err && err.message) ? err.message : String(err);
+      reportResult({ ok: false, event: 'error', req_id: reqId, error: message, site: site || 'unknown' });
+    }
+  };
+
+  // ── Detect which site we're on ────────────────────────────────────────
+  const detectSite = () => {
+    const href = window.location.href.toLowerCase();
+    if (href.includes('gemini.google.com')) return 'gemini';
+    if (href.includes('claude.ai')) return 'claude';
+    if (href.includes('chatgpt.com')) return 'chatgpt';
+    if (href.includes('chat.deepseek.com')) return 'deepseek';
+    if (href.includes('grok.com')) return 'grok';
+    return null;
+  };
+
+  // ── Check if page is ready (input element exists) ─────────────────────
+  const checkReady = () => {
+    const site = detectSite();
+    if (!site) return false;
+    const cfg = SITE_CONFIGS[site];
+    if (!cfg) return false;
+    if (site === 'gemini') return !!findGeminiInput();
+    return !!findElement(cfg.input_selectors, { visible: true });
+  };
+
+  // ── Clear _lastHash when URL changes (new chat detected) ──────────────
+  let _lastObservedUrl = window.location.href;
+  setInterval(() => {
+    const currentUrl = window.location.href;
+    if (currentUrl !== _lastObservedUrl) {
+      _lastObservedUrl = currentUrl;
+      if (window.__kimBridge) {
+        window.__kimBridge._lastHash = null;
+        console.log('[KimBridge] URL changed, cleared _lastHash');
+      }
+    }
+  }, 1000);
+
+  // ── Public API ─────────────────────────────────────────────────────────
+  window.__kimBridge = {
+    _v: 10,
+    _lastHash: null, // Tracks the completion hash of the most recent request
+    _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
+    send,
+    detectSite,
+    checkReady,
+    SITE_CONFIGS,
+    // Legacy compat
+    getLatestResponseText: (site) => {
+      const siteKey = SITE_CONFIGS[site] ? site : 'claude';
+      return getLatestResponseText(SITE_CONFIGS[siteKey], siteKey);
+    },
+  };
+
+  console.log('[KimBridge] Persistent bridge v2 installed for', detectSite() || 'unknown site');
+})();
