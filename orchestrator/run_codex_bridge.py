@@ -1,4 +1,8 @@
 """
+DEPRECATED: superseded by orchestrator/codex_bridge_service.py (Phase 7).
+The Tauri subprocess spawn now points at codex_bridge_service.
+This file is kept only for reference and will be deleted after smoke testing.
+
 Spawn `codex` and relay its LLM calls through Kim's BrowserProvider so users
 can run Code-tab tasks without an API key.
 

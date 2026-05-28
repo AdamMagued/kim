@@ -275,7 +275,7 @@ pub(crate) async fn send_task(
                 format!("[STATUS] codex binary: {}", code_bin.display()),
             );
             let mut c = Command::new(&python);
-            c.args(["-m", "orchestrator.run_codex_bridge"])
+            c.args(["-m", "orchestrator.codex_bridge_service"])
                 .arg("--task").arg(&task)
                 .arg("--cwd").arg(target_root.to_string_lossy().to_string())
                 .arg("--provider").arg(&provider_arg)
