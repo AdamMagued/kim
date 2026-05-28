@@ -13,9 +13,12 @@ import type {
   AccentTheme,
   KimAccount,
   TypingAnimation,
+  GoogleAccount,
+  GoogleApiAccount,
 } from '../../types';
 import { VOICES_BY_ENGINE } from '../../types';
 import { toast } from '../Toast';
+import { PairingModal } from '../PairingModal';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -26,9 +29,17 @@ type PaneId =
   | 'paths'
   | 'data'
   | 'account'
+  | 'relay'
   | 'mcp'
   | 'feedback'
   | 'about';
+
+interface GoogleApiStatus extends GoogleApiAccount {
+  connected: boolean;
+  email: string;
+  needs_reauth?: boolean;
+  error?: string;
+}
 
 interface Props {
   settings: Settings;
@@ -50,6 +61,7 @@ const NAV: { id: PaneId; label: string; icon: PaneId }[] = [
   { id: 'paths', label: 'Paths', icon: 'paths' },
   { id: 'data', label: 'Data', icon: 'data' },
   { id: 'account', label: 'Account', icon: 'account' },
+  { id: 'relay', label: 'Phone Relay', icon: 'relay' },
   { id: 'mcp', label: 'MCP', icon: 'mcp' },
   { id: 'feedback', label: 'Feedback', icon: 'feedback' },
   { id: 'about', label: 'About', icon: 'about' },
@@ -228,6 +240,13 @@ function NavIcon({ name }: { name: PaneId }) {
         <svg width="15" height="15" viewBox="0 0 16 16">
           <circle {...stroke} cx="8" cy="8" r="6.5" />
           <path {...stroke} d="M8 7v4M8 5v.5" />
+        </svg>
+      );
+    case 'relay':
+      return (
+        <svg width="15" height="15" viewBox="0 0 24 24">
+          <rect {...stroke} x="7" y="2" width="10" height="20" rx="2" />
+          <path {...stroke} d="M11 18h2" />
         </svg>
       );
   }
@@ -1369,6 +1388,152 @@ function PaneAccount({
   const [verifying, setVerifying] = useState(false);
   const [tokenError, setTokenError] = useState('');
   const [saving, setSaving] = useState(false);
+  const [googleEmail, setGoogleEmail] = useState('');
+  const [googleAuthuser, setGoogleAuthuser] = useState('0');
+  const [googleError, setGoogleError] = useState('');
+  const [googleApiStatus, setGoogleApiStatus] = useState<GoogleApiStatus | null>(account.google_api_account ? { ...account.google_api_account } : null);
+  const [googleApiBusy, setGoogleApiBusy] = useState(false);
+  const [googleApiError, setGoogleApiError] = useState('');
+
+  const googleAccounts = account.google_accounts ?? [];
+  const activeGoogleEmail = account.google_active_account
+    ?? googleAccounts[0]?.email
+    ?? '';
+  const activeGoogleAccount = googleAccounts.find(a => a.email === activeGoogleEmail) ?? googleAccounts[0] ?? null;
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<GoogleApiStatus>('google_oauth_status')
+      .then(status => {
+        if (!cancelled) {
+          setGoogleApiStatus(status);
+          setGoogleApiError(status.error ?? '');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setGoogleApiStatus(account.google_api_account ? { ...account.google_api_account } : null);
+      });
+    return () => { cancelled = true; };
+  }, [account.google_api_account]);
+
+  async function connectGoogleApi() {
+    setGoogleApiBusy(true);
+    setGoogleApiError('');
+    try {
+      const status = await invoke<GoogleApiStatus>('google_oauth_start');
+      setGoogleApiStatus(status);
+      await onAccountChange({ ...account, google_api_account: status });
+      toast(status.email ? `Google connected as ${status.email}.` : 'Google connected for Kim.', 'success', 3000);
+    } catch (err) {
+      const message = String(err);
+      setGoogleApiError(message);
+      toast(message || 'Could not connect Google.', 'error', 6000);
+    } finally {
+      setGoogleApiBusy(false);
+    }
+  }
+
+  async function disconnectGoogleApi() {
+    setGoogleApiBusy(true);
+    setGoogleApiError('');
+    try {
+      await invoke('google_oauth_disconnect');
+      const next = { ...account, google_api_account: undefined };
+      setGoogleApiStatus({ connected: false, email: '' });
+      await onAccountChange(next);
+      toast('Google disconnected from Kim.', 'success', 2500);
+    } catch (err) {
+      const message = String(err);
+      setGoogleApiError(message);
+      toast(message || 'Could not disconnect Google.', 'error', 5000);
+    } finally {
+      setGoogleApiBusy(false);
+    }
+  }
+
+  async function testGoogleApi() {
+    setGoogleApiBusy(true);
+    setGoogleApiError('');
+    try {
+      const status = await invoke<GoogleApiStatus>('google_oauth_test');
+      setGoogleApiStatus(status);
+      await onAccountChange({ ...account, google_api_account: status });
+      toast('Google for Kim is working.', 'success', 2500);
+    } catch (err) {
+      const message = String(err);
+      setGoogleApiError(message);
+      toast(message || 'Google test failed.', 'error', 6000);
+    } finally {
+      setGoogleApiBusy(false);
+    }
+  }
+
+  async function saveGoogleAccountPatch(
+    google_accounts: GoogleAccount[],
+    google_active_account: string | undefined,
+    successMessage?: string,
+  ) {
+    setSaving(true);
+    try {
+      await onAccountChange({
+        ...account,
+        google_accounts,
+        google_active_account,
+      });
+      if (successMessage) toast(successMessage, 'success', 2500);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function addGoogleAccount() {
+    const email = googleEmail.trim().toLowerCase();
+    const index = Number.parseInt(googleAuthuser.trim(), 10);
+    setGoogleError('');
+    if (!/^\S+@\S+\.\S+$/.test(email)) {
+      setGoogleError('Enter the Google email address you use in the Gemini WebView.');
+      return;
+    }
+    if (!Number.isInteger(index) || index < 0) {
+      setGoogleError('authuser must be 0 or a positive whole number.');
+      return;
+    }
+    const nextAccounts = [
+      ...googleAccounts.filter(a => a.email.trim().toLowerCase() !== email),
+      { email, authuser_index: index },
+    ].sort((a, b) => a.authuser_index - b.authuser_index || a.email.localeCompare(b.email));
+    await saveGoogleAccountPatch(nextAccounts, email, 'Google account linked for Gemini.');
+    setGoogleEmail('');
+    setGoogleAuthuser(String(index + 1));
+  }
+
+  async function setActiveGoogle(email: string) {
+    const selected = googleAccounts.find(a => a.email === email);
+    await saveGoogleAccountPatch(googleAccounts, selected?.email, selected ? `Gemini will use authuser=${selected.authuser_index}.` : undefined);
+  }
+
+  async function removeGoogleAccount(email: string) {
+    const nextAccounts = googleAccounts.filter(a => a.email !== email);
+    const nextActive = activeGoogleEmail === email ? nextAccounts[0]?.email : activeGoogleEmail;
+    await saveGoogleAccountPatch(nextAccounts, nextActive, 'Google account removed.');
+  }
+
+  async function openActiveGemini() {
+    const authuser = activeGoogleAccount?.authuser_index;
+    const url = authuser === undefined
+      ? 'https://gemini.google.com/app'
+      : `https://gemini.google.com/app?authuser=${authuser}`;
+    try {
+      await invoke<string>('open_browser_signin_window', {
+        url,
+        providerName: 'Gemini',
+      });
+      await invoke('show_browser_window').catch(() => {});
+      toast('Gemini opened in Kim. Complete Google sign-in there if needed.', 'info', 6000);
+    } catch (err) {
+      toast(typeof err === 'string' ? err : 'Could not open Gemini.', 'error', 5000);
+    }
+  }
 
   useEffect(() => {
     setNameVal(account.display_name);
@@ -1570,6 +1735,118 @@ function PaneAccount({
           </div>
         </div>
       )}
+
+      <SectionLabel>Google for Kim (API)</SectionLabel>
+      <Row
+        title={googleApiStatus?.connected ? 'Connected as Google' : 'Use Gemini through your Google account'}
+        subtitle={googleApiStatus?.connected
+          ? (googleApiStatus.email ? `${googleApiStatus.email}${googleApiStatus.needs_reauth ? ' · reconnect required' : ''}` : 'Connected')
+          : 'Continue with Google once, then chat normally. No API key setup in Kim.'}
+      >
+        {googleApiStatus?.connected ? (
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <button type="button" className="kr-btn" onClick={testGoogleApi} disabled={googleApiBusy}>
+              {googleApiBusy ? 'Checking…' : 'Test'}
+            </button>
+            <button type="button" className="kr-btn" onClick={disconnectGoogleApi} disabled={googleApiBusy}>
+              Disconnect
+            </button>
+          </div>
+        ) : (
+          <button type="button" className="kr-btn kr-btn-primary" onClick={connectGoogleApi} disabled={googleApiBusy}>
+            {googleApiBusy ? 'Opening Google…' : 'Continue with Google'}
+          </button>
+        )}
+      </Row>
+      <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginTop: -6, marginBottom: 18, lineHeight: 1.5 }}>
+        This powers the <code>gemini</code> API provider. Refresh tokens stay in OS secure storage; Kim only passes short-lived access to the Python agent.
+      </div>
+      {googleApiError && <div style={{ color: 'var(--kim-red)', fontSize: 12, marginBottom: 12 }}>{googleApiError}</div>}
+
+      <SectionLabel>Google for Browser: Gemini</SectionLabel>
+      <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginBottom: 12, lineHeight: 1.5 }}>
+        Kim routes Gemini with Google's <code>authuser</code> index and the cookies already in the in-app WebView. It does not save or auto-fill Google passwords.
+      </div>
+
+      {googleAccounts.length > 0 && (
+        <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
+          {googleAccounts.map(g => {
+            const active = g.email === activeGoogleEmail;
+            return (
+              <div
+                key={g.email}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 12,
+                  padding: '10px 12px',
+                  background: 'var(--kim-surface)',
+                  borderRadius: 12,
+                  border: active ? '1px solid var(--kim-accent)' : '1px solid var(--kim-border)',
+                }}
+              >
+                <div style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: '50%',
+                  background: active ? 'var(--kim-accent)' : 'var(--kim-surface-raised)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: active ? 'var(--kim-on-accent)' : 'var(--kim-text-2)',
+                  fontSize: 12,
+                  fontWeight: 600,
+                }}>
+                  G
+                </div>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--kim-text)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{g.email}</div>
+                  <div style={{ fontSize: 11, color: 'var(--kim-text-3)' }}>authuser={g.authuser_index}{active ? ' · active' : ''}</div>
+                </div>
+                {!active && (
+                  <button type="button" className="kr-btn" onClick={() => setActiveGoogle(g.email)} disabled={saving}>
+                    Use
+                  </button>
+                )}
+                <button type="button" className="kr-btn" onClick={() => removeGoogleAccount(g.email)} disabled={saving}>
+                  Remove
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+        <input
+          type="email"
+          className="kr-input"
+          placeholder="you@gmail.com"
+          value={googleEmail}
+          onChange={e => { setGoogleEmail(e.target.value); setGoogleError(''); }}
+          style={{ flex: 1 }}
+        />
+        <input
+          type="number"
+          min={0}
+          step={1}
+          className="kr-input"
+          aria-label="Google authuser index"
+          value={googleAuthuser}
+          onChange={e => { setGoogleAuthuser(e.target.value); setGoogleError(''); }}
+          style={{ width: 80 }}
+        />
+        <button type="button" className="kr-btn kr-btn-primary" onClick={addGoogleAccount} disabled={saving || !googleEmail.trim()}>
+          Link
+        </button>
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginBottom: 12, lineHeight: 1.5 }}>
+        Use <code>0</code> for the first Google account in this WebView profile, <code>1</code> for the second, and so on. Test with “Open active Gemini”.
+      </div>
+      {googleError && <div style={{ color: 'var(--kim-red)', fontSize: 12, marginBottom: 10 }}>{googleError}</div>}
+      <button type="button" className="kr-btn" onClick={openActiveGemini} style={{ width: '100%', justifyContent: 'center', marginBottom: 20 }}>
+        Open active Gemini{activeGoogleAccount ? ` (${activeGoogleAccount.email}, authuser=${activeGoogleAccount.authuser_index})` : ''}
+      </button>
 
       <SectionLabel>danger zone</SectionLabel>
       <Row danger title="Reset onboarding" subtitle="Forget your account and re-run the welcome flow on next launch.">
@@ -1887,6 +2164,142 @@ function PaneAbout({ appVersion, onCheckUpdate }: { appVersion: string; onCheckU
   );
 }
 
+interface RelayConfigSnapshot {
+  url: string;
+  pc_key_configured: boolean;
+}
+
+function PaneRelay({ settings }: { settings: Settings }) {
+  const [cfg, setCfg] = useState<RelayConfigSnapshot | null>(null);
+  const [urlDraft, setUrlDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [pairOpen, setPairOpen] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function refresh() {
+    try {
+      const snap = await invoke<RelayConfigSnapshot>('read_relay_config', {
+        projectRoot: settings.project_root || null,
+      });
+      setCfg(snap);
+      setUrlDraft(snap.url);
+      setErr(null);
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+  useEffect(() => {
+    refresh();
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, []);
+
+  async function saveUrl() {
+    setSaving(true);
+    try {
+      await invoke('write_relay_url', {
+        url: urlDraft.trim(),
+        projectRoot: settings.project_root || null,
+      });
+      toast('Relay URL saved.', 'success', 2000);
+      await refresh();
+    } catch (e) {
+      toast(`Failed to save: ${String(e)}`, 'error', 4000);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const urlDirty = (cfg?.url ?? '') !== urlDraft.trim();
+  const canPair = !!(cfg?.url && cfg?.pc_key_configured);
+
+  return (
+    <>
+      <SectionLabel>Status & Info</SectionLabel>
+      <div style={{ color: 'var(--kim-text-2)', fontSize: 13, lineHeight: 1.6, marginBottom: 20 }}>
+        Send prompts from your phone to this PC. Kim runs the task here (with full
+        access to your files, browser, and screen) and streams the result back.
+        Pair once with a QR code; after that, prompts route automatically while
+        relay mode is on.
+      </div>
+
+      <SectionLabel>Relay URL</SectionLabel>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
+        <input
+          className="kr-input"
+          placeholder="https://kim-relay.fly.dev"
+          value={urlDraft}
+          onChange={(e) => setUrlDraft(e.target.value)}
+          spellCheck={false}
+          autoCapitalize="none"
+          autoCorrect="off"
+          style={{ flex: 1 }}
+        />
+        <button
+          type="button"
+          className="kr-btn kr-btn-primary"
+          onClick={saveUrl}
+          disabled={!urlDirty || saving}
+        >
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginTop: -12, marginBottom: 20 }}>
+        The relay server that bridges phone ↔ PC. Self-host or use the one shared with you.
+      </div>
+
+      <SectionLabel>PC API key</SectionLabel>
+      <Row
+        title="API key configuration"
+        subtitle="Stored in .env as RELAY_PC_API_KEY. Set this before pairing."
+      >
+        <span
+          style={{
+            fontSize: 12,
+            color: cfg?.pc_key_configured ? 'var(--kim-green)' : 'var(--kim-red)',
+            fontWeight: 500,
+          }}
+        >
+          {cfg?.pc_key_configured ? '✓ Configured' : '⚠ Missing from .env'}
+        </span>
+      </Row>
+
+      {err && (
+        <div style={{ color: 'var(--kim-red)', fontSize: 13, marginBottom: 18 }}>
+          {err}
+        </div>
+      )}
+
+      <SectionLabel>Pairing</SectionLabel>
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginTop: 10 }}>
+        <button
+          type="button"
+          className="kr-btn kr-btn-primary"
+          onClick={() => setPairOpen(true)}
+          disabled={!canPair}
+          title={
+            !cfg?.url
+              ? 'Set a relay URL first.'
+              : !cfg.pc_key_configured
+              ? 'Add RELAY_PC_API_KEY to .env first.'
+              : ''
+          }
+        >
+          Pair a phone
+        </button>
+        <span style={{ color: 'var(--kim-text-3)', fontSize: 12 }}>
+          You'll get a QR. Open Kim on the phone → Settings → Phone Relay → paste it.
+        </span>
+      </div>
+
+      <PairingModal
+        open={pairOpen}
+        onClose={() => setPairOpen(false)}
+        projectRoot={settings.project_root || undefined}
+      />
+    </>
+  );
+}
+
 // ── Main shell ────────────────────────────────────────────────────────────────
 
 const PANE_META: Record<PaneId, { title: string; subtitle: string }> = {
@@ -1896,6 +2309,7 @@ const PANE_META: Record<PaneId, { title: string; subtitle: string }> = {
   paths: { title: 'Paths', subtitle: 'Where Kim reads and writes on disk.' },
   data: { title: 'Data', subtitle: 'Your sessions live on your machine. Nothing leaves unless you sync.' },
   account: { title: 'Account', subtitle: 'How you show up across Kim and your linked services.' },
+  relay: { title: 'Phone Relay', subtitle: 'Send prompts from your phone to this PC.' },
   mcp: { title: 'MCP', subtitle: 'Tool packs Kim can call — built-in and your own.' },
   feedback: { title: 'Feedback', subtitle: "Tell us what's on your mind. We read every one." },
   about: { title: 'About', subtitle: "What's running, and what's new." },
@@ -2012,6 +2426,7 @@ export function RevampSettings(props: Props) {
           {active === 'paths' && <PanePaths settings={settings} onChange={onChange} />}
           {active === 'data' && <PaneData account={account} onAccountChange={onAccountChange} />}
           {active === 'account' && <PaneAccount account={account} onAccountChange={onAccountChange} />}
+          {active === 'relay' && <PaneRelay settings={settings} />}
           {active === 'mcp' && <PaneMCP />}
           {active === 'feedback' && <PaneFeedback />}
           {active === 'about' && <PaneAbout appVersion={appVersion} onCheckUpdate={onCheckUpdate} />}
