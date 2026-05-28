@@ -299,7 +299,15 @@ pub async fn ollama_get_status(
     selected_model: Option<String>,
     mode: Option<String>,
     context_limit_override: Option<u32>,
+    app_handle: tauri::AppHandle,
 ) -> Result<OllamaStatus, String> {
+    use tauri::Manager;
+    let app_config = app_handle.state::<crate::config::AppConfig>();
+    let ollama_fallback = app_config
+        .default_model
+        .get("ollama")
+        .cloned()
+        .unwrap_or_else(|| "gpt-oss:120b-cloud".to_string());
     let base_url = base_url.unwrap_or_else(|| "http://localhost:11434".to_string());
     let selected_mode = mode.unwrap_or_else(|| "local".to_string()).to_lowercase();
     let installed_path = find_ollama_binary();
@@ -407,7 +415,7 @@ pub async fn ollama_get_status(
 
     let selected = selected_model.clone().filter(|m| !m.trim().is_empty()).or_else(|| {
         if selected_mode == "cloud" {
-            Some("gpt-oss:120b-cloud".to_string())
+            Some(ollama_fallback.clone())
         } else {
             local_models.first().map(|m| m.name.clone())
         }
@@ -424,7 +432,7 @@ pub async fn ollama_get_status(
         .unwrap_or(false);
 
     let (cloud_connected, cloud_message) = if selected_mode == "cloud" {
-        let probe_model = selected.clone().unwrap_or_else(|| "gpt-oss:120b-cloud".to_string());
+        let probe_model = selected.clone().unwrap_or(ollama_fallback);
         match ollama_chat_probe(&base_url, &probe_model).await {
             Ok(()) => (true, Some("Connected to Ollama".to_string())),
             Err(detail) => (false, Some(friendly_ollama_cloud_message(&detail))),

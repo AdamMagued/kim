@@ -1,5 +1,5 @@
 use crate::*;
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+use tiny_http::{Method, Request, Server};
 use tauri::Manager;
 use std::time::Duration;
 
@@ -1423,10 +1423,13 @@ fn handle_bridge_result_request(
         "reqId": req_id,
     }));
 
+    let app_config = app_handle.state::<crate::config::AppConfig>();
+    let timeout_secs = app_config.bridge_timeout_secs;
+
     let result = collect_bridge_payload(
         &window,
         &req_id,
-        Duration::from_secs(BRIDGE_COMPLETION_TIMEOUT_S),
+        Duration::from_secs(timeout_secs),
     );
 
     let mut should_hide = false;
@@ -1609,8 +1612,10 @@ fn show_screenshot_flash_impl(app_handle: &tauri::AppHandle) {
             let win: tauri::WebviewWindow = win;
             let _ = win.set_ignore_cursor_events(true);
             let win_for_close = win.clone();
+            let config = app_handle.state::<crate::config::AppConfig>();
+            let delay_ms = config.screenshot_flash_duration_ms;
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(3300));
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 let _ = win_for_close.close();
             });
         }
@@ -1714,11 +1719,14 @@ pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Resul
     // Best-effort remove legacy cleartext token
     let _ = std::fs::remove_file(sessions_dir.join(".bridge_token"));
 
+    let app_config = app_handle.state::<crate::config::AppConfig>();
+    let timeout_secs = app_config.bridge_timeout_secs;
+
     std::thread::spawn(move || {
         eprintln!(
             "[Kim] In-app browser bridge listening at {} (mode=sentinel_v1, timeout={}s)",
             base_url,
-            BRIDGE_COMPLETION_TIMEOUT_S,
+            timeout_secs,
         );
         for request in server.incoming_requests() {
             let app = app_handle.clone();

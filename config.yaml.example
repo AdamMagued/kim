@@ -10,6 +10,12 @@ custom_sites: {}
 logging:
   level: INFO
 max_iterations: 25
+# Timeout duration in seconds for in-app browser completions
+bridge_timeout_secs: 720
+# Duration in milliseconds for the screenshot white flash animation overlay
+screenshot_flash_duration_ms: 3300
+# IPC event protocol format ("legacy" or "typed")
+ipc_protocol: legacy
 max_tokens: 4096
 memory_keep_screenshots: 4
 memory_max_messages: 40

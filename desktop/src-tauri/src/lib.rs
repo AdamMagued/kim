@@ -7,8 +7,8 @@ use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Listener, Manager, State};
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+use tauri::{Emitter, Listener, Manager};
+use tiny_http::{Header, Request, Response, StatusCode};
 use tokio::sync::Mutex;
 
 mod google_oauth;
@@ -21,6 +21,7 @@ pub mod relay;
 pub mod run_history;
 pub mod session_commands;
 pub mod voice_config;
+pub mod config;
 
 // Re-export commonly used types/helpers from submodules so remaining lib.rs
 // code (session listing, run history, codex file-bridge) can use them unqualified.
@@ -137,7 +138,6 @@ static WEBVIEW_BRIDGE_NOTIFY: OnceLock<(StdMutex<()>, Condvar)> = OnceLock::new(
 static WEBVIEW_WAS_HIDDEN: OnceLock<StdMutex<std::collections::HashSet<String>>> = OnceLock::new();
 /// Debug/testing mode: keep the provider webview visible while sending.
 static WEBVIEW_KEEP_VISIBLE: OnceLock<StdMutex<bool>> = OnceLock::new();
-const BRIDGE_COMPLETION_TIMEOUT_S: u64 = 720;
 /// PID of the currently-running agent subprocess, accessible from both the
 /// sync bridge thread (/v1/task, /v1/cancel) and the async Tauri commands.
 static BRIDGE_TASK_PID: OnceLock<StdMutex<Option<u32>>> = OnceLock::new();
@@ -2822,6 +2822,9 @@ fn run_bridge_completion_once(
     completion_hash: Option<&str>,
     model_tier: Option<&str>,
 ) -> Result<BridgeCompleteResponse, String> {
+    let app_config = window.state::<config::AppConfig>();
+    let timeout_secs = app_config.bridge_timeout_secs;
+
     let req_id = format!(
         "r-{}-{}",
         std::process::id(),
@@ -2836,7 +2839,7 @@ fn run_bridge_completion_once(
             "promptLen": prompt.len(),
             "attachments": attachments.len(),
             "collectorMode": "sentinel_v1",
-            "collectorTimeoutS": BRIDGE_COMPLETION_TIMEOUT_S,
+            "collectorTimeoutS": timeout_secs,
         }),
     );
 
@@ -2929,7 +2932,7 @@ fn run_bridge_completion_once(
         "bridge collect begin",
         serde_json::json!({
             "reqId": req_id,
-            "timeoutS": BRIDGE_COMPLETION_TIMEOUT_S,
+            "timeoutS": timeout_secs,
             "mode": "sentinel_v1",
         }),
     );
@@ -2937,7 +2940,7 @@ fn run_bridge_completion_once(
     let result = collect_bridge_payload(
         window,
         &req_id,
-        Duration::from_secs(BRIDGE_COMPLETION_TIMEOUT_S),
+        Duration::from_secs(timeout_secs),
     );
 
     agent_debug_log(
@@ -3753,11 +3756,12 @@ fn ollama_openai_base_url(base_url: Option<&str>) -> String {
     }
 }
 
-async fn selected_ollama_codex_model(
+pub(crate) async fn selected_ollama_codex_model(
     mode: Option<&str>,
     base_url: Option<&str>,
     local_model: Option<&str>,
     cloud_model: Option<&str>,
+    config: &config::AppConfig,
 ) -> Result<String, String> {
     let mode = mode.unwrap_or("cloud").trim().to_ascii_lowercase();
     if mode == "local" {
@@ -3776,14 +3780,15 @@ async fn selected_ollama_codex_model(
         }
         return Err("Pick or pull an Ollama local model before running Codex with Ollama Local.".to_string());
     }
+    let fallback = config.default_model.get("ollama").map(|s| s.as_str()).unwrap_or("gpt-oss:120b-cloud");
     Ok(cloud_model
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("gpt-oss:120b-cloud")
+        .unwrap_or(fallback)
         .to_string())
 }
 
-async fn configure_codex_direct_provider(
+pub(crate) async fn configure_codex_direct_provider(
     cmd: &mut tokio::process::Command,
     provider_arg: &str,
     kim_root: &Path,
@@ -3791,6 +3796,7 @@ async fn configure_codex_direct_provider(
     ollama_mode: Option<&str>,
     ollama_local_model: Option<&str>,
     ollama_cloud_model: Option<&str>,
+    config: &config::AppConfig,
 ) -> Result<String, String> {
     let provider = provider_arg.trim().to_ascii_lowercase();
     match provider.as_str() {
@@ -3800,6 +3806,7 @@ async fn configure_codex_direct_provider(
                 ollama_base_url,
                 ollama_local_model,
                 ollama_cloud_model,
+                config,
             ).await?;
             cmd.arg("--model").arg(&model)
                 .env("OPENAI_BASE_URL", ollama_openai_base_url(ollama_base_url))
@@ -3810,8 +3817,9 @@ async fn configure_codex_direct_provider(
         "openai" => {
             let key = read_env_file_var(kim_root, "OPENAI_API_KEY")
                 .ok_or_else(|| "Codex with OpenAI needs OPENAI_API_KEY in the environment or Kim's .env.".to_string())?;
+            let fallback = config.default_model.get("openai").map(|s| s.as_str()).unwrap_or("openai/gpt-4o");
             let model = read_first_env_file_var(kim_root, &["CODEX_OPENAI_MODEL", "OPENAI_MODEL"])
-                .unwrap_or_else(|| "openai/gpt-4o".to_string());
+                .unwrap_or_else(|| fallback.to_string());
             cmd.arg("--model").arg(&model)
                 .env("OPENAI_API_KEY", key);
             if let Some(base) = read_env_file_var(kim_root, "OPENAI_BASE_URL") {
@@ -3822,8 +3830,9 @@ async fn configure_codex_direct_provider(
         "deepseek" => {
             let key = read_env_file_var(kim_root, "DEEPSEEK_API_KEY")
                 .ok_or_else(|| "Codex with DeepSeek needs DEEPSEEK_API_KEY in the environment or Kim's .env.".to_string())?;
+            let fallback = config.default_model.get("deepseek").map(|s| s.as_str()).unwrap_or("deepseek-chat");
             let model = read_first_env_file_var(kim_root, &["CODEX_DEEPSEEK_MODEL", "DEEPSEEK_MODEL"])
-                .unwrap_or_else(|| "deepseek-chat".to_string());
+                .unwrap_or_else(|| fallback.to_string());
             let base = read_env_file_var(kim_root, "DEEPSEEK_BASE_URL")
                 .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
             cmd.arg("--model").arg(&model)
@@ -3834,8 +3843,9 @@ async fn configure_codex_direct_provider(
         "gemini" => {
             let key = read_env_file_var(kim_root, "GOOGLE_API_KEY")
                 .ok_or_else(|| "Codex with Gemini direct API needs GOOGLE_API_KEY in the environment or Kim's .env. Kim's Google OAuth token is only wired into the Chat provider path.".to_string())?;
+            let fallback = config.default_model.get("gemini").map(|s| s.as_str()).unwrap_or("gemini-2.0-flash");
             let model = read_first_env_file_var(kim_root, &["CODEX_GEMINI_MODEL", "GEMINI_MODEL"])
-                .unwrap_or_else(|| "gemini-2.0-flash".to_string());
+                .unwrap_or_else(|| fallback.to_string());
             let base = read_env_file_var(kim_root, "GEMINI_OPENAI_BASE_URL")
                 .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta/openai".to_string());
             cmd.arg("--model").arg(&model)
@@ -3900,6 +3910,8 @@ pub(crate) fn config_yaml_path(project_root: Option<String>) -> PathBuf {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let task_state: TaskState = Arc::new(Mutex::new(RunningTask::default()));
+    let config_path = config_yaml_path(None);
+    let config = config::load_config(&config_path);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -3926,6 +3938,7 @@ pub fn run() {
             Ok(())
         })
         .manage(task_state)
+        .manage(config)
         .invoke_handler(tauri::generate_handler![
             session_commands::list_sessions,
             session_commands::delete_sessions,
