@@ -81,3 +81,29 @@ agent.py calls BrowserProvider.complete()
 3. **MCP tool schema**: mcp_server → agent.py (via stdio)
 4. **Session JSONL**: agent.py → disk → lib.rs → ChatView.tsx
 5. **Tauri events**: lib.rs → ChatView.tsx (via `emit()`)
+
+---
+
+## Preserved decisions (from agent handoff archives)
+
+1. **Browser LLM sign-in detection UX**:
+   - The in-app WebView window for Google/Gemini/Claude authentication is labeled `"kim-browser-signin"`. Heuristic detection categorizes URL pages using provider domain matching while checking for signin/login substrings to determine if a user is "likely signed in".
+   - The React frontend uses the `get_browser_current_url` Tauri command to fetch the WebView URL and dynamically update user-facing prompts/toasts without automating user credentials.
+
+2. **Context Budget and compaction**:
+   - A cumulative input token budget is configured via `config.context_budget_tokens`, `KIM_CONTEXT_BUDGET_TOKENS` environment variable, or default `200_000`.
+   - Budget states are segmented into `ok`, `warn` (≥80%), and `critical` (≥95%). Estimated token usage is calculated for Browser providers, but exact `[STATS]` output is withheld to prevent UI pill conflicts.
+   - Compaction prompts (`__KIM_COMPACT_CONTEXT__`, `compact`, or `/compact`) execute inline LLM summarization, clear active memory, and prompt BrowserProvider with `clear_chat=True` on the subsequent completion request.
+
+3. **Gemini API user-owned OAuth**:
+   - A direct API-based `provider: gemini` runs alongside `browser:gemini`. It implements a Google Cloud OAuth PKCE loopback mechanism to store user OAuth credentials (in secure OS storage) rather than relying on developer-provided global credentials. 
+   - Authenticators pass these tokens down to the agent environment under the `KIM_GOOGLE_ACCESS_TOKEN` variable.
+
+4. **Multi-login mapping via `authuser`**:
+   - Google account multi-login profiles linked within `KimAccount` store `{ email, authuser_index }` pairings.
+   - The active identity's `authuser_index` propagates down to the browser bridge (`authuser` key) via the `/v1/send` endpoint, driving WebView loads to URLs matching `?authuser=N`.
+
+5. **kimTools Gateway security isolation**:
+   - `kimTools` is a separate local API gateway/proxy operating on port 8046.
+   - Hardcoded OAuth credentials have been completely removed from source. It relies exclusively on env vars (`GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET`), falling back to a 503 error when missing.
+
