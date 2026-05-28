@@ -8,168 +8,133 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 ## desktop/src (React/TypeScript UI)
 
 **Main application shell:**
-- `App.tsx` — Root component: settings, session management, theme loading, update checks
-- `main.tsx` — React entry point with Tauri initialization
+- `App.tsx` — Root component: settings panels, session list management, theme configuration, auto-updates
+- `main.tsx` — React entry point with Tauri application initialization and design-tokens CSS import
 
 **Core chat interface:**
-- `components/ChatView.tsx` — Main chat UI: activity feed, trace display, plan parsing, run history, provider switching, retry/cancel logic
-- `components/MessageBubble.tsx` — Message display with role-based styling and typing animation
-- `components/Sidebar.tsx` — Navigation sidebar for sessions and settings
+- `components/ChatView.tsx` — Main chat UI: activity stream, plan checking, input composer, and provider switches
+- `components/MessageBubble.tsx` — Custom conversation bubble rendering with markdown and typing animations
+- `components/kim-ui/RevampSidebar.tsx` — Active navigation sidebar managing sessions, settings, and workspace profiles
 
 **Thinking & plan display:**
-- `components/kim-ui/ThinkingWithPlan.tsx` — Live thinking panel: trace items (`TraceItem[]`), plan card, auto-collapse
-- `components/kim-ui/CollapsiblePlan.tsx` — `PlanStep` / `PlanStepStatus` types and collapsible plan cards
+- `components/kim-ui/ThinkingWithPlan.tsx` — Stream trace viewer representing LLM thoughts, tool outputs, and collapsible plans
+- `components/kim-ui/CollapsiblePlan.tsx` — Nested checklist UI components reflecting dynamic agent tasks
 
 **Settings & configuration:**
-- `components/kim-ui/RevampSettings.tsx` — Multi-pane settings UI (appearance, AI, voice, paths, data, account, MCP, feedback, about)
-- `components/SettingsPanel.tsx` — Settings panel shell
-- `components/ProviderPicker.tsx` — LLM provider selection dropdown
-- `components/BrowserProviderPicker.tsx` — Browser provider (Claude/ChatGPT/Gemini) selector
+- `components/kim-ui/RevampSettings.tsx` — Tabbed settings dialog (Appearance, AI config, paths, MCP tools, and accounts)
+- `components/ProviderPicker.tsx` — Provider model selector dropdown
+- `components/BrowserProviderPicker.tsx` — Browser LLM selector for Playwright session setups
 
 **Other UI components:**
-- `components/OnboardingFlow.tsx` — Initial onboarding walkthrough
-- `components/ToolCallCard.tsx` — Tool call display with args and results
-- `components/PairingModal.tsx` — QR code relay pairing modal (NOTE: missing `qrcode.react` types, pre-existing build error)
-- `components/UpdateModal.tsx` — App update notification and installation
-- `components/Toast.tsx` — Transient notification system
-- `components/CancelWidget.tsx` — Floating task cancellation widget
-- `components/kim-ui/ConnectorsPanel.tsx` — Site-specific connector configuration UI
-- `components/kim-ui/WorkedForPill.tsx` — "Worked for Xs" disclosure pill with run history
+- `components/OnboardingFlow.tsx` — Guided user walkthrough for initial desktop application onboarding
+- `components/ToolCallCard.tsx` — Structured view showing MCP tool execution inputs, parameters, and return states
+- `components/PairingModal.tsx` — Mobile pairing QR code display for the tasks relay server
+- `components/UpdateModal.tsx` — Tauri update alert popup
+- `components/Toast.tsx` — Application toast notifications
+- `components/CancelWidget.tsx` — Persistent overlay for quick execution cancellations
+- `components/kim-ui/ConnectorsPanel.tsx` — Third-party site-specific credentials and cookie status manager
+- `components/kim-ui/WorkedForPill.tsx` — Run-time history indicator showing execution metrics
 
-**Hooks:**
-- `hooks/useTheme.ts` — Theme switching and persistence
-- `hooks/useAccount.ts` — User account state management
-- `hooks/useAuthStatus.ts` — OAuth / authentication status tracking
-- `hooks/useSessions.ts` — Session list and navigation
-
-**Types:**
-- `types/index.ts` — Central type definitions: messages, settings, voice config, providers, sessions
+**Hooks & Styles:**
+- `hooks/useTheme.ts` — Persistent application theme state loader
+- `hooks/useAccount.ts` — Load/save user accounts state via Tauri commands
+- `hooks/useAuthStatus.ts` — OAuth state checkers for third-party cloud auth
+- `hooks/useSessions.ts` — Active chat sessions hook
+- `types/index.ts` — Shared TypeScript type interfaces (messages, providers, settings)
+- `styles/design-tokens.css` — Global CSS variables for design system themes and typography (relocated from design-mocks)
 
 ---
 
 ## desktop/src-tauri/src (Rust Tauri backend)
 
-- `main.rs` — Tauri app entry point and configuration
-- `lib.rs` — ~7420-line Rust shell; central webview bridge, browser sign-in lifecycle, task spawning, and remaining shared Tauri commands
-- `google_oauth.rs` — Google OAuth 2.0 handler for Gemini authentication via system keychain
-- `account.rs`, `codex_projects.rs`, `data_io.rs`, `feedback.rs`, `ollama.rs`, `relay.rs`, `run_history.rs`, `session_commands.rs`, `voice_config.rs` — extracted Tauri command modules registered by `lib.rs`
+- `main.rs` — Rust application bootstrap and Tauri build initialization
+- `lib.rs` — Tauri 2 desktop shell; sets up core command mapping, WebView window parameters, and invokes child processes
+- `google_oauth.rs` — Google OAuth 2.0 PKCE desktop flow handling Google profile linkings
+- `account.rs`, `codex_projects.rs`, `data_io.rs`, `feedback.rs`, `ollama.rs`, `relay.rs`, `run_history.rs`, `session_commands.rs`, `voice_config.rs` — Modular Rust Tauri commands registered into the main handler
 
 ---
 
 ## orchestrator (Python agent engine)
 
 **Agent core:**
-- `agent.py` — Main async agent loop: task execution, LLM provider calls, MCP tool dispatch, screenshot capture, stuck detection, context budgeting, `_build_system_prompt`, `_build_lean_system_prompt`
-- `agent_states.py` — Explicit run-loop termination enum and result helper
-- `cli.py` — CLI parser/entrypoint extracted from `agent.py`
-- `mcp_client.py` — `MultiMCPClient` and MCP stdio session startup
-- `ui_bridge.py` — UI bridge/log handler extracted from `agent.py`
-- `tool_utils.py` — Tool-name normalization and JSON tool-call extraction
-- `task_queue.py` — Local task queue with relay server poller
+- `agent.py` — Core async execution loop: prompts assembly, token limits checking, screenshots, stuck triggers, and tool calls
+- `agent_states.py` — Run states and execution outcome enums
+- `cli.py` — Command-line interface parameters wrapper for standalone invocations
+- `mcp_client.py` — Stdio-based client connection launcher mapping tool calls
+- `ui_bridge.py` — Formatted stdout output logger mapping data streams
+- `tool_utils.py` — Normalizer for tool calls and JSON responses extraction
+- `task_queue.py` — Task queue coordinator for relay integrations
 
 **LLM providers:**
-- `providers/base.py` — Abstract `BaseProvider` interface and factory
-- `providers/claude.py` — Anthropic API (streaming, tool use, vision)
-- `providers/openai_provider.py` — OpenAI GPT integration
-- `providers/gemini.py` — Google Gemini API with OAuth support
-- `providers/deepseek.py` — DeepSeek API integration
-- `providers/ollama.py` — Local Ollama with native tool calls, vision-error retry, image stripping
-- `providers/browser_provider.py` — 25-line compatibility shim
-- `providers/browser/provider.py` — Playwright/CDP and in-app webview bridge BrowserProvider implementation
-- `providers/browser/bridge_client.py` — HTTP client for the Rust in-app bridge
-- `providers/browser/prompt_builder.py` — Prompt/history formatting and attachment extraction
-- `providers/browser/response_parser.py` — Scraped response parsing
-- `providers/browser/site_configs.py` — Site selector maps
+- `providers/base.py` — Core provider abstract classes and initialization maps
+- `providers/claude.py` — Anthropic Claude SDK adapter
+- `providers/openai_provider.py` — OpenAI API integration
+- `providers/gemini.py` — Gemini developer API adapter with OAuth Bearer access
+- `providers/deepseek.py` — DeepSeek API client
+- `providers/ollama.py` — Local Ollama provider support with local vision retries
+- `providers/browser_provider.py` — Compatibility endpoint interface for Webview-backed providers
+- `providers/browser/provider.py` — Playwright browser executor utilizing CDP and WebView hooks
+- `providers/browser/bridge_client.py` — REST proxy link between browser backend and Rust Tauri bridge
+- `providers/browser/prompt_builder.py` — Scraper-compatible prompt and attachments constructor
+- `providers/browser/response_parser.py` — Scrape target analyzer extracts text or tool calls
+- `providers/browser/site_configs.py` — Provider selector DOM maps
 
 **Memory & context:**
-- `memory.py` — Conversation history + compression, sliding window, automatic screenshot pruning
-- `context_meter.py` — Context window budget tracking and per-message token estimation
-- `context_loader.py` — Instruction file discovery and prompt building from project files
-- `compaction.py` — Deterministic message compaction for stateless API providers
+- `memory.py` — Session history compilation, pruning, and screenshot budgets management
+- `context_meter.py` — Token usage estimator and boundary checks for browser/API provider states
+- `context_loader.py` — Instruction files discoverer and prompt context injector
+- `compaction.py` — History summarizing compaction logic for context preservation
 
 **Session management:**
-- `session_store.py` — JSONL session persistence with summaries (kim_sessions/)
-- `relay_worker.py` — Relay server integration for phone-to-PC task dispatch
+- `session_store.py` — JSONL session logging, message caches, and runs log sidecars
+- `archive/relay_worker.py` — Legacy phone-to-PC relay task poller client (archived)
 
 ---
 
 ## mcp_server (Model Context Protocol server — 31 tools)
 
-- `server.py` — Main MCP server (stdio transport); imports tools/dispatch from `tool_registry.py`; Claude Desktop / Claude Code compatible
-- `tool_registry.py` — MCP tool definitions and dispatch map
-- `config.py` — Configuration loading from config.yaml and environment variables
-- `logger.py` — JSON Lines structured logging to logs/kim_{date}.jsonl
-- `os_utils.py` — Cross-platform OS detection and command translation (Windows / macOS / Linux)
+- `server.py` — Stdio transport MCP server router; processes incoming tool calls
+- `tool_registry.py` — Central catalog and schema definitions for the 31 OS-control tools
+- `config.py` — Environment variables and config.yaml loader
+- `logger.py` — JSON structured logger outputting execution histories
+- `os_utils.py` — Platform translator adapting file, process, and system commands to Windows/macOS/Linux
 
 **Tools:**
-- `tools/files.py` — read_file, write_file, list_dir, delete_file (path validation vs PROJECT_ROOT)
-- `tools/shell.py` — run_command, run_powershell (cross-platform via os_utils.translate_command)
-- `tools/keyboard.py` — type_text, hotkey, key_press
-- `tools/mouse.py` — click, double_click, right_click, drag, scroll
-- `tools/windows.py` — get_windows, focus_window, resize_window (pygetwindow / osascript / wmctrl)
-- `tools/screen.py` — take_screenshot, take_annotated_screenshot, get_screen_info
-- `tools/screen_annotator.py` — Screenshot annotation with bounding boxes
-- `tools/web.py` — web_open, web_observe, web_click, web_fill, web_press, web_text, web_screenshot, web_wait_for, web_wait_for_url, web_back, web_close, web_resolve
-- `tools/web_element_scoring.py` — Element scoring helpers for web resolver
-- `tools/web_observe_js.py` — DOM observation JavaScript blob
-- `tools/codex_bridge.py` — Browser-backed Codex proxy bridge library
-- `tools/git.py` — git_status, git_diff, git_add, git_commit, git_log, git_checkout
-- `tools/code.py` — run_python, run_node, lint_file (ruff / flake8)
-- `tools/search.py` — search_in_files (grep/ripgrep), find_files (glob)
+- `tools/files.py` — Projects root-scoped read, write, listing, and delete actions
+- `tools/shell.py` — Process exec shell triggers matching OS environments
+- `tools/keyboard.py` — PyAutoGUI keystrokes, text injections, and shortcuts actions
+- `tools/mouse.py` — Target pointer controls (clicks, drags, double clicks, scrolls)
+- `tools/windows.py` — Desktop window listings and focus management via system APIs
+- `tools/screen.py` — Desktop screen vision capture and monitors queries
+- `tools/screen_annotator.py` — Graphic annotator applying numeric bounding boxes
+- `tools/web.py` — Browser navigation, page inspection, DOM click, form fillers, and screenshots actions
+- `tools/web_element_scoring.py` — Numeric prioritizer scoring elements for target queries
+- `tools/web_observe_js.py` — Client JS observer recording interactive elements
+- `tools/codex_bridge.py` — Local proxy wrapper linking tools to Codex executor calls
+- `tools/git.py` — Sandboxed Git status, diffs, commits, branches, and logs execution
+- `tools/code.py` — Local runtime builders for Python and NodeJS snippets with linter hooks
+- `tools/search.py` — Quick local file searchers (ripgrep / file finder)
 
 ---
 
-## pythonExperimentTool/claw-code/rust/crates/kim-cli/src (Rust TUI CLI)
+## relay_server (FastAPI phone-to-PC tasks coordinator)
 
-- `main.rs` — CLI entry point; non-blocking tokio event loop (current_thread); `App` struct with follow-mode scroll, mouse capture, streaming task spawn/cancel; `drain_events` / `apply_app_event` for channel-fed `AppEvent`s
-- `ui.rs` — Ratatui rendering: header, body (chat + bottom-docked thinking panel), input, status, session browser, model picker, slash palette; bottom-anchored auto-scroll via `follow: bool` + `last_max_scroll: Cell<u16>`
-- `thinking.rs` — Thinking visualization: braille/line/moon/block spinners, shimmer text, pulse dot, `TraceItem` enum (Thought / Tool / Plan), `draw_thinking_panel`
-- `theme.rs` — `Theme` struct (Copy); two themes: `DarkNeovim`, `QuietLight`
-- `provider.rs` — `AppEvent` enum; `stream_kim_request` (desktop bridge → streaming SSE); `stream_openai_compatible` (OpenAI/Ollama/Gemini/DeepSeek); `stream_anthropic` (Anthropic SSE); `ThinkParser` (<think> tag state machine)
-- `commands.rs` — `/login`, `/provider`, `/model`, `/git`, `/run`, `/search`, `/files`, `/compact`, `/sessions`, `/help` and other slash commands
-- `config.rs` — `KimConfig` load/save (provider, model, theme, API keys, base URLs)
-- `sessions.rs` — Session discovery (`discover_sessions`, `discover_project_sessions`), `load_session_messages`, `find_session_by_id`
+- `main.py` — API endpoints managing phone connections, prompt lists, status queries, and WebSocket relays
+- `auth.py` — Simple API-key verification middleware
+- `queue.py` — Local SQLite queue storing queued tasks
+- `models.py` — Pydantic schemas validating task states
 
 ---
 
-## relay_server (FastAPI relay — phone-to-PC task dispatch)
+## extension (Chrome extension browser scraper)
 
-- `main.py` — FastAPI app: POST /prompt, GET /prompt/next, POST /result, GET /result/{task_id}, WS /ws, GET /status
-- `auth.py` — API key middleware (phone_key vs pc_key)
-- `queue.py` — SQLite task queue (tasks table)
-- `models.py` — Pydantic request/response schemas
-
----
-
-## extension (Chrome extension)
-
-- `manifest.json` — Permissions and content_scripts for claude.ai, chatgpt.com, gemini.google.com, chat.deepseek.com
-- `background.js` — Service worker: parses `## FILE:` / `## CMD:` blocks, POSTs to Kim bridge, relay status tracking
-- `content_claude.js` — Claude.ai selectors and auto-loop logic
-- `content_chatgpt.js` — ChatGPT.com selectors and auto-loop logic
-- `content_gemini.js` — Gemini selectors and auto-loop logic
-- `content_deepseek.js` — DeepSeek selectors and auto-loop logic
-- `popup.js` — Popup UI: auto-loop toggle, relay/bridge connection status
+- `manifest.json` — Chrome extension descriptors mapping permissions and scripts to Claude/ChatGPT/Gemini
+- `background.js` — Core extension worker coordinating page loads, DOM scrape outputs, and Tauri bridge posts
+- `content_claude.js`, `content_chatgpt.js`, `content_gemini.js`, `content_deepseek.js` — Target DOM scrapers translating visual page state to JSON feeds
+- `popup.js` — Status UI controlling extension scraper toggles and service links
 
 ---
 
-## tray (System tray app)
+## pythonExperimentTool/claw-code (TUI client)
 
-- `app.py` — pystray tray icon + VoiceEngine init; spawns KimAgent; speaks on task done
-- `ui.py` — Tkinter ControlPanel window: task input, provider switch, live log, voice toggle
-- `settings.py` — Settings window: API keys, paths, preferences
-- `voice.py` — `VoiceEngine`: dual-backend TTS (Kokoro local / HTTP API), `clean_for_speech()`, non-blocking playback via ThreadPoolExecutor
-
----
-
-## Key architectural patterns
-
-1. **MCP protocol** — All OS control flows through `mcp_server/server.py` over stdio
-2. **Provider abstraction** — All LLM calls go through `BaseProvider`; unified `{"role","content"}` messages
-3. **Cross-platform** — `os_utils.py` translates commands; platform-specific window backends
-4. **Session persistence** — JSONL in `kim_sessions/` with per-session `.runs.json` sidecar for run history
-5. **Context budgeting** — `ContextMeter` tracks input tokens; compaction activates at thresholds
-6. **Screenshot lifecycle** — Auto-pruned from older messages to preserve token budget
-7. **Browser provider** — Playwright CDP + persistent cookie storage (`sessions/chrome_data/`)
-8. **Streaming TUI** — tokio single-thread runtime; `stream_kim_request` → `UnboundedSender<AppEvent>` → `drain_events` at 33ms cadence; `ThinkParser` routes `<think>` tags to trace panel
-9. **Follow-mode scroll** — `App.follow: bool`; `last_max_scroll: Cell<u16>` published by `draw_chat` each frame; mouse wheel + arrow keys engage/disengage follow
+- `rust/crates/kim-cli/src` — Complete TUI interface: single-threaded event loop, Ratatui render interfaces, TUI configurations, local TUI session explorers, and TUI shortcuts
