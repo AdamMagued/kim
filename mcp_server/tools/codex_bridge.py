@@ -1,6 +1,11 @@
 """
 Codex Bridge — relay module.
 
+NOTE: The Tauri subprocess spawn now uses orchestrator/codex_bridge_service.py
+(Phase 7). This module remains the canonical home for _CodexProxy and
+run_codex_subtask, which are imported by codex_bridge_service. It will be
+deleted once the new service has been verified end-to-end in production.
+
 Spawns an OpenAI Codex CLI subprocess and routes its LLM calls through
 Kim's BrowserProvider via a local HTTP proxy server.
 
