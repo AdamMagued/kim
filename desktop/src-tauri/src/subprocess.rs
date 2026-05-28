@@ -4,6 +4,28 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tauri::State;
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum KimEvent {
+    Status { message: String },
+    Plan { steps: Vec<serde_json::Value> },
+    Step { n: usize, data: serde_json::Value },
+    Done { n: usize },
+    Context {
+        cumulative_input: u64,
+        budget: u64,
+        phase: String,
+        percent: u32,
+        last_input: u64,
+        last_output: u64,
+        source: String,
+        estimate: bool,
+    },
+    Stats { input: u64, output: u64, total: u64 },
+    UiScreenshotFlash,
+    UiShow,
+}
+
 pub(crate) fn find_python_interpreter(project_root: &Path) -> Result<String, String> {
     let candidates = [
         project_root.join("venv").join("bin").join("python"),
@@ -502,13 +524,56 @@ pub(crate) async fn send_task(
         *guard = child_pid;
     }
 
+    let ipc_typed = app_config.ipc_protocol == "typed";
     let stdout_handle = if let Some(stdout) = child.stdout.take() {
         let reader = tokio::io::BufReader::new(stdout);
         let app = app_handle.clone();
         Some(tokio::spawn(async move {
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let _ = app.emit("kim-agent-output", line);
+                if ipc_typed {
+                    if let Ok(event) = serde_json::from_str::<KimEvent>(&line) {
+                        match &event {
+                            KimEvent::Status { message } => {
+                                let _ = app.emit("kim:status", serde_json::json!({"message": message}));
+                            }
+                            KimEvent::Plan { steps } => {
+                                let _ = app.emit("kim:plan", serde_json::json!({"steps": steps}));
+                            }
+                            KimEvent::Step { n, data } => {
+                                let _ = app.emit("kim:step", serde_json::json!({"n": n, "data": data}));
+                            }
+                            KimEvent::Done { n } => {
+                                let _ = app.emit("kim:done", serde_json::json!({"n": n}));
+                            }
+                            KimEvent::Context { cumulative_input, budget, phase, percent, last_input, last_output, source, estimate } => {
+                                let _ = app.emit("kim:context", serde_json::json!({
+                                    "cumulative_input": cumulative_input,
+                                    "budget": budget,
+                                    "phase": phase,
+                                    "percent": percent,
+                                    "last_input": last_input,
+                                    "last_output": last_output,
+                                    "source": source,
+                                    "estimate": estimate,
+                                }));
+                            }
+                            KimEvent::Stats { input, output, total } => {
+                                let _ = app.emit("kim:stats", serde_json::json!({"input": input, "output": output, "total": total}));
+                            }
+                            KimEvent::UiScreenshotFlash => {
+                                let _ = app.emit("kim:ui", serde_json::json!({"action": "screenshot_flash"}));
+                            }
+                            KimEvent::UiShow => {
+                                let _ = app.emit("kim:ui", serde_json::json!({"action": "show"}));
+                            }
+                        }
+                    }
+                    // Always dual-emit on legacy channel so existing TypeScript parsers still run
+                    let _ = app.emit("kim-agent-output", &line);
+                } else {
+                    let _ = app.emit("kim-agent-output", &line);
+                }
             }
         }))
     } else {
@@ -731,3 +796,92 @@ pub(crate) fn process_exists(pid: u32) -> bool {
         Err(_) => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_find_python_finds_venv() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let root = tmp.path();
+
+        // Create a fake venv/bin/python
+        let venv_bin = root.join("venv").join("bin");
+        fs::create_dir_all(&venv_bin).unwrap();
+        let python_path = venv_bin.join("python");
+        fs::write(&python_path, "#!/bin/sh\n").unwrap();
+
+        // Make it "exist" (the function only checks .exists(), not executability)
+        let result = find_python_interpreter(root);
+        assert!(result.is_ok(), "Expected Ok, got {:?}", result);
+        let found = result.unwrap();
+        assert!(
+            found.contains("venv"),
+            "Expected venv path, got: {}",
+            found
+        );
+    }
+
+    #[test]
+    fn test_find_python_finds_dot_venv() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let root = tmp.path();
+
+        // Create a fake .venv/bin/python (no venv/)
+        let venv_bin = root.join(".venv").join("bin");
+        fs::create_dir_all(&venv_bin).unwrap();
+        let python_path = venv_bin.join("python");
+        fs::write(&python_path, "#!/bin/sh\n").unwrap();
+
+        let result = find_python_interpreter(root);
+        assert!(result.is_ok());
+        let found = result.unwrap();
+        assert!(
+            found.contains(".venv"),
+            "Expected .venv path, got: {}",
+            found
+        );
+    }
+
+    #[test]
+    fn test_find_python_prefers_venv_over_dot_venv() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let root = tmp.path();
+
+        // Create both venv/ and .venv/
+        for dir_name in &["venv", ".venv"] {
+            let venv_bin = root.join(dir_name).join("bin");
+            fs::create_dir_all(&venv_bin).unwrap();
+            fs::write(venv_bin.join("python"), "#!/bin/sh\n").unwrap();
+        }
+
+        let result = find_python_interpreter(root);
+        assert!(result.is_ok());
+        let found = result.unwrap();
+        // venv/ comes first in the candidate list
+        assert!(
+            found.contains("/venv/") && !found.contains("/.venv/"),
+            "Expected venv/ to be preferred over .venv/, got: {}",
+            found
+        );
+    }
+
+    #[test]
+    fn test_find_python_fallback_to_system() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let root = tmp.path();
+        // No venv directories — should fall back to system python3/python
+
+        let result = find_python_interpreter(root);
+        // On a system with Python installed this should succeed;
+        // on CI without Python it may fail — both are valid.
+        // We just verify it doesn't panic.
+        match result {
+            Ok(cmd) => assert!(!cmd.is_empty()),
+            Err(msg) => assert!(msg.contains("No Python interpreter")),
+        }
+    }
+}
+

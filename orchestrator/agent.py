@@ -57,6 +57,7 @@ from mcp import ClientSession
 from orchestrator.context_meter import (
     DEFAULT_CONTEXT_BUDGET_TOKENS,
     ContextMeter,
+    ContextSnapshot,
     coerce_budget,
     estimate_request_tokens,
 )
@@ -278,6 +279,7 @@ class KimAgent:
                     self._last_step_signature = ""  # reset step dedupe on new plan
                     self._last_done_signature = ""
                     self._log("INFO", f"[STATUS] [PLAN]{sig}")
+                    print(json.dumps({"type": "plan", "steps": plan_payload["steps"]}, separators=(",", ":"), ensure_ascii=False), flush=True)
 
         # ── STEP markers ────────────────────────────────────────────────
         # Match the LAST step marker in this turn (the most recent one wins —
@@ -298,6 +300,7 @@ class KimAgent:
                 self._last_step_signature = sig
                 self._current_step_index = int(m.group(1))
                 self._log("INFO", f"[STATUS] [STEP]{sig}")
+                print(json.dumps({"type": "step", "n": step_payload["index"], "data": step_payload}, separators=(",", ":"), ensure_ascii=False), flush=True)
 
         # ── DONE markers ────────────────────────────────────────────────
         done_matches = list(
@@ -314,6 +317,7 @@ class KimAgent:
             if sig != self._last_done_signature:
                 self._last_done_signature = sig
                 self._log("INFO", f"[STATUS] [DONE]{sig}")
+                print(json.dumps({"type": "done", "n": done_payload["index"]}, separators=(",", ":"), ensure_ascii=False), flush=True)
 
     def _is_preview_mode(self) -> bool:
         if self._ui_bridge is not None:
@@ -375,10 +379,14 @@ class KimAgent:
                 f" output_tokens={output_tokens}"
                 f" total_tokens={total}",
             )
+            print(json.dumps({"type": "stats", "input": input_tokens, "output": output_tokens, "total": total}, separators=(",", ":"), ensure_ascii=False), flush=True)
 
         if usage:
             try:
                 self._log("INFO", f"[USAGE] {json.dumps(usage, ensure_ascii=False, separators=(',', ':'))}")
+                _usage_typed: dict = {"type": "usage"}
+                _usage_typed.update(usage)
+                print(json.dumps(_usage_typed, ensure_ascii=False, separators=(",", ":")), flush=True)
             except Exception:
                 logger.debug("Failed to serialize usage payload", exc_info=True)
 
@@ -392,10 +400,30 @@ class KimAgent:
             return
         self._persist_context_state_extra({"needs_fresh_chat": self._clear_chat_on_next_call})
         self._log("INFO", snapshot.to_log_line())
+        self._print_context_json(snapshot)
 
     def _emit_context_snapshot(self) -> None:
         snapshot = self._context_meter.snapshot(source="session", estimated=False)
         self._log("INFO", snapshot.to_log_line())
+        self._print_context_json(snapshot)
+
+    def _print_context_json(self, snapshot: ContextSnapshot) -> None:
+        """Emit a typed JSON context line to stdout for the Rust typed-IPC parser."""
+        print(json.dumps(
+            {
+                "type": "context",
+                "cumulative_input": snapshot.cumulative_input,
+                "budget": snapshot.budget,
+                "phase": snapshot.phase,
+                "percent": int(round(snapshot.ratio * 100)),
+                "last_input": snapshot.last_input,
+                "last_output": snapshot.last_output,
+                "source": snapshot.source,
+                "estimate": snapshot.estimated,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ), flush=True)
 
     def _persist_context_state_extra(self, extra: dict[str, Any] | None = None) -> None:
         state = self._context_meter.to_metadata()
@@ -418,7 +446,7 @@ class KimAgent:
             {"success": bool, "summary": str, "screenshot": str (base64)}
         """
         self._log("INFO", f"=== Starting task: {task!r} ===")
-        print("[STATUS] Kim is working on it…", flush=True)
+        print(json.dumps({"type": "status", "message": "Kim is working on it…"}, separators=(",", ":"), ensure_ascii=False), flush=True)
         self._screenshot_hashes = []
         # Reset plan/step dedupe so a fresh PLAN block at the start of this
         # task is always forwarded to the UI (even if the previous task
@@ -827,7 +855,7 @@ class KimAgent:
         if _is_screenshot:
             # SCREENSHOT_FLASH tells ChatView to trigger the aura animation AND
             # hide only the main window (not the flash overlay window).
-            print("[UI] SCREENSHOT_FLASH", flush=True)
+            print(json.dumps({"type": "ui_screenshot_flash"}, separators=(",", ":"), ensure_ascii=False), flush=True)
             if self._ui_bridge:
                 try:
                     await self._ui_bridge.hide_for_screenshot()
@@ -849,7 +877,7 @@ class KimAgent:
             output = f"ERROR calling {name}: {e}"
         finally:
             if _is_screenshot:
-                print("[UI] SHOW", flush=True)
+                print(json.dumps({"type": "ui_show"}, separators=(",", ":"), ensure_ascii=False), flush=True)
                 if self._ui_bridge:
                     try:
                         await self._ui_bridge.show_after_screenshot()
@@ -1316,6 +1344,7 @@ Rules:
         self._clear_chat_on_next_call = True
         self._persist_context_state_extra({"needs_fresh_chat": True})
         self._log("INFO", snapshot.to_log_line())
+        self._print_context_json(snapshot)
 
         done = f"TASK_COMPLETE: Compacted context into {artifact_path.name}; fresh chat memory is ready."
         self._session_store.append_message({"role": "assistant", "content": done})
@@ -1345,6 +1374,7 @@ Rules:
         compacted_at = datetime.now(timezone.utc).isoformat()
         snapshot = self._context_meter.reset_after_compact(compacted_at=compacted_at)
         self._log("INFO", snapshot.to_log_line())
+        self._print_context_json(snapshot)
 
         # Persist compacted history to session store
         try:
