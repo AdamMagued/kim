@@ -37,4 +37,9 @@ def make_run_result(
     This helper keeps that contract in one place.
     """
     success = termination == AgentTermination.TASK_COMPLETE
-    return {"success": success, "summary": summary, "screenshot": screenshot}
+    return {
+        "success": success,
+        "termination": termination.value,
+        "summary": summary,
+        "screenshot": screenshot,
+    }

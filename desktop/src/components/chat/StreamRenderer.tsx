@@ -1,5 +1,5 @@
 import type { RefObject } from 'react';
-import type { ActivityItem, CodexRunGroup, TouchedFile, PendingTask } from './types';
+import type { ActivityItem, CodexRunGroup, TouchedFile, PendingTask, HitlApprovalStatus } from './types';
 import type { KimMessage, Settings, KimAccount } from '../../types';
 import { MessageBubble } from '../MessageBubble';
 import { SignalCard } from '../ToolCallCard';
@@ -73,6 +73,7 @@ export interface StreamRendererProps {
   runHistory: { activity: ActivityItem[]; durationSec: number }[];
   codexRuns: CodexRunGroup[];
   taskError: string | null;
+  hitlApprovalStatus: HitlApprovalStatus | null;
   settings: Settings;
   newChatMode: boolean;
   activity: ActivityItem[];
@@ -107,6 +108,7 @@ export function StreamRenderer({
   runHistory,
   codexRuns,
   taskError,
+  hitlApprovalStatus,
   settings,
   newChatMode,
   activity,
@@ -150,6 +152,37 @@ export function StreamRenderer({
           planLook="card"
           style={{ flex: 1, minWidth: 0 }}
         />
+      </div>
+    );
+  }
+
+  function renderHitlStatus() {
+    if (!hitlApprovalStatus) return null;
+    const state =
+      hitlApprovalStatus.approved === null
+        ? 'Waiting for approval'
+        : hitlApprovalStatus.approved
+          ? 'Approved'
+          : 'Denied';
+    const detail =
+      hitlApprovalStatus.approved === null
+        ? 'Kim paused before a high-risk action.'
+        : hitlApprovalStatus.approved
+          ? 'Kim can continue with the approved action.'
+          : 'Kim will choose another approach or ask for help.';
+
+    return (
+      <div className="kim-msg-row kim-msg-row--assistant">
+        <div
+          className={`kim-hitl-status${hitlApprovalStatus.approved === false ? ' kim-hitl-status--denied' : ''}`}
+          role="status"
+          aria-live="polite"
+        >
+          <span className="kim-hitl-status__label">{state}</span>
+          <span className="kim-hitl-status__body">
+            {detail} Tool: {hitlApprovalStatus.tool}. Risk: {hitlApprovalStatus.risk} ({hitlApprovalStatus.reason}).
+          </span>
+        </div>
       </div>
     );
   }
@@ -277,8 +310,6 @@ export function StreamRenderer({
                   : 'Pick up where you left off, or start fresh.'}
               </p>
 
-              {renderComposer(true)}
-
               <div
                 style={{
                   display: 'flex',
@@ -346,6 +377,8 @@ export function StreamRenderer({
             });
           })()}
 
+          {renderHitlStatus()}
+
           {/* Error / retry */}
           {taskError && taskError !== 'agent-error' && (
             <div className="kim-msg-row kim-msg-row--assistant">
@@ -400,7 +433,7 @@ export function StreamRenderer({
           <div ref={bottomRef as any} />
         </div>
 
-        {!empty && renderComposer(false)}
+        {renderComposer(false)}
       </div>
     );
   }
@@ -527,6 +560,8 @@ export function StreamRenderer({
                 );
               });
             })()}
+
+            {renderHitlStatus()}
 
             {taskError && (
               <div className="kim-msg-row kim-msg-row--assistant">

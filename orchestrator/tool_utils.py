@@ -9,7 +9,7 @@ Extracted from orchestrator/agent.py. Used by KimAgent to:
 
 import json
 import re
-from typing import Any
+from typing import Any, Optional
 
 _TOOL_NAME_ALIASES = {
     "screenshot": "take_screenshot",
@@ -40,7 +40,7 @@ def normalize_tool_name(raw_name: Any) -> str:
 _normalize_tool_name = normalize_tool_name
 
 
-def extract_json_tool_call(content: str) -> dict | None:
+def extract_json_tool_call(content: str) -> Optional[dict]:
     """Find and parse a text-JSON tool call of the form {"tool": "...", "args": {...}}.
 
     Some models (e.g. gpt-oss:20b) cannot use native tool_calls and instead emit

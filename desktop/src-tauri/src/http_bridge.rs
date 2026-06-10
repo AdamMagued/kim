@@ -140,7 +140,17 @@ fn handle_webview_bridge_request(
         }
         (Method::Get, path) if path.starts_with("/v1/ping") => {
             let full_uri = request.url().to_string();
-            let url = tauri::Url::parse(&format!("http://localhost{}", full_uri)).unwrap();
+            let url = match tauri::Url::parse(&format!("http://localhost{}", full_uri)) {
+                Ok(u) => u,
+                Err(e) => {
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid ping URI: {}", e)}),
+                    );
+                    return;
+                }
+            };
             let mut req_id = String::new();
             let mut payload_str = String::new();
             for (key, value) in url.query_pairs() {

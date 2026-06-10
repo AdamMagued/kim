@@ -1,0 +1,144 @@
+/* ════════════════════════════════════════════════════════════════════════════
+   BLOBBY LOADERS — 3, 6, 12, 15, 20
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* Shared: tiny 28×28 display inside the working indicator */
+.kim-blob-loader {
+  width: 28px;
+  height: 28px;
+  display: block;
+  overflow: visible;
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+/* ── Loader 3 — pulsing blob ── */
+@keyframes kim-l03 {
+  0%,100% { transform: scale(0.82); }
+  50%     { transform: scale(1.08); }
+}
+.kim-blob-l3 path {
+  transform-origin: 50px 50px;
+  animation: kim-l03 1.4s ease-in-out infinite;
+}
+
+/* ── Loader 6 — splitting cell ── */
+@keyframes kim-l06a {
+  0%,100% { transform: translateX(-16px) scale(1, 1); }
+  50%     { transform: translateX(0)     scale(0.8, 1.1); }
+}
+@keyframes kim-l06b {
+  0%,100% { transform: translateX(16px)  scale(1, 1); }
+  50%     { transform: translateX(0)     scale(0.8, 1.1); }
+}
+.kim-blob-l6__a {
+  transform-origin: 50px 50px;
+  animation: kim-l06a 1.6s ease-in-out infinite;
+}
+.kim-blob-l6__b {
+  transform-origin: 50px 50px;
+  animation: kim-l06b 1.6s ease-in-out infinite;
+}
+/* Slightly larger for session loading context */
+.kim-messages__loading .kim-blob-loader {
+  width: 40px;
+  height: 40px;
+}
+
+/* ── Loader 12 — pill squeeze ── */
+@keyframes kim-l12 {
+  0%,100% { transform: scaleX(1)   scaleY(1); }
+  25%     { transform: scaleX(.5)  scaleY(1.5); }
+  50%     { transform: scaleX(1)   scaleY(1); }
+  75%     { transform: scaleX(1.5) scaleY(.5); }
+}
+.kim-blob-l12__pill {
+  transform-origin: 50px 50px;
+  animation: kim-l12 1.8s ease-in-out infinite;
+}
+
+/* ── Loader 15 — chasing dots (goo) ── */
+@keyframes kim-l15a {
+  0%   { transform: translateX(-24px); }
+  50%  { transform: translateX(24px); }
+  100% { transform: translateX(-24px); }
+}
+@keyframes kim-l15b {
+  0%   { transform: translateX(-24px); }
+  50%  { transform: translateX(24px); }
+  100% { transform: translateX(-24px); }
+}
+.kim-blob-l15__d1 {
+  transform-origin: 50px 50px;
+  animation: kim-l15a 1.8s ease-in-out infinite;
+}
+.kim-blob-l15__d2 {
+  transform-origin: 50px 50px;
+  animation: kim-l15b 1.8s ease-in-out infinite -0.9s;
+}
+
+/* ── Loader 20 — mitosis ── */
+@keyframes kim-l20a {
+  0%,100% { transform: translateX(0)    scale(1); }
+  50%     { transform: translateX(-14px) scale(.85); }
+}
+@keyframes kim-l20b {
+  0%,100% { transform: translateX(0)   scale(1); }
+  50%     { transform: translateX(14px) scale(.85); }
+}
+.kim-blob-l20__a {
+  transform-origin: 50px 50px;
+  animation: kim-l20a 1.6s ease-in-out infinite;
+}
+.kim-blob-l20__b {
+  transform-origin: 50px 50px;
+  animation: kim-l20b 1.6s ease-in-out infinite;
+}
+
+/* Working indicator: use the blob loader instead of dots */
+.kim-working-indicator {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  margin: 8px 0;
+}
+/* Hide old three-dot indicator if still present */
+.kim-working-indicator__dots { display: none !important; }
+
+/* Reduced motion: pause all blob animations */
+@media (prefers-reduced-motion: reduce) {
+  .kim-chat,
+  .kim-chat__output > *,
+  .kim-composer,
+  .kim-topbar__title {
+    animation: none !important;
+  }
+  .kr-row-hover {
+    transition: none !important;
+  }
+  .kr-row-hover:hover,
+  .kr-row-hover:active {
+    transform: none !important;
+  }
+  .kim-blob-l3 path,
+  .kim-blob-l6__a, .kim-blob-l6__b,
+  .kim-blob-l12__pill,
+  .kim-blob-l15__d1, .kim-blob-l15__d2,
+  .kim-blob-l20__a, .kim-blob-l20__b {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+  }
+  .kim-ob__wordmark, .kim-ob__tagline, .kim-ob__input-shell,
+  .kim-ob__footer, .kim-ob__logo-mark, .kim-ob__screen--in,
+  .kim-ob__github-title, .kim-ob__github-desc, .kim-ob__token-row,
+  .kim-ob__github-actions {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}
+

@@ -11,9 +11,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── Frontend: TypeScript + Vite build ──────────────────────────────────────
+  # ── Frontend: TypeScript + Vite build + Vitest ─────────────────────────────
   frontend:
-    name: Frontend (TS + Vite)
+    name: Frontend (TS + Vite + Vitest)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -34,12 +34,15 @@ jobs:
       - name: TypeScript check
         run: npx tsc --noEmit
 
+      - name: Vitest unit tests
+        run: npm run test
+
       - name: Vite build
         run: npm run build
 
-  # ── Rust: cargo check + clippy ─────────────────────────────────────────────
+  # ── Rust: cargo check + clippy + test ──────────────────────────────────────
   rust:
-    name: Rust (cargo check)
+    name: Rust (check + clippy + test)
     runs-on: ubuntu-latest
 
     steps:
@@ -72,9 +75,40 @@ jobs:
         working-directory: desktop/src-tauri
         run: cargo clippy -- -D warnings
 
-  # ── Python: import check + flake8 lint ────────────────────────────────────
+      - name: cargo test
+        working-directory: desktop/src-tauri
+        run: cargo test
+
+  # ── Rust CLI: fmt + check + test (no Tauri/WebKit deps) ──────────────────
+  rust-cli:
+    name: Rust CLI (fmt + check + test)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable (+ rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Rust cache (cli)
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./cli -> target
+
+      - name: cargo fmt check
+        run: cargo fmt --manifest-path cli/Cargo.toml -- --check
+
+      - name: cargo check
+        run: cargo check --manifest-path cli/Cargo.toml
+
+      - name: cargo test
+        run: cargo test --manifest-path cli/Cargo.toml -- --test-threads=1
+
+  # ── Python: lint + pytest ──────────────────────────────────────────────────
   python:
-    name: Python (lint)
+    name: Python (lint + test)
     runs-on: ubuntu-latest
 
     steps:
@@ -96,7 +130,9 @@ jobs:
             PyYAML \
             httpx \
             aiofiles \
-            flake8
+            flake8 \
+            pytest \
+            pytest-asyncio
 
       - name: flake8 lint (orchestrator)
         run: |
@@ -121,3 +157,10 @@ jobs:
           from orchestrator import context_loader
           print('All orchestrator modules import cleanly.')
           "
+
+      - name: pytest (unit tests)
+        run: |
+          python -m pytest tests/ -v \
+            --ignore=tests/kim_test_suite.py \
+            --ignore=tests/claw_test_suite.py \
+            --ignore=tests/test_gemini_user_project_mode.py

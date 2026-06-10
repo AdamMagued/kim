@@ -89,3 +89,11 @@ export interface ProviderUsageState {
   prompt_eval_duration?: number;
   eval_duration?: number;
 }
+
+/** Last high-risk approval event surfaced by the typed desktop stream. */
+export interface HitlApprovalStatus {
+  tool: string;
+  risk: string;
+  reason: string;
+  approved: boolean | null;
+}

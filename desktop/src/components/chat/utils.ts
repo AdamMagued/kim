@@ -253,6 +253,16 @@ export const HIDDEN_SUBSTRINGS = [
   // Provider internal noise
   'sending to gemini', 'sending to claude', 'sending to chatgpt',
   'getattr(logger, level.lower(), logger.info)(message)',
+  // InteractionPolicy diagnostics (legacy multi-line format that leaked internal state)
+  'Last observe_ui generation', 'Last web_observe generation',
+  'known UI IDs:', 'known web IDs:', 'last UI observe dirty:', 'last observe dirty:',
+  'Suggested next action:', 'POLICY_WARNING', 'POLICY_BLOCK',
+  // External tool stdin chatter (codex/claw inheriting a TTY)
+  'stdin',
+  // Backend routing/startup diagnostics that shouldn't render as thoughts
+  'Routing to Codex',
+  // Native UI tool-result noise
+  'No interactive controls', "title='", 'title="',
 ];
 
 /** Regex patterns that silently drop a line. */
@@ -383,6 +393,8 @@ export const TOOL_MAP: Record<string, { icon: string; label: (args: Record<strin
   grep_search:        { icon: '›', label: a => `Searching for \`${String(a.pattern ?? a.query ?? '')}\`` },
   glob_search:        { icon: '›', label: a => `Searching for \`${String(a.pattern ?? a.glob ?? '')}\`` },
   list_files:         { icon: '›', label: a => `Listing \`${basename(String(a.path ?? a.directory ?? ''))}\`` },
+  get_windows:        { icon: '›', label: _a => 'Listing open windows' },
+  get_screen_info:    { icon: '›', label: _a => 'Reading screen info' },
 };
 
 export function parseLogLine(raw: string, id: number): ActivityItem | null {
@@ -578,7 +590,12 @@ export function synthesizeExchangeActivity(
     slice.push(allMsgs[i]);
   }
 
-  const lastAsstIdx = slice.reduce((acc, m, i) => m.role === 'assistant' ? i : acc, -1);
+  // Exclude only a final *text* answer — a trailing tool-call message
+  // (block-array tool_use or string-JSON tool_call) is still activity.
+  const lastAsstIdx = slice.reduce(
+    (acc, m, i) => isTextOnlyAssistant(m) && !isIntermediateToolCall(m) ? i : acc,
+    -1,
+  );
   const actSlice = lastAsstIdx > 0 ? slice.slice(0, lastAsstIdx) : slice;
   return synthesizeActivityFromMessages(actSlice, TOOL_MAP);
 }
@@ -586,7 +603,7 @@ export function synthesizeExchangeActivity(
 function finalizeCodexRun(userMessage: KimMessage, intermediates: KimMessage[]): CodexRunGroup {
   let finalIdx = -1;
   for (let i = intermediates.length - 1; i >= 0; i--) {
-    if (isTextOnlyAssistant(intermediates[i])) { finalIdx = i; break; }
+    if (isTextOnlyAssistant(intermediates[i]) && !isIntermediateToolCall(intermediates[i])) { finalIdx = i; break; }
   }
   const finalAssistantMessage = finalIdx >= 0 ? intermediates[finalIdx] : null;
   const activityMessages = finalIdx >= 0

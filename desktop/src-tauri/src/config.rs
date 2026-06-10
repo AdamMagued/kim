@@ -104,4 +104,39 @@ ipc_protocol: typed
         assert_eq!(config.screenshot_flash_duration_ms, 3300);
         assert_eq!(config.ipc_protocol, "legacy");
     }
+
+    #[test]
+    fn test_load_config_from_file() {
+        let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let yaml_content = r#"
+max_iterations: 50
+bridge_timeout_secs: 300
+ipc_protocol: typed
+"#;
+        std::fs::write(tmp.path(), yaml_content).unwrap();
+        let config = load_config(tmp.path());
+        assert_eq!(config.max_iterations, 50);
+        assert_eq!(config.bridge_timeout_secs, 300);
+        assert_eq!(config.ipc_protocol, "typed");
+        // Unset fields should use defaults
+        assert_eq!(config.screenshot_flash_duration_ms, 3300);
+    }
+
+    #[test]
+    fn test_load_config_missing_file_returns_defaults() {
+        let config = load_config(Path::new("/nonexistent/path/config.yaml"));
+        assert_eq!(config.max_iterations, 25);
+        assert_eq!(config.bridge_timeout_secs, 720);
+        assert_eq!(config.ipc_protocol, "legacy");
+    }
+
+    #[test]
+    fn test_load_config_invalid_yaml_returns_defaults() {
+        let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        std::fs::write(tmp.path(), "{{{{ this is not valid yaml !@#$").unwrap();
+        let config = load_config(tmp.path());
+        assert_eq!(config.max_iterations, 25);
+        assert_eq!(config.bridge_timeout_secs, 720);
+    }
 }
+

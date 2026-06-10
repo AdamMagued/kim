@@ -10,26 +10,26 @@ describe('Chat Parsers and Plan Extractors', () => {
         {
           id: 1,
           kind: 'status',
+          icon: '',
           text: '[PLAN]{"steps":["Step One","Step Two","Step Three"]}',
-          timestamp: 1000,
         },
         {
           id: 2,
           kind: 'status',
+          icon: '',
           text: '[STEP]{"index":1}',
-          timestamp: 2000,
         },
         {
           id: 3,
           kind: 'status',
+          icon: '',
           text: '[DONE]{"index":1,"summary":"Done step one"}',
-          timestamp: 3000,
         },
         {
           id: 4,
           kind: 'status',
+          icon: '',
           text: '[STEP]{"index":2}',
-          timestamp: 4000,
         },
       ];
 
@@ -48,20 +48,20 @@ describe('Chat Parsers and Plan Extractors', () => {
         {
           id: 1,
           kind: 'status',
+          icon: '',
           text: '[PLAN]{"steps":["Step One","Step Two"]}',
-          timestamp: 1000,
         },
         {
           id: 2,
           kind: 'tool',
+          icon: '',
           text: 'Reading file `test.txt`',
-          timestamp: 2000,
         },
         {
           id: 3,
           kind: 'status',
+          icon: '',
           text: 'Running terminal command',
-          timestamp: 3000,
         },
       ];
 
@@ -106,6 +106,16 @@ describe('Chat Parsers and Plan Extractors', () => {
       }
     });
 
+    it('should parse CONTEXT when source contains ":" (compact path)', () => {
+      const line = '[CONTEXT] cumulative_input=1000 budget=200000 phase=ok percent=1 last_input=100 last_output=5 source=BrowserProvider:compact estimate=1';
+      const parsed = parseAgentLine(line, 1);
+      expect(parsed.type).toBe('context');
+      if (parsed.type === 'context') {
+        expect(parsed.payload.source).toBe('BrowserProvider:compact');
+        expect(parsed.payload.estimate).toBe(true);
+      }
+    });
+
     it('should parse USAGE correctly', () => {
       const line = '[USAGE] {"provider":"openai","model":"gpt-4o","input":150,"output":50}';
       const parsed = parseAgentLine(line, 1);
@@ -124,6 +134,59 @@ describe('Chat Parsers and Plan Extractors', () => {
       expect(parsed.type).toBe('need_help');
       if (parsed.type === 'need_help') {
         expect(parsed.payload).toBe('Reached conversational loop.');
+      }
+    });
+  });
+
+  describe('parseAgentLine Kim lifecycle JSON lines', () => {
+    it('should silently ignore run_done JSON lines', () => {
+      const line = '{"type":"run_done","termination":"task_complete","success":true}';
+      const parsed = parseAgentLine(line, 1);
+      expect(parsed.type).toBe('none');
+    });
+
+    it('should silently ignore run_done failure JSON lines', () => {
+      const line = '{"type":"run_done","termination":"max_iterations","success":false}';
+      const parsed = parseAgentLine(line, 1);
+      expect(parsed.type).toBe('none');
+    });
+
+    it('should silently ignore provider_error JSON lines', () => {
+      const line = '{"type":"provider_error","code":"rate_limit","retryable":false}';
+      const parsed = parseAgentLine(line, 1);
+      expect(parsed.type).toBe('none');
+    });
+
+    it('should silently ignore provider_error retryable JSON lines', () => {
+      const line = '{"type":"provider_error","code":"server_error","retryable":true}';
+      const parsed = parseAgentLine(line, 1);
+      expect(parsed.type).toBe('none');
+    });
+
+    it('should silently ignore hitl_approval_request JSON lines', () => {
+      const line = '{"type":"hitl_approval_request","tool":"run_command","risk":"high","reason":"arbitrary_code_execution"}';
+      const parsed = parseAgentLine(line, 1);
+      expect(parsed.type).toBe('none');
+    });
+
+    it('should silently ignore hitl_approval_result approved JSON lines', () => {
+      const line = '{"type":"hitl_approval_result","tool":"run_command","approved":true}';
+      const parsed = parseAgentLine(line, 1);
+      expect(parsed.type).toBe('none');
+    });
+
+    it('should silently ignore hitl_approval_result denied JSON lines', () => {
+      const line = '{"type":"hitl_approval_result","tool":"delete_file","approved":false}';
+      const parsed = parseAgentLine(line, 1);
+      expect(parsed.type).toBe('none');
+    });
+
+    it('should silence hitl_approval_request for all high-risk tools', () => {
+      const tools = ['run_command', 'delete_file', 'git_commit', 'run_python'];
+      for (const tool of tools) {
+        const line = `{"type":"hitl_approval_request","tool":"${tool}","risk":"high","reason":"arbitrary_code_execution"}`;
+        const parsed = parseAgentLine(line, 1);
+        expect(parsed.type).toBe('none');
       }
     });
   });

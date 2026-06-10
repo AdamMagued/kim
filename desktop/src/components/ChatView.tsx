@@ -432,7 +432,8 @@ export function ChatView({
   }
 
   // ── New Chat / Session Stream feed ──────────────────────────────────────────
-  const empty = !stream.hasSentMessageRef.current && stream.liveHistory.length === 0;
+  const { liveHistory, activity } = stream;
+  const empty = !stream.hasSentMessageRef.current && messages.length === 0 && liveHistory.length === 0 && activity.length === 0;
 
   return (
     <StreamRenderer
@@ -442,6 +443,7 @@ export function ChatView({
       runHistory={stream.runHistory}
       codexRuns={codexRuns}
       taskError={stream.taskError}
+      hitlApprovalStatus={stream.hitlApprovalStatus}
       settings={settings}
       newChatMode={newChatMode}
       activity={stream.activity}

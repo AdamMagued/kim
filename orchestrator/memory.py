@@ -12,6 +12,8 @@ Providers receive messages in this canonical format and transform them to their
 native API format internally.
 """
 
+from __future__ import annotations
+
 import copy
 import logging
 from typing import Union
@@ -64,8 +66,11 @@ class ConversationMemory:
 
         Each message should have at minimum ``{"role": ..., "content": ...}``.
         Internal metadata keys (``_has_screenshot``) are preserved if present.
+        Records without a ``"role"`` key (e.g. ``{"type": "run_result", ...}``)
+        are silently skipped so typed metadata records in session JSONL files
+        do not pollute the conversation stack or cause KeyError in get_messages.
         """
-        self._messages = list(messages)
+        self._messages = [m for m in messages if "role" in m]
         self._enforce_limits()
 
     # ------------------------------------------------------------------
@@ -171,15 +176,16 @@ class ConversationMemory:
 
 
 def _strip_images(content: Content) -> Content:
-    """Remove image items from a content list; keep text items."""
+    """Remove image items from a content list; keep text items.
+
+    A list input always returns a list — never collapses to a plain string —
+    so a message's content type stays stable across turns (providers branch
+    on isinstance(content, list)).
+    """
     if isinstance(content, str):
         return content
     kept = [item for item in content if item.get("type") != "image"]
     if not kept:
-        return "(screenshot removed — not in active window)"
-    # If only one text item remains, unwrap to string
-    if len(kept) == 1 and kept[0].get("type") == "text":
-        return kept[0]["text"] + "\n(screenshot removed)"
-    # Append a note
+        return [{"type": "text", "text": "(screenshot removed — not in active window)"}]
     kept.append({"type": "text", "text": "(screenshot removed)"})
     return kept

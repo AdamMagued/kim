@@ -8,6 +8,7 @@ from orchestrator.providers.ollama import (
     _normalize_tool_arguments,
     _parse_num_ctx,
     _parse_ollama_ps_context,
+    _tool_result_message,
 )
 
 
@@ -93,9 +94,11 @@ llama3.2:latest         def456          2.0 GB    100% GPU     4 minutes from no
         self.assertEqual(converted[0]["role"], "assistant")
         self.assertEqual(converted[0]["tool_calls"][0]["function"]["name"], "observe_ui")
         self.assertNotIn("usage", converted[0]["content"])
+        # The tool result must reference the SAME id as the tool call it answers.
+        call_id = converted[0]["tool_calls"][0]["id"]
         self.assertEqual(
             converted[1],
-            {"role": "tool", "tool_name": "observe_ui", "content": '{"ok":true}'},
+            {"role": "tool", "tool_call_id": call_id, "content": '{"ok":true}'},
         )
 
     def test_screenshot_tool_result_stays_image_message(self):
@@ -115,6 +118,111 @@ llama3.2:latest         def456          2.0 GB    100% GPU     4 minutes from no
         self.assertEqual(converted[0]["role"], "user")
         self.assertEqual(converted[0]["images"], ["abc123"])
 
+    # ── Additional normalization edge case tests ─────────────────────────────
+
+    def test_normalize_tool_arguments_handles_empty_dict(self):
+        self.assertEqual(_normalize_tool_arguments({}), {})
+
+    def test_normalize_tool_arguments_handles_none(self):
+        self.assertEqual(_normalize_tool_arguments(None), {})
+
+    def test_normalize_tool_arguments_handles_empty_string(self):
+        self.assertEqual(_normalize_tool_arguments(""), {})
+
+    def test_normalize_tool_arguments_handles_nested_json(self):
+        nested = '{"path": "file.py", "content": "line1\\nline2"}'
+        result = _normalize_tool_arguments(nested)
+        self.assertEqual(result["path"], "file.py")
+        self.assertIn("line1", result["content"])
+
+    def test_normalize_image_data_strips_jpeg_prefix(self):
+        self.assertEqual(
+            _normalize_image_data("data:image/jpeg;base64,xyz789"),
+            "xyz789",
+        )
+
+    def test_normalize_image_data_returns_plain_data_unchanged(self):
+        self.assertEqual(_normalize_image_data("abc123"), "abc123")
+
+    def test_parse_num_ctx_returns_none_for_missing(self):
+        raw = "temperature 0.2\ntop_p 0.9\n"
+        self.assertIsNone(_parse_num_ctx(raw))
+
+    def test_parse_ollama_ps_context_returns_none_for_missing_model(self):
+        stdout = """NAME                    ID              SIZE      PROCESSOR    UNTIL              CONTEXT
+gpt-oss:120b-cloud      abc123          73 GB     100% GPU     4 minutes from now 65536
+"""
+        self.assertIsNone(_parse_ollama_ps_context(stdout, "nonexistent:model"))
+
+    def test_plain_text_message_converts_unchanged(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        converted = provider._to_ollama_messages(
+            [{"role": "user", "content": "Hello, world!"}],
+            "",
+        )
+        self.assertEqual(len(converted), 1)
+        self.assertEqual(converted[0]["role"], "user")
+        self.assertEqual(converted[0]["content"], "Hello, world!")
+
+    def test_multiple_images_all_extracted(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        converted = provider._to_ollama_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Two screenshots"},
+                        {"type": "image", "data": "img1", "media_type": "image/png"},
+                        {"type": "image", "data": "img2", "media_type": "image/png"},
+                    ],
+                }
+            ],
+            "",
+        )
+        self.assertEqual(converted[0]["images"], ["img1", "img2"])
+
+
+class ToolResultMessageContractTests(unittest.TestCase):
+    """Contract tests for _tool_result_message schema correctness.
+
+    The OpenAI-compatible Ollama API requires role='tool' messages to carry
+    'tool_call_id', not 'tool_name'.  Using 'tool_name' is a non-standard field
+    that well-behaved Ollama models and cloud-compatible endpoints silently ignore
+    or reject — the fix uses the spec-correct key name.
+    """
+
+    def test_uses_tool_call_id_key_not_tool_name(self):
+        """Spec requires 'tool_call_id', not 'tool_name', in role='tool' messages."""
+        result = _tool_result_message("user", "[Tool result: shell_run]\nsome output")
+        self.assertIsNotNone(result)
+        self.assertIn("tool_call_id", result)
+        self.assertNotIn("tool_name", result)
+
+    def test_tool_call_id_value_is_tool_name(self):
+        """Without a stored call ID, the tool name is used as the identifier."""
+        result = _tool_result_message("user", "[Tool result: read_file]\ncontents")
+        self.assertEqual(result["tool_call_id"], "read_file")
+
+    def test_body_extracted_correctly(self):
+        result = _tool_result_message("user", "[Tool result: shell_run]\nline1\nline2")
+        self.assertEqual(result["content"], "line1\nline2")
+
+    def test_role_is_tool(self):
+        result = _tool_result_message("user", "[Tool result: git_status]\nmodified: x.py")
+        self.assertEqual(result["role"], "tool")
+
+    def test_non_user_role_returns_none(self):
+        self.assertIsNone(_tool_result_message("assistant", "[Tool result: click]\nok"))
+
+    def test_non_matching_text_returns_none(self):
+        self.assertIsNone(_tool_result_message("user", "plain message without tool result prefix"))
+
+    def test_empty_body_is_preserved(self):
+        result = _tool_result_message("user", "[Tool result: take_screenshot]\n")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["content"], "")
+
 
 if __name__ == "__main__":
     unittest.main()
+

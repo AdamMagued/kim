@@ -1,12 +1,52 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import type { ActivityItem, ProviderUsageState, PendingTask } from '../components/chat/types';
+import type { ActivityItem, ProviderUsageState, PendingTask, HitlApprovalStatus } from '../components/chat/types';
 import type { SessionInfo, Settings } from '../types';
 import { parseAgentLine, buildThinkingTrace } from '../components/chat/parsers';
 import { parsePlanFromActivity, browserSiteFromProvider } from '../components/chat/utils';
 
 const MAX_ACTIVITY_ITEMS = 300;
+
+function providerErrorMessage(code: string | null): string | null {
+  if (!code) return null;
+  switch (code) {
+    case 'auth':
+      return 'Provider authentication failed. Check the selected provider sign-in or API key.';
+    case 'rate_limit':
+      return 'Provider rate limit reached. Try again after a short wait.';
+    case 'server_error':
+      return 'Provider server error. Try again in a moment.';
+    case 'timeout':
+      return 'Provider request timed out. Try again or switch providers.';
+    case 'network':
+      return 'Provider network error. Check your connection and try again.';
+    case 'invalid_request':
+      return 'Provider rejected the request. Try a shorter or simpler task.';
+    default:
+      return `Provider error: ${code}`;
+  }
+}
+
+function terminationMessage(termination: string | null): string | null {
+  if (!termination) return null;
+  switch (termination) {
+    case 'max_iterations':
+      return 'Kim stopped after reaching the maximum iteration limit. Progress is saved — send "continue" to pick up where it left off.';
+    case 'stuck':
+      return 'Kim stopped because the screen stopped changing.';
+    case 'provider_failed':
+      return 'Kim stopped because the selected provider failed.';
+    case 'conversational_loop':
+      return 'Kim stopped because the model kept replying without taking action.';
+    case 'need_help':
+      return 'Kim needs your help to continue.';
+    case 'cancelled':
+      return null;
+    default:
+      return null;
+  }
+}
 
 export interface UseChatStreamProps {
   session: SessionInfo | null;
@@ -34,6 +74,7 @@ export function useChatStream({
   const [contextState, setContextState] = useState<{ cumulative_input: number; budget: number; phase: string; percent: number; last_input: number; last_output: number; source: string; estimate: boolean } | null>(null);
   const [liveHistory, setLiveHistory] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
   const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
+  const [hitlApprovalStatus, setHitlApprovalStatus] = useState<HitlApprovalStatus | null>(null);
 
   // Refs for tracking streams
   const activityCounterRef = useRef(0);
@@ -48,6 +89,10 @@ export function useChatStream({
   const answerReceivedThisRunRef = useRef(false);
   const doneHandledRef = useRef(false);
   const hasSentMessageRef = useRef(false);
+  // Typed-IPC capture refs — populated by kim:run-done / kim:provider-error.
+  // Capture-only: no behavior changes to legacy paths, no re-render cost.
+  const terminationReasonRef = useRef<string | null>(null);
+  const lastProviderErrorCodeRef = useRef<string | null>(null);
 
   // Deduplication maps
   const recentRawRef = useRef<Map<string, number>>(new Map());
@@ -283,6 +328,10 @@ export function useChatStream({
     let unlistenTypedContext: (() => void) | undefined;
     let unlistenTypedStats: (() => void) | undefined;
     let unlistenTypedUi: (() => void) | undefined;
+    let unlistenTypedRunDone: (() => void) | undefined;
+    let unlistenTypedProviderError: (() => void) | undefined;
+    let unlistenTypedHitlRequest: (() => void) | undefined;
+    let unlistenTypedHitlResult: (() => void) | undefined;
 
     // Typed IPC listeners (kim:* events) — update parallel state only, never push activity items.
     // These fire when ipc_protocol == "typed" in Rust config; the legacy kim-agent-output
@@ -330,6 +379,42 @@ export function useChatStream({
     listen<{ input: number; output: number; total: number }>('kim:stats', e => {
       setTokenStats({ input: e.payload.input, output: e.payload.output, total: e.payload.total });
     }).then(fn => { unlistenTypedStats = fn; });
+
+    // Typed run lifecycle events — capture-only in current slice.
+    // terminationReasonRef gives the kim-agent-done handler richer context;
+    // exposing it to the UI (e.g. a termination-specific banner) is the
+    // remaining Tier 2b gap documented in HARNESS_ROADMAP.md.
+    listen<{ termination: string; success: boolean }>('kim:run-done', e => {
+      terminationReasonRef.current = e.payload.termination;
+    }).then(fn => { unlistenTypedRunDone = fn; });
+
+    // Capture provider error code for future UI surfacing (Tier 2e remaining gap).
+    // Not surfaced via setTaskError here because the taskError string is rendered
+    // raw by StreamRenderer when !== 'agent-error'; a dedicated banner slot is
+    // needed before a structured code can be shown to the user.
+    listen<{ code: string; retryable: boolean }>('kim:provider-error', e => {
+      lastProviderErrorCodeRef.current = e.payload.code;
+    }).then(fn => { unlistenTypedProviderError = fn; });
+
+    // HITL approval visibility. This is display-only for now; the approval
+    // decision path still lives in the agent/UIBridge layer.
+    listen<{ tool: string; risk: string; reason: string }>('kim:hitl-approval-request', e => {
+      setHitlApprovalStatus({
+        tool: e.payload.tool,
+        risk: e.payload.risk,
+        reason: e.payload.reason,
+        approved: null,
+      });
+    }).then(fn => { unlistenTypedHitlRequest = fn; });
+
+    listen<{ tool: string; approved: boolean }>('kim:hitl-approval-result', e => {
+      setHitlApprovalStatus(prev => ({
+        tool: e.payload.tool,
+        risk: prev?.tool === e.payload.tool ? prev.risk : 'high',
+        reason: prev?.tool === e.payload.tool ? prev.reason : 'approval_result',
+        approved: e.payload.approved,
+      }));
+    }).then(fn => { unlistenTypedHitlResult = fn; });
 
     listen<{ action: 'screenshot_flash' | 'show' }>('kim:ui', e => {
       if (e.payload.action === 'screenshot_flash' && isRunningRef.current) {
@@ -395,7 +480,11 @@ export function useChatStream({
 
       if (!event.payload && !wasCancelled) {
         if (!hadNeedHelp) {
-          setTaskError('agent-error');
+          setTaskError(
+            providerErrorMessage(lastProviderErrorCodeRef.current)
+              ?? terminationMessage(terminationReasonRef.current)
+              ?? 'agent-error'
+          );
         }
         if (lastRunTaskRef.current) {
           setLastFailedTask(lastRunTaskRef.current);
@@ -416,6 +505,7 @@ export function useChatStream({
       appendRaw('⏹ Task cancelled');
       setIsRunning(false);
       setCancelling(false);
+      setHitlApprovalStatus(null);
       currentTaskRef.current = null;
     }).then(fn => { unlistenCancelled = fn; });
 
@@ -432,6 +522,10 @@ export function useChatStream({
       unlistenTypedContext?.();
       unlistenTypedStats?.();
       unlistenTypedUi?.();
+      unlistenTypedRunDone?.();
+      unlistenTypedProviderError?.();
+      unlistenTypedHitlRequest?.();
+      unlistenTypedHitlResult?.();
     };
   }, [appendRaw, flushActivityNow, clearActivityNow, setMessageReloadNonce, commitCurrentBrowserUrl]);
 
@@ -478,6 +572,8 @@ export function useChatStream({
     setLiveHistory,
     lastFailedTask,
     setLastFailedTask,
+    hitlApprovalStatus,
+    setHitlApprovalStatus,
 
     // Refs
     currentTaskRef,
@@ -488,6 +584,8 @@ export function useChatStream({
     answerReceivedThisRunRef,
     doneHandledRef,
     hasSentMessageRef,
+    terminationReasonRef,
+    lastProviderErrorCodeRef,
     activityCounterRef,
     activityRef,
     activityFlushTimerRef,

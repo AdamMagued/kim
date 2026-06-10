@@ -54,6 +54,7 @@ SETUP (visible mode):
         https://chatgpt.com
         https://gemini.google.com
 """
+from __future__ import annotations
 
 import asyncio
 import json
@@ -1002,7 +1003,7 @@ class BrowserProvider(BaseProvider):
         return False
 
     async def _wait_for_generation_complete(
-        self, page: Page, stop_selectors: list[str], response_selectors: list[str], completion_hash: str | None, site: str = "AI", min_index: int = 0
+        self, page: Page, stop_selectors: list[str], response_selectors: list[str], completion_hash: Optional[str], site: str = "AI", min_index: int = 0
     ) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + GENERATION_WAIT_S

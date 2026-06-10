@@ -24,6 +24,10 @@ enum KimEvent {
     Stats { input: u64, output: u64, total: u64 },
     UiScreenshotFlash,
     UiShow,
+    RunDone { termination: String, success: bool },
+    ProviderError { code: String, retryable: bool },
+    HitlApprovalRequest { tool: String, risk: String, reason: String },
+    HitlApprovalResult { tool: String, approved: bool },
 }
 
 pub(crate) fn find_python_interpreter(project_root: &Path) -> Result<String, String> {
@@ -567,6 +571,18 @@ pub(crate) async fn send_task(
                             KimEvent::UiShow => {
                                 let _ = app.emit("kim:ui", serde_json::json!({"action": "show"}));
                             }
+                            KimEvent::RunDone { termination, success } => {
+                                let _ = app.emit("kim:run-done", serde_json::json!({"termination": termination, "success": success}));
+                            }
+                            KimEvent::ProviderError { code, retryable } => {
+                                let _ = app.emit("kim:provider-error", serde_json::json!({"code": code, "retryable": retryable}));
+                            }
+                            KimEvent::HitlApprovalRequest { tool, risk, reason } => {
+                                let _ = app.emit("kim:hitl-approval-request", serde_json::json!({"tool": tool, "risk": risk, "reason": reason}));
+                            }
+                            KimEvent::HitlApprovalResult { tool, approved } => {
+                                let _ = app.emit("kim:hitl-approval-result", serde_json::json!({"tool": tool, "approved": approved}));
+                            }
                         }
                     }
                     // Always dual-emit on legacy channel so existing TypeScript parsers still run
@@ -801,6 +817,115 @@ pub(crate) fn process_exists(pid: u32) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn test_parse_run_done_event() {
+        let json = r#"{"type":"run_done","termination":"task_complete","success":true}"#;
+        let event: KimEvent = serde_json::from_str(json).expect("run_done should deserialize");
+        match event {
+            KimEvent::RunDone { termination, success } => {
+                assert_eq!(termination, "task_complete");
+                assert!(success);
+            }
+            _ => panic!("Expected RunDone, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_run_done_failed_variant() {
+        let json = r#"{"type":"run_done","termination":"max_iterations","success":false}"#;
+        let event: KimEvent = serde_json::from_str(json).expect("run_done failed should deserialize");
+        match event {
+            KimEvent::RunDone { termination, success } => {
+                assert_eq!(termination, "max_iterations");
+                assert!(!success);
+            }
+            _ => panic!("Expected RunDone"),
+        }
+    }
+
+    #[test]
+    fn test_parse_provider_error_event() {
+        let json = r#"{"type":"provider_error","code":"rate_limit","retryable":false}"#;
+        let event: KimEvent = serde_json::from_str(json).expect("provider_error should deserialize");
+        match event {
+            KimEvent::ProviderError { code, retryable } => {
+                assert_eq!(code, "rate_limit");
+                assert!(!retryable);
+            }
+            _ => panic!("Expected ProviderError, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_provider_error_retryable_variant() {
+        let json = r#"{"type":"provider_error","code":"server_error","retryable":true}"#;
+        let event: KimEvent = serde_json::from_str(json).expect("provider_error retryable should deserialize");
+        match event {
+            KimEvent::ProviderError { code, retryable } => {
+                assert_eq!(code, "server_error");
+                assert!(retryable);
+            }
+            _ => panic!("Expected ProviderError"),
+        }
+    }
+
+    #[test]
+    fn test_parse_run_done_all_terminations() {
+        let terminations = [
+            "task_complete", "cancelled", "max_iterations",
+            "stuck", "provider_failed", "need_help", "conversational_loop",
+        ];
+        for term in &terminations {
+            let json = format!(r#"{{"type":"run_done","termination":"{}","success":false}}"#, term);
+            let event: KimEvent = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("run_done with termination={} failed: {}", term, e));
+            match event {
+                KimEvent::RunDone { termination, .. } => assert_eq!(&termination, term),
+                _ => panic!("Expected RunDone for termination={}", term),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_hitl_approval_request_event() {
+        let json = r#"{"type":"hitl_approval_request","tool":"run_command","risk":"high","reason":"arbitrary_code_execution"}"#;
+        let event: KimEvent = serde_json::from_str(json).expect("hitl_approval_request should deserialize");
+        match event {
+            KimEvent::HitlApprovalRequest { tool, risk, reason } => {
+                assert_eq!(tool, "run_command");
+                assert_eq!(risk, "high");
+                assert_eq!(reason, "arbitrary_code_execution");
+            }
+            _ => panic!("Expected HitlApprovalRequest, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_hitl_approval_result_approved_event() {
+        let json = r#"{"type":"hitl_approval_result","tool":"run_command","approved":true}"#;
+        let event: KimEvent = serde_json::from_str(json).expect("hitl_approval_result should deserialize");
+        match event {
+            KimEvent::HitlApprovalResult { tool, approved } => {
+                assert_eq!(tool, "run_command");
+                assert!(approved);
+            }
+            _ => panic!("Expected HitlApprovalResult, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_hitl_approval_result_denied_event() {
+        let json = r#"{"type":"hitl_approval_result","tool":"delete_file","approved":false}"#;
+        let event: KimEvent = serde_json::from_str(json).expect("hitl_approval_result denied should deserialize");
+        match event {
+            KimEvent::HitlApprovalResult { tool, approved } => {
+                assert_eq!(tool, "delete_file");
+                assert!(!approved);
+            }
+            _ => panic!("Expected HitlApprovalResult, got {:?}", event),
+        }
+    }
 
     #[test]
     fn test_find_python_finds_venv() {

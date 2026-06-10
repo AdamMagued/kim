@@ -53,6 +53,8 @@ export function useTaskRunner({
       stream.doneHandledRef.current = false;
       stream.cancelFlagRef.current = false;
       stream.needHelpFlagRef.current = false;
+      stream.terminationReasonRef.current = null;
+      stream.lastProviderErrorCodeRef.current = null;
       stream.answerReceivedThisRunRef.current = false;
       stream.recentActivityItemRef.current.clear();
       stream.hasSentMessageRef.current = true;
@@ -63,6 +65,7 @@ export function useTaskRunner({
       stream.setLiveHistory([]);
       stream.setTaskError(null);
       stream.setTokenStats(null);
+      stream.setHitlApprovalStatus(null);
       stream.setCancelling(false);
       scroll.setAutoFollowOutput(true);
 
