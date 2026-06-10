@@ -66,6 +66,8 @@ export function useTaskRunner({
       stream.setTaskError(null);
       stream.setTokenStats(null);
       stream.setHitlApprovalStatus(null);
+      stream.setRunFailure(null);
+      stream.setRateLimitedState(null);
       stream.setCancelling(false);
       scroll.setAutoFollowOutput(true);
 

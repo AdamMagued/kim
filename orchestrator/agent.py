@@ -69,7 +69,7 @@ from orchestrator import compaction as _compaction
 from orchestrator.interaction_policy import InteractionPolicy
 from orchestrator.tool_errors import classify_tool_output
 from orchestrator.tool_risk import classify_tool_risk, coerce_hitl_bool
-from orchestrator.agent_states import AgentTermination, make_run_result
+from orchestrator.agent_states import AgentTermination, make_run_result, run_failure_event
 
 if TYPE_CHECKING:
     from tray.voice import VoiceEngine
@@ -585,6 +585,7 @@ class KimAgent:
                 # because this path is only reached after all retry attempts are exhausted.
                 print(json.dumps({"type": "provider_error", "code": provider_error.code, "retryable": False}, separators=(",", ":"), ensure_ascii=False), flush=True)
                 self._log("ERROR", f"Provider error (all retries exhausted): {e}")
+                self._last_provider_error_code = provider_error.code
                 need_help = f"NEED_HELP: LLM provider call failed after retries: {e}"
                 self.memory.add_assistant(need_help)
                 self._session_store.append_message({"role": "assistant", "content": need_help})
@@ -1182,6 +1183,13 @@ class KimAgent:
                     f"LLM call failed (attempt {attempt}/{self._max_retries}): "
                     f"{type(e).__name__}: {e} ({provider_error.code}) — retrying in {delay:.1f}s",
                 )
+                # Emit typed event so the frontend can show "Rate-limited, retrying in Xs..."
+                print(json.dumps({
+                    "type": "rate_limited",
+                    "delay": round(delay, 1),
+                    "attempt": attempt,
+                    "max_retries": self._max_retries,
+                }, separators=(",", ":"), ensure_ascii=False), flush=True)
                 await asyncio.sleep(delay)
 
         raise last_error  # type: ignore[misc]
@@ -1203,6 +1211,25 @@ class KimAgent:
             self._session_store.append_run_result(result)
         except Exception as e:
             self._log("WARN", f"Failed to persist run result to session: {e}")
+
+        # Emit structured run_failed event for non-success terminations so the
+        # frontend can render a distinct error card with a recovery suggestion.
+        if not result.get("success"):
+            try:
+                termination_str = result.get("termination", "")
+                termination = AgentTermination(termination_str) if termination_str else None
+                if termination:
+                    provider_code = getattr(self, "_last_provider_error_code", "")
+                    event = run_failure_event(
+                        termination,
+                        result.get("summary", ""),
+                        provider_error_code=provider_code,
+                    )
+                    if event:
+                        print(json.dumps(event, separators=(",", ":"), ensure_ascii=False), flush=True)
+            except Exception:
+                pass
+
         return result
 
     # ------------------------------------------------------------------
