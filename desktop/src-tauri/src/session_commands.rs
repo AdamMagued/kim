@@ -371,6 +371,35 @@ print(json.dumps(result))
     Ok(stdout)
 }
 
+/// Open the logs directory in the system file manager.
+/// Creates the directory if it doesn't exist yet.
+#[tauri::command]
+pub fn reveal_logs() -> Result<(), String> {
+    let kim_root = crate::default_project_root();
+    let log_dir = kim_root.join("logs");
+    std::fs::create_dir_all(&log_dir).map_err(|e| format!("Failed to create logs dir: {e}"))?;
+
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg(&log_dir)
+        .spawn()
+        .map_err(|e| format!("open failed: {e}"))?;
+
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("explorer")
+        .arg(&log_dir)
+        .spawn()
+        .map_err(|e| format!("explorer failed: {e}"))?;
+
+    #[cfg(target_os = "linux")]
+    std::process::Command::new("xdg-open")
+        .arg(&log_dir)
+        .spawn()
+        .map_err(|e| format!("xdg-open failed: {e}"))?;
+
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()

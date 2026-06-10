@@ -172,3 +172,28 @@ def setup_structured_logging(
     )
 
     return json_handler
+
+
+def apply_log_retention(log_dir: str = "logs", keep_days: int = 7) -> int:
+    """
+    Delete log files older than `keep_days` days from `log_dir`.
+
+    A file dated D is deleted when D < (today - keep_days). Files dated exactly
+    keep_days ago are kept. Returns the number of files deleted.
+    """
+    from datetime import date as _date, timedelta
+    deleted = 0
+    log_path = Path(log_dir)
+    if not log_path.exists():
+        return 0
+    cutoff = _date.today() - timedelta(days=keep_days)
+    for f in log_path.glob("kim_*.jsonl"):
+        try:
+            date_str = f.stem[len("kim_"):]  # "YYYY-MM-DD"
+            file_date = _date.fromisoformat(date_str)
+            if file_date < cutoff:
+                f.unlink()
+                deleted += 1
+        except (ValueError, OSError):
+            continue
+    return deleted
