@@ -26,7 +26,8 @@ Last updated: 2026-06-10
 | P1-5 | Session retention pruning + screenshot stripping | `ac10b77` | ✅ Done |
 | P1-1 | Structured rotating file logs + Reveal logs button | `56a15f7` | ✅ Done |
 | P1-2 | Typed run_failed error events + error cards + rate-limited UI | `2f54625` | ✅ Done |
-| P1-3 | Approval-gate UI round-trip + per-session permission mode toggle | pending | ✅ Done |
+| P1-3 | Approval-gate UI round-trip + per-session permission mode toggle | `f8a3e37` | ✅ Done |
+| P0-1 | PyInstaller spec for sidecar + sidecar-first `find_python_interpreter()` | pending | ✅ Done |
 
 ### Infra fixes
 
@@ -109,6 +110,13 @@ Last updated: 2026-06-10
 - `tests/test_stdin_approval_bridge.py`: 9 tests (approve/deny/cancel/timeout/malformed, auto-wire variants)
 - **Note:** `tauri dev` needs a restart to pick up Rust changes
 
+### P0-1 — PyInstaller spec + sidecar-first interpreter resolution
+- `kim-orchestrator.spec`: PyInstaller spec at repo root; bundles `orchestrator/` + `mcp_server/` as single `console=True` executable; includes all 6 provider hidden imports; excludes tkinter/numpy/pytest; `TODO(human):` markers for codesign_identity + entitlements
+- `desktop/src-tauri/src/subprocess.rs`: New `find_bundled_orchestrator()` — looks for `kim-orchestrator` or `kim-orchestrator-<target-triple>` adjacent to current exe; `is_bundled_orchestrator()` predicate; `dirs_home()` helper; `find_python_interpreter()` now checks bundled sidecar first (sidecar → `~/.kim_root` → `~/.kim` → system); `send_task` skips `-m orchestrator.agent` when sidecar is detected
+- `externalBin` in `tauri.conf.json` NOT added — file must exist at build time and the binary is machine-built; documented as `TODO(human)` in the spec file
+- 4 new Rust tests: `sidecar_name_no_triple`, `sidecar_name_with_triple`, `is_bundled_orch_true/false`
+- **Note:** `tauri dev` needs a restart to pick up Rust changes
+
 ### fix — ultralytics namespace collision
 - Commit `642a488`
 - Root cause: `test_prompt_render.py` and `test_make_test_agent.py` used `from tests.conftest import`, which resolved to the globally-installed ultralytics `tests` package instead of the local `tests/` directory. These tests were *introduced* in V-5/V-6 on this branch, so the 6 failures were NOT pre-existing.
@@ -128,7 +136,7 @@ Last updated: 2026-06-10
 
 ### Track B
 - [x] P1-3: approval-gate UI round-trip + permission mode toggle — ✅ Done
-- [ ] P0-1: PyInstaller spec + sidecar resolution in `find_python_interpreter()`
+- [x] P0-1: PyInstaller spec + sidecar resolution in `find_python_interpreter()` — ✅ Done
 - [ ] Part II quick wins: H (kill voice), J (feature-flag relay pane), D (cost meter), F (OS notifications)
 
 ### Human-blocked

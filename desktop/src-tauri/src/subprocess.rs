@@ -62,20 +62,56 @@ enum KimEvent {
     HitlApprovalResult { tool: String, approved: bool },
 }
 
+/// Resolve a Python interpreter or bundled orchestrator sidecar.
+///
+/// Resolution order (first match wins):
+///   1. Bundled `kim-orchestrator` sidecar adjacent to the Tauri executable
+///      (set when running as a packaged .app; Tauri places sidecars in the
+///      same MacOS/ directory as the main binary).
+///   2. `.kim_root/venv` or `.kim/venv` under the user's home directory
+///      (created by the install script).
+///   3. Project-local `venv/` or `.venv/` under `project_root`.
+///   4. System-level `python3` / `python` on PATH.
+///
+/// When the sidecar is found, the caller should invoke it directly (as a
+/// standalone executable) rather than as `<interpreter> -m orchestrator.agent`.
+/// The caller is responsible for detecting sidecar mode via
+/// `is_bundled_orchestrator()` and adjusting the command accordingly.
 pub(crate) fn find_python_interpreter(project_root: &Path) -> Result<String, String> {
+    // ── 1. Bundled sidecar — highest priority when running as a packaged app ──
+    if let Some(sidecar) = find_bundled_orchestrator() {
+        return Ok(sidecar);
+    }
+
+    // ── 2. Install-script venv in ~/.kim_root or ~/.kim ───────────────────────
+    if let Some(home) = dirs_home() {
+        let install_candidates = [
+            home.join(".kim_root").join("venv").join("bin").join("python"),
+            home.join(".kim_root").join(".venv").join("bin").join("python"),
+            home.join(".kim").join("venv").join("bin").join("python"),
+            home.join(".kim").join(".venv").join("bin").join("python"),
+        ];
+        for c in install_candidates {
+            if c.exists() {
+                return Ok(c.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    // ── 3. Project-local venv ─────────────────────────────────────────────────
     let candidates = [
         project_root.join("venv").join("bin").join("python"),
         project_root.join(".venv").join("bin").join("python"),
         project_root.join("venv").join("Scripts").join("python.exe"),
         project_root.join(".venv").join("Scripts").join("python.exe"),
     ];
-
     for candidate in candidates {
         if candidate.exists() {
             return Ok(candidate.to_string_lossy().to_string());
         }
     }
 
+    // ── 4. System Python ──────────────────────────────────────────────────────
     #[cfg(target_os = "windows")]
     let cmd_candidates = ["py", "python", "python3"];
     #[cfg(not(target_os = "windows"))]
@@ -88,9 +124,78 @@ pub(crate) fn find_python_interpreter(project_root: &Path) -> Result<String, Str
     }
 
     Err(
-        "No Python interpreter found. Install Python 3 or create a project venv (venv/.venv)."
+        "No Python interpreter found. Install Python 3, create a project venv (venv/.venv), \
+         or rebuild the app with the bundled kim-orchestrator sidecar."
             .to_string(),
     )
+}
+
+/// Returns the path to the bundled `kim-orchestrator` sidecar if running
+/// as a packaged Tauri app. Returns `None` in development mode.
+///
+/// On macOS, Tauri places sidecars in `<app>.app/Contents/MacOS/` adjacent
+/// to the main binary. The sidecar binary name carries the platform target
+/// triple at bundle time but is resolved without it at runtime via the
+/// `externalBin` Tauri config mechanism. We look for both the bare name and
+/// the current-platform suffixed name so the function works in both contexts.
+fn find_bundled_orchestrator() -> Option<String> {
+    // Resolve the directory containing the current executable.
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+
+    // On macOS .app bundles, exe_dir ends with Contents/MacOS/.
+    // On Linux AppImage / Windows installer, exe_dir is the install root.
+    let sidecar_name = "kim-orchestrator";
+    let target_triple = std::env::consts::ARCH.to_string()
+        + "-"
+        + if cfg!(target_os = "macos") {
+            "apple-darwin"
+        } else if cfg!(target_os = "linux") {
+            "unknown-linux-gnu"
+        } else if cfg!(target_os = "windows") {
+            "pc-windows-msvc"
+        } else {
+            "unknown"
+        };
+
+    // Try bare name first (development builds / installed via direct copy).
+    let bare = exe_dir.join(sidecar_name);
+    if bare.exists() {
+        return Some(bare.to_string_lossy().to_string());
+    }
+
+    // Try platform-suffixed name (Tauri sidecar bundle convention).
+    let suffixed = exe_dir.join(format!("{}-{}", sidecar_name, target_triple));
+    if suffixed.exists() {
+        return Some(suffixed.to_string_lossy().to_string());
+    }
+
+    // Windows: also check for .exe extension.
+    #[cfg(target_os = "windows")]
+    {
+        let win_bare = exe_dir.join(format!("{}.exe", sidecar_name));
+        if win_bare.exists() {
+            return Some(win_bare.to_string_lossy().to_string());
+        }
+    }
+
+    None
+}
+
+/// Returns true when the resolved interpreter path points to the bundled
+/// `kim-orchestrator` sidecar (a standalone executable, not a Python binary).
+/// The caller must invoke it directly rather than via `python -m orchestrator.agent`.
+pub(crate) fn is_bundled_orchestrator(interpreter: &str) -> bool {
+    interpreter.contains("kim-orchestrator")
+}
+
+/// Best-effort home directory resolution (avoids pulling in the `dirs` crate).
+fn dirs_home() -> Option<PathBuf> {
+    // Try $HOME on Unix / $USERPROFILE on Windows.
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(PathBuf::from)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -408,8 +513,13 @@ pub(crate) async fn send_task(
     } else {
         let python = find_python_interpreter(&kim_root)?;
         let mut c = Command::new(&python);
-        c.args(["-m", "orchestrator.agent"])
-            .arg("--task")
+        // When the resolved interpreter is the bundled sidecar, invoke it
+        // directly (it is a standalone executable, not a Python binary).
+        // Otherwise use the standard `python -m orchestrator.agent` invocation.
+        if !is_bundled_orchestrator(&python) {
+            c.args(["-m", "orchestrator.agent"]);
+        }
+        c.arg("--task")
             .arg(&task)
             .arg("--session-dir")
             .arg(session_dir.to_string_lossy().to_string())
@@ -1074,6 +1184,39 @@ mod tests {
             Ok(cmd) => assert!(!cmd.is_empty()),
             Err(msg) => assert!(msg.contains("No Python interpreter")),
         }
+    }
+
+    #[test]
+    fn test_is_bundled_orchestrator_positive() {
+        assert!(is_bundled_orchestrator("/path/to/kim-orchestrator-aarch64-apple-darwin"));
+        assert!(is_bundled_orchestrator("/Applications/Kim.app/Contents/MacOS/kim-orchestrator"));
+        assert!(is_bundled_orchestrator("kim-orchestrator"));
+    }
+
+    #[test]
+    fn test_is_bundled_orchestrator_negative() {
+        assert!(!is_bundled_orchestrator("/usr/bin/python3"));
+        assert!(!is_bundled_orchestrator("python"));
+        assert!(!is_bundled_orchestrator("/path/venv/bin/python"));
+    }
+
+    #[test]
+    fn test_find_bundled_orchestrator_absent_in_test() {
+        // In the test binary context, there is no kim-orchestrator sidecar
+        // adjacent to the test executable. find_bundled_orchestrator() must
+        // return None rather than panicking.
+        let result = find_bundled_orchestrator();
+        // Either None (no sidecar found) or Some (if by coincidence a binary
+        // named kim-orchestrator exists in the test dir) — both are valid.
+        // This test just asserts the function doesn't panic.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_dirs_home_returns_something() {
+        // HOME or USERPROFILE should be set in any normal environment.
+        let home = dirs_home();
+        assert!(home.is_some(), "dirs_home() returned None — HOME not set?");
     }
 }
 
