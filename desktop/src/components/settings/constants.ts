@@ -5,7 +5,7 @@
  * No JSX, no hooks — safe to import from non-React contexts.
  */
 
-import type { Provider, VoiceEngine, AccentTheme } from '../../types';
+import type { Provider, AccentTheme } from '../../types';
 
 export const PROVIDERS: { value: Provider; label: string }[] = [
   { value: 'ollama', label: 'Ollama (local/cloud, no API key)' },
@@ -14,13 +14,6 @@ export const PROVIDERS: { value: Provider; label: string }[] = [
   { value: 'openai', label: 'GPT-4o (OpenAI)' },
   { value: 'gemini', label: 'Gemini (Google)' },
   { value: 'deepseek', label: 'DeepSeek' },
-];
-
-export const VOICE_ENGINES: { value: VoiceEngine; label: string }[] = [
-  { value: 'kokoro', label: 'Kokoro (local, fast)' },
-  { value: 'maya1', label: 'Maya-1 (local, expressive)' },
-  { value: 'http', label: 'HTTP (OpenAI-compatible)' },
-  { value: 'hume', label: 'Hume (cloud)' },
 ];
 
 export const ACCENTS: { value: AccentTheme; label: string; light: string; dark: string }[] = [

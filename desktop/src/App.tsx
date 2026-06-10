@@ -27,10 +27,6 @@ function loadSettings(): Settings {
       return {
         ...DEFAULT_SETTINGS,
         ...parsed,
-        voice: {
-          ...DEFAULT_SETTINGS.voice,
-          ...(parsed.voice ?? {}),
-        },
         schedule_timer: {
           ...DEFAULT_SETTINGS.schedule_timer,
           ...(parsed.schedule_timer ?? {}),
@@ -133,7 +129,7 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsInitialPane, setSettingsInitialPane] = useState<
-    'appearance' | 'ai' | 'voice' | 'paths' | 'data' | 'schedule' | 'account' | 'mcp' | 'feedback' | 'about' | undefined
+    'appearance' | 'ai' | 'paths' | 'data' | 'schedule' | 'account' | 'mcp' | 'feedback' | 'about' | undefined
   >(undefined);
 
   const [appVersion, setAppVersion] = useState('0.1.0');
