@@ -289,10 +289,10 @@ class BrowserProvider(BaseProvider):
             return None
         return self._parse_authuser_env(str(selected.get("authuser_index", "")))
 
-    async def complete(
+    async def complete(  # type: ignore[override]
         self,
         messages: list[dict],
-        tools: list[dict] = None,
+        tools: list[dict] | None = None,
         system: str = "",
         clear_chat: bool = False,
         **kwargs,

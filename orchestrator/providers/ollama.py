@@ -127,7 +127,7 @@ class OllamaProvider(BaseProvider):
         messages: list[dict],
         tools: list[dict],
         system: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         model = await self._resolve_selected_model()
         await self._ensure_daemon_running()
         await self._validate_model(model)
@@ -411,11 +411,12 @@ class OllamaProvider(BaseProvider):
         if final_obj is None:
             raise RuntimeError("Ollama stream ended without a final done response.")
 
-        final_message = final_obj.get("message") if isinstance(final_obj.get("message"), dict) else {}
+        _raw_msg = final_obj.get("message")
+        final_message: dict = _raw_msg if isinstance(_raw_msg, dict) else {}
         if not pieces and isinstance(final_message.get("content"), str):
             pieces.append(str(final_message.get("content") or ""))
         if not tool_calls and isinstance(final_message.get("tool_calls"), list):
-            tool_calls = [x for x in final_message.get("tool_calls") if isinstance(x, dict)]
+            tool_calls = [x for x in (final_message.get("tool_calls") or []) if isinstance(x, dict)]
         return final_obj, "".join(pieces).strip(), tool_calls
 
     async def _usage_from_final(self, final_obj: dict[str, Any], model: str) -> dict[str, Any]:

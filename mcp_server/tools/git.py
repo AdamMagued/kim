@@ -61,6 +61,7 @@ async def _run_git(*args: str, cwd: str | None = None, timeout: int | None = Non
     cmd = ["git"] + list(args)
     logger.info(f"git: {' '.join(cmd)} (cwd={resolved_cwd})")
 
+    proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -84,11 +85,12 @@ async def _run_git(*args: str, cwd: str | None = None, timeout: int | None = Non
             parts.append("(no output)")
         return "\n".join(parts)
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await asyncio.wait_for(proc.wait(), timeout=2)
-        except Exception:
-            pass
+        if proc is not None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                pass
         return f"ERROR: git command timed out after {resolved_timeout}s"
     except FileNotFoundError:
         return (

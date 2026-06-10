@@ -207,4 +207,4 @@ def _load_font(size: int = 12) -> Optional[ImageFont.FreeTypeFont]:
 
     # Fallback: Pillow's built-in bitmap font (tiny but always available)
     logger.debug("No TrueType font found; using Pillow default font")
-    return ImageFont.load_default()
+    return ImageFont.load_default()  # type: ignore[return-value]

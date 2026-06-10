@@ -172,8 +172,8 @@ async def handle_run_command(args: dict) -> str:
             return block_msg
 
     logger.info(f"run_command: {cmd!r} cwd={cwd} sandbox={sandbox_mode}")
+    sandbox_dir = None
     try:
-        sandbox_dir = None
         if sandbox_mode:
             sandbox_dir = tempfile.TemporaryDirectory(prefix="kim-shell-")
             exec_cwd = sandbox_dir.name
@@ -213,7 +213,7 @@ async def handle_run_command(args: dict) -> str:
         logger.error(f"run_command failed: {e}", exc_info=True)
         return f"ERROR: {e}"
     finally:
-        if 'sandbox_dir' in locals() and sandbox_dir is not None:
+        if sandbox_dir is not None:
             sandbox_dir.cleanup()
 
 
@@ -254,8 +254,8 @@ async def handle_run_powershell(args: dict) -> str:
             )
 
     logger.info(f"run_powershell [{ps_exe}]: {script[:80]}... sandbox={sandbox_mode}")
+    sandbox_dir = None
     try:
-        sandbox_dir = None
         if sandbox_mode:
             sandbox_dir = tempfile.TemporaryDirectory(prefix="kim-powershell-")
             exec_cwd = sandbox_dir.name
@@ -304,5 +304,5 @@ async def handle_run_powershell(args: dict) -> str:
         logger.error(f"run_powershell failed: {e}", exc_info=True)
         return f"ERROR: {e}"
     finally:
-        if 'sandbox_dir' in locals() and sandbox_dir is not None:
+        if sandbox_dir is not None:
             sandbox_dir.cleanup()

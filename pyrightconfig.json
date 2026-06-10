@@ -1,0 +1,10 @@
+{
+  "include": [
+    "orchestrator/providers",
+    "mcp_server"
+  ],
+  "pythonVersion": "3.9",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none"
+}

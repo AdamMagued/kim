@@ -17,6 +17,8 @@ Or in tests:
 
 from __future__ import annotations
 
+from typing import Any
+
 from orchestrator.providers.base import BaseProvider
 
 
@@ -38,7 +40,7 @@ class FakeProvider(BaseProvider):
         messages: list[dict],
         tools: list[dict],
         system: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         response = self._responses[min(self._index, len(self._responses) - 1)]
         self._index += 1
         return response

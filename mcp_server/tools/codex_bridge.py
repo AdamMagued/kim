@@ -486,7 +486,7 @@ class _CodexProxy:
         await self._runner.setup()
         site = web.TCPSite(self._runner, "127.0.0.1", 0)
         await site.start()
-        self._port = site._server.sockets[0].getsockname()[1]
+        self._port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
         logger.info(f"Codex proxy started on port {self._port}")
         return self._port
 

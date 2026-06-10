@@ -11,7 +11,7 @@ ContentItem:
     {"type": "text",  "text": "..."}
     {"type": "image", "data": "<base64>", "media_type": "image/png"}
 
-Return value:
+Return value (see ProviderResponse below):
     {"type": "tool_call", "tool": str, "args": dict}
   | {"type": "text",      "content": str}
 """
@@ -19,8 +19,47 @@ Return value:
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any, Literal, TypedDict, Union
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Typed contracts — providers return one of these; agent consumes typed fields
+# ---------------------------------------------------------------------------
+
+class ToolCallResponse(TypedDict):
+    """Provider response requesting a tool call."""
+    type: Literal["tool_call"]
+    tool: str
+    args: dict[str, Any]
+
+
+class TextResponse(TypedDict, total=False):
+    """Provider response with a text completion."""
+    type: Literal["text"]       # required
+    content: str                # required
+    usage: dict[str, Any]       # optional — token counts from the provider
+
+
+# The union type returned by BaseProvider.complete().
+# TypedDicts are plain dicts at runtime, so existing code is unaffected.
+ProviderResponse = Union[ToolCallResponse, TextResponse]
+
+
+class ToolResult(TypedDict, total=False):
+    """Typed envelope for tool execution results.
+
+    `ok` and `payload` are required; `display_text` is optional.
+    Use `ToolResult(ok=True, payload=data)` for successful results and
+    `ToolResult(ok=False, payload={"error": msg})` for failures.
+    """
+    ok: bool            # required
+    payload: Any        # required — raw result data
+    display_text: str   # optional — human-readable summary for the UI
+
+
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -101,10 +140,10 @@ class BaseProvider(ABC):
     @abstractmethod
     async def complete(
         self,
-        messages: list[dict],
-        tools: list[dict],
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
         system: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """
         Args:
             messages:  Canonical conversation history (user/assistant turns).
@@ -113,8 +152,7 @@ class BaseProvider(ABC):
             system:    System prompt string.
 
         Returns:
-            {"type": "tool_call", "tool": str, "args": dict}
-          | {"type": "text", "content": str}
+            ProviderResponse — either ToolCallResponse or TextResponse (see above).
         """
 
 
