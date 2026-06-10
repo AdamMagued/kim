@@ -18,6 +18,7 @@ import { useSessionScroll } from '../hooks/useSessionScroll';
 import { useSessionLoader } from '../hooks/useSessionLoader';
 import { useBrowserRestore } from '../hooks/useBrowserRestore';
 import { useTaskRunner } from '../hooks/useTaskRunner';
+import { useOsNotifications } from '../hooks/useOsNotifications';
 import { StreamRenderer } from './chat/StreamRenderer';
 import { WelcomeScreen } from './chat/WelcomeScreen';
 import { ChatComposer } from './chat/ChatComposer';
@@ -115,6 +116,9 @@ export function ChatView({
     },
     [browserCommandArgs, resolveProvider]
   );
+
+  // OS notifications for task completion/failure
+  useOsNotifications();
 
   // Hook into Tauri events and streaming state management
   const stream = useChatStream({

@@ -27,7 +27,11 @@ Last updated: 2026-06-10
 | P1-1 | Structured rotating file logs + Reveal logs button | `56a15f7` | ✅ Done |
 | P1-2 | Typed run_failed error events + error cards + rate-limited UI | `2f54625` | ✅ Done |
 | P1-3 | Approval-gate UI round-trip + per-session permission mode toggle | `f8a3e37` | ✅ Done |
-| P0-1 | PyInstaller spec for sidecar + sidecar-first `find_python_interpreter()` | pending | ✅ Done |
+| P0-1 | PyInstaller spec for sidecar + sidecar-first `find_python_interpreter()` | `a37cba0` | ✅ Done |
+| II-H | Kill voice cleanly (tray.voice, VoiceSettings, PaneVoice, config keys) | `5c5e4f9` | ✅ Done |
+| II-J | Feature-flag relay pane off (code preserved) | `734ee75` | ✅ Done |
+| II-D | Cost meter — per-model price table + cost chip on WorkedForPill | `d5c71e5` | ✅ Done |
+| II-F | OS notifications on task completion/failure (Tauri notification plugin) | pending | ✅ Done |
 
 ### Infra fixes
 
@@ -117,6 +121,35 @@ Last updated: 2026-06-10
 - 4 new Rust tests: `sidecar_name_no_triple`, `sidecar_name_with_triple`, `is_bundled_orch_true/false`
 - **Note:** `tauri dev` needs a restart to pick up Rust changes
 
+### II-H — Kill voice cleanly
+- `orchestrator/agent.py`: Removed `TYPE_CHECKING` VoiceEngine import, `voice_engine` param from `KimAgent.__init__` and `mcp_agent_context`, `_voice_speak()` and all call sites, `voice.human_quirks` blocks from both system-prompt builders
+- `desktop/src/types/index.ts`: Removed `VoiceEngine` type, `VoiceSettings` interface, `VOICES_BY_ENGINE` catalog, `voice` field from `Settings` and `DEFAULT_SETTINGS`
+- `desktop/src/components/kim-ui/RevampSettings.tsx` + `RevampSidebar.tsx`: Removed 'voice' from PaneId, NAV, NavIcon, PANE_META, render, SettingsPane type
+- `desktop/src/components/kim-ui/settings-panes/PaneSystem.tsx`: Deleted `PaneVoice` component and `VOICE_ENGINES` constant
+- `tests/test_make_test_agent.py`: Added `test_agent_no_voice_attributes` invariant
+- **Note:** `tauri dev` needs a restart to pick up Rust changes
+
+### II-J — Feature-flag relay pane off
+- `desktop/src/components/kim-ui/RevampSettings.tsx`: Added `RELAY_ENABLED = false` constant; `NAV` computed by filtering relay from `NAV_ALL`; render of `PaneRelay` gated on flag
+- All relay code preserved: `PaneRelay` in `PaneInfo.tsx`, `relay.rs`, `relay.css`, relay capability still in `default.json`
+- `tests/test_invariants.py`: `TestRelayFeatureFlag` — verifies flag is false, code preserved, PaneId 'relay' exists
+
+### II-D — Cost meter
+- `desktop/src/components/chat/utils.ts`: `PRICE_PER_1M` table for claude/openai/gemini/deepseek/ollama/browser; `estimateCostUsd()` and `formatCostUsd()` utilities
+- `desktop/src/components/chat/StreamRenderer.tsx`: Added `tokenStats` prop; cost chip shown below `WorkedForPill` for last run — "local · $0" for ollama/browser, "~$X.XXXX" for cloud
+- `desktop/src/components/ChatView.tsx`: Passes `stream.tokenStats` to `StreamRenderer`
+- `desktop/src/components/chat/__tests__/utils.test.ts`: 10 new tests for cost utilities
+
+### II-F — OS notifications on task completion/failure
+- `desktop/src-tauri/Cargo.toml`: Added `tauri-plugin-notification = "2"`
+- `desktop/src-tauri/src/lib.rs`: Registered `tauri_plugin_notification::init()`
+- `desktop/src-tauri/capabilities/default.json`: Added `"notification:default"` permission
+- `desktop/package.json`: Added `@tauri-apps/plugin-notification`
+- `desktop/src/hooks/useOsNotifications.ts`: New hook; listens to `kim:run-done` + `kim:run-failed`; sends OS notification via plugin (lazy permission request, best-effort)
+- `desktop/src/components/ChatView.tsx`: Calls `useOsNotifications()` unconditionally
+- `tests/test_invariants.py`: `TestOsNotificationsHook` — 5 structural invariants
+- **Note:** `tauri dev` needs a restart to pick up Rust changes
+
 ### fix — ultralytics namespace collision
 - Commit `642a488`
 - Root cause: `test_prompt_render.py` and `test_make_test_agent.py` used `from tests.conftest import`, which resolved to the globally-installed ultralytics `tests` package instead of the local `tests/` directory. These tests were *introduced* in V-5/V-6 on this branch, so the 6 failures were NOT pre-existing.
@@ -137,7 +170,10 @@ Last updated: 2026-06-10
 ### Track B
 - [x] P1-3: approval-gate UI round-trip + permission mode toggle — ✅ Done
 - [x] P0-1: PyInstaller spec + sidecar resolution in `find_python_interpreter()` — ✅ Done
-- [ ] Part II quick wins: H (kill voice), J (feature-flag relay pane), D (cost meter), F (OS notifications)
+- [x] II-H: Kill voice — ✅ Done (`5c5e4f9`)
+- [x] II-J: Feature-flag relay pane off — ✅ Done (`734ee75`)
+- [x] II-D: Cost meter — ✅ Done (`d5c71e5`)
+- [x] II-F: OS notifications — ✅ Done
 
 ### Human-blocked
 - License choice (TODO in README)

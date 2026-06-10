@@ -169,3 +169,35 @@ class TestRelayFeatureFlag:
         assert "'relay'" in content, (
             "PaneId 'relay' must still exist in RevampSettings.tsx (code preserved, just flagged off)"
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. II-F OS notifications hook wiring invariants
+# ---------------------------------------------------------------------------
+
+class TestOsNotificationsHook:
+    """useOsNotifications hook must exist and listen to the right Tauri events."""
+
+    def test_hook_file_exists(self):
+        hook = Path(__file__).parent.parent / "desktop/src/hooks/useOsNotifications.ts"
+        assert hook.exists(), "useOsNotifications.ts hook file must exist (II-F)"
+
+    def test_hook_listens_run_done(self):
+        hook = Path(__file__).parent.parent / "desktop/src/hooks/useOsNotifications.ts"
+        content = hook.read_text()
+        assert "kim:run-done" in content, "hook must listen to kim:run-done event"
+
+    def test_hook_listens_run_failed(self):
+        hook = Path(__file__).parent.parent / "desktop/src/hooks/useOsNotifications.ts"
+        content = hook.read_text()
+        assert "kim:run-failed" in content, "hook must listen to kim:run-failed event"
+
+    def test_hook_uses_notification_plugin(self):
+        hook = Path(__file__).parent.parent / "desktop/src/hooks/useOsNotifications.ts"
+        content = hook.read_text()
+        assert "plugin-notification" in content, "hook must import from @tauri-apps/plugin-notification"
+
+    def test_hook_wired_in_chatview(self):
+        chatview = Path(__file__).parent.parent / "desktop/src/components/ChatView.tsx"
+        content = chatview.read_text()
+        assert "useOsNotifications" in content, "useOsNotifications must be called in ChatView.tsx"
