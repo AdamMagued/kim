@@ -2,6 +2,7 @@
 //!
 //! Extracted from lib.rs (Phase 8 restructure).
 //! Public Tauri commands: `list_sessions`, `delete_sessions`,
+//! `delete_all_sessions`, `prune_sessions`,
 //! `summarize_session`, `load_session_messages`, `get_app_version`.
 
 use std::fs;
@@ -317,6 +318,57 @@ pub async fn load_session_messages(
     }
 
     Err(format!("Session not found: {}", session_id))
+}
+
+/// Apply the retention policy: strip screenshots from sessions older than
+/// `screenshot_strip_age_days` and delete sessions older than `max_age_days`.
+/// Delegates to the Python SessionStore.prune_old_sessions via a subprocess call,
+/// so config and Python helper logic stay in one place.
+///
+/// Returns a JSON string: {"stripped": N, "deleted": N}.
+#[tauri::command]
+pub async fn prune_sessions(
+    max_age_days: Option<u32>,
+    screenshot_strip_age_days: Option<u32>,
+) -> Result<String, String> {
+    use tokio::process::Command;
+    let kim_root = crate::default_project_root();
+    let python = crate::find_python_interpreter(&kim_root)?;
+
+    let max_days = max_age_days.unwrap_or(30);
+    let strip_days = screenshot_strip_age_days.unwrap_or(2);
+
+    let script = format!(
+        r#"
+import json, sys
+sys.path.insert(0, r"{root}")
+from orchestrator.session_store import SessionStore
+result = SessionStore.prune_old_sessions(max_age_days={max}, screenshot_strip_age_days={strip})
+print(json.dumps(result))
+"#,
+        root = kim_root.display(),
+        max = max_days,
+        strip = strip_days,
+    );
+
+    let output = Command::new(&python)
+        .arg("-c")
+        .arg(&script)
+        .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
+        .output()
+        .await
+        .map_err(|e| format!("Failed to spawn Python for prune: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("prune_sessions failed: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // Validate it's JSON before returning
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .map_err(|e| format!("Unexpected prune output: {e}"))?;
+    Ok(stdout)
 }
 
 #[tauri::command]

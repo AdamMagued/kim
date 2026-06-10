@@ -681,6 +681,108 @@ class SessionStore:
 
         return sessions
 
+    @staticmethod
+    def prune_old_sessions(
+        max_age_days: int = 30,
+        screenshot_strip_age_days: int = 2,
+        base_dir: Optional[Path] = None,
+    ) -> dict:
+        """
+        Retention policy:
+          - Strip screenshot payloads from sessions older than `screenshot_strip_age_days`.
+          - Delete session files (JSONL + summary + context) older than `max_age_days`.
+
+        Returns {"stripped": int, "deleted": int} counts.
+        """
+        from datetime import timedelta
+        base = Path(base_dir) if base_dir else _DEFAULT_BASE_DIR
+        if not base.exists():
+            return {"stripped": 0, "deleted": 0}
+
+        today = date.today()
+        strip_cutoff = today - timedelta(days=screenshot_strip_age_days)
+        delete_cutoff = today - timedelta(days=max_age_days)
+
+        stripped = 0
+        deleted = 0
+
+        for date_dir in sorted(base.iterdir()):
+            if not date_dir.is_dir():
+                continue
+            try:
+                dir_date = date.fromisoformat(date_dir.name)
+            except ValueError:
+                continue  # skip non-date dirs
+
+            for jsonl_file in date_dir.glob("*.jsonl"):
+                if dir_date <= delete_cutoff:
+                    # Delete the session entirely
+                    session_id = jsonl_file.stem
+                    for ext in (".jsonl", ".summary.txt", ".context.json"):
+                        candidate = date_dir / f"{session_id}{ext}"
+                        if candidate.exists():
+                            try:
+                                candidate.unlink()
+                            except OSError as e:
+                                logger.warning(f"Could not delete {candidate}: {e}")
+                    deleted += 1
+                elif dir_date <= strip_cutoff:
+                    # Strip screenshot data in place
+                    try:
+                        messages = _read_jsonl(jsonl_file)
+                        has_images = any(
+                            isinstance(m.get("content"), list)
+                            and any(
+                                isinstance(b, dict) and b.get("type") == "image"
+                                for b in m.get("content", [])
+                            )
+                            for m in messages
+                        )
+                        if has_images:
+                            stripped_messages = [_strip_images_for_disk(m) for m in messages]
+                            tmp = jsonl_file.with_suffix(".jsonl.tmp")
+                            with open(tmp, "w", encoding="utf-8") as f:
+                                for msg in stripped_messages:
+                                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                            tmp.replace(jsonl_file)
+                            stripped += 1
+                    except Exception as e:
+                        logger.warning(f"Could not strip screenshots from {jsonl_file}: {e}")
+
+            # Remove empty date dirs
+            try:
+                if not any(date_dir.iterdir()):
+                    date_dir.rmdir()
+            except OSError:
+                pass
+
+        return {"stripped": stripped, "deleted": deleted}
+
+    @staticmethod
+    def delete_all_sessions(base_dir: Optional[Path] = None) -> int:
+        """
+        Delete all session data. Returns the number of session files removed.
+
+        Used by Settings → Data → "Delete all my data".
+        """
+        import shutil
+        base = Path(base_dir) if base_dir else _DEFAULT_BASE_DIR
+        if not base.exists():
+            return 0
+
+        count = 0
+        for date_dir in base.iterdir():
+            if not date_dir.is_dir():
+                continue
+            count += sum(1 for _ in date_dir.glob("*.jsonl"))
+            try:
+                shutil.rmtree(date_dir)
+            except OSError as e:
+                logger.warning(f"Could not remove session dir {date_dir}: {e}")
+
+        logger.info(f"delete_all_sessions: removed {count} session files")
+        return count
+
 
 # ------------------------------------------------------------------
 # Internal helpers

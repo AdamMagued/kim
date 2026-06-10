@@ -1938,6 +1938,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             session_commands::list_sessions,
             session_commands::delete_sessions,
+            session_commands::prune_sessions,
             session_commands::load_session_messages,
             session_commands::summarize_session,
             run_history::save_run_history,
