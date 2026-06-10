@@ -14,6 +14,8 @@ import {
   basename,
   getGreeting,
   providerLabel,
+  estimateCostUsd,
+  formatCostUsd,
 } from './utils';
 import { buildThinkingTrace, traceToWorkedFor } from './parsers';
 
@@ -102,6 +104,7 @@ export interface StreamRendererProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   setTaskInput: (val: string) => void;
   resolveProvider: () => string;
+  tokenStats?: { input: number; output: number; total: number } | null;
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -142,6 +145,7 @@ export function StreamRenderer({
   textareaRef,
   setTaskInput,
   resolveProvider,
+  tokenStats,
 }: StreamRendererProps) {
 
   // ── Render Helpers ─────────────────────────────────────────────────────────
@@ -240,13 +244,35 @@ export function StreamRenderer({
     );
   }
 
-  function renderWorkedFor(_idx: number, run: { activity: ActivityItem[]; durationSec: number }) {
+  function renderWorkedFor(_idx: number, run: { activity: ActivityItem[]; durationSec: number }, showCost = false) {
     const historyTrace = buildThinkingTrace(run.activity, parsePlanFromActivity(run.activity));
     const workedForTrace = traceToWorkedFor(historyTrace);
     const duration = run.durationSec > 0 ? formatDuration(run.durationSec) : '…';
+    const provider = resolveProvider();
+    const costUsd = showCost && tokenStats
+      ? estimateCostUsd(provider, tokenStats.input, tokenStats.output)
+      : null;
     return (
-      <div className="kim-msg-row kim-msg-row--assistant">
+      <div className="kim-msg-row kim-msg-row--assistant" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 6 }}>
         <WorkedForPill trace={workedForTrace} duration={duration} />
+        {costUsd !== null && (
+          <span
+            title={`~${formatCostUsd(costUsd)} estimated · ${tokenStats?.input.toLocaleString()} in / ${tokenStats?.output.toLocaleString()} out tokens`}
+            style={{
+              fontFamily: 'var(--kim-mono)',
+              fontSize: 11.5,
+              color: costUsd === 0 ? 'var(--kim-text-4)' : 'var(--kim-text-3)',
+              background: 'var(--kim-surface)',
+              border: '1px solid var(--kim-border)',
+              borderRadius: 6,
+              padding: '2px 7px',
+              cursor: 'default',
+              userSelect: 'none',
+            }}
+          >
+            {costUsd === 0 ? 'local · $0' : `~${formatCostUsd(costUsd)}`}
+          </span>
+        )}
       </div>
     );
   }
@@ -409,13 +435,15 @@ export function StreamRenderer({
               const showActivityAfter = msg.role === 'user' && isRealUserMessage(msg) &&
                 !collapsed.slice(i + 1).some(({ msg: m }) => m.role === 'assistant' && !isIntermediateToolCall(m));
               let workedRun: { activity: ActivityItem[]; durationSec: number } | null = null;
+              let workedRunIsLast = false;
               if (msg.role === 'assistant') {
                 liveAsstRunIdx += 1;
                 workedRun = runHistory[liveAsstRunIdx] ?? null;
+                workedRunIsLast = liveAsstRunIdx === runHistory.length - 1;
               }
               return (
                 <div key={`live-${i}`}>
-                  {workedRun && renderWorkedFor(liveUserIdx, workedRun)}
+                  {workedRun && renderWorkedFor(liveUserIdx, workedRun, workedRunIsLast)}
                   <MessageBubble
                     message={msg}
                     animate={i === liveHistory.length - 1}
@@ -673,13 +701,15 @@ export function StreamRenderer({
                 const showActivityAfter = msg.role === 'user' && isRealUserMessage(msg) &&
                   !collapsed.slice(i + 1).some(({ msg: m }) => m.role === 'assistant' && !isIntermediateToolCall(m));
                 let workedRun: { activity: ActivityItem[]; durationSec: number } | null = null;
+                let workedRunIsLast2 = false;
                 if (msg.role === 'assistant') {
                   workedRun = runHistory[liveAsstIdx] ?? null;
+                  workedRunIsLast2 = liveAsstIdx === runHistory.length - 1;
                   liveAsstIdx += 1;
                 }
                 return (
                   <div key={`live-${i}`}>
-                    {workedRun && renderWorkedFor(liveUserMsgIdx, workedRun)}
+                    {workedRun && renderWorkedFor(liveUserMsgIdx, workedRun, workedRunIsLast2)}
                     <MessageBubble
                       message={msg}
                       animate={i === liveHistory.length - 1}

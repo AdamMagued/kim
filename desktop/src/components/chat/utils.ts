@@ -853,3 +853,28 @@ export function projectLabel(path?: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? path;
 }
+
+// ── Cost estimation ───────────────────────────────────────────────────────────
+
+// USD cost per 1M tokens { input, output }. Zero for free/local providers.
+// Rates are approximate; see provider docs for exact pricing.
+const PRICE_PER_1M: Record<string, { input: number; output: number }> = {
+  claude:   { input: 3.00,  output: 15.00  }, // claude-sonnet-4.x default
+  openai:   { input: 5.00,  output: 15.00  }, // gpt-4o
+  gemini:   { input: 1.25,  output: 5.00   }, // gemini-1.5-pro
+  deepseek: { input: 0.27,  output: 1.10   }, // deepseek-chat
+  ollama:   { input: 0,     output: 0      }, // local
+  browser:  { input: 0,     output: 0      }, // local
+};
+
+export function estimateCostUsd(provider: string, inputTokens: number, outputTokens: number): number {
+  const rates = PRICE_PER_1M[provider] ?? PRICE_PER_1M['claude'];
+  return (inputTokens * rates.input + outputTokens * rates.output) / 1_000_000;
+}
+
+export function formatCostUsd(usd: number): string {
+  if (usd === 0) return '$0.00';
+  if (usd < 0.0001) return '<$0.0001';
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(4)}`;
+}

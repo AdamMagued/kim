@@ -476,6 +476,7 @@ export function ChatView({
       textareaRef={textareaRef}
       setTaskInput={setTaskInput}
       resolveProvider={resolveProvider}
+      tokenStats={stream.tokenStats}
     />
   );
 }
