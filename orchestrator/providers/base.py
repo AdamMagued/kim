@@ -121,14 +121,20 @@ class BaseProvider(ABC):
 def create_provider(name: str, config: dict) -> BaseProvider:
     """
     Factory — returns a provider instance for the given name.
-    Names: "claude", "openai", "gemini", "deepseek", "browser", "ollama"
+    Names: "claude", "openai", "gemini", "deepseek", "browser", "ollama", "fake"
     Also: "browser:claude", "browser:chatgpt", … (sets browser_provider.preferred_site).
+
+    KIM_FAKE=1 env var forces the "fake" provider regardless of config/args.
 
     Gemini auth contract:
       - legacy/dev: GOOGLE_API_KEY or config["api_key"]
       - Kim OAuth: Tauri injects KIM_GOOGLE_ACCESS_TOKEN (+ optional expiry/project)
         after refreshing the OS-keychain refresh token. Python never sees refresh tokens.
     """
+    import os
+    if os.environ.get("KIM_FAKE", "").strip() not in ("", "0"):
+        from orchestrator.providers.fake import FakeProvider
+        return FakeProvider()
     name = name.lower().strip()
     if name.startswith("browser:"):
         sub = name.split(":", 1)[1].strip().lower()
@@ -162,4 +168,7 @@ def create_provider(name: str, config: dict) -> BaseProvider:
     if name == "browser":
         from orchestrator.providers.browser_provider import BrowserProvider
         return BrowserProvider(config)
-    raise ValueError(f"Unknown provider: {name!r}. Choose from: claude, openai, gemini, deepseek, browser, ollama")
+    if name == "fake":
+        from orchestrator.providers.fake import FakeProvider
+        return FakeProvider()
+    raise ValueError(f"Unknown provider: {name!r}. Choose from: claude, openai, gemini, deepseek, browser, ollama, fake")
