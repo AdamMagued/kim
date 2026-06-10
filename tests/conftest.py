@@ -120,7 +120,6 @@ def make_test_agent(**overrides):
 
     # Required private attrs
     agent._ui_bridge = ui_bridge
-    agent._voice = None
     agent._session_store = session_store
     agent._resume_session_id = None
     agent._screenshot_hashes = []

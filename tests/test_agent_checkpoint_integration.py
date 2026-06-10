@@ -182,7 +182,6 @@ def _build_agent(spy_store: _SpySessionStore, provider_responses: list):
     agent._current_step_index = 0
 
     agent._log = lambda level, msg: None
-    agent._voice_speak = AsyncMock(return_value=None)
     agent._is_cancelled = lambda: False
     agent._is_stuck = lambda _: False
     agent._emit_plan_markers = lambda _: None

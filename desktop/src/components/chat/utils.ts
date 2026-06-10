@@ -221,8 +221,6 @@ export const HIDDEN_SUBSTRINGS = [
   '[--task', '[--provider', '[--config', '[--max-iter', '[--resume', '[-h]',
   // BrowserProvider internal debug
   'BrowserProvider:', 'cdp_url=', "sites=['", 'headless =',
-  // VoiceEngine
-  'VoiceEngine initialized:', 'fallback chain:',
   // MCP / asyncio internals
   'mcp_server', 'mcp.shared', 'McpError', 'stdio_client',
   'asyncio.run(', 'ExceptionGroup:', 'TaskGroup',

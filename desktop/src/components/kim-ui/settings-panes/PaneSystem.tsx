@@ -1,10 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import type { Settings, Theme, VoiceEngine, VoiceSettings, AccentTheme, TypingAnimation, KimAccount } from '../../../types';
-import { VOICES_BY_ENGINE } from '../../../types';
-import { SectionLabel, Row, Toggle } from './primitives';
+import type { Settings, Theme, AccentTheme, TypingAnimation, KimAccount } from '../../../types';
+import { SectionLabel } from './primitives';
 
 const ACCENTS: { value: AccentTheme; label: string; color: string }[] = [
   { value: 'indigo', label: 'Terracotta', color: '#e8b89a' },
@@ -13,13 +12,6 @@ const ACCENTS: { value: AccentTheme; label: string; color: string }[] = [
   { value: 'teal', label: 'Sage', color: '#a8c5a3' },
   { value: 'jade', label: 'Rose', color: '#d4a0a0' },
   { value: 'mono', label: 'Mono', color: '#e8e0d2' },
-];
-
-const VOICE_ENGINES: { value: VoiceEngine; title: string; sub: string }[] = [
-  { value: 'kokoro', title: 'Kokoro', sub: 'Local · fast' },
-  { value: 'maya1', title: 'Maya-1', sub: 'Local · expressive' },
-  { value: 'http', title: 'HTTP', sub: 'OpenAI-compatible API' },
-  { value: 'hume', title: 'Hume', sub: 'Cloud · API key' },
 ];
 
 const ANIMATIONS: { value: TypingAnimation; label: string; desc: string }[] = [
@@ -135,133 +127,6 @@ function PaneAppearance({ settings, onChange }: { settings: Settings; onChange: 
         ))}
       </div>
       <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginTop: 8 }}>Applies to the newest message only.</div>
-    </>
-  );
-}
-
-function PaneVoice({ settings, onChange }: { settings: Settings; onChange: (s: Settings) => void }) {
-  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
-  const [voiceError, setVoiceError] = useState<string | null>(null);
-
-  useEffect(() => {
-    invoke<VoiceSettings>('read_voice_config', { projectRoot: settings.project_root || null })
-      .then((cfg) => onChange({ ...settings, voice: { ...settings.voice, ...cfg } }))
-      .catch((err) => setVoiceError(`Failed to read config.yaml: ${String(err)}`));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function updateVoice<K extends keyof VoiceSettings>(key: K, value: VoiceSettings[K]) {
-    const next: VoiceSettings = { ...settings.voice, [key]: value };
-    if (key === 'engine') {
-      const vs = VOICES_BY_ENGINE[value as VoiceEngine];
-      if (vs.length > 0) next.voice_id = vs[0].value;
-    }
-    onChange({ ...settings, voice: next });
-    setSaveState('saving');
-    setVoiceError(null);
-    try {
-      await invoke('write_voice_config', { config: next, projectRoot: settings.project_root || null });
-      setSaveState('saved');
-      setTimeout(() => setSaveState('idle'), 1500);
-    } catch (err) {
-      setSaveState('error');
-      setVoiceError(String(err));
-    }
-  }
-
-  const voices = VOICES_BY_ENGINE[settings.voice.engine] ?? [];
-
-  return (
-    <>
-      <Row title="Enable voice" subtitle="Speak completions, errors, and confirmations aloud.">
-        <Toggle on={settings.voice.enabled} onClick={() => updateVoice('enabled', !settings.voice.enabled)} />
-      </Row>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginTop: 22 }}>
-        <div>
-          <SectionLabel>engine</SectionLabel>
-          {VOICE_ENGINES.map((e) => (
-            <button
-              key={e.value}
-              type="button"
-              className={`kr-tile${settings.voice.engine === e.value ? ' kr-on' : ''}`}
-              onClick={() => updateVoice('engine', e.value)}
-              disabled={!settings.voice.enabled}
-              style={{ marginBottom: 8, width: '100%' }}
-            >
-              <div style={{ fontSize: 13.5 }}>{e.title}</div>
-              <div
-                style={{
-                  fontSize: 11.5,
-                  color: 'var(--kim-text-3)',
-                  fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
-                  marginTop: 2,
-                }}
-              >
-                {e.sub}
-              </div>
-            </button>
-          ))}
-        </div>
-        <div>
-          <SectionLabel>voice · {voices.length} available</SectionLabel>
-          <div style={{ maxHeight: 380, overflowY: 'auto' }}>
-            {voices.map((v) => (
-              <button
-                key={v.value}
-                type="button"
-                className={`kr-tile${settings.voice.voice_id === v.value ? ' kr-on' : ''}`}
-                onClick={() => updateVoice('voice_id', v.value)}
-                disabled={!settings.voice.enabled}
-                style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 10, width: '100%' }}
-              >
-                <span
-                  style={{
-                    width: 28,
-                    height: 28,
-                    borderRadius: 8,
-                    border: '1px solid var(--kim-border)',
-                    background: 'var(--kim-bg-2)',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                  }}
-                >
-                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-                    <path d="M3 2v6l5-3z" fill="currentColor" />
-                  </svg>
-                </span>
-                <div style={{ flex: 1, textAlign: 'left' }}>
-                  <div style={{ fontSize: 13.5 }}>{v.label}</div>
-                </div>
-                {settings.voice.voice_id === v.value && <span style={{ color: 'var(--kim-accent)', fontSize: 11 }}>✓</span>}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      {voiceError && (
-        <div
-          style={{
-            marginTop: 12,
-            padding: '10px 14px',
-            border: '1px solid var(--kim-red)',
-            borderRadius: 10,
-            color: 'var(--kim-red)',
-            fontSize: 12.5,
-            background: 'rgba(212,148,151,0.05)',
-          }}
-        >
-          {voiceError}
-        </div>
-      )}
-      {saveState === 'saving' && (
-        <div style={{ marginTop: 12, fontSize: 12, color: 'var(--kim-text-3)' }}>Saving…</div>
-      )}
-      {saveState === 'saved' && (
-        <div style={{ marginTop: 12, fontSize: 12, color: 'var(--kim-green)' }}>Saved</div>
-      )}
     </>
   );
 }
@@ -529,4 +394,4 @@ function PaneData({
   );
 }
 
-export { PaneAppearance, PaneVoice, PanePaths, PaneData };
+export { PaneAppearance, PanePaths, PaneData };

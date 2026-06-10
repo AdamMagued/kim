@@ -26,7 +26,6 @@ def test_make_test_agent_default_attributes():
     assert agent._tools is not None
     assert len(agent._tools) >= 1
     assert agent._ui_bridge is None
-    assert agent._voice is None
 
 
 def test_make_test_agent_custom_max_iterations():
@@ -81,3 +80,13 @@ def test_make_test_agent_has_all_attributes_used_by_run():
     assert hasattr(agent, "_context_meter")
     assert hasattr(agent, "_interaction_policy")
     assert hasattr(agent, "_total_tokens")
+
+
+def test_agent_no_voice_attributes():
+    """II-H: voice is fully removed — no _voice attr and no voice_engine param."""
+    import inspect
+    from orchestrator.agent import KimAgent
+    agent = make_test_agent()
+    assert not hasattr(agent, "_voice"), "_voice attribute should not exist after II-H"
+    sig = inspect.signature(KimAgent.__init__)
+    assert "voice_engine" not in sig.parameters, "voice_engine param must not exist after II-H"

@@ -4,7 +4,7 @@ import { PaneSchedule } from '../settings/SchedulePane';
 import { PaneHeader } from './settings-panes/primitives';
 import { PaneAI } from './settings-panes/PaneAI';
 import { PaneAccount } from './settings-panes/PaneAccount';
-import { PaneAppearance, PaneVoice, PanePaths, PaneData } from './settings-panes/PaneSystem';
+import { PaneAppearance, PanePaths, PaneData } from './settings-panes/PaneSystem';
 import { PaneMCP, PaneFeedback, PaneAbout, PaneRelay } from './settings-panes/PaneInfo';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -12,7 +12,6 @@ import { PaneMCP, PaneFeedback, PaneAbout, PaneRelay } from './settings-panes/Pa
 type PaneId =
   | 'appearance'
   | 'ai'
-  | 'voice'
   | 'paths'
   | 'data'
   | 'schedule'
@@ -38,7 +37,6 @@ interface Props {
 const NAV: { id: PaneId; label: string; icon: PaneId }[] = [
   { id: 'appearance', label: 'Appearance', icon: 'appearance' },
   { id: 'ai', label: 'AI', icon: 'ai' },
-  { id: 'voice', label: 'Voice', icon: 'voice' },
   { id: 'paths', label: 'Paths', icon: 'paths' },
   { id: 'data', label: 'Data', icon: 'data' },
   { id: 'schedule', label: 'Schedules', icon: 'schedule' },
@@ -76,13 +74,6 @@ function NavIcon({ name }: { name: PaneId }) {
       return (
         <svg width="15" height="15" viewBox="0 0 16 16">
           <path {...stroke} d="M8 1.5v3M8 11.5v3M1.5 8h3M11.5 8h3M3.5 3.5l2 2M10.5 10.5l2 2M3.5 12.5l2-2M10.5 5.5l2-2" />
-        </svg>
-      );
-    case 'voice':
-      return (
-        <svg width="15" height="15" viewBox="0 0 16 16">
-          <rect {...stroke} x="6" y="2" width="4" height="8" rx="2" />
-          <path {...stroke} d="M3 7.5c0 2.8 2.2 5 5 5s5-2.2 5-5M8 12.5v2" />
         </svg>
       );
     case 'paths':
@@ -144,7 +135,6 @@ function NavIcon({ name }: { name: PaneId }) {
 const PANE_META: Record<PaneId, { title: string; subtitle: string }> = {
   appearance: { title: 'Appearance', subtitle: 'How Kim looks on your machine.' },
   ai: { title: 'AI', subtitle: 'Which model runs Kim and how it behaves while working.' },
-  voice: { title: 'Voice', subtitle: 'Kim speaks task completions, stuck detection, and tool announcements.' },
   paths: { title: 'Paths', subtitle: 'Where Kim reads and writes on disk.' },
   data: { title: 'Data', subtitle: 'Your sessions live on your machine. Nothing leaves unless you sync.' },
   schedule: { title: 'Schedules', subtitle: 'Plan recurring tasks and run due work on demand.' },
@@ -262,7 +252,6 @@ export function RevampSettings(props: Props) {
           <PaneHeader title={meta.title} subtitle={meta.subtitle} onClose={onClose} />
           {active === 'appearance' && <PaneAppearance settings={settings} onChange={onChange} />}
           {active === 'ai' && <PaneAI settings={settings} onChange={onChange} />}
-          {active === 'voice' && <PaneVoice settings={settings} onChange={onChange} />}
           {active === 'paths' && <PanePaths settings={settings} onChange={onChange} />}
           {active === 'data' && <PaneData account={account} onAccountChange={onAccountChange} />}
           {active === 'schedule' && <PaneSchedule settings={settings} onChange={onChange} />}
