@@ -3,10 +3,11 @@
 **Date:** 2026-06-10 · **Branch:** `kim-improvement` · **App version:** 0.9.6
 **Supersedes:** `IMPROVEMENT_PLAN.md` (mostly executed) and extends `HARNESS_ROADMAP.md`
 
-This is the single document to read for two questions:
+This is the single document to read for three questions:
 
 1. **What should we add to make Kim dramatically better?** (Part II)
 2. **What is left before Kim is production-grade?** (Part I)
+3. **How do we make the repo 10/10 to vibe-code in — minimal context, maximum safety?** (Part V)
 
 Everything below was verified against the actual repo state on 2026-06-10 — not guessed.
 
@@ -23,6 +24,7 @@ After the 2026-06 quality pass (commits `d58f19e` + `c4ff733`):
 | Test health | unknown | **green** | 816 pytest · 31 vitest · 50 cargo, tsc clean, cargo zero warnings |
 | Web automation | 4/10 | **6.5/10** | `web_fill_form` composite tool, synonym resolver, FORM_SCHEMA, state diffs |
 | Production readiness | — | **~5/10** | The gap is almost entirely *distribution, observability, and resilience* — not features |
+| Vibecodability | 4.5/10 | **6.5/10** | MCP tools are 8.5; the Rust↔Python seam is a 4. Part V is the plan to 10. |
 
 **The headline:** Kim's *agent core* is now solid. What separates it from a shippable product is everything **around** the agent: how it installs, how it updates, how it fails, and how you find out when it fails on someone else's machine.
 
@@ -289,6 +291,124 @@ E kill dual IPC → D streaming + prompt caching + cost meter → H voice decisi
 ### Phase 4 — "Magic" (ongoing)
 A playbooks + semantic resolver + web_extract → C cross-session memory → B Google-suite tools → F scheduling UI.
 **Exit test:** "make a private repo called X" the *second* time completes in under 10 seconds.
+
+---
+
+# PART V — Vibecodability: 6.5 → 10
+
+**Goal:** an AI agent (or a tired human) should be able to fix a bug or add a feature while reading the **minimum** number of files, with the compiler and tests catching cross-cutting breakage instead of tribal knowledge. Every item below is a token-economy play: less context needed per change, more breakage caught mechanically.
+
+Current per-area scores: MCP tools **8.5** · Python orchestrator **7** · React frontend **6** · Rust **6** · Rust↔Python seam **4**.
+
+The underlying principles, named, because they're the test for whether a future change helps or hurts:
+
+- **Single Source of Truth** — a fact defined twice will drift; a model editing one copy can't know the other exists
+- **Design by Contract / fail fast** — contracts as types and runtime asserts, not conventions in docs
+- **Test the seams, not just the units** — breakage at boundaries must be *announced*, because that's exactly where a model's context window ends
+- **Single Responsibility / small files** — any one edit should fit on one screen with its context
+- **Dependency Inversion** — construct with injected deps so tests don't reverse-engineer internals
+- **Poka-yoke (mistake-proofing)** — turn every "you just have to know" invariant into a check that fails loudly
+- **Locality of context** — docs scoped to the directory they describe, sized to be loaded whole
+
+## V-1. One source of truth for the IPC protocol ⚡ (worst offender, biggest win)
+
+**Today:** every agent event is emitted twice (legacy `[STATUS]`-style text + typed `kim:*` JSON) and parsed by hand-written regexes in `desktop/src/components/chat/parsers.ts`. A model that updates one path cannot know the other exists without having read both sides. Nothing errors when they drift — the UI just silently rots. This is the single largest vibecodability tax in the repo.
+
+- [ ] Kill the legacy text protocol (Part II-E) — single emit path
+- [ ] **Schema-first events:** define every event once in `events.schema.json` (or Python dataclasses as the source) → codegen TypeScript types into `desktop/src/types/events.gen.ts` via `npm run gen:events`
+- [ ] CI check: regenerate and `git diff --exit-code` — drift between schema and generated types fails the build
+- [ ] **Payoff:** adding an event = edit one schema file; `tsc` then *lists every consumer that needs updating*. The model needs zero memory of the frontend.
+
+## V-2. Contracts as types, not conventions
+
+**Today:** providers return bare dicts (`{"type": "tool_call", "tool": ..., "args": ...}`), tool results are bare strings, and nothing type-checks the Python at all (no mypy/pyright in `requirements.txt` or CI — verified). A typo in a dict key is a runtime mystery three layers away.
+
+- [ ] `ProviderResponse` dataclass (or TypedDict) in `providers/base.py`; all five providers return it; agent consumes typed fields
+- [ ] Typed tool-result envelope (`ok/error + payload + display_text`) instead of magic string prefixes like `"FORM_FILL_REPORT\n"`
+- [ ] Add **pyright** (fast, zero-config) to CI for `orchestrator/` + `mcp_server/` — start at `basic` strictness, ratchet up
+- [ ] ESLint rule banning new `any` in `desktop/src/` (warn-level first, error after cleanup)
+- [ ] **Payoff:** a wrong field name becomes a red squiggle in the diff, not a bug report. Models lean on type errors as a free correctness oracle — it's the cheapest feedback channel that exists.
+
+## V-3. Contract tests at every seam
+
+**Today:** the Rust stdout-parser and the Python emitter are tested only against themselves. The two seams where all real breakage happens have zero coverage.
+
+- [ ] **Golden-transcript test (Rust↔Python):** run the orchestrator with a scripted fake provider, capture stdout, feed it to the Rust parsing functions, snapshot-assert the parsed events. One test, both languages, catches every protocol drift.
+- [ ] **Provider contract suite:** one parametrized pytest file running identical scenarios (text reply, tool call, tool result round-trip, image content) across all five providers' message-formatting layers. The Ollama tool-call-id bug (B7) would have been caught on day one.
+- [ ] Grow the fixture-driven web evals (`tests/evals/`) with every resolver change — they already caught 3 real bugs at birth
+- [ ] **Payoff:** a model can confidently edit *one side* of a seam; the test tells it what broke on the other side. This is what makes a context window boundary safe.
+
+## V-4. Finish the god-file decomposition (Single Responsibility)
+
+**Today:** `ChatView.tsx` ≈ 3,300 lines, `chat.css` 2,448, `agent.py` ≈ 1,800. Every edit in these files forces a model to load enormous context to change 10 lines — the literal opposite of token economy.
+
+- [ ] `ChatView.tsx` → container + `MessageList` + `ActivityFeed` + `Composer` + `codexEvents.ts` (the JSONL `item.completed` parsing deserves its own tested module)
+- [ ] `agent.py` run-loop body → named phase methods (`_perceive`, `_decide`, `_act`, `_settle`) so any single edit fits in one screen; extract the stuck-detection cluster into `stuck_detection.py`
+- [ ] `chat.css` → per-component files (and delete selectors orphaned by the dead-component purge)
+- [ ] **Working rule going forward:** no file over ~500 lines without a header comment justifying it; add a soft CI warning (`scripts/check_file_sizes.sh`) so drift is visible in PRs
+- [ ] **Payoff:** smaller files = the model reads only what it edits. This is the most direct token-savings item in the whole plan.
+
+## V-5. Constructor injection for `KimAgent` (Dependency Inversion)
+
+**Today:** tests build agents via `KimAgent.__new__` and hand-wire ~30 private attributes (`tests/test_agent_checkpoint_integration.py:145-216`). Adding one attribute to `__init__` breaks tests in ways that look completely unrelated — a model adding a feature gets punished by mystery failures.
+
+- [ ] `AgentDeps` dataclass (provider, session_store, interaction_policy, context_meter, ui_bridge, config) with sane defaults; `KimAgent.__init__(deps)`
+- [ ] One shared test factory `make_test_agent(**overrides)` in `tests/conftest.py`; delete every `__new__` wiring block
+- [ ] **Payoff:** new attributes get a default in exactly one place. Tests stop encoding the constructor's private internals, so refactors stop breaking them.
+
+## V-6. Encode the invisible invariants as checks (poka-yoke)
+
+**Today:** the repo's most dangerous knowledge lives only in docs/memory: f-string prompts need doubled braces, CSS import order is load-bearing, the Code tab must never touch OpenAI auth, tool schemas must match dispatch entries. A model that didn't read the right doc violates one within minutes — and nothing stops it.
+
+- [ ] **Prompt-render test:** render every system-prompt template with representative args; a stray `{` becomes a failing test instead of a runtime `KeyError` mid-task
+- [ ] **Tool-registry startup validation:** every schema has a dispatch entry and vice versa; mismatch = loud startup error, also covered by a unit test
+- [ ] **Constraint test for the standing rule:** assert the Code-tab provider resolution can never yield OpenAI auth/gpt-5.5 — the rule graduates from memory to a red test
+- [ ] **CSS order check:** tiny script asserting `index.css` import order matches a declared manifest; or better, eliminate order-dependence by scoping styles per component as part of V-4
+- [ ] **Payoff:** "you just have to know X" becomes "CI tells you X." Tribal knowledge is exactly what models don't have — this converts it into feedback they do get.
+
+## V-7. Scoped, layered context docs (token economy, directly)
+
+**Today:** one 694-line `CLAUDE.md` at the root (verified). It's good — but a model fixing a CSS bug pays the full 694-line tax to learn Rust invariants it doesn't need, every single session.
+
+- [ ] Shrink root `CLAUDE.md` to a ≤60-line **router**: what Kim is, the standing constraints, and pointers
+- [ ] Per-directory `CLAUDE.md` files, each ≤60 lines: `orchestrator/`, `mcp_server/`, `desktop/src/`, `desktop/src-tauri/` — what lives here, the local invariants, how to test *this* layer (agentic tools auto-load the nearest one — that's the mechanism this exploits)
+- [ ] **`HOW_TO.md` golden-path recipes**, each listing the *exact minimal file set* to touch:
+  - Add an MCP tool (handler → `tool_registry.py` schema + dispatch → risk tier → test) — 4 files
+  - Add a provider (subclass → factory → contract-test entry) — 3 files
+  - Add a settings pane (pane component → `PANE_META` → nav) — 3 files
+  - Add an agent event (schema → regen → emit → render) — 3 files after V-1
+- [ ] **Payoff:** this is the highest-leverage token saver in the plan. A recipe turns "explore 20 files to find the pattern" into "read 1 doc, open 3 files." Every future session, every model, forever.
+
+## V-8. One-command feedback loops
+
+**Today:** verifying a cross-layer change means knowing four incantations (`pytest`, `npm run test`, `npx tsc --noEmit`, `cargo check`) and which apply. No justfile/Makefile exists (verified). And truly end-to-end verification needs Chrome + CDP + API keys — so models skip it.
+
+- [ ] **`justfile`** at repo root: `just check` (tsc + cargo check + fast pytest subset, in parallel), `just test` (everything), `just test-web` (evals only), `just dev`
+- [ ] Mark slow/integration tests (`@pytest.mark.slow`) so `just check` finishes in <30s — feedback loops above ~30s stop being loops
+- [ ] **Offline fake mode:** `KIM_FAKE=1` runs the full agent loop with a scripted provider + `FakePage` web layer — full end-to-end verification with **zero** API keys, browsers, or spend. The fakes already exist in the eval suite; this just wires them into the real entrypoint.
+- [ ] **Payoff:** a model can *prove* its change works for the cost of one command. Cheap verification is the difference between "looks right" and "is right."
+
+## V-9. Error messages that teach
+
+- [ ] Seam errors include the fix: `Unknown event type 'run_pasued' — valid types are in events.schema.json; run 'npm run gen:events' after adding one`
+- [ ] Orchestrator startup self-check prints exactly what's missing and the remediation (no venv? no Playwright browsers? CDP unreachable?) instead of a stack trace from three layers down
+- [ ] **Payoff:** every great error message is context the model didn't have to load up front — documentation delivered exactly when needed.
+
+## Scoring impact
+
+| Item | Principle | Score impact | Effort |
+|---|---|---|---|
+| V-1 IPC single source + codegen | Single Source of Truth | **+1.0** | 4–6 days (includes Part II-E) |
+| V-7 scoped docs + recipes | Locality of context | **+0.7** | 1–2 days ← **do first, pure writing** |
+| V-3 seam contract tests | Test the boundaries | **+0.5** | 2–3 days |
+| V-4 god-file splits | Single Responsibility | **+0.5** | 3–4 days |
+| V-2 typed contracts + pyright | Design by Contract | **+0.5** | 2–3 days |
+| V-8 justfile + fake mode | Fast feedback | **+0.4** | 1–2 days |
+| V-6 invariants as checks | Poka-yoke | **+0.3** | 1–2 days |
+| V-5 agent DI | Dependency Inversion | **+0.3** | 1 day |
+| V-9 teaching errors | Just-in-time context | **+0.2** | ongoing habit |
+
+Total: 6.5 → **~10**, roughly 3 weeks of focused work. **Recommended order: V-7 first** (pure documentation, zero risk, immediate payoff for every session after), then V-8, then V-1 aligned with Phase 3's IPC kill, then the rest opportunistically — V-3/V-5/V-6 pair naturally with whatever feature work touches those areas. This track runs **parallel** to Phases 1–2 of Part IV; none of it blocks shipping, all of it makes every later phase cheaper.
 
 ---
 
