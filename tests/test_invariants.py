@@ -142,3 +142,30 @@ class TestCSSImportOrder:
         import_text = "\n".join(imports)
         for f in self.EXPECTED_ORDER:
             assert f in import_text, f"Expected CSS file missing from index.css: {f}"
+
+
+# ---------------------------------------------------------------------------
+# 4. II-J relay feature-flag: pane hidden but code preserved
+# ---------------------------------------------------------------------------
+
+class TestRelayFeatureFlag:
+    """Relay pane is feature-flagged off; code must still exist (not deleted)."""
+
+    def test_relay_flag_is_false(self):
+        src = Path(__file__).parent.parent / "desktop/src/components/kim-ui/RevampSettings.tsx"
+        content = src.read_text()
+        assert "RELAY_ENABLED = false" in content, (
+            "RELAY_ENABLED must be false in RevampSettings.tsx (II-J)"
+        )
+
+    def test_relay_code_preserved(self):
+        pane_info = Path(__file__).parent.parent / "desktop/src/components/kim-ui/settings-panes/PaneInfo.tsx"
+        content = pane_info.read_text()
+        assert "PaneRelay" in content, "PaneRelay code must not be deleted (II-J: flag off, not delete)"
+
+    def test_relay_pane_id_preserved(self):
+        src = Path(__file__).parent.parent / "desktop/src/components/kim-ui/RevampSettings.tsx"
+        content = src.read_text()
+        assert "'relay'" in content, (
+            "PaneId 'relay' must still exist in RevampSettings.tsx (code preserved, just flagged off)"
+        )

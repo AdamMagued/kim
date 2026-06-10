@@ -32,9 +32,14 @@ interface Props {
   initialPane?: PaneId;
 }
 
+// ── Feature flags ─────────────────────────────────────────────────────────────
+
+// Set to true to re-enable the Phone Relay pane in Settings.
+const RELAY_ENABLED = false;
+
 // ── Static config ─────────────────────────────────────────────────────────────
 
-const NAV: { id: PaneId; label: string; icon: PaneId }[] = [
+const NAV_ALL: { id: PaneId; label: string; icon: PaneId }[] = [
   { id: 'appearance', label: 'Appearance', icon: 'appearance' },
   { id: 'ai', label: 'AI', icon: 'ai' },
   { id: 'paths', label: 'Paths', icon: 'paths' },
@@ -46,6 +51,8 @@ const NAV: { id: PaneId; label: string; icon: PaneId }[] = [
   { id: 'feedback', label: 'Feedback', icon: 'feedback' },
   { id: 'about', label: 'About', icon: 'about' },
 ];
+
+const NAV = RELAY_ENABLED ? NAV_ALL : NAV_ALL.filter(n => n.id !== 'relay');
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
@@ -256,7 +263,7 @@ export function RevampSettings(props: Props) {
           {active === 'data' && <PaneData account={account} onAccountChange={onAccountChange} />}
           {active === 'schedule' && <PaneSchedule settings={settings} onChange={onChange} />}
           {active === 'account' && <PaneAccount account={account} onAccountChange={onAccountChange} />}
-          {active === 'relay' && <PaneRelay settings={settings} />}
+          {RELAY_ENABLED && active === 'relay' && <PaneRelay settings={settings} />}
           {active === 'mcp' && <PaneMCP />}
           {active === 'feedback' && <PaneFeedback />}
           {active === 'about' && <PaneAbout appVersion={appVersion} onCheckUpdate={onCheckUpdate} />}
