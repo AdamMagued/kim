@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Kim Agent IPC Events",
+  "description": "All typed events emitted from Python orchestrator → Rust subprocess.rs → Tauri → React. Edit this file and run 'npm run gen:events' to regenerate events.gen.ts.",
+  "events": [
+    {
+      "event": "kim:status",
+      "typeName": "KimStatus",
+      "description": "A human-readable status message from the agent loop (activity feed item).",
+      "payload": {
+        "message": { "type": "string", "description": "Status text to display in activity feed." }
+      }
+    },
+    {
+      "event": "kim:plan",
+      "typeName": "KimPlan",
+      "description": "Agent emitted a structured plan with step list.",
+      "payload": {
+        "steps": {
+          "type": "unknown[]",
+          "description": "Array of plan step objects."
+        }
+      }
+    },
+    {
+      "event": "kim:step",
+      "typeName": "KimStep",
+      "description": "Agent advanced to a new plan step.",
+      "payload": {
+        "n": { "type": "number", "description": "1-based step index." },
+        "data": { "type": "Record<string, unknown>", "description": "Step metadata." }
+      }
+    },
+    {
+      "event": "kim:done",
+      "typeName": "KimDone",
+      "description": "Agent completed a plan step.",
+      "payload": {
+        "n": { "type": "number", "description": "1-based step index that finished." }
+      }
+    },
+    {
+      "event": "kim:context",
+      "typeName": "KimContext",
+      "description": "Context window usage snapshot.",
+      "payload": {
+        "cumulative_input": { "type": "number", "description": "Total input tokens consumed so far." },
+        "budget": { "type": "number", "description": "Configured context token budget." },
+        "phase": { "type": "string", "description": "Budget phase label (ok / warn / critical / full)." },
+        "percent": { "type": "number", "description": "Percentage of budget consumed (0–100)." },
+        "last_input": { "type": "number", "description": "Input tokens in the last provider call." },
+        "last_output": { "type": "number", "description": "Output tokens in the last provider call." },
+        "source": { "type": "string", "description": "Provider identifier that produced this snapshot." },
+        "estimate": { "type": "boolean", "description": "True when token count is estimated rather than exact." }
+      }
+    },
+    {
+      "event": "kim:stats",
+      "typeName": "KimStats",
+      "description": "Cumulative token usage for this run.",
+      "payload": {
+        "input": { "type": "number", "description": "Cumulative input tokens." },
+        "output": { "type": "number", "description": "Cumulative output tokens." },
+        "total": { "type": "number", "description": "input + output." }
+      }
+    },
+    {
+      "event": "kim:ui",
+      "typeName": "KimUi",
+      "description": "Window/UI control signal from the agent.",
+      "payload": {
+        "action": {
+          "type": "'screenshot_flash' | 'show'",
+          "description": "'screenshot_flash' triggers flash overlay; 'show' brings main window to front."
+        }
+      }
+    },
+    {
+      "event": "kim:run-done",
+      "typeName": "KimRunDone",
+      "description": "Run completed (success or expected failure).",
+      "payload": {
+        "termination": {
+          "type": "string",
+          "description": "Termination reason key: task_complete | max_iterations | stuck | provider_failed | need_help | cancelled | conversational_loop."
+        },
+        "success": { "type": "boolean", "description": "True only when termination === 'task_complete'." }
+      }
+    },
+    {
+      "event": "kim:run-failed",
+      "typeName": "KimRunFailed",
+      "description": "Run ended due to a recoverable or unrecoverable error.",
+      "payload": {
+        "reason": { "type": "string", "description": "Machine-readable error key (e.g. 'provider_auth', 'rate_limit')." },
+        "recoverable": { "type": "boolean", "description": "True when the user can retry without config changes." },
+        "suggestion": { "type": "string", "description": "Human-readable next-action hint." }
+      }
+    },
+    {
+      "event": "kim:provider-error",
+      "typeName": "KimProviderError",
+      "description": "Provider call failed with a specific error code.",
+      "payload": {
+        "code": {
+          "type": "string",
+          "description": "Error code: auth | rate_limit | server_error | timeout | network | invalid_request."
+        },
+        "retryable": { "type": "boolean", "description": "True when automatic retry is possible." }
+      }
+    },
+    {
+      "event": "kim:rate-limited",
+      "typeName": "KimRateLimited",
+      "description": "Provider rate-limited; agent will retry after a delay.",
+      "payload": {
+        "delay": { "type": "number", "description": "Seconds until next retry." },
+        "attempt": { "type": "number", "description": "Current retry attempt number (1-based)." },
+        "max_retries": { "type": "number", "description": "Maximum retries configured." }
+      }
+    },
+    {
+      "event": "kim:hitl-approval-request",
+      "typeName": "KimHitlApprovalRequest",
+      "description": "Agent is requesting human approval before executing a high-risk tool.",
+      "payload": {
+        "tool": { "type": "string", "description": "MCP tool name requiring approval." },
+        "risk": {
+          "type": "string",
+          "description": "Risk level: high | medium. Determines UI prominence."
+        },
+        "reason": { "type": "string", "description": "Machine-readable reason key (e.g. 'arbitrary_code_execution')." }
+      }
+    },
+    {
+      "event": "kim:hitl-approval-result",
+      "typeName": "KimHitlApprovalResult",
+      "description": "Human approval decision sent back to the agent.",
+      "payload": {
+        "tool": { "type": "string", "description": "MCP tool name that was approved or denied." },
+        "approved": { "type": "boolean", "description": "True if the user approved the tool call." }
+      }
+    }
+  ]
+}

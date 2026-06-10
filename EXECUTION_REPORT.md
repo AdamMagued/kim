@@ -14,16 +14,24 @@ Last updated: 2026-06-10
 | V-7 | Scoped CLAUDE.md docs + HOW_TO.md recipes | `9b19a12` | ✅ Done |
 | V-8 | justfile + KIM_FAKE=1 offline mode + `@pytest.mark.slow` | `e2f00f3` | ✅ Done |
 | V-6 | Invariant tests (prompt render, tool registry, Code-tab constraint, CSS order) | `eccb3ee` | ✅ Done |
-| V-5 | `make_test_agent` factory in `conftest.py` | `47d091c` | ✅ Done |
+| V-5 | `make_test_agent` factory in `conftest.py` | `ed23360` | ✅ Done |
+| V-2 | ProviderResponse TypedDict contract + pyright in CI | `a7fff3d` | ✅ Done |
 
 ### Track B — Production Polish
 
 | ID | Title | Commit | Status |
 |----|-------|--------|--------|
 | P0-5 | CI branch triggers + `workflow_dispatch` | `5e7e345` | ✅ Done |
-| P0-4 | README.md (install, architecture, providers) | `ac10b77` | ✅ Done |
-| P1-5 | Session retention pruning + screenshot stripping | `ed23360` | ✅ Done |
+| P0-4 | README.md (install, architecture, providers) | `47d091c` | ✅ Done |
+| P1-5 | Session retention pruning + screenshot stripping | `ac10b77` | ✅ Done |
 | P1-1 | Structured rotating file logs + Reveal logs button | `56a15f7` | ✅ Done |
+| P1-2 | Typed run_failed error events + error cards + rate-limited UI | `2f54625` | ✅ Done |
+
+### Infra fixes
+
+| ID | Title | Commit | Status |
+|----|-------|--------|--------|
+| fix | Import fix: `from tests.conftest` → `from conftest` (ultralytics namespace collision) | `642a488` | ✅ Done |
 
 ---
 
@@ -49,6 +57,10 @@ Last updated: 2026-06-10
 - `tests/conftest.py`: `make_test_agent(**overrides)` and `test_agent` fixture
 - `tests/test_make_test_agent.py`: 8 tests verifying factory
 
+### V-2 — ProviderResponse TypedDict + pyright in CI
+- Commit `a7fff3d`; added `ProviderResponse` TypedDict in `orchestrator/providers/base.py`
+- pyright in CI for orchestrator + mcp_server at `basic` strictness
+
 ### P0-5 — CI branch triggers
 - `.github/workflows/ci.yml` on-push branches extended to include `kim-improvement`, `production-roadmap`
 - Added `workflow_dispatch`
@@ -71,18 +83,36 @@ Last updated: 2026-06-10
 - `tests/test_log_retention.py`: 7 tests
 - **Note:** `tauri dev` needs a restart to pick up Rust changes
 
+### P1-2 — Typed run_failed error events + error cards
+- Commit `2f54625`
+- `orchestrator/agent_states.py`: `run_failure_event()` maps `AgentTermination` → typed failure dict
+- `orchestrator/agent.py`: emits `kim:run_failed` JSON; stores `_last_provider_error_code`; emits `rate_limited` JSON before sleep
+- `desktop/src-tauri/src/subprocess.rs`: `RunFailed` + `RateLimited` variants in `KimEvent` enum
+- `desktop/src/hooks/useChatStream.ts`: `runFailure` + `rateLimitedState` state + event listeners
+- `desktop/src/hooks/useTaskRunner.ts`: clears stale state on run start
+- `desktop/src/components/ChatView.tsx`: passes new props to `StreamRenderer`
+- `desktop/src/components/chat/StreamRenderer.tsx`: run-failed card + rate-limited banner
+- `tests/test_run_failure_event.py`: 11 tests
+- **Note:** `tauri dev` needs a restart to pick up Rust changes
+
+### fix — ultralytics namespace collision
+- Commit `642a488`
+- Root cause: `test_prompt_render.py` and `test_make_test_agent.py` used `from tests.conftest import`, which resolved to the globally-installed ultralytics `tests` package instead of the local `tests/` directory. These tests were *introduced* in V-5/V-6 on this branch, so the 6 failures were NOT pre-existing.
+- Fix: changed both files to `from conftest import` (pytest adds `tests/` to `sys.path`)
+- Verification: `python3 -m pytest tests/ -q` → 862 passed, 0 failed, 13 skipped
+
 ---
 
 ## Remaining Items (roadmap order)
 
 ### Track A
-- [ ] V-2: `ProviderResponse` TypedDict + typed tool-result envelope + pyright in CI
+- [x] V-2: `ProviderResponse` TypedDict + pyright in CI — ✅ Done (`a7fff3d`)
+- [ ] V-1 (partial): schema-first codegen — `events.schema.json` → `events.gen.ts` + `npm run gen:events` + CI drift check
+- [ ] V-1 (legacy-kill) BLOCKED: kill dual-emit from `subprocess.rs` / legacy `kim-agent-output` text parsing in `parsers.ts`. **Blocked on**: golden-transcript seam test (V-3) — removing the dual-emit without a test that asserts "these Python stdout lines → these typed events → these activity items" risks silent UI rot. The Codex CLI subprocess also uses `kim-agent-output` and cannot be schema-firsted. Do not remove dual-emit until V-3 seam tests exist.
 - [ ] V-3: golden-transcript Rust↔Python seam test + provider contract suite
-- [ ] V-1 + II-E: kill legacy text IPC; schema-first events with codegen + CI drift check
 - [ ] V-4: split ChatView.tsx, decompose agent.py loop, split chat.css
 
 ### Track B
-- [ ] P1-2: typed `kim:run_failed` error events + error cards + pre-flight checks
 - [ ] P1-3: approval-gate UI round-trip + permission mode toggle
 - [ ] P0-1: PyInstaller spec + sidecar resolution in `find_python_interpreter()`
 - [ ] Part II quick wins: H (kill voice), J (feature-flag relay pane), D (cost meter), F (OS notifications)
