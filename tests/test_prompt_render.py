@@ -64,23 +64,13 @@ else:
 # ---------------------------------------------------------------------------
 
 def _make_agent(lean: bool = False):
-    """Build a minimal KimAgent-like object with enough state to call the
-    prompt builders without starting the MCP server or a real provider."""
+    """Build a minimal KimAgent-like object for prompt rendering tests."""
     from orchestrator.providers.fake import FakeProvider
+    from tests.conftest import make_test_agent
     provider = FakeProvider()
     if lean:
         provider.lean_system_prompt = True
-
-    from orchestrator.agent import KimAgent
-    agent = object.__new__(KimAgent)
-    agent.config = {}
-    agent.provider = provider
-    agent.max_iterations = 25
-    agent._tools = [
-        {"name": "take_screenshot", "description": "Take screenshot", "parameters": {}},
-        {"name": "run_command", "description": "Run shell command", "parameters": {}},
-    ]
-    return agent
+    return make_test_agent(provider=provider)
 
 
 # ---------------------------------------------------------------------------
