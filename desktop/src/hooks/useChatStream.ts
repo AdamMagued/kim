@@ -619,5 +619,8 @@ export function useChatStream({
     clearActivityNow,
     flushActivityNow,
     enqueueActivityUpdate,
+
+    // HITL approval round-trip
+    hitlRespond: (approved: boolean) => invoke('hitl_respond_approval', { approved }).catch(() => {}),
   };
 }

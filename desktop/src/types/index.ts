@@ -141,6 +141,8 @@ export interface CodexProject {
 export type Theme = 'dark' | 'light' | 'system';
 export type Provider = 'claude' | 'openai' | 'gemini' | 'deepseek' | 'browser' | 'ollama';
 export type AccentTheme = 'indigo' | 'ocean' | 'ember' | 'teal' | 'jade' | 'mono';
+/** HITL permission gate. full_auto = no gate; ask_risky = high-risk tools only; ask_always = medium+high. */
+export type PermissionMode = 'full_auto' | 'ask_risky' | 'ask_always';
 export type VoiceEngine = 'kokoro' | 'maya1' | 'http' | 'hume';
 export type TypingAnimation = 'none' | 'typewriter' | 'word-fade' | 'char-blur';
 
@@ -180,6 +182,7 @@ export interface Settings {
   schedule_timer: ScheduleTimerSettings;
   typing_animation: TypingAnimation;
   ollama: OllamaSettings;
+  permission_mode: PermissionMode;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -202,6 +205,7 @@ export const DEFAULT_SETTINGS: Settings = {
     interval_seconds: 300,
   },
   typing_animation: 'none',
+  permission_mode: 'full_auto' as PermissionMode,
   ollama: {
     base_url: 'http://localhost:11434',
     mode: 'cloud',

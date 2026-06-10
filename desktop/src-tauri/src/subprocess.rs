@@ -1,8 +1,38 @@
 use crate::*;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tauri::State;
+use tokio::sync::Mutex as TokioMutex;
+
+// ── HITL stdin channel (Rust → Python approval relay) ────────────────────────
+//
+// The running agent's stdin handle is stored here after spawn so that
+// `hitl_respond_approval` can write the user's approve/deny decision to it.
+// Each new task replaces the stored handle (old handle dropped = pipe closed).
+fn hitl_stdin() -> &'static TokioMutex<Option<tokio::process::ChildStdin>> {
+    static HITL_STDIN: OnceLock<TokioMutex<Option<tokio::process::ChildStdin>>> = OnceLock::new();
+    HITL_STDIN.get_or_init(|| TokioMutex::new(None))
+}
+
+/// Write the user's HITL approval decision to the running agent's stdin.
+/// Python's StdinApprovalBridge reads this line to unblock confirm_action().
+#[tauri::command]
+pub(crate) async fn hitl_respond_approval(approved: bool) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let mut guard = hitl_stdin().lock().await;
+    if let Some(ref mut stdin) = *guard {
+        let msg = if approved {
+            "{\"type\":\"hitl_approve\",\"approved\":true}\n"
+        } else {
+            "{\"type\":\"hitl_approve\",\"approved\":false}\n"
+        };
+        stdin.write_all(msg.as_bytes()).await.map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())
+    } else {
+        Err("No agent stdin available for HITL response".to_string())
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -172,6 +202,9 @@ pub(crate) async fn send_task(
     ollama_local_model: Option<String>,
     ollama_cloud_model: Option<String>,
     ollama_context_limit_override: Option<u32>,
+    // HITL permission mode: "full_auto" | "ask_risky" | "ask_always"
+    // Maps to KIM_HITL_RISK_THRESHOLD: full_auto=off, ask_risky=high, ask_always=medium
+    permission_mode: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TaskState>,
 ) -> Result<String, String> {
@@ -387,8 +420,19 @@ pub(crate) async fn send_task(
             // Ensure `import orchestrator` and `import mcp_server` always resolve
             // from the Kim repo, regardless of the target project.
             .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
+            // Signal to Python that we are running under Tauri so StdinApprovalBridge
+            // is auto-wired when a HITL risk threshold is set.
+            .env("KIM_TAURI_MODE", "1")
+            // Pipe stdin so hitl_respond_approval can write approval decisions to it.
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Map permission_mode → KIM_HITL_RISK_THRESHOLD env var.
+        match permission_mode.as_deref().unwrap_or("full_auto") {
+            "ask_risky" => { c.env("KIM_HITL_RISK_THRESHOLD", "high"); }
+            "ask_always" => { c.env("KIM_HITL_RISK_THRESHOLD", "medium"); }
+            _ => {} // full_auto: no threshold = no HITL gate
+        }
         c
     };
 
@@ -530,6 +574,11 @@ pub(crate) async fn send_task(
         *guard = child_pid;
     }
 
+    // Store stdin handle for HITL approval round-trip (only for Kim orchestrator, not Codex).
+    if !is_codex {
+        *hitl_stdin().lock().await = child.stdin.take();
+    }
+
     let ipc_typed = app_config.ipc_protocol == "typed";
     let stdout_handle = if let Some(stdout) = child.stdout.take() {
         let reader = tokio::io::BufReader::new(stdout);
@@ -644,6 +693,8 @@ pub(crate) async fn send_task(
     if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
         *guard = None;
     }
+    // Drop the HITL stdin handle so the pipe is closed.
+    *hitl_stdin().lock().await = None;
     if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
         *guard = None;
     }

@@ -1862,7 +1862,7 @@ pub(crate) async fn configure_codex_direct_provider(
 }
 
 pub(crate) mod subprocess;
-pub(crate) use subprocess::{find_python_interpreter, send_task, cancel_task, process_exists, send_signal};
+pub(crate) use subprocess::{find_python_interpreter, send_task, cancel_task, hitl_respond_approval, process_exists, send_signal};
 
 // ---------------------------------------------------------------------------
 // Voice config (config.yaml — voice:/enabled, voice:/engine, voice:/voice_id)
@@ -1966,6 +1966,7 @@ pub fn run() {
             set_task_active_mode,
             send_task,
             cancel_task,
+            hitl_respond_approval,
             voice_config::read_voice_config,
             voice_config::write_voice_config,
             relay::read_relay_config,
