@@ -8,6 +8,7 @@ and back.
 
 import logging
 import os
+from typing import Any
 
 import anthropic
 
@@ -32,7 +33,7 @@ class AnthropicProvider(BaseProvider):
         messages: list[dict],
         tools: list[dict],
         system: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         claude_messages = self._to_claude_messages(messages)
         claude_tools = self._to_claude_tools(tools)
 

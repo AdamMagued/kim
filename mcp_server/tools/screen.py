@@ -25,7 +25,7 @@ async def handle_take_screenshot(args: dict) -> str:
             img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
         if scale != 1.0:
             new_size = (int(img.width * scale), int(img.height * scale))
-            img = img.resize(new_size, Image.LANCZOS)
+            img = img.resize(new_size, Image.LANCZOS)  # type: ignore[attr-defined]
         buffer = io.BytesIO()
         img.save(buffer, format="PNG", optimize=True)
         b64 = base64.b64encode(buffer.getvalue()).decode()
@@ -43,14 +43,14 @@ async def handle_get_screen_info(args: dict) -> str:
     if platform.system() == "Windows":
         try:
             import ctypes
-            user32 = ctypes.windll.user32
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
             user32.SetProcessDPIAware()
             width = user32.GetSystemMetrics(0)
             height = user32.GetSystemMetrics(1)
-            hdc = ctypes.windll.gdi32.CreateDCW("DISPLAY", None, None, None)
-            dpi_x = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)
-            dpi_y = ctypes.windll.gdi32.GetDeviceCaps(hdc, 90)
-            ctypes.windll.gdi32.DeleteDC(hdc)
+            hdc = ctypes.windll.gdi32.CreateDCW("DISPLAY", None, None, None)  # type: ignore[attr-defined]
+            dpi_x = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # type: ignore[attr-defined]
+            dpi_y = ctypes.windll.gdi32.GetDeviceCaps(hdc, 90)  # type: ignore[attr-defined]
+            ctypes.windll.gdi32.DeleteDC(hdc)  # type: ignore[attr-defined]
             lines.extend([
                 f"Primary resolution: {width}x{height}",
                 f"DPI: {dpi_x}x{dpi_y}",
@@ -117,7 +117,7 @@ async def handle_take_annotated_screenshot(args: dict) -> str:
         # Scale down (same as take_screenshot)
         if scale != 1.0:
             new_size = (int(img.width * scale), int(img.height * scale))
-            img = img.resize(new_size, Image.LANCZOS)
+            img = img.resize(new_size, Image.LANCZOS)  # type: ignore[attr-defined]
 
         # Draw the ruler grid
         annotated_img, grid_map = annotate_screenshot(

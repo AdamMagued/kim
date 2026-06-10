@@ -23,8 +23,27 @@ check:
     source venv/bin/activate && python -m pytest tests/ -q -m "not slow" --tb=short &
     PYTEST_PID=$!
 
-    wait $TSC_PID && wait $CARGO_PID && wait $PYTEST_PID
+    echo "=== pyright ==="
+    pyright --outputjson | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+errs = [e for e in d.get('generalDiagnostics', []) if e['severity'] == 'error']
+if errs:
+    for e in errs:
+        print(e['file'] + ':' + str(e['range']['start']['line']+1) + ': ' + e['message'])
+    sys.exit(1)
+print('pyright: 0 errors')
+" &
+    PYRIGHT_PID=$!
+
+    wait $TSC_PID && wait $CARGO_PID && wait $PYTEST_PID && wait $PYRIGHT_PID
     echo "=== check: all green ==="
+
+# pyright type check only
+typecheck:
+    #!/usr/bin/env bash
+    set -e
+    pyright
 
 # Full test suite: all three languages
 test:

@@ -165,7 +165,7 @@ class GeminiProvider(BaseProvider):
                 else:
                     self._oauth_access_token_provider = EnvOAuthAccessTokenProvider()
             else:
-                self._oauth_access_token_provider = oauth_provider
+                self._oauth_access_token_provider = oauth_provider  # type: ignore[assignment]
             # For user-project mode, use the user project ID instead of Kim's quota project
             self._quota_project = self._user_project_id
         else:  # oauth mode
@@ -185,7 +185,7 @@ class GeminiProvider(BaseProvider):
                 else:
                     self._oauth_access_token_provider = EnvOAuthAccessTokenProvider()
             else:
-                self._oauth_access_token_provider = oauth_provider
+                self._oauth_access_token_provider = oauth_provider  # type: ignore[assignment]
 
         logger.info("GeminiProvider: model=%s auth=%s", self._model_name, self._auth_mode)
 
@@ -194,7 +194,7 @@ class GeminiProvider(BaseProvider):
         messages: list[dict],
         tools: list[dict],
         system: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         if not messages:
             return {"type": "text", "content": "SYSTEM ERROR: No messages provided."}
 

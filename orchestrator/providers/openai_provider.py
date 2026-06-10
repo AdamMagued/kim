@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Any
 
 import openai
 
@@ -67,7 +68,7 @@ class OpenAIProvider(BaseProvider):
         messages: list[dict],
         tools: list[dict],
         system: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         oai_messages = [{"role": "system", "content": system}] + self._to_oai_messages(messages)
         oai_tools = self._to_oai_tools(tools)
 

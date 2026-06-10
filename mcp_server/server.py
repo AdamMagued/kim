@@ -114,7 +114,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if handler is None:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
     try:
-        result = await handler(arguments or {})
+        result = await handler(arguments or {})  # type: ignore[operator]
         return [TextContent(type="text", text=str(result))]
     except PermissionError as e:
         logger.warning(f"PERMISSION_ERROR in {name}: {e}")
