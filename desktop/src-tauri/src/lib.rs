@@ -1944,6 +1944,7 @@ pub fn run() {
             run_history::save_run_history,
             run_history::load_run_history,
             session_commands::get_app_version,
+            session_commands::reveal_logs,
             run_history::get_platform_info,
             run_history::run_update,
             browser_bridge::add_custom_provider_capability,

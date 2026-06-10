@@ -53,11 +53,24 @@ async def _cli_main(args: argparse.Namespace) -> None:
     if args.max_iter:
         config["max_iterations"] = args.max_iter
 
+    log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         stream=sys.stderr,
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    # Wire structured rotating file logs (logs/kim-YYYY-MM-DD.jsonl, 7-day retention)
+    try:
+        from pathlib import Path
+        from mcp_server.logger import setup_structured_logging, apply_log_retention
+        # Logs live alongside the repo root (where orchestrator/ and logs/ sit)
+        _repo_root = Path(__file__).resolve().parent.parent
+        _log_dir = _repo_root / "logs"
+        setup_structured_logging(log_dir=str(_log_dir), level=log_level, also_stderr=False)
+        apply_log_retention(log_dir=str(_log_dir), keep_days=7)
+    except Exception as _log_err:
+        logging.getLogger(__name__).debug(f"Could not set up structured logs: {_log_err}")
 
     task = args.task or input("Task: ").strip()
     print(f"Running: {task!r}  provider={config.get('provider', 'claude')}", file=sys.stderr)

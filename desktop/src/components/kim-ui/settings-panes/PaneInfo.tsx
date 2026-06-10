@@ -226,6 +226,30 @@ function PaneFeedback() {
       >
         {sending ? 'Sending…' : 'Send feedback'}
       </button>
+
+      <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--kim-border)' }}>
+        <SectionLabel>attach logs to your report</SectionLabel>
+        <div style={{ fontSize: 12.5, color: 'var(--kim-text-3)', marginBottom: 10, lineHeight: 1.55 }}>
+          Kim writes structured logs to <code style={{ fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace' }}>logs/kim-YYYY-MM-DD.jsonl</code> (7-day rolling window). Attach them to bug reports for faster diagnosis.
+        </div>
+        <button
+          type="button"
+          className="kr-btn"
+          onClick={async () => {
+            try {
+              await invoke('reveal_logs');
+            } catch (err) {
+              toast(`Could not open logs folder: ${String(err)}`, 'error', 4000);
+            }
+          }}
+          style={{ gap: 7 }}
+        >
+          <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+            <path d="M1 4a1 1 0 011-1h3l1.5 1.5H12a1 1 0 011 1V11a1 1 0 01-1 1H2a1 1 0 01-1-1V4z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+          </svg>
+          Reveal logs
+        </button>
+      </div>
     </form>
   );
 }
