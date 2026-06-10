@@ -444,6 +444,8 @@ export function ChatView({
       codexRuns={codexRuns}
       taskError={stream.taskError}
       hitlApprovalStatus={stream.hitlApprovalStatus}
+      runFailure={stream.runFailure}
+      rateLimitedState={stream.rateLimitedState}
       settings={settings}
       newChatMode={newChatMode}
       activity={stream.activity}

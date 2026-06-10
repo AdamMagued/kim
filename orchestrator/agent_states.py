@@ -43,3 +43,68 @@ def make_run_result(
         "summary": summary,
         "screenshot": screenshot,
     }
+
+
+def run_failure_event(
+    termination: AgentTermination,
+    summary: str,
+    provider_error_code: str = "",
+) -> dict | None:
+    """Build a kim:run_failed event payload for failed (non-success) runs.
+
+    Returns None for TASK_COMPLETE and CANCELLED (not failures).
+    """
+    if termination in (AgentTermination.TASK_COMPLETE, AgentTermination.CANCELLED):
+        return None
+
+    # Determine recoverability and suggested action
+    t = termination
+    code = provider_error_code.lower()
+
+    # CDP / browser provider errors detected from summary text
+    is_browser_error = any(
+        marker in summary.lower()
+        for marker in ("cdp", "remote-debugging", "playwright", "browser provider")
+    )
+
+    if t == AgentTermination.PROVIDER_FAILED:
+        if is_browser_error:
+            recoverable = True
+            suggestion = "Start Chrome with --remote-debugging-port=9222 and retry."
+        elif code in ("auth", "permission"):
+            recoverable = False
+            suggestion = "Re-authenticate in Settings → AI Provider."
+        elif code in ("rate_limit",):
+            recoverable = True
+            suggestion = "Wait a moment, then retry the task."
+        elif code in ("network", "timeout"):
+            recoverable = True
+            suggestion = "Check your internet connection and retry."
+        elif code in ("server_error",):
+            recoverable = True
+            suggestion = "Provider server error — retry in a moment."
+        else:
+            recoverable = True
+            suggestion = "Check Settings → AI Provider and retry."
+    elif t == AgentTermination.STUCK:
+        recoverable = True
+        suggestion = "Kim may be confused. Try rephrasing your task or breaking it into smaller steps."
+    elif t == AgentTermination.MAX_ITERATIONS:
+        recoverable = True
+        suggestion = "Task hit the iteration limit. Try breaking it into smaller steps."
+    elif t == AgentTermination.NEED_HELP:
+        recoverable = True
+        suggestion = "Kim needs clarification. Add more details to your task description."
+    elif t == AgentTermination.CONVERSATIONAL_LOOP:
+        recoverable = True
+        suggestion = "Kim got stuck in a loop. Try rephrasing your task."
+    else:
+        recoverable = False
+        suggestion = "An unexpected error occurred. Check Settings → Feedback → Reveal logs."
+
+    return {
+        "type": "run_failed",
+        "reason": t.value,
+        "recoverable": recoverable,
+        "suggestion": suggestion,
+    }

@@ -75,6 +75,8 @@ export function useChatStream({
   const [liveHistory, setLiveHistory] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
   const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
   const [hitlApprovalStatus, setHitlApprovalStatus] = useState<HitlApprovalStatus | null>(null);
+  const [runFailure, setRunFailure] = useState<{ reason: string; recoverable: boolean; suggestion: string } | null>(null);
+  const [rateLimitedState, setRateLimitedState] = useState<{ delay: number; attempt: number; max_retries: number } | null>(null);
 
   // Refs for tracking streams
   const activityCounterRef = useRef(0);
@@ -329,7 +331,9 @@ export function useChatStream({
     let unlistenTypedStats: (() => void) | undefined;
     let unlistenTypedUi: (() => void) | undefined;
     let unlistenTypedRunDone: (() => void) | undefined;
+    let unlistenTypedRunFailed: (() => void) | undefined;
     let unlistenTypedProviderError: (() => void) | undefined;
+    let unlistenTypedRateLimited: (() => void) | undefined;
     let unlistenTypedHitlRequest: (() => void) | undefined;
     let unlistenTypedHitlResult: (() => void) | undefined;
 
@@ -415,6 +419,16 @@ export function useChatStream({
         approved: e.payload.approved,
       }));
     }).then(fn => { unlistenTypedHitlResult = fn; });
+
+    listen<{ reason: string; recoverable: boolean; suggestion: string }>('kim:run-failed', e => {
+      setRunFailure(e.payload);
+    }).then(fn => { unlistenTypedRunFailed = fn; });
+
+    listen<{ delay: number; attempt: number; max_retries: number }>('kim:rate-limited', e => {
+      setRateLimitedState(e.payload);
+      // Auto-clear after the delay so the banner disappears when the retry fires
+      setTimeout(() => setRateLimitedState(null), (e.payload.delay + 1) * 1000);
+    }).then(fn => { unlistenTypedRateLimited = fn; });
 
     listen<{ action: 'screenshot_flash' | 'show' }>('kim:ui', e => {
       if (e.payload.action === 'screenshot_flash' && isRunningRef.current) {
@@ -523,7 +537,9 @@ export function useChatStream({
       unlistenTypedStats?.();
       unlistenTypedUi?.();
       unlistenTypedRunDone?.();
+      unlistenTypedRunFailed?.();
       unlistenTypedProviderError?.();
+      unlistenTypedRateLimited?.();
       unlistenTypedHitlRequest?.();
       unlistenTypedHitlResult?.();
     };
@@ -574,6 +590,10 @@ export function useChatStream({
     setLastFailedTask,
     hitlApprovalStatus,
     setHitlApprovalStatus,
+    runFailure,
+    setRunFailure,
+    rateLimitedState,
+    setRateLimitedState,
 
     // Refs
     currentTaskRef,

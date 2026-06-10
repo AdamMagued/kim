@@ -25,7 +25,9 @@ enum KimEvent {
     UiScreenshotFlash,
     UiShow,
     RunDone { termination: String, success: bool },
+    RunFailed { reason: String, recoverable: bool, suggestion: String },
     ProviderError { code: String, retryable: bool },
+    RateLimited { delay: f64, attempt: u32, max_retries: u32 },
     HitlApprovalRequest { tool: String, risk: String, reason: String },
     HitlApprovalResult { tool: String, approved: bool },
 }
@@ -574,8 +576,22 @@ pub(crate) async fn send_task(
                             KimEvent::RunDone { termination, success } => {
                                 let _ = app.emit("kim:run-done", serde_json::json!({"termination": termination, "success": success}));
                             }
+                            KimEvent::RunFailed { reason, recoverable, suggestion } => {
+                                let _ = app.emit("kim:run-failed", serde_json::json!({
+                                    "reason": reason,
+                                    "recoverable": recoverable,
+                                    "suggestion": suggestion,
+                                }));
+                            }
                             KimEvent::ProviderError { code, retryable } => {
                                 let _ = app.emit("kim:provider-error", serde_json::json!({"code": code, "retryable": retryable}));
+                            }
+                            KimEvent::RateLimited { delay, attempt, max_retries } => {
+                                let _ = app.emit("kim:rate-limited", serde_json::json!({
+                                    "delay": delay,
+                                    "attempt": attempt,
+                                    "max_retries": max_retries,
+                                }));
                             }
                             KimEvent::HitlApprovalRequest { tool, risk, reason } => {
                                 let _ = app.emit("kim:hitl-approval-request", serde_json::json!({"tool": tool, "risk": risk, "reason": reason}));

@@ -74,6 +74,8 @@ export interface StreamRendererProps {
   codexRuns: CodexRunGroup[];
   taskError: string | null;
   hitlApprovalStatus: HitlApprovalStatus | null;
+  runFailure?: { reason: string; recoverable: boolean; suggestion: string } | null;
+  rateLimitedState?: { delay: number; attempt: number; max_retries: number } | null;
   settings: Settings;
   newChatMode: boolean;
   activity: ActivityItem[];
@@ -109,6 +111,8 @@ export function StreamRenderer({
   codexRuns,
   taskError,
   hitlApprovalStatus,
+  runFailure,
+  rateLimitedState,
   settings,
   newChatMode,
   activity,
@@ -403,6 +407,85 @@ export function StreamRenderer({
                     Retry
                   </button>
                 )}
+              </div>
+            </div>
+          )}
+
+          {/* Structured run-failed card — rendered when Python emits kim:run_failed */}
+          {runFailure && !isRunning && (
+            <div className="kim-msg-row kim-msg-row--assistant">
+              <div
+                className="kim-run-failed-card"
+                role="alert"
+                style={{
+                  background: 'var(--kim-surface)',
+                  border: '1px solid var(--kim-red, #e05c5c)',
+                  borderRadius: 12,
+                  padding: '14px 16px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 8,
+                  maxWidth: 520,
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ color: 'var(--kim-red, #e05c5c)', fontSize: 16 }}>✕</span>
+                  <span style={{ fontWeight: 500, fontSize: 13.5 }}>
+                    {runFailure.reason === 'max_iterations'
+                      ? 'Iteration limit reached'
+                      : runFailure.reason === 'stuck'
+                      ? 'Kim got stuck'
+                      : runFailure.reason === 'need_help'
+                      ? 'Kim needs help'
+                      : runFailure.reason === 'conversational_loop'
+                      ? 'Conversational loop detected'
+                      : 'Task failed'}
+                  </span>
+                </div>
+                <div style={{ fontSize: 12.5, color: 'var(--kim-text-2)', lineHeight: 1.55 }}>
+                  {runFailure.suggestion}
+                </div>
+                {runFailure.recoverable && lastRunTask && (
+                  <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                    <button
+                      type="button"
+                      className="kr-btn kr-btn-primary"
+                      style={{ fontSize: 12, padding: '6px 12px' }}
+                      onClick={() => void handleRetryLast()}
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Rate-limited banner — shows while backing off, auto-clears after delay */}
+          {rateLimitedState && isRunning && (
+            <div className="kim-msg-row kim-msg-row--assistant">
+              <div
+                style={{
+                  background: 'var(--kim-surface)',
+                  border: '1px solid var(--kim-border)',
+                  borderRadius: 10,
+                  padding: '10px 14px',
+                  fontSize: 12.5,
+                  color: 'var(--kim-text-2)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  maxWidth: 400,
+                }}
+              >
+                <span style={{ fontSize: 14 }}>⏳</span>
+                <span>
+                  Rate-limited — retrying in {rateLimitedState.delay}s
+                  {rateLimitedState.attempt < rateLimitedState.max_retries
+                    ? ` (attempt ${rateLimitedState.attempt}/${rateLimitedState.max_retries})`
+                    : ''}
+                  …
+                </span>
               </div>
             </div>
           )}
