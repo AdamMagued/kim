@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, 'feature/**', 'fix/**']
+    branches: [main, develop, 'feature/**', 'fix/**', 'kim-improvement', 'production-roadmap']
   pull_request:
-    branches: [main]
+    branches: [main, kim-improvement]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
