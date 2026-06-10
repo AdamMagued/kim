@@ -26,21 +26,33 @@ jobs:
             platform: macos-latest
             args: '--target aarch64-apple-darwin'
             rust-target: aarch64-apple-darwin
+            cli-target-dir: target/aarch64-apple-darwin/release
+            cli-asset-suffix: macos-aarch64
+            cli-bin: kim
 
           - label: macOS Intel
             platform: macos-latest
             args: '--target x86_64-apple-darwin'
             rust-target: x86_64-apple-darwin
+            cli-target-dir: target/x86_64-apple-darwin/release
+            cli-asset-suffix: macos-x86_64
+            cli-bin: kim
 
           - label: Linux (x64)
             platform: ubuntu-22.04
             args: ''
             rust-target: ''
+            cli-target-dir: target/release
+            cli-asset-suffix: linux-x86_64
+            cli-bin: kim
 
           - label: Windows (x64)
             platform: windows-latest
             args: ''
             rust-target: ''
+            cli-target-dir: target/release
+            cli-asset-suffix: windows-x86_64
+            cli-bin: kim.exe
 
     runs-on: ${{ matrix.platform }}
 
@@ -63,7 +75,9 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: ./desktop/src-tauri -> target
+          workspaces: |
+            ./desktop/src-tauri -> target
+            ./cli -> target
 
       # ── Linux system libs (WebKit2GTK + friends) ─────────────────────────
       - name: Install Linux system deps
@@ -106,13 +120,13 @@ jobs:
 
             ### Download the right file for your OS
 
-            | Platform | File |
-            |---|---|
-            | macOS (Apple Silicon M1/M2/M3) | `Kim_*_aarch64.dmg` |
-            | macOS (Intel) | `Kim_*_x64.dmg` |
-            | Windows 10/11 | `Kim_*_x64-setup.exe` |
-            | Linux (Debian/Ubuntu) | `kim_*_amd64.deb` |
-            | Linux (other) | `kim_*_amd64.AppImage` |
+            | Platform | Desktop app | KimCLI (terminal) |
+            |---|---|---|
+            | macOS (Apple Silicon M1/M2/M3) | `Kim_*_aarch64.dmg` | `kim-cli-*-macos-aarch64` |
+            | macOS (Intel) | `Kim_*_x64.dmg` | `kim-cli-*-macos-x86_64` |
+            | Windows 10/11 | `Kim_*_x64-setup.exe` | `kim-cli-*-windows-x86_64.exe` |
+            | Linux (Debian/Ubuntu) | `kim_*_amd64.deb` | `kim-cli-*-linux-x86_64` |
+            | Linux (other) | `kim_*_amd64.AppImage` | `kim-cli-*-linux-x86_64` |
 
             > **Note:** Binaries are unsigned. macOS users: right-click → Open
             > the first time. Windows users: click "More info" → "Run anyway".
@@ -125,3 +139,64 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # ── KimCLI binary ─────────────────────────────────────────────────────
+
+      - name: Compute KimCLI asset name
+        id: cli-asset
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="sha-$(git rev-parse --short HEAD)"
+          fi
+          # Preserve .exe suffix from matrix cli-bin (kim or kim.exe)
+          BIN="${{ matrix.cli-bin }}"
+          EXT="${BIN#kim}"          # '' on Unix, '.exe' on Windows
+          FILENAME="kim-cli-${VERSION}-${{ matrix.cli-asset-suffix }}${EXT}"
+          echo "filename=${FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build KimCLI
+        shell: bash
+        run: |
+          EXTRA=""
+          if [[ -n "${{ matrix.rust-target }}" ]]; then
+            EXTRA="--target ${{ matrix.rust-target }}"
+          fi
+          cargo build --manifest-path cli/Cargo.toml --release $EXTRA
+
+      - name: Stage KimCLI binary
+        id: cli-stage
+        shell: bash
+        run: |
+          mkdir -p cli-dist
+          SRC="cli/${{ matrix.cli-target-dir }}/${{ matrix.cli-bin }}"
+          DEST="cli-dist/${{ steps.cli-asset.outputs.filename }}"
+          cp "${SRC}" "${DEST}"
+          echo "path=${DEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload KimCLI artifact (dry run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.cli-asset.outputs.filename }}
+          path: ${{ steps.cli-stage.outputs.path }}
+          retention-days: 7
+
+      - name: Upload KimCLI to release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          # draft: true keeps this consistent with the draft created by tauri-action.
+          # softprops uses getReleaseByTag which excludes draft releases from its
+          # results; without draft:true it would create a *published* release for the
+          # same tag, producing two separate releases (one draft with the Tauri desktop
+          # assets, one published with only the CLI binary).
+          draft: true
+          make_latest: false
+          files: ${{ steps.cli-stage.outputs.path }}

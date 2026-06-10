@@ -48,6 +48,7 @@ from mcp_server.tools.screen import (
     handle_take_annotated_screenshot,
     handle_take_screenshot,
 )
+from mcp_server.tools.memory import handle_read_memory, handle_write_memory
 from mcp_server.tools.search import handle_find_files, handle_search_in_files
 from mcp_server.tools.shell import handle_run_command, handle_run_powershell
 from mcp_server.tools.ui_observe import handle_click_ui, handle_observe_ui
@@ -56,6 +57,7 @@ from mcp_server.tools.web import (
     handle_web_click,
     handle_web_close,
     handle_web_fill,
+    handle_web_fill_form,
     handle_web_observe,
     handle_web_open,
     handle_web_press,
@@ -367,6 +369,49 @@ _WEB_TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="web_fill_form",
+        description=(
+            "Fill an ENTIRE web form in one call — STRONGLY PREFERRED over chains of "
+            "web_resolve/web_fill/web_click whenever a form has 2+ fields. Pass a mapping "
+            "of semantic field descriptions to values, e.g. "
+            '{"repository name": "my-repo", "visibility": "private", "add a README": true} '
+            "plus an optional 'submit' button description. Kim observes the page itself, "
+            "resolves each field (text, checkbox, radio option, or select), applies the "
+            "value, clicks submit once every field succeeded, and returns a per-field "
+            "JSON report with the final page state. Booleans toggle checkboxes; option "
+            "names pick radios/selects."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "fields": {
+                    "type": "object",
+                    "description": (
+                        "Map of field description -> value. Examples: "
+                        '{"repository name": "demo"} fills a textbox; '
+                        '{"visibility": "private"} clicks the Private radio; '
+                        '{"add a README checkbox": true} checks a checkbox.'
+                    ),
+                    "additionalProperties": True,
+                },
+                "submit": {
+                    "type": "string",
+                    "description": (
+                        "Optional submit/create/save button description. Clicked only "
+                        "after all fields succeed."
+                    ),
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["loose", "normal", "strict"],
+                    "default": "normal",
+                    "description": "Resolver match strictness.",
+                },
+            },
+            "required": ["fields"],
+        },
+    ),
+    Tool(
         name="web_press",
         description=(
             "Press a single key in the controlled browser (Enter, Tab, Escape, ArrowDown, "
@@ -461,6 +506,7 @@ _WEB_DISPATCH = {
     "web_resolve": handle_web_resolve,
     "web_click": handle_web_click,
     "web_fill": handle_web_fill,
+    "web_fill_form": handle_web_fill_form,
     "web_press": handle_web_press,
     "web_text": handle_web_text,
     "web_screenshot": handle_web_screenshot,
@@ -891,6 +937,65 @@ _SEARCH_DISPATCH = {
 }
 
 
+# ── Persistent agent memory ───────────────────────────────────────────────────
+
+_MEMORY_TOOLS: list[Tool] = [
+    Tool(
+        name="write_memory",
+        description=(
+            "Store a named finding in persistent project memory so it survives "
+            "across agent sessions.  Use this to record discoveries (API endpoints, "
+            "file locations, credentials format, architecture notes) that would "
+            "otherwise require re-running discovery steps next session.  "
+            "Memory is scoped to the current project directory."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "Short name for the memory entry (e.g. 'db_host', 'auth_flow')",
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Content to store (plain text, up to 16 384 chars)",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Project directory to scope memory to (defaults to PROJECT_ROOT)",
+                },
+            },
+            "required": ["key", "value"],
+        },
+    ),
+    Tool(
+        name="read_memory",
+        description=(
+            "Read a named finding from persistent project memory.  "
+            "Omit key to list all stored entries for this project."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "Key to retrieve (omit to list all entries)",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Project directory to scope memory to (defaults to PROJECT_ROOT)",
+                },
+            },
+        },
+    ),
+]
+
+_MEMORY_DISPATCH = {
+    "write_memory": handle_write_memory,
+    "read_memory": handle_read_memory,
+}
+
+
 # ── Public aggregates ────────────────────────────────────────────────────────
 
 TOOLS: list[Tool] = (
@@ -904,6 +1009,7 @@ TOOLS: list[Tool] = (
     + _GIT_TOOLS
     + _CODE_TOOLS
     + _SEARCH_TOOLS
+    + _MEMORY_TOOLS
 )
 
 DISPATCH: dict[str, object] = {}
@@ -918,5 +1024,27 @@ for _d in (
     _GIT_DISPATCH,
     _CODE_DISPATCH,
     _SEARCH_DISPATCH,
+    _MEMORY_DISPATCH,
 ):
     DISPATCH.update(_d)
+
+
+# -- Tier membership ----------------------------------------------------------
+# Maps each granular tier name to the dispatch dict whose keys are that tier's
+# tool names.  server.py passes this to tool_tiers.get_active_tool_names() to
+# apply KIM_ENABLED_TOOL_TIERS filtering at startup.  TOOLS and DISPATCH above
+# remain the full unfiltered sets so default behavior is unchanged.
+
+TIER_DISPATCH: dict[str, dict] = {
+    "file":     _FILE_DISPATCH,
+    "shell":    _SHELL_DISPATCH,
+    "screen":   _SCREEN_DISPATCH,
+    "web":      _WEB_DISPATCH,
+    "mouse":    _MOUSE_DISPATCH,
+    "keyboard": _KEYBOARD_DISPATCH,
+    "windows":  _WINDOW_DISPATCH,
+    "git":      _GIT_DISPATCH,
+    "code":     _CODE_DISPATCH,
+    "search":   _SEARCH_DISPATCH,
+    "memory":   _MEMORY_DISPATCH,
+}

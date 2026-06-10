@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import './index.css';
 
@@ -30,6 +31,10 @@ function loadSettings(): Settings {
           ...DEFAULT_SETTINGS.voice,
           ...(parsed.voice ?? {}),
         },
+        schedule_timer: {
+          ...DEFAULT_SETTINGS.schedule_timer,
+          ...(parsed.schedule_timer ?? {}),
+        },
         ollama: {
           ...DEFAULT_SETTINGS.ollama,
           ...(parsed.ollama ?? {}),
@@ -52,6 +57,21 @@ interface GithubRelease {
   html_url: string;
 }
 
+interface ScheduleTimerTickEvent {
+  tick_count: number;
+  result?: string | null;
+  error?: string | null;
+}
+
+interface ScheduleRunDueResult {
+  ok?: boolean;
+  launched?: boolean;
+  skipped?: boolean;
+  task?: string;
+  task_id?: string;
+  error?: string;
+}
+
 function compareSemver(a: string, b: string): number {
   const pa = a.split('.').map(n => parseInt(n, 10) || 0);
   const pb = b.split('.').map(n => parseInt(n, 10) || 0);
@@ -67,6 +87,17 @@ function compareSemver(a: string, b: string): number {
 
 function applyAccent(accent: AccentTheme) {
   document.documentElement.setAttribute('data-accent', accent);
+}
+
+function parseScheduleRunDueResult(json: string | null | undefined): ScheduleRunDueResult | null {
+  if (!json) return null;
+  try {
+    const parsed = JSON.parse(json);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    return parsed as ScheduleRunDueResult;
+  } catch {
+    return null;
+  }
 }
 
 function isNoDragTarget(target: EventTarget | null): boolean {
@@ -102,7 +133,7 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsInitialPane, setSettingsInitialPane] = useState<
-    'appearance' | 'ai' | 'voice' | 'paths' | 'data' | 'account' | 'mcp' | 'feedback' | 'about' | undefined
+    'appearance' | 'ai' | 'voice' | 'paths' | 'data' | 'schedule' | 'account' | 'mcp' | 'feedback' | 'about' | undefined
   >(undefined);
 
   const [appVersion, setAppVersion] = useState('0.1.0');
@@ -155,6 +186,33 @@ export default function App() {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<ScheduleTimerTickEvent>('schedule-timer-tick', (event) => {
+      const payload = event.payload;
+      if (payload.error) {
+        toast(`Schedule timer error: ${payload.error}`, 'error', 7000);
+        return;
+      }
+      const result = parseScheduleRunDueResult(payload.result);
+      if (result?.error) {
+        toast(`Scheduled task failed: ${result.error}`, 'error', 7000);
+      } else if (result?.launched) {
+        toast(`Scheduled task launched: ${result.task || result.task_id || 'task'}`, 'success', 4500);
+      }
+    }).then((fn) => { unlisten = fn; }).catch(() => {});
+    return () => { unlisten?.(); };
+  }, []);
+
+  useEffect(() => {
+    if (!settings.schedule_timer.enabled) return;
+    const intervalSeconds = settings.schedule_timer.interval_seconds || DEFAULT_SETTINGS.schedule_timer.interval_seconds;
+    invoke('start_schedule_timer', { intervalSeconds })
+      .catch((e) => {
+        toast(`Could not start schedule timer: ${String(e)}`, 'error', 7000);
+      });
+  }, [settings.schedule_timer.enabled, settings.schedule_timer.interval_seconds]);
 
   async function silentUpdateCheck(currentVersion: string) {
     try {
@@ -217,8 +275,9 @@ export default function App() {
     setActiveTab(tab);
     setActiveSession(null);
     setNewChatMode(false);
-    // When switching tabs, don't automatically clear the selected project,
-    // but maybe we just leave it so if they go back to Code it's there.
+    // A pending Chat-session selection must not fire after the user moves to
+    // Code — it would snap the UI back to the last Chat conversation.
+    setPendingSelectSessionId(null);
   }
 
   function handleSelectProject(path: string) {
@@ -256,6 +315,17 @@ export default function App() {
     // ChatView's key continues to use the same id so transitioning from
     // newChatMode → loaded does not remount.
     if (completedSession) {
+      // Don't navigate when a Codex session from a different project completes —
+      // switching would replace the current chat with only the latest turn.
+      if (
+        activeTab === 'code' &&
+        completedSession.session_type === 'codex' &&
+        completedSession.project_path !== activeProjectPath
+      ) {
+        setSessionRefreshNonce(n => n + 1);
+        refresh();
+        return;
+      }
       // Code-tab (Codex) completion: Codex always creates a NEW session file
       // (it doesn't support --resume). If the user was already viewing an
       // OLD session, navigating to the new session replaces the old messages
@@ -293,18 +363,23 @@ export default function App() {
     setTimeout(() => { refresh(); }, 400);
     setTimeout(() => { refresh(); }, 1200);
     setTimeout(() => { refresh(); }, 2400);
-  }, [activeTab, refresh]);
+  }, [activeTab, activeProjectPath, refresh]);
 
   // Auto-select the just-completed session once it appears in kimSessions.
+  // Only applies to the Chat tab — Code tab manages its own session navigation.
   useEffect(() => {
     if (!pendingSelectSessionId) return;
+    if (activeTab !== 'chat') {
+      setPendingSelectSessionId(null);
+      return;
+    }
     const session = kimSessions.find(s => s.session_id === pendingSelectSessionId);
     if (session) {
       setActiveSession(session);
       setNewChatMode(false);
       setPendingSelectSessionId(null);
     }
-  }, [kimSessions, pendingSelectSessionId]);
+  }, [kimSessions, pendingSelectSessionId, activeTab]);
 
   async function checkForUpdates() {
     toast('Checking for updates…', 'info', 2000);

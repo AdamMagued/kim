@@ -160,6 +160,11 @@ export interface VoiceSettings {
   voice_id: string;    // kokoro voice_id OR hume voice_name OR http voice
 }
 
+export interface ScheduleTimerSettings {
+  enabled: boolean;
+  interval_seconds: number;
+}
+
 export interface Settings {
   kim_sessions_dir: string;
   codex_sessions_dir: string;
@@ -172,6 +177,7 @@ export interface Settings {
   theme: Theme;
   accent: AccentTheme;
   voice: VoiceSettings;
+  schedule_timer: ScheduleTimerSettings;
   typing_animation: TypingAnimation;
   ollama: OllamaSettings;
 }
@@ -190,6 +196,10 @@ export const DEFAULT_SETTINGS: Settings = {
     enabled: true,
     engine: 'kokoro',
     voice_id: 'af_heart',
+  },
+  schedule_timer: {
+    enabled: false,
+    interval_seconds: 300,
   },
   typing_animation: 'none',
   ollama: {

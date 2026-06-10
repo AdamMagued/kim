@@ -114,5 +114,5 @@ def test_parse_rest_response_preserves_usage_and_tool_calls(monkeypatch):
         "type": "tool_call",
         "tool": "bash",
         "args": {"cmd": "ls"},
-        "usage": {"input": 10, "output": 4},
+        "usage": {"input": 10, "output": 4, "cache_read_tokens": 0},
     }

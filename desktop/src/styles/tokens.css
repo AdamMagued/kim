@@ -1,0 +1,396 @@
+/* Enable class-based dark mode */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ── Accent themes — applied via data-accent="..." on <html> ─────────────── */
+
+/* Ocean — muted teal-blue (warm-shifted) */
+:root[data-accent="ocean"] {
+  --accent:           #6a8f9d;
+  --accent-hover:     #5a7f8d;
+  --accent-active:    #4a6f7d;
+  --accent-muted:     #f0f5f7;
+  --accent-soft:      #dde9ed;
+  --accent-gradient:  linear-gradient(135deg, #6a8f9d 0%, #7da3b0 55%, #90b7c3 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #5a7f8d 0%, #6a8f9d 55%, #7da3b0 100%);
+  --ring:             rgba(106, 143, 157, 0.22);
+  --bubble-user-bg:   #6a8f9d;
+}
+.dark[data-accent="ocean"] {
+  --accent:           #90b7c3;
+  --accent-hover:     #a3c5d0;
+  --accent-active:    #7da3b0;
+  --accent-muted:     #1a2628;
+  --accent-soft:      #243034;
+  --accent-gradient:  linear-gradient(135deg, #7da3b0 0%, #90b7c3 55%, #a3c5d0 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #6a8f9d 0%, #7da3b0 55%, #90b7c3 100%);
+  --ring:             rgba(144, 183, 195, 0.30);
+  --bubble-user-bg:   #90b7c3;
+}
+
+/* Ember — warm amber/sienna */
+:root[data-accent="ember"] {
+  --accent:           #c4835a;
+  --accent-hover:     #b4734a;
+  --accent-active:    #a4633a;
+  --accent-muted:     #faf3ee;
+  --accent-soft:      #f0e0d4;
+  --accent-gradient:  linear-gradient(135deg, #c4835a 0%, #d4936a 55%, #e4a37a 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #b4734a 0%, #c4835a 55%, #d4936a 100%);
+  --ring:             rgba(196, 131, 90, 0.22);
+  --bubble-user-bg:   #c4835a;
+}
+.dark[data-accent="ember"] {
+  --accent:           #e4a37a;
+  --accent-hover:     #f0b38a;
+  --accent-active:    #d4936a;
+  --accent-muted:     #2c1e14;
+  --accent-soft:      #3d2a1c;
+  --accent-gradient:  linear-gradient(135deg, #d4936a 0%, #e4a37a 55%, #f0b38a 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #c4835a 0%, #d4936a 55%, #e4a37a 100%);
+  --ring:             rgba(228, 163, 122, 0.30);
+  --bubble-user-bg:   #e4a37a;
+}
+
+/* Teal — sage green */
+:root[data-accent="teal"] {
+  --accent:           #6a8f66;
+  --accent-hover:     #5a7f56;
+  --accent-active:    #4a6f46;
+  --accent-muted:     #f0f5ef;
+  --accent-soft:      #dde9db;
+  --accent-gradient:  linear-gradient(135deg, #6a8f66 0%, #7da378 55%, #90b78a 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #5a7f56 0%, #6a8f66 55%, #7da378 100%);
+  --ring:             rgba(106, 143, 102, 0.22);
+  --bubble-user-bg:   #6a8f66;
+}
+.dark[data-accent="teal"] {
+  --accent:           #a8c5a3;
+  --accent-hover:     #b8d5b3;
+  --accent-active:    #90b78a;
+  --accent-muted:     #1a2618;
+  --accent-soft:      #243320;
+  --accent-gradient:  linear-gradient(135deg, #90b78a 0%, #a8c5a3 55%, #b8d5b3 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #7da378 0%, #90b78a 55%, #a8c5a3 100%);
+  --ring:             rgba(168, 197, 163, 0.30);
+  --bubble-user-bg:   #a8c5a3;
+}
+
+/* Jade — dusty rose */
+:root[data-accent="jade"] {
+  --accent:           #9d7a7a;
+  --accent-hover:     #8d6a6a;
+  --accent-active:    #7d5a5a;
+  --accent-muted:     #f5f0f0;
+  --accent-soft:      #e9dede;
+  --accent-gradient:  linear-gradient(135deg, #9d7a7a 0%, #b08d8d 55%, #c3a0a0 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #8d6a6a 0%, #9d7a7a 55%, #b08d8d 100%);
+  --ring:             rgba(157, 122, 122, 0.22);
+  --bubble-user-bg:   #9d7a7a;
+}
+.dark[data-accent="jade"] {
+  --accent:           #d4a0a0;
+  --accent-hover:     #e0b0b0;
+  --accent-active:    #c39090;
+  --accent-muted:     #2a1e1e;
+  --accent-soft:      #362828;
+  --accent-gradient:  linear-gradient(135deg, #c39090 0%, #d4a0a0 55%, #e0b0b0 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #b08d8d 0%, #c39090 55%, #d4a0a0 100%);
+  --ring:             rgba(212, 160, 160, 0.30);
+  --bubble-user-bg:   #d4a0a0;
+}
+
+/* Mono — warm monochrome */
+:root[data-accent="mono"] {
+  --accent:           #2d2822;
+  --accent-hover:     #1a1614;
+  --accent-active:    #0a0a08;
+  --accent-muted:     #f5f2f0;
+  --accent-soft:      #e8e2dd;
+  --accent-gradient:  linear-gradient(135deg, #3d3630 0%, #2d2822 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #2d2822 0%, #1a1614 100%);
+  --ring:             rgba(45, 40, 34, 0.20);
+  --bubble-user-bg:   #2d2822;
+}
+.dark[data-accent="mono"] {
+  --accent:           #e8dfd6;
+  --accent-hover:     #f0e8e0;
+  --accent-active:    #d8d0c8;
+  --accent-muted:     #221e1c;
+  --accent-soft:      #2a2420;
+  --accent-gradient:  linear-gradient(135deg, #9d8f82 0%, #e8dfd6 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #d8d0c8 0%, #f0e8e0 100%);
+  --ring:             rgba(232, 223, 214, 0.25);
+  --bubble-user-bg:   #e8dfd6;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   KIM DESIGN SYSTEM
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Theme tokens: Light (Soft Pastel Light) ─────────────────────────────── */
+:root {
+  /* Neutrals — warm off-whites */
+  --bg:               #faf7f5;
+  --bg-elevated:      #ffffff;
+  --bg-sidebar:       #f2eeeb;
+  --bg-card:          #f5f1ed;
+  --bg-card-hover:    #ede8e4;
+  --bg-input:         #ffffff;
+  --bg-overlay:       rgba(45, 40, 34, 0.42);
+  --bg-glass:         rgba(255, 255, 255, 0.72);
+  --sidebar-glass-bg: rgba(250, 247, 245, 0.88);
+  --sidebar-glass-bg-strong: rgba(255, 255, 255, 0.34);
+  --sidebar-glass-border: rgba(184, 138, 116, 0.20);
+  --sidebar-glass-shadow: rgba(45, 40, 34, 0.10);
+  --connector-glass-bg: rgba(250, 247, 245, 0.86);
+  --bg-inset:         #f0ebe6;
+  --surface-raised:   #f8f5f2;
+
+  /* Text */
+  --text:             #2d2822;
+  --text-strong:      #1a1614;
+  --text-muted:       #6b5f54;
+  --text-subtle:      #9d8f82;
+
+  /* Accents — warm brand (default indigo mapped to warm terracotta) */
+  --accent:           #b88a74;
+  --accent-hover:     #a67a64;
+  --accent-active:    #946a54;
+  --accent-muted:     #f0e5dd;
+  --accent-soft:      #e8d8cc;
+  --accent-gradient:  linear-gradient(135deg, #b88a74 0%, #c89a84 55%, #d4a08a 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #a67a64 0%, #b88a74 55%, #c89a84 100%);
+
+  /* Secondary accents */
+  --accent-claw:      #9d7861;
+  --accent-claw-muted:#f0e5dd;
+  --success:          #6a8f66;
+  --success-muted:    #e8f2e8;
+  --warning:          #c4935a;
+  --danger:           #8f4a4a;
+  --danger-hover:     #7a3a3a;
+  --danger-muted:     #f2e8e8;
+
+  /* Borders & dividers */
+  --border:           #e5ddd6;
+  --border-strong:    #d8d0c8;
+  --ring:             rgba(184, 138, 116, 0.22);
+
+  /* Chat bubbles */
+  --bubble-user-bg:   #b88a74;
+  --bubble-user-text: #ffffff;
+  --bubble-ai-bg:     #f5f1ed;
+  --bubble-ai-text:   #2d2822;
+  --bubble-ai-border: #e5ddd6;
+
+  /* Shadows — warm-toned */
+  --shadow-xs:  0 1px 2px rgba(45, 40, 34, 0.04);
+  --shadow-sm:  0 2px 4px rgba(45, 40, 34, 0.06), 0 1px 2px rgba(45, 40, 34, 0.04);
+  --shadow-md:  0 4px 12px rgba(45, 40, 34, 0.08), 0 2px 4px rgba(45, 40, 34, 0.04);
+  --shadow-lg:  0 12px 32px rgba(45, 40, 34, 0.10), 0 4px 8px rgba(45, 40, 34, 0.05);
+  --shadow-xl:  0 24px 60px rgba(45, 40, 34, 0.16), 0 8px 16px rgba(45, 40, 34, 0.08);
+  --shadow-glow: 0 0 0 3px var(--ring);
+
+  /* Scrollbars */
+  --scrollbar:        #d8d0c8;
+  --scrollbar-hover:  #c0b8b0;
+
+  /* Kim-revamp tokens — light variants */
+  --kim-bg:           #faf7f5;
+  --kim-bg-2:         #f2eeeb;
+  --kim-surface:      #f5f1ed;
+  --kim-surface-2:    #ede8e4;
+  --kim-border:       #e5ddd6;
+  --kim-text:         #2d2822;
+  --kim-text-2:       #6b5f54;
+  --kim-text-3:       #9d8f82;
+  --kim-text-4:       #c0b8b0;
+  --kim-accent:       #b88a74;
+  --kim-accent-soft:  #b88a7422;
+  --kim-accent-line:  #b88a7455;
+  --kim-green:        #6a8f66;
+  --kim-red:          #8f4a4a;
+  --kim-sidebar-gradient: linear-gradient(180deg, #f2eeeb 0%, #ede8e4 100%);
+  --kim-on-accent:    #ffffff;
+
+  color-scheme: light;
+}
+
+/* ── Theme tokens: Dark (Kim · UI revamp — warm dark) ──────────────────────── */
+.dark {
+  /* Design tokens (kim-revamp-* mirror the source styles.css verbatim) */
+  --kim-bg:           #0d0a08;
+  --kim-bg-2:         #131010;
+  --kim-surface:      #1a1614;
+  --kim-surface-2:    #221c19;
+  --kim-border:       #2a2320;
+  --kim-text:         #ece3dc;
+  --kim-text-2:       #a89d94;
+  --kim-text-3:       #6b625b;
+  --kim-text-4:       #4a423d;
+  --kim-accent:       #e8b89a;
+  --kim-accent-soft:  #e8b89a22;
+  --kim-accent-line:  #e8b89a55;
+  --kim-green:        #7bc097;
+  --kim-red:          #d49497;
+  --kim-sidebar-gradient: linear-gradient(180deg, #110d0b 0%, #0d0a08 100%);
+  --kim-on-accent:    #1a0e08;
+
+  /* Existing kim-app tokens — remapped to design palette */
+  --bg:               #0d0a08;
+  --bg-elevated:      #1a1614;
+  --bg-sidebar:       #110d0b;
+  --bg-card:          #1a1614;
+  --bg-card-hover:    #221c19;
+  --bg-input:         #131010;
+  --bg-overlay:       rgba(0, 0, 0, 0.65);
+  --bg-glass:         rgba(20, 16, 14, 0.72);
+  --sidebar-glass-bg: rgba(17, 13, 11, 0.94);
+  --sidebar-glass-bg-strong: rgba(232, 184, 154, 0.10);
+  --sidebar-glass-border: rgba(232, 184, 154, 0.18);
+  --sidebar-glass-shadow: rgba(0, 0, 0, 0.50);
+  --connector-glass-bg: rgba(17, 13, 11, 0.92);
+  --bg-inset:         #131010;
+  --surface-raised:   #221c19;
+
+  --text:             #ece3dc;
+  --text-strong:      #ffffff;
+  --text-muted:       #a89d94;
+  --text-subtle:      #6b625b;
+
+  --accent:           #e8b89a;
+  --accent-hover:     #f0c8aa;
+  --accent-active:    #d8a888;
+  --accent-muted:     #3a2d24;
+  --accent-soft:      #e8b89a22;
+  --accent-gradient:  linear-gradient(135deg, #e8b89a 0%, #d8a888 55%, #c98968 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #f0c8aa 0%, #e8b89a 55%, #d8a888 100%);
+
+  --accent-claw:      #e8b89a;
+  --accent-claw-muted:#3a2d24;
+  --success:          #7bc097;
+  --success-muted:    #1d2a22;
+  --warning:          #e8b89a;
+  --danger:           #d49497;
+  --danger-hover:     #e0a4a7;
+  --danger-muted:     #3a2626;
+
+  --border:           #2a2320;
+  --border-strong:    #34292c;
+  --ring:             rgba(232, 184, 154, 0.30);
+
+  --bubble-user-bg:   #221c19;
+  --bubble-user-text: #ece3dc;
+  --bubble-ai-bg:     transparent;
+  --bubble-ai-text:   #ece3dc;
+  --bubble-ai-border: transparent;
+
+  --shadow-xs:  0 1px 2px rgba(0, 0, 0, 0.24);
+  --shadow-sm:  0 2px 4px rgba(0, 0, 0, 0.32), 0 1px 2px rgba(0, 0, 0, 0.18);
+  --shadow-md:  0 4px 14px rgba(0, 0, 0, 0.40), 0 2px 4px rgba(0, 0, 0, 0.22);
+  --shadow-lg:  0 16px 40px rgba(0, 0, 0, 0.50), 0 4px 8px rgba(0, 0, 0, 0.28);
+  --shadow-xl:  0 28px 72px rgba(0, 0, 0, 0.62), 0 8px 20px rgba(0, 0, 0, 0.38);
+  --shadow-glow: 0 0 0 3px var(--ring);
+
+  --scrollbar:        #3d3630;
+  --scrollbar-hover:  #4a4238;
+
+  color-scheme: dark;
+}
+
+/* ── Reset ────────────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  font-family:
+    "Inter var", "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11", "ss01";
+  letter-spacing: -0.005em;
+  background-color: transparent;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* Mono stack */
+code, pre, kbd, samp,
+.kim-font-mono {
+  font-family: "JetBrains Mono", "SF Mono", "Fira Code", Consolas, monospace;
+  font-variant-ligatures: common-ligatures;
+}
+
+/* ── Scrollbars ───────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-hover);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+/* ── Selection ────────────────────────────────────────────────────────────── */
+::selection {
+  background: var(--accent-soft);
+  color: var(--text-strong);
+}
+.dark ::selection {
+  background: var(--accent-muted);
+  color: var(--text-strong);
+}
+
+/* ── Utilities ────────────────────────────────────────────────────────────── */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  padding: 1px 5px;
+  margin: 0 2px;
+  border-radius: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  box-shadow: 0 1px 0 var(--border-strong);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  font-family: inherit;
+  line-height: 1;
+}
+

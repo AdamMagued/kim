@@ -59,6 +59,46 @@ _RESOLVE_THRESHOLDS = {
     "strict": 0.58,
 }
 
+# Vocabulary bridges between how users describe a field and how sites label it.
+# Used by _expand_with_synonyms to generate extra match needles — the original
+# needle always scores first, so synonyms only widen recall, never override.
+_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "name": ("title", "label"),
+    "title": ("name", "subject"),
+    "repo": ("repository",),
+    "repository": ("repo",),
+    "private": ("restricted",),
+    "submit": ("create", "save", "send", "confirm", "done", "continue", "go"),
+    "create": ("new", "add", "submit"),
+    "email": ("e-mail", "mail", "address"),
+    "username": ("user", "login", "handle"),
+    "password": ("passphrase", "pass"),
+    "search": ("find", "query", "lookup"),
+    "description": ("summary", "details", "about", "bio"),
+    "delete": ("remove", "trash", "discard"),
+    "settings": ("preferences", "options", "configuration"),
+    "visibility": ("access", "privacy"),
+    "phone": ("telephone", "mobile", "tel"),
+    "login": ("signin", "sign"),
+    "message": ("body", "comment", "text"),
+    "folder": ("directory",),
+}
+
+
+def _expand_with_synonyms(needles: list[str]) -> list[str]:
+    """Return needles plus single-token synonym variants (originals first)."""
+    expanded = list(needles)
+    seen = {_norm(n) for n in needles}
+    for needle in needles:
+        toks = _tokens(needle)
+        for i, tok in enumerate(toks):
+            for syn in _SYNONYMS.get(tok, ()):
+                variant = " ".join(toks[:i] + [syn] + toks[i + 1:])
+                if variant and variant not in seen:
+                    seen.add(variant)
+                    expanded.append(variant)
+    return expanded
+
 
 def _norm(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())

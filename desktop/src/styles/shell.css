@@ -1,0 +1,222 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   APP SHELL
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.kim-app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: transparent;
+  color: var(--text);
+  animation: kim-app-enter 0.55s cubic-bezier(.22,.9,.3,1) both;
+}
+/* New row layout: sidebar runs full height; main column sits to the right. */
+.kim-app--row {
+  flex-direction: row;
+}
+.kim-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.kim-topbar {
+  height: 60px;
+  min-height: 60px;
+  display: flex;
+  align-items: center;
+  padding: 0 16px 0 16px;
+  gap: 12px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--kim-border);
+  background: var(--kim-bg);
+  -webkit-app-region: drag;
+  user-select: none;
+}
+.kim-topbar button,
+.kim-topbar input,
+.kim-topbar .kim-no-drag {
+  -webkit-app-region: no-drag;
+}
+.kim-topbar__title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  overflow: hidden;
+  animation: kim-soft-pop 0.24s cubic-bezier(.2,.8,.2,1) both;
+}
+.kim-topbar__title-text {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-strong);
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 520px;
+}
+@keyframes kim-app-enter {
+  from { opacity: 0; transform: scale(0.985); filter: blur(4px); }
+  to   { opacity: 1; transform: scale(1);     filter: blur(0);   }
+}
+
+/* ── Header ───────────────────────────────────────────────────────────────── */
+.kim-header {
+  height: 52px;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  gap: 12px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-glass);
+  backdrop-filter: saturate(180%) blur(14px);
+  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  z-index: 10;
+  /* Allow window drag on macOS when using titleBarStyle:Overlay */
+  -webkit-app-region: drag;
+  user-select: none;
+}
+.kim-header button,
+.kim-header input,
+.kim-header .kim-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.kim-header__traffic-lights-spacer {
+  width: 68px;
+  height: 100%;
+  flex-shrink: 0;
+}
+/* Only reserve the traffic-lights space on macOS */
+@media not all and (min-resolution: 0.001dpcm) {}
+@supports (-webkit-backdrop-filter: blur(1px)) {
+  /* macOS Safari-based webviews keep the spacer */
+}
+/* Fallback: hide spacer on non-mac-looking environments via narrow width */
+@media (max-width: 0) { .kim-header__traffic-lights-spacer { display: none; } }
+
+.kim-header__brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.kim-logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.kim-header__title {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: -0.02em;
+  color: var(--text-strong);
+}
+.kim-header__version {
+  font-size: 11px;
+  color: var(--text-subtle);
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-card);
+  font-family: "JetBrains Mono", "SF Mono", monospace;
+  letter-spacing: 0;
+}
+
+.kim-header__breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+}
+.kim-header__slash {
+  color: var(--text-subtle);
+  font-size: 16px;
+}
+.kim-header__session-id {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: "JetBrains Mono", "SF Mono", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+.kim-header__new-chat-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.kim-header__session-badge {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 5px;
+}
+.kim-header__session-badge--kim {
+  color: var(--accent);
+  background: var(--accent-muted);
+}
+.kim-header__session-badge--claw {
+  color: var(--accent-claw);
+  background: var(--accent-claw-muted);
+}
+
+.kim-header__summarize-btn {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 9px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.kim-header__summarize-btn:hover {
+  color: var(--text-strong);
+  background: var(--accent-muted);
+  border-color: var(--accent);
+}
+.kim-header__summarize-btn:active {
+  transform: translateY(1px);
+}
+
+.kim-pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 var(--accent);
+  animation: kim-pulse 1.6s ease-in-out infinite;
+  display: inline-block;
+}
+.kim-pulse-dot--accent {
+  background: var(--accent);
+}
+
+/* ── Body ─────────────────────────────────────────────────────────────────── */
+.kim-body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  min-height: 0;
+  background: transparent;
+}
+

@@ -11,11 +11,15 @@ Usage:
     python -m kimctl browser show
     python -m kimctl browser hide
     python -m kimctl browser click "<selector>"
+    python -m kimctl compare --task "<task>" --providers p1,p2 [--timeout <sec>]
+                             [--save-dir PATH | --no-save] [--config PATH] [--json]
+    python -m kimctl trace [<session_id>] [--json]
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -472,6 +476,470 @@ def cmd_cancel(args):
         print(f"{'✅' if data.get('ok') else '❌'} {msg}")
 
 
+# ---------------------------------------------------------------------------
+# Schedule helpers (local file ops -- no bridge required)
+# ---------------------------------------------------------------------------
+
+def _schedule_store_file() -> "Optional[Path]":
+    """Return an override path for the schedule store, or None to use CronStore's default.
+
+    Set KIM_SCHEDULES_FILE to point at a different file (useful for testing).
+    When None is returned, CronStore falls back to its built-in default path
+    (kim_schedules.json at the project root), keeping path logic in one place.
+    """
+    env = os.environ.get("KIM_SCHEDULES_FILE", "").strip()
+    return Path(env) if env else None
+
+
+def _warn_if_forbidden_provider(provider: Optional[str]) -> None:
+    """Print a warning if the provider violates the scheduled-executor allowlist.
+
+    Uses the same is_allowed_provider check as the runner so add-time warnings
+    are always consistent with runtime enforcement.
+    """
+    if not provider:
+        return
+    from orchestrator.scheduled_runner import is_allowed_provider
+    if not is_allowed_provider(provider):
+        print(
+            f"Warning: provider {provider!r} violates the scheduled-executor constraint "
+            "(allowed: ollama, ollama-cloud, browser, browser:<site>); "
+            "this task will be skipped at runtime.",
+            file=sys.stderr,
+        )
+
+
+def _print_task_table(tasks: list) -> None:
+    if not tasks:
+        print("No scheduled tasks.")
+        return
+    print(f"{'ID':<32}  {'Expr':<14}  {'Runs':>4}  En  Task")
+    print("-" * 78)
+    for t in tasks:
+        en = "Y" if t.enabled else "n"
+        preview = t.task[:33] + "..." if len(t.task) > 36 else t.task
+        print(f"{t.id:<32}  {t.schedule_expr:<14}  {t.run_count:>4}  {en:<2}  {preview}")
+
+
+def _sch_list(store, args, use_json: bool) -> None:
+    tasks = store.list_tasks(enabled_only=getattr(args, "enabled_only", False))
+    if use_json:
+        _print_json([t.to_dict() for t in tasks])
+    else:
+        _print_task_table(tasks)
+
+
+def _sch_add(store, args, use_json: bool) -> None:
+    _warn_if_forbidden_provider(getattr(args, "provider", None))
+    enabled = not getattr(args, "disabled", False)
+    try:
+        t = store.add(
+            args.task,
+            args.expr,
+            provider=getattr(args, "provider", None) or None,
+            enabled=enabled,
+        )
+    except ValueError as exc:
+        if use_json:
+            _print_json({"ok": False, "error": str(exc)})
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if use_json:
+        _print_json({"ok": True, "task": t.to_dict()})
+    else:
+        print(f"Added {t.id}  {t.schedule_expr}  {t.task!r}")
+
+
+def _sch_update(store, args, use_json: bool) -> None:
+    enable = getattr(args, "enable", False)
+    disable = getattr(args, "disable", False)
+    if enable and disable:
+        msg = "--enable and --disable are mutually exclusive."
+        if use_json:
+            _print_json({"ok": False, "error": msg})
+        else:
+            print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    kwargs: dict = {}
+    task_text = getattr(args, "task_text", None)
+    if task_text is not None:
+        kwargs["task"] = task_text
+    expr = getattr(args, "expr", None)
+    if expr is not None:
+        kwargs["schedule_expr"] = expr
+    provider = getattr(args, "provider", None)
+    if provider is not None:
+        kwargs["provider"] = provider
+    if enable:
+        kwargs["enabled"] = True
+    elif disable:
+        kwargs["enabled"] = False
+
+    if not kwargs:
+        msg = "Nothing to update. Use --task, --expr, --provider, --enable, or --disable."
+        if use_json:
+            _print_json({"ok": False, "error": msg})
+        else:
+            print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        t = store.update(args.id, **kwargs)
+    except ValueError as exc:
+        if use_json:
+            _print_json({"ok": False, "error": str(exc)})
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if t is None:
+        msg = f"Task {args.id!r} not found."
+        if use_json:
+            _print_json({"ok": False, "error": msg})
+        else:
+            print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    if use_json:
+        _print_json({"ok": True, "task": t.to_dict()})
+    else:
+        print(f"Updated {t.id}")
+
+
+def _sch_delete(store, args, use_json: bool) -> None:
+    deleted = store.delete(args.id)
+    if not deleted:
+        msg = f"Task {args.id!r} not found."
+        if use_json:
+            _print_json({"ok": False, "error": msg})
+        else:
+            print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(1)
+    if use_json:
+        _print_json({"ok": True, "id": args.id})
+    else:
+        print(f"Deleted {args.id}")
+
+
+def _sch_due(store, args, use_json: bool) -> None:
+    from datetime import datetime, timezone as _tz
+    as_of = None
+    as_of_str = getattr(args, "as_of", None)
+    if as_of_str:
+        try:
+            dt = datetime.fromisoformat(as_of_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_tz.utc)
+            as_of = dt
+        except ValueError as exc:
+            if use_json:
+                _print_json({"ok": False, "error": f"Invalid --as-of: {exc}"})
+            else:
+                print(f"Error: invalid --as-of value: {exc}", file=sys.stderr)
+            sys.exit(1)
+    tasks = store.due_tasks(as_of=as_of)
+    if use_json:
+        _print_json([t.to_dict() for t in tasks])
+    else:
+        if not tasks:
+            print("No tasks due.")
+        else:
+            _print_task_table(tasks)
+
+
+def _sch_record_run(store, args, use_json: bool) -> None:
+    from datetime import datetime, timezone as _tz
+    ran_at = None
+    at_str = getattr(args, "at", None)
+    if at_str:
+        try:
+            dt = datetime.fromisoformat(at_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_tz.utc)
+            ran_at = dt
+        except ValueError as exc:
+            if use_json:
+                _print_json({"ok": False, "error": f"Invalid --at: {exc}"})
+            else:
+                print(f"Error: invalid --at value: {exc}", file=sys.stderr)
+            sys.exit(1)
+    t = store.record_run(args.id, ran_at=ran_at)
+    if t is None:
+        msg = f"Task {args.id!r} not found or corrupt."
+        if use_json:
+            _print_json({"ok": False, "error": msg})
+        else:
+            print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(1)
+    if use_json:
+        _print_json({"ok": True, "task": t.to_dict()})
+    else:
+        print(
+            f"Recorded run for {t.id}  "
+            f"run_count={t.run_count}  next_run_at={t.next_run_at}"
+        )
+
+
+def _sch_run_due(store, args, use_json: bool) -> None:
+    from orchestrator.scheduled_runner import run_next_due_task
+    dry_run = getattr(args, "dry_run", False)
+    result = run_next_due_task(store_file=_schedule_store_file(), dry_run=dry_run)
+    if result is None:
+        if use_json:
+            print(json.dumps({"ok": True, "launched": False, "reason": "no tasks due"}))
+        else:
+            print("No tasks due.")
+        return
+    if result.error:
+        if use_json:
+            print(json.dumps({"ok": False, **result.to_dict()}))
+        else:
+            print(f"Error launching task {result.task_id}: {result.error}", file=sys.stderr)
+        sys.exit(1)
+    if use_json:
+        print(json.dumps({"ok": True, **result.to_dict()}))
+    else:
+        if result.skipped:
+            print(f"Skipped: {result.task_text!r} — {result.skip_reason}")
+        elif result.launched:
+            print(f"Launched: {result.task_text!r} (id={result.task_id})")
+            if result.recorded:
+                print("  run recorded — next_run_at advanced")
+            if result.log_file:
+                print(f"  agent log: {result.log_file}")
+
+
+_SCH_HANDLERS: dict = {
+    "list": _sch_list,
+    "add": _sch_add,
+    "update": _sch_update,
+    "delete": _sch_delete,
+    "due": _sch_due,
+    "record-run": _sch_record_run,
+    "run-due": _sch_run_due,
+}
+
+
+def cmd_schedule(args):
+    """Manage scheduled agent tasks (local file ops, no bridge required).
+
+    Provider constraint: scheduled tasks in Code-tab context may only use
+    ollama or browser providers, never openai/gpt variants. The CLI warns on
+    add; enforcement is the executor's responsibility (a later slice).
+    """
+    from orchestrator.cron_store import CronStore
+    store = CronStore(store_file=_schedule_store_file())
+
+    action = getattr(args, "schedule_action", None)
+    use_json = getattr(args, "json", False)
+
+    if not action or action not in _SCH_HANDLERS:
+        print(
+            "Usage: kimctl schedule {list,add,update,delete,due,record-run,run-due}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    _SCH_HANDLERS[action](store, args, use_json)
+
+
+def cmd_compare(args):
+    """Run the same task through multiple providers and print a structured comparison."""
+    # Parse provider list
+    raw_providers = getattr(args, "providers", "") or ""
+    providers = [p.strip() for p in raw_providers.split(",")]
+    if not raw_providers.strip():
+        if args.json:
+            _print_json({"ok": False, "error": "--providers is required (comma-separated list)"})
+        else:
+            print("Error: --providers is required (comma-separated list)", file=sys.stderr)
+        sys.exit(1)
+
+    # Resolve save directory
+    no_save = getattr(args, "no_save", False)
+    save_dir_arg = getattr(args, "save_dir", None)
+    if no_save:
+        save_dir = Path("/dev/null")
+    elif save_dir_arg:
+        save_dir = Path(save_dir_arg)
+    else:
+        save_dir = None  # compare_providers will use its default (kim_comparisons/)
+
+    timeout = float(getattr(args, "timeout", 120) or 120)
+
+    try:
+        from orchestrator.compare import compare_providers
+        _validate_compare_request(args.task, providers, timeout)
+    except ValueError as exc:
+        if args.json:
+            _print_json({"ok": False, "error": str(exc)})
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load kim config for provider credentials / MCP server path. Keep this
+    # independent from orchestrator.agent so lightweight CLI/test paths do not
+    # require importing the MCP client package until a real comparison starts.
+    try:
+        config = _load_compare_config(getattr(args, "config", None))
+    except Exception as exc:
+        if args.json:
+            _print_json({"ok": False, "error": f"could not load config: {exc}"})
+        else:
+            print(f"Error: could not load config: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        results, saved_path = asyncio.run(compare_providers(
+            task=args.task,
+            providers=providers,
+            config=config,
+            timeout_seconds=timeout,
+            save_dir=save_dir,
+            _session_factory=getattr(args, "_session_factory", None),
+        ))
+    except ValueError as exc:
+        if args.json:
+            _print_json({"ok": False, "error": str(exc)})
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        if args.json:
+            _print_json({"ok": False, "error": f"comparison failed: {exc}"})
+        else:
+            print(f"Error: comparison failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        _print_json({
+            "ok": True,
+            "results": results,
+            "saved": str(saved_path) if saved_path else None,
+        })
+    else:
+        _print_comparison_table(results)
+        if saved_path:
+            print(f"Saved: {saved_path}")
+
+
+def _validate_compare_request(task: str, providers: list, timeout: float) -> None:
+    if not task or not task.strip():
+        raise ValueError("task must not be empty")
+    if not providers:
+        raise ValueError("providers list must not be empty")
+    providers = [str(p).strip() for p in providers]
+    if any(not p for p in providers):
+        raise ValueError("provider names must not be empty")
+    seen = set()
+    duplicates = []
+    for provider in providers:
+        key = provider.lower()
+        if key in seen:
+            duplicates.append(provider)
+        seen.add(key)
+    if duplicates:
+        raise ValueError(f"duplicate providers are not allowed: {', '.join(duplicates)}")
+    if len(providers) > 8:
+        raise ValueError(f"compare_providers: at most 8 providers allowed, got {len(providers)}")
+    if timeout < 1:
+        raise ValueError(f"timeout_seconds must be >= 1, got {timeout}")
+
+
+def _load_compare_config(config_path: Optional[str]) -> dict:
+    path = Path(config_path) if config_path else _kim_root() / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        import yaml  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required to read config.yaml") from exc
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _print_comparison_table(results: list) -> None:
+    if not results:
+        print("No results.")
+        return
+    print(f"{'Provider':<20}  {'OK':>3}  {'Duration':>9}  Summary / Error")
+    print("-" * 72)
+    for r in results:
+        ok_flag = "yes" if r.get("success") else "no"
+        dur = f"{r.get('duration_seconds', 0.0):.1f}s"
+        detail = r.get("summary") or r.get("error") or r.get("termination") or "--"
+        if len(detail) > 38:
+            detail = detail[:35] + "..."
+        print(f"{r.get('provider', '?'):<20}  {ok_flag:>3}  {dur:>9}  {detail}")
+
+
+def cmd_trace(args):
+    """Print a trace summary for one session or all sessions (read-only, no bridge needed)."""
+    from orchestrator.session_store import SessionStore
+
+    session_id = getattr(args, "session_id", None) or None
+    base = _sessions_dir()
+
+    if session_id and not SessionStore.session_exists(session_id, base_dir=base):
+        if args.json:
+            _print_json({"ok": False, "error": f"Session '{session_id}' not found."})
+        else:
+            print(f"Session '{session_id}' not found.", file=sys.stderr)
+        sys.exit(EXIT_TRANSPORT)
+
+    summary = SessionStore.summarize_trace_events(session_id=session_id, base_dir=base)
+
+    if args.json:
+        _print_json(summary)
+        return
+
+    # Human-readable output
+    sid_label = summary["session_id"] or "(all sessions)"
+    print(f"Trace summary  (session: {sid_label})")
+    print("─" * 50)
+    print(f"Events: {summary['event_count']}")
+
+    by_type = summary["by_type"]
+    if by_type:
+        type_parts = "  ".join(f"{k}: {v}" for k, v in sorted(by_type.items()))
+        print(f"  by type:    {type_parts}")
+
+    tc = summary["tool_calls"]
+    print(
+        f"\nTool calls:   started={tc['started']}  "
+        f"completed={tc['completed']}  errored={tc['errored']}"
+    )
+    if tc["by_tool"]:
+        by_tool = "  ".join(f"{k}×{v}" for k, v in sorted(tc["by_tool"].items()))
+        print(f"  by tool:    {by_tool}")
+    if tc["error_codes"]:
+        ec = "  ".join(f"{k}×{v}" for k, v in sorted(tc["error_codes"].items()))
+        print(f"  error_codes: {ec}")
+    if tc["risk_levels"]:
+        rl = "  ".join(f"{k}×{v}" for k, v in sorted(tc["risk_levels"].items()))
+        print(f"  risk_levels: {rl}")
+
+    lt = summary["llm_turns"]
+    print(
+        f"\nLLM turns:    started={lt['started']}  "
+        f"completed={lt['completed']}  errored={lt['errored']}"
+    )
+    if lt["by_provider"]:
+        by_prov = "  ".join(f"{k}×{v}" for k, v in sorted(lt["by_provider"].items()))
+        print(f"  by provider: {by_prov}")
+    if lt["error_codes"]:
+        ec = "  ".join(f"{k}×{v}" for k, v in sorted(lt["error_codes"].items()))
+        print(f"  error_codes: {ec}")
+
+    run = summary["run"]
+    print(f"\nRun:          started={run['started']}  result={run['result']}")
+    if run["result"] > 0:
+        print(f"  success:     {run['success']}")
+        print(f"  termination: {run['termination']}")
+
+
 def cmd_browser(args):
     if args.browser_action == "show":
         resp = _bridge_request("POST", "/v1/browser/show", json={})
@@ -540,6 +1008,91 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("cancel", help="Cancel the running task")
     sp.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    # schedule
+    sp = sub.add_parser("schedule", help="Manage scheduled agent tasks (local, no bridge)")
+    ssp = sp.add_subparsers(dest="schedule_action", help="Schedule subcommand")
+
+    s = ssp.add_parser("list", help="List scheduled tasks")
+    s.add_argument("--enabled-only", dest="enabled_only", action="store_true",
+                   help="Show only enabled tasks")
+    s.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    s = ssp.add_parser(
+        "add",
+        help="Add a scheduled task (Code-tab: provider must be ollama or browser, not openai/gpt)",
+    )
+    s.add_argument("task", help="Task text to run on schedule")
+    s.add_argument("expr", help="Schedule expr: @hourly, @daily, @weekly, @every <N>m/h/d")
+    s.add_argument("--provider", metavar="NAME", help="Provider hint (ollama, browser, ...)")
+    s.add_argument("--disabled", action="store_true", help="Create as disabled")
+    s.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    s = ssp.add_parser("update", help="Update fields on a scheduled task")
+    s.add_argument("id", help="Task ID to update")
+    s.add_argument("--task", dest="task_text", metavar="TEXT", help="New task text")
+    s.add_argument("--expr", metavar="EXPR", help="New schedule expression")
+    s.add_argument("--provider", metavar="NAME", help="New provider hint")
+    s.add_argument("--enable", action="store_true", help="Enable the task")
+    s.add_argument("--disable", action="store_true", help="Disable the task")
+    s.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    s = ssp.add_parser("delete", help="Delete a scheduled task")
+    s.add_argument("id", help="Task ID to delete")
+    s.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    s = ssp.add_parser("due", help="List tasks due now (or at --as-of)")
+    s.add_argument("--as-of", dest="as_of", metavar="ISO_DATETIME",
+                   help="Check due tasks at this UTC datetime instead of now")
+    s.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    s = ssp.add_parser("record-run", help="Record that a scheduled task ran")
+    s.add_argument("id", help="Task ID that ran")
+    s.add_argument("--at", dest="at", metavar="ISO_DATETIME",
+                   help="When the task ran (default: now UTC)")
+    s.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    s = ssp.add_parser(
+        "run-due",
+        help=(
+            "Launch the next due task via orchestrator.agent. "
+            "Only ollama/ollama-cloud/browser providers are allowed."
+        ),
+    )
+    s.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="Show what would run without spawning")
+    s.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    # compare
+    sp = sub.add_parser(
+        "compare",
+        help="Run a task through multiple providers and compare results",
+    )
+    sp.add_argument("--task", "-t", required=True, metavar="TASK",
+                    help="Task text to run through each provider")
+    sp.add_argument("--providers", required=True, metavar="P1,P2,...",
+                    help="Comma-separated provider names (e.g. ollama,claude)")
+    sp.add_argument("--timeout", type=float, default=120.0, metavar="SECONDS",
+                    help="Per-provider timeout in seconds (default: 120)")
+    sp.add_argument("--save-dir", dest="save_dir", metavar="PATH",
+                    help="Directory to save comparison JSON (default: kim_comparisons/)")
+    sp.add_argument("--no-save", dest="no_save", action="store_true",
+                    help="Do not save comparison results to disk")
+    sp.add_argument("--config", metavar="PATH", help="Path to config.yaml")
+    sp.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    # trace
+    sp = sub.add_parser(
+        "trace",
+        help="Print trace summary for one session or all sessions (read-only, no bridge needed)",
+    )
+    sp.add_argument(
+        "session_id",
+        nargs="?",
+        default=None,
+        help="Session ID to inspect (omit to summarize all sessions)",
+    )
+    sp.add_argument("--json", action="store_true", help="Machine-readable output")
+
     # browser
     sp = sub.add_parser("browser", help="Control the in-app browser")
     sp.add_argument("browser_action", choices=["show", "hide", "click", "new-chat"],
@@ -565,6 +1118,9 @@ def main():
         "send": cmd_send,
         "cancel": cmd_cancel,
         "browser": cmd_browser,
+        "schedule": cmd_schedule,
+        "compare": cmd_compare,
+        "trace": cmd_trace,
     }
 
     handler = commands.get(args.command)

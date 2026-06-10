@@ -64,6 +64,11 @@ async def _run_search_cmd(cmd: list[str], cwd: str, timeout: int) -> str:
 
         return out.strip()
     except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except Exception:
+            pass
         return f"ERROR: Search timed out after {timeout}s. Try a more specific pattern."
     except FileNotFoundError:
         return f"ERROR: '{cmd[0]}' is not installed or not found on PATH."

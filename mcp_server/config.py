@@ -58,6 +58,11 @@ BLOCKED_COMMANDS: list[str] = _cfg.get("shell", {}).get("blocked_commands", [
 ])
 
 SHELL_TIMEOUT: int = int(_cfg.get("shell", {}).get("timeout", 30))
+_shell_sandbox_env = os.environ.get("KIM_SHELL_SANDBOX_MODE")
+if _shell_sandbox_env is None:
+    SHELL_SANDBOX_MODE: bool = bool(_cfg.get("shell", {}).get("sandbox_mode", False))
+else:
+    SHELL_SANDBOX_MODE = _shell_sandbox_env.strip().lower() in {"1", "true", "yes", "on"}
 CODE_TIMEOUT: int = int(_cfg.get("code_timeout", 30))
 PREVIEW_MODE: bool = bool(_cfg.get("preview_mode", False))
 LOG_LEVEL: str = _cfg.get("logging", {}).get("level", "INFO")
@@ -143,4 +148,3 @@ def validate_path(path_str: str) -> Path:
 
 def get_config() -> dict:
     return _cfg
-

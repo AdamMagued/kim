@@ -48,7 +48,7 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 import yaml
 from dotenv import load_dotenv
@@ -62,11 +62,13 @@ from orchestrator.context_meter import (
     estimate_request_tokens,
 )
 from orchestrator.memory import ConversationMemory
-from orchestrator.providers.base import BaseProvider, create_provider
+from orchestrator.providers.base import BaseProvider, classify_provider_error, create_provider
 from orchestrator.session_store import SessionStore
 from orchestrator.context_loader import discover_instruction_files, build_instruction_prompt
 from orchestrator import compaction as _compaction
 from orchestrator.interaction_policy import InteractionPolicy
+from orchestrator.tool_errors import classify_tool_output
+from orchestrator.tool_risk import classify_tool_risk, coerce_hitl_bool
 from orchestrator.agent_states import AgentTermination, make_run_result
 
 if TYPE_CHECKING:
@@ -140,6 +142,19 @@ def load_config(path: Optional[str] = None) -> dict:
         return yaml.safe_load(f) or {}
 
 
+def _resolve_hitl_threshold(config: dict, env_val: Optional[str] = None) -> Optional[str]:
+    """Return the HITL risk threshold from config or env var.
+
+    Accepts "high", "medium", or "low".  Config key wins over env var.
+    Any other value (including None / empty string) disables the gate.
+    """
+    raw = config.get("hitl_risk_threshold") or env_val
+    if raw is None:
+        return None
+    normalized = str(raw).strip().lower()
+    return normalized if normalized in ("high", "medium", "low") else None
+
+
 # ---------------------------------------------------------------------------
 # MCP client (extracted to orchestrator/mcp_client.py)
 # ---------------------------------------------------------------------------
@@ -176,13 +191,22 @@ class KimAgent:
             max_messages=int(config.get("memory_max_messages", 40)),
             keep_screenshots=int(config.get("memory_keep_screenshots", 4)),
         )
-        self._screenshot_hashes: list[str] = []
+        self._screenshot_hashes: list = []
+        self._recent_action_sigs: list[str] = []
         self._tools: list[dict] = []
         self._ui_bridge: Optional[UIBridge] = ui_bridge
         self._voice = voice_engine
         self._session_store = session_store or SessionStore()
         self._resume_session_id = resume_session_id
-        self._interaction_policy = InteractionPolicy()
+        import os as _os
+        _block_high_risk = (
+            coerce_hitl_bool(config.get("hitl_block_high_risk"))
+            or coerce_hitl_bool(_os.environ.get("KIM_HITL_BLOCK_HIGH_RISK"))
+        )
+        self._interaction_policy = InteractionPolicy(block_high_risk=_block_high_risk)
+        self._hitl_risk_threshold = _resolve_hitl_threshold(
+            config, _os.environ.get("KIM_HITL_RISK_THRESHOLD")
+        )
         # Retry configuration for LLM API calls
         self._max_retries: int = int(config.get("max_retries", 5))
         self._retry_base_delay: float = float(config.get("retry_base_delay", 1.0))
@@ -350,9 +374,9 @@ class KimAgent:
 
     def _track_context_usage(
         self,
-        usage: dict | None,
+        usage: Optional[dict],
         *,
-        fallback_input_tokens: int | None = None,
+        fallback_input_tokens: Optional[int] = None,
         fallback_source: str = "unknown",
     ) -> None:
         """Emit legacy [STATS] for exact usage and [CONTEXT] for the budget UI."""
@@ -425,7 +449,7 @@ class KimAgent:
             ensure_ascii=False,
         ), flush=True)
 
-    def _persist_context_state_extra(self, extra: dict[str, Any] | None = None) -> None:
+    def _persist_context_state_extra(self, extra: Optional[Dict[str, Any]] = None) -> None:
         state = self._context_meter.to_metadata()
         if extra:
             state.update(extra)
@@ -448,6 +472,7 @@ class KimAgent:
         self._log("INFO", f"=== Starting task: {task!r} ===")
         print(json.dumps({"type": "status", "message": "Kim is working on it…"}, separators=(",", ":"), ensure_ascii=False), flush=True)
         self._screenshot_hashes = []
+        self._recent_action_sigs = []
         # Reset plan/step dedupe so a fresh PLAN block at the start of this
         # task is always forwarded to the UI (even if the previous task
         # already emitted a plan with the same hash).
@@ -459,6 +484,11 @@ class KimAgent:
 
         if task.strip().lower() in _COMPACT_CONTROL_TASKS:
             return await self._compact_and_reset_context()
+
+        try:
+            self._session_store.append_run_started(task)
+        except Exception as e:
+            self._log("WARN", f"Failed to write run_started trace: {e}")
 
         # Let the provider reset any per-session state (e.g. BrowserProvider
         # clears _sent_system_prompt so the new task gets its system prompt).
@@ -491,7 +521,11 @@ class KimAgent:
 
         await self._refresh_tools()
         if not self._tools:
-            return {"success": False, "summary": "No MCP tools available", "screenshot": ""}
+            return self._complete_run(make_run_result(
+                AgentTermination.PROVIDER_FAILED,
+                "No MCP tools available",
+                "",
+            ))
 
         self._emit_context_snapshot()
         system_prompt = self._build_system_prompt(task)
@@ -502,6 +536,7 @@ class KimAgent:
         if compact_ctx:
             system_prompt = compact_ctx + "\n\n---\n\n" + system_prompt
         consecutive_continues = 0
+        _last_tool_name: Optional[str] = None
 
         first_msg = {"role": "user", "content": f"Task: {task}"}
         self.memory.add_user(f"Task: {task}")
@@ -513,9 +548,18 @@ class KimAgent:
             # ── Cancellation check ──────────────────────────────────────
             if self._is_cancelled():
                 self._log("WARN", "Task cancelled by user")
-                return make_run_result(AgentTermination.CANCELLED, "Cancelled by user", last_screenshot_b64)
+                return self._complete_run(make_run_result(AgentTermination.CANCELLED, "Cancelled by user", last_screenshot_b64))
 
             self._log("INFO", f"--- Iteration {iteration}/{self.max_iterations} ---")
+            try:
+                self._session_store.append_checkpoint(
+                    iteration=iteration,
+                    phase="iteration_start",
+                    last_tool_name=_last_tool_name,
+                    consecutive_continues=consecutive_continues,
+                )
+            except Exception:
+                pass  # trace write must never abort the agent run
 
             request_messages = self.memory.get_messages()
             request_estimate = estimate_request_tokens(
@@ -534,11 +578,17 @@ class KimAgent:
                     clear_chat=clear_chat,
                 )
             except Exception as e:
+                provider_error = classify_provider_error(e)
+                self._log("INFO", f"[STATUS] provider error: {provider_error.code}")
+                # Typed JSON line — parsed by KimEvent::ProviderError in Rust and
+                # forwarded as kim:provider-error to the frontend.  retryable=False
+                # because this path is only reached after all retry attempts are exhausted.
+                print(json.dumps({"type": "provider_error", "code": provider_error.code, "retryable": False}, separators=(",", ":"), ensure_ascii=False), flush=True)
                 self._log("ERROR", f"Provider error (all retries exhausted): {e}")
                 need_help = f"NEED_HELP: LLM provider call failed after retries: {e}"
                 self.memory.add_assistant(need_help)
                 self._session_store.append_message({"role": "assistant", "content": need_help})
-                return make_run_result(AgentTermination.PROVIDER_FAILED, need_help, last_screenshot_b64)
+                return self._complete_run(make_run_result(AgentTermination.PROVIDER_FAILED, need_help, last_screenshot_b64))
 
             # ── Track token/context usage ────────────────────────────────
             self._track_context_usage(
@@ -573,8 +623,7 @@ class KimAgent:
                     )
                     self._log("INFO", f"task_complete tool intercepted → TASK_COMPLETE: {summary}")
                     await self._voice_speak(summary)
-                    self._session_store.flush()
-                    return summary
+                    return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, summary, last_screenshot_b64))
 
                 if tool_name == "batch":
                     calls = tool_args.get("calls", [])
@@ -654,6 +703,7 @@ class KimAgent:
 
                 # Execute via MCP
                 result_text = await self._execute_tool(tool_name, tool_args)
+                _last_tool_name = tool_name
                 self._log("INFO", f"Result: {result_text[:200]}")
 
                 if tool_name == "web_open" and result_text.startswith("AUTH_FAILED:"):
@@ -667,7 +717,9 @@ class KimAgent:
                     )
                     self.memory.add_assistant(summary)
                     self._session_store.append_message({"role": "assistant", "content": summary})
-                    return {"success": False, "summary": summary, "screenshot": last_screenshot_b64}
+                    return self._complete_run(make_run_result(
+                        AgentTermination.NEED_HELP, summary, last_screenshot_b64,
+                    ))
 
                 # Only include a screenshot if the LLM explicitly called take_screenshot
                 if tool_name == "take_screenshot":
@@ -680,11 +732,11 @@ class KimAgent:
                     if self._is_stuck(screenshot_b64) and iteration > 3:
                         self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
                         await self._voice_speak("I appear to be stuck. The screen is not changing.")
-                        return make_run_result(
+                        return self._complete_run(make_run_result(
                             AgentTermination.STUCK,
                             "STUCK: Screen not changing after repeated actions.",
                             screenshot_b64,
-                        )
+                        ))
 
                     user_content = [
                         {"type": "text", "text": f"[Tool result: {tool_name}]\nScreenshot captured."},
@@ -734,6 +786,18 @@ class KimAgent:
                     user_content = f"[Tool result: {tool_name}]\n{result_text}"
                     self.memory.add_user(user_content)
                     self._session_store.append_message({"role": "user", "content": user_content})
+
+                # ── Loop guard: same call, same args, same result, 3x ────
+                if self._note_repeated_action(tool_name, tool_args, result_text):
+                    nudge = (
+                        "[Loop guard] You have made the same tool call with identical "
+                        "arguments and received an identical result 3 times in a row. "
+                        "This approach is not working — change strategy: use a different "
+                        "tool or different arguments, or stop and ask via NEED_HELP."
+                    )
+                    self._log("WARN", "Repeated identical action 3x — nudging model to change approach")
+                    self.memory.add_user(nudge)
+                    self._session_store.append_message({"role": "user", "content": nudge})
                 continue
 
             # ── Text response ────────────────────────────────────────────
@@ -760,6 +824,7 @@ class KimAgent:
                     print(f"[TOOL] {tool_name}({json.dumps(tool_args)[:120]})", flush=True)
                     consecutive_continues = 0
                     result_text = await self._execute_tool(tool_name, tool_args)
+                    _last_tool_name = tool_name
                     user_content = f"[Tool result: {tool_name}]\n{result_text}"
                     self.memory.add_user(user_content)
                     self._session_store.append_message({"role": "user", "content": user_content})
@@ -779,13 +844,13 @@ class KimAgent:
                     summary = _tc.group(1).strip()
                     self._log("DEBUG", f"TASK_COMPLETE: {summary}")
                     await self._generate_and_save_summary(task, summary)
-                    return make_run_result(AgentTermination.TASK_COMPLETE, summary, last_screenshot_b64)
+                    return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, summary, last_screenshot_b64))
 
                 _nh = re.search(r"\bNEED_HELP:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
                 if _nh:
                     reason = _nh.group(1).strip()
                     self._log("DEBUG", f"NEED_HELP: {reason}")
-                    return make_run_result(AgentTermination.NEED_HELP, f"NEED_HELP: {reason}", last_screenshot_b64)
+                    return self._complete_run(make_run_result(AgentTermination.NEED_HELP, f"NEED_HELP: {reason}", last_screenshot_b64))
 
                 self._log("DEBUG", f"Text (continuing): {content[:120]}")
 
@@ -793,7 +858,7 @@ class KimAgent:
                 if consecutive_continues >= 3:
                     msg = "NEED_HELP: Model is stuck in a conversational loop without calling tools."
                     self._log("WARN", msg)
-                    return make_run_result(AgentTermination.CONVERSATIONAL_LOOP, msg, last_screenshot_b64)
+                    return self._complete_run(make_run_result(AgentTermination.CONVERSATIONAL_LOOP, msg, last_screenshot_b64))
 
                 # Remind the model to emit TASK_COMPLETE if the task is done,
                 # or call a tool if more work is needed. Never allow a bare conversational reply.
@@ -805,11 +870,12 @@ class KimAgent:
                 continue
 
         self._log("WARN", f"Max iterations ({self.max_iterations}) reached")
-        return make_run_result(
+        return self._complete_run(make_run_result(
             AgentTermination.MAX_ITERATIONS,
-            f"Reached maximum iterations ({self.max_iterations}) without completing.",
+            f"Reached maximum iterations ({self.max_iterations}) without completing. "
+            'Progress is saved in this chat — send "continue" to resume from where Kim left off.',
             last_screenshot_b64,
-        )
+        ))
 
     # ------------------------------------------------------------------
     # MCP helpers
@@ -834,8 +900,55 @@ class KimAgent:
         if decision.message:
             level = "WARN" if not decision.allowed or "WARNING" in decision.message else "INFO"
             self._log(level, f"[POLICY] {decision.message}")
+
+        # Interactive HITL approval gate — ask the user before executing tools at or
+        # above the configured risk threshold.  Fires only when a UIBridge is attached
+        # and preview mode is not already handling confirmation.  If the user approves,
+        # a HITL hard-block from block_high_risk is bypassed so the tool actually runs.
+        _hitl_interactively_approved = False
+        if (self._hitl_risk_threshold
+                and self._ui_bridge
+                and not self._is_preview_mode()):
+            _hitl_risk = classify_tool_risk(name, args or {})
+            _ord = {"high": 2, "medium": 1, "low": 0}
+            if _ord.get(_hitl_risk["level"], 0) >= _ord.get(self._hitl_risk_threshold, 99):
+                print(json.dumps({
+                    "type": "hitl_approval_request",
+                    "tool": name,
+                    "risk": _hitl_risk["level"],
+                    "reason": _hitl_risk["reason"],
+                }, separators=(",", ":"), ensure_ascii=False), flush=True)
+                _hitl_interactively_approved = await self._ui_bridge.confirm_action(name, args or {})
+                print(json.dumps({
+                    "type": "hitl_approval_result",
+                    "tool": name,
+                    "approved": _hitl_interactively_approved,
+                }, separators=(",", ":"), ensure_ascii=False), flush=True)
+                if not _hitl_interactively_approved:
+                    return (
+                        f"HITL_DENIED: User denied '{name}' ({_hitl_risk['reason']}). "
+                        "Choose a different approach or ask the user for permission."
+                    )
+
         if not decision.allowed:
-            return decision.message
+            # When interactive approval was granted above, bypass HITL hard-blocks so
+            # the tool executes.  All other policy blocks (staleness, unknown IDs…) are
+            # still enforced regardless of approval.
+            if _hitl_interactively_approved and decision.hard_block and "HITL_REQUIRED" in decision.message:
+                pass
+            else:
+                return decision.message
+
+        arg_keys = list((args or {}).keys())
+        _risk = classify_tool_risk(name, args or {})
+        try:
+            self._session_store.append_tool_event(
+                name, "started",
+                arg_keys=arg_keys,
+                risk_level=_risk["level"],
+            )
+        except Exception as e:
+            self._log("WARN", f"Failed to write tool_started trace: {e}")
 
         # ── Pre-execution: capture file state for diff ───────────────────
         _file_path: Optional[str] = None
@@ -888,6 +1001,19 @@ class KimAgent:
 
         duration_ms = int((_time.monotonic() - t0) * 1000)
 
+        try:
+            _error_code = classify_tool_output(output)
+            self._session_store.append_tool_event(
+                name,
+                "errored" if _error_code else "completed",
+                arg_keys=arg_keys,
+                duration_ms=duration_ms,
+                error=output if _error_code else None,
+                error_code=_error_code,
+            )
+        except Exception as e:
+            self._log("WARN", f"Failed to write tool_result trace: {e}")
+
         # ── Post-execution: emit line diff for file writes ───────────────
         if _file_path and name in _write_ops:
             try:
@@ -914,14 +1040,60 @@ class KimAgent:
     # Stuck detection
     # ------------------------------------------------------------------
 
+    def _screenshot_signature(self, screenshot_b64: str):
+        """Perceptual signature: 16x16 grayscale thumbnail, 16 luminance levels.
+
+        Falls back to an exact MD5 string when the image cannot be decoded,
+        which degrades the comparison to the old exact-match behavior.
+        """
+        try:
+            from PIL import Image
+            raw = base64.b64decode(screenshot_b64)
+            img = Image.open(io.BytesIO(raw)).convert("L").resize((16, 16))
+            return tuple(p // 16 for p in img.getdata())
+        except Exception:
+            return hashlib.md5(screenshot_b64.encode()).hexdigest()
+
+    @staticmethod
+    def _signatures_similar(a, b) -> bool:
+        if isinstance(a, str) or isinstance(b, str):
+            return a == b
+        if len(a) != len(b):
+            return False
+        differing = sum(1 for x, y in zip(a, b) if abs(x - y) > 1)
+        return differing <= 8  # ~3% of the 256 thumbnail pixels
+
     def _is_stuck(self, screenshot_b64: str) -> bool:
-        """Return True if the last 3 screenshots are identical (MD5 of full b64)."""
-        h = hashlib.md5(screenshot_b64.encode()).hexdigest()
-        self._screenshot_hashes.append(h)
+        """True when the last 3 screenshots are visually unchanged.
+
+        Perceptual comparison instead of exact MD5: a blinking cursor or a
+        clock tick no longer defeats detection, and tiny render noise no
+        longer counts as 'the screen changed'.
+        """
+        sig = self._screenshot_signature(screenshot_b64)
+        self._screenshot_hashes.append(sig)
         if len(self._screenshot_hashes) > 3:
             self._screenshot_hashes.pop(0)
-        if len(self._screenshot_hashes) == 3 and len(set(self._screenshot_hashes)) == 1:
-            self._log("DEBUG", f"Stuck check: 3 identical hashes ({h[:12]}...)")
+        if len(self._screenshot_hashes) == 3 and all(
+            self._signatures_similar(self._screenshot_hashes[i], self._screenshot_hashes[i + 1])
+            for i in range(2)
+        ):
+            self._log("DEBUG", "Stuck check: 3 visually identical screenshots")
+            return True
+        return False
+
+    def _note_repeated_action(self, tool_name: str, tool_args: dict, result_text: str) -> bool:
+        """Track identical (tool, args, result) triples; True on the 3rd consecutive repeat."""
+        try:
+            args_sig = json.dumps(tool_args or {}, sort_keys=True)[:300]
+        except (TypeError, ValueError):
+            args_sig = str(tool_args)[:300]
+        sig = f"{tool_name}|{args_sig}|{str(result_text)[:200]}"
+        if self._recent_action_sigs and self._recent_action_sigs[-1] != sig:
+            self._recent_action_sigs.clear()
+        self._recent_action_sigs.append(sig)
+        if len(self._recent_action_sigs) >= 3:
+            self._recent_action_sigs.clear()  # fire the nudge once per streak
             return True
         return False
 
@@ -947,19 +1119,58 @@ class KimAgent:
         """
         last_error = None
         for attempt in range(1, self._max_retries + 1):
+            import time as _time
+            t0 = _time.monotonic()
+            provider_name = type(self.provider).__name__
+            try:
+                self._session_store.append_llm_event(
+                    "started",
+                    provider=provider_name,
+                    attempt=attempt,
+                    message_count=len(messages),
+                    tool_count=len(tools),
+                )
+            except Exception as trace_error:
+                self._log("WARN", f"Failed to write llm_started trace: {trace_error}")
             try:
                 kwargs = {}
                 if clear_chat and _provider_accepts_kwarg(self.provider.complete, "clear_chat"):
                     kwargs["clear_chat"] = True
-                return await self.provider.complete(
+                response = await self.provider.complete(
                     messages=messages,
                     tools=tools,
                     system=system,
                     **kwargs,
                 )
+                try:
+                    self._session_store.append_llm_event(
+                        "completed",
+                        provider=provider_name,
+                        attempt=attempt,
+                        message_count=len(messages),
+                        tool_count=len(tools),
+                        duration_ms=int((_time.monotonic() - t0) * 1000),
+                        usage=response.get("usage", {}) if isinstance(response, dict) else {},
+                    )
+                except Exception as trace_error:
+                    self._log("WARN", f"Failed to write llm_completed trace: {trace_error}")
+                return response
             except Exception as e:
                 last_error = e
-                if not self._is_retryable(e):
+                provider_error = classify_provider_error(e)
+                try:
+                    self._session_store.append_llm_event(
+                        "errored",
+                        provider=provider_name,
+                        attempt=attempt,
+                        message_count=len(messages),
+                        tool_count=len(tools),
+                        duration_ms=int((_time.monotonic() - t0) * 1000),
+                        error_code=provider_error.code,
+                    )
+                except Exception as trace_error:
+                    self._log("WARN", f"Failed to write llm_errored trace: {trace_error}")
+                if not provider_error.retryable:
                     raise
 
                 delay = min(
@@ -969,7 +1180,7 @@ class KimAgent:
                 self._log(
                     "WARN",
                     f"LLM call failed (attempt {attempt}/{self._max_retries}): "
-                    f"{type(e).__name__}: {e} — retrying in {delay:.1f}s",
+                    f"{type(e).__name__}: {e} ({provider_error.code}) — retrying in {delay:.1f}s",
                 )
                 await asyncio.sleep(delay)
 
@@ -978,35 +1189,21 @@ class KimAgent:
     @staticmethod
     def _is_retryable(error: Exception) -> bool:
         """Determine if an LLM error is worth retrying."""
-        error_str = str(error).lower()
-        error_type = type(error).__name__.lower()
+        return classify_provider_error(error).retryable
 
-        # Rate limit errors (HTTP 429)
-        if "rate" in error_str and "limit" in error_str:
-            return True
-        if "429" in error_str:
-            return True
-        if "ratelimit" in error_type:
-            return True
+    def _complete_run(self, result: dict) -> dict:
+        """Persist a run_result record to the session JSONL then return it.
 
-        # Server errors (HTTP 5xx) — match only standalone status codes,
-        # not substrings like '500' inside file names or other numbers.
-        import re as _re_retry
-        for code in ("500", "502", "503", "529"):
-            if _re_retry.search(r'(?<![\d])' + code + r'(?![\d])', error_str):
-                return True
-        if "server" in error_str and "error" in error_str:
-            return True
-        if "overloaded" in error_str:
-            return True
-
-        # Network / timeout errors
-        if isinstance(error, (ConnectionError, TimeoutError, OSError)):
-            return True
-        if "timeout" in error_str or "connection" in error_str:
-            return True
-
-        return False
+        Centralising the append call here means adding a new return path
+        never accidentally skips the record.  The try/except ensures a
+        session-store I/O failure never prevents the caller from receiving
+        the run result.
+        """
+        try:
+            self._session_store.append_run_result(result)
+        except Exception as e:
+            self._log("WARN", f"Failed to persist run result to session: {e}")
+        return result
 
     # ------------------------------------------------------------------
     # System prompt
@@ -1086,9 +1283,16 @@ You MUST respond in EXACTLY one of these formats on every turn:
 - Use take_screenshot or take_annotated_screenshot only when the user asks a visual
   question ("what's on my screen", image/color/layout inspection) or observe_ui is
   empty/ambiguous and keyboard/accessibility actions are insufficient.
-- For browser form tasks, use web_open, then web_observe, then web_resolve for the
-  semantic target, then web_fill/web_click by element_id, then web_observe again
-  after state-changing actions. Prefer web_resolve over guessing from long lists.
+- TOOL ROUTING: if a dedicated tool exists for a service (e.g. github_create_repo
+  for GitHub repos), ALWAYS prefer it over browser automation — it is faster and
+  far more reliable than driving the website.
+- For browser form tasks: web_open, then web_observe (its FORM_SCHEMA section lists
+  every fillable field), then ONE web_fill_form call with all field descriptions,
+  values, and the submit button — e.g. web_fill_form({{"fields": {{"repository name":
+  "demo", "visibility": "private"}}, "submit": "create repository button"}}).
+  Use web_resolve/web_fill/web_click individually only for single actions or to fix
+  fields that web_fill_form reported as failed. Element IDs are stale after
+  web_fill_form — call web_observe again before id-based actions.
   Use web_wait_for_url for URL verification. Do not press Enter to submit forms
   when a submit/create button can be resolved and clicked.
 - Prefer run_command for launching apps (e.g. {_LAUNCH_EXAMPLE}).
@@ -1241,7 +1445,8 @@ Rules:
 - **Visual questions** ("what's on my screen?", "what do you see?", "describe my screen", "what's open?"): call `take_screenshot` FIRST, then look at the image and describe in detail what you actually see — apps, windows, text, UI elements, colors, layout. Do NOT say "I captured a screenshot" or list window titles from `get_windows`. The user wants visual description from a real screenshot.
 - **Window management tasks** ("list my windows", "switch to X", "close Y", "resize Z"): use `get_windows` to enumerate windows, then `focus_window` or other tools.
 - **Clicking / interacting with an app**: use `observe_ui` to read the accessibility tree, then `click_ui` or `type_text`. Take a screenshot only when `observe_ui` returns empty or for visual confirmation.
-- **Browser forms**: use `web_observe` before `web_click`/`web_fill`; call `web_resolve` for targets like "repository name textbox" or "submit button"; observe again after fills/clicks that change state. Use `web_wait_for_url` for URL verification and do not press Enter to submit when a submit/create button can be resolved.
+- **Tool routing**: if a dedicated tool exists for a service (e.g. `github_create_repo`), ALWAYS prefer it over browser automation.
+- **Browser forms**: `web_open` → `web_observe` (read its FORM_SCHEMA) → ONE `web_fill_form` call with all fields + the submit button. Use `web_resolve`/`web_fill`/`web_click` only for single actions or to fix fields web_fill_form reported as failed; element IDs are stale after web_fill_form, so observe again first. Use `web_wait_for_url` for URL verification and do not press Enter to submit when a submit/create button can be resolved.
 - Use `focus_window` before typing into any application.
 - Use {_PATH_STYLE}.
 - Maximum {self.max_iterations} tool calls allowed. If you exceed this, the task will be cancelled.
@@ -1296,10 +1501,13 @@ Rules:
             base_dir=self._session_store.base_dir,
             warn_if_missing=False,
         ) or self.memory.get_messages()
+        # Session JSONL also contains typed trace records (run_started,
+        # tool_call, llm_turn…) with no "role" key — keep only real turns.
+        messages = [m for m in messages if "role" in m]
         if not messages:
             msg = "NEED_HELP: There is no saved conversation to compact yet."
             self._log("WARN", msg)
-            return {"success": False, "summary": msg, "screenshot": ""}
+            return self._complete_run(make_run_result(AgentTermination.NEED_HELP, msg))
 
         compact_prompt = _build_compact_prompt(messages)
         try:
@@ -1314,7 +1522,7 @@ Rules:
         except Exception as e:
             msg = f"NEED_HELP: Compact failed before a summary was created: {e}"
             self._log("ERROR", msg)
-            return {"success": False, "summary": msg, "screenshot": ""}
+            return self._complete_run(make_run_result(AgentTermination.NEED_HELP, msg))
 
         self._track_context_usage(
             response.get("usage", {}),
@@ -1336,7 +1544,7 @@ Rules:
         except Exception as e:
             msg = f"NEED_HELP: Compact summary was generated but could not be saved: {e}"
             self._log("ERROR", msg)
-            return {"success": False, "summary": msg, "screenshot": ""}
+            return self._complete_run(make_run_result(AgentTermination.NEED_HELP, msg))
 
         self.memory.clear()
         compacted_at = datetime.now(timezone.utc).isoformat()
@@ -1348,7 +1556,9 @@ Rules:
 
         done = f"TASK_COMPLETE: Compacted context into {artifact_path.name}; fresh chat memory is ready."
         self._session_store.append_message({"role": "assistant", "content": done})
-        return {"success": True, "summary": done, "screenshot": "", "compact_artifact": str(artifact_path)}
+        result = make_run_result(AgentTermination.TASK_COMPLETE, done)
+        result["compact_artifact"] = str(artifact_path)
+        return self._complete_run(result)
 
     async def _compact_api_provider(self) -> dict:
         """Codex-style local compaction for stateless API providers (Ollama, Claude, etc.)."""
@@ -1358,14 +1568,14 @@ Rules:
         if not messages:
             msg = "NEED_HELP: There is no conversation to compact yet."
             self._log("WARN", msg)
-            return {"success": False, "summary": msg, "screenshot": ""}
+            return self._complete_run(make_run_result(AgentTermination.NEED_HELP, msg))
 
         try:
             compacted = _compaction.compact_messages(messages)
         except Exception as e:
             msg = f"NEED_HELP: Local compaction failed: {e}"
             self._log("ERROR", msg)
-            return {"success": False, "summary": msg, "screenshot": ""}
+            return self._complete_run(make_run_result(AgentTermination.NEED_HELP, msg))
 
         # Replace in-memory history with the compacted version
         self.memory.load_from_messages(compacted)
@@ -1390,7 +1600,7 @@ Rules:
             f"Kept {len(compacted) - 1} recent messages; older history summarised locally."
         )
         self._session_store.append_message({"role": "assistant", "content": done})
-        return {"success": True, "summary": done, "screenshot": ""}
+        return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, done))
 
     async def _generate_and_save_summary(self, task: str, result_summary: str) -> None:
         """Save a session summary to disk.

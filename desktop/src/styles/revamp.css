@@ -1,0 +1,435 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   KIM · UI REVAMP — design system primitives
+   Mirrors the styles in the UI Revamp prototype. Prefix: .kr-* (kim revamp).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* shimmer (active thinking line) */
+@keyframes kr-shimmer-text {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+.kr-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--kim-text-3) 0%,
+    var(--kim-text-3) 35%,
+    var(--kim-text) 50%,
+    var(--kim-text-3) 65%,
+    var(--kim-text-3) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: kr-shimmer-text 2.4s linear infinite;
+}
+.kr-shimmer-mono {
+  background: linear-gradient(
+    90deg,
+    #8a7e73 0%,
+    #8a7e73 35%,
+    #f3e3d3 50%,
+    #8a7e73 65%,
+    #8a7e73 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: kr-shimmer-text 2.2s linear infinite;
+}
+
+/* pulse dot for "thinking" indicators */
+@keyframes kr-pulse-dot {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50%      { opacity: 1;    transform: scale(1); }
+}
+.kr-pulse-dot {
+  width: 6px; height: 6px; border-radius: 999px;
+  background: var(--kim-accent);
+  animation: kr-pulse-dot 1.4s ease-in-out infinite;
+  display: inline-block;
+}
+
+/* spinner */
+@keyframes kr-spin { to { transform: rotate(360deg); } }
+.kr-spinner {
+  width: 11px; height: 11px;
+  border: 1.5px solid var(--kim-text-4);
+  border-top-color: var(--kim-accent);
+  border-radius: 999px;
+  animation: kr-spin 0.9s linear infinite;
+  display: inline-block;
+}
+
+/* fade up for trace lines */
+@keyframes kr-fade-up {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.kr-fade-up { animation: kr-fade-up 0.35s ease both; }
+
+/* progress bar flow */
+@keyframes kr-bar-flow {
+  0%   { background-position: 0% 0; }
+  100% { background-position: 200% 0; }
+}
+.kr-bar-flow {
+  background: linear-gradient(
+    90deg,
+    var(--kim-accent-line) 0%,
+    var(--kim-accent) 50%,
+    var(--kim-accent-line) 100%
+  );
+  background-size: 200% 100%;
+  animation: kr-bar-flow 2s linear infinite;
+}
+
+/* generic small-caps eyebrow label */
+.kr-eyebrow {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--kim-text-3);
+}
+
+/* kbd badge */
+.kr-kbd {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid var(--kim-border);
+  border-radius: 5px;
+  color: var(--kim-text-2);
+  background: var(--kim-surface);
+}
+
+/* segmented control */
+.kr-seg {
+  display: inline-flex;
+  background: var(--kim-bg-2);
+  border: 1px solid var(--kim-border);
+  border-radius: 10px;
+  padding: 3px;
+  gap: 2px;
+}
+.kr-seg button {
+  background: transparent;
+  border: 0;
+  color: var(--kim-text-3);
+  font: inherit;
+  padding: 6px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.kr-seg button.kr-on {
+  background: var(--kim-surface-2);
+  color: var(--kim-text);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset;
+}
+
+/* icon button */
+.kr-icon-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--kim-text-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background .15s, border-color .15s, color .15s;
+}
+.kr-icon-btn:hover {
+  background: var(--kim-surface);
+  border-color: var(--kim-border);
+  color: var(--kim-text);
+}
+
+/* tile (selectable card) */
+.kr-tile {
+  background: var(--kim-surface);
+  border: 1px solid var(--kim-border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  cursor: pointer;
+  transition: border-color .15s, transform .15s, background .15s;
+  text-align: left;
+  font: inherit;
+  color: var(--kim-text);
+}
+.kr-tile:hover {
+  border-color: var(--kim-accent-line);
+}
+.kr-tile.kr-on {
+  border-color: var(--kim-accent);
+  background: linear-gradient(180deg, var(--kim-accent-soft), transparent);
+}
+
+/* swatch */
+.kr-swatch {
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: transform .15s;
+  position: relative;
+  padding: 0;
+}
+.kr-swatch:hover { transform: scale(1.08); }
+.kr-swatch.kr-on {
+  border-color: var(--kim-text);
+  box-shadow: 0 0 0 3px var(--kim-bg), 0 0 0 4px var(--kim-accent);
+}
+
+/* toggle switch */
+.kr-toggle {
+  width: 38px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--kim-surface-2);
+  border: 1px solid var(--kim-border);
+  position: relative;
+  cursor: pointer;
+  transition: background .2s;
+  padding: 0;
+  flex-shrink: 0;
+}
+.kr-toggle.kr-on { background: var(--kim-accent); }
+.kr-toggle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: var(--kim-text);
+  transition: transform .2s;
+}
+.kr-toggle.kr-on::after {
+  transform: translateX(16px);
+  background: #fff;
+}
+
+/* input */
+.kr-input {
+  width: 100%;
+  background: var(--kim-bg-2);
+  border: 1px solid var(--kim-border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  color: var(--kim-text);
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 13px;
+}
+.kr-input:focus {
+  outline: none;
+  border-color: var(--kim-accent-line);
+}
+
+/* buttons */
+.kr-btn {
+  background: var(--kim-surface);
+  border: 1px solid var(--kim-border);
+  color: var(--kim-text);
+  padding: 8px 14px;
+  border-radius: 9px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  transition: border-color .15s, filter .15s, background .15s;
+}
+.kr-btn:hover { border-color: var(--kim-accent-line); }
+.kr-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.kr-btn-primary {
+  background: var(--kim-accent);
+  color: #1a0e08;
+  border-color: var(--kim-accent);
+  font-weight: 600;
+}
+.kr-btn-primary:hover { filter: brightness(1.05); }
+
+.kr-danger { border-left: 2px solid var(--kim-red); }
+
+/* row-hover utility */
+.kr-row-hover {
+  transition: background .14s ease, border-color .14s ease, transform .14s ease, box-shadow .14s ease;
+}
+.kr-row-hover:hover {
+  background: var(--kim-surface);
+  transform: translateX(2px);
+}
+.kr-row-hover:active {
+  transform: translateX(2px) scale(0.995);
+}
+
+/* glass shell (settings) */
+.kr-glass {
+  background: var(--kim-surface);
+}
+
+/* grain overlay */
+.kr-grain {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+}
+
+/* details / summary chevron */
+.kr-details > summary { list-style: none; cursor: pointer; }
+.kr-details > summary::-webkit-details-marker { display: none; }
+.kr-chevron { transition: transform .2s; display: inline-block; }
+.kr-details[open] .kr-chevron { transform: rotate(90deg); }
+
+/* faint scrollbar for stream containers */
+.kr-stream::-webkit-scrollbar { width: 6px; }
+.kr-stream::-webkit-scrollbar-thumb { background: var(--kim-border); border-radius: 3px; }
+.kr-stream::-webkit-scrollbar-track { background: transparent; }
+
+/* ── Empty-hero composer treatment ────────────────────────────────────────────
+   When the chat is in new-chat mode and no messages have been sent yet, the
+   composer is rendered INSIDE the centered hero (not pinned to the bottom).
+   Match the design's accent border + peach soft-ring shadow. */
+.kim-chat--empty-hero .kim-chat__output {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 24px 40px;
+}
+/* ── Hero composer: two-row layout (textarea on top, controls below) ──── */
+.kim-composer__box--hero {
+  max-width: 680px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "textarea textarea"
+    "tools    actions";
+  align-items: center;
+  gap: 6px 8px;
+  padding: 14px 14px 10px;
+  border-radius: 16px;
+  border: 1px solid var(--kim-accent-line);
+  background: var(--kim-surface);
+  box-shadow:
+    0 0 0 4px var(--kim-accent-soft),
+    0 12px 32px -16px rgba(0, 0, 0, 0.4);
+  position: relative;
+}
+.kim-composer__box--hero:focus-within {
+  border-color: var(--kim-accent);
+  box-shadow:
+    0 0 0 4px var(--kim-accent-soft),
+    0 0 0 6px rgba(232, 184, 154, 0.08),
+    0 12px 32px -14px rgba(0, 0, 0, 0.5);
+}
+.kim-composer__box--hero .kim-composer__textarea {
+  grid-area: textarea;
+  padding: 4px 4px 12px;
+  font-size: 14.5px;
+}
+/* Single continuous separator between textarea and the bottom row.
+ * Using a ::before pseudo on the box (rather than border-top on each grid
+ * cell) so there is no visible gap where the column-gap sits.
+ * Anchored from the BOTTOM so it's stable as the textarea grows. The bottom
+ * row is ~34px tall (send button) + 10px box padding-bottom = 44px from the
+ * box bottom — the line sits 4px above that. */
+.kim-composer__box--hero::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 48px;
+  height: 1px;
+  background: var(--kim-border);
+  pointer-events: none;
+  opacity: 0.6;
+}
+.kim-composer__box--hero .kim-composer__left-tools {
+  grid-area: tools;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.kim-composer__box--hero .kim-composer__actions {
+  grid-area: actions;
+  gap: 8px;
+}
+.kim-composer__box--hero .kim-btn--stop  { order: 1; }
+.kim-composer__box--hero .kim-context-ring-wrap { order: 2; }
+.kim-composer__box--hero .kim-composer__shortcut-hint { order: 3; }
+.kim-composer__box--hero .kim-btn--send-hero { order: 4; }
+
+/* Decorative left-tool buttons (bell / list / paperclip) */
+.kim-composer__left-tools {
+  display: none; /* hidden when not in hero mode */
+}
+.kim-composer__tool-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--kim-text-3);
+  cursor: default;
+  opacity: 0.7;
+  transition: background 0.12s, color 0.12s, opacity 0.12s;
+}
+.kim-composer__tool-btn:not(:disabled) { cursor: pointer; }
+.kim-composer__tool-btn:not(:disabled):hover {
+  background: var(--kim-surface-2);
+  color: var(--kim-text-2);
+  opacity: 1;
+}
+
+/* Inline keyboard-shortcut hint next to the send button */
+.kim-composer__shortcut-hint {
+  font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+  font-size: 10.5px;
+  color: var(--kim-text-3);
+  background: var(--kim-bg-2);
+  border: 1px solid var(--kim-border);
+  border-radius: 5px;
+  padding: 3px 6px;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+
+/* Hero send button: circular, warm-accent fill, up-arrow inside */
+.kim-btn--send-hero {
+  width: 34px;
+  height: 34px;
+  min-width: 34px;
+  border-radius: 999px;
+  padding: 0;
+  background: var(--kim-accent);
+  color: #1a0e08;
+}
+.kim-btn--send-hero:disabled {
+  background: var(--kim-surface-2);
+  color: var(--kim-text-4);
+}
+.kim-btn--send-hero:hover:not(:disabled) {
+  filter: brightness(1.06);
+  transform: translateY(-1px);
+}
+
+.kim-chat--empty-hero .kim-composer__hint {
+  display: none;
+}
+

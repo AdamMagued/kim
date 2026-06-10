@@ -15,6 +15,7 @@ export type SettingsPane =
   | 'voice'
   | 'paths'
   | 'data'
+  | 'schedule'
   | 'account'
   | 'mcp'
   | 'feedback'

@@ -7,7 +7,7 @@ import { cleanActivityText, parseAnswerLine, friendlyError, parseLogLine } from 
 export function parseToolVerb(text: string): { verb: string; target: string } | null {
   // Standard "Verb target" format produced by TOOL_MAP labels
   const verbMatch = text.match(
-    /^(Reading|Writing|Running|Editing|Creating|Deleting|Listing|Searching|Opening|Clicking|Typing|Pressing|Checking|Viewing|Updating|Appending|Using|Asking|Dragging|Scrolling|Focusing|Observing|Navigating|Fetching|Committing|Installing|Moving|Copying|Renaming|Double-clicking|Right-clicking|Git)\s*(.*)/i
+    /^(Reading|Writing|Running|Editing|Creating|Deleting|Listing|Searching|Opening|Clicking|Typing|Pressing|Checking|Viewing|Updating|Appending|Using|Asking|Dragging|Scrolling|Focusing|Observing|Navigating|Fetching|Committing|Installing|Moving|Copying|Renaming|Double-clicking|Right-clicking|Git|Capturing)\s*(.*)/i
   );
   if (verbMatch) {
     return { verb: verbMatch[1], target: verbMatch[2].replace(/`/g, '').trim() };
@@ -149,7 +149,9 @@ export function parseAgentLine(line: string, id: number): ParsedAgentLine {
     };
   }
 
-  const ctxMatch = line.match(/\[CONTEXT\]\s+cumulative_input=(\d+)\s+budget=(\d+)\s+phase=(\w+)\s+percent=(\d+)\s+last_input=(\d+)\s+last_output=(\d+)\s+source=([a-zA-Z0-9_\-]+)\s+estimate=(\d)/);
+  // `source` may contain ':' or '.' (e.g. "BrowserProvider:compact"), so the
+  // class must cover every value _print_context_json / to_log_line can emit.
+  const ctxMatch = line.match(/\[CONTEXT\]\s+cumulative_input=(\d+)\s+budget=(\d+)\s+phase=(\w+)\s+percent=(\d+)\s+last_input=(\d+)\s+last_output=(\d+)\s+source=([a-zA-Z0-9_.:\-]+)\s+estimate=(\d)/);
   if (ctxMatch) {
     return {
       type: 'context',
@@ -230,6 +232,17 @@ export function parseAgentLine(line: string, id: number): ParsedAgentLine {
       }
       if (parsed.type === 'thread.started' || parsed.type === 'turn.started' || parsed.type === 'turn.completed') {
         return { type: 'codex_ignored' };
+      }
+      // Kim lifecycle events handled via typed IPC (kim:run-done / kim:provider-error).
+      // Must be explicitly silenced here so the raw JSON line never leaks into the
+      // activity feed via the legacy kim-agent-output dual-emit path.
+      if (
+        parsed.type === 'run_done' ||
+        parsed.type === 'provider_error' ||
+        parsed.type === 'hitl_approval_request' ||
+        parsed.type === 'hitl_approval_result'
+      ) {
+        return { type: 'none' };
       }
 
       const errorMsg = (parsed.error ?? '').trim();

@@ -1,9 +1,15 @@
 """
 Google Gemini provider.
 
-Supports three authentication modes:
+All three auth modes call the Generative Language REST API directly
+(generativelanguage.googleapis.com) — no Google SDK dependency. The
+deprecated google-generativeai package was removed after its EOL notice;
+the REST request/response transforms below are the single wire format.
 
-1. API key (legacy/dev): GOOGLE_API_KEY or config["api_key"].
+Supported authentication modes:
+
+1. API key (legacy/dev): GOOGLE_API_KEY or config["api_key"], sent via the
+   x-goog-api-key header.
 2. Kim Google OAuth (shared quota): a short-lived bearer token passed by Tauri
    in KIM_GOOGLE_ACCESS_TOKEN, using Kim's shared project quota via x-goog-user-project.
 3. User-owned free-tier project (oauth_user_project): OAuth bearer token +
@@ -17,7 +23,6 @@ fall back or switch modes unexpectedly.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -29,22 +34,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-import google.generativeai as genai
-from google.generativeai import protos
-
 from orchestrator.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
-
-# Map JSON Schema type strings → Gemini Type enum
-_TYPE_MAP: dict[str, int] = {
-    "string": protos.Type.STRING,
-    "integer": protos.Type.INTEGER,
-    "number": protos.Type.NUMBER,
-    "boolean": protos.Type.BOOLEAN,
-    "array": protos.Type.ARRAY,
-    "object": protos.Type.OBJECT,
-}
 
 # Official Gemini OAuth quickstart/cookbook currently documents this narrow
 # Generative Language scope for user-managed credentials. Do not broaden it in
@@ -155,7 +147,7 @@ class GeminiProvider(BaseProvider):
 
         self._auth_mode = "oauth_user_project" if wants_oauth_user_project else ("oauth" if wants_oauth else "api_key")
         if self._auth_mode == "api_key":
-            genai.configure(api_key=api_key)
+            self._api_key = api_key
             self._oauth_access_token_provider: Callable[[], _OAuthAccessToken] | None = None
         elif self._auth_mode == "oauth_user_project":
             if oauth_provider is not None and not callable(oauth_provider):
@@ -212,29 +204,13 @@ class GeminiProvider(BaseProvider):
         return await self._complete_api_key(messages, tools, system)
 
     async def _complete_api_key(self, messages: list[dict], tools: list[dict], system: str) -> dict:
-        # #24: Cache GenerativeModel since it takes time to initialize and validate schemas
-        if not hasattr(self, "_cached_model") or getattr(self, "_last_tools_repr", None) != repr(tools):
-            gemini_tools = self._to_gemini_tools(tools)
-            self._cached_model = genai.GenerativeModel(
-                model_name=self._model_name,
-                tools=gemini_tools,
-                system_instruction=system,
-                generation_config=genai.GenerationConfig(max_output_tokens=self._max_tokens),
-            )
-            self._last_tools_repr = repr(tools)
-
-        # Split into history (all but last message) + current message
-        history = self._to_gemini_contents(messages[:-1])
-        current_parts = self._to_parts(messages[-1]["content"])
-
-        chat = self._cached_model.start_chat(history=history)
-        try:
-            response = await chat.send_message_async(current_parts)
-        except Exception as e:
-            logger.error("Gemini API error: %s", e, exc_info=True)
-            raise
-
-        return self._parse_response(response)
+        headers = {
+            "x-goog-api-key": self._api_key,
+            "Content-Type": "application/json",
+        }
+        body = self._to_rest_request(messages, tools, system)
+        response = await asyncio.to_thread(self._post_rest, body, headers, "Gemini API")
+        return self._parse_rest_response(response)
 
     async def _complete_oauth(self, messages: list[dict], tools: list[dict], system: str) -> dict:
         assert self._oauth_access_token_provider is not None
@@ -248,76 +224,52 @@ class GeminiProvider(BaseProvider):
                     f"Please set {OAUTH_USER_PROJECT_ENV} or reconfigure in Settings."
                 )
 
+        headers = {
+            "Authorization": f"Bearer {token.token}",
+            "Content-Type": "application/json",
+        }
+        if self._quota_project:
+            headers["x-goog-user-project"] = self._quota_project
+
         body = self._to_rest_request(messages, tools, system)
-        url = self._generate_content_url()
-
-        def _post() -> dict[str, Any]:
-            data = json.dumps(body).encode("utf-8")
-            headers = {
-                "Authorization": f"Bearer {token.token}",
-                "Content-Type": "application/json",
-            }
-            if self._quota_project:
-                headers["x-goog-user-project"] = self._quota_project
-            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-            try:
-                with urllib.request.urlopen(req, timeout=OAUTH_REQUEST_TIMEOUT_S) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
-            except urllib.error.HTTPError as exc:
-                raw = exc.read().decode("utf-8", errors="replace")
-                # Redact body enough for logs; never include bearer token.
-                logger.error("Gemini OAuth API error: HTTP %s: %s", exc.code, _truncate(raw, 2000))
-
-                # Enhanced error message for user-project mode
-                if self._auth_mode == "oauth_user_project":
-                    if exc.code == 429:
-                        raise RuntimeError(
-                            f"Your Google Gemini free-tier quota has been exceeded for project {self._quota_project}. "
-                            f"Wait for your quota to reset, upgrade to a paid plan, or use an API key."
-                        ) from exc
-                    elif exc.code in (400, 403):
-                        raise RuntimeError(
-                            f"Your Google Cloud project {self._quota_project} is not properly configured. "
-                            f"Ensure the Gemini API is enabled and billing is set up if using paid models."
-                        ) from exc
-
-                raise RuntimeError(f"Gemini OAuth API error: HTTP {exc.code}: {_safe_google_error(raw)}") from exc
-
         try:
-            response = await asyncio.to_thread(_post)
+            response = await asyncio.to_thread(self._post_rest, body, headers, "Gemini OAuth API")
         except Exception:
             logger.exception("Gemini OAuth request failed")
             raise
         return self._parse_rest_response(response)
 
+    def _post_rest(self, body: dict[str, Any], headers: dict[str, str], error_label: str) -> dict[str, Any]:
+        """POST a generateContent request. Blocking — call via asyncio.to_thread."""
+        url = self._generate_content_url()
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=OAUTH_REQUEST_TIMEOUT_S) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            # Redact body enough for logs; never include credentials.
+            logger.error("%s error: HTTP %s: %s", error_label, exc.code, _truncate(raw, 2000))
+
+            # Enhanced error message for user-project mode
+            if self._auth_mode == "oauth_user_project":
+                if exc.code == 429:
+                    raise RuntimeError(
+                        f"Your Google Gemini free-tier quota has been exceeded for project {self._quota_project}. "
+                        f"Wait for your quota to reset, upgrade to a paid plan, or use an API key."
+                    ) from exc
+                elif exc.code in (400, 403):
+                    raise RuntimeError(
+                        f"Your Google Cloud project {self._quota_project} is not properly configured. "
+                        f"Ensure the Gemini API is enabled and billing is set up if using paid models."
+                    ) from exc
+
+            raise RuntimeError(f"{error_label} error: HTTP {exc.code}: {_safe_google_error(raw)}") from exc
+
     # ------------------------------------------------------------------
     # Format transforms
     # ------------------------------------------------------------------
-
-    def _to_gemini_contents(self, messages: list[dict]) -> list[protos.Content]:
-        contents = []
-        for msg in messages:
-            role = "user" if msg["role"] == "user" else "model"
-            parts = self._to_parts(msg["content"])
-            contents.append(protos.Content(role=role, parts=parts))
-        return contents
-
-    def _to_parts(self, content: Any) -> list[protos.Part]:
-        if isinstance(content, str):
-            return [protos.Part(text=content)]
-        parts = []
-        for item in content:
-            if item["type"] == "text":
-                parts.append(protos.Part(text=item["text"]))
-            elif item["type"] == "image":
-                img_bytes = base64.b64decode(item["data"])
-                parts.append(protos.Part(
-                    inline_data=protos.Blob(
-                        mime_type=item.get("media_type", "image/png"),
-                        data=img_bytes,
-                    )
-                ))
-        return parts or [protos.Part(text="")]
 
     def _to_rest_request(self, messages: list[dict], tools: list[dict], system: str) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -351,27 +303,6 @@ class GeminiProvider(BaseProvider):
                 })
         return parts or [{"text": ""}]
 
-    def _to_gemini_tools(self, tools: list[dict]) -> list[protos.Tool]:
-        declarations = []
-        for t in tools:
-            params = t.get("parameters", {})
-            props: dict[str, protos.Schema] = {}
-            for prop_name, prop_schema in params.get("properties", {}).items():
-                props[prop_name] = self._convert_schema(prop_schema)
-
-            fd = protos.FunctionDeclaration(
-                name=t["name"],
-                description=t.get("description", ""),
-                parameters=protos.Schema(
-                    type=protos.Type.OBJECT,
-                    properties=props,
-                    required=params.get("required", []),
-                ) if props else None,
-            )
-            declarations.append(fd)
-
-        return [protos.Tool(function_declarations=declarations)] if declarations else []
-
     def _to_rest_tools(self, tools: list[dict]) -> list[dict[str, Any]]:
         declarations: list[dict[str, Any]] = []
         for t in tools:
@@ -384,21 +315,6 @@ class GeminiProvider(BaseProvider):
                 declaration["parameters"] = self._convert_schema_json(params)
             declarations.append(declaration)
         return [{"functionDeclarations": declarations}] if declarations else []
-
-    def _convert_schema(self, schema: dict) -> protos.Schema:
-        raw_type = schema.get("type", "string")
-        gemini_type = _TYPE_MAP.get(raw_type, protos.Type.STRING)
-        s = protos.Schema(type=gemini_type)
-        if "description" in schema:
-            s.description = schema["description"]
-        if "enum" in schema:
-            s.enum[:] = [str(v) for v in schema["enum"]]
-        if raw_type == "array" and "items" in schema:
-            s.items.CopyFrom(self._convert_schema(schema["items"]))
-        if raw_type == "object" and "properties" in schema:
-            for k, v in schema["properties"].items():
-                s.properties[k].CopyFrom(self._convert_schema(v))
-        return s
 
     def _convert_schema_json(self, schema: dict) -> dict[str, Any]:
         raw_type = str(schema.get("type", "object" if "properties" in schema else "string")).lower()
@@ -429,45 +345,14 @@ class GeminiProvider(BaseProvider):
     # Response parsing
     # ------------------------------------------------------------------
 
-    def _parse_response(self, response) -> dict:
-        # Extract token usage first — available on all response types
-        usage: dict = {}
-        try:
-            um = response.usage_metadata
-            usage = {
-                "input": getattr(um, "prompt_token_count", 0) or 0,
-                "output": getattr(um, "candidates_token_count", 0) or 0,
-            }
-        except Exception:
-            pass
-
-        try:
-            candidate = response.candidates[0]
-        except (AttributeError, IndexError):
-            return {"type": "text", "content": "", "usage": usage}
-
-        for part in candidate.content.parts:
-            if hasattr(part, "function_call") and part.function_call.name:
-                return {
-                    "type": "tool_call",
-                    "tool": part.function_call.name,
-                    "args": dict(part.function_call.args),
-                    "usage": usage,
-                }
-            if hasattr(part, "text") and part.text:
-                return {"type": "text", "content": part.text, "usage": usage}
-
-        # Fallback to response.text accessor
-        try:
-            return {"type": "text", "content": response.text, "usage": usage}
-        except Exception:
-            return {"type": "text", "content": "", "usage": usage}
-
     def _parse_rest_response(self, response: dict[str, Any]) -> dict:
+        # cachedContentTokenCount is a SUBSET of input (tokens served from
+        # cache, billed at ~0.25x) — non-zero when CachedContent is in play.
         usage_meta = response.get("usageMetadata") or {}
         usage = {
             "input": usage_meta.get("promptTokenCount", 0) or 0,
             "output": usage_meta.get("candidatesTokenCount", 0) or 0,
+            "cache_read_tokens": usage_meta.get("cachedContentTokenCount", 0) or 0,
         }
         candidates = response.get("candidates") or []
         if not candidates:

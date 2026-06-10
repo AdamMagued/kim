@@ -18,8 +18,80 @@ Return value:
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ProviderError(Exception):
+    """Normalized provider failure metadata.
+
+    Providers still raise their native exceptions today; this wrapper gives the
+    agent loop a central, stable classification boundary for retry decisions
+    and user-visible status codes.
+    """
+
+    code: str
+    message: str
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        super().__init__(self.message)
+
+
+def classify_provider_error(error: Exception) -> ProviderError:
+    """Classify provider exceptions without requiring every provider to wrap them.
+
+    Auth-like failures must be checked before OSError because PermissionError is
+    an OSError subclass.  Retrying sign-in/API-key failures wastes time and hides
+    the actionable fix from the user.
+    """
+    if isinstance(error, ProviderError):
+        return error
+
+    message = str(error)
+    lowered = message.lower()
+    error_type = type(error).__name__.lower()
+
+    auth_markers = (
+        "sign in",
+        "unauthorized",
+        "forbidden",
+        "permission denied",
+        "api key",
+        "apikey",
+        "access token",
+        "oauth",
+        "credential",
+        "auth",
+    )
+    if isinstance(error, PermissionError) or any(marker in lowered for marker in auth_markers):
+        return ProviderError("auth", message, retryable=False)
+
+    if isinstance(error, ValueError) or "invalid request" in lowered or "bad request" in lowered or "400" in lowered:
+        return ProviderError("invalid_request", message, retryable=False)
+
+    if "rate" in lowered and "limit" in lowered:
+        return ProviderError("rate_limit", message, retryable=True)
+    if "429" in lowered or "ratelimit" in error_type:
+        return ProviderError("rate_limit", message, retryable=True)
+
+    import re as _re_provider_error
+    for code in ("500", "502", "503", "529"):
+        if _re_provider_error.search(r"(?<![\d])" + code + r"(?![\d])", lowered):
+            return ProviderError("server_error", message, retryable=True)
+    if "server" in lowered and "error" in lowered:
+        return ProviderError("server_error", message, retryable=True)
+    if "overloaded" in lowered:
+        return ProviderError("server_error", message, retryable=True)
+
+    if isinstance(error, TimeoutError) or "timeout" in lowered:
+        return ProviderError("timeout", message, retryable=True)
+    if isinstance(error, (ConnectionError, OSError)) or "connection" in lowered:
+        return ProviderError("network", message, retryable=True)
+
+    return ProviderError("unknown", message, retryable=False)
 
 
 class BaseProvider(ABC):

@@ -183,11 +183,7 @@ async def run_codex_subtask(
 
         async def _drain_stderr() -> None:
             assert process and process.stderr
-            async for raw in process.stderr:
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    stderr_lines.append(line)
-                    logger.debug("codex stderr: %s", line)
+            await _drain_stderr_to(process.stderr, stderr_lines)
 
         try:
             await asyncio.wait_for(
@@ -225,6 +221,16 @@ async def run_codex_subtask(
             "message": f"Codex bridge error: {e}",
         }
     finally:
+        # Kill the subprocess on every non-normal exit (exception, cancellation,
+        # BrokenPipeError from stdout, etc.).  The timeout path already kills
+        # explicitly; this guard covers all other early-exit paths so Codex
+        # never becomes an orphan process.
+        if process is not None and process.returncode is None:
+            try:
+                process.kill()
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except Exception:
+                pass
         await proxy.stop()
         shutil.rmtree(str(config_dir), ignore_errors=True)
 
@@ -1084,6 +1090,27 @@ def _make_responses_tool_reply(resp_id: str, text: str, tool_calls: list) -> dic
 
 
 # ── Output parsing & surfacing ───────────────────────────────────────────────
+
+
+async def _drain_stderr_to(
+    stderr_stream: asyncio.StreamReader,
+    stderr_lines: list,
+    max_line_chars: int = 200,
+) -> None:
+    """Read all lines from stderr, accumulate them, and surface each one in real time.
+
+    Lines are printed as ``[STATUS] codex: {line}`` (truncated to *max_line_chars*)
+    so they appear in the user-visible activity feed rather than disappearing into a
+    debug log.  Accumulated lines remain available for the non-zero-exit error message.
+    Empty lines are skipped to avoid cluttering the UI with blank status entries.
+    """
+    async for raw in stderr_stream:
+        line = raw.decode("utf-8", errors="replace").rstrip()
+        if not line:
+            continue
+        stderr_lines.append(line)
+        logger.debug("codex stderr: %s", line)
+        print(f"[STATUS] codex: {line[:max_line_chars]}", flush=True)
 
 
 def _surface_codex_output(stdout_text: str) -> None:

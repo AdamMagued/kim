@@ -5,11 +5,13 @@ The goal is to make ordinary desktop workflows text/structure-first instead
 of screenshot-first. On macOS this uses the Accessibility tree via
 System Events. Other platforms return a clean limitation for now.
 """
+from __future__ import annotations
 
 import asyncio
 import logging
 import re
 from dataclasses import dataclass
+from typing import Optional
 
 from mcp_server.os_utils import CURRENT_OS, IS_MACOS
 
@@ -38,10 +40,10 @@ _LAST_ELEMENTS: dict[str, UIElement] = {}
 # Cached AX-trust result. None until probed; True/False once known. macOS TCC
 # is process-lifetime sticky — if we have access once, we have it for the rest
 # of this process, so cache to skip the AppleScript probe on every call.
-_AX_TRUSTED_CACHE: bool | None = None
+_AX_TRUSTED_CACHE: Optional[bool] = None
 
 
-def _native_ax_trusted() -> bool | None:
+def _native_ax_trusted() -> Optional[bool]:
     """Return True if the current process has Accessibility access via the
     native AX API, False if not, or None if PyObjC isn't available (caller
     should fall back to the AppleScript probe).

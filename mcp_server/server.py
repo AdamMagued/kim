@@ -41,7 +41,8 @@ from mcp.types import TextContent, Tool
 
 from mcp_server.config import LOG_LEVEL, ENABLED_CONNECTOR_IDS
 from mcp_server.sites import enabled_connectors, load_builtin_connectors
-from mcp_server.tool_registry import DISPATCH, TOOLS
+from mcp_server.tool_registry import DISPATCH, TOOLS, TIER_DISPATCH
+from mcp_server.tool_tiers import get_active_tool_names
 
 # Logging goes to stderr — stdout is reserved for MCP protocol messages.
 _LOG_LEVEL = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
@@ -62,10 +63,18 @@ logger = logging.getLogger("kim.server")
 server = Server("kim")
 
 # ---------------------------------------------------------------------------
-# Mutable copies — connectors append at startup
+# Mutable copies -- connectors append at startup
+# Apply KIM_ENABLED_TOOL_TIERS filtering before connectors are merged so that
+# only the requested tiers are exposed.  Connectors are always appended
+# unchanged; they are already gated by ENABLED_CONNECTOR_IDS in config.
 # ---------------------------------------------------------------------------
-_TOOLS: list[Tool] = list(TOOLS)
-_DISPATCH: dict[str, object] = dict(DISPATCH)
+_enabled_names = get_active_tool_names(TIER_DISPATCH)
+if _enabled_names is None:
+    _TOOLS: list[Tool] = list(TOOLS)
+    _DISPATCH: dict[str, object] = dict(DISPATCH)
+else:
+    _TOOLS = [t for t in TOOLS if t.name in _enabled_names]
+    _DISPATCH = {k: v for k, v in DISPATCH.items() if k in _enabled_names}
 
 # ---------------------------------------------------------------------------
 # Site connectors — auto-discover + merge
