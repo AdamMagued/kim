@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import pytest
-from tests.conftest import make_test_agent
+from conftest import make_test_agent
 
 
 def test_make_test_agent_returns_kim_agent():
