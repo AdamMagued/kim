@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import type { SessionInfo, Settings, KimAccount } from '../types';
+import type { SessionInfo, Settings, KimAccount, PermissionMode } from '../types';
 import { toast } from './Toast';
 import { ConnectorsPanel } from './kim-ui';
 import {
@@ -63,6 +63,10 @@ export function ChatView({
   const [messageReloadNonce, setMessageReloadNonce] = useState(0);
   const [taskInput, setTaskInput] = useState('');
   const [connectorsOpen, setConnectorsOpen] = useState(false);
+  // Per-session permission mode — starts from persistent settings but can be toggled per session.
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(
+    () => settings.permission_mode ?? 'full_auto'
+  );
   const [connectorsClosing, setConnectorsClosing] = useState(false);
   const [browserProvider, setBrowserProvider] = useState('claude');
   const [conversationId] = useState(() => Math.random().toString(36).substring(7));
@@ -174,7 +178,7 @@ export function ChatView({
     handleRetryLast,
   } = useTaskRunner({
     session,
-    settings,
+    settings: { ...settings, permission_mode: permissionMode },
     activeTab,
     activeProjectPath,
     conversationId,
@@ -444,6 +448,9 @@ export function ChatView({
       codexRuns={codexRuns}
       taskError={stream.taskError}
       hitlApprovalStatus={stream.hitlApprovalStatus}
+      onHitlRespond={stream.hitlRespond}
+      permissionMode={permissionMode}
+      onPermissionModeChange={setPermissionMode}
       runFailure={stream.runFailure}
       rateLimitedState={stream.rateLimitedState}
       settings={settings}

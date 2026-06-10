@@ -7,12 +7,14 @@ agent loop and to let tray/ui.py import UIBridge without pulling in the full
 agent module.
 
 Imported in agent.py as:
-    from orchestrator.ui_bridge import UIBridge, UIBridgeLogHandler
+    from orchestrator.ui_bridge import UIBridge, UIBridgeLogHandler, StdinApprovalBridge
 """
 
 import asyncio
+import json
 import logging
 import queue
+import sys
 import threading
 
 
@@ -133,3 +135,32 @@ class UIBridgeLogHandler(logging.Handler):
             self._bridge.log(record.levelname, msg)
         except Exception:
             pass
+
+
+class StdinApprovalBridge(UIBridge):
+    """
+    Minimal UIBridge for Tauri mode (no Tkinter).
+
+    confirm_action() pauses the agent and waits for Rust to write a JSON
+    approval line to the process's stdin:
+        {"type": "hitl_approve", "approved": true|false}
+
+    Timeout: 120 s — auto-denies if no response arrives.
+    """
+
+    async def confirm_action(self, tool_name: str, args: dict) -> bool:
+        if self._cancelled.is_set():
+            return False
+        loop = asyncio.get_running_loop()
+        try:
+            line: str = await asyncio.wait_for(
+                loop.run_in_executor(None, sys.stdin.readline),
+                timeout=120.0,
+            )
+            data = json.loads(line.strip())
+            return bool(data.get("approved", False))
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "HITL stdin approval failed (%s) — denying tool '%s'", exc, tool_name
+            )
+            return False

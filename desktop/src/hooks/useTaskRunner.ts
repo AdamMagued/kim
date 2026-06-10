@@ -147,6 +147,7 @@ export function useTaskRunner({
           ollamaLocalModel: settings.ollama.local_model || null,
           ollamaCloudModel: settings.ollama.cloud_model || null,
           ollamaContextLimitOverride: settings.ollama.context_limit_override ?? null,
+          permissionMode: settings.permission_mode ?? 'full_auto',
         });
       } catch (err) {
         if (!stream.doneHandledRef.current) {

@@ -207,6 +207,13 @@ class KimAgent:
         self._hitl_risk_threshold = _resolve_hitl_threshold(
             config, _os.environ.get("KIM_HITL_RISK_THRESHOLD")
         )
+        # In Tauri mode with HITL enabled, auto-wire StdinApprovalBridge so the
+        # interactive approval gate can pause the agent and wait for user input.
+        if (not self._ui_bridge
+                and self._hitl_risk_threshold
+                and _os.environ.get("KIM_TAURI_MODE") == "1"):
+            from orchestrator.ui_bridge import StdinApprovalBridge
+            self._ui_bridge = StdinApprovalBridge()
         # Retry configuration for LLM API calls
         self._max_retries: int = int(config.get("max_retries", 5))
         self._retry_base_delay: float = float(config.get("retry_base_delay", 1.0))

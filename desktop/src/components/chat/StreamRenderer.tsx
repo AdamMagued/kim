@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import type { ActivityItem, CodexRunGroup, TouchedFile, PendingTask, HitlApprovalStatus } from './types';
-import type { KimMessage, Settings, KimAccount } from '../../types';
+import type { KimMessage, Settings, KimAccount, PermissionMode } from '../../types';
 import { MessageBubble } from '../MessageBubble';
 import { SignalCard } from '../ToolCallCard';
 import { ThinkingWithPlan, WorkedForPill } from '../kim-ui';
@@ -74,6 +74,9 @@ export interface StreamRendererProps {
   codexRuns: CodexRunGroup[];
   taskError: string | null;
   hitlApprovalStatus: HitlApprovalStatus | null;
+  onHitlRespond?: (approved: boolean) => void;
+  permissionMode?: PermissionMode;
+  onPermissionModeChange?: (mode: PermissionMode) => void;
   runFailure?: { reason: string; recoverable: boolean; suggestion: string } | null;
   rateLimitedState?: { delay: number; attempt: number; max_retries: number } | null;
   settings: Settings;
@@ -111,6 +114,9 @@ export function StreamRenderer({
   codexRuns,
   taskError,
   hitlApprovalStatus,
+  onHitlRespond,
+  permissionMode,
+  onPermissionModeChange,
   runFailure,
   rateLimitedState,
   settings,
@@ -162,14 +168,15 @@ export function StreamRenderer({
 
   function renderHitlStatus() {
     if (!hitlApprovalStatus) return null;
-    const state =
-      hitlApprovalStatus.approved === null
-        ? 'Waiting for approval'
+    const isPending = hitlApprovalStatus.approved === null;
+    const stateLabel =
+      isPending
+        ? 'Approval required'
         : hitlApprovalStatus.approved
           ? 'Approved'
           : 'Denied';
     const detail =
-      hitlApprovalStatus.approved === null
+      isPending
         ? 'Kim paused before a high-risk action.'
         : hitlApprovalStatus.approved
           ? 'Kim can continue with the approved action.'
@@ -182,11 +189,53 @@ export function StreamRenderer({
           role="status"
           aria-live="polite"
         >
-          <span className="kim-hitl-status__label">{state}</span>
+          <span className="kim-hitl-status__label">{stateLabel}</span>
           <span className="kim-hitl-status__body">
-            {detail} Tool: {hitlApprovalStatus.tool}. Risk: {hitlApprovalStatus.risk} ({hitlApprovalStatus.reason}).
+            {detail} Tool: <strong>{hitlApprovalStatus.tool}</strong>. Risk: {hitlApprovalStatus.risk} ({hitlApprovalStatus.reason}).
           </span>
+          {isPending && onHitlRespond && (
+            <span className="kim-hitl-status__actions">
+              <button
+                className="kim-hitl-btn kim-hitl-btn--approve"
+                onClick={() => onHitlRespond(true)}
+                aria-label="Approve tool execution"
+              >
+                Approve
+              </button>
+              <button
+                className="kim-hitl-btn kim-hitl-btn--deny"
+                onClick={() => onHitlRespond(false)}
+                aria-label="Deny tool execution"
+              >
+                Deny
+              </button>
+            </span>
+          )}
         </div>
+      </div>
+    );
+  }
+
+  function renderPermissionToggle() {
+    if (!onPermissionModeChange) return null;
+    const modes: { value: PermissionMode; label: string }[] = [
+      { value: 'full_auto', label: 'Full auto' },
+      { value: 'ask_risky', label: 'Ask risky' },
+      { value: 'ask_always', label: 'Ask always' },
+    ];
+    const current = permissionMode ?? 'full_auto';
+    return (
+      <div className="kim-permission-toggle" role="group" aria-label="Permission mode">
+        {modes.map(m => (
+          <button
+            key={m.value}
+            className={`kim-permission-toggle__btn${current === m.value ? ' kim-permission-toggle__btn--active' : ''}`}
+            onClick={() => onPermissionModeChange(m.value)}
+            aria-pressed={current === m.value}
+          >
+            {m.label}
+          </button>
+        ))}
       </div>
     );
   }
@@ -516,6 +565,7 @@ export function StreamRenderer({
           <div ref={bottomRef as any} />
         </div>
 
+        {renderPermissionToggle()}
         {renderComposer(false)}
       </div>
     );
@@ -658,6 +708,7 @@ export function StreamRenderer({
         <div ref={bottomRef as any} />
       </div>
 
+      {renderPermissionToggle()}
       {renderComposer()}
     </div>
   );

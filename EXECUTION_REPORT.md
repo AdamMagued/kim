@@ -26,6 +26,7 @@ Last updated: 2026-06-10
 | P1-5 | Session retention pruning + screenshot stripping | `ac10b77` | ✅ Done |
 | P1-1 | Structured rotating file logs + Reveal logs button | `56a15f7` | ✅ Done |
 | P1-2 | Typed run_failed error events + error cards + rate-limited UI | `2f54625` | ✅ Done |
+| P1-3 | Approval-gate UI round-trip + per-session permission mode toggle | pending | ✅ Done |
 
 ### Infra fixes
 
@@ -95,6 +96,19 @@ Last updated: 2026-06-10
 - `tests/test_run_failure_event.py`: 11 tests
 - **Note:** `tauri dev` needs a restart to pick up Rust changes
 
+### P1-3 — Approval-gate UI round-trip + per-session permission mode toggle
+- `orchestrator/ui_bridge.py`: Added `StdinApprovalBridge` — reads `{"type":"hitl_approve","approved":true|false}` from stdin, 120 s auto-deny timeout
+- `orchestrator/agent.py`: Auto-wires `StdinApprovalBridge` in `__init__` when `KIM_TAURI_MODE=1` + `KIM_HITL_RISK_THRESHOLD` is set
+- `desktop/src-tauri/src/subprocess.rs`: Added `hitl_stdin()` global, `hitl_respond_approval` command, piped stdin for Kim orchestrator, pass `KIM_TAURI_MODE=1` + `KIM_HITL_RISK_THRESHOLD` based on `permission_mode` param, cleanup on task end
+- `desktop/src-tauri/src/lib.rs`: Registered `hitl_respond_approval` command, exported from subprocess
+- `desktop/src/types/index.ts`: Added `PermissionMode` type + `permission_mode` field to `Settings` (default: `'full_auto'`)
+- `desktop/src/hooks/useTaskRunner.ts`: Passes `permissionMode` to `send_task`
+- `desktop/src/hooks/useChatStream.ts`: Exports `hitlRespond(approved)` callback via `invoke('hitl_respond_approval', ...)`
+- `desktop/src/components/chat/StreamRenderer.tsx`: Added Approve/Deny buttons in HITL status card when `approved === null`; added `renderPermissionToggle()` (3-button toggle: Full auto / Ask risky / Ask always) rendered above the composer
+- `desktop/src/components/ChatView.tsx`: Local `permissionMode` state for per-session override; passes `onHitlRespond`, `permissionMode`, `onPermissionModeChange` to StreamRenderer; merges override into settings for useTaskRunner
+- `tests/test_stdin_approval_bridge.py`: 9 tests (approve/deny/cancel/timeout/malformed, auto-wire variants)
+- **Note:** `tauri dev` needs a restart to pick up Rust changes
+
 ### fix — ultralytics namespace collision
 - Commit `642a488`
 - Root cause: `test_prompt_render.py` and `test_make_test_agent.py` used `from tests.conftest import`, which resolved to the globally-installed ultralytics `tests` package instead of the local `tests/` directory. These tests were *introduced* in V-5/V-6 on this branch, so the 6 failures were NOT pre-existing.
@@ -113,7 +127,7 @@ Last updated: 2026-06-10
 - [ ] V-4: split ChatView.tsx, decompose agent.py loop, split chat.css
 
 ### Track B
-- [ ] P1-3: approval-gate UI round-trip + permission mode toggle
+- [x] P1-3: approval-gate UI round-trip + permission mode toggle — ✅ Done
 - [ ] P0-1: PyInstaller spec + sidecar resolution in `find_python_interpreter()`
 - [ ] Part II quick wins: H (kill voice), J (feature-flag relay pane), D (cost meter), F (OS notifications)
 
