@@ -82,7 +82,6 @@ from orchestrator.providers.browser.site_configs import (
     MOD_KEY,
     RESPONSE_WAIT_S,
     SITE_CONFIGS,
-    _BRIDGE_TIMEOUT_S,
     _INJECT_MAX_RETRIES,
     _POPUP_DISMISS_LABELS,
     _VERIFY_MIN_CHARS,
@@ -810,7 +809,8 @@ class BrowserProvider(BaseProvider):
                     if (!el) return false;
                     el.focus();
                     if ('value' in el) {
-                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, "value")?.set;
                         if (nativeInputValueSetter) {
                             nativeInputValueSetter.call(el, text);
                         } else {
@@ -886,18 +886,24 @@ class BrowserProvider(BaseProvider):
             return actual_norm == expected_norm
 
         if len(actual_norm) < max(_VERIFY_MIN_CHARS, int(len(expected_norm) * 0.98)):
-            logger.warning(f"Injection failed: actual length {len(actual_norm)} is < 98% of expected {len(expected_norm)}")
+            logger.warning(
+                f"Injection failed: actual length {len(actual_norm)} is < 98% of expected {len(expected_norm)}"
+            )
             return False
 
         def fuzzy_match(a: str, b: str) -> bool:
             return _re.sub(r'\W+', '', a) == _re.sub(r'\W+', '', b)
 
         if not fuzzy_match(actual_norm[:200], expected_norm[:200]):
-            logger.warning(f"Injection failed: Prefix mismatch. Actual: {actual_norm[:50]}... Expected: {expected_norm[:50]}...")
+            logger.warning(
+                f"Injection failed: Prefix mismatch. Actual: {actual_norm[:50]}... Expected: {expected_norm[:50]}..."
+            )
             return False
 
         if not fuzzy_match(actual_norm[-200:], expected_norm[-200:]):
-            logger.warning(f"Injection failed: Suffix mismatch. Actual: ...{actual_norm[-50:]} Expected: ...{expected_norm[-50:]}")
+            logger.warning(
+                f"Injection failed: Suffix mismatch. Actual: ...{actual_norm[-50:]} Expected: ...{expected_norm[-50:]}"
+            )
             return False
 
         return True
@@ -906,7 +912,9 @@ class BrowserProvider(BaseProvider):
     # Send + wait + scrape
     # ==================================================================
 
-    async def _send_and_wait(self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = "") -> str:
+    async def _send_and_wait(
+        self, page: Page, cfg: dict, message: str, site: str = "AI", completion_hash: str = ""
+    ) -> str:
         response_sel = await self._find_selector(page, cfg["response_selectors"])
         if not response_sel:
             response_sel = cfg["response_selectors"][0]
@@ -1003,7 +1011,8 @@ class BrowserProvider(BaseProvider):
         return False
 
     async def _wait_for_generation_complete(
-        self, page: Page, stop_selectors: list[str], response_selectors: list[str], completion_hash: Optional[str], site: str = "AI", min_index: int = 0
+        self, page: Page, stop_selectors: list[str], response_selectors: list[str],
+        completion_hash: Optional[str], site: str = "AI", min_index: int = 0
     ) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + GENERATION_WAIT_S
@@ -1018,7 +1027,9 @@ class BrowserProvider(BaseProvider):
             current_text = ""
             try:
                 current_text = await self._scrape_last_response(page, response_selectors, min_index=min_index)
-                logger.debug(f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}")
+                logger.debug(
+                    f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}"
+                )
                 if completion_hash and completion_hash in current_text:
                     logger.debug("Generation complete (completion hash found)")
                     return

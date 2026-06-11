@@ -22,4 +22,6 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["BrowserProvider", "SITE_CONFIGS"]
+# BrowserProvider is provided lazily by __getattr__ above (avoids importing
+# playwright at module load); flake8 can't see that, hence the F822 suppression.
+__all__ = ["BrowserProvider", "SITE_CONFIGS"]  # noqa: F822

@@ -102,6 +102,7 @@ def _exclusive_lock(lock_path: Path, timeout: float = _LOCK_TIMEOUT):
             finally:
                 fcntl.flock(fh, fcntl.LOCK_UN)
 
+
 _DEFAULT_STORE_FILE = Path(__file__).resolve().parent.parent / "kim_schedules.json"
 
 _MAX_TASK_LEN = 4096
