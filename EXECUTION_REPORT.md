@@ -200,8 +200,7 @@ Last updated: 2026-06-11
 - [x] V-2: `ProviderResponse` TypedDict + pyright in CI — ✅ Done (`a7fff3d`)
 - [x] V-3: Golden-transcript seam test + provider contract suite — ✅ Done (`e0aca6d`)
 - [x] V-1: Kill dual-emit (Kim-agent path) + dead text parsers — ✅ Done (`5a8268f`)
-- [ ] V-1 (partial): schema-first codegen — `events.schema.json` → `events.gen.ts` + `npm run gen:events` + CI drift check (intentionally deferred — no value-add until event schema stabilizes)
-- [x] V-3: golden-transcript Rust↔Python seam test + provider contract suite — ✅ Done
+- [x] V-1 (codegen half): schema-first codegen — `events.schema.json` → `events.gen.ts` + `npm run gen:events` + CI drift check — ✅ Done (`7ee3621`; this line previously said "deferred" in error — the audit verified events.gen.ts, the generator script, and the CI drift check all exist)
 - [x] V-4: split ChatView.tsx, decompose agent.py loop, split chat.css — ✅ Done (V-4b complete; V-4a MessageList PARTIAL — see below)
 
 ### Track B
