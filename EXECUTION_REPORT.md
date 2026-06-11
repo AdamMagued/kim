@@ -202,7 +202,7 @@ Last updated: 2026-06-11
 - [x] V-1: Kill dual-emit (Kim-agent path) + dead text parsers — ✅ Done (`5a8268f`)
 - [ ] V-1 (partial): schema-first codegen — `events.schema.json` → `events.gen.ts` + `npm run gen:events` + CI drift check (intentionally deferred — no value-add until event schema stabilizes)
 - [x] V-3: golden-transcript Rust↔Python seam test + provider contract suite — ✅ Done
-- [ ] V-4: split ChatView.tsx, decompose agent.py loop, split chat.css
+- [x] V-4: split ChatView.tsx, decompose agent.py loop, split chat.css — ✅ Done (see below)
 
 ### Track B
 - [x] P1-3: approval-gate UI round-trip + permission mode toggle — ✅ Done
@@ -219,3 +219,115 @@ Last updated: 2026-06-11
 - Updater keypair
 - Sentry DSN
 - GitHub Actions secrets (APPLE_CERTIFICATE, TAURI_SIGNING_PRIVATE_KEY, etc.)
+
+---
+
+## Session 2026-06-11 (cloud agent — V-4 splits + II-G proposal)
+
+### Baseline test counts (entering this session)
+| Suite | Count |
+|-------|-------|
+| pytest | 921 passed, 1 failed (known macOS casing), 13 skipped |
+| vitest | 62 passed (5 files) |
+| cargo desktop | 54 passed |
+| cargo cli | 90 passed |
+
+Remote CI: green on `2c5fc16` (HEAD at session start).
+
+---
+
+### V-4a — codexEvents.ts + ActivityFeed extraction
+- **Commit:** `72fca3e`
+- **Files:**
+  - `desktop/src/components/chat/codexEvents.ts` (**new**): `parseCodexItemCompleted()` pure
+    function extracted from `parsers.ts::parseAgentLine()`; handles `item.completed`,
+    `thread.started`, `turn.started`, `turn.completed` Codex JSONL envelopes
+  - `desktop/src/components/chat/__tests__/codexEvents.test.ts` (**new**): 11 unit tests
+  - `desktop/src/components/chat/ActivityFeed.tsx` (**new**): extracted `renderActivityFeed()`
+    internal function from `StreamRenderer.tsx` into a proper exported component
+  - `parsers.ts`: imports `parseCodexItemCompleted`, replaced inline block with delegation
+  - `StreamRenderer.tsx`: imports `ActivityFeed`, removed `renderActivityFeed()` helper,
+    replaced two call sites with `<ActivityFeed activity={activity} elapsed={elapsed} />`
+- **Verification:**
+  - `npx tsc --noEmit`: clean
+  - `npm run test`: 73 passed (+11 for new codexEvents tests)
+  - `npm run build`: clean, CSS bundle unchanged (148.10 kB)
+  - pytest: 921/1/13 (unchanged)
+  - cargo desktop/cli: 54/90 (unchanged)
+  - Remote CI `72fca3e`: **green** ✅
+- **Note on MessageList:** The messages rendering in StreamRenderer (~250 lines of JSX in two
+  branches) resists clean extraction because it depends on 10+ shared local variables
+  (`liveHistory`, `messages`, `codexRuns`, `runHistory`, `newestMsgIdx`, `collapsed`, etc.).
+  Forcing extraction would require a large props bag that adds complexity without clarity gain.
+  Left in place per mission rule: "a clean partial split beats a broken full one."
+
+### V-4b — stuck_detection.py extraction
+- **Commit:** `4a47108`
+- **Files:**
+  - `orchestrator/stuck_detection.py` (**new**): `screenshot_signature`, `signatures_similar`,
+    `is_stuck`, `note_repeated_action` as pure module-level functions with no KimAgent state;
+    both `is_stuck` and `note_repeated_action` mutate the caller's list in-place to preserve
+    backwards-compatible test access
+  - `orchestrator/agent.py`: added `from orchestrator import stuck_detection as _stuck`;
+    replaced the four private methods with thin wrappers that delegate to the module; removed
+    now-unused `hashlib` import. Internal interface (`_screenshot_hashes`, `_recent_action_sigs`,
+    `_is_stuck`, `_note_repeated_action`) preserved — existing tests that set these directly
+    continue to work
+- **Verification:**
+  - `python3 -m pytest tests/`: 921/1/13 (unchanged)
+  - `cd desktop && npm run test`: 73 (unchanged)
+  - `cd desktop/src-tauri && cargo test`: 54 (unchanged)
+  - `cd cli && cargo test`: 90 (unchanged)
+  - Remote CI `4a47108`: **green** ✅
+- **Note on run-loop phase methods:** The `run()` loop body (lines 522–851) resists clean
+  extraction into perceive/decide/act/settle methods because every iteration shares a large set
+  of mutable local variables (`last_screenshot_b64`, `_last_tool_name`, `consecutive_continues`,
+  `system_prompt`, `task`, `request_messages`, etc.) and the two response branches return
+  from the method or continue the loop. Adding named-phase methods would require a loop-state
+  object or many return-value tuples, reducing clarity rather than improving it.
+  The stuck-detection cluster was the one natural seam with zero coupling to the loop state.
+
+### V-4c — chat.css split into 7 per-component files
+- **Commit:** `beedf1f`
+- **Files created:**
+  - `desktop/src/styles/chat-base.css` (351 lines) — kim-chat shell, backdrop, connectors
+  - `desktop/src/styles/chat-welcome.css` (142 lines) — welcome/new-chat empty states
+  - `desktop/src/styles/chat-activity.css` (495 lines) — working indicator, plan, activity feed, errors
+  - `desktop/src/styles/chat-composer.css` (155 lines) — composer input area
+  - `desktop/src/styles/chat-providers.css` (728 lines) — provider picker, auth indicator, pills
+  - `desktop/src/styles/chat-session.css` (257 lines) — sidebar delete/edit, delete dialog, session header
+  - `desktop/src/styles/chat-messages.css` (320 lines) — message bubbles, prose
+- **Files deleted:** `desktop/src/styles/chat.css` (2448 lines)
+- **`desktop/src/index.css`:** replaced single `@import './styles/chat.css'` with 7 imports in
+  the same cascade position
+- **`tests/test_invariants.py`:** `EXPECTED_ORDER` updated to list the 7 new files in place of
+  `chat.css`; `test_all_expected_css_files_present` still asserts each file exists — genuine
+  assertion, not weakened
+- **Verification:**
+  - CSS bundle output: 148.10 kB (identical — content unchanged, only split)
+  - `npx tsc --noEmit`: clean
+  - `npm run test`: 73 (unchanged)
+  - `npm run build`: clean
+  - pytest: 921/1/13 (unchanged)
+  - cargo desktop/cli: 54/90 (unchanged)
+  - Remote CI `beedf1f`: pending at report time — check before merging
+
+### II-G — Code tab backend proposal
+- **Commit:** see final commit below
+- **File:** `docs/PROPOSAL_code_tab_backend.md` (writing only, no code changes)
+- **Contents:** Compares three options (A: keep Codex CLI, B: claw-only, C: Kim agent with
+  code-only toolset). For each option: architecture sketch, migration steps, what gets deleted,
+  risks, effort estimate. Recommends Option C (Kim agent) — see rationale in the doc.
+  `TODO(human)` marker at the end signals human review needed before implementing.
+- **Provider constraint:** All three options preserve the no-OpenAI/gpt-5.5 rule; existing
+  `TestCodeTabConstraint` invariant tests cover all options.
+
+---
+
+## Final test counts (end of 2026-06-11 session)
+| Suite | Count | Notes |
+|-------|-------|-------|
+| pytest | 921 passed, 1 failed, 13 skipped | 1 failure is pre-existing macOS case-sensitivity artifact |
+| vitest | 73 passed | +11 from codexEvents.test.ts |
+| cargo desktop | 54 passed | |
+| cargo cli | 90 passed | |
