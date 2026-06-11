@@ -31,7 +31,6 @@ Programmatic usage:
 
 import asyncio
 import base64
-import hashlib
 import inspect
 import io
 import json
@@ -66,6 +65,7 @@ from orchestrator.interaction_policy import InteractionPolicy
 from orchestrator.tool_errors import classify_tool_output
 from orchestrator.tool_risk import classify_tool_risk, coerce_hitl_bool
 from orchestrator.agent_states import AgentTermination, make_run_result, run_failure_event
+from orchestrator import stuck_detection as _stuck
 
 load_dotenv()
 
@@ -1010,65 +1010,24 @@ class KimAgent:
         return raw
 
     # ------------------------------------------------------------------
-    # Stuck detection
+    # Stuck detection — logic lives in orchestrator/stuck_detection.py
     # ------------------------------------------------------------------
 
     def _screenshot_signature(self, screenshot_b64: str):
-        """Perceptual signature: 16x16 grayscale thumbnail, 16 luminance levels.
-
-        Falls back to an exact MD5 string when the image cannot be decoded,
-        which degrades the comparison to the old exact-match behavior.
-        """
-        try:
-            from PIL import Image
-            raw = base64.b64decode(screenshot_b64)
-            img = Image.open(io.BytesIO(raw)).convert("L").resize((16, 16))
-            return tuple(p // 16 for p in img.getdata())
-        except Exception:
-            return hashlib.md5(screenshot_b64.encode()).hexdigest()
+        return _stuck.screenshot_signature(screenshot_b64)
 
     @staticmethod
     def _signatures_similar(a, b) -> bool:
-        if isinstance(a, str) or isinstance(b, str):
-            return a == b
-        if len(a) != len(b):
-            return False
-        differing = sum(1 for x, y in zip(a, b) if abs(x - y) > 1)
-        return differing <= 8  # ~3% of the 256 thumbnail pixels
+        return _stuck.signatures_similar(a, b)
 
     def _is_stuck(self, screenshot_b64: str) -> bool:
-        """True when the last 3 screenshots are visually unchanged.
-
-        Perceptual comparison instead of exact MD5: a blinking cursor or a
-        clock tick no longer defeats detection, and tiny render noise no
-        longer counts as 'the screen changed'.
-        """
-        sig = self._screenshot_signature(screenshot_b64)
-        self._screenshot_hashes.append(sig)
-        if len(self._screenshot_hashes) > 3:
-            self._screenshot_hashes.pop(0)
-        if len(self._screenshot_hashes) == 3 and all(
-            self._signatures_similar(self._screenshot_hashes[i], self._screenshot_hashes[i + 1])
-            for i in range(2)
-        ):
+        stuck = _stuck.is_stuck(self._screenshot_hashes, screenshot_b64)
+        if stuck:
             self._log("DEBUG", "Stuck check: 3 visually identical screenshots")
-            return True
-        return False
+        return stuck
 
     def _note_repeated_action(self, tool_name: str, tool_args: dict, result_text: str) -> bool:
-        """Track identical (tool, args, result) triples; True on the 3rd consecutive repeat."""
-        try:
-            args_sig = json.dumps(tool_args or {}, sort_keys=True)[:300]
-        except (TypeError, ValueError):
-            args_sig = str(tool_args)[:300]
-        sig = f"{tool_name}|{args_sig}|{str(result_text)[:200]}"
-        if self._recent_action_sigs and self._recent_action_sigs[-1] != sig:
-            self._recent_action_sigs.clear()
-        self._recent_action_sigs.append(sig)
-        if len(self._recent_action_sigs) >= 3:
-            self._recent_action_sigs.clear()  # fire the nudge once per streak
-            return True
-        return False
+        return _stuck.note_repeated_action(self._recent_action_sigs, tool_name, tool_args, result_text)
 
     # ------------------------------------------------------------------
     # LLM retry with exponential backoff
