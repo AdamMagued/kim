@@ -261,7 +261,7 @@ Remote CI: green on `2c5fc16` (HEAD at session start).
   Forcing extraction would require a large props bag that adds complexity without clarity gain.
   Left in place per mission rule: "a clean partial split beats a broken full one."
 
-### V-4b — stuck_detection.py extraction
+### V-4b (1/2) — stuck_detection.py extraction
 - **Commit:** `4a47108`
 - **Files:**
   - `orchestrator/stuck_detection.py` (**new**): `screenshot_signature`, `signatures_similar`,
@@ -279,13 +279,30 @@ Remote CI: green on `2c5fc16` (HEAD at session start).
   - `cd desktop/src-tauri && cargo test`: 54 (unchanged)
   - `cd cli && cargo test`: 90 (unchanged)
   - Remote CI `4a47108`: **green** ✅
-- **Note on run-loop phase methods:** The `run()` loop body (lines 522–851) resists clean
-  extraction into perceive/decide/act/settle methods because every iteration shares a large set
-  of mutable local variables (`last_screenshot_b64`, `_last_tool_name`, `consecutive_continues`,
-  `system_prompt`, `task`, `request_messages`, etc.) and the two response branches return
-  from the method or continue the loop. Adding named-phase methods would require a loop-state
-  object or many return-value tuples, reducing clarity rather than improving it.
-  The stuck-detection cluster was the one natural seam with zero coupling to the loop state.
+
+### V-4b (2/2) — run-loop phase methods
+- **Commit:** `a08e1b4`
+- **Files:**
+  - `orchestrator/agent.py`: Promoted three loop-state locals to `self._run_*` instance
+    attributes (`_run_screenshot_b64`, `_run_last_tool`, `_run_consecutive_continues`).
+    Extracted the 195-line tool-call branch into `_handle_tool_response(response, iteration)`
+    and the 68-line text-response branch into `_handle_text_response(response, task)`.
+    Both return `None` to continue the loop or a completed run-result dict (via
+    `self._complete_run(make_run_result(...))`) to exit. The `run()` for-loop body
+    shrinks from ~330 lines to ~30 lines.
+- **Note:** The test `test_agent_calls_complete_run_on_all_termination_paths` enforces that
+  all `make_run_result()` calls go through `self._complete_run()`. The phase methods satisfy
+  this by calling `self._complete_run(make_run_result(...))` directly; the outer loop
+  returns the already-processed result without wrapping it again.
+- **Verification:**
+  - `python3 -m pytest tests/`: 921/1/13 (unchanged)
+  - `cd desktop && npm run test`: 73 (unchanged)
+  - `cd desktop/src-tauri && cargo test`: 54 (unchanged)
+  - `cd cli && cargo test`: 90 (unchanged)
+  - Remote CI `a08e1b4`: **green** ✅
+- **MessageList note (unchanged):** The messages rendering in StreamRenderer (~250 lines of JSX)
+  depends on 10+ shared local variables and is not cleanly extractable. Left in place per
+  mission rule: "a clean partial split beats a broken full one." Status: PARTIAL.
 
 ### V-4c — chat.css split into 7 per-component files
 - **Commit:** `beedf1f`
@@ -324,10 +341,33 @@ Remote CI: green on `2c5fc16` (HEAD at session start).
 
 ---
 
-## Final test counts (end of 2026-06-11 session)
+## Final test counts (end of 2026-06-11 session, including V-4b phase-method extraction)
 | Suite | Count | Notes |
 |-------|-------|-------|
 | pytest | 921 passed, 1 failed, 13 skipped | 1 failure is pre-existing macOS case-sensitivity artifact |
 | vitest | 73 passed | +11 from codexEvents.test.ts |
 | cargo desktop | 54 passed | |
 | cargo cli | 90 passed | |
+
+## Commit list (`git log --oneline kim-improvement..production-roadmap`, end of session)
+```
+a08e1b4 V-4b (2/2): extract _handle_tool_response + _handle_text_response from run() loop
+b5caa76 II-G: Code tab backend proposal + EXECUTION_REPORT + delete mission brief
+beedf1f V-4c: split chat.css (2448 lines) into 7 per-component files
+4a47108 V-4b: extract stuck-detection cluster to orchestrator/stuck_detection.py
+72fca3e V-4a: extract codexEvents.ts + ActivityFeed from StreamRenderer
+2c5fc16 docs: add NEXT_MISSION brief for cloud agent (V-4 splits + II-G proposal)
+```
+(plus 25 earlier commits on this branch from previous sessions)
+
+## Human reviewer double-checks
+- **V-4b MessageList**: `StreamRenderer.tsx` messages rendering (~250 lines JSX, two branches)
+  was not extracted — left in place intentionally. See note in V-4b (1/2) above.
+- **V-4b phase methods**: `_handle_tool_response` and `_handle_text_response` are instance
+  methods on `KimAgent`; `self._run_*` attrs are set fresh at the top of each `run()` call.
+  The agent is not designed for concurrent `run()` invocations — this is unchanged from before.
+- **V-4c CI**: `beedf1f` CI confirmed **green** (`gh run list` output available).
+- **II-G proposal**: `docs/PROPOSAL_code_tab_backend.md` contains `TODO(human): Review and
+  decide before implementing. Option C requires a UX sign-off meeting.`
+- **Branch guard**: `production-roadmap` must NOT be merged to `main` or `kim-improvement`
+  without human review.
