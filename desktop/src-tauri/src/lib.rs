@@ -1782,6 +1782,7 @@ pub(crate) async fn selected_ollama_codex_model(
         .to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn configure_codex_direct_provider(
     cmd: &mut tokio::process::Command,
     provider_arg: &str,

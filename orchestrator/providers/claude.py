@@ -42,8 +42,8 @@ class AnthropicProvider(BaseProvider):
                 model=self._model,
                 max_tokens=self._max_tokens,
                 system=system,
-                tools=claude_tools,
-                messages=claude_messages,
+                tools=claude_tools,  # pyright: ignore[reportArgumentType]
+                messages=claude_messages,  # pyright: ignore[reportArgumentType]
             )
         except anthropic.RateLimitError:
             raise

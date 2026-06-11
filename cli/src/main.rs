@@ -1406,10 +1406,14 @@ fn help_text() -> &'static str {
 }
 
 fn new_session_id() -> String {
+    // Counter suffix: two sessions created within the same millisecond
+    // (new chat right after launch, tests) must still get distinct IDs.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    format!("session-{millis}")
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("session-{millis}-{n}")
 }
 
 /* ===========================================================
