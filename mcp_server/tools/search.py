@@ -29,6 +29,7 @@ MAX_FIND_RESULTS = 200
 
 async def _run_search_cmd(cmd: list[str], cwd: str, timeout: int) -> str:
     """Run a search command and return output."""
+    proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -64,6 +65,12 @@ async def _run_search_cmd(cmd: list[str], cwd: str, timeout: int) -> str:
 
         return out.strip()
     except asyncio.TimeoutError:
+        if proc is not None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                pass
         return f"ERROR: Search timed out after {timeout}s. Try a more specific pattern."
     except FileNotFoundError:
         return f"ERROR: '{cmd[0]}' is not installed or not found on PATH."

@@ -7,6 +7,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from orchestrator.tool_risk import classify_tool_risk
+
 
 @dataclass
 class PolicyDecision:
@@ -23,7 +25,13 @@ class InteractionPolicy:
     _NATIVE_STATE_CHANGERS = {"click_ui", "type_text", "hotkey", "key_press"}
     _COORDINATE_TOOLS = {"click", "double_click", "right_click", "drag"}
 
-    def __init__(self) -> None:
+    def __init__(self, *, block_high_risk: bool = False) -> None:
+        # When True, high-risk tools are hard-blocked via before_tool() so that
+        # the agent receives a HITL_REQUIRED message instead of executing them.
+        # Intended for config-gated use; off by default.
+        # Enable via config["hitl_block_high_risk"] = True or
+        # env KIM_HITL_BLOCK_HIGH_RISK=true.
+        self._block_high_risk = block_high_risk
         self.web_generation = 0
         self.ui_generation = 0
         self.known_web_element_ids: set[str] = set()
@@ -37,6 +45,17 @@ class InteractionPolicy:
 
     def before_tool(self, name: str, args: dict[str, Any] | None = None) -> PolicyDecision:
         args = args or {}
+
+        if self._block_high_risk:
+            risk = classify_tool_risk(name, args)
+            if risk["level"] == "high":
+                return self._block(
+                    "HITL_REQUIRED",
+                    f"Tool '{name}' is high-risk ({risk['reason']}) and requires human approval.",
+                    "Pause and ask the user to confirm this action before proceeding.",
+                    hard=True,
+                )
+
         if name == "web_open":
             return PolicyDecision()
         if name == "web_observe":
@@ -179,6 +198,16 @@ class InteractionPolicy:
             self.ui_generation += 1
             return
 
+        if name == "web_fill_form":
+            # The composite tool observes internally, so it never needs a prior
+            # snapshot — but its internal re-observes invalidate every element_id
+            # the model saw before the call. Force a fresh web_observe before the
+            # next id-based action.
+            self.web_observe_attempted = True
+            if not failed:
+                self.web_state_dirty = True
+            return
+
         if name in self._WEB_STATE_CHANGERS:
             if failed:
                 return
@@ -206,16 +235,7 @@ class InteractionPolicy:
         )
 
     def _message(self, severity: str, reason: str, suggested_action: str) -> str:
-        return (
-            f"{severity}: {reason}\n"
-            f"Last web_observe generation: {self.web_generation}; "
-            f"known web IDs: {len(self.known_web_element_ids)}; "
-            f"last observe dirty: {self.web_state_dirty}.\n"
-            f"Last observe_ui generation: {self.ui_generation}; "
-            f"known UI IDs: {len(self.known_ui_element_ids)}; "
-            f"last UI observe dirty: {self.ui_state_dirty}.\n"
-            f"Suggested next action: {suggested_action}"
-        )
+        return f"{severity}: {reason} — {suggested_action}"
 
     @staticmethod
     def _parse_web_observe(result_text: str) -> tuple[set[str], int, bool]:

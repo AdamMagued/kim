@@ -1,0 +1,320 @@
+/* ── Messages ─────────────────────────────────────────────────────────────── */
+.kim-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 0 24px;
+  min-height: 0;
+}
+.kim-messages__loading,
+.kim-messages__empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  flex-direction: column;
+  color: var(--text-muted);
+  font-size: 13px;
+  gap: 10px;
+}
+.kim-messages__empty-icon {
+  font-size: 32px;
+  opacity: 0.5;
+}
+.kim-messages__empty-text { font-size: 13.5px; }
+
+.kim-spinner {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2.5px solid var(--border);
+  border-top-color: var(--accent);
+  animation: kim-spin 0.7s linear infinite;
+}
+
+/* Message bubbles */
+.kim-msg-row {
+  display: flex;
+  padding: 5px 24px;
+}
+.kim-msg-row--user { justify-content: flex-end; }
+.kim-msg-row--assistant { justify-content: flex-start; }
+.kim-msg-row--system { justify-content: center; padding: 8px 24px; }
+
+.kim-bubble {
+  max-width: 720px;
+  min-width: 0;
+  padding: 11px 16px;
+  font-size: 14.5px;
+  line-height: 1.55;
+  letter-spacing: -0.005em;
+  word-break: break-word;
+  animation: kim-slide-up 0.25s ease;
+}
+.kim-bubble--user {
+  background: var(--accent);
+  color: #fff;
+  border-radius: 18px 18px 4px 18px;
+  white-space: pre-wrap;
+  max-width: 75%;
+}
+/* V7 hybrid stream — user message */
+.kim-bubble--user-stream.kim-bubble--user {
+  background: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--bubble-user-bg) 78%, #ffffff) 0%,
+    var(--bubble-user-bg) 100%
+  );
+  color: var(--bubble-user-text, #fff);
+  border: 1px solid color-mix(in srgb, var(--bubble-user-bg) 42%, #ffffff 58%);
+  border-radius: 16px 16px 4px 16px;
+  box-shadow: var(--shadow-sm);
+}
+.dark .kim-bubble--user-stream.kim-bubble--user {
+  background: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--bubble-user-bg) 70%, #0a0a0a) 0%,
+    var(--bubble-user-bg) 100%
+  );
+  border-color: color-mix(in srgb, var(--bubble-user-bg) 50%, #000000 50%);
+  box-shadow: 0 1px 0 color-mix(in srgb, #fff 6%, transparent);
+}
+.kim-bubble--assistant {
+  background: var(--bubble-ai-bg);
+  color: var(--bubble-ai-text);
+  border: 1px solid var(--bubble-ai-border);
+  border-radius: 4px 18px 18px 18px;
+  max-width: 82%;
+}
+.kim-bubble--assistant-group-top {
+  border-radius: 18px 18px 4px 4px;
+  margin-bottom: 2px;
+}
+
+.kim-bubble__img {
+  max-width: 100%;
+  max-height: 480px;
+  border-radius: 8px;
+  margin: 10px 0;
+  display: block;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  object-fit: contain;
+}
+
+.kim-bubble__link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  font-weight: 500;
+  transition: color 0.12s;
+}
+.kim-bubble__link:hover {
+  color: var(--accent-hover);
+}
+.kim-bubble--live {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  padding: 10px 14px;
+  border-radius: 4px 18px 18px 18px;
+  margin-left: 0;
+}
+.kim-msg-row--live {
+  padding-top: 0;
+}
+
+/* Hover-revealed message actions (copy, edit) */
+.kim-bubble-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  /* Width is content-driven, capped per-side below. min-width is intentionally
+     unset (defaults to auto) so the wrap doesn't collapse to 0 and squeeze the
+     bubble narrower than its text content (which would force "hi" → "h\ni"). */
+}
+.kim-bubble-wrap--user {
+  align-items: flex-end;
+  max-width: 75%;
+}
+.kim-bubble-wrap--assistant {
+  align-items: flex-start;
+  max-width: 82%;
+}
+/* Inside the wrap, the bubble's `max-width: 75/82%` would resolve against the
+   wrap's auto width, producing a smaller-than-content bubble. Override to
+   100% of the wrap so the bubble fits its text. */
+.kim-bubble-wrap .kim-bubble--user,
+.kim-bubble-wrap .kim-bubble--assistant {
+  max-width: 100%;
+}
+.kim-bubble-wrap__inner {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  width: 100%;
+}
+.kim-bubble-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  pointer-events: none;
+}
+.kim-bubble-wrap:hover .kim-bubble-actions,
+.kim-bubble-wrap:focus-within .kim-bubble-actions {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+.kim-bubble-actions--user { justify-content: flex-end; }
+.kim-bubble-action {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.kim-bubble-action:hover {
+  background: var(--bg-card-hover);
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--border));
+}
+.kim-bubble-action:active { transform: scale(0.94); }
+
+/* Inline edit mode for user bubbles */
+.kim-bubble--editing {
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--border));
+  border-radius: 14px;
+  padding: 10px 12px;
+  max-width: 100%;
+  width: min(560px, 75vw);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.kim-bubble__edit-textarea {
+  width: 100%;
+  min-height: 36px;
+  resize: none;
+  background: transparent;
+  border: 0;
+  outline: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 14.5px;
+  line-height: 1.5;
+}
+.kim-bubble__edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.kim-bubble__edit-btn {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.kim-bubble__edit-btn:hover {
+  background: var(--bg-card-hover);
+  color: var(--text);
+}
+.kim-bubble__edit-btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.kim-bubble__edit-btn--primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: #fff;
+}
+
+.kim-system-note {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 4px 12px;
+  max-width: 520px;
+  text-align: center;
+}
+
+.kim-tool-result-row {
+  padding: 4px 24px;
+}
+.kim-tool-result-inline {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 11.5px;
+  font-family: "JetBrains Mono", "SF Mono", monospace;
+  color: var(--text-muted);
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  max-width: 720px;
+}
+.kim-tool-result-inline__name {
+  font-weight: 700;
+  color: var(--accent);
+  font-family: inherit;
+}
+
+/* ── Prose (rendered markdown in assistant bubbles) ──────────────────────── */
+.prose p { margin-bottom: 0.65rem; }
+.prose p:last-child { margin-bottom: 0; }
+.prose code {
+  font-family: "JetBrains Mono", "SF Mono", monospace;
+  font-size: 0.85em;
+  padding: 0.12em 0.36em;
+  border-radius: 4px;
+  background: var(--bg-card);
+  color: var(--accent);
+  border: 1px solid var(--border);
+}
+.prose pre {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  font-size: 0.82em;
+  margin: 0.6rem 0;
+  line-height: 1.5;
+}
+.prose pre code {
+  background: none;
+  padding: 0;
+  border: none;
+  color: var(--text);
+}
+.prose ul, .prose ol {
+  padding-left: 1.5rem;
+  margin-bottom: 0.65rem;
+}
+.prose li { margin-bottom: 0.25rem; }
+.prose strong { font-weight: 600; color: var(--text-strong); }
+.prose em { font-style: italic; }
+

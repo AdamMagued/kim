@@ -12,9 +12,9 @@ const SIDEBAR_DEFAULT_WIDTH = 280;
 export type SettingsPane =
   | 'appearance'
   | 'ai'
-  | 'voice'
   | 'paths'
   | 'data'
+  | 'schedule'
   | 'account'
   | 'mcp'
   | 'feedback'

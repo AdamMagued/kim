@@ -8,6 +8,7 @@ and back.
 
 import logging
 import os
+from typing import Any
 
 import anthropic
 
@@ -32,7 +33,7 @@ class AnthropicProvider(BaseProvider):
         messages: list[dict],
         tools: list[dict],
         system: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         claude_messages = self._to_claude_messages(messages)
         claude_tools = self._to_claude_tools(tools)
 
@@ -41,8 +42,8 @@ class AnthropicProvider(BaseProvider):
                 model=self._model,
                 max_tokens=self._max_tokens,
                 system=system,
-                tools=claude_tools,
-                messages=claude_messages,
+                tools=claude_tools,  # pyright: ignore[reportArgumentType]
+                messages=claude_messages,  # pyright: ignore[reportArgumentType]
             )
         except anthropic.RateLimitError:
             raise
@@ -101,12 +102,19 @@ class AnthropicProvider(BaseProvider):
     # ------------------------------------------------------------------
 
     def _parse_response(self, response) -> dict:
-        # Extract token usage if available
+        # Extract token usage if available.
+        # Anthropic counts cache tokens separately from input_tokens (additive).
         usage = {}
         if hasattr(response, "usage") and response.usage:
             usage = {
                 "input": getattr(response.usage, "input_tokens", 0),
                 "output": getattr(response.usage, "output_tokens", 0),
+                # Cache tokens: non-zero only when prompt caching is active.
+                # cache_creation_tokens: tokens written to cache this call (billed ~1.25x).
+                # cache_read_tokens: tokens read from an existing cache entry (billed ~0.1x).
+                # Both are ADDITIVE to input_tokens (not a subset).
+                "cache_creation_tokens": getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
+                "cache_read_tokens": getattr(response.usage, "cache_read_input_tokens", 0) or 0,
             }
 
         tool_blocks = [b for b in response.content if b.type == "tool_use"]

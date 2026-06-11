@@ -1,0 +1,36 @@
+/* ════════════════════════════════════════════════════════════════════════════
+   GREETING — Syne font, overflow-safe descenders
+   ════════════════════════════════════════════════════════════════════════════ */
+
+.kim-greeting {
+  font-family: 'Syne', ui-sans-serif, -apple-system, sans-serif !important;
+  font-weight: 600 !important;
+  letter-spacing: -.025em !important;
+  line-height: 1.32 !important;
+  /* Syne has unusually deep descenders; reserve enough room for g/y/p tails. */
+  padding-top: 0.05em !important;
+  padding-bottom: 0.34em !important;
+  overflow: visible !important;
+  display: inline-block !important;
+  text-rendering: geometricPrecision;
+}
+
+/* Any ancestor of a greeting must not clip its descenders */
+.kim-empty-welcome,
+.kim-new-chat-empty,
+.kim-empty-welcome__greeting,
+.kim-new-chat-empty__title {
+  overflow: visible !important;
+}
+
+/* Override the empty welcome title specifically */
+.kim-empty-welcome__title.kim-greeting,
+.kim-empty-welcome__greeting.kim-greeting {
+  font-size: 26px;
+  min-height: calc(1em + 0.34em);
+}
+.kim-new-chat-empty__title.kim-greeting {
+  font-size: 28px;
+  min-height: calc(1em + 0.34em);
+}
+

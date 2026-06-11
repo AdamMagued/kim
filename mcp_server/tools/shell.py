@@ -11,11 +11,13 @@ Provides run_command and run_powershell tools with:
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 import re
 import shlex
+import tempfile
 
-from mcp_server.config import SHELL_TIMEOUT, validate_path, PROJECT_ROOT
+from mcp_server.config import SHELL_SANDBOX_MODE, SHELL_TIMEOUT, validate_path, PROJECT_ROOT
 from mcp_server.os_utils import (
     CURRENT_OS,
     IS_WINDOWS,
@@ -40,8 +42,30 @@ _DENY_PATTERNS = [
     re.compile(r"\bdd\b.*\bif=/dev/zero\b"),  # dd if=/dev/zero
 ]
 
-# Metacharacters that enable command chaining / injection
-_CHAIN_METACHAR_RE = re.compile(r"[;|&`]|\$\(")
+# Metacharacters that enable command chaining / injection.
+# \n and \r are included because the POSIX shell treats newline identically
+# to semicolon as a command separator, making them a bypass vector for the
+# allow_chaining=False guard when the string is passed to create_subprocess_shell.
+_CHAIN_METACHAR_RE = re.compile(r"[;|&`\n\r]|\$\(")
+
+_SANDBOX_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def _sandbox_enabled(args: dict) -> bool:
+    if "sandbox_mode" in args:
+        return bool(args.get("sandbox_mode"))
+    return SHELL_SANDBOX_MODE
+
+
+def _sandbox_env() -> dict[str, str]:
+    env = {
+        "PATH": _SANDBOX_PATH,
+        "HOME": str(PROJECT_ROOT),
+        "TMPDIR": tempfile.gettempdir(),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", ""),
+    }
+    return {key: value for key, value in env.items() if value}
 
 
 def _basename(token: str) -> str:
@@ -122,30 +146,48 @@ async def handle_run_command(args: dict) -> str:
     cwd = str(args.get("cwd", str(PROJECT_ROOT)))
     timeout = int(args.get("timeout", SHELL_TIMEOUT))
     allow_chaining = bool(args.get("allow_chaining", False))
+    sandbox_mode = _sandbox_enabled(args)
 
     block_msg = _check_blocked(cmd, allow_chaining=allow_chaining)
     if block_msg:
         logger.warning(f"run_command BLOCKED: {cmd}")
         return block_msg
 
-    try:
-        validate_path(cwd)
-    except PermissionError as e:
-        return f"PERMISSION_ERROR: cwd {e}"
+    if not sandbox_mode:
+        try:
+            validate_path(cwd)
+        except PermissionError as e:
+            return f"PERMISSION_ERROR: cwd {e}"
 
     # ── Cross-platform translation ───────────────────────────────────────
     original_cmd = cmd
     cmd = translate_command(cmd)
     if cmd != original_cmd:
         logger.info(f"run_command translated: {original_cmd!r} → {cmd!r}")
+        # The translated string is what actually executes — vet it too, since
+        # translation can rewrite a benign-looking token into a blocked one.
+        block_msg = _check_blocked(cmd, allow_chaining=allow_chaining)
+        if block_msg:
+            logger.warning(f"run_command BLOCKED after translation: {cmd}")
+            return block_msg
 
-    logger.info(f"run_command: {cmd!r} cwd={cwd}")
+    logger.info(f"run_command: {cmd!r} cwd={cwd} sandbox={sandbox_mode}")
+    sandbox_dir = None
     try:
+        if sandbox_mode:
+            sandbox_dir = tempfile.TemporaryDirectory(prefix="kim-shell-")
+            exec_cwd = sandbox_dir.name
+            env = _sandbox_env()
+        else:
+            exec_cwd = cwd
+            env = None
+
         proc = await asyncio.create_subprocess_shell(
             cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
+            cwd=exec_cwd,
+            env=env,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -164,10 +206,15 @@ async def handle_run_command(args: dict) -> str:
             parts.append(f"stdout:\n{out}")
         if err:
             parts.append(f"stderr:\n{err}")
+        if sandbox_mode:
+            parts.append("sandbox: enabled")
         return "\n".join(parts)
     except Exception as e:
         logger.error(f"run_command failed: {e}", exc_info=True)
         return f"ERROR: {e}"
+    finally:
+        if sandbox_dir is not None:
+            sandbox_dir.cleanup()
 
 
 async def handle_run_powershell(args: dict) -> str:
@@ -182,6 +229,7 @@ async def handle_run_powershell(args: dict) -> str:
     """
     script = args["script"]
     timeout = int(args.get("timeout", SHELL_TIMEOUT))
+    sandbox_mode = _sandbox_enabled(args)
 
     block_msg = _check_blocked(script, allow_chaining=True)  # PS scripts naturally chain
     if block_msg:
@@ -205,8 +253,17 @@ async def handle_run_powershell(args: dict) -> str:
                 f"'Get-Content file.txt' with 'cat file.txt', etc."
             )
 
-    logger.info(f"run_powershell [{ps_exe}]: {script[:80]}...")
+    logger.info(f"run_powershell [{ps_exe}]: {script[:80]}... sandbox={sandbox_mode}")
+    sandbox_dir = None
     try:
+        if sandbox_mode:
+            sandbox_dir = tempfile.TemporaryDirectory(prefix="kim-powershell-")
+            exec_cwd = sandbox_dir.name
+            env = _sandbox_env()
+        else:
+            exec_cwd = str(PROJECT_ROOT)
+            env = None
+
         ps_args = [
             ps_exe,
             "-NonInteractive",
@@ -221,7 +278,8 @@ async def handle_run_powershell(args: dict) -> str:
             *ps_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(PROJECT_ROOT),
+            cwd=exec_cwd,
+            env=env,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -239,7 +297,12 @@ async def handle_run_powershell(args: dict) -> str:
             parts.append(f"stdout:\n{out}")
         if err:
             parts.append(f"stderr:\n{err}")
+        if sandbox_mode:
+            parts.append("sandbox: enabled")
         return "\n".join(parts)
     except Exception as e:
         logger.error(f"run_powershell failed: {e}", exc_info=True)
         return f"ERROR: {e}"
+    finally:
+        if sandbox_dir is not None:
+            sandbox_dir.cleanup()

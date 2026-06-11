@@ -1,10 +1,10 @@
 import os
 import unittest
 
-from mcp_server.tools.claw_bridge import (
-    _claw_browser_system_prompt,
-    _latest_bridge_response_fragment,
-    _provider_response_to_bridge,
+from mcp_server.tools.codex_bridge import (
+    _codex_browser_system_prompt,
+    _provider_response_to_chat_completions,
+    _provider_response_to_responses_api,
 )
 
 
@@ -20,23 +20,40 @@ def _browser_provider_or_skip(case: unittest.TestCase):
 
 
 class BrowserProtocolTests(unittest.TestCase):
-    def test_claw_prompt_has_no_static_plain_sentinel_contract(self):
-        prompt = _claw_browser_system_prompt()
+    def test_codex_prompt_has_no_static_plain_sentinel_contract(self):
+        prompt = _codex_browser_system_prompt()
         self.assertNotIn("raw JSON followed by the [END_OF_RESPONSE] marker", prompt)
         self.assertNotIn("\n[END_OF_RESPONSE]\n", prompt)
-        self.assertIn("omit the tool_calls key entirely", prompt)
+        self.assertIn("omit tool_calls entirely", prompt)
 
-    def test_latest_fragment_splits_dynamic_and_legacy_markers(self):
-        raw = '{"text":"old"}[END_OF_RESPONSE_abcd1234] {"text":"new"}[END_OF_RESPONSE]'
-        self.assertEqual(_latest_bridge_response_fragment(raw), '{"text":"new"}')
+    def test_empty_tool_calls_is_tolerated_as_final_responses_text(self):
+        parsed = _provider_response_to_responses_api(
+            {"type": "text", "content": '{"text":"done","tool_calls":[]}'},
+            relay_num=1,
+        )
+        self.assertEqual(parsed["output"][0]["content"][0]["text"], "done")
 
-    def test_empty_tool_calls_is_tolerated_as_final_text(self):
-        parsed = _provider_response_to_bridge({
-            "type": "text",
-            "content": '{"text":"done","tool_calls":[]}[END_OF_RESPONSE_abc123]',
-        })
-        self.assertEqual(parsed.get("text"), "done")
-        self.assertEqual(parsed.get("tool_calls"), [])
+    def test_tool_calls_are_mapped_to_responses_api(self):
+        parsed = _provider_response_to_responses_api(
+            {
+                "type": "text",
+                "content": '{"text":"use shell","tool_calls":[{"name":"shell","input":{"cmd":"ls"}}]}',
+            },
+            relay_num=1,
+        )
+        self.assertEqual(parsed["output"][1]["type"], "function_call")
+        self.assertEqual(parsed["output"][1]["name"], "shell")
+
+    def test_tool_calls_are_mapped_to_chat_completions(self):
+        parsed = _provider_response_to_chat_completions(
+            {
+                "type": "text",
+                "content": '{"text":"use shell","tool_calls":[{"name":"shell","input":{"cmd":"ls"}}]}',
+            },
+            relay_num=1,
+        )
+        message = parsed["choices"][0]["message"]
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "shell")
 
     def test_browser_provider_strips_current_hash_and_old_fragments(self):
         provider = _browser_provider_or_skip(self)
@@ -46,12 +63,12 @@ class BrowserProtocolTests(unittest.TestCase):
             '{"tool":"x","args":{}}',
         )
 
-    def test_formatted_claw_prompt_has_only_dynamic_marker_instruction(self):
+    def test_formatted_codex_prompt_has_only_dynamic_marker_instruction(self):
         provider = _browser_provider_or_skip(self)
         prompt, _attachments, completion_hash = provider._format_prompt(
             messages=[{"role": "user", "content": "say hi"}],
             tools=[],
-            system=_claw_browser_system_prompt(),
+            system=_codex_browser_system_prompt(),
         )
         self.assertIn(completion_hash, prompt)
         self.assertIn("append the exact string", prompt)

@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 
 async def _run_exec(
     cmd: list[str],
-    cwd: str = None,
-    timeout: int = None,
-    extra_env: dict = None,
+    cwd: str | None = None,
+    timeout: int | None = None,
+    extra_env: dict | None = None,
 ) -> str:
     """Run a command via create_subprocess_exec and return formatted output."""
     resolved_cwd = cwd or str(PROJECT_ROOT)

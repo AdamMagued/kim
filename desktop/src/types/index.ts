@@ -141,7 +141,8 @@ export interface CodexProject {
 export type Theme = 'dark' | 'light' | 'system';
 export type Provider = 'claude' | 'openai' | 'gemini' | 'deepseek' | 'browser' | 'ollama';
 export type AccentTheme = 'indigo' | 'ocean' | 'ember' | 'teal' | 'jade' | 'mono';
-export type VoiceEngine = 'kokoro' | 'maya1' | 'http' | 'hume';
+/** HITL permission gate. full_auto = no gate; ask_risky = high-risk tools only; ask_always = medium+high. */
+export type PermissionMode = 'full_auto' | 'ask_risky' | 'ask_always';
 export type TypingAnimation = 'none' | 'typewriter' | 'word-fade' | 'char-blur';
 
 export interface OllamaSettings {
@@ -154,10 +155,9 @@ export interface OllamaSettings {
   context_limit_override: number | null;
 }
 
-export interface VoiceSettings {
+export interface ScheduleTimerSettings {
   enabled: boolean;
-  engine: VoiceEngine;
-  voice_id: string;    // kokoro voice_id OR hume voice_name OR http voice
+  interval_seconds: number;
 }
 
 export interface Settings {
@@ -171,9 +171,10 @@ export interface Settings {
   context_budget_tokens: number;
   theme: Theme;
   accent: AccentTheme;
-  voice: VoiceSettings;
+  schedule_timer: ScheduleTimerSettings;
   typing_animation: TypingAnimation;
   ollama: OllamaSettings;
+  permission_mode: PermissionMode;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -186,12 +187,12 @@ export const DEFAULT_SETTINGS: Settings = {
   context_budget_tokens: 200_000,
   theme: 'system',
   accent: 'indigo',
-  voice: {
-    enabled: true,
-    engine: 'kokoro',
-    voice_id: 'af_heart',
+  schedule_timer: {
+    enabled: false,
+    interval_seconds: 300,
   },
   typing_animation: 'none',
+  permission_mode: 'full_auto' as PermissionMode,
   ollama: {
     base_url: 'http://localhost:11434',
     mode: 'cloud',
@@ -201,37 +202,6 @@ export const DEFAULT_SETTINGS: Settings = {
     cloud_connected: false,
     context_limit_override: null,
   },
-};
-
-// Voice catalog per engine — used by SettingsPanel to populate the voice dropdown.
-export const VOICES_BY_ENGINE: Record<VoiceEngine, { value: string; label: string }[]> = {
-  kokoro: [
-    { value: 'af_heart', label: 'Heart (warm female)' },
-    { value: 'af_sky',   label: 'Sky (bright female)' },
-    { value: 'af_bella', label: 'Bella (soft female)' },
-    { value: 'af_sarah', label: 'Sarah (neutral female)' },
-    { value: 'am_adam',  label: 'Adam (male)' },
-    { value: 'am_michael', label: 'Michael (male)' },
-    { value: 'bf_emma',  label: 'Emma (British female)' },
-    { value: 'bm_george', label: 'George (British male)' },
-  ],
-  maya1: [
-    { value: 'default', label: 'Default (speaker description from config)' },
-  ],
-  http: [
-    { value: 'nova',    label: 'Nova' },
-    { value: 'alloy',   label: 'Alloy' },
-    { value: 'echo',    label: 'Echo' },
-    { value: 'fable',   label: 'Fable' },
-    { value: 'onyx',    label: 'Onyx' },
-    { value: 'shimmer', label: 'Shimmer' },
-  ],
-  hume: [
-    { value: 'Alice Bennett', label: 'Alice Bennett (warm female)' },
-    { value: 'Ava Song',      label: 'Ava Song' },
-    { value: 'Colton Rivers', label: 'Colton Rivers (male)' },
-    { value: 'Dacher Keltner', label: 'Dacher Keltner (male)' },
-  ],
 };
 
 // ── Agent events ─────────────────────────────────────────────────────────────

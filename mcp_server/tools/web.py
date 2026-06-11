@@ -137,11 +137,17 @@ def _browser_executable() -> str | None:
     return None
 
 
+_CDP_CONNECT_TIMEOUT_MS = int(os.environ.get("KIM_CDP_CONNECT_TIMEOUT_MS", "10000"))
+
+
 async def _connect_over_cdp(port: int) -> Any | None:
     global _last_connection_error
     for host in ["127.0.0.1", "localhost"]:
         try:
-            return await _playwright.chromium.connect_over_cdp(f"http://{host}:{port}")
+            return await _playwright.chromium.connect_over_cdp(
+                f"http://{host}:{port}",
+                timeout=_CDP_CONNECT_TIMEOUT_MS,
+            )
         except Exception as e:
             _last_connection_error = str(e)
     return None
@@ -355,376 +361,16 @@ async def handle_web_open(args: dict) -> str:
     return f"Opened: {page.url}{mode_str}\nTitle: {title}"
 
 
-# JS that walks the live DOM and returns interactive elements with stable
-# selectors and bounding boxes. Runs entirely in the page so we see exactly
-# what the user sees.
-_OBSERVE_JS = r"""
-() => {
-  const elementState = el => {
-    const r = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-    const s = el ? window.getComputedStyle(el) : null;
-    const hidden = !el || !r || r.width <= 1 || r.height <= 1 ||
-      !s || s.visibility === 'hidden' || s.display === 'none' ||
-      parseFloat(s.opacity || '1') < 0.05;
-    const visible = !hidden;
-    const inViewport = visible &&
-      r.bottom >= 0 && r.top <= window.innerHeight &&
-      r.right >= 0 && r.left <= window.innerWidth;
-    return {
-      hidden,
-      visible,
-      in_viewport: inViewport,
-      bbox: r ? [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)] : [0, 0, 0, 0],
-    };
-  };
-
-  const cleanText = value => (value || '').replace(/\s+/g, ' ').trim();
-
-  const labelOf = el => {
-    const al = el.getAttribute && el.getAttribute('aria-label');
-    if (al) return al.trim();
-    if (el.placeholder) return ('placeholder: ' + el.placeholder).trim();
-    if (el.title) return el.title.trim();
-    if (el.alt) return el.alt.trim();
-    if (el.value && el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'button')) return el.value.trim();
-    const lid = el.getAttribute && el.getAttribute('aria-labelledby');
-    if (lid) {
-      const labelled = lid.split(/\s+/).map(id => {
-        const r = document.getElementById(id);
-        return r ? cleanText(r.textContent) : '';
-      }).filter(Boolean).join(' ');
-      if (labelled) return labelled;
-    }
-    if (el.labels && el.labels.length) {
-      const labels = Array.from(el.labels).map(l => cleanText(l.textContent)).filter(Boolean);
-      if (labels.length) return labels.join(' ');
-    }
-    if (el.id) {
-      const lab = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
-      if (lab) return cleanText(lab.textContent);
-    }
-    const parentLabel = el.closest && el.closest('label');
-    if (parentLabel) {
-      const parentText = cleanText(parentLabel.textContent);
-      if (parentText) return parentText;
-    }
-    const inner = cleanText(el.innerText || el.textContent || '');
-    return inner.slice(0, 120);
-  };
-
-  const visibleTextOf = el => cleanText(el.innerText || el.textContent || '').slice(0, 180);
-
-  const nearbyTextOf = el => {
-    const parts = [];
-    const previous = el.previousElementSibling;
-    const next = el.nextElementSibling;
-    if (previous) parts.push(cleanText(previous.innerText || previous.textContent || ''));
-    if (next) parts.push(cleanText(next.innerText || next.textContent || ''));
-    const parent = el.parentElement;
-    if (parent) parts.push(cleanText(parent.innerText || parent.textContent || ''));
-    return parts.filter(Boolean).join(' | ').slice(0, 260);
-  };
-
-  const containerOf = el => {
-    const container = el.closest && el.closest(
-      'form, main, [role="main"], section, article, dialog, [data-testid], [aria-label], .Box, .Layout-main'
-    );
-    return container || el.parentElement || document.body;
-  };
-
-  const cssPath = el => {
-    if (el.id && document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) {
-      return '#' + CSS.escape(el.id);
-    }
-    const parts = [];
-    let cur = el;
-    while (cur && cur.nodeType === 1 && cur !== document.body && parts.length < 6) {
-      let sel = cur.tagName.toLowerCase();
-      if (cur.id) {
-        sel += '#' + CSS.escape(cur.id);
-        parts.unshift(sel);
-        break;
-      }
-      const parent = cur.parentNode;
-      if (parent) {
-        const sibs = Array.from(parent.children).filter(n => n.tagName === cur.tagName);
-        if (sibs.length > 1) sel += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
-      }
-      parts.unshift(sel);
-      cur = cur.parentNode;
-    }
-    return parts.join(' > ');
-  };
-
-  const SEL = [
-    'a[href]', 'button', 'input:not([type="hidden"])', 'textarea', 'select',
-    '[role="button"]', '[role="link"]', '[role="textbox"]', '[role="searchbox"]',
-    '[role="checkbox"]', '[role="radio"]', '[role="combobox"]', '[role="menuitem"]',
-    '[role="tab"]', '[contenteditable="true"]', '[contenteditable=""]',
-    'summary', '[onclick]', '[tabindex]:not([tabindex="-1"])'
-  ].join(',');
-
-  const seen = new Set();
-  const out = [];
-  let i = 0;
-  for (const el of document.querySelectorAll(SEL)) {
-    if (seen.has(el)) continue;
-    seen.add(el);
-    const state = elementState(el);
-    const r = el.getBoundingClientRect();
-    const tag = el.tagName.toLowerCase();
-    const role = el.getAttribute('role') || tag;
-    const form = el.form || el.closest('form');
-    const container = containerOf(el);
-    const disabled = el.disabled === true || (el.getAttribute && el.getAttribute('aria-disabled') === 'true');
-    const required = el.required === true || (el.getAttribute && el.getAttribute('aria-required') === 'true');
-    const checked = el.checked === true ||
-      (el.getAttribute && el.getAttribute('aria-checked') === 'true') ||
-      (el.getAttribute && el.getAttribute('aria-pressed') === 'true') ||
-      (el.getAttribute && el.getAttribute('aria-selected') === 'true');
-    out.push({
-      id: 'w' + (++i),
-      tag,
-      role,
-      label: labelOf(el).slice(0, 140),
-      text: visibleTextOf(el),
-      aria_label: (el.getAttribute && (el.getAttribute('aria-label') || '')).slice(0, 140),
-      placeholder: (el.placeholder || '').slice(0, 140),
-      name: (el.getAttribute && (el.getAttribute('name') || '')).slice(0, 140),
-      title: (el.getAttribute && (el.getAttribute('title') || '')).slice(0, 140),
-      nearby_text: nearbyTextOf(el),
-      value: (el.value || '').slice(0, 120),
-      href: (tag === 'a' && el.href) ? el.href.slice(0, 120) : '',
-      type: el.type || '',
-      checked,
-      disabled,
-      required,
-      visible: state.visible,
-      hidden: state.hidden,
-      in_viewport: state.in_viewport,
-      form_id: form ? (form.id || form.getAttribute('name') || cssPath(form)) : '',
-      container_id: container ? cssPath(container) : '',
-      container_text: container ? cleanText(container.innerText || container.textContent || '').slice(0, 320) : '',
-      bbox: state.bbox,
-      selector: cssPath(el),
-    });
-    if (out.length >= 500) break;
-  }
-  return { url: location.href, title: document.title, elements: out };
-}
-"""
-
-
-_GENERIC_INTENT_TOKENS = {
-    "a",
-    "an",
-    "and",
-    "button",
-    "field",
-    "input",
-    "textbox",
-    "text",
-    "box",
-    "select",
-    "dropdown",
-    "control",
-    "element",
-    "the",
-}
-
-_ACTION_INTENT_TOKENS = {
-    "click",
-    "confirm",
-    "continue",
-    "create",
-    "finish",
-    "open",
-    "press",
-    "publish",
-    "save",
-    "send",
-    "submit",
-}
-
-_RESOLVE_THRESHOLDS = {
-    "loose": 0.20,
-    "normal": 0.25,
-    "strict": 0.58,
-}
-
-
-def _norm(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip().lower())
-
-
-def _tokens(value: Any) -> list[str]:
-    return [t for t in re.split(r"[^a-z0-9]+", _norm(value)) if len(t) > 1]
-
-
-def _as_str_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, (list, tuple, set)):
-        return [str(v) for v in value if str(v).strip()]
-    return [str(value)]
-
-
-def _strip_placeholder_prefix(value: Any) -> str:
-    text = str(value or "").strip()
-    if text.lower().startswith("placeholder:"):
-        return text.split(":", 1)[1].strip()
-    return text
-
-
-def _role_candidates(el: dict[str, Any]) -> set[str]:
-    role = _norm(el.get("role"))
-    tag = _norm(el.get("tag"))
-    typ = _norm(el.get("type"))
-    candidates = {v for v in (role, tag, typ) if v}
-    if tag == "textarea":
-        candidates.add("textbox")
-    if tag == "select":
-        candidates.add("combobox")
-        candidates.add("listbox")
-    if tag == "button":
-        candidates.add("button")
-    if tag == "input":
-        if typ in {"button", "submit", "reset"}:
-            candidates.add("button")
-        elif typ == "checkbox":
-            candidates.add("checkbox")
-        elif typ == "radio":
-            candidates.add("radio")
-        elif typ in {"email", "search", "tel", "text", "url", "password", "number"} or not typ:
-            candidates.add("textbox")
-            if typ:
-                candidates.add(f"{typ}box")
-    if role in {"searchbox", "textbox"}:
-        candidates.add("textbox")
-    if role == "link":
-        candidates.add("a")
-    return candidates
-
-
-def _infer_preferred_roles(intent: str) -> list[str]:
-    toks = set(_tokens(intent))
-    roles: list[str] = []
-    if toks & {"button", "submit", "create", "save", "send", "continue", "publish"}:
-        roles.append("button")
-    if toks & {"radio", "visibility", "public", "private"}:
-        roles.append("radio")
-    if toks & {"checkbox", "check"}:
-        roles.append("checkbox")
-    if toks & {
-        "textbox",
-        "input",
-        "field",
-        "email",
-        "recipient",
-        "name",
-        "description",
-        "search",
-        "text",
-    }:
-        roles.append("textbox")
-    return roles
-
-
-def _intent_focus(intent: str) -> str:
-    keep = [t for t in _tokens(intent) if t not in _GENERIC_INTENT_TOKENS]
-    return " ".join(keep) or intent
-
-
-def _important_tokens(intent: str) -> list[str]:
-    return [
-        t for t in _tokens(intent)
-        if t not in _GENERIC_INTENT_TOKENS and t not in _ACTION_INTENT_TOKENS
-    ]
-
-
-def _match_score(needle: str, haystack: str) -> float:
-    needle_norm = _norm(needle)
-    hay_norm = _norm(haystack)
-    if not needle_norm or not hay_norm:
-        return 0.0
-    if needle_norm == hay_norm:
-        return 1.0
-    if needle_norm in hay_norm:
-        return 0.88
-    hay_tokens = set(_tokens(hay_norm))
-    needle_tokens = [t for t in _tokens(needle_norm) if t not in _GENERIC_INTENT_TOKENS]
-    if not needle_tokens or not hay_tokens:
-        return 0.0
-    overlap = sum(1 for t in needle_tokens if t in hay_tokens)
-    if overlap == len(needle_tokens):
-        return 0.74
-    if overlap:
-        return 0.36 + (0.28 * overlap / max(len(needle_tokens), 1))
-    compact_hay = hay_norm.replace("-", " ").replace("_", " ")
-    return 0.55 if needle_norm.replace("-", " ").replace("_", " ") in compact_hay else 0.0
-
-
-def _best_match(needles: list[str], haystacks: list[str]) -> tuple[float, str]:
-    best = 0.0
-    best_reason = ""
-    for needle in needles:
-        for hay in haystacks:
-            score = _match_score(needle, hay)
-            if score > best:
-                best = score
-                best_reason = f"{needle!r} matched {hay!r}"
-    return best, best_reason
-
-
-def _is_visible_element(el: dict[str, Any]) -> bool:
-    if el.get("visible") is False:
-        return False
-    if el.get("hidden") is True:
-        return False
-    bbox = el.get("bbox")
-    if not isinstance(bbox, list) or len(bbox) != 4:
-        return False
-    try:
-        return float(bbox[2]) > 1 and float(bbox[3]) > 1
-    except (TypeError, ValueError):
-        return False
-
-
-def _debug_label(el: dict[str, Any]) -> str:
-    for key in ("label", "aria_label", "placeholder", "name", "text", "title", "value"):
-        value = _strip_placeholder_prefix(el.get(key))
-        if value:
-            return str(value)
-    return f"<{el.get('tag', '?')} role={el.get('role', '?')}>"
-
-
-def _candidate_metadata(el: dict[str, Any], confidence: float, reason: str) -> dict[str, Any]:
-    return {
-        "element_id": el.get("id"),
-        "confidence": round(confidence, 3),
-        "reason": reason,
-        "tag": el.get("tag", ""),
-        "role": el.get("role", ""),
-        "type": el.get("type", ""),
-        "label": el.get("label", ""),
-        "text": el.get("text", ""),
-        "aria_label": el.get("aria_label", ""),
-        "placeholder": el.get("placeholder", ""),
-        "name": el.get("name", ""),
-        "value": el.get("value", ""),
-        "title": el.get("title", ""),
-        "nearby_text": el.get("nearby_text", ""),
-        "disabled": bool(el.get("disabled")),
-        "required": bool(el.get("required")),
-        "visible": _is_visible_element(el),
-        "hidden": bool(el.get("hidden")),
-        "in_viewport": bool(el.get("in_viewport")),
-        "form_id": el.get("form_id", ""),
-        "container_id": el.get("container_id", ""),
-        "bbox": el.get("bbox"),
-    }
+from mcp_server.tools.web_observe_js import _OBSERVE_JS
+from mcp_server.tools.web_element_scoring import (
+    _GENERIC_INTENT_TOKENS, _ACTION_INTENT_TOKENS, _RESOLVE_THRESHOLDS,
+    _norm, _tokens, _as_str_list, _strip_placeholder_prefix,
+    _role_candidates, _infer_preferred_roles, _intent_focus,
+    _important_tokens, _match_score, _best_match,
+    _is_visible_element, _debug_label, _candidate_metadata,
+    _scope_value, _searchable_text, _missing_strict_tokens,
+    _expand_with_synonyms,
+)
 
 
 def _scope_for_element(element_id: str | None) -> dict[str, Any]:
@@ -740,13 +386,6 @@ def _scope_for_element(element_id: str | None) -> dict[str, Any]:
     if el.get("container_id"):
         scope["container_id"] = el.get("container_id")
     return scope
-
-
-def _scope_value(scope: Any, key: str) -> str:
-    if not isinstance(scope, dict):
-        return ""
-    value = scope.get(key)
-    return str(value or "").strip()
 
 
 def _element_scope_matches(el: dict[str, Any], scope: Any) -> tuple[bool, str]:
@@ -789,28 +428,6 @@ def _element_scope_matches(el: dict[str, Any], scope: Any) -> tuple[bool, str]:
     return True, "scope matched"
 
 
-def _searchable_text(el: dict[str, Any]) -> str:
-    return " ".join(
-        str(el.get(k, ""))
-        for k in (
-            "label",
-            "text",
-            "aria_label",
-            "placeholder",
-            "name",
-            "value",
-            "title",
-            "nearby_text",
-            "container_text",
-            "type",
-        )
-    )
-
-
-def _missing_strict_tokens(el: dict[str, Any], intent: str) -> list[str]:
-    hay_tokens = set(_tokens(_searchable_text(el)))
-    return [token for token in _important_tokens(intent) if token not in hay_tokens]
-
 
 def _is_global_nav_candidate(el: dict[str, Any]) -> bool:
     form_id = str(el.get("form_id") or "")
@@ -833,6 +450,8 @@ def _resolve_element(
     elements: list[dict[str, Any]] | None = None,
     mode: str = "normal",
     scope: dict[str, Any] | None = None,
+    require_text_evidence: bool = False,
+    restrict_roles: bool = False,
 ) -> dict[str, Any]:
     """Resolve a semantic browser intent to the best known observed element."""
     intent = str(intent or "").strip()
@@ -845,9 +464,9 @@ def _resolve_element(
     preferred_input = _as_str_list(preferred_roles) or _infer_preferred_roles(intent)
     preferred = [_norm(r) for r in preferred_input if _norm(r)]
     focus = _intent_focus(intent)
-    label_needles = _as_str_list(label_hints) or [focus]
-    text_needles = _as_str_list(text_hints) or [focus]
-    intent_needles = [intent, focus]
+    label_needles = _expand_with_synonyms(_as_str_list(label_hints) or [focus])
+    text_needles = _expand_with_synonyms(_as_str_list(text_hints) or [focus])
+    intent_needles = _expand_with_synonyms([intent, focus])
 
     candidates: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
@@ -879,7 +498,7 @@ def _resolve_element(
                 score += 0.14
                 reasons.append("tag matched input")
             else:
-                if mode == "strict":
+                if mode == "strict" or restrict_roles:
                     skipped += 1
                     rejected.append(_candidate_metadata(el, 0.0, f"role {sorted(roles)} did not match {preferred}"))
                     continue
@@ -936,6 +555,14 @@ def _resolve_element(
         if intent_score:
             score += 0.22 * intent_score
             reasons.append(f"intent {intent_reason}")
+
+        # Role/visibility bonuses alone can clear the loose/normal thresholds,
+        # which lets a junk intent resolve to a random field. Callers that act
+        # on the result (web_fill_form) demand at least one textual match.
+        if require_text_evidence and not (label_score or placeholder_score or text_score or intent_score):
+            skipped += 1
+            rejected.append(_candidate_metadata(el, 0.0, "no text evidence for intent"))
+            continue
 
         if _is_visible_element(el):
             score += 0.04
@@ -1275,6 +902,7 @@ async def handle_web_observe(args: dict) -> str:
 
     if len(shown_elements) > limit:
         lines.append(f"... {len(shown_elements) - limit} more — re-run with limit higher if needed.")
+    lines.extend(_form_schema_lines(elements))
     if diagnostics.get("messages"):
         lines.append("")
         lines.append("Form diagnostics:")
@@ -1284,6 +912,87 @@ async def handle_web_observe(args: dict) -> str:
     lines.append("WEB_OBSERVATION_JSON:")
     lines.append(json.dumps(_structured_observation_payload(result, elements, diagnostics), indent=2))
     return "\n".join(lines)
+
+
+def _form_schema_lines(elements: list[dict[str, Any]]) -> list[str]:
+    """Compact fill-ready schema: one line per field, radio groups collapsed.
+
+    Gives the model everything it needs to emit a single web_fill_form call
+    without resolving fields one by one.
+    """
+    visible_fields = [el for el in elements if _is_visible_element(el) and _is_field(el)]
+    if not visible_fields:
+        return []
+
+    lines = ["", "FORM_SCHEMA (one web_fill_form call can fill all of these):"]
+    radio_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    flat: list[dict[str, Any]] = []
+    for el in visible_fields:
+        roles = _role_candidates(el)
+        if "radio" in roles and el.get("name"):
+            key = (str(el.get("form_id") or ""), str(el["name"]))
+            radio_groups.setdefault(key, []).append(el)
+        else:
+            flat.append(el)
+
+    for el in flat:
+        roles = _role_candidates(el)
+        if "checkbox" in roles:
+            kind = "checkbox"
+        elif roles & {"combobox", "listbox"}:
+            kind = "select"
+        else:
+            kind = "text"
+        bits = [kind]
+        if el.get("required"):
+            bits.append("required")
+        if kind == "checkbox":
+            bits.append("checked" if el.get("checked") else "unchecked")
+        elif str(el.get("value") or "").strip():
+            bits.append(f"value={str(el['value'])[:40]!r}")
+        lines.append(f"- {el.get('id')}: {_debug_label(el)!r} ({', '.join(bits)})")
+
+    for (_form_id, name), group in radio_groups.items():
+        options = ", ".join(
+            _debug_label(el) + (" *" if el.get("checked") else "")
+            for el in group
+        )
+        lines.append(f"- radio group {name!r}: options: {options} (* = selected)")
+
+    return lines
+
+
+async def _post_action_state(page) -> str:
+    """Compact page-state line for mutation results.
+
+    Read-only: evaluates the observe JS transiently WITHOUT calling
+    _remember_observation, so previously issued element_ids stay valid.
+    """
+    try:
+        url = page.url
+    except Exception:
+        return ""
+    prev = _last_observation or {}
+    parts: list[str] = []
+    if url != prev.get("url", ""):
+        parts.append(f"url changed -> {url}")
+    try:
+        result = await page.evaluate(_OBSERVE_JS)
+        fresh_elements = list(result.get("elements") or [])
+        new_count = len([el for el in fresh_elements if _is_visible_element(el)])
+        old_count = len([el for el in (prev.get("elements") or []) if _is_visible_element(el)])
+        if new_count != old_count:
+            parts.append(
+                f"visible elements {old_count} -> {new_count} "
+                "(element_ids may be stale; web_observe before further id-based actions)"
+            )
+        diagnostics = _build_form_diagnostics(result)
+        parts.extend((diagnostics.get("messages") or [])[:3])
+    except Exception:
+        pass
+    if not parts:
+        return ""
+    return "PAGE_STATE: " + "; ".join(parts)
 
 
 async def handle_web_resolve(args: dict) -> str:
@@ -1333,7 +1042,8 @@ async def handle_web_click(args: dict) -> str:
         await locator.click(timeout=6000)
     except Exception as e:
         return f"ERROR: click failed for {el_id} ({selector}): {e}"
-    return f"Clicked {el_id}"
+    state = await _post_action_state(page)
+    return f"Clicked {el_id}" + (f"\n{state}" if state else "")
 
 
 async def handle_web_fill(args: dict) -> str:
@@ -1349,7 +1059,253 @@ async def handle_web_fill(args: dict) -> str:
         await page.locator(selector).first.fill(text, timeout=6000)
     except Exception as e:
         return f"ERROR: fill failed for {el_id}: {e}"
-    return f"Filled {el_id} with {len(text)} chars"
+    state = await _post_action_state(page)
+    return f"Filled {el_id} with {len(text)} chars" + (f"\n{state}" if state else "")
+
+
+# ── Composite form filling ───────────────────────────────────────────────────
+
+_TRUTHY_VALUES = {"true", "yes", "on", "1", "checked", "check", "enable", "enabled"}
+_FALSY_VALUES = {"false", "no", "off", "0", "unchecked", "uncheck", "disable", "disabled"}
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    """Interpret a field value as a checkbox toggle. None = not boolean-like."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    text = _norm(value)
+    if text in _TRUTHY_VALUES:
+        return True
+    if text in _FALSY_VALUES:
+        return False
+    return None
+
+
+async def _observe_now(page) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run the observe JS and commit it to the element maps."""
+    result = await page.evaluate(_OBSERVE_JS)
+    return _remember_observation(result)
+
+
+async def _act_on_element(page, element_id: str, action: str, value: Any = None) -> str | None:
+    """Perform click/fill/select on a mapped element. Returns error text or None."""
+    selector = _element_map.get(element_id)
+    if not selector:
+        return f"no selector mapped for {element_id}"
+    locator = page.locator(selector).first
+    try:
+        await locator.scroll_into_view_if_needed(timeout=6000)
+        if action == "click":
+            await locator.click(timeout=6000)
+        elif action == "select":
+            label = str(value)
+            try:
+                await locator.select_option(label=label, timeout=6000)
+            except Exception:
+                await locator.select_option(value=label, timeout=6000)
+        else:
+            await locator.fill(str(value), timeout=6000)
+        return None
+    except Exception as e:
+        return str(e)
+
+
+async def _fill_one_field(page, intent: str, raw_value: Any, mode: str) -> dict[str, Any]:
+    """Resolve one field description and apply its value.
+
+    Handles four shapes:
+      - text inputs / textareas        -> fill
+      - checkboxes (boolean-ish value) -> click to reach desired state
+      - radio groups (option value)    -> resolve "<value> <intent>" and click
+      - selects                        -> select_option by label, then value
+    Falls back to Playwright's accessible-label lookup when the observation
+    map can't resolve the field.
+    """
+    entry: dict[str, Any] = {"intent": intent, "value": raw_value, "ok": False}
+    bool_value = _coerce_bool(raw_value)
+
+    resolved = _resolve_element(intent=intent, mode=mode, require_text_evidence=True)
+    el = _element_data_map.get(str(resolved.get("element_id") or "")) if resolved.get("ok") else None
+    roles = _role_candidates(el) if el else set()
+
+    # Option-valued field ("visibility" -> "private"): the specific option
+    # element matches "<value> <intent>" better than the group label does.
+    if bool_value is None and isinstance(raw_value, str) and raw_value.strip():
+        if el is None or "radio" in roles:
+            option = _resolve_element(
+                intent=f"{raw_value} {intent}",
+                preferred_roles=["radio", "checkbox"],
+                label_hints=[str(raw_value)],
+                text_hints=[str(raw_value)],
+                mode=mode,
+                require_text_evidence=True,
+                restrict_roles=True,
+            )
+            if option.get("ok"):
+                option_el = _element_data_map.get(str(option["element_id"]))
+                option_roles = _role_candidates(option_el or {})
+                if option_roles & {"radio", "checkbox"}:
+                    resolved, el, roles = option, option_el, option_roles
+
+    if el is not None:
+        element_id = str(el.get("id"))
+        entry["element_id"] = element_id
+        entry["confidence"] = resolved.get("confidence")
+        entry["matched_label"] = _debug_label(el)
+
+        if "radio" in roles:
+            entry["action"] = "click (radio)"
+            error = None if el.get("checked") else await _act_on_element(page, element_id, "click")
+        elif "checkbox" in roles:
+            desired = bool_value if bool_value is not None else True
+            entry["action"] = f"click (checkbox -> {'checked' if desired else 'unchecked'})"
+            if bool(el.get("checked")) == desired:
+                error = None
+            else:
+                error = await _act_on_element(page, element_id, "click")
+        elif roles & {"combobox", "listbox"} or el.get("tag") == "select":
+            entry["action"] = "select"
+            error = await _act_on_element(page, element_id, "select", raw_value)
+            if error:
+                entry["action"] = "fill (select fallback)"
+                error = await _act_on_element(page, element_id, "fill", raw_value)
+        else:
+            entry["action"] = "fill"
+            error = await _act_on_element(page, element_id, "fill", raw_value)
+
+        if error:
+            entry["error"] = error
+        else:
+            entry["ok"] = True
+        return entry
+
+    # Fallback: browser-native accessible-label lookup (covers labels the
+    # observation extractor missed). Text fields only — option semantics
+    # need the observation metadata.
+    if bool_value is None:
+        try:
+            pattern = re.compile(re.escape(_intent_focus(intent)), re.IGNORECASE)
+            locator = page.get_by_label(pattern).first
+            if await locator.count() > 0:
+                await locator.fill(str(raw_value), timeout=6000)
+                entry["ok"] = True
+                entry["action"] = "fill (accessible-label fallback)"
+                return entry
+        except Exception as e:
+            entry["fallback_error"] = str(e)
+
+    entry["error"] = f"could not resolve field: {resolved.get('reason') or 'no match'}"
+    entry["candidates"] = (resolved.get("candidates") or [])[:3]
+    return entry
+
+
+async def handle_web_fill_form(args: dict) -> str:
+    """Fill a whole form in one tool call: observe, resolve every field,
+    act, optionally submit, and report. Replaces 5-10 single-step calls."""
+    fields = args.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        return ("ERROR: 'fields' must be a non-empty object mapping field descriptions "
+                "to values, e.g. {\"repository name\": \"my-repo\", \"private\": true}.")
+    submit = str(args.get("submit") or "").strip()
+    mode = str(args.get("mode") or "normal")
+
+    page = await _page()
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+    except Exception:
+        pass
+    try:
+        await _observe_now(page)
+    except Exception as e:
+        return f"ERROR: could not observe the page before filling: {e}"
+
+    report: list[dict[str, Any]] = []
+    fields_ok = True
+    for intent, raw_value in fields.items():
+        entry = await _fill_one_field(page, str(intent), raw_value, mode)
+        report.append(entry)
+        if not entry.get("ok"):
+            fields_ok = False
+
+    submit_entry: dict[str, Any] | None = None
+    if submit:
+        if not fields_ok:
+            submit_entry = {
+                "intent": submit,
+                "ok": False,
+                "skipped": True,
+                "error": "skipped because one or more fields failed — fix them or submit manually",
+            }
+        else:
+            # Re-observe: filling often enables a previously disabled submit.
+            try:
+                await _observe_now(page)
+            except Exception:
+                pass
+            resolved = _resolve_element(
+                intent=submit,
+                preferred_roles=["button"],
+                require_enabled=True,
+                mode=mode,
+                require_text_evidence=True,
+                restrict_roles=True,
+            )
+            if resolved.get("ok"):
+                element_id = str(resolved["element_id"])
+                error = await _act_on_element(page, element_id, "click")
+                if error is None:
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=8000)
+                    except Exception:
+                        pass
+                submit_entry = {
+                    "intent": submit,
+                    "ok": error is None,
+                    "element_id": element_id,
+                    "confidence": resolved.get("confidence"),
+                }
+                if error:
+                    submit_entry["error"] = error
+            else:
+                submit_entry = {
+                    "intent": submit,
+                    "ok": False,
+                    "error": f"could not resolve an enabled submit target: {resolved.get('reason')}",
+                    "candidates": (resolved.get("candidates") or [])[:3],
+                }
+
+    final_state: dict[str, Any] = {}
+    try:
+        elements, diagnostics = await _observe_now(page)
+        final_state = {
+            "url": (_last_observation or {}).get("url", ""),
+            "title": (_last_observation or {}).get("title", ""),
+            "diagnostic_messages": diagnostics.get("messages", []),
+        }
+    except Exception:
+        try:
+            final_state = {"url": page.url}
+        except Exception:
+            pass
+
+    overall_ok = fields_ok and (submit_entry is None or bool(submit_entry.get("ok")))
+    payload = {
+        "ok": overall_ok,
+        "fields": report,
+        "submit": submit_entry,
+        "final_state": final_state,
+        "note": "element_ids from earlier observations are stale; call web_observe before further id-based actions.",
+    }
+    logger.info(
+        "web_fill_form ok=%s fields=%d failed=%d submit=%r",
+        overall_ok,
+        len(report),
+        sum(1 for r in report if not r.get("ok")),
+        submit or None,
+    )
+    return "FORM_FILL_REPORT\n" + json.dumps(payload, indent=2)
 
 
 async def handle_web_press(args: dict) -> str:

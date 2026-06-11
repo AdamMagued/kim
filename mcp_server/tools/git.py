@@ -45,7 +45,7 @@ def _validate_git_paths(paths: list[str], cwd: str) -> str | None:
     return None
 
 
-async def _run_git(*args: str, cwd: str = None, timeout: int = None) -> str:
+async def _run_git(*args: str, cwd: str | None = None, timeout: int | None = None) -> str:
     """
     Run a git command safely via create_subprocess_exec.
     Returns formatted output string with exit code, stdout, and stderr.
@@ -61,6 +61,7 @@ async def _run_git(*args: str, cwd: str = None, timeout: int = None) -> str:
     cmd = ["git"] + list(args)
     logger.info(f"git: {' '.join(cmd)} (cwd={resolved_cwd})")
 
+    proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -84,6 +85,12 @@ async def _run_git(*args: str, cwd: str = None, timeout: int = None) -> str:
             parts.append("(no output)")
         return "\n".join(parts)
     except asyncio.TimeoutError:
+        if proc is not None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                pass
         return f"ERROR: git command timed out after {resolved_timeout}s"
     except FileNotFoundError:
         return (
@@ -161,7 +168,7 @@ async def handle_git_commit(args: dict) -> str:
     Requires 'message' parameter.
     """
     cwd = args.get("cwd", str(PROJECT_ROOT))
-    message = args.get("message", "")
+    message = str(args.get("message") or "")
     if not message.strip():
         return "ERROR: Commit message is required. Provide a 'message' parameter."
     try:
@@ -179,7 +186,10 @@ async def handle_git_log(args: dict) -> str:
     - 'oneline' for compact output.
     """
     cwd = args.get("cwd", str(PROJECT_ROOT))
-    n = int(args.get("n", 10))
+    try:
+        n = max(1, int(args.get("n", 10)))
+    except (TypeError, ValueError):
+        n = 10
     oneline = args.get("oneline", True)
     try:
         git_args = ["log", f"-{n}"]
@@ -200,7 +210,7 @@ async def handle_git_checkout(args: dict) -> str:
     - 'create' if True, creates a new branch (-b flag).
     """
     cwd = args.get("cwd", str(PROJECT_ROOT))
-    target = args.get("target", "")
+    target = str(args.get("target") or "")
     create = args.get("create", False)
     if not target.strip():
         return "ERROR: 'target' parameter is required (branch name or file path)."

@@ -127,7 +127,7 @@ class OllamaProvider(BaseProvider):
         messages: list[dict],
         tools: list[dict],
         system: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         model = await self._resolve_selected_model()
         await self._ensure_daemon_running()
         await self._validate_model(model)
@@ -278,14 +278,22 @@ class OllamaProvider(BaseProvider):
 
     def _to_ollama_messages(self, messages: list[dict], system: str) -> list[dict]:
         out: list[dict] = []
+        # Assign a unique id to each assistant tool call and reuse it on the
+        # matching tool-result message, so strict servers can pair them. The
+        # pending pair is (tool_name, call_id) for the most recent unanswered call.
+        call_seq = 0
+        pending_call: tuple[str, str] | None = None
         if system.strip():
             out.append({"role": "system", "content": system})
         for msg in messages:
             role = str(msg.get("role") or "user")
             content = msg.get("content")
             if role == "assistant" and isinstance(content, str):
-                native_tool_call = _assistant_tool_call_message(content)
+                native_tool_call = _assistant_tool_call_message(content, call_id=f"call_{call_seq}")
                 if native_tool_call:
+                    call_seq += 1
+                    tc = native_tool_call["tool_calls"][0]
+                    pending_call = (tc["function"]["name"], tc["id"])
                     out.append(native_tool_call)
                     continue
             if isinstance(content, list):
@@ -311,15 +319,17 @@ class OllamaProvider(BaseProvider):
                 if images:
                     converted["images"] = images
                 else:
-                    tool_result = _tool_result_message(role, converted["content"])
+                    tool_result = _tool_result_message(role, converted["content"], pending=pending_call)
                     if tool_result:
+                        pending_call = None
                         out.append(tool_result)
                         continue
                 out.append(converted)
             else:
                 text = str(content or "")
-                tool_result = _tool_result_message(role, text)
+                tool_result = _tool_result_message(role, text, pending=pending_call)
                 if tool_result:
+                    pending_call = None
                     out.append(tool_result)
                     continue
                 out.append({"role": role, "content": text})
@@ -401,11 +411,12 @@ class OllamaProvider(BaseProvider):
         if final_obj is None:
             raise RuntimeError("Ollama stream ended without a final done response.")
 
-        final_message = final_obj.get("message") if isinstance(final_obj.get("message"), dict) else {}
+        _raw_msg = final_obj.get("message")
+        final_message: dict = _raw_msg if isinstance(_raw_msg, dict) else {}
         if not pieces and isinstance(final_message.get("content"), str):
             pieces.append(str(final_message.get("content") or ""))
         if not tool_calls and isinstance(final_message.get("tool_calls"), list):
-            tool_calls = [x for x in final_message.get("tool_calls") if isinstance(x, dict)]
+            tool_calls = [x for x in (final_message.get("tool_calls") or []) if isinstance(x, dict)]
         return final_obj, "".join(pieces).strip(), tool_calls
 
     async def _usage_from_final(self, final_obj: dict[str, Any], model: str) -> dict[str, Any]:
@@ -507,7 +518,7 @@ def _normalize_tool_arguments(raw: Any) -> dict[str, Any]:
     return {}
 
 
-def _assistant_tool_call_message(raw_content: str) -> dict[str, Any] | None:
+def _assistant_tool_call_message(raw_content: str, call_id: str | None = None) -> dict[str, Any] | None:
     try:
         parsed = json.loads(raw_content)
     except json.JSONDecodeError:
@@ -519,23 +530,27 @@ def _assistant_tool_call_message(raw_content: str) -> dict[str, Any] | None:
         return None
     args = _normalize_tool_arguments(parsed.get("args"))
     content = str(parsed.get("content") or "").strip()
+    tool_call: dict[str, Any] = {
+        "type": "function",
+        "function": {
+            "index": 0,
+            "name": name,
+            "arguments": args,
+        },
+    }
+    tool_call["id"] = call_id if call_id else name
     return {
         "role": "assistant",
         "content": content,
-        "tool_calls": [
-            {
-                "type": "function",
-                "function": {
-                    "index": 0,
-                    "name": name,
-                    "arguments": args,
-                },
-            }
-        ],
+        "tool_calls": [tool_call],
     }
 
 
-def _tool_result_message(role: str, text: str) -> dict[str, Any] | None:
+def _tool_result_message(
+    role: str,
+    text: str,
+    pending: tuple[str, str] | None = None,
+) -> dict[str, Any] | None:
     if role != "user":
         return None
     match = re.match(r"^\s*\[Tool result:\s*([A-Za-z0-9_.:-]+)\]\s*\n?([\s\S]*)$", text)
@@ -545,9 +560,12 @@ def _tool_result_message(role: str, text: str) -> dict[str, Any] | None:
     body = match.group(2).strip()
     if not name:
         return None
+    # Reuse the id of the pending tool call when names match; orphan results
+    # (resumed sessions, trimmed history) fall back to the tool name.
+    call_id = pending[1] if pending and pending[0] == name else name
     return {
         "role": "tool",
-        "tool_name": name,
+        "tool_call_id": call_id,
         "content": body,
     }
 

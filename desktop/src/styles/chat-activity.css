@@ -1,0 +1,495 @@
+/* Working indicator */
+.kim-working-indicator {
+  max-width: 720px;
+  margin: 16px auto 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 4px;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 400;
+  animation: kim-fade-in 0.25s ease;
+}
+.kim-working-indicator__dots {
+  display: inline-flex;
+  gap: 3px;
+}
+.kim-working-indicator__dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: kim-dots-bounce 1.2s ease-in-out infinite;
+}
+.kim-working-indicator__dots span:nth-child(2) { animation-delay: 0.15s; }
+.kim-working-indicator__dots span:nth-child(3) { animation-delay: 0.3s; }
+.kim-working-indicator__timer {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--text-subtle);
+  letter-spacing: 0.02em;
+}
+
+/* Thinking header — sits above the live activity feed while a task runs */
+.kim-thinking-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.kim-thinking-header__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: kim-pulse 1.4s ease-in-out infinite;
+}
+.kim-thinking-header__label {
+  font-weight: 500;
+  color: var(--text-strong);
+}
+.kim-thinking-header__timer {
+  margin-left: auto;
+  font-family: "JetBrains Mono", "SF Mono", monospace;
+  font-size: 11px;
+  color: var(--text-subtle);
+}
+
+/* V7 hybrid stream — thinking row + live panel */
+.kim-thinking-header--stream {
+  width: 100%;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.kim-thinking-header__lead {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.kim-thinking-header__trail {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--text-subtle);
+}
+.kim-thinking-header--stream .kim-thinking-header__timer {
+  margin-left: 0;
+}
+.kim-thinking-header__sep {
+  opacity: 0.55;
+  user-select: none;
+}
+.kim-thinking-header__steps {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.kim-bubble--live-stream {
+  max-width: 100%;
+  width: 100%;
+  background: color-mix(in srgb, var(--bg-elevated) 88%, var(--accent-muted));
+  border: 1px solid color-mix(in srgb, var(--border) 80%, var(--accent) 12%);
+  box-shadow: var(--shadow-xs);
+}
+
+/* Inline plan card (Chat · collapsible plan mock) */
+.kim-plan-live {
+  margin: 0 0 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-card) 70%, transparent);
+  overflow: hidden;
+}
+.kim-plan-live__toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: color-mix(in srgb, var(--bg-card) 50%, transparent);
+  padding: 8px 10px 8px 8px;
+  font: inherit;
+  cursor: pointer;
+  color: var(--text);
+  transition: background 0.12s ease;
+}
+.kim-plan-live__toggle:hover {
+  background: var(--bg-card-hover);
+}
+.kim-plan-live__chev {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  transform: rotate(0deg);
+  transition: transform 0.16s ease;
+}
+.kim-plan-live__toggle.is-expanded .kim-plan-live__chev {
+  transform: rotate(90deg);
+}
+.kim-plan-live__title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-strong);
+}
+.kim-plan-live__progress {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.kim-plan-live__list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 10px 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.kim-plan-live__step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text);
+  transition: color 0.18s ease;
+}
+.kim-plan-live__idx {
+  flex-shrink: 0;
+  min-width: 1.25rem;
+  width: 1.25rem;
+  height: 1.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-subtle);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-card);
+  box-sizing: border-box;
+  transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+}
+.kim-plan-live__text {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-muted);
+  transition: color 0.18s ease;
+}
+
+/* ── Step states (structured plans only) ──────────────────────────────── */
+/* Completed steps: filled accent circle with a check glyph, faded text. */
+.kim-plan-live__step--done .kim-plan-live__idx {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-foreground, #fff);
+}
+.kim-plan-live__step--done .kim-plan-live__text {
+  color: var(--text-subtle);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--text-subtle) 60%, transparent);
+}
+
+/* Active step: hollow ring with a pulsing dot inside, primary text colour. */
+.kim-plan-live__step--active .kim-plan-live__idx {
+  background: transparent;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.kim-plan-live__step--active .kim-plan-live__text {
+  color: var(--text-strong, var(--text));
+  font-weight: 500;
+}
+.kim-plan-live__active-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: kim-plan-pulse 1.2s ease-in-out infinite;
+}
+@keyframes kim-plan-pulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.85); }
+  50%      { opacity: 1.0; transform: scale(1.0); }
+}
+
+/* Pending steps inherit the base muted look. */
+.kim-plan-live__step--pending .kim-plan-live__idx {
+  color: var(--text-subtle);
+}
+
+/* Worked-for chip — collapsible disclosure showing a completed run's activity */
+.kim-worked-for {
+  margin: 6px 0 8px;
+  max-width: 100%;
+}
+.kim-worked-for__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px 4px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.kim-worked-for__chip:hover {
+  background: var(--bg-card-hover);
+  color: var(--text-strong);
+}
+.kim-worked-for__chevron {
+  transition: transform 140ms ease;
+}
+.kim-worked-for__chip.is-expanded .kim-worked-for__chevron {
+  transform: rotate(90deg);
+}
+.kim-worked-for__panel {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-card) 50%, transparent);
+  animation: kim-menu-in 140ms ease-out;
+}
+.kim-activity-feed--archive {
+  opacity: 0.85;
+}
+
+/* File pills — compact badges showing touched files under each run's answer */
+.kim-file-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 720px;
+  padding: 4px 0 8px;
+  animation: kim-fade-in 0.2s ease;
+}
+.kim-file-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-card) 60%, transparent);
+  color: var(--text-muted);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.kim-file-pill__name {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--text);
+}
+.kim-file-pill__stats {
+  display: inline-flex;
+  gap: 4px;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.kim-file-pill__stat-add {
+  color: var(--success, #16a34a);
+}
+.kim-file-pill__stat-del {
+  color: var(--danger, #dc2626);
+}
+
+/* Activity feed — replaces raw log output */
+.kim-activity-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.kim-activity-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  animation: kim-fade-in 0.18s ease;
+}
+.kim-activity-item--tool {
+  color: var(--text);
+}
+.kim-activity-item--status {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.kim-activity-item--info {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.kim-activity-item--error {
+  background: var(--danger-muted);
+  color: var(--danger-hover);
+  border-radius: 8px;
+  padding: 7px 12px;
+}
+.kim-activity-item--success {
+  color: var(--success, #16a34a);
+  font-weight: 500;
+}
+.kim-activity-item--cancelled {
+  color: var(--warning);
+  font-weight: 500;
+}
+.kim-activity-item__icon {
+  flex-shrink: 0;
+  font-size: 14px;
+  line-height: 1;
+  width: 20px;
+  text-align: center;
+}
+.kim-activity-item__text {
+  flex: 1;
+  word-break: break-word;
+}
+.kim-activity-item__text code,
+.kim-activity-item__text strong {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  background: var(--bg-inset);
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: var(--text-strong);
+}
+/* Render backtick-wrapped text as inline code */
+.kim-activity-item__text {
+  /* rendered via dangerouslySetInnerHTML or via parseMarkdown below;
+     styles above cover the code tag if we inject it */
+}
+
+/* Task error banner */
+.kim-task-error {
+  max-width: 720px;
+  margin: 12px auto 0;
+  background: var(--danger-muted);
+  border: 1px solid rgba(143, 74, 74, 0.28);
+  border-radius: 10px;
+  padding: 10px 14px;
+  color: var(--danger-hover);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  animation: kim-scale-in 0.2s ease;
+}
+.kim-task-error__retry {
+  margin-left: auto;
+  border: 1px solid rgba(143, 74, 74, 0.35);
+  background: rgba(255, 255, 255, 0.6);
+  color: var(--danger-hover);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.dark .kim-task-error__retry {
+  background: rgba(25, 25, 30, 0.45);
+}
+.kim-task-error__retry:hover {
+  border-color: var(--danger);
+}
+.dark .kim-task-error { color: var(--danger-hover); }
+.kim-task-error__icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--danger);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.kim-hitl-status {
+  max-width: 720px;
+  margin: 10px auto 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: var(--text);
+  font-size: 13px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  animation: kim-scale-in 0.2s ease;
+}
+.kim-hitl-status--denied {
+  border-color: rgba(143, 74, 74, 0.28);
+  background: var(--danger-muted);
+}
+.kim-hitl-status__label {
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 18px;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+.kim-hitl-status__body {
+  min-width: 0;
+  line-height: 1.45;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.kim-queue-indicator {
+  max-width: 720px;
+  margin: 10px auto 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.kim-jump-latest-wrap {
+  max-width: 720px;
+  margin: 12px auto 0;
+  display: flex;
+  justify-content: center;
+}
+
+.kim-jump-latest-btn {
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.kim-jump-latest-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+

@@ -5,9 +5,12 @@ Uses function calling (tools API) for structured responses.
 Transforms canonical messages/tools to OpenAI format and back.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
+from typing import Any
 
 import openai
 
@@ -65,7 +68,7 @@ class OpenAIProvider(BaseProvider):
         messages: list[dict],
         tools: list[dict],
         system: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         oai_messages = [{"role": "system", "content": system}] + self._to_oai_messages(messages)
         oai_tools = self._to_oai_tools(tools)
 
@@ -140,12 +143,20 @@ class OpenAIProvider(BaseProvider):
         choice = response.choices[0]
         msg = choice.message
 
-        # Extract token usage
+        # Extract token usage.
+        # OpenAI's prompt_tokens INCLUDES cached_tokens (cache_read is a subset, not additive).
+        # cache_creation_tokens is not reported by OpenAI — always 0.
+        # Note: DeepSeek (subclass) reports cache via prompt_cache_hit_tokens at the top level
+        # rather than prompt_tokens_details.cached_tokens, so cache_read_tokens will be 0 for
+        # DeepSeek even when caching is active — known limitation, fix in a later slice.
         usage = {}
         if hasattr(response, "usage") and response.usage:
+            details = getattr(response.usage, "prompt_tokens_details", None)
             usage = {
                 "input": getattr(response.usage, "prompt_tokens", 0),
                 "output": getattr(response.usage, "completion_tokens", 0),
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": (getattr(details, "cached_tokens", 0) or 0) if details else 0,
             }
 
         if msg.tool_calls:
