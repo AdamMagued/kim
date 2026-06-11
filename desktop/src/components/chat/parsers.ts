@@ -1,4 +1,4 @@
-import type { ActivityItem, LivePlanParsed, ProviderUsageState } from './types';
+import type { ActivityItem, LivePlanParsed } from './types';
 import type { TraceItem, WorkedForTraceItem, WorkedForToolKind } from '../kim-ui';
 import { cleanActivityText, parseAnswerLine, friendlyError, parseLogLine } from './utils';
 
@@ -99,29 +99,9 @@ export function traceToWorkedFor(trace: TraceItem[]): WorkedForTraceItem[] {
   return result;
 }
 
-// ── State Parsing Helpers ──────────────────────────────────────────────────
-
-export interface ContextState {
-  cumulative_input: number;
-  budget: number;
-  phase: string;
-  percent: number;
-  last_input: number;
-  last_output: number;
-  source: string;
-  estimate: boolean;
-}
-
-export interface TokenStats {
-  input: number;
-  output: number;
-  total: number;
-}
+// ── Parsed line discriminated union ──────────────────────────────────────────
 
 export type ParsedAgentLine =
-  | { type: 'stats'; payload: TokenStats }
-  | { type: 'context'; payload: ContextState }
-  | { type: 'usage'; payload: ProviderUsageState }
   | { type: 'answer'; payload: string }
   | { type: 'codex_agent_message'; payload: string }
   | { type: 'codex_reasoning'; payload: string }
@@ -129,75 +109,11 @@ export type ParsedAgentLine =
   | { type: 'codex_ignored' }
   | { type: 'error'; payload: string }
   | { type: 'diff'; payload: { path: string; added: number; removed: number } }
-  | { type: 'screenshot_flash' }
-  | { type: 'show_window' }
   | { type: 'need_help'; payload: string }
   | { type: 'activity_item'; payload: ActivityItem }
   | { type: 'none' };
 
 export function parseAgentLine(line: string, id: number): ParsedAgentLine {
-  // Handle [STATS] token lines — update token counter, don't add to feed
-  const statsMatch = line.match(/\[STATS\]\s+input_tokens=(\d+)\s+output_tokens=(\d+)\s+total_tokens=(\d+)/);
-  if (statsMatch) {
-    return {
-      type: 'stats',
-      payload: {
-        input: parseInt(statsMatch[1]),
-        output: parseInt(statsMatch[2]),
-        total: parseInt(statsMatch[3]),
-      },
-    };
-  }
-
-  // `source` may contain ':' or '.' (e.g. "BrowserProvider:compact"), so the
-  // class must cover every value _print_context_json / to_log_line can emit.
-  const ctxMatch = line.match(/\[CONTEXT\]\s+cumulative_input=(\d+)\s+budget=(\d+)\s+phase=(\w+)\s+percent=(\d+)\s+last_input=(\d+)\s+last_output=(\d+)\s+source=([a-zA-Z0-9_.:\-]+)\s+estimate=(\d)/);
-  if (ctxMatch) {
-    return {
-      type: 'context',
-      payload: {
-        cumulative_input: parseInt(ctxMatch[1]),
-        budget: parseInt(ctxMatch[2]),
-        phase: ctxMatch[3],
-        percent: parseInt(ctxMatch[4]),
-        last_input: parseInt(ctxMatch[5]),
-        last_output: parseInt(ctxMatch[6]),
-        source: ctxMatch[7],
-        estimate: ctxMatch[8] === '1',
-      },
-    };
-  }
-
-  if (line.startsWith('[USAGE] ')) {
-    try {
-      const parsed = JSON.parse(line.slice(8)) as Record<string, unknown>;
-      const input = typeof parsed.input === 'number' ? parsed.input : undefined;
-      const output = typeof parsed.output === 'number' ? parsed.output : undefined;
-      return {
-        type: 'usage',
-        payload: {
-          provider: String(parsed.provider ?? parsed.source ?? 'unknown'),
-          model: typeof parsed.model === 'string' ? parsed.model : undefined,
-          mode: typeof parsed.mode === 'string' ? parsed.mode : undefined,
-          input,
-          output,
-          total: typeof input === 'number' && typeof output === 'number' ? input + output : undefined,
-          usage_available: Boolean(parsed.usage_available),
-          tokens_per_second: typeof parsed.tokens_per_second === 'number' ? parsed.tokens_per_second : undefined,
-          context_limit: typeof parsed.context_limit === 'number' ? parsed.context_limit : undefined,
-          context_limit_source: typeof parsed.context_limit_source === 'string' ? parsed.context_limit_source : undefined,
-          billing: typeof parsed.billing === 'string' ? parsed.billing : undefined,
-          total_duration: typeof parsed.total_duration === 'number' ? parsed.total_duration : undefined,
-          load_duration: typeof parsed.load_duration === 'number' ? parsed.load_duration : undefined,
-          prompt_eval_duration: typeof parsed.prompt_eval_duration === 'number' ? parsed.prompt_eval_duration : undefined,
-          eval_duration: typeof parsed.eval_duration === 'number' ? parsed.eval_duration : undefined,
-        },
-      };
-    } catch {
-      // Ignore malformed usage lines.
-    }
-  }
-
   // [ANSWER] is a final assistant message from the Codex browser bridge.
   const answerText = parseAnswerLine(line);
   if (answerText !== null) {
@@ -232,17 +148,6 @@ export function parseAgentLine(line: string, id: number): ParsedAgentLine {
       }
       if (parsed.type === 'thread.started' || parsed.type === 'turn.started' || parsed.type === 'turn.completed') {
         return { type: 'codex_ignored' };
-      }
-      // Kim lifecycle events handled via typed IPC (kim:run-done / kim:provider-error).
-      // Must be explicitly silenced here so the raw JSON line never leaks into the
-      // activity feed via the legacy kim-agent-output dual-emit path.
-      if (
-        parsed.type === 'run_done' ||
-        parsed.type === 'provider_error' ||
-        parsed.type === 'hitl_approval_request' ||
-        parsed.type === 'hitl_approval_result'
-      ) {
-        return { type: 'none' };
       }
 
       const errorMsg = (parsed.error ?? '').trim();
@@ -280,13 +185,6 @@ export function parseAgentLine(line: string, id: number): ParsedAgentLine {
         removed: parseInt(diffMatch[3]),
       },
     };
-  }
-
-  if (line.includes('[UI] SCREENSHOT_FLASH')) {
-    return { type: 'screenshot_flash' };
-  }
-  if (line.includes('[UI] SHOW')) {
-    return { type: 'show_window' };
   }
 
   const item = parseLogLine(line, id);
