@@ -510,28 +510,28 @@ class KimAgent:
         compact_ctx = self.memory.compact_summary
         if compact_ctx:
             system_prompt = compact_ctx + "\n\n---\n\n" + system_prompt
-        consecutive_continues = 0
-        _last_tool_name: Optional[str] = None
+        self._run_consecutive_continues: int = 0
+        self._run_last_tool: Optional[str] = None
 
         first_msg = {"role": "user", "content": f"Task: {task}"}
         self.memory.add_user(f"Task: {task}")
         self._session_store.append_message(first_msg)
 
-        last_screenshot_b64 = ""
+        self._run_screenshot_b64: str = ""
 
         for iteration in range(1, self.max_iterations + 1):
             # ── Cancellation check ──────────────────────────────────────
             if self._is_cancelled():
                 self._log("WARN", "Task cancelled by user")
-                return self._complete_run(make_run_result(AgentTermination.CANCELLED, "Cancelled by user", last_screenshot_b64))
+                return self._complete_run(make_run_result(AgentTermination.CANCELLED, "Cancelled by user", self._run_screenshot_b64))
 
             self._log("INFO", f"--- Iteration {iteration}/{self.max_iterations} ---")
             try:
                 self._session_store.append_checkpoint(
                     iteration=iteration,
                     phase="iteration_start",
-                    last_tool_name=_last_tool_name,
-                    consecutive_continues=consecutive_continues,
+                    last_tool_name=self._run_last_tool,
+                    consecutive_continues=self._run_consecutive_continues,
                 )
             except Exception:
                 pass  # trace write must never abort the agent run
@@ -564,7 +564,7 @@ class KimAgent:
                 need_help = f"NEED_HELP: LLM provider call failed after retries: {e}"
                 self.memory.add_assistant(need_help)
                 self._session_store.append_message({"role": "assistant", "content": need_help})
-                return self._complete_run(make_run_result(AgentTermination.PROVIDER_FAILED, need_help, last_screenshot_b64))
+                return self._complete_run(make_run_result(AgentTermination.PROVIDER_FAILED, need_help, self._run_screenshot_b64))
 
             # ── Track token/context usage ────────────────────────────────
             self._track_context_usage(
@@ -578,268 +578,16 @@ class KimAgent:
 
             # ── Tool call ────────────────────────────────────────────────
             if response["type"] == "tool_call":
-                self._emit_plan_markers(str(response.get("content", "")))
-                consecutive_continues = 0
-                raw_tool_name = response["tool"]
-                tool_name = _normalize_tool_name(raw_tool_name)
-                tool_args = response.get("args", {})
-                if raw_tool_name != tool_name:
-                    self._log("INFO", f"Normalized tool name '{raw_tool_name}' -> '{tool_name}'")
-                self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]})")
-                print(f"[TOOL] {tool_name}({json.dumps(tool_args)[:120]})", flush=True)
-
-                # Model tried to call task_complete as a tool — treat it as TASK_COMPLETE: text
-                if tool_name in ("task_complete", "TASK_COMPLETE"):
-                    summary = (
-                        tool_args.get("message")
-                        or tool_args.get("summary")
-                        or tool_args.get("result")
-                        or str(tool_args)
-                    )
-                    self._log("INFO", f"task_complete tool intercepted → TASK_COMPLETE: {summary}")
-                    return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, summary, last_screenshot_b64))
-
-                if tool_name == "batch":
-                    calls = tool_args.get("calls", [])
-                    if not isinstance(calls, list):
-                        self._session_store.append_message(
-                            {"role": "user", "content": "[Tool result: batch]\nERROR: 'calls' must be a list."})
-                        continue
-
-                    _BATCH_SAFE = {"read_file", "list_dir", "git_status", "git_diff",
-                                   "git_log", "search_in_files", "find_files",
-                                   "get_screen_info", "get_windows", "observe_ui"}
-                    batch_results = []
-                    aborted_after = -1
-                    ok = True
-
-                    assistant_msg = {"role": "assistant", "content": json.dumps(response)}
-                    self.memory.add_assistant(json.dumps(response))
-                    self._session_store.append_message(assistant_msg)
-
-                    for idx, call in enumerate(calls):
-                        raw_sub_tool = call.get("tool")
-                        sub_tool = _normalize_tool_name(raw_sub_tool)
-                        sub_args = call.get("args", {})
-
-                        if sub_tool not in _BATCH_SAFE:
-                            batch_results.append(
-                                f"Call {idx} ({raw_sub_tool}): ERROR: Tool '{raw_sub_tool}' "
-                                f"is not safe for batching. Allowed: {', '.join(_BATCH_SAFE)}."
-                            )
-                            ok = False
-                            aborted_after = idx
-                            break
-
-                        if self._is_preview_mode() and self._ui_bridge:
-                            confirmed = await self._ui_bridge.confirm_action(sub_tool, sub_args)
-                            if not confirmed:
-                                batch_results.append(f"Call {idx} ({sub_tool}): ERROR: Denied by user.")
-                                ok = False
-                                aborted_after = idx
-                                break
-
-                        try:
-                            sub_result = await self._execute_tool(sub_tool, sub_args)
-                            batch_results.append(f"Call {idx} ({sub_tool}):\n{sub_result}")
-                        except Exception as e:
-                            batch_results.append(f"Call {idx} ({sub_tool}): ERROR: {e}")
-                            ok = False
-                            aborted_after = idx
-                            break
-
-                    summary_obj = {"ok": ok}
-                    if not ok:
-                        summary_obj["aborted_after"] = aborted_after
-                    result_text = json.dumps(summary_obj) + "\n\n" + "\n---\n".join(batch_results)
-                    self._log("INFO", f"Batch result: {result_text[:200]}")
-
-                    user_content = f"[Tool result: batch]\n{result_text}"
-                    self.memory.add_user(user_content)
-                    self._session_store.append_message({"role": "user", "content": user_content})
-                    continue
-
-                # Preview mode — pause and ask for confirmation
-                if self._is_preview_mode() and self._ui_bridge:
-                    self._log("INFO", f"[Preview] Waiting for confirmation: {tool_name}")
-                    confirmed = await self._ui_bridge.confirm_action(tool_name, tool_args)
-                    if not confirmed:
-                        self._log("WARN", f"Action denied by user: {tool_name}")
-                        self.memory.add_user(
-                            f"[User denied the action: {tool_name}]. "
-                            "Choose a different approach that does not require this action."
-                        )
-                        continue
-
-                assistant_msg = {"role": "assistant", "content": json.dumps(response)}
-                self.memory.add_assistant(json.dumps(response))
-                self._session_store.append_message(assistant_msg)
-
-                # Execute via MCP
-                result_text = await self._execute_tool(tool_name, tool_args)
-                _last_tool_name = tool_name
-                self._log("INFO", f"Result: {result_text[:200]}")
-
-                if tool_name == "web_open" and result_text.startswith("AUTH_FAILED:"):
-                    summary = (
-                        "NEED_HELP: The website rejected the supplied login credentials, "
-                        "so the page content is not accessible yet."
-                    )
-                    self.memory.add_user(f"[Tool result: {tool_name}]\n{result_text}")
-                    self._session_store.append_message(
-                        {"role": "user", "content": f"[Tool result: {tool_name}]\n{result_text}"}
-                    )
-                    self.memory.add_assistant(summary)
-                    self._session_store.append_message({"role": "assistant", "content": summary})
-                    return self._complete_run(make_run_result(
-                        AgentTermination.NEED_HELP, summary, last_screenshot_b64,
-                    ))
-
-                # Only include a screenshot if the LLM explicitly called take_screenshot
-                if tool_name == "take_screenshot":
-                    screenshot_b64 = result_text
-                    if screenshot_b64.startswith("data:image/png;base64,"):
-                        screenshot_b64 = screenshot_b64[len("data:image/png;base64,"):]
-                    last_screenshot_b64 = screenshot_b64
-
-                    # Stuck detection
-                    if self._is_stuck(screenshot_b64) and iteration > 3:
-                        self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
-                        return self._complete_run(make_run_result(
-                            AgentTermination.STUCK,
-                            "STUCK: Screen not changing after repeated actions.",
-                            screenshot_b64,
-                        ))
-
-                    user_content = [
-                        {"type": "text", "text": f"[Tool result: {tool_name}]\nScreenshot captured."},
-                        {"type": "image", "data": screenshot_b64, "media_type": "image/png"},
-                    ]
-                    self.memory.add_user(user_content, has_screenshot=True)
-                    self._session_store.append_message({"role": "user", "content": user_content})
-
-                elif tool_name == "take_annotated_screenshot":
-                    # Parse the JSON result to extract annotated image + grid
-                    try:
-                        ann_data = json.loads(result_text)
-                    except (json.JSONDecodeError, TypeError):
-                        ann_data = {}
-
-                    ann_image_b64 = ann_data.get("image", "")
-                    if ann_image_b64.startswith("data:image/png;base64,"):
-                        ann_image_b64 = ann_image_b64[len("data:image/png;base64,"):]
-                    last_screenshot_b64 = ann_image_b64
-
-                    # Build text context with the grid mapping + instructions
-                    grid_map = ann_data.get("grid", {})
-                    instructions = ann_data.get("instructions", "")
-                    screen_w = ann_data.get("screen_width", "?")
-                    screen_h = ann_data.get("screen_height", "?")
-                    grid_text = (
-                        f"[Tool result: {tool_name}]\n"
-                        f"Annotated screenshot captured (screen: {screen_w}×{screen_h}).\n"
-                        f"{instructions}\n\n"
-                        f"Grid marker coordinates (label → [x, y] in real screen pixels):\n"
-                        f"{json.dumps(grid_map, separators=(',', ':'))}"
-                    )
-
-                    if ann_image_b64:
-                        user_content = [
-                            {"type": "text", "text": grid_text},
-                            {"type": "image", "data": ann_image_b64, "media_type": "image/png"},
-                        ]
-                        self.memory.add_user(user_content, has_screenshot=True)
-                        self._session_store.append_message({"role": "user", "content": user_content})
-                    else:
-                        # Fallback: no image, just text
-                        self.memory.add_user(grid_text)
-                        self._session_store.append_message({"role": "user", "content": grid_text})
-
-                else:
-                    user_content = f"[Tool result: {tool_name}]\n{result_text}"
-                    self.memory.add_user(user_content)
-                    self._session_store.append_message({"role": "user", "content": user_content})
-
-                # ── Loop guard: same call, same args, same result, 3x ────
-                if self._note_repeated_action(tool_name, tool_args, result_text):
-                    nudge = (
-                        "[Loop guard] You have made the same tool call with identical "
-                        "arguments and received an identical result 3 times in a row. "
-                        "This approach is not working — change strategy: use a different "
-                        "tool or different arguments, or stop and ask via NEED_HELP."
-                    )
-                    self._log("WARN", "Repeated identical action 3x — nudging model to change approach")
-                    self.memory.add_user(nudge)
-                    self._session_store.append_message({"role": "user", "content": nudge})
+                _phase_result = await self._handle_tool_response(response, iteration)
+                if _phase_result is not None:
+                    return _phase_result
                 continue
 
             # ── Text response ────────────────────────────────────────────
             if response["type"] == "text":
-                content = str(response.get("content", "")).strip()
-
-                # Strip "Thought for Xs" reasoning preamble that some models prepend.
-                content = re.sub(r'^Thought for \d+s\s*\n?', '', content, flags=re.IGNORECASE).strip()
-
-                # Some models (e.g. gpt-oss:20b) cannot use native tool_calls and
-                # instead emit {"tool": "...", "args": {...}} as plain text.
-                # Parse and execute it so it never pollutes chat history.
-                _json_call = _extract_json_tool_call(content)
-                if _json_call:
-                    # Keep only the thinking narration (strip the raw JSON blob).
-                    thinking = (content[:_json_call['start']] + content[_json_call['end']:]).strip()
-                    if thinking:
-                        self.memory.add_assistant(thinking)
-                        self._session_store.append_message({"role": "assistant", "content": thinking})
-                        self._emit_plan_markers(thinking)
-                    tool_name = _normalize_tool_name(_json_call['tool'])
-                    tool_args = _json_call['args']
-                    self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]}) [text-json]")
-                    print(f"[TOOL] {tool_name}({json.dumps(tool_args)[:120]})", flush=True)
-                    consecutive_continues = 0
-                    result_text = await self._execute_tool(tool_name, tool_args)
-                    _last_tool_name = tool_name
-                    user_content = f"[Tool result: {tool_name}]\n{result_text}"
-                    self.memory.add_user(user_content)
-                    self._session_store.append_message({"role": "user", "content": user_content})
-                    continue
-
-                self.memory.add_assistant(content)
-                self._session_store.append_message({"role": "assistant", "content": content})
-
-                # Surface PLAN: / STEP n: markers as [STATUS] events so the
-                # frontend's plan-checklist UI can render them live. We emit a
-                # structured JSON blob inside the status line; the frontend
-                # parser picks it up via parseLogLine.
-                self._emit_plan_markers(content)
-
-                _tc = re.search(r"\bTASK_COMPLETE:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
-                if _tc:
-                    summary = _tc.group(1).strip()
-                    self._log("DEBUG", f"TASK_COMPLETE: {summary}")
-                    await self._generate_and_save_summary(task, summary)
-                    return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, summary, last_screenshot_b64))
-
-                _nh = re.search(r"\bNEED_HELP:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
-                if _nh:
-                    reason = _nh.group(1).strip()
-                    self._log("DEBUG", f"NEED_HELP: {reason}")
-                    return self._complete_run(make_run_result(AgentTermination.NEED_HELP, f"NEED_HELP: {reason}", last_screenshot_b64))
-
-                self._log("DEBUG", f"Text (continuing): {content[:120]}")
-
-                consecutive_continues += 1
-                if consecutive_continues >= 3:
-                    msg = "NEED_HELP: Model is stuck in a conversational loop without calling tools."
-                    self._log("WARN", msg)
-                    return self._complete_run(make_run_result(AgentTermination.CONVERSATIONAL_LOOP, msg, last_screenshot_b64))
-
-                # Remind the model to emit TASK_COMPLETE if the task is done,
-                # or call a tool if more work is needed. Never allow a bare conversational reply.
-                self.memory.add_user(
-                    "If the task is complete or the question has been answered, respond with: "
-                    "TASK_COMPLETE: <one-sentence summary>. "
-                    "If more work is needed, call the next tool — do not reply with conversational text. "
-                    "For UI state, use observe_ui first; avoid screenshots unless essential.")
+                _phase_result = await self._handle_text_response(response, task)
+                if _phase_result is not None:
+                    return _phase_result
                 continue
 
         self._log("WARN", f"Max iterations ({self.max_iterations}) reached")
@@ -847,8 +595,278 @@ class KimAgent:
             AgentTermination.MAX_ITERATIONS,
             f"Reached maximum iterations ({self.max_iterations}) without completing. "
             'Progress is saved in this chat — send "continue" to resume from where Kim left off.',
-            last_screenshot_b64,
+            self._run_screenshot_b64,
         ))
+
+    # ------------------------------------------------------------------
+    # Run-loop phase handlers (called from run())
+    # ------------------------------------------------------------------
+
+    async def _handle_tool_response(self, response: dict, iteration: int) -> Optional[dict]:
+        """Handle one tool-call response. Returns None to continue, or a run-result dict to exit."""
+        self._emit_plan_markers(str(response.get("content", "")))
+        self._run_consecutive_continues = 0
+        raw_tool_name = response["tool"]
+        tool_name = _normalize_tool_name(raw_tool_name)
+        tool_args = response.get("args", {})
+        if raw_tool_name != tool_name:
+            self._log("INFO", f"Normalized tool name '{raw_tool_name}' -> '{tool_name}'")
+        self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]})")
+        print(f"[TOOL] {tool_name}({json.dumps(tool_args)[:120]})", flush=True)
+
+        # Model tried to call task_complete as a tool — treat it as TASK_COMPLETE: text
+        if tool_name in ("task_complete", "TASK_COMPLETE"):
+            summary = (
+                tool_args.get("message")
+                or tool_args.get("summary")
+                or tool_args.get("result")
+                or str(tool_args)
+            )
+            self._log("INFO", f"task_complete tool intercepted → TASK_COMPLETE: {summary}")
+            return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, summary, self._run_screenshot_b64))
+
+        if tool_name == "batch":
+            calls = tool_args.get("calls", [])
+            if not isinstance(calls, list):
+                self._session_store.append_message(
+                    {"role": "user", "content": "[Tool result: batch]\nERROR: 'calls' must be a list."})
+                return None
+
+            _BATCH_SAFE = {"read_file", "list_dir", "git_status", "git_diff",
+                           "git_log", "search_in_files", "find_files",
+                           "get_screen_info", "get_windows", "observe_ui"}
+            batch_results = []
+            aborted_after = -1
+            ok = True
+
+            assistant_msg = {"role": "assistant", "content": json.dumps(response)}
+            self.memory.add_assistant(json.dumps(response))
+            self._session_store.append_message(assistant_msg)
+
+            for idx, call in enumerate(calls):
+                raw_sub_tool = call.get("tool")
+                sub_tool = _normalize_tool_name(raw_sub_tool)
+                sub_args = call.get("args", {})
+
+                if sub_tool not in _BATCH_SAFE:
+                    batch_results.append(
+                        f"Call {idx} ({raw_sub_tool}): ERROR: Tool '{raw_sub_tool}' "
+                        f"is not safe for batching. Allowed: {', '.join(_BATCH_SAFE)}."
+                    )
+                    ok = False
+                    aborted_after = idx
+                    break
+
+                if self._is_preview_mode() and self._ui_bridge:
+                    confirmed = await self._ui_bridge.confirm_action(sub_tool, sub_args)
+                    if not confirmed:
+                        batch_results.append(f"Call {idx} ({sub_tool}): ERROR: Denied by user.")
+                        ok = False
+                        aborted_after = idx
+                        break
+
+                try:
+                    sub_result = await self._execute_tool(sub_tool, sub_args)
+                    batch_results.append(f"Call {idx} ({sub_tool}):\n{sub_result}")
+                except Exception as e:
+                    batch_results.append(f"Call {idx} ({sub_tool}): ERROR: {e}")
+                    ok = False
+                    aborted_after = idx
+                    break
+
+            summary_obj = {"ok": ok}
+            if not ok:
+                summary_obj["aborted_after"] = aborted_after
+            result_text = json.dumps(summary_obj) + "\n\n" + "\n---\n".join(batch_results)
+            self._log("INFO", f"Batch result: {result_text[:200]}")
+
+            user_content = f"[Tool result: batch]\n{result_text}"
+            self.memory.add_user(user_content)
+            self._session_store.append_message({"role": "user", "content": user_content})
+            return None
+
+        # Preview mode — pause and ask for confirmation
+        if self._is_preview_mode() and self._ui_bridge:
+            self._log("INFO", f"[Preview] Waiting for confirmation: {tool_name}")
+            confirmed = await self._ui_bridge.confirm_action(tool_name, tool_args)
+            if not confirmed:
+                self._log("WARN", f"Action denied by user: {tool_name}")
+                self.memory.add_user(
+                    f"[User denied the action: {tool_name}]. "
+                    "Choose a different approach that does not require this action."
+                )
+                return None
+
+        assistant_msg = {"role": "assistant", "content": json.dumps(response)}
+        self.memory.add_assistant(json.dumps(response))
+        self._session_store.append_message(assistant_msg)
+
+        # Execute via MCP
+        result_text = await self._execute_tool(tool_name, tool_args)
+        self._run_last_tool = tool_name
+        self._log("INFO", f"Result: {result_text[:200]}")
+
+        if tool_name == "web_open" and result_text.startswith("AUTH_FAILED:"):
+            summary = (
+                "NEED_HELP: The website rejected the supplied login credentials, "
+                "so the page content is not accessible yet."
+            )
+            self.memory.add_user(f"[Tool result: {tool_name}]\n{result_text}")
+            self._session_store.append_message(
+                {"role": "user", "content": f"[Tool result: {tool_name}]\n{result_text}"}
+            )
+            self.memory.add_assistant(summary)
+            self._session_store.append_message({"role": "assistant", "content": summary})
+            return self._complete_run(make_run_result(
+                AgentTermination.NEED_HELP, summary, self._run_screenshot_b64,
+            ))
+
+        # Only include a screenshot if the LLM explicitly called take_screenshot
+        if tool_name == "take_screenshot":
+            screenshot_b64 = result_text
+            if screenshot_b64.startswith("data:image/png;base64,"):
+                screenshot_b64 = screenshot_b64[len("data:image/png;base64,"):]
+            self._run_screenshot_b64 = screenshot_b64
+
+            # Stuck detection
+            if self._is_stuck(screenshot_b64) and iteration > 3:
+                self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
+                return self._complete_run(make_run_result(
+                    AgentTermination.STUCK,
+                    "STUCK: Screen not changing after repeated actions.",
+                    screenshot_b64,
+                ))
+
+            user_content = [
+                {"type": "text", "text": f"[Tool result: {tool_name}]\nScreenshot captured."},
+                {"type": "image", "data": screenshot_b64, "media_type": "image/png"},
+            ]
+            self.memory.add_user(user_content, has_screenshot=True)
+            self._session_store.append_message({"role": "user", "content": user_content})
+
+        elif tool_name == "take_annotated_screenshot":
+            # Parse the JSON result to extract annotated image + grid
+            try:
+                ann_data = json.loads(result_text)
+            except (json.JSONDecodeError, TypeError):
+                ann_data = {}
+
+            ann_image_b64 = ann_data.get("image", "")
+            if ann_image_b64.startswith("data:image/png;base64,"):
+                ann_image_b64 = ann_image_b64[len("data:image/png;base64,"):]
+            self._run_screenshot_b64 = ann_image_b64
+
+            # Build text context with the grid mapping + instructions
+            grid_map = ann_data.get("grid", {})
+            instructions = ann_data.get("instructions", "")
+            screen_w = ann_data.get("screen_width", "?")
+            screen_h = ann_data.get("screen_height", "?")
+            grid_text = (
+                f"[Tool result: {tool_name}]\n"
+                f"Annotated screenshot captured (screen: {screen_w}×{screen_h}).\n"
+                f"{instructions}\n\n"
+                f"Grid marker coordinates (label → [x, y] in real screen pixels):\n"
+                f"{json.dumps(grid_map, separators=(',', ':'))}"
+            )
+
+            if ann_image_b64:
+                user_content = [
+                    {"type": "text", "text": grid_text},
+                    {"type": "image", "data": ann_image_b64, "media_type": "image/png"},
+                ]
+                self.memory.add_user(user_content, has_screenshot=True)
+                self._session_store.append_message({"role": "user", "content": user_content})
+            else:
+                # Fallback: no image, just text
+                self.memory.add_user(grid_text)
+                self._session_store.append_message({"role": "user", "content": grid_text})
+
+        else:
+            user_content = f"[Tool result: {tool_name}]\n{result_text}"
+            self.memory.add_user(user_content)
+            self._session_store.append_message({"role": "user", "content": user_content})
+
+        # ── Loop guard: same call, same args, same result, 3x ────
+        if self._note_repeated_action(tool_name, tool_args, result_text):
+            nudge = (
+                "[Loop guard] You have made the same tool call with identical "
+                "arguments and received an identical result 3 times in a row. "
+                "This approach is not working — change strategy: use a different "
+                "tool or different arguments, or stop and ask via NEED_HELP."
+            )
+            self._log("WARN", "Repeated identical action 3x — nudging model to change approach")
+            self.memory.add_user(nudge)
+            self._session_store.append_message({"role": "user", "content": nudge})
+        return None
+
+    async def _handle_text_response(self, response: dict, task: str) -> Optional[dict]:
+        """Handle one text response. Returns None to continue, or a run-result dict to exit."""
+        content = str(response.get("content", "")).strip()
+
+        # Strip "Thought for Xs" reasoning preamble that some models prepend.
+        content = re.sub(r'^Thought for \d+s\s*\n?', '', content, flags=re.IGNORECASE).strip()
+
+        # Some models (e.g. gpt-oss:20b) cannot use native tool_calls and
+        # instead emit {"tool": "...", "args": {...}} as plain text.
+        # Parse and execute it so it never pollutes chat history.
+        _json_call = _extract_json_tool_call(content)
+        if _json_call:
+            # Keep only the thinking narration (strip the raw JSON blob).
+            thinking = (content[:_json_call['start']] + content[_json_call['end']:]).strip()
+            if thinking:
+                self.memory.add_assistant(thinking)
+                self._session_store.append_message({"role": "assistant", "content": thinking})
+                self._emit_plan_markers(thinking)
+            tool_name = _normalize_tool_name(_json_call['tool'])
+            tool_args = _json_call['args']
+            self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]}) [text-json]")
+            print(f"[TOOL] {tool_name}({json.dumps(tool_args)[:120]})", flush=True)
+            self._run_consecutive_continues = 0
+            result_text = await self._execute_tool(tool_name, tool_args)
+            self._run_last_tool = tool_name
+            user_content = f"[Tool result: {tool_name}]\n{result_text}"
+            self.memory.add_user(user_content)
+            self._session_store.append_message({"role": "user", "content": user_content})
+            return None
+
+        self.memory.add_assistant(content)
+        self._session_store.append_message({"role": "assistant", "content": content})
+
+        # Surface PLAN: / STEP n: markers as [STATUS] events so the
+        # frontend's plan-checklist UI can render them live. We emit a
+        # structured JSON blob inside the status line; the frontend
+        # parser picks it up via parseLogLine.
+        self._emit_plan_markers(content)
+
+        _tc = re.search(r"\bTASK_COMPLETE:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
+        if _tc:
+            summary = _tc.group(1).strip()
+            self._log("DEBUG", f"TASK_COMPLETE: {summary}")
+            await self._generate_and_save_summary(task, summary)
+            return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, summary, self._run_screenshot_b64))
+
+        _nh = re.search(r"\bNEED_HELP:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
+        if _nh:
+            reason = _nh.group(1).strip()
+            self._log("DEBUG", f"NEED_HELP: {reason}")
+            return self._complete_run(make_run_result(AgentTermination.NEED_HELP, f"NEED_HELP: {reason}", self._run_screenshot_b64))
+
+        self._log("DEBUG", f"Text (continuing): {content[:120]}")
+
+        self._run_consecutive_continues += 1
+        if self._run_consecutive_continues >= 3:
+            msg = "NEED_HELP: Model is stuck in a conversational loop without calling tools."
+            self._log("WARN", msg)
+            return self._complete_run(make_run_result(AgentTermination.CONVERSATIONAL_LOOP, msg, self._run_screenshot_b64))
+
+        # Remind the model to emit TASK_COMPLETE if the task is done,
+        # or call a tool if more work is needed. Never allow a bare conversational reply.
+        self.memory.add_user(
+            "If the task is complete or the question has been answered, respond with: "
+            "TASK_COMPLETE: <one-sentence summary>. "
+            "If more work is needed, call the next tool — do not reply with conversational text. "
+            "For UI state, use observe_ui first; avoid screenshots unless essential.")
+        return None
 
     # ------------------------------------------------------------------
     # MCP helpers
