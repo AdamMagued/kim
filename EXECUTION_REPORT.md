@@ -15,7 +15,7 @@ Last updated: 2026-06-11
 | V-8 | justfile + KIM_FAKE=1 offline mode + `@pytest.mark.slow` | `e2f00f3` | ✅ Done |
 | V-6 | Invariant tests (prompt render, tool registry, Code-tab constraint, CSS order) | `eccb3ee` | ✅ Done |
 | V-5 | `make_test_agent` factory in `conftest.py` | `ed23360` | ✅ Done |
-| V-1 | Kill dual-emit for Kim-agent path; remove dead text parsers (`[STATS]`/`[CONTEXT]`/`[USAGE]`/`[UI]`); clean useChatStream dead cases | TBD | ✅ Done |
+| V-1 | Kill dual-emit for Kim-agent path; remove dead text parsers (`[STATS]`/`[CONTEXT]`/`[USAGE]`/`[UI]`); clean useChatStream dead cases | `5a8268f` | ✅ Done |
 | V-2 | ProviderResponse TypedDict contract + pyright in CI | `a7fff3d` | ✅ Done |
 
 ### Track B — Production Polish
@@ -199,7 +199,7 @@ Last updated: 2026-06-11
 ### Track A
 - [x] V-2: `ProviderResponse` TypedDict + pyright in CI — ✅ Done (`a7fff3d`)
 - [x] V-3: Golden-transcript seam test + provider contract suite — ✅ Done (`e0aca6d`)
-- [x] V-1: Kill dual-emit (Kim-agent path) + dead text parsers — ✅ Done (TBD commit)
+- [x] V-1: Kill dual-emit (Kim-agent path) + dead text parsers — ✅ Done (`5a8268f`)
 - [ ] V-1 (partial): schema-first codegen — `events.schema.json` → `events.gen.ts` + `npm run gen:events` + CI drift check (intentionally deferred — no value-add until event schema stabilizes)
 - [x] V-3: golden-transcript Rust↔Python seam test + provider contract suite — ✅ Done
 - [ ] V-4: split ChatView.tsx, decompose agent.py loop, split chat.css
