@@ -38,6 +38,20 @@ Last updated: 2026-06-10
 | ID | Title | Commit | Status |
 |----|-------|--------|--------|
 | fix | Import fix: `from tests.conftest` → `from conftest` (ultralytics namespace collision) | `642a488` | ✅ Done |
+| fix | CI workflow YAML invalid since V-2 — pyright step used plain scalar for multi-line script | `75897ee` | ✅ Done |
+| fix | First real CI run fallout — pyright `# type: ignore` suppressions, clippy `allow(too_many_arguments)`, CLI session-id millisecond-collision bug | `4bbb1f1` | ✅ Done |
+| fix | Flake8 backlog from first real CI run — unused imports, long lines, F822 lazy-export suppression | `0d3b771` | ✅ Done |
+
+---
+
+## Baseline test counts (as of `0d3b771`, branch head entering new session 2026-06-11)
+
+| Suite | Count | Notes |
+|-------|-------|-------|
+| `python -m pytest tests/` | 884 passed, **1 failed**, 8 skipped | The 1 failure (`test_run_command_default_uses_requested_cwd`) is a macOS case-insensitive-FS artifact: `PROJECT_ROOT` resolves to `Desktop/kimFork/...` but `pwd` returns canonical `desktop/kimFORK/...`. CI (Linux) is unaffected — remote run `0d3b771` is green. Pre-existing from parent branch `d58f19e`. |
+| `cd desktop && npm run test` | 41 passed | |
+| `cd desktop/src-tauri && cargo test` | 54 passed | |
+| `cd cli && cargo test` | 90 passed | |
 
 ---
 
