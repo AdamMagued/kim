@@ -209,4 +209,6 @@ def create_provider(name: str, config: dict) -> BaseProvider:
     if name == "fake":
         from orchestrator.providers.fake import FakeProvider
         return FakeProvider()
-    raise ValueError(f"Unknown provider: {name!r}. Choose from: claude, openai, gemini, deepseek, browser, ollama, fake")
+    raise ValueError(
+        f"Unknown provider: {name!r}. Choose from: claude, openai, gemini, deepseek, browser, ollama, fake"
+    )

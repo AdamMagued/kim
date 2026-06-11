@@ -10,7 +10,6 @@ Usage:
 """
 
 import argparse
-import asyncio
 import json
 import logging
 import sys
@@ -87,7 +86,8 @@ async def _cli_main(args: argparse.Namespace) -> None:
     # Typed JSON line: parsed by KimEvent::RunDone in Rust subprocess.rs and
     # forwarded as kim:run-done to the frontend.  Emitted before the human-readable
     # [STATUS] line so Rust sees it while the process is still running.
-    print(json.dumps({"type": "run_done", "termination": termination, "success": bool(result["success"])}, separators=(",", ":"), ensure_ascii=False), flush=True)
+    run_done = {"type": "run_done", "termination": termination, "success": bool(result["success"])}
+    print(json.dumps(run_done, separators=(",", ":"), ensure_ascii=False), flush=True)
     # Human-readable line for legacy kim-agent-output path and activity feed.
     print(f"[STATUS] run ended: {termination}", flush=True)
     print(f"\n[{status}] {result['summary']}")

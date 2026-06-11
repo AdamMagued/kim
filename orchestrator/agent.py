@@ -29,7 +29,6 @@ Programmatic usage:
         result = await agent.run("open Chrome")
 """
 
-import argparse
 import asyncio
 import base64
 import hashlib
@@ -39,16 +38,13 @@ import json
 import logging
 import os
 import platform
-import queue
 import random
 import re
 import secrets
-import sys
-import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -111,7 +107,6 @@ _OS_NAME, _LAUNCH_EXAMPLE, _PATH_STYLE = _detect_os()
 # Tool name normalization (extracted to orchestrator/tool_utils.py)
 # ---------------------------------------------------------------------------
 from orchestrator.tool_utils import (  # noqa: E402
-    _TOOL_NAME_ALIASES,
     _normalize_tool_name,
     _extract_json_tool_call,
 )
@@ -120,7 +115,7 @@ from orchestrator.tool_utils import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # UIBridge (extracted to orchestrator/ui_bridge.py)
 # ---------------------------------------------------------------------------
-from orchestrator.ui_bridge import UIBridge, UIBridgeLogHandler  # noqa: E402
+from orchestrator.ui_bridge import UIBridge  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +150,7 @@ def _resolve_hitl_threshold(config: dict, env_val: Optional[str] = None) -> Opti
 # ---------------------------------------------------------------------------
 # MCP client (extracted to orchestrator/mcp_client.py)
 # ---------------------------------------------------------------------------
-from orchestrator.mcp_client import MultiMCPClient, mcp_session_context  # noqa: E402
+from orchestrator.mcp_client import mcp_session_context  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
