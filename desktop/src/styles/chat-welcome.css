@@ -1,0 +1,142 @@
+/* Empty welcome (no session selected) — redesigned to match chat interface mockup */
+.kim-empty-welcome {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--text-muted);
+  padding: 40px;
+  animation: kim-fade-in 0.4s ease;
+}
+.kim-empty-welcome__icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
+  background: var(--accent-muted);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 8px;
+}
+.kim-empty-welcome__glow { display: none; }
+.kim-empty-welcome__title {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-strong);
+  letter-spacing: -0.02em;
+}
+.kim-empty-welcome__subtitle {
+  font-size: 14px;
+  color: var(--text-muted);
+  max-width: 360px;
+  text-align: center;
+}
+.kim-empty-welcome__kbd-hint {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-subtle);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* New-chat empty — quiet greeting */
+.kim-chat__output {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px 24px 20px;
+  min-height: 0;
+}
+
+.kim-chat__output > * {
+  animation: kim-soft-rise 0.26s cubic-bezier(.2,.8,.2,1) both;
+}
+
+.kim-provider-switch-wrap {
+  max-width: 720px;
+  margin: 0 auto 18px;
+}
+
+.kim-provider-switch-wrap--active {
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.kim-new-chat-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  max-width: 560px;
+  margin: clamp(72px, 15vh, 150px) auto 0;
+  animation: kim-slide-up 0.4s ease;
+}
+.kim-new-chat-empty__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 100px;
+  background: var(--accent-muted);
+  color: var(--accent);
+  letter-spacing: 0.01em;
+  margin-bottom: 14px;
+}
+.kim-new-chat-empty__title {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--text-strong);
+  letter-spacing: -0.03em;
+  margin-bottom: 8px;
+}
+.kim-new-chat-empty__subtitle {
+  font-size: 15px;
+  color: var(--text-muted);
+  line-height: 1.55;
+  margin-bottom: 0;
+  max-width: 460px;
+}
+
+/* App launch mock — shortcut chips under greeting */
+.kim-new-chat-empty--launch .kim-new-chat-empty__subtitle {
+  margin-bottom: 22px;
+}
+.kim-launch-shortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px 18px;
+  font-size: 12px;
+  color: var(--text-subtle);
+}
+.kim-launch-shortcuts--center {
+  justify-content: center;
+  margin-top: 6px;
+}
+.kim-launch-shortcuts .kim-kbd {
+  display: inline-block;
+  margin-right: 3px;
+}
+.kim-empty-welcome--launch .kim-launch-shortcuts {
+  margin-top: 16px;
+  justify-content: center;
+}
+.kim-kbd {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-card);
+  color: var(--text-muted);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+}
+

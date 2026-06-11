@@ -1,0 +1,351 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   CHAT VIEW
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.kim-chat {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: var(--kim-bg);
+  overflow: hidden;
+  min-height: 0;
+  position: relative;
+  isolation: isolate;
+  animation: kim-surface-enter 0.28s cubic-bezier(.2,.8,.2,1) both;
+  transform-origin: 50% 42%;
+}
+
+/* ── Chrome shader backdrop inside the chat pane ───────────────────────── */
+.kim-chat__backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.kim-chat__backdrop-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  opacity: 0.015;
+  mix-blend-mode: screen;
+  filter: saturate(0.72) contrast(1.04);
+  animation: kim-chat-backdrop-fade 1.4s ease both;
+}
+:root[data-theme="light"] .kim-chat__backdrop-canvas {
+  opacity: 0.010;
+  mix-blend-mode: multiply;
+}
+.kim-chat__backdrop-scrim {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(130% 90% at 50% 0%, transparent 0%, var(--bg) 65%),
+    linear-gradient(180deg, transparent 0%, var(--bg) 100%);
+  opacity: 0.88;
+}
+@keyframes kim-chat-backdrop-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Keep chat content above the backdrop */
+.kim-chat > *:not(.kim-chat__backdrop):not(.kim-connectors-layer) {
+  position: relative;
+  z-index: 1;
+}
+
+/* Topbar connectors button — replaces the old in-chat trigger and the theme
+   toggle. Compact 28×28 square with a 4-dot accent grid. */
+.kim-topbar__connectors-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
+}
+.kim-topbar__connectors-btn:hover {
+  background: var(--bg-card-hover);
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.kim-topbar__connectors-btn:active { transform: scale(0.96); }
+.kim-topbar__connectors-glyph {
+  position: relative;
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+}
+.kim-topbar__connectors-glyph::before,
+.kim-topbar__connectors-glyph::after,
+.kim-topbar__connectors-glyph span {
+  content: "";
+  position: absolute;
+  border-radius: 999px;
+  background: var(--accent);
+}
+.kim-topbar__connectors-glyph::before {
+  width: 6px;
+  height: 6px;
+  left: 0;
+  top: 0;
+}
+.kim-topbar__connectors-glyph::after {
+  width: 6px;
+  height: 6px;
+  right: 0;
+  bottom: 0;
+}
+.kim-topbar__connectors-glyph span:first-child {
+  width: 6px;
+  height: 6px;
+  right: 0;
+  top: 0;
+  opacity: 0.68;
+}
+.kim-topbar__connectors-glyph span:last-child {
+  width: 2px;
+  height: 11px;
+  left: 6px;
+  top: 2px;
+  transform: rotate(-45deg);
+  opacity: 0.45;
+}
+
+.kim-connectors-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  pointer-events: none;
+  animation: kim-connectors-layer-in 0.24s ease both;
+}
+.kim-connectors-layer.is-closing {
+  animation: kim-connectors-layer-out 0.26s ease both;
+}
+.kim-connectors-scrim {
+  position: fixed;
+  inset: 0;
+  border: 0;
+  background: rgba(14, 12, 10, 0.08);
+  cursor: default;
+  pointer-events: auto;
+  animation: kim-connectors-scrim-in 0.24s ease both;
+}
+.kim-connectors-layer.is-closing .kim-connectors-scrim {
+  animation: kim-connectors-scrim-out 0.26s ease both;
+}
+.kim-connectors-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: min(390px, calc(100vw - 44px));
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--sidebar-glass-border);
+  background: var(--connector-glass-bg);
+  box-shadow:
+    -16px 0 42px var(--sidebar-glass-shadow),
+    inset 1px 0 0 rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(30px) saturate(155%);
+  -webkit-backdrop-filter: blur(30px) saturate(155%);
+  pointer-events: auto;
+  animation: kim-connectors-in 0.28s cubic-bezier(0.19, 1, 0.22, 1) both;
+}
+.kim-connectors-layer.is-closing .kim-connectors-panel {
+  animation: kim-connectors-out 0.24s cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+@keyframes kim-connectors-layer-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes kim-connectors-layer-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes kim-connectors-scrim-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes kim-connectors-scrim-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes kim-connectors-in {
+  from { opacity: 0; transform: translateX(28px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes kim-connectors-out {
+  from { opacity: 1; transform: translateX(0); }
+  to { opacity: 0; transform: translateX(22px); }
+}
+.kim-connectors-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 22px 22px 16px;
+  border-bottom: 1px solid var(--sidebar-glass-border);
+}
+.kim-connectors-panel__title {
+  font-size: 20px;
+  line-height: 1.1;
+  font-weight: 700;
+  color: var(--text-strong);
+  letter-spacing: -0.02em;
+}
+.kim-connectors-panel__subtitle {
+  margin-top: 5px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.kim-connectors-panel__close {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--sidebar-glass-border) 86%, transparent);
+  background: color-mix(in srgb, var(--bg-card) 52%, transparent);
+  color: var(--text-muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.kim-connectors-panel__close:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-card-hover) 62%, transparent);
+}
+.kim-connectors-search {
+  display: block;
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--sidebar-glass-border);
+}
+.kim-connectors-search input {
+  width: 100%;
+  height: 36px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--sidebar-glass-border) 86%, transparent);
+  background: color-mix(in srgb, var(--bg-input) 68%, transparent);
+  color: var(--text);
+  padding: 0 11px;
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+.kim-connectors-search input:focus {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-glow);
+}
+.kim-connectors-search input::placeholder {
+  color: var(--text-subtle);
+}
+.kim-connectors-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 0 18px;
+}
+.kim-connector-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 86px;
+  padding: 13px 22px;
+  border-bottom: 1px solid color-mix(in srgb, var(--sidebar-glass-border) 78%, transparent);
+  background: transparent;
+  transition: background 0.14s ease;
+}
+.kim-connector-row:hover {
+  background: color-mix(in srgb, var(--bg-card-hover) 45%, transparent);
+}
+.kim-connector-row__icon {
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--sidebar-glass-border) 86%, transparent);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent-muted) 66%, transparent), color-mix(in srgb, var(--bg-card) 54%, transparent));
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  box-shadow: var(--shadow-xs);
+}
+.kim-connector-row__body {
+  min-width: 0;
+  flex: 1;
+}
+.kim-connector-row__name {
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--text-strong);
+  letter-spacing: -0.01em;
+}
+.kim-connector-row__desc {
+  margin-top: 4px;
+  max-width: 190px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+.kim-connector-row__action {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+}
+.kim-connector-connect {
+  height: 34px;
+  min-width: 116px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 0 10px 0 14px;
+  border: 0;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-card-hover) 72%, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  opacity: 0.78;
+}
+.kim-connector-connect__divider {
+  width: 1px;
+  align-self: stretch;
+  background: color-mix(in srgb, var(--border-strong) 72%, transparent);
+}
+.kim-connector-connect__chevron {
+  font-size: 18px;
+  line-height: 1;
+  color: var(--text-muted);
+  transform: translateY(-1px);
+}
+.kim-connector-item__actions {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-subtle);
+}
+.kim-connectors-empty {
+  padding: 30px 10px;
+  text-align: center;
+  color: var(--text-subtle);
+  font-size: 13px;
+}
+

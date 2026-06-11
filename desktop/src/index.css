@@ -7,7 +7,13 @@
 @import './styles/animations.css';
 @import './styles/shell.css';
 @import './styles/sidebar.css';
-@import './styles/chat.css';
+@import './styles/chat-base.css';
+@import './styles/chat-welcome.css';
+@import './styles/chat-activity.css';
+@import './styles/chat-composer.css';
+@import './styles/chat-providers.css';
+@import './styles/chat-session.css';
+@import './styles/chat-messages.css';
 @import './styles/tool-cards.css';
 @import './styles/theme-toggle.css';
 @import './styles/settings.css';
