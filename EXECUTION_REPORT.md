@@ -202,7 +202,7 @@ Last updated: 2026-06-11
 - [x] V-1: Kill dual-emit (Kim-agent path) + dead text parsers — ✅ Done (`5a8268f`)
 - [ ] V-1 (partial): schema-first codegen — `events.schema.json` → `events.gen.ts` + `npm run gen:events` + CI drift check (intentionally deferred — no value-add until event schema stabilizes)
 - [x] V-3: golden-transcript Rust↔Python seam test + provider contract suite — ✅ Done
-- [x] V-4: split ChatView.tsx, decompose agent.py loop, split chat.css — ✅ Done (see below)
+- [x] V-4: split ChatView.tsx, decompose agent.py loop, split chat.css — ✅ Done (V-4b complete; V-4a MessageList PARTIAL — see below)
 
 ### Track B
 - [x] P1-3: approval-gate UI round-trip + permission mode toggle — ✅ Done
@@ -351,6 +351,7 @@ Remote CI: green on `2c5fc16` (HEAD at session start).
 
 ## Commit list (`git log --oneline kim-improvement..production-roadmap`, end of session)
 ```
+9dc15af V-4b report: update EXECUTION_REPORT for phase-method extraction
 a08e1b4 V-4b (2/2): extract _handle_tool_response + _handle_text_response from run() loop
 b5caa76 II-G: Code tab backend proposal + EXECUTION_REPORT + delete mission brief
 beedf1f V-4c: split chat.css (2448 lines) into 7 per-component files
