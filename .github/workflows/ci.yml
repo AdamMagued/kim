@@ -142,16 +142,17 @@ jobs:
             pytest-asyncio
 
       - name: pyright (basic type check — orchestrator/providers + mcp_server)
-        run: pyright --outputjson | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-errs = [e for e in d.get('generalDiagnostics', []) if e['severity'] == 'error']
-if errs:
-    for e in errs:
-        print(e['file'] + ':' + str(e['range']['start']['line']+1) + ': ' + e['message'])
-    sys.exit(1)
-print('pyright: 0 errors')
-"
+        run: |
+          pyright --outputjson | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          errs = [e for e in d.get('generalDiagnostics', []) if e['severity'] == 'error']
+          if errs:
+              for e in errs:
+                  print(e['file'] + ':' + str(e['range']['start']['line']+1) + ': ' + e['message'])
+              sys.exit(1)
+          print('pyright: 0 errors')
+          "
 
       - name: flake8 lint (orchestrator)
         run: |
