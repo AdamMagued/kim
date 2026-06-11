@@ -1,0 +1,257 @@
+/* ── Sidebar delete action button ────────────────────────────────────────── */
+.kim-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 7px;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  transition: background 0.12s, opacity 0.12s;
+}
+.kim-action-btn--danger {
+  background: var(--danger);
+  color: #fff;
+}
+.kim-action-btn--danger:hover {
+  background: color-mix(in srgb, var(--danger) 85%, black);
+}
+.kim-action-btn--danger:active {
+  opacity: 0.85;
+}
+
+/* ── Session item edit mode ──────────────────────────────────────────────── */
+.kim-session-item--edit {
+  border-radius: 8px;
+  padding: 7px 8px;
+  transition: background 0.12s;
+}
+.kim-session-item--edit:hover {
+  background: var(--bg-card);
+}
+.kim-session-item--selected {
+  background: var(--danger-muted, rgba(239, 68, 68, 0.08));
+  border-left: 2px solid var(--danger);
+}
+
+/* ── Delete confirmation dialog ──────────────────────────────────────────── */
+.kim-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9000;
+  animation: kim-fade-in 0.15s ease;
+}
+@keyframes kim-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.kim-confirm-dialog {
+  width: 380px;
+  max-width: calc(100vw - 48px);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 28px 24px 20px;
+  box-shadow: var(--shadow-xl);
+  text-align: center;
+  animation: kim-scale-in 0.2s ease;
+}
+.kim-confirm-dialog__icon {
+  margin-bottom: 12px;
+}
+.kim-confirm-dialog__title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-strong);
+  margin-bottom: 8px;
+  letter-spacing: -0.02em;
+}
+.kim-confirm-dialog__text {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin-bottom: 20px;
+}
+.kim-confirm-dialog__actions {
+  display: flex;
+  gap: 8px;
+}
+.kim-confirm-dialog__btn {
+  flex: 1;
+  padding: 9px 16px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  transition: background 0.12s, opacity 0.12s;
+}
+.kim-confirm-dialog__btn--cancel {
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.kim-confirm-dialog__btn--cancel:hover {
+  background: var(--bg-card-hover);
+}
+.kim-confirm-dialog__btn--danger {
+  background: var(--danger);
+  color: #fff;
+}
+.kim-confirm-dialog__btn--danger:hover {
+  background: color-mix(in srgb, var(--danger) 85%, black);
+}
+.kim-confirm-dialog__btn--danger:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Send / Stop buttons */
+.kim-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+  font-family: inherit;
+}
+.kim-btn--send {
+  background: var(--accent);
+  color: #fff;
+}
+.kim-btn--send:hover:not(:disabled) {
+  background: var(--accent-gradient-hover);
+  box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  transform: translateY(-1px);
+}
+.kim-btn--send:active:not(:disabled) {
+  transform: translateY(0) scale(0.96);
+}
+.kim-btn--send:disabled {
+  background: var(--bg-card);
+  color: var(--text-subtle);
+  cursor: not-allowed;
+  box-shadow: none;
+}
+.kim-btn--stop {
+  background: var(--danger);
+  color: #fff;
+  box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  animation: kim-glow-pulse 1.6s ease-in-out infinite;
+}
+.kim-btn--stop:hover:not(:disabled) {
+  background: var(--danger-hover);
+  transform: translateY(-1px);
+}
+.kim-btn--stop-pending {
+  cursor: wait;
+  opacity: 0.8;
+  animation: none;
+}
+.kim-btn--attach {
+  background: transparent;
+  color: var(--kim-text-3);
+  border: none;
+  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border-radius: 6px;
+  height: 30px;
+  width: 30px;
+  flex-shrink: 0;
+  transition: color 0.15s, background 0.15s;
+}
+.kim-btn--attach:hover { color: var(--kim-text); background: var(--kim-surface); }
+
+/* ── Session header (existing session view) ───────────────────────────────── */
+.kim-session-header {
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  background: var(--bg-glass);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.kim-session-header__main { min-width: 0; flex: 1; }
+.kim-session-header__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.kim-session-header__id {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+  font-family: "JetBrains Mono", "SF Mono", monospace;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kim-session-header__meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.kim-session-header__dot { color: var(--text-subtle); }
+.kim-session-header__summary-tag {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--success-muted);
+  color: var(--success);
+}
+.kim-session-header__summary {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  margin-top: 8px;
+  max-width: 720px;
+  line-height: 1.5;
+  padding: 8px 12px;
+  background: var(--bg-card);
+  border-radius: 8px;
+  border-left: 3px solid var(--accent);
+}
+
+.kim-session-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 3px 8px;
+  border-radius: 5px;
+}
+.kim-session-badge--kim {
+  color: var(--accent);
+  background: var(--accent-muted);
+}
+.kim-session-badge--claw {
+  color: var(--accent-claw);
+  background: var(--accent-claw-muted);
+}
+
