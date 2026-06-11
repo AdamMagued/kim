@@ -1,9 +1,11 @@
 # MISSION_PROMPTS — run these in order, one per agent session
 
 Usage: tell your agent **"Open MISSION_PROMPTS.md and execute Prompt N exactly."**
-Each prompt is self-contained for a zero-context agent. Run them in order — later
-prompts assume earlier ones merged. After each prompt finishes, a human (or the
-reviewing agent) verifies before starting the next.
+Each prompt is self-contained for a zero-context agent.
+**Run order: 1 → 2 → 3 → 4 → 5 → 6 → 9 → 7 → 8** (1 and 2 are independent and may run
+in parallel worktrees; 7 is the big feature milestone; 8 is release prep, always last).
+After each prompt finishes, a human (or the reviewing agent) verifies before starting
+the next.
 
 ---
 
@@ -110,8 +112,15 @@ reviewing agent) verifies before starting the next.
 
 ## Prompt 4 — Installer batch: prebuilt-first, Python provisioning, root collision
 
-> Open MISSION_PROMPTS.md, read GLOBAL RULES, then fix audit items **A14, A15, C1** plus
-> A9's documentation. Specifics:
+> Open MISSION_PROMPTS.md, read GLOBAL RULES, then fix audit items **A14, A15, C1, D1**
+> plus A9's documentation. Specifics:
+> **D1** (`desktop/src-tauri/src/subprocess.rs find_python_interpreter`): `~/.kim_root`
+> is a FILE containing the checkout path, not a directory — delete the impossible
+> `~/.kim_root/venv/...` candidates and instead READ the file, then probe
+> `<contents>/venv/bin/python` (+ `.venv`, + Windows `Scripts\python.exe`). Unit-test
+> with a temp home: file → venv resolution; file pointing at a dir without venv → falls
+> through; no file → unchanged behavior. This is what makes A15's provisioned venv
+> actually get used by the desktop app.
 > **A14** (`cli/install.sh`): before falling back to `cargo build`, try downloading the
 > prebuilt `kim` binary from the latest GitHub release
 > (`https://github.com/AdamMagued/kim/releases` — assets named per release.yml's
@@ -203,6 +212,38 @@ reviewing agent) verifies before starting the next.
 > Definition of done: scripted REPL session shows a tool-using task (e.g. "list the
 > files in this folder and summarize the biggest one") executing real tools with visible
 > activity lines, a resumable session file, all four suites green, CI green.
+
+## Prompt 9 — Backend plumbing batch: bridge pairing, packaged logs, attachments, scheduler
+
+> Open MISSION_PROMPTS.md, read GLOBAL RULES, then fix audit items **D2, D3, D4, D5, D6**.
+> Specifics:
+> **D2** (`desktop/src-tauri/src/http_bridge.rs` + `cli/src/provider.rs`): make the CLI
+> and desktop pair by default. Desktop: whatever token it ends up using (env, .env, or
+> the random fallback) gets written to `~/.kim/bridge_token` with 0600 perms (overwrite
+> on every bridge start; document that it's a local-loopback credential). CLI
+> `bridge_token()`: env `KIM_API_KEY` first, then read that file. Add a `kim doctor`
+> line showing whether a bridge token source was found. Integration check: start the
+> desktop bridge locally with no env token and verify a CLI `/v1/task` round-trip
+> succeeds (or document precisely why it couldn't be tested).
+> **D3** (`orchestrator/cli.py` log setup): if `<repo_root>/logs` is not writable
+> (packaged/frozen mode), fall back to `~/.kim/logs`. Update the Settings "Reveal logs"
+> path resolution (`PaneInfo.tsx` + its Tauri command) to check both locations. Test:
+> monkeypatch an unwritable dir → logs land in the fallback.
+> **D4** (`desktop/src-tauri/src/feedback.rs save_attachment`): write each attachment to
+> a unique subdir (`kim_attachments/<unix-ms>-<rand>/<original-name>` — keep the original
+> filename for model readability), and sweep subdirs older than 7 days on each call.
+> Unit-test collision: two saves of `report.pdf` → two distinct paths, both readable.
+> **D5** (`desktop/src-tauri/src/session_commands.rs prune_sessions`): stop interpolating
+> the repo path into Python source — pass it via env var (`KIM_ROOT`) or argv and read it
+> in the snippet. Test with a path containing a quote char.
+> **D6** (new, smallest-possible scheduler loop): in Rust (`lib.rs` setup or a small
+> `scheduler.rs`), spawn a tokio interval (60s) that calls `schedule_commands::run_due_once`
+> when (a) a new `settings.schedules_enabled` flag is true (default true if schedules
+> exist), and (b) no agent task is currently running (reuse the existing running-task
+> tracking — never let a scheduled run stomp an interactive one; skip the tick instead).
+> Log each fired schedule to the activity/status channel. Add overlap protection (a
+> static AtomicBool guard). Cargo test for the guard logic; manual verification with a
+> 1-minute schedule documented in the report.
 
 ## Prompt 8 — Release hygiene: version bump, changelog, tag dry-run
 

@@ -239,6 +239,55 @@ different behavior; one appends `/v1`, one strips it. Consolidate.
 
 ---
 
+## D. Second-pass findings (Rust backend + plumbing, 2026-06-12)
+
+### D1 · P1 — `find_python_interpreter` treats `~/.kim_root` as a directory; it's a file
+`subprocess.rs` step 2 probes `~/.kim_root/venv/bin/python` etc. — but **both installers
+write `~/.kim_root` as a plain FILE containing the checkout path** (`echo "$PWD" >
+~/.kim_root`). Those candidates are impossible paths (you can't have children under a
+file) — the entire step is dead code, and the function **never reads the file** to locate
+the install checkout's venv. Consequence: a packaged app (no sidecar) or any run where
+`project_root` isn't the checkout itself falls through to system python, which lacks the
+orchestrator deps → agent fails to boot with an import error. Fix: read the file, resolve
+`<contents>/venv/bin/python`.
+
+### D2 · P1 — CLI ↔ desktop bridge token pairing is broken by default
+`/v1/task` (the CLI's desktop/browser-provider entry) is correctly gated on
+`X-Kim-Token`. But when `KIM_API_KEY` is missing from env/.env, the desktop **falls back
+to a random token** (http_bridge.rs:1709) and deliberately never writes it to disk —
+while the CLI only sends the header if *its own* env has `KIM_API_KEY`. Net: on a default
+setup, `kim` + `/login browser:claude` → every request 401s. Two products that are
+supposed to pair out of the box can't. Fix: desktop writes the active token to a 0600
+file (e.g. `~/.kim/bridge_token`), CLI reads env → that file, in that order.
+
+### D3 · P2 — Structured file logs break in packaged mode
+Log setup (`orchestrator/cli.py:62`) writes to `<repo_root>/logs` derived from
+`Path(__file__).parent.parent` — inside a frozen sidecar/.app bundle that's read-only, so
+setup throws and is silently `except`-ed to a debug message. Packaged users get no file
+logs and the Settings "Reveal logs" button points at nothing. Fix: fall back to a user
+data dir (`~/.kim/logs`) when the repo dir isn't writable.
+
+### D4 · P2 — Attachment storage: collisions, no cleanup
+`save_attachment` (feedback.rs) writes every attachment to the shared
+`$TMPDIR/kim_attachments/<original-filename>` — two different files named `report.pdf`
+(any session, any time) silently overwrite each other, and nothing ever cleans the
+directory. Fix: per-save unique subdir (timestamp/uuid) + retention sweep.
+
+### D5 · P3 — `prune_sessions` python snippet breaks on quote-in-path
+session_commands.rs interpolates `kim_root.display()` into a python raw string
+(`r"{root}"`) — a path containing `"` produces a syntax error. Use an env var or argv
+instead of source interpolation.
+
+### D6 · P1 — Scheduled tasks never fire on their own
+The whole scheduling subsystem (cron_store, schedule_commands, SchedulePane) is
+button-driven only: `run_due_scheduled_task` is invoked solely from the Settings pane
+(SchedulePane.tsx:497). There is **no background timer** in Rust or the frontend — a
+"scheduled" task runs only if the user opens Settings and clicks. Fix: a Tauri background
+interval (e.g. every 60s, gated on a setting) calling `run_due_once`, with overlap
+protection.
+
+---
+
 ## Ratings (out of 10)
 
 | Area | Score | One-liner |
