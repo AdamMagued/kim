@@ -759,10 +759,16 @@ pub(crate) async fn send_task(
                                 let _ = app.emit("kim:hitl-approval-result", serde_json::json!({"tool": tool, "approved": approved}));
                             }
                         }
+                    } else {
+                        // Not a typed KimEvent — forward on legacy channel for [TOOL] / [SUCCESS]
+                        // text lines that still come from the Kim-agent path (those do not JSON-parse
+                        // as KimEvent and carry real activity-feed content).
+                        let _ = app.emit("kim-agent-output", &line);
                     }
-                    // Always dual-emit on legacy channel so existing TypeScript parsers still run
-                    let _ = app.emit("kim-agent-output", &line);
                 } else {
+                    // Codex CLI subprocess path — all lines forwarded on the legacy channel.
+                    // Codex exec speaks item.completed JSONL + [STATUS] / [ANSWER] text protocol;
+                    // that output format is not under our control and cannot be schema-firsted.
                     let _ = app.emit("kim-agent-output", &line);
                 }
             }

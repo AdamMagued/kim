@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import type { ActivityItem, ProviderUsageState, PendingTask, HitlApprovalStatus } from '../components/chat/types';
+import type { ActivityItem, PendingTask, HitlApprovalStatus } from '../components/chat/types';
 import type { SessionInfo, Settings } from '../types';
 import { parseAgentLine, buildThinkingTrace } from '../components/chat/parsers';
 import { parsePlanFromActivity, browserSiteFromProvider } from '../components/chat/utils';
@@ -70,7 +70,6 @@ export function useChatStream({
   const [taskError, setTaskError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
-  const [providerUsage, setProviderUsage] = useState<ProviderUsageState | null>(null);
   const [contextState, setContextState] = useState<{ cumulative_input: number; budget: number; phase: string; percent: number; last_input: number; last_output: number; source: string; estimate: boolean } | null>(null);
   const [liveHistory, setLiveHistory] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
   const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
@@ -214,15 +213,6 @@ export function useChatStream({
     const parsed = parseAgentLine(line, id);
 
     switch (parsed.type) {
-      case 'stats':
-        setTokenStats(parsed.payload);
-        break;
-      case 'context':
-        setContextState(parsed.payload);
-        break;
-      case 'usage':
-        setProviderUsage(parsed.payload);
-        break;
       case 'answer':
       case 'codex_agent_message':
         answerReceivedThisRunRef.current = true;
@@ -271,17 +261,6 @@ export function useChatStream({
         });
         break;
       }
-      case 'screenshot_flash':
-        if (isRunningRef.current) {
-          invoke('show_screenshot_flash').catch(() => {});
-          invoke('set_task_active_mode', { active: true }).catch(() => {});
-        }
-        break;
-      case 'show_window':
-        if (isRunningRef.current) {
-          invoke('show_main_window').catch(() => {});
-        }
-        break;
       case 'need_help':
         needHelpFlagRef.current = true;
         setTaskError(parsed.payload);
@@ -580,8 +559,6 @@ export function useChatStream({
     setElapsed,
     tokenStats,
     setTokenStats,
-    providerUsage,
-    setProviderUsage,
     contextState,
     setContextState,
     liveHistory,

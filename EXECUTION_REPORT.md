@@ -1,7 +1,7 @@
 # Kim Production Roadmap — Execution Report
 
 Branch: `production-roadmap` off `kim-improvement`
-Last updated: 2026-06-10
+Last updated: 2026-06-11
 
 ---
 
@@ -15,6 +15,7 @@ Last updated: 2026-06-10
 | V-8 | justfile + KIM_FAKE=1 offline mode + `@pytest.mark.slow` | `e2f00f3` | ✅ Done |
 | V-6 | Invariant tests (prompt render, tool registry, Code-tab constraint, CSS order) | `eccb3ee` | ✅ Done |
 | V-5 | `make_test_agent` factory in `conftest.py` | `ed23360` | ✅ Done |
+| V-1 | Kill dual-emit for Kim-agent path; remove dead text parsers (`[STATS]`/`[CONTEXT]`/`[USAGE]`/`[UI]`); clean useChatStream dead cases | TBD | ✅ Done |
 | V-2 | ProviderResponse TypedDict contract + pyright in CI | `a7fff3d` | ✅ Done |
 
 ### Track B — Production Polish
@@ -148,6 +149,27 @@ Last updated: 2026-06-10
 - All relay code preserved: `PaneRelay` in `PaneInfo.tsx`, `relay.rs`, `relay.css`, relay capability still in `default.json`
 - `tests/test_invariants.py`: `TestRelayFeatureFlag` — verifies flag is false, code preserved, PaneId 'relay' exists
 
+### V-1 — Kill legacy dual-emit + dead text parsers
+- **Rust (`subprocess.rs`)**: `ipc_typed=true` branch no longer dual-emits typed `KimEvent` lines on `kim-agent-output`. Only non-KimEvent lines (legacy text: `[TOOL]`, `[SUCCESS]`, `[STATUS]`) are forwarded on the legacy channel. `ipc_typed=false` (Codex CLI path) is unchanged — all lines still forwarded on legacy channel.
+- **`parsers.ts`**: Removed dead parsing branches that were never reachable for Kim-agent stdout:
+  - `[STATS] input_tokens=...` text regex (goes to Python logger/stderr, not stdout)
+  - `[CONTEXT] cumulative_input=...` text regex (goes to Python logger/stderr)
+  - `[USAGE] {...}` prefix block (goes to Python logger/stderr)
+  - Explicit `run_done`/`provider_error`/`hitl_*` silencing (now handled at Rust level — never reaches `kim-agent-output`)
+  - `[UI] SCREENSHOT_FLASH` / `[UI] SHOW` text checks (agent emits JSON format; handled by `kim:ui` typed event)
+- **`ParsedAgentLine` type**: Removed `stats`, `context`, `usage`, `screenshot_flash`, `show_window` variants. Removed `ContextState`, `TokenStats` interfaces. Removed `ProviderUsageState` import.
+- **`useChatStream.ts`**: Removed dead `case 'stats':`, `case 'context':`, `case 'usage':`, `case 'screenshot_flash':`, `case 'show_window':` from `appendRaw`. Removed `providerUsage`/`setProviderUsage` state (was only set from dead `[USAGE]` path; no typed `kim:usage` event exists). UI state for context and stats is still set from the typed `kim:context` / `kim:stats` Tauri event listeners.
+- **`parsers.test.ts`**: Removed 4 dead tests for `[STATS]`, `[CONTEXT]` (×2), `[USAGE]` text formats.
+- **Test counts after V-1**: pytest 926/1/8 (unchanged); Vitest 62 passed (−4 dead text-format tests); Rust unchanged.
+
+### V-3 — Golden-transcript seam test + provider contract suite
+- Commit `e0aca6d`
+- `tests/test_v3_golden_transcript.py`: runs `KimAgent.run()` end-to-end with `FakeProvider` + mocked async MCP session; captures stdout; verifies every emitted line has the expected shape (`status`, `context`, `stats`, `ui_screenshot_flash`, `ui_show`, `legacy_tool`); writes `tests/fixtures/golden_transcript.json` snapshot; additional tests for `run_failed` and `provider_error` emission paths. 10 tests.
+- `tests/fixtures/golden_transcript.json`: canonical 7-line transcript (status → context → context → [TOOL] take_screenshot → ui_screenshot_flash → ui_show → context) from `FakeProvider(take_screenshot + TASK_COMPLETE)` run.
+- `tests/test_provider_contract.py`: 32 parametrized tests across claude, openai, deepseek, gemini, ollama message-formatting layers — text, tool-call, tool-result, and image scenarios. No network required.
+- `desktop/src/components/chat/__tests__/agentProtocol.test.ts`: 25 Vitest tests feed all 7 golden lines to `parseAgentLine()`; assert typed JSON events are silenced (`type:'none'`), legacy `[TOOL]` lines produce `activity_item`, `[SUCCESS]`/`[FAILED]` behave correctly. Covers full golden fixture round-trip.
+- **Test counts after V-3**: pytest 926 passed / 1 failed (known macOS casing) / 8 skipped; Vitest 66 passed; Rust desktop 54; Rust CLI 90.
+
 ### II-D — Cost meter
 - `desktop/src/components/chat/utils.ts`: `PRICE_PER_1M` table for claude/openai/gemini/deepseek/ollama/browser; `estimateCostUsd()` and `formatCostUsd()` utilities
 - `desktop/src/components/chat/StreamRenderer.tsx`: Added `tokenStats` prop; cost chip shown below `WorkedForPill` for last run — "local · $0" for ollama/browser, "~$X.XXXX" for cloud
@@ -176,9 +198,10 @@ Last updated: 2026-06-10
 
 ### Track A
 - [x] V-2: `ProviderResponse` TypedDict + pyright in CI — ✅ Done (`a7fff3d`)
-- [ ] V-1 (partial): schema-first codegen — `events.schema.json` → `events.gen.ts` + `npm run gen:events` + CI drift check
-- [ ] V-1 (legacy-kill) BLOCKED: kill dual-emit from `subprocess.rs` / legacy `kim-agent-output` text parsing in `parsers.ts`. **Blocked on**: golden-transcript seam test (V-3) — removing the dual-emit without a test that asserts "these Python stdout lines → these typed events → these activity items" risks silent UI rot. The Codex CLI subprocess also uses `kim-agent-output` and cannot be schema-firsted. Do not remove dual-emit until V-3 seam tests exist.
-- [ ] V-3: golden-transcript Rust↔Python seam test + provider contract suite
+- [x] V-3: Golden-transcript seam test + provider contract suite — ✅ Done (`e0aca6d`)
+- [x] V-1: Kill dual-emit (Kim-agent path) + dead text parsers — ✅ Done (TBD commit)
+- [ ] V-1 (partial): schema-first codegen — `events.schema.json` → `events.gen.ts` + `npm run gen:events` + CI drift check (intentionally deferred — no value-add until event schema stabilizes)
+- [x] V-3: golden-transcript Rust↔Python seam test + provider contract suite — ✅ Done
 - [ ] V-4: split ChatView.tsx, decompose agent.py loop, split chat.css
 
 ### Track B

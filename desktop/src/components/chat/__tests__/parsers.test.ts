@@ -79,55 +79,6 @@ describe('Chat Parsers and Plan Extractors', () => {
   });
 
   describe('parseAgentLine status and context variants', () => {
-    it('should parse STATS correctly', () => {
-      const line = '[STATS]   input_tokens=1500 output_tokens=350 total_tokens=1850';
-      const parsed = parseAgentLine(line, 1);
-      expect(parsed.type).toBe('stats');
-      if (parsed.type === 'stats') {
-        expect(parsed.payload.input).toBe(1500);
-        expect(parsed.payload.output).toBe(350);
-        expect(parsed.payload.total).toBe(1850);
-      }
-    });
-
-    it('should parse CONTEXT correctly', () => {
-      const line = '[CONTEXT] cumulative_input=24500 budget=200000 phase=ok percent=12 last_input=450 last_output=12 source=api estimate=0';
-      const parsed = parseAgentLine(line, 1);
-      expect(parsed.type).toBe('context');
-      if (parsed.type === 'context') {
-        expect(parsed.payload.cumulative_input).toBe(24500);
-        expect(parsed.payload.budget).toBe(200000);
-        expect(parsed.payload.phase).toBe('ok');
-        expect(parsed.payload.percent).toBe(12);
-        expect(parsed.payload.last_input).toBe(450);
-        expect(parsed.payload.last_output).toBe(12);
-        expect(parsed.payload.source).toBe('api');
-        expect(parsed.payload.estimate).toBe(false);
-      }
-    });
-
-    it('should parse CONTEXT when source contains ":" (compact path)', () => {
-      const line = '[CONTEXT] cumulative_input=1000 budget=200000 phase=ok percent=1 last_input=100 last_output=5 source=BrowserProvider:compact estimate=1';
-      const parsed = parseAgentLine(line, 1);
-      expect(parsed.type).toBe('context');
-      if (parsed.type === 'context') {
-        expect(parsed.payload.source).toBe('BrowserProvider:compact');
-        expect(parsed.payload.estimate).toBe(true);
-      }
-    });
-
-    it('should parse USAGE correctly', () => {
-      const line = '[USAGE] {"provider":"openai","model":"gpt-4o","input":150,"output":50}';
-      const parsed = parseAgentLine(line, 1);
-      expect(parsed.type).toBe('usage');
-      if (parsed.type === 'usage') {
-        expect(parsed.payload.provider).toBe('openai');
-        expect(parsed.payload.model).toBe('gpt-4o');
-        expect(parsed.payload.input).toBe(150);
-        expect(parsed.payload.output).toBe(50);
-      }
-    });
-
     it('should parse NEED_HELP correctly', () => {
       const line = 'NEED_HELP: Reached conversational loop.';
       const parsed = parseAgentLine(line, 1);
