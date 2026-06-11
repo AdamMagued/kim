@@ -16,6 +16,15 @@ from orchestrator.providers.gemini import (
     OAUTH_USER_PROJECT_ENV,
 )
 
+_GEMINI_ENV_VARS = ("GOOGLE_API_KEY", OAUTH_TOKEN_ENV, OAUTH_USER_PROJECT_ENV)
+
+
+@pytest.fixture(autouse=True)
+def _clear_gemini_env(monkeypatch):
+    """Isolate tests from any Gemini credentials set in the host environment."""
+    for var in _GEMINI_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
 
 class TestOAuthUserProjectMode:
     """Tests for oauth_user_project authentication mode."""

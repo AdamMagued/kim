@@ -240,7 +240,8 @@ class KimAgent:
 
     def _log(self, level: str, message: str) -> None:
         """Log to Python logger AND UIBridge (if attached)."""
-        getattr(logger, level.lower(), logger.info)(message)
+        _level = "warning" if level.upper() == "WARN" else level.lower()
+        getattr(logger, _level, logger.info)(message)
         if self._ui_bridge:
             self._ui_bridge.log(level, message)
 
