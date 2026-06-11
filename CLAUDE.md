@@ -30,12 +30,14 @@ See `PRODUCTION_ROADMAP.md` for the current work backlog and sequencing.
 2. Don't know → grep/find with a targeted pattern; `repomap.md` if it exists.
 3. Never do a broad full-repo sweep as a first move.
 
-## Test commands
+## Test commands (all four suites — cli/ is a separate crate, easy to forget)
 ```
-python -m pytest tests/           # 816+ Python tests
-cd desktop && npm run test        # 31 Vitest tests
-cd desktop/src-tauri && cargo test # 50 Rust tests
+python -m pytest tests/            # 927+ Python tests (venv required)
+cd desktop && npx tsc --noEmit && npm run test  # 73 Vitest tests
+cd desktop/src-tauri && cargo test # 54 Rust tests (desktop)
+cd cli && cargo test               # 90 Rust tests (kim CLI)
 ```
+After every push, confirm the remote CI run is green: `gh run list --limit 1`.
 
 ## Known pre-existing issue
 `desktop/src/components/PairingModal.tsx` — missing `qrcode.react` types. Ignore; predates recent work.
