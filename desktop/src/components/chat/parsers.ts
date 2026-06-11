@@ -1,6 +1,7 @@
 import type { ActivityItem, LivePlanParsed } from './types';
 import type { TraceItem, WorkedForTraceItem, WorkedForToolKind } from '../kim-ui';
-import { cleanActivityText, parseAnswerLine, friendlyError, parseLogLine } from './utils';
+import { parseAnswerLine, friendlyError, parseLogLine } from './utils';
+import { parseCodexItemCompleted } from './codexEvents';
 
 // ── Trace helpers (activity → ThinkingWithPlan format) ─────────────────────
 
@@ -134,21 +135,9 @@ export function parseAgentLine(line: string, id: number): ParsedAgentLine {
         item?: { type?: string; text?: string; action?: { command?: string } };
       };
 
-      // New Codex CLI JSONL format (codex exec --json)
-      if (parsed.type === 'item.completed' && parsed.item) {
-        const item = parsed.item;
-        if (item.type === 'agent_message' && item.text?.trim()) {
-          return { type: 'codex_agent_message', payload: item.text.trim() };
-        } else if (item.type === 'reasoning' && item.text?.trim()) {
-          return { type: 'codex_reasoning', payload: cleanActivityText(item.text.trim()) };
-        } else if (item.type === 'local_shell_call' && item.action?.command) {
-          return { type: 'codex_shell_call', payload: item.action.command };
-        }
-        return { type: 'codex_ignored' };
-      }
-      if (parsed.type === 'thread.started' || parsed.type === 'turn.started' || parsed.type === 'turn.completed') {
-        return { type: 'codex_ignored' };
-      }
+      // New Codex CLI JSONL format (codex exec --json) — delegated to codexEvents.ts
+      const codexResult = parseCodexItemCompleted(parsed);
+      if (codexResult !== null) return codexResult;
 
       const errorMsg = (parsed.error ?? '').trim();
       if (errorMsg) {

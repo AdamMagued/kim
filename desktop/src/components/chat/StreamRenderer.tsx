@@ -3,7 +3,7 @@ import type { ActivityItem, CodexRunGroup, TouchedFile, PendingTask, HitlApprova
 import type { KimMessage, Settings, KimAccount, PermissionMode } from '../../types';
 import { MessageBubble } from '../MessageBubble';
 import { SignalCard } from '../ToolCallCard';
-import { ThinkingWithPlan, WorkedForPill } from '../kim-ui';
+import { WorkedForPill } from '../kim-ui';
 import {
   formatDuration,
   parsePlanFromActivity,
@@ -18,6 +18,7 @@ import {
   formatCostUsd,
 } from './utils';
 import { buildThinkingTrace, traceToWorkedFor } from './parsers';
+import { ActivityFeed } from './ActivityFeed';
 
 // ── Blobby Loader Component ──────────────────────────────────────────────────
 
@@ -149,26 +150,6 @@ export function StreamRenderer({
 }: StreamRendererProps) {
 
   // ── Render Helpers ─────────────────────────────────────────────────────────
-
-  function renderActivityFeed() {
-    if (activity.length === 0) return null;
-    const livePlan = parsePlanFromActivity(activity);
-    const toolCalls = activity.filter(a => a.kind === 'tool').length;
-    const streamStepCount = Math.max(toolCalls, activity.length);
-    const trace = buildThinkingTrace(activity, livePlan);
-
-    return (
-      <div className="kim-msg-row kim-msg-row--assistant kim-msg-row--live">
-        <ThinkingWithPlan
-          trace={trace}
-          duration={elapsed > 0 ? formatDuration(elapsed) : undefined}
-          steps={streamStepCount}
-          planLook="card"
-          style={{ flex: 1, minWidth: 0 }}
-        />
-      </div>
-    );
-  }
 
   function renderHitlStatus() {
     if (!hitlApprovalStatus) return null;
@@ -452,7 +433,7 @@ export function StreamRenderer({
                     retries={retries}
                     onEdit={msg.role === 'user' ? (newText) => handleEditLiveMessage(i, newText) : undefined}
                   />
-                  {showActivityAfter && renderActivityFeed()}
+                  {showActivityAfter && <ActivityFeed activity={activity} elapsed={elapsed} />}
                 </div>
               );
             });
@@ -718,7 +699,7 @@ export function StreamRenderer({
                       retries={retries}
                       onEdit={msg.role === 'user' ? (newText) => handleEditLiveMessage(i, newText) : undefined}
                     />
-                    {showActivityAfter && renderActivityFeed()}
+                    {showActivityAfter && <ActivityFeed activity={activity} elapsed={elapsed} />}
                   </div>
                 );
               });
