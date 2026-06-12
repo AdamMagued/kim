@@ -288,6 +288,36 @@ protection.
 
 ---
 
+## E. Third-pass findings (2026-06-12)
+
+### E1 · P1 — Gemini provider silently drops parallel tool calls
+`orchestrator/providers/gemini.py:363-371` returns on the FIRST `functionCall` part —
+any additional functionCall parts and any text parts after it are discarded without a
+trace. Claude (`claude.py:132`), OpenAI, and Ollama all wrap multi-calls as a `batch`
+tool call; Gemini violates the provider contract. Exactly the class of bug the V-3
+parametrized contract suite should cover — add a multi-call scenario to it when fixing.
+(DeepSeek is safe: subclasses OpenAIProvider.)
+
+### E2 · INFO — Discord webhook: verified NOT exposed
+`feedback.rs` embeds the webhook via `option_env!("KIM_DISCORD_WEBHOOK")` at compile
+time — source contains no URL. Verified: no real webhook URL (numeric id) anywhere in
+git history; no `sk-ant-`/`AIza`/`ghp_` real-shaped keys in any commit; no `.env` ever
+committed; CI/release workflows do NOT set `KIM_DISCORD_WEBHOOK`, so public release
+binaries ship with it empty (feedback no-ops). **Standing rule:** never add the webhook
+to public CI — any URL compiled into a distributed binary is extractable with `strings`
+and spammable/deletable by anyone (Discord webhooks carry full post+delete rights). If
+real feedback collection is wanted for public builds, proxy it through a tiny server-side
+relay instead. One papercut: with the webhook unset, `send_feedback` returns Ok and the
+UI shows success while sending nothing — intentional per the comment, but "Feedback
+recorded locally" honesty would be better.
+
+### E3 · CI status — nothing to fix
+All recent `main` runs green (`cf729a8`, `5aacf5a`, `ab2722d`, merge `5d837dc`); no red
+runs on any live branch. The only historical CI breakage (invalid workflow YAML) was
+fixed in `75897ee` and is documented in EXECUTION_REPORT.md.
+
+---
+
 ## Ratings (out of 10)
 
 | Area | Score | One-liner |

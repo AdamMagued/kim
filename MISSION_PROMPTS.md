@@ -76,7 +76,10 @@ the next.
 > `runFailure` is set, suppress the redundant `taskError` banner for the same run.
 > **B5** (`components/chat/utils.ts`): `estimateCostUsd` — normalize provider (strip
 > `browser:*` → `browser`); store the provider used per run alongside runHistory and
-> price with THAT, not the currently selected provider. Vitest for `browser:claude` → $0.
+> price with THAT, not the currently selected provider. NOTE: runHistory is persisted
+> via `save_run_history` — adding a provider field changes the saved shape; loading
+> runs saved without it must not break (default to null → hide the cost chip).
+> Vitest for `browser:claude` → $0.
 > **B6** (`ChatView.tsx` newChatMode effect): also clear liveHistory, runFailure,
 > rateLimitedState, hitlApprovalStatus, lastFailedTask.
 > **B7** (`hooks/useChatStream.ts` kim-agent-done handler): clear `hitlApprovalStatus`.
@@ -123,8 +126,9 @@ the next.
 > actually get used by the desktop app.
 > **A14** (`cli/install.sh`): before falling back to `cargo build`, try downloading the
 > prebuilt `kim` binary from the latest GitHub release
-> (`https://github.com/AdamMagued/kim/releases` — assets named per release.yml's
-> `cli-asset-suffix`: kim-macos-aarch64, kim-macos-x86_64, kim-linux-x86_64). Detect
+> (`https://github.com/AdamMagued/kim/releases` — assets are named
+> `kim-cli-<version>-<suffix>` per release.yml line ~157, suffixes: macos-aarch64,
+> macos-x86_64, linux-x86_64, windows-x86_64.exe). Detect
 > OS/arch via `uname`, verify the download runs (`kim --version`), fall back to
 > source-build when no asset matches or download fails. Keep all env overrides working.
 > Test both paths locally (force-fallback with a bogus repo URL for the build path).
@@ -244,6 +248,11 @@ the next.
 > Log each fired schedule to the activity/status channel. Add overlap protection (a
 > static AtomicBool guard). Cargo test for the guard logic; manual verification with a
 > 1-minute schedule documented in the report.
+> **E1** (`orchestrator/providers/gemini.py` `_parse_response`): collect ALL
+> `functionCall` parts; when >1, return the same `{"tool": "batch", "args": {"calls":
+> [...]}}` shape claude.py/openai_provider.py use; never discard trailing parts. Add a
+> multi-functionCall scenario to the V-3 provider contract suite (all providers must
+> pass it — this is the test that would have caught the bug).
 
 ## Prompt 8 — Release hygiene: version bump, changelog, tag dry-run
 
