@@ -167,6 +167,14 @@ the next.
 > **B13**: remove the `as any` casts (settings provider write, bottomRef ×3,
 > browserCommandArgs return) with real types.
 > **B14** (`utils.ts formatCostUsd`): collapse the dead branch.
+> **F2** (`MessageBubble.tsx renderText`): fix fenced-code handling — extract ```fence
+> pairs BEFORE paragraph-splitting so blank lines inside code blocks survive; handle
+> fences mid-paragraph. Vitest: code block containing a blank line round-trips into one
+> `<pre>`.
+> **F3** (`MessageBubble.tsx`): sanitize URL schemes — links only http/https/mailto
+> (else render as plain text); images only data:/asset/'self' by default, remote https
+> images behind a click-to-load placeholder. Vitest for `javascript:` link and remote
+> img.
 > **B15** (`ChatView.tsx`): sync `permissionMode` when `settings.permission_mode` changes
 > (useEffect), keeping per-session override behavior.
 
@@ -255,6 +263,9 @@ the next.
 > [...]}}` shape claude.py/openai_provider.py use; never discard trailing parts. Add a
 > multi-functionCall scenario to the V-3 provider contract suite (all providers must
 > pass it — this is the test that would have caught the bug).
+> **F1** (`orchestrator/task_queue.py`): dead module, zero importers — delete it (git
+> history preserves it), unless Prompt 10's steering work explicitly claims it (check
+> with the report of that prompt if already run).
 
 ## Prompt 10 — Trust & control: run revert, steering, approval previews, privacy pause
 

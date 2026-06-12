@@ -318,6 +318,35 @@ fixed in `75897ee` and is documented in EXECUTION_REPORT.md.
 
 ---
 
+## F. Fourth-pass findings (2026-06-12)
+
+### F1 · P2 — `orchestrator/task_queue.py` is a dead module
+Zero importers anywhere (`relay_worker.py` is already gone). Either it's the intended
+home for the B1 queue/steering backend (then wire it) or it should be deleted —
+unreferenced modules rot and mislead.
+
+### F2 · P2 — Markdown renderer mangles fenced code blocks containing blank lines
+`MessageBubble.tsx renderText` splits on `/\n\n+/` BEFORE detecting ``` fences — a code
+block with a blank line inside is split into paragraphs and its second half renders as
+prose (asterisks/underscores get styled, indentation collapses). Fences not at the start
+of a paragraph are also unhandled. Fix: scan for fence pairs first, then paragraph-split
+only the non-code segments.
+
+### F3 · P2 — Renderer doesn't sanitize link/img URL schemes
+`<a href>` and `<img src>` take whatever URL the model emits. CSP blocks `file://`
+images but allows **any `https:` image** (`img-src … https:`) → model/tool output can
+embed remote images (classic exfil/tracking channel for an agent that pastes web content
+into chat). Links: restrict to http(s)/mailto; images: consider `data:`/`'self'` only,
+or route remote images through a click-to-load placeholder.
+
+### Verified clean this pass (for the record)
+`browser_bridge.rs` URL handling (serde-JSON-escaped into `eval`, scheme allowlisted
+http/https), capability scoping, CSP `script-src 'self'`, `frame-ancestors 'none'`;
+`memory.py` screenshot pruning; compaction preserve-recent logic; OAuth token flow
+(refresh tokens never reach Python).
+
+---
+
 ## Ratings (out of 10)
 
 | Area | Score | One-liner |
