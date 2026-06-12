@@ -2,10 +2,10 @@
 
 Usage: tell your agent **"Open MISSION_PROMPTS.md and execute Prompt N exactly."**
 Each prompt is self-contained for a zero-context agent.
-**Run order: 1 → 2 → 3 → 4 → 5 → 6 → 9 → 10 → 11 → 12 → 7 → 8** (1 and 2 are independent
-and may run in parallel worktrees; 10–12 are UX feature batches from PRODUCTION_ROADMAP
-Part II-K; 7 is the big CLI milestone; 8 is release prep, always last. 11 and 12 are
-independent of each other).
+**Run order: 13 → 1 → 2 → 3 → 4 → 5 → 6 → 9 → 10 → 11 → 12 → 7 → 8**
+(13 is a SECURITY batch — do it first; 1 and 2 are independent and may run in parallel
+worktrees; 10–12 are UX feature batches from PRODUCTION_ROADMAP Part II-K; 7 is the big
+CLI milestone; 8 is release prep, always last. 11 and 12 are independent of each other.)
 After each prompt finishes, a human (or the reviewing agent) verifies before starting
 the next.
 
@@ -334,6 +334,30 @@ the next.
 > **K10 — Export run as Markdown**: action on the run pill + session ⋯ menu: build
 > markdown (user/assistant messages, collapsed activity as bullet list, files touched,
 > duration/cost) → clipboard + optional save dialog. Vitest snapshot for the builder.
+
+## Prompt 13 — Sandbox hardening: secret-file deny, sensitive dirs (SECURITY)
+
+> Open MISSION_PROMPTS.md, read GLOBAL RULES, then fix audit items **G1, G2, G3** in
+> `mcp_server/config.py` (+ files.py for G3). This is a security batch — every fix needs
+> a test proving the denial. Specifics:
+> **G1** (`validate_path`): enforce the already-defined `_SENSITIVE_GLOBS` against
+> `p.name` at ANY depth, not just `$HOME`. Deny `.env`, `.env.*`, and add common secret
+> filenames: `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `credentials`, `.npmrc`,
+> `.pypirc`. A read of the project-root `.env` must raise PermissionError. Tests:
+> project `.env`, nested `sub/dir/.env.local`, `keys/server.pem` all denied; a normal
+> `notes.txt` allowed. Update root `CLAUDE.md`'s "Standing constraints" if it overclaims
+> `.env` protection.
+> **G2** (`_SENSITIVE_PATHS`): add `~/.config/gcloud`, `~/.mozilla`, `~/.password-store`,
+> `~/Library/Application Support/Google/Chrome`, `~/Library/Application Support/Firefox`,
+> `~/Library/Application Support/Code`. Keep cross-platform (guard the macOS-only ones).
+> Test each is denied.
+> **G3** (`files.py handle_write_file`): require the data-URI base64 branch to match the
+> WHOLE content (`^data:[^,]*;base64,` anchored, no trailing junk) AND add an explicit
+> `binary: bool` arg path; a text file whose content merely starts with `data:...;base64,`
+> must be written as text. Test both.
+> NOTE: do NOT touch the shell blocklist — it is a documented speed-bump, not a boundary
+> (the real control is the HITL gate). Adding to `_DENY_COMMANDS` is fine; do not claim
+> it's a sandbox.
 
 ## Prompt 8 — Release hygiene: version bump, changelog, tag dry-run
 

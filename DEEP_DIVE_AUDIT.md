@@ -347,6 +347,41 @@ http/https), capability scoping, CSP `script-src 'self'`, `frame-ancestors 'none
 
 ---
 
+## G. Fifth-pass findings — MCP tool sandbox (2026-06-12)
+
+### G1 · P1 (security) — `.env` files inside the project/any subdir are readable by the agent
+`mcp_server/config.py validate_path` defines `_SENSITIVE_GLOBS = [".env", ".env.*"]` but
+**never uses it** — the only dotenv guard is `if p.parent == _HOME and p.name.startswith(".env")`,
+i.e. ONLY a `.env` sitting directly in `$HOME`. The project root has a real `.env` with
+secrets (verified present), and it falls inside `ALLOWED_PATHS` (PROJECT_ROOT is always
+allowed) → `read_file(".env")` returns the API keys in plaintext to the model. Fix: apply
+`_SENSITIVE_GLOBS` against `p.name` at ANY depth (deny `.env`, `.env.*` everywhere), plus
+common secret filenames (`*.pem`, `id_rsa`, `credentials`, `*.key`). The CLAUDE.md claim
+that `.env` is protected is currently false for project-level files.
+
+### G2 · P2 — Sensitive-dir deny list has gaps (browser creds, cloud SDKs)
+`_SENSITIVE_PATHS` covers `.ssh/.aws/.gnupg/.kube/.docker/.netrc/.config/gh/Keychains`
+but misses high-value targets reachable when `~` is in allowed_paths:
+`~/.config/gcloud`, `~/Library/Application Support/{Google/Chrome,Firefox}` (cookies +
+saved sessions = full account takeover), `~/.mozilla`, `~/.password-store`,
+`~/Library/Application Support/Code` (extension tokens). Expand the list; consider an
+allowlist-only model when `~` is granted.
+
+### G3 · P3 — `write_file` base64 sniff is content-controlled
+A text file whose content legitimately begins `data:...;base64,` is silently written as
+decoded binary. Rare, but the heuristic should require the data-URI to be the WHOLE
+content and the tool to have an explicit `binary` flag rather than sniffing.
+
+### Verified acceptable (documented threat model)
+Shell blocklist (`_DENY_COMMANDS` first-token + fork-bomb/dd regex) is a speed-bump, not
+a boundary — `python3 -c "os.system('rm -rf')"` bypasses it trivially. This is BY DESIGN:
+the real control is the HITL/permission-mode gate (K6 approval previews make it usable).
+Don't market the blocklist as a security boundary. Path sandbox `.resolve()` correctly
+neutralizes `../` and symlink escapes at validate time (minor TOCTOU between validate and
+open is low-risk on a single-user desktop).
+
+---
+
 ## Ratings (out of 10)
 
 | Area | Score | One-liner |
