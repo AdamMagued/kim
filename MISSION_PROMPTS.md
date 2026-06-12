@@ -2,8 +2,10 @@
 
 Usage: tell your agent **"Open MISSION_PROMPTS.md and execute Prompt N exactly."**
 Each prompt is self-contained for a zero-context agent.
-**Run order: 1 → 2 → 3 → 4 → 5 → 6 → 9 → 7 → 8** (1 and 2 are independent and may run
-in parallel worktrees; 7 is the big feature milestone; 8 is release prep, always last).
+**Run order: 1 → 2 → 3 → 4 → 5 → 6 → 9 → 10 → 11 → 12 → 7 → 8** (1 and 2 are independent
+and may run in parallel worktrees; 10–12 are UX feature batches from PRODUCTION_ROADMAP
+Part II-K; 7 is the big CLI milestone; 8 is release prep, always last. 11 and 12 are
+independent of each other).
 After each prompt finishes, a human (or the reviewing agent) verifies before starting
 the next.
 
@@ -253,6 +255,74 @@ the next.
 > [...]}}` shape claude.py/openai_provider.py use; never discard trailing parts. Add a
 > multi-functionCall scenario to the V-3 provider contract suite (all providers must
 > pass it — this is the test that would have caught the bug).
+
+## Prompt 10 — Trust & control: run revert, steering, approval previews, privacy pause
+
+> Open MISSION_PROMPTS.md, read GLOBAL RULES, then implement `PRODUCTION_ROADMAP.md`
+> Part II-K items **1, 3, 6, 9**. Prereqs: Prompts 2 and 9 merged. Design first: 1-page
+> `docs/PROPOSAL_trust_features.md`, commit, then build.
+> **K1 — Run checkpoints + revert**: before each run in code/chat mode, record files the
+> agent touches (hook `write_file`/`edit` paths in `mcp_server/tools/files.py` + the
+> existing `[DIFF]` emission) and back up pre-images to `~/.kim/checkpoints/<run-id>/`
+> (cap 50MB/run, skip larger with a note). New Tauri command `revert_run(run_id)`
+> restores pre-images (creating `.kim-revert.bak` of current state first — revert must
+> itself be undoable). UI: "Revert changes" action on the run pill when a checkpoint
+> exists. Python tests for backup/restore round-trip incl. new-file deletion case.
+> **K3 — Mid-run steering**: typing while running offers "Steer" (default) vs "Queue":
+> steer writes `{"type":"user_steer","text":...}` to agent stdin (extend the HITL stdin
+> JSON channel in `subprocess.rs` + Python's stdin reader) and the agent injects it as a
+> user message before its next LLM call, with a `[STATUS] steering noted` ack. Update
+> the B1 queue UI accordingly. Python test: steer line arrives → message lands in next
+> request payload.
+> **K6 — Approval previews**: `kim:hitl-approval-request` already carries tool+risk —
+> extend the Python emit to include a `preview` field (run_command → the command string;
+> write_file/edit → unified diff ≤40 lines; web actions → URL + element label) and
+> render it monospace in the approval card. Schema change → `events.schema.json` +
+> `npm run gen:events`.
+> **K9 — Privacy pause**: global flag (tray menu item + composer eye icon →
+> `set_privacy_pause` Tauri command → env-file or stdin flag the MCP server checks);
+> while paused, `take_screenshot`/`screen`/`web_screenshot` tools return a typed error
+> ("Privacy pause is on") and the agent is prompted to inform the user rather than loop.
+> Test: pause → screenshot tool returns the typed error.
+
+## Prompt 11 — Speed & access: global hotkey overlay, tray, command palette
+
+> Open MISSION_PROMPTS.md, read GLOBAL RULES, then implement Part II-K items **2, 7, 8**.
+> **K2 — Quick-ask overlay**: `tauri-plugin-global-shortcut` (default ⌥Space,
+> rebindable in Settings → System); shortcut toggles a small frameless always-on-top
+> WebviewWindow with a single composer input; submit routes to the active (or newest)
+> chat session via the existing send path and focuses the main window only when the
+> run needs attention (HITL/need-help). Esc hides. Handle shortcut-registration
+> failure gracefully (already-taken hotkey → toast + Settings link).
+> **K7 — Tray**: `tauri::tray` menu — status line (idle/“Running: <task 40ch>”),
+> Cancel current run, last 3 sessions (open), Quick ask, Privacy pause toggle (wire to
+> K9 if merged, else hide), Quit. Update status from the existing isRunning/task state
+> in Rust (subprocess tracking), not from the frontend.
+> **K8 — Command palette**: ⌘K in-app palette listing: new chat, new code session,
+> switch session (fuzzy), switch provider, toggle mode, cancel run, open settings panes.
+> Centralize these as an actions registry module so palette/shortcuts/tray share one
+> implementation (no copy-pasted invoke calls). Vitest for the registry; manual
+> verification checklist in the report for hotkey/tray (CI can't test OS integration —
+> say exactly what you verified by hand).
+
+## Prompt 12 — Session & composer UX: manage sessions, paste images, export
+
+> Open MISSION_PROMPTS.md, read GLOBAL RULES, then implement Part II-K items **4, 5, 10**.
+> **K4 — Session management**: sidebar context menu (right-click + ⋯ button): Rename
+> (writes a `title` field to a session meta sidecar or first-class field — check
+> `session_commands.rs` read path and extend), Pin (pinned float to top, persisted),
+> Delete (single session: JSONL + summary + meta, with confirm). Full-text search box
+> in the sidebar filtering by title + message content (Rust command doing the grep —
+> stream results, cap 200ms/50 results). Tests for the Rust search + delete commands.
+> **K5 — Paste & region capture**: composer `onPaste` handler for `clipboardData` image
+> items → existing `save_attachment` path (after Prompt 9's D4 fix) → attachment chip.
+> "Capture region" button: hide windows → interactive region screenshot (macOS
+> `screencapture -i -x <file>`; Linux `gnome-screenshot -a`/`slurp+grim` best-effort;
+> Windows: skip with tooltip) → attach. Verify the image actually reaches the provider
+> payload (attachments → message content) end-to-end with the fake provider.
+> **K10 — Export run as Markdown**: action on the run pill + session ⋯ menu: build
+> markdown (user/assistant messages, collapsed activity as bullet list, files touched,
+> duration/cost) → clipboard + optional save dialog. Vitest snapshot for the builder.
 
 ## Prompt 8 — Release hygiene: version bump, changelog, tag dry-run
 

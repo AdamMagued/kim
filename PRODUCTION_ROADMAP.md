@@ -258,6 +258,40 @@ Currently: install → blank chat. A user's first 5 minutes decide everything.
 - **If dropping for 1.0:** hide the pane behind a feature flag (don't delete — it's real code) and revisit post-launch
 - Either way, stop shipping it in limbo.
 
+## K. UX must-haves (added 2026-06-12 — verified missing, table stakes for this category)
+
+Ranked by impact-per-effort. None of these exist today (verified by code search).
+
+1. **Run checkpoints + one-click revert** 🥇 *(trust — the #1 blocker to letting an agent
+   edit files)*. Before any run that may write files, snapshot the workspace (git stash
+   object or `.kim/checkpoints/` copy of touched files via the existing `[DIFF]`/touched
+   tracking); after the run, show "Revert this run's changes" on the run pill. Cursor and
+   Claude Code both ship this; an agent without undo is an agent users babysit.
+2. **Global hotkey + quick-ask overlay** 🥈 (⌥Space): summon a floating composer anywhere,
+   type a task, it runs in the current/last session; Esc dismisses. A desktop agent that
+   requires Cmd-Tabbing to its window loses its whole desktop advantage.
+   (`tauri-plugin-global-shortcut` + a small always-on-top WebviewWindow.)
+3. **Mid-run steering**: typing while a run is active injects the message into the live
+   agent loop (stdin channel already exists for HITL) instead of the broken queue (B1) —
+   "also check the staging env" without cancel/restart. Claude Code parity feature.
+4. **Session management basics**: rename, pin, delete, and full-text search across
+   sessions in the sidebar. Today sessions can only be opened — names are
+   first-prompt-truncation forever, and the only "delete" is Settings → nuke everything.
+5. **Paste & region-capture attachments**: ⌘V an image into the composer (clipboardData
+   handler — missing today); "Attach screen region" button → crop overlay → attached
+   image. Natural fit for a screenshot-driven agent.
+6. **Approval-gate previews**: the HITL card shows the tool name only — show the actual
+   command line / file diff / URL it wants to act on. Approving blind defeats the gate.
+7. **Menu-bar (tray) presence**: status dot (idle/running), current task one-liner,
+   Cancel, last-3 sessions, quick-ask. The agent should feel resident, not app-shaped.
+8. **Command palette (⌘K) + shortcuts**: new chat, switch session/provider/mode,
+   cancel run, open settings. Cheap once actions are centralized.
+9. **Privacy pause**: one toggle (tray + composer) that blocks screenshots/screen-reading
+   tools until re-enabled — agent runs needing vision fail fast with a clear message.
+   For an agent that can see your screen, "stop looking" must be one click.
+10. **Export run as Markdown**: copy a clean transcript (messages + tool activity +
+    files touched) for sharing/debugging.
+
 ---
 
 # PART III — Open product decisions (need an answer from you)
