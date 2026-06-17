@@ -10,6 +10,12 @@ describe('estimateCostUsd', () => {
     expect(estimateCostUsd('browser', 100_000, 50_000)).toBe(0);
   });
 
+  it('returns 0 for browser:* session providers (B5 — not claude rates)', () => {
+    expect(estimateCostUsd('browser:claude', 100_000, 50_000)).toBe(0);
+    expect(estimateCostUsd('browser:chatgpt', 1_000_000, 1_000_000)).toBe(0);
+    expect(estimateCostUsd('BROWSER:Gemini', 500_000, 500_000)).toBe(0);
+  });
+
   it('calculates cost for claude at known rates', () => {
     // claude: $3/1M input, $15/1M output
     const cost = estimateCostUsd('claude', 1_000_000, 1_000_000);

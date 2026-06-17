@@ -177,7 +177,6 @@ export function ChatView({
 
   const {
     queuedTasks,
-    interruptTask,
     handleSubmit,
     handleRetryLast,
   } = useTaskRunner({
@@ -191,7 +190,6 @@ export function ChatView({
     browserCommandArgs,
     stream,
     scroll,
-    handleCancel,
   });
 
   // ── Reset state when entering a new chat ─────────────────────────────────────
@@ -204,6 +202,13 @@ export function ChatView({
       stream.setContextState(null);
       stream.setElapsed(0);
       stream.hasSentMessageRef.current = false;
+      // B6: also clear live bubbles, failure/rate-limit cards, pending approval,
+      // and the retry target so stale UI can't bleed into a fresh chat.
+      stream.setLiveHistory([]);
+      stream.setRunFailure(null);
+      stream.setRateLimitedState(null);
+      stream.setHitlApprovalStatus(null);
+      stream.setLastFailedTask(null);
     }
   }, [newChatMode, stream.clearActivityNow]);
 
@@ -466,7 +471,6 @@ export function ChatView({
       bottomRef={scroll.bottomRef}
       newestMsgIdx={newestMsgIdx}
       queuedTasks={queuedTasks}
-      interruptTask={interruptTask}
       lastRunTask={stream.lastRunTaskRef.current}
       elapsed={stream.elapsed}
       handleRetryLast={handleRetryLast}

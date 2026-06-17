@@ -868,7 +868,13 @@ const PRICE_PER_1M: Record<string, { input: number; output: number }> = {
 };
 
 export function estimateCostUsd(provider: string, inputTokens: number, outputTokens: number): number {
-  const rates = PRICE_PER_1M[provider] ?? PRICE_PER_1M['claude'];
+  // B5: browser providers stream as `browser:claude` / `browser:chatgpt` etc.
+  // Those are free local sessions — normalize to the `browser` (zero-cost) key
+  // so they don't fall through to the default claude rate and show a fake cost.
+  const normalized = provider.trim().toLowerCase().startsWith('browser')
+    ? 'browser'
+    : provider;
+  const rates = PRICE_PER_1M[normalized] ?? PRICE_PER_1M['claude'];
   return (inputTokens * rates.input + outputTokens * rates.output) / 1_000_000;
 }
 

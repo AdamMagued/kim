@@ -435,6 +435,9 @@ export function useChatStream({
       needHelpFlagRef.current = false;
       setIsRunning(false);
       setCancelling(false);
+      // B7: a run that ends while an approval is pending (timeout/agent exit)
+      // must not leave a dead Approve/Deny card (clicking it hits a dead run).
+      setHitlApprovalStatus(null);
 
       const startedAt = startTimeRef.current;
       const durationSec = startedAt ? Math.max(1, Math.round((Date.now() - startedAt) / 1000)) : 0;

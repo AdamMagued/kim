@@ -91,7 +91,6 @@ export interface StreamRendererProps {
   bottomRef: RefObject<HTMLDivElement | null>;
   newestMsgIdx: number | null;
   queuedTasks: PendingTask[];
-  interruptTask: PendingTask | null;
   lastRunTask: PendingTask | null;
   elapsed: number;
   handleRetryLast: () => void;
@@ -132,7 +131,6 @@ export function StreamRenderer({
   bottomRef,
   newestMsgIdx,
   queuedTasks,
-  interruptTask,
   lastRunTask,
   elapsed,
   handleRetryLast,
@@ -548,11 +546,9 @@ export function StreamRenderer({
             </div>
           )}
 
-          {(queuedTasks.length > 0 || interruptTask) && (
+          {queuedTasks.length > 0 && (
             <div className="kim-queue-indicator" role="status" aria-live="polite">
-              {interruptTask
-                ? 'Interrupt pending. Current task will be replaced when cancellation completes.'
-                : `${queuedTasks.length} queued message${queuedTasks.length === 1 ? '' : 's'} waiting.`}
+              {`${queuedTasks.length} queued message${queuedTasks.length === 1 ? '' : 's'} waiting.`}
             </div>
           )}
 
