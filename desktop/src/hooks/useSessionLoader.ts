@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { SessionInfo, KimMessage, Settings } from '../types';
 import type { CodexRunGroup } from '../components/chat/types';
 import { collapseMessages, groupCodexMessages, isIntermediateToolCall } from '../components/chat/utils';
+import { toast } from '../components/Toast';
 import type { useChatStream } from './useChatStream';
 
 interface UseSessionLoaderProps {
@@ -22,7 +23,10 @@ export function useSessionLoader({
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [newestMsgIdx, setNewestMsgIdx] = useState<number | null>(null);
   const [codexRuns, setCodexRuns] = useState<CodexRunGroup[]>([]);
-  const prevMsgCountRef = useRef(0);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // B12: key the previous-count by session id so the "newest message" animation
+  // heuristic doesn't compare against a different session's count after a switch.
+  const prevMsgCountRef = useRef<Map<string, number>>(new Map());
   const lastLoadedSessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -40,6 +44,7 @@ export function useSessionLoader({
       isSessionChange && prevId === null && session.session_id === stream.currentTaskRef.current?.id.toString();
     const isSeamlessTransition = isSelfTransition || isCodexContinuation;
     lastLoadedSessionIdRef.current = session.session_id;
+    setLoadError(null);
 
     if (isSessionChange && !isSeamlessTransition) {
       setLoadingMessages(true);
@@ -83,7 +88,7 @@ export function useSessionLoader({
           : settings.codex_sessions_dir || null,
     })
       .then(msgs => {
-        const prev = prevMsgCountRef.current;
+        const prev = prevMsgCountRef.current.get(session.session_id) ?? 0;
         const displayMsgs = msgs.filter(m => m.role !== 'compact_summary');
         const lastAssistantIdx = displayMsgs.reduceRight(
           (found, m, i) => (found === -1 && m.role === 'assistant' ? i : found),
@@ -100,7 +105,7 @@ export function useSessionLoader({
         } else {
           setNewestMsgIdx(null);
         }
-        prevMsgCountRef.current = displayMsgs.length;
+        prevMsgCountRef.current.set(session.session_id, displayMsgs.length);
         setMessages(displayMsgs);
 
         if (session.session_type === 'codex') {
@@ -125,7 +130,13 @@ export function useSessionLoader({
           }
         }
       })
-      .catch(() => {})
+      .catch(() => {
+        // B12: don't silently swallow — surface so the user isn't left with a
+        // bare "No messages" with no explanation.
+        setMessages([]);
+        setLoadError("Couldn't read this session file.");
+        toast("Couldn't read this session file.", 'error', 4000);
+      })
       .finally(() => {
         if (isSessionChange && !isSeamlessTransition) setLoadingMessages(false);
       });
@@ -138,5 +149,6 @@ export function useSessionLoader({
     newestMsgIdx,
     codexRuns,
     setCodexRuns,
+    loadError,
   };
 }

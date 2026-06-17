@@ -398,7 +398,9 @@ export function StreamRenderer({
       <div className={`kim-chat${empty ? ' kim-chat--empty-hero' : ''}`}>
         {renderConnectorsChrome()}
 
-        <div className="kim-messages" ref={bottomRef as any}>
+        {/* B11: only the bottom sentinel gets bottomRef — binding it here too
+            made the scroll target mount-order-dependent. */}
+        <div className="kim-messages">
           {empty && (
             <div
               style={{
@@ -574,7 +576,7 @@ export function StreamRenderer({
             </div>
           )}
 
-          <div ref={bottomRef as any} />
+          <div ref={bottomRef} />
         </div>
 
         {renderPermissionToggle()}
@@ -726,7 +728,7 @@ export function StreamRenderer({
             )}
           </>
         )}
-        <div ref={bottomRef as any} />
+        <div ref={bottomRef} />
       </div>
 
       {renderPermissionToggle()}

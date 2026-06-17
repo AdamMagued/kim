@@ -68,6 +68,11 @@ export function ChatView({
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(
     () => settings.permission_mode ?? 'full_auto'
   );
+  // B15: keep the per-session toggle in sync when the persistent default changes
+  // in Settings (the state initializer only ran once, so it silently diverged).
+  useEffect(() => {
+    setPermissionMode(settings.permission_mode ?? 'full_auto');
+  }, [settings.permission_mode]);
   const [connectorsClosing, setConnectorsClosing] = useState(false);
   const [browserProvider, setBrowserProvider] = useState('claude');
   const [conversationId] = useState(() => Math.random().toString(36).substring(7));
@@ -291,7 +296,7 @@ export function ChatView({
         }
       }
       if (onSettingsChange) {
-        onSettingsChange({ ...settings, provider: val as any });
+        onSettingsChange({ ...settings, provider: val as Settings['provider'] });
       }
     },
     [

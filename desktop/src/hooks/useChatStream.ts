@@ -97,6 +97,15 @@ export function useChatStream({
   // Capture-only: no behavior changes to legacy paths, no re-render cost.
   const terminationReasonRef = useRef<string | null>(null);
   const lastProviderErrorCodeRef = useRef<string | null>(null);
+  // B9: track the rate-limited auto-clear timer so a stale timer from one run
+  // can't clear a later run's banner.
+  const rateLimitTimerRef = useRef<number | null>(null);
+  const clearRateLimitTimer = () => {
+    if (rateLimitTimerRef.current !== null) {
+      window.clearTimeout(rateLimitTimerRef.current);
+      rateLimitTimerRef.current = null;
+    }
+  };
 
   // Deduplication maps
   const recentRawRef = useRef<Map<string, number>>(new Map());
@@ -305,10 +314,6 @@ export function useChatStream({
     let unlistenDone: (() => void) | undefined;
     let unlistenCodeSession: (() => void) | undefined;
     let unlistenCancelled: (() => void) | undefined;
-    let unlistenTypedStatus: (() => void) | undefined;
-    let unlistenTypedPlan: (() => void) | undefined;
-    let unlistenTypedStep: (() => void) | undefined;
-    let unlistenTypedDone: (() => void) | undefined;
     let unlistenTypedContext: (() => void) | undefined;
     let unlistenTypedStats: (() => void) | undefined;
     let unlistenTypedUi: (() => void) | undefined;
@@ -319,27 +324,10 @@ export function useChatStream({
     let unlistenTypedHitlRequest: (() => void) | undefined;
     let unlistenTypedHitlResult: (() => void) | undefined;
 
-    // Typed IPC listeners (kim:* events) — update parallel state only, never push activity items.
-    // These fire when ipc_protocol == "typed" in Rust config; the legacy kim-agent-output
-    // path continues to run in parallel (dual-emit) so no data is lost.
-    listen<{ message: string }>('kim:status', _e => {
-      // Status messages drive activity via legacy [STATUS] stderr parsing.
-      // Nothing extra needed here.
-    }).then(fn => { unlistenTypedStatus = fn; });
-
-    listen<{ steps: string[] }>('kim:plan', _e => {
-      // Plan state is derived via parsePlanFromActivity on the activity array.
-      // No direct state mutation needed here.
-    }).then(fn => { unlistenTypedPlan = fn; });
-
-    listen<{ n: number; data: Record<string, unknown> }>('kim:step', _e => {
-      // Step transitions drive plan state via legacy activity parsing.
-    }).then(fn => { unlistenTypedStep = fn; });
-
-    listen<{ n: number }>('kim:done', _e => {
-      // Done markers drive plan state via legacy activity parsing.
-    }).then(fn => { unlistenTypedDone = fn; });
-
+    // Typed IPC listeners (kim:* events). Post-V-1, activity/plan/step state is
+    // derived from the legacy kim-agent-output stream via parsePlanFromActivity,
+    // so kim:status/plan/step/done carried no extra state — those four no-op
+    // listeners were removed (B10). The typed listeners below DO own state.
     listen<{
       cumulative_input: number;
       budget: number;
@@ -408,8 +396,12 @@ export function useChatStream({
 
     listen<{ delay: number; attempt: number; max_retries: number }>('kim:rate-limited', e => {
       setRateLimitedState(e.payload);
-      // Auto-clear after the delay so the banner disappears when the retry fires
-      setTimeout(() => setRateLimitedState(null), (e.payload.delay + 1) * 1000);
+      // B9: cancel any prior auto-clear timer before scheduling a new one.
+      clearRateLimitTimer();
+      rateLimitTimerRef.current = window.setTimeout(() => {
+        rateLimitTimerRef.current = null;
+        setRateLimitedState(null);
+      }, (e.payload.delay + 1) * 1000);
     }).then(fn => { unlistenTypedRateLimited = fn; });
 
     listen<{ action: 'screenshot_flash' | 'show' }>('kim:ui', e => {
@@ -441,6 +433,7 @@ export function useChatStream({
       // B7: a run that ends while an approval is pending (timeout/agent exit)
       // must not leave a dead Approve/Deny card (clicking it hits a dead run).
       setHitlApprovalStatus(null);
+      clearRateLimitTimer(); // B9: don't let a stale timer touch the next run
 
       const startedAt = startTimeRef.current;
       const durationSec = startedAt ? Math.max(1, Math.round((Date.now() - startedAt) / 1000)) : 0;
@@ -514,10 +507,7 @@ export function useChatStream({
       unlistenDone?.();
       unlistenCodeSession?.();
       unlistenCancelled?.();
-      unlistenTypedStatus?.();
-      unlistenTypedPlan?.();
-      unlistenTypedStep?.();
-      unlistenTypedDone?.();
+      clearRateLimitTimer(); // B9: cancel pending rate-limit timer on unmount
       unlistenTypedContext?.();
       unlistenTypedStats?.();
       unlistenTypedUi?.();
