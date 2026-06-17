@@ -83,13 +83,19 @@ pub(crate) fn find_python_interpreter(project_root: &Path) -> Result<String, Str
         return Ok(sidecar);
     }
 
-    // ── 2. Install-script venv in ~/.kim_root or ~/.kim ───────────────────────
+    // ── 2. Install-script venv via ~/.kim_root pointer file, or ~/.kim dir ─────
     if let Some(home) = dirs_home() {
+        // ~/.kim_root is a FILE containing the install checkout path (D1 — the
+        // old code treated it as a directory, so its candidates never existed).
+        if let Some(py) = venv_from_kim_root_file(&home) {
+            return Ok(py);
+        }
+        // ~/.kim may itself hold a provisioned venv.
         let install_candidates = [
-            home.join(".kim_root").join("venv").join("bin").join("python"),
-            home.join(".kim_root").join(".venv").join("bin").join("python"),
             home.join(".kim").join("venv").join("bin").join("python"),
             home.join(".kim").join(".venv").join("bin").join("python"),
+            home.join(".kim").join("venv").join("Scripts").join("python.exe"),
+            home.join(".kim").join(".venv").join("Scripts").join("python.exe"),
         ];
         for c in install_candidates {
             if c.exists() {
@@ -128,6 +134,27 @@ pub(crate) fn find_python_interpreter(project_root: &Path) -> Result<String, Str
          or rebuild the app with the bundled kim-orchestrator sidecar."
             .to_string(),
     )
+}
+
+/// Resolve a venv interpreter from the `~/.kim_root` pointer FILE (D1).
+/// The file's contents are the install checkout path; we probe its venv. Returns
+/// None if the file is absent, empty, or the checkout has no venv.
+fn venv_from_kim_root_file(home: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(home.join(".kim_root")).ok()?;
+    let checkout = PathBuf::from(contents.trim());
+    if checkout.as_os_str().is_empty() {
+        return None;
+    }
+    let candidates = [
+        checkout.join("venv").join("bin").join("python"),
+        checkout.join(".venv").join("bin").join("python"),
+        checkout.join("venv").join("Scripts").join("python.exe"),
+        checkout.join(".venv").join("Scripts").join("python.exe"),
+    ];
+    candidates
+        .into_iter()
+        .find(|c| c.exists())
+        .map(|c| c.to_string_lossy().to_string())
 }
 
 /// Returns the path to the bundled `kim-orchestrator` sidecar if running
@@ -1130,6 +1157,45 @@ mod tests {
             "Expected venv path, got: {}",
             found
         );
+    }
+
+    // ── D1: ~/.kim_root is a pointer FILE, not a directory ──────────────────
+
+    #[test]
+    fn test_kim_root_file_resolves_checkout_venv() {
+        let home = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let bin = checkout.path().join("venv").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("python"), "#!/bin/sh\n").unwrap();
+        // ~/.kim_root is a FILE containing the checkout path.
+        fs::write(
+            home.path().join(".kim_root"),
+            checkout.path().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        let found = venv_from_kim_root_file(home.path());
+        assert!(found.is_some(), "expected venv from .kim_root file");
+        assert!(found.unwrap().contains("venv"));
+    }
+
+    #[test]
+    fn test_kim_root_file_pointing_at_dir_without_venv_falls_through() {
+        let home = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap(); // no venv inside
+        fs::write(
+            home.path().join(".kim_root"),
+            checkout.path().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        assert!(venv_from_kim_root_file(home.path()).is_none());
+    }
+
+    #[test]
+    fn test_no_kim_root_file_returns_none() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(venv_from_kim_root_file(home.path()).is_none());
     }
 
     #[test]

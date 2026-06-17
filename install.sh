@@ -102,6 +102,19 @@ mkdir -p logs
 mkdir -p sessions/chrome_data
 
 # ── Write project root for .app bundle discovery ─────────────────────────
+# C1: warn loudly if ~/.kim_root already points somewhere else — the desktop app
+# and the CLI share this marker, so repointing it changes what code mode runs.
+if [ -f "$HOME/.kim_root" ]; then
+  OLD_KIM_ROOT="$(head -n1 "$HOME/.kim_root" 2>/dev/null)"
+  if [ -n "$OLD_KIM_ROOT" ] && [ "$OLD_KIM_ROOT" != "$PWD" ]; then
+    echo "" >&2
+    echo "  ⚠  ~/.kim_root already points to a different checkout:" >&2
+    echo "       old: $OLD_KIM_ROOT" >&2
+    echo "       new: $PWD" >&2
+    echo "     This overrides what 'kim code' / the browser bridge uses." >&2
+    echo "" >&2
+  fi
+fi
 echo "$PWD" > "$HOME/.kim_root"
 echo "  Saved project root to ~/.kim_root (used by Kim.app)"
 
