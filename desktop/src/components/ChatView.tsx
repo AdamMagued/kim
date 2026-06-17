@@ -380,11 +380,14 @@ export function ChatView({
   };
 
   const handleEditLiveMessage = (idx: number, newText: string) => {
-    stream.setLiveHistory(prev => {
-      const next = [...prev];
-      if (next[idx]) next[idx].content = newText;
-      return next;
-    });
+    // B2: `idx` is the real liveHistory index (via collapsed srcIdx). Edit is
+    // Claude-style: truncate the live exchange at this message and resend the
+    // edited text as a new turn. (Was: a cosmetic in-place mutation that edited
+    // the wrong message after retry-collapse and never reached the agent.)
+    const trimmed = newText.trim();
+    if (!trimmed) return;
+    stream.setLiveHistory(prev => prev.slice(0, idx));
+    handleSubmit(trimmed);
   };
 
   const renderComposer = (heroMode = false) => {

@@ -66,7 +66,10 @@ export function useChatStream({
   const [isRunning, setIsRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [activity, setActivity] = useState<ActivityItem[]>([]);
-  const [runHistory, setRunHistory] = useState<{ activity: ActivityItem[]; durationSec: number }[]>([]);
+  // B5: each run carries the provider it actually used so the cost chip prices
+  // with THAT, not the currently-selected provider. Optional — runs persisted
+  // before this field load as undefined (cost chip hidden).
+  const [runHistory, setRunHistory] = useState<{ activity: ActivityItem[]; durationSec: number; provider?: string | null }[]>([]);
   const [taskError, setTaskError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
@@ -446,7 +449,7 @@ export function useChatStream({
 
       if (event.payload && !wasCancelled && activitySnapshot.length > 0) {
         setRunHistory(prev => {
-          const next = [...prev, { activity: activitySnapshot, durationSec }];
+          const next = [...prev, { activity: activitySnapshot, durationSec, provider: currentTaskRef.current?.provider ?? null }];
           const completedCodeSession = completedCodeSessionRef.current;
           const sid = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
           if (sid) {

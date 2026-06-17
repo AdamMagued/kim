@@ -747,8 +747,12 @@ export function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | n
 // ── Message collapsing ────────────────────────────────────────────────────────
 
 export function collapseMessages(msgs: KimMessage[]) {
-  const res: {msg: KimMessage, retries: number}[] = [];
-  for (const msg of msgs) {
+  // B2: carry `srcIdx` — the index of each kept message in the ORIGINAL array —
+  // so callers can map a collapsed-array position back to the real message
+  // (editing used the collapsed index against the uncollapsed array → wrong msg).
+  const res: {msg: KimMessage, retries: number, srcIdx: number}[] = [];
+  for (let i = 0; i < msgs.length; i++) {
+    const msg = msgs[i];
     if (res.length > 0 && msg.role === 'assistant' && typeof msg.content === 'string') {
       const prev = res[res.length - 1];
       if (prev.msg.role === 'assistant' && typeof prev.msg.content === 'string') {
@@ -763,7 +767,7 @@ export function collapseMessages(msgs: KimMessage[]) {
         }
       }
     }
-    res.push({ msg, retries: 0 });
+    res.push({ msg, retries: 0, srcIdx: i });
   }
   return res;
 }
