@@ -965,31 +965,33 @@ async fn apply_repl_outcome(
             print_note(&app.status);
             Ok(false)
         }
-    }
-}
-
-fn handle_repl_message(app: &mut App, message: String) -> Result<bool, Box<dyn std::error::Error>> {
-    if message == "Conversation cleared." {
-        app.messages.clear();
-        save_current_session_allow_empty(app);
-        print_note("Conversation cleared.");
-        return Ok(false);
-    }
-    if let Some(session_id) = message.strip_prefix("__KIM_RESUME_SESSION__:") {
-        app.resume_session(session_id);
-        app.view = ViewState::InChat;
-        print_recent_transcript(app);
-        return Ok(false);
-    }
-    match message.as_str() {
-        "__KIM_REFRESH_SESSIONS__" => {
+        // A11: real outcome variants replacing magic-string sentinels.
+        CommandOutcome::ClearConversation => {
+            app.messages.clear();
+            save_current_session_allow_empty(app);
+            print_note("Conversation cleared.");
+            Ok(false)
+        }
+        CommandOutcome::OpenSessionPicker => {
             app.refresh_sessions();
             if io::stdin().is_terminal() {
                 choose_session_interactively(app)?;
             } else {
                 print_session_list(&app.sessions);
             }
+            Ok(false)
         }
+        CommandOutcome::ResumeSession(session_id) => {
+            app.resume_session(&session_id);
+            app.view = ViewState::InChat;
+            print_recent_transcript(app);
+            Ok(false)
+        }
+    }
+}
+
+fn handle_repl_message(app: &mut App, message: String) -> Result<bool, Box<dyn std::error::Error>> {
+    match message.as_str() {
         "__KIM_COMPACT__" => {
             compact_app_messages(app);
             if let Some(last) = app.messages.last() {
@@ -1026,24 +1028,36 @@ async fn stream_repl_turn(
     let code_mode = app.mode == AppMode::Code;
     let session_id = app.current_session_id.clone();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         stream_kim_request(&config, &history, code_mode, &session_id, tx).await;
     });
 
-    consume_turn_events(app, rx, Instant::now(), save_current_session).await
+    // A6: Ctrl-C cancels the current generation instead of killing the CLI.
+    // tokio::signal::ctrl_c fires only while we await here (between turns,
+    // rustyline owns the prompt and its own Ctrl-C handling resumes).
+    let cancel = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let result = consume_turn_events(app, rx, Instant::now(), save_current_session, cancel).await;
+    // Reap the request task (kill_on_drop reaps any child subprocess). No-op if
+    // it already finished.
+    handle.abort();
+    result
 }
 
 /// Consume one turn's streamed events, render them, and persist the result.
 /// Extracted from `stream_repl_turn` so it can be driven by a stubbed event
 /// channel with an injected `save` sink in tests — no network required. (A1/A2)
-async fn consume_turn_events<S>(
+async fn consume_turn_events<S, C>(
     app: &mut App,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     started: Instant,
     mut save: S,
+    cancel: C,
 ) -> Result<bool, Box<dyn std::error::Error>>
 where
     S: FnMut(&App),
+    C: std::future::Future<Output = ()>,
 {
     let mut assistant = String::new();
     let mut printed_answer_label = false;
@@ -1051,7 +1065,27 @@ where
     let mut last_tool_line = String::new();
     let mut bridge_used = false;
 
-    while let Some(event) = rx.recv().await {
+    tokio::pin!(cancel);
+    loop {
+        let event = tokio::select! {
+            maybe = rx.recv() => match maybe {
+                Some(event) => event,
+                None => break,
+            },
+            _ = &mut cancel => {
+                // A6: cancel mid-stream — keep whatever already streamed, drop
+                // back to the prompt instead of killing the whole CLI.
+                if printed_answer_label && !assistant.ends_with('\n') {
+                    println!();
+                }
+                print_note("(cancelled)");
+                if !assistant.trim().is_empty() {
+                    app.push(MessageRole::Assistant, std::mem::take(&mut assistant));
+                    save(app);
+                }
+                return Ok(false);
+            }
+        };
         match event {
             AppEvent::TextChunk(chunk) => {
                 if !printed_answer_label {
@@ -1354,7 +1388,7 @@ fn normalize_existing_path(token: &str) -> Option<PathBuf> {
         .flatten()
 }
 
-fn split_shellish_tokens(input: &str) -> Vec<String> {
+pub(crate) fn split_shellish_tokens(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quote = None;
@@ -1466,6 +1500,32 @@ mod tests {
         }
     }
 
+    // A6: a cancel signal must end the turn (return to prompt) instead of
+    // hanging on an open stream / killing the process.
+    #[tokio::test]
+    async fn cancel_signal_ends_turn_without_hanging() {
+        let dir = temp_session_dir();
+        let mut app = test_app("cancel-test-1");
+        app.push(MessageRole::User, "do something long");
+        save_into(&dir)(&app);
+
+        // tx stays open with no Done — without cancel, recv() would block forever.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        tx.send(AppEvent::TextChunk("partial".to_string())).unwrap();
+
+        let res = consume_turn_events(
+            &mut app,
+            rx,
+            Instant::now(),
+            save_into(&dir),
+            std::future::ready(()),
+        )
+        .await;
+        assert!(res.is_ok(), "cancelled turn should return Ok, not hang");
+        drop(tx);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // A1: a normal chat turn must persist BOTH the user message and the streamed
     // assistant reply, and app.messages must carry the reply for the next turn.
     #[tokio::test]
@@ -1479,7 +1539,7 @@ mod tests {
         tx.send(AppEvent::TextChunk("4".to_string())).unwrap();
         tx.send(AppEvent::Done(false)).unwrap();
         drop(tx);
-        consume_turn_events(&mut app, rx, Instant::now(), save_into(&dir))
+        consume_turn_events(&mut app, rx, Instant::now(), save_into(&dir), std::future::pending::<()>())
             .await
             .unwrap();
 
@@ -1516,7 +1576,7 @@ mod tests {
         tx.send(AppEvent::TextChunk("first answer".to_string())).unwrap();
         tx.send(AppEvent::Done(false)).unwrap();
         drop(tx);
-        consume_turn_events(&mut app, rx, Instant::now(), save_into(&dir))
+        consume_turn_events(&mut app, rx, Instant::now(), save_into(&dir), std::future::pending::<()>())
             .await
             .unwrap();
 
@@ -1531,7 +1591,7 @@ mod tests {
         tx2.send(AppEvent::TextChunk("second answer".to_string())).unwrap();
         tx2.send(AppEvent::Done(false)).unwrap();
         drop(tx2);
-        consume_turn_events(&mut app2, rx2, Instant::now(), save_into(&dir))
+        consume_turn_events(&mut app2, rx2, Instant::now(), save_into(&dir), std::future::pending::<()>())
             .await
             .unwrap();
 

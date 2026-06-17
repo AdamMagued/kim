@@ -317,7 +317,7 @@ async fn stream_openai_compatible(
         }
     };
     let base_url = if provider.name == "ollama" {
-        trim_base_url(&config.ollama_base_url)
+        format!("{}/v1", normalize_base_url(&config.ollama_base_url))
     } else {
         provider.default_base_url.to_string()
     };
@@ -640,6 +640,9 @@ fn process_anthropic_sse_line(
 <think> / </think> tag parser
 =========================================================== */
 
+/// gpt-oss harmony channel-boundary token fused into delta.content. (A4)
+const ASSISTANT_FINAL: &str = "assistantfinal";
+
 enum ThinkState {
     Normal,
     InThink,
@@ -663,15 +666,36 @@ impl ThinkParser {
         loop {
             match self.state {
                 ThinkState::Normal => {
-                    if let Some(pos) = self.buf.find("<think>") {
+                    let think_pos = self.buf.find("<think>");
+                    // gpt-oss "harmony" streams chain-of-thought in delta.content
+                    // ending with the fused token `assistantfinal`, then the
+                    // answer. Treat it as a channel boundary: text before → thought,
+                    // marker swallowed, text after → answer. (A4)
+                    let final_pos = self.buf.find(ASSISTANT_FINAL);
+                    let use_think = match (think_pos, final_pos) {
+                        (Some(tp), Some(fp)) => tp <= fp,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if use_think {
+                        let pos = think_pos.expect("think_pos present");
                         let before = self.buf[..pos].to_string();
                         if !before.is_empty() {
                             let _ = tx.send(AppEvent::TextChunk(before));
                         }
                         self.buf = self.buf[pos + 7..].to_string();
                         self.state = ThinkState::InThink;
+                    } else if let Some(pos) = final_pos {
+                        let before = self.buf[..pos].to_string();
+                        if !before.is_empty() {
+                            let _ = tx.send(AppEvent::ThoughtChunk(before));
+                        }
+                        self.buf = self.buf[pos + ASSISTANT_FINAL.len()..].to_string();
+                        // stay in Normal — what follows the marker is the answer.
                     } else {
-                        let flush_up_to = split_before_tail_chars(&self.buf, 6);
+                        // Hold back enough of the tail (>= marker length) so
+                        // `assistantfinal` can't be split across two flushes.
+                        let flush_up_to = split_before_tail_chars(&self.buf, 14);
                         if flush_up_to > 0 {
                             let to_flush = self.buf[..flush_up_to].to_string();
                             let _ = tx.send(AppEvent::TextChunk(to_flush));
@@ -987,7 +1011,7 @@ async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent
         return None;
     }
 
-    let ollama_base = trim_base_url(&config.ollama_base_url);
+    let ollama_base = format!("{}/v1", normalize_base_url(&config.ollama_base_url));
     let mut child = match Command::new("python3")
         .args([tmp_path.to_string_lossy().as_ref(), ollama_base.as_str()])
         .stdout(std::process::Stdio::piped())
@@ -1161,13 +1185,16 @@ or run kim from inside the Kim repo directory."
     })
 }
 
-fn trim_base_url(base_url: &str) -> String {
+/// Normalize a provider base URL to a bare origin (no trailing slash, no `/v1`
+/// suffix). Callers append the endpoint they need (`/v1/chat/completions`,
+/// `/api/tags`, …). Handles trailing slashes and a `/v1/` suffix correctly. (A16)
+pub(crate) fn normalize_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.ends_with("/v1") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/v1")
-    }
+    trimmed
+        .strip_suffix("/v1")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 const KIM_CHAT_SYSTEM_PROMPT: &str = "\
@@ -1345,6 +1372,66 @@ mod tests {
             events.iter().any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.ends_with('…'))),
             "expected a truncated ThoughtChunk, got {events:?}"
         );
+    }
+
+    // ── A16: base-URL normalization ─────────────────────────────────────────
+
+    #[test]
+    fn normalize_base_url_strips_v1_and_trailing_slash() {
+        assert_eq!(normalize_base_url("http://host:11434"), "http://host:11434");
+        assert_eq!(normalize_base_url("http://host:11434/"), "http://host:11434");
+        assert_eq!(normalize_base_url("http://host:11434/v1"), "http://host:11434");
+        // The A16 bug: a trailing slash after /v1 used to defeat the strip.
+        assert_eq!(normalize_base_url("http://host:11434/v1/"), "http://host:11434");
+        assert_eq!(normalize_base_url("  http://host/v1/  "), "http://host");
+    }
+
+    // ── A4: assistantfinal harmony boundary ─────────────────────────────────
+
+    #[test]
+    fn assistantfinal_splits_thought_and_answer_in_one_feed() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        parser.feed("reasoning here assistantfinalThe answer", &tx);
+        parser.flush(&tx);
+        let events = drain(&mut rx);
+        let thoughts: String = events.iter().filter_map(|e| match e {
+            AppEvent::ThoughtChunk(t) => Some(t.clone()), _ => None }).collect();
+        let answer: String = events.iter().filter_map(|e| match e {
+            AppEvent::TextChunk(t) => Some(t.clone()), _ => None }).collect();
+        assert_eq!(thoughts, "reasoning here ");
+        assert_eq!(answer, "The answer");
+        assert!(!thoughts.contains("assistantfinal") && !answer.contains("assistantfinal"));
+    }
+
+    #[test]
+    fn assistantfinal_marker_split_across_two_feeds() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        // Each feed is <= the 14-char tail-hold so nothing flushes prematurely.
+        parser.feed("think ", &tx);
+        parser.feed("assistantfinalDONE", &tx);
+        parser.flush(&tx);
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t == "think ")));
+        assert!(events.iter().any(|e| matches!(e, AppEvent::TextChunk(t) if t == "DONE")));
+        assert!(events.iter().all(|e| match e {
+            AppEvent::TextChunk(t) | AppEvent::ThoughtChunk(t) => !t.contains("assistantfinal"),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn no_assistantfinal_marker_is_plain_text() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        parser.feed("plain answer text", &tx);
+        parser.flush(&tx);
+        let events = drain(&mut rx);
+        let answer: String = events.iter().filter_map(|e| match e {
+            AppEvent::TextChunk(t) => Some(t.clone()), _ => None }).collect();
+        assert_eq!(answer, "plain answer text");
+        assert!(!events.iter().any(|e| matches!(e, AppEvent::ThoughtChunk(_))));
     }
 
     #[test]

@@ -28,6 +28,12 @@ pub enum CommandOutcome {
     ToggleMode,
     /// Start a brand-new chat session (new session ID, cleared messages).
     NewChat,
+    /// Clear the current conversation's messages (A11 — was a sentinel string).
+    ClearConversation,
+    /// Open / refresh the session picker (A11 — was "__KIM_REFRESH_SESSIONS__").
+    OpenSessionPicker,
+    /// Resume a specific session by id (A11 — was "__KIM_RESUME_SESSION__:<id>").
+    ResumeSession(String),
 }
 
 pub const SUPPORTED_COMMANDS: &[&str] = &[
@@ -72,7 +78,7 @@ pub async fn handle_command(input: &str, config: &mut KimConfig) -> CommandOutco
     match command {
         "/" | "/help" | "/commands" => CommandOutcome::Message(commands_menu(args)),
         "/exit" => CommandOutcome::Exit,
-        "/clear" => CommandOutcome::Message("Conversation cleared.".to_string()),
+        "/clear" => CommandOutcome::ClearConversation,
         "/new" => CommandOutcome::NewChat,
         "/status" => CommandOutcome::Message(status(config)),
         "/doctor" => doctor(config).await,
@@ -81,12 +87,12 @@ pub async fn handle_command(input: &str, config: &mut KimConfig) -> CommandOutco
         "/theme" => set_theme(args, config),
         "/login" => login(args, config).await,
         "/logout" => logout(args, config),
-        "/sessions" => CommandOutcome::Message("__KIM_REFRESH_SESSIONS__".to_string()),
+        "/sessions" => CommandOutcome::OpenSessionPicker,
         "/resume" => {
             if args.is_empty() {
-                CommandOutcome::Message("__KIM_REFRESH_SESSIONS__".to_string())
+                CommandOutcome::OpenSessionPicker
             } else {
-                CommandOutcome::Message(format!("__KIM_RESUME_SESSION__:{args}"))
+                CommandOutcome::ResumeSession(args.to_string())
             }
         }
         "/usage" => CommandOutcome::Message("Usage tracking is local-only in this v1 shell; provider billing remains in provider dashboards.".to_string()),
@@ -381,9 +387,13 @@ async fn doctor(config: &KimConfig) -> CommandOutcome {
     ];
 
     if config.provider == "ollama" {
+        let base = crate::provider::normalize_base_url(&config.ollama_base_url);
+        lines.push(format!("Ollama server: {}", http_status(&base, "/api/tags").await));
+        // A8: doctor must verify the configured model is actually servable —
+        // it previously reported "ok" while the selected model was missing.
         lines.push(format!(
-            "Ollama server: {}",
-            http_status(&trim_base_url(&config.ollama_base_url), "/api/tags").await
+            "Ollama model: {}",
+            ollama_model_status(&base, &config.model).await
         ));
     }
     if config.provider == "desktop" || is_browser_provider(&config.provider) {
@@ -406,6 +416,19 @@ async fn doctor(config: &KimConfig) -> CommandOutcome {
             "API key: {}",
             api_key_status(key_env, env_val, stored, &config.provider)
         ));
+        // A8: note whether the configured model appears in the known list.
+        let opts = model_options(config).await;
+        if !opts.is_empty() {
+            lines.push(format!(
+                "Model '{}': {}",
+                config.model,
+                if opts.iter().any(|m| m == &config.model) {
+                    "in the known model list".to_string()
+                } else {
+                    format!("not in the known list (known: {})", opts.join(", "))
+                }
+            ));
+        }
     }
 
     CommandOutcome::Message(lines.join("\n"))
@@ -684,10 +707,50 @@ async fn ollama_server_models() -> Option<Vec<String>> {
     Some(models)
 }
 
-fn trim_base_url(url: &str) -> String {
-    url.trim_end_matches("/v1")
-        .trim_end_matches('/')
-        .to_string()
+/// Fetch the model list from a specific ollama base URL (respects config, not a
+/// hardcoded host). Returns None if unreachable / non-200. (A8)
+async fn ollama_models_at(base: &str) -> Option<Vec<String>> {
+    let url = format!("{}/api/tags", base.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.unwrap_or_default();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    Some(
+        json["models"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["name"].as_str())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    )
+}
+
+/// Doctor line: is `model` actually servable by this ollama endpoint? (A8)
+async fn ollama_model_status(base: &str, model: &str) -> String {
+    if known_ollama_cloud_models().contains(&model) {
+        return format!("'{model}' is a known Ollama cloud model");
+    }
+    match ollama_models_at(base).await {
+        Some(models) if models.iter().any(|m| m == model) => {
+            format!("'{model}' is installed")
+        }
+        Some(models) => format!(
+            "⚠ '{model}' is not installed and not a known cloud model — pull it or pick another (installed: {})",
+            if models.is_empty() { "none".to_string() } else { models.join(", ") }
+        ),
+        None => format!("⚠ could not reach /api/tags to verify '{model}'"),
+    }
 }
 
 /// Returns a human-readable API-key status for /doctor.  Precedence mirrors
@@ -885,7 +948,9 @@ async fn run_project_command(program: &str, args: &str) -> CommandOutcome {
     if args.trim().is_empty() {
         return CommandOutcome::Message(format!("Usage: /{program} <args>"));
     }
-    let split = args.split_whitespace().collect::<Vec<_>>();
+    // A10: honor quotes so `/git commit -m "two words"` stays one argument.
+    let tokens = crate::split_shellish_tokens(args);
+    let split = tokens.iter().map(String::as_str).collect::<Vec<_>>();
     shell(program, &split, &format!("{program} {args}")).await
 }
 
