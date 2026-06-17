@@ -281,7 +281,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         CliCommand::Repl { resume_id } => match run_repl(resume_id.as_deref()).await {
             Ok(session_id) => {
-                println!("Resume this Kim session with: kim --resume {session_id}")
+                // Only advertise --resume when a session file was actually
+                // written (empty REPLs and skipped saves leave none). (A7)
+                let session_saved = dirs::home_dir()
+                    .map(|h| {
+                        h.join(".kim")
+                            .join("sessions")
+                            .join(format!("{session_id}.jsonl"))
+                    })
+                    .map(|p| p.exists())
+                    .unwrap_or(false);
+                if session_saved {
+                    println!("Resume this Kim session with: kim --resume {session_id}");
+                }
             }
             Err(error) => {
                 eprintln!("kim error: {error}");
@@ -1003,22 +1015,36 @@ async fn stream_repl_turn(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     app.view = ViewState::InChat;
     app.push(MessageRole::User, prompt.clone());
-    let is_local_agent = app.config.provider != "desktop" && app.mode != AppMode::Code;
-    if !is_local_agent {
-        save_current_session(app);
-    }
+    // Persist the user turn up front so the session file exists even if the
+    // request errors or is interrupted, and so resumed chats keep their history.
+    // (A1/A2 — the old `is_local_agent` reload-from-file branch was vestigial:
+    // nothing writes that file mid-stream, so it wiped state every turn.)
+    save_current_session(app);
 
     let history = app.chat_history();
     let config = app.config.clone();
     let code_mode = app.mode == AppMode::Code;
     let session_id = app.current_session_id.clone();
-    let spawn_session_id = session_id.clone();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
     tokio::spawn(async move {
-        stream_kim_request(&config, &history, code_mode, &spawn_session_id, tx).await;
+        stream_kim_request(&config, &history, code_mode, &session_id, tx).await;
     });
 
-    let started = Instant::now();
+    consume_turn_events(app, rx, Instant::now(), save_current_session).await
+}
+
+/// Consume one turn's streamed events, render them, and persist the result.
+/// Extracted from `stream_repl_turn` so it can be driven by a stubbed event
+/// channel with an injected `save` sink in tests — no network required. (A1/A2)
+async fn consume_turn_events<S>(
+    app: &mut App,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    started: Instant,
+    mut save: S,
+) -> Result<bool, Box<dyn std::error::Error>>
+where
+    S: FnMut(&App),
+{
     let mut assistant = String::new();
     let mut printed_answer_label = false;
     let mut printed_thinking = false;
@@ -1070,54 +1096,25 @@ async fn stream_repl_turn(
                     role: MessageRole::Error,
                     content: error,
                 });
-                save_current_session(app);
+                save(app);
                 return Ok(false);
             }
         }
     }
 
-    if is_local_agent {
-        if let Some(home) = dirs::home_dir() {
-            let session_file = home
-                .join(".kim")
-                .join("sessions")
-                .join(format!("{}.jsonl", session_id));
-            if session_file.exists() {
-                if let Ok(new_messages) = sessions::load_session_messages(&session_file) {
-                    let old_len = app.messages.len();
-                    app.messages = new_messages;
-                    for msg in app.messages.iter().skip(old_len) {
-                        if msg.role == MessageRole::Assistant {
-                            if !printed_answer_label {
-                                if printed_thinking {
-                                    println!();
-                                }
-                                print!("{}", paint_bold("Kim: ", kim_accent_color()));
-                                stdout().flush()?;
-                                printed_answer_label = true;
-                            }
-                            println!("{}", msg.content);
-                        }
-                    }
-                }
-            }
-        }
-        if !printed_answer_label {
-            println!("Kim: (no response)");
+    if printed_answer_label {
+        if !assistant.ends_with('\n') {
+            println!();
         }
     } else {
-        if printed_answer_label {
-            if !assistant.ends_with('\n') {
-                println!();
-            }
-        } else {
-            println!("Kim: (no response)");
-        }
+        println!("Kim: (no response)");
+    }
 
-        if !assistant.trim().is_empty() {
-            app.push(MessageRole::Assistant, assistant);
-            save_current_session(app);
-        }
+    // Push the streamed assistant reply into the session and persist again, so
+    // the next turn's `chat_history()` actually includes Kim's response. (A1)
+    if !assistant.trim().is_empty() {
+        app.push(MessageRole::Assistant, assistant);
+        save(app);
     }
 
     let via = if bridge_used { " via Kim desktop" } else { "" };
@@ -1426,11 +1423,132 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        parse_cli_args, prompt_file_references, prompt_with_file_references, provider_is_ready,
-        provider_is_ready_with_env, split_shellish_tokens, App, AppMode, CliCommand, MessageRole,
-        ViewState,
+        consume_turn_events, parse_cli_args, prompt_file_references, prompt_with_file_references,
+        provider_is_ready, provider_is_ready_with_env, split_shellish_tokens, App, AppEvent,
+        AppMode, CliCommand, MessageRole, ViewState,
     };
     use crate::config::KimConfig;
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+
+    fn temp_session_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kim-cli-sesstest-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp session dir");
+        dir
+    }
+
+    fn test_app(session_id: &str) -> App {
+        App {
+            config: KimConfig::default(),
+            messages: Vec::new(),
+            sessions: Vec::new(),
+            selected_session: 0,
+            current_session_id: session_id.to_string(),
+            ctrl_c_armed: false,
+            mode: AppMode::Chat,
+            view: ViewState::InChat,
+            provider_ready: true,
+            status: "ready".to_string(),
+        }
+    }
+
+    fn save_into<'a>(dir: &'a Path) -> impl FnMut(&App) + 'a {
+        move |a: &App| {
+            crate::sessions::save_session_messages_in(dir, &a.current_session_id, &a.messages)
+                .expect("session save");
+        }
+    }
+
+    // A1: a normal chat turn must persist BOTH the user message and the streamed
+    // assistant reply, and app.messages must carry the reply for the next turn.
+    #[tokio::test]
+    async fn turn_persists_user_and_assistant_reply() {
+        let dir = temp_session_dir();
+        let mut app = test_app("persist-test-1234");
+        app.push(MessageRole::User, "what is 2+2?");
+        save_into(&dir)(&app); // pre-turn save (as stream_repl_turn does)
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        tx.send(AppEvent::TextChunk("4".to_string())).unwrap();
+        tx.send(AppEvent::Done(false)).unwrap();
+        drop(tx);
+        consume_turn_events(&mut app, rx, Instant::now(), save_into(&dir))
+            .await
+            .unwrap();
+
+        // (b) reply is in app.messages
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Assistant && m.content == "4"));
+        // (a) session file exists with both turns
+        let file = dir.join("persist-test-1234.jsonl");
+        assert!(file.exists(), "session file should be written");
+        let loaded = crate::sessions::load_session_messages(&file).unwrap();
+        assert!(loaded
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content == "what is 2+2?"));
+        assert!(loaded
+            .iter()
+            .any(|m| m.role == MessageRole::Assistant && m.content == "4"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // A2: resuming a session then taking another turn must preserve old AND new
+    // messages (the old reload branch wiped the new exchange every turn).
+    #[tokio::test]
+    async fn resumed_session_preserves_old_and_new_messages() {
+        let dir = temp_session_dir();
+        let sid = "resume-test-9999";
+
+        // Turn 1
+        let mut app = test_app(sid);
+        app.push(MessageRole::User, "first question");
+        save_into(&dir)(&app);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        tx.send(AppEvent::TextChunk("first answer".to_string())).unwrap();
+        tx.send(AppEvent::Done(false)).unwrap();
+        drop(tx);
+        consume_turn_events(&mut app, rx, Instant::now(), save_into(&dir))
+            .await
+            .unwrap();
+
+        // Resume into a fresh app from the saved file, then take turn 2.
+        let file = dir.join(format!("{sid}.jsonl"));
+        let resumed = crate::sessions::load_session_messages(&file).unwrap();
+        let mut app2 = test_app(sid);
+        app2.messages = resumed;
+        app2.push(MessageRole::User, "second question");
+        save_into(&dir)(&app2);
+        let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        tx2.send(AppEvent::TextChunk("second answer".to_string())).unwrap();
+        tx2.send(AppEvent::Done(false)).unwrap();
+        drop(tx2);
+        consume_turn_events(&mut app2, rx2, Instant::now(), save_into(&dir))
+            .await
+            .unwrap();
+
+        let final_msgs = crate::sessions::load_session_messages(&file).unwrap();
+        for expected in [
+            "first question",
+            "first answer",
+            "second question",
+            "second answer",
+        ] {
+            assert!(
+                final_msgs.iter().any(|m| m.content == expected),
+                "resumed session lost message: {expected}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn start_new_chat_resets_session_and_clears_messages() {

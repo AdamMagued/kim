@@ -90,7 +90,7 @@ pub fn save_session_messages(session_id: &str, messages: &[UiMessage]) -> Result
 
 /// Inner implementation — accepts an explicit root so tests can target a temp dir
 /// without touching the real `~/.kim/sessions` store.
-fn save_session_messages_in(
+pub(crate) fn save_session_messages_in(
     root: &Path,
     session_id: &str,
     messages: &[UiMessage],
@@ -449,7 +449,7 @@ fn days_in_month(month: u8, year: u16) -> u8 {
     }
 }
 
-fn truncate(text: &str, max: usize) -> String {
+pub(crate) fn truncate(text: &str, max: usize) -> String {
     let mut chars = text.chars();
     let truncated = chars.by_ref().take(max).collect::<String>();
     if chars.next().is_some() {

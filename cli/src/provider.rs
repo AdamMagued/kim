@@ -508,6 +508,18 @@ fn sse_data_payload(line: &str) -> Option<&str> {
     line.strip_prefix("data:").map(str::trim_start)
 }
 
+/// Render an in-stream error payload into a user-facing message. Handles both
+/// an object with a `message` field and a bare string error. (A3)
+fn format_stream_error(err: &Value) -> String {
+    let detail = err
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| err.as_str().map(str::to_string))
+        .unwrap_or_else(|| err.to_string());
+    format!("Provider error: {detail}")
+}
+
 fn process_openai_sse_line(line: &str, parser: &mut ThinkParser, tx: &UnboundedSender<AppEvent>) {
     let Some(data) = sse_data_payload(line) else {
         return;
@@ -518,6 +530,12 @@ fn process_openai_sse_line(line: &str, parser: &mut ThinkParser, tx: &UnboundedS
     let Ok(json) = serde_json::from_str::<Value>(data) else {
         return;
     };
+    // In-stream provider errors (ollama/openai emit `{"error": ...}` mid-stream,
+    // e.g. model-not-found) must surface, not be silently dropped. (A3)
+    if let Some(err) = json.get("error") {
+        let _ = tx.send(AppEvent::Err(format_stream_error(err)));
+        return;
+    }
     let Some(choices) = json.get("choices").and_then(Value::as_array) else {
         return;
     };
@@ -607,6 +625,12 @@ fn process_anthropic_sse_line(
                 }
                 _ => {}
             }
+        }
+        // Anthropic streams `{"type":"error","error":{...}}` events; surface
+        // them instead of dropping the stream silently. (A3)
+        Some("error") => {
+            let err = json.get("error").unwrap_or(&json);
+            let _ = tx.send(AppEvent::Err(format_stream_error(err)));
         }
         _ => {}
     }
@@ -897,11 +921,8 @@ fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: boo
             if let Some(output) = json.get("output").and_then(Value::as_str) {
                 let trimmed = output.trim();
                 if !trimmed.is_empty() {
-                    let display = if trimmed.len() > 300 {
-                        format!("{}…", &trimmed[..300])
-                    } else {
-                        trimmed.to_string()
-                    };
+                    // char-boundary-safe truncation — byte slicing panics mid-UTF-8 (A5)
+                    let display = crate::sessions::truncate(trimmed, 300);
                     let _ = tx.send(AppEvent::ThoughtChunk(display));
                 }
             }
@@ -927,11 +948,8 @@ fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: boo
                         if let Some(output) = item.get("output").and_then(Value::as_str) {
                             let trimmed = output.trim();
                             if !trimmed.is_empty() {
-                                let display = if trimmed.len() > 300 {
-                                    format!("{}…", &trimmed[..300])
-                                } else {
-                                    trimmed.to_string()
-                                };
+                                // char-boundary-safe truncation (A5)
+                                let display = crate::sessions::truncate(trimmed, 300);
                                 let _ = tx.send(AppEvent::ThoughtChunk(display));
                             }
                         }
@@ -1248,6 +1266,85 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, AppEvent::TextChunk(t) if t == "done")));
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> Vec<AppEvent> {
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
+
+    // ── A3: in-stream provider errors surface as AppEvent::Err ──────────────
+
+    #[test]
+    fn openai_sse_surfaces_error_object() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        // ollama emits this when the requested model isn't pulled.
+        process_openai_sse_line(
+            r#"data: {"error":{"message":"model 'gpt-oss:20b-cloud' not found"}}"#,
+            &mut parser,
+            &tx,
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(e, AppEvent::Err(m) if m.contains("not found"))),
+            "expected an Err event, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn openai_sse_surfaces_bare_string_error() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        process_openai_sse_line(
+            r#"data: {"error":"upstream timed out"}"#,
+            &mut parser,
+            &tx,
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(e, AppEvent::Err(m) if m.contains("upstream timed out"))),
+            "expected an Err event, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_surfaces_error_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        process_anthropic_sse_line(
+            r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            &mut parser,
+            &tx,
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(e, AppEvent::Err(m) if m.contains("Overloaded"))),
+            "expected an Err event, got {events:?}"
+        );
+    }
+
+    // ── A5: char-boundary-safe truncation of tool output ────────────────────
+
+    #[test]
+    fn function_call_output_truncation_is_char_safe() {
+        // Byte 300 lands mid-emoji; byte slicing `&trimmed[..300]` would panic.
+        let mut payload = "a".repeat(299);
+        payload.push('🦀'); // 4-byte char straddling the 300-byte boundary
+        payload.push_str(&"b".repeat(50));
+        let line = serde_json::json!({"type": "function_call_output", "output": payload})
+            .to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Must not panic.
+        process_codex_line(&line, &tx, false);
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.ends_with('…'))),
+            "expected a truncated ThoughtChunk, got {events:?}"
+        );
     }
 
     #[test]
