@@ -162,11 +162,16 @@ pub async fn stream_kim_request(
     }
 
     // Chat mode: stream directly to the configured provider.
-    // Prepend the system prompt then call the appropriate streaming function.
-    let system = KIM_CHAT_SYSTEM_PROMPT;
+    // Prepend the system prompt (plus project KIM.md context, if present) then
+    // call the appropriate streaming function. (A12)
+    let mut system = KIM_CHAT_SYSTEM_PROMPT.to_string();
+    if let Some(kim_md) = load_kim_md() {
+        system.push_str("\n\n# Project context (from KIM.md)\n");
+        system.push_str(&kim_md);
+    }
     let mut full = vec![ChatMessage {
         role: "system".to_string(),
-        content: system.to_string(),
+        content: system,
     }];
     full.extend_from_slice(messages);
 
@@ -265,13 +270,30 @@ async fn stream_via_bridge(
     if let Some(token) = bridge_token() {
         request = request.header("X-Kim-Token", token);
     }
-    match request.send().await {
+    // A13: /v1/task is non-streaming — it returns one blob after the whole run.
+    // Emit a heartbeat every ~5s so the user isn't staring at silence.
+    let response_future = async {
+        let resp = request.send().await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Ok::<(reqwest::StatusCode, String), reqwest::Error>((status, body))
+    };
+    tokio::pin!(response_future);
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+    heartbeat.tick().await; // consume the immediate first tick
+    let result = loop {
+        tokio::select! {
+            r = &mut response_future => break r,
+            _ = heartbeat.tick() => {
+                let _ = tx.send(AppEvent::ThoughtChunk("Kim desktop is working…".to_string()));
+            }
+        }
+    };
+    match result {
         Err(e) => {
             let _ = tx.send(AppEvent::Err(format!("Desktop bridge request failed: {e}")));
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        Ok((status, body)) => {
             if status.is_success() {
                 if let Ok(value) = serde_json::from_str::<Value>(&body) {
                     if let Some(response) = value.get("response").and_then(Value::as_str) {
@@ -1197,6 +1219,43 @@ pub(crate) fn normalize_base_url(base_url: &str) -> String {
         .to_string()
 }
 
+/// A12: load project context from the nearest KIM.md, walking up from cwd to the
+/// repo root (a dir with `.git` or `orchestrator/agent.py`). Capped at ~4KB.
+fn load_kim_md() -> Option<String> {
+    load_kim_md_from(&std::env::current_dir().ok()?)
+}
+
+fn load_kim_md_from(start: &Path) -> Option<String> {
+    const CAP: usize = 4096;
+    let mut dir = start.to_path_buf();
+    loop {
+        let candidate = dir.join("KIM.md");
+        if candidate.is_file() {
+            let mut content = std::fs::read_to_string(&candidate).ok()?;
+            if content.len() > CAP {
+                // char-boundary-safe truncation
+                let end = content
+                    .char_indices()
+                    .take_while(|(i, _)| *i < CAP)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                content.truncate(end);
+                content.push_str("\n…(KIM.md truncated at 4KB)");
+            }
+            return Some(content);
+        }
+        // Stop at the repo root (having checked KIM.md there) or filesystem root.
+        if dir.join(".git").exists() || dir.join("orchestrator").join("agent.py").exists() {
+            break;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
 const KIM_CHAT_SYSTEM_PROMPT: &str = "\
 You are Kim, a personal AI assistant. Help with any task: questions, research, \
 writing, coding, planning, or analysis. Be direct and conversational. \
@@ -1372,6 +1431,47 @@ mod tests {
             events.iter().any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.ends_with('…'))),
             "expected a truncated ThoughtChunk, got {events:?}"
         );
+    }
+
+    // ── A12: KIM.md project context loading ─────────────────────────────────
+
+    #[test]
+    fn load_kim_md_reads_nearest_file_and_caps_size() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kim-md-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // .git marker so the walk stops here.
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        std::fs::write(tmp.join("KIM.md"), "# Project\nUse cargo test.").unwrap();
+        let got = load_kim_md_from(&tmp).expect("should find KIM.md");
+        assert!(got.contains("Use cargo test."));
+
+        // Oversized KIM.md is truncated with a note.
+        std::fs::write(tmp.join("KIM.md"), "x".repeat(9000)).unwrap();
+        let big = load_kim_md_from(&tmp).unwrap();
+        assert!(big.contains("truncated"));
+        assert!(big.len() < 9000);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn load_kim_md_returns_none_when_absent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kim-md-none-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        assert!(load_kim_md_from(&tmp).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // ── A16: base-URL normalization ─────────────────────────────────────────

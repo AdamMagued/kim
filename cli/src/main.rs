@@ -180,25 +180,33 @@ impl App {
     }
 
     fn chat_history(&self) -> Vec<ChatMessage> {
-        self.messages
-            .iter()
-            .filter_map(|m| match m.role {
-                MessageRole::User => Some(ChatMessage {
-                    role: "user".to_string(),
-                    content: m.content.clone(),
-                }),
-                MessageRole::Assistant => Some(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: m.content.clone(),
-                }),
-                MessageRole::System | MessageRole::Error | MessageRole::Reasoning => None,
-            })
-            .rev()
-            .take(24)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect()
+        // A20: keep the newest messages within BOTH a message-count cap (24) and a
+        // crude char budget (~48k), dropping oldest first, so a few huge messages
+        // can't blow the context window. The newest message is always included.
+        const MAX_MSGS: usize = 24;
+        const MAX_CHARS: usize = 48_000;
+        let mut out: Vec<ChatMessage> = Vec::new();
+        let mut total = 0usize;
+        for m in self.messages.iter().rev() {
+            let role = match m.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::System | MessageRole::Error | MessageRole::Reasoning => continue,
+            };
+            if out.len() >= MAX_MSGS {
+                break;
+            }
+            if !out.is_empty() && total + m.content.len() > MAX_CHARS {
+                break;
+            }
+            total += m.content.len();
+            out.push(ChatMessage {
+                role: role.to_string(),
+                content: m.content.clone(),
+            });
+        }
+        out.reverse();
+        out
     }
 
     fn refresh_sessions(&mut self) {
@@ -206,8 +214,9 @@ impl App {
             AppMode::Chat => discover_sessions(),
             AppMode::Code => discover_project_sessions(),
         };
+        // A17: clamp to the last valid index, not len() (which is out of range).
         if !self.sessions.is_empty() {
-            self.selected_session = self.selected_session.min(self.sessions.len());
+            self.selected_session = self.selected_session.min(self.sessions.len() - 1);
         } else {
             self.selected_session = 0;
         }
@@ -1370,6 +1379,18 @@ fn normalize_existing_path(token: &str) -> Option<PathBuf> {
     if trimmed.is_empty() {
         return None;
     }
+    // A19: don't match innocent words. Require a path-ish token (a separator, a
+    // dot, or ~) and never treat a bare "." / ".." as a reference.
+    if trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    let path_ish = trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('.')
+        || trimmed.starts_with('~');
+    if !path_ish {
+        return None;
+    }
     let expanded = if trimmed == "~" {
         dirs::home_dir()?
     } else if let Some(rest) = trimmed.strip_prefix("~/") {
@@ -1382,10 +1403,17 @@ fn normalize_existing_path(token: &str) -> Option<PathBuf> {
     } else {
         std::env::current_dir().ok()?.join(expanded)
     };
-    candidate
-        .exists()
-        .then(|| std::fs::canonicalize(candidate).ok())
-        .flatten()
+    if !candidate.exists() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(&candidate).ok()?;
+    // A19: never reference the current working directory itself.
+    if let Ok(cwd) = std::env::current_dir() {
+        if std::fs::canonicalize(&cwd).ok().as_deref() == Some(canonical.as_path()) {
+            return None;
+        }
+    }
+    Some(canonical)
 }
 
 pub(crate) fn split_shellish_tokens(input: &str) -> Vec<String> {
@@ -1689,6 +1717,55 @@ mod tests {
             .api_keys
             .insert("gemini".to_string(), " \n ".to_string());
         assert!(!provider_is_ready_with_env(&config, |_| None));
+    }
+
+    // ── A20: chat_history budget ────────────────────────────────────────────
+
+    #[test]
+    fn chat_history_caps_message_count() {
+        let mut app = test_app("budget-count");
+        for i in 0..40 {
+            app.push(MessageRole::User, format!("m{i}"));
+        }
+        let hist = app.chat_history();
+        assert!(hist.len() <= 24, "expected <=24, got {}", hist.len());
+        assert_eq!(hist.last().unwrap().content, "m39"); // newest preserved
+    }
+
+    #[test]
+    fn chat_history_respects_char_budget() {
+        let mut app = test_app("budget-chars");
+        app.push(MessageRole::User, "a".repeat(30_000));
+        app.push(MessageRole::Assistant, "b".repeat(30_000));
+        app.push(MessageRole::User, "c".repeat(30_000));
+        let hist = app.chat_history();
+        // Only the newest fits under the ~48k budget (the next would exceed it).
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].content.chars().next(), Some('c'));
+    }
+
+    // ── A19: file-reference detector ────────────────────────────────────────
+
+    #[test]
+    fn file_refs_ignore_bare_dot_and_plain_words() {
+        assert!(prompt_file_references("what is .").is_empty());
+        assert!(prompt_file_references("tell me about cargo").is_empty());
+    }
+
+    #[test]
+    fn file_refs_match_pathish_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "kim-ref-{}.txt",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::write(&path, "x").unwrap();
+        // Use forward slashes — split_shellish_tokens treats `\` as an escape, so
+        // a Windows backslash path would be mangled (a real cross-platform gap in
+        // the tokenizer, separate from A19's matching gate).
+        let token = path.to_string_lossy().replace('\\', "/");
+        let refs = prompt_file_references(&format!("inspect {token}"));
+        let _ = fs::remove_file(&path);
+        assert!(refs.iter().any(|p| p.to_string_lossy().contains("kim-ref-")));
     }
 
     #[test]

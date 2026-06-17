@@ -464,19 +464,15 @@ async fn set_model(args: &str, config: &mut KimConfig) -> CommandOutcome {
 pub async fn model_options(config: &KimConfig) -> Vec<String> {
     let mut models = match config.provider.as_str() {
         "ollama" => ollama_models().await,
+        // A18: current Claude model ids (claude-api).
         "claude" => vec![
-            "claude-opus-4-7".to_string(),
-            "claude-opus-4-6".to_string(),
+            "claude-opus-4-8".to_string(),
             "claude-sonnet-4-6".to_string(),
             "claude-haiku-4-5-20251001".to_string(),
+            "claude-opus-4-7".to_string(),
         ],
-        "openai" => vec![
-            "gpt-4o".to_string(),
-            "gpt-4o-mini".to_string(),
-            "o1".to_string(),
-            "o1-mini".to_string(),
-            "o3-mini".to_string(),
-        ],
+        // A18: fetch live where cheap (/v1/models), static fallback otherwise.
+        "openai" => openai_models(config).await,
         "gemini" => vec![
             "gemini-2.5-pro".to_string(),
             "gemini-2.5-flash".to_string(),
@@ -493,6 +489,50 @@ pub async fn model_options(config: &KimConfig) -> Vec<String> {
         models.insert(0, config.model.clone());
     }
     models
+}
+
+/// A18: OpenAI model list — live from /v1/models when a key is available,
+/// otherwise a static fallback. Filters to chat-capable gpt*/o* ids.
+async fn openai_models(config: &KimConfig) -> Vec<String> {
+    let fallback: Vec<String> = ["gpt-4o", "gpt-4o-mini", "o3", "o3-mini", "o1"]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .or_else(|| config.api_keys.get("openai").cloned())
+        .unwrap_or_default();
+    if key.trim().is_empty() {
+        return fallback;
+    }
+    let resp = reqwest::Client::new()
+        .get("https://api.openai.com/v1/models")
+        .header("Authorization", format!("Bearer {}", key.trim()))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await;
+    let Ok(r) = resp else { return fallback };
+    if !r.status().is_success() {
+        return fallback;
+    }
+    let text = r.text().await.unwrap_or_default();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let mut ids: Vec<String> = json["data"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m["id"].as_str())
+                .filter(|id| id.starts_with("gpt") || id.starts_with('o'))
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return fallback;
+    }
+    ids.sort();
+    ids
 }
 
 async fn ollama_models() -> Vec<String> {

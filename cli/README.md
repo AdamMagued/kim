@@ -129,3 +129,20 @@ KimCLI should feel like a first-class terminal agent:
 - Keyless browser providers when desktop Kim is running.
 - Local Ollama support for fully local/free usage.
 - One-command install with a normal `kim` executable on PATH.
+
+## Session formats (C2)
+
+KimCLI discovers sessions from two stores with **different formats**:
+
+1. **CLI sessions** — `~/.kim/sessions/<id>.jsonl`, written by KimCLI itself.
+   Each line is `{"type":"message","role","content","timestamp_ms"}`. These
+   resume fully: the whole user/assistant transcript is restored.
+2. **Orchestrator traces** — `kim_sessions/<date>/<id>.jsonl` (and in-repo dirs),
+   written by the desktop/orchestrator agent. These are richer trace records
+   (tool calls, screenshots, plan steps). When resumed in the CLI, only the
+   displayable text is recovered — **tool context is not resumable**, so the
+   CLI labels such a resume as a read-only transcript.
+
+The session picker scans both stores plus the current directory's `.kim/`. If a
+resumed session looks like an orchestrator trace, treat it as a read-only
+reference, not a fully continuable conversation.
