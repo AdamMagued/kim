@@ -173,7 +173,6 @@ export function ChatComposer({
     onSubmit(fullText);
   };
 
-  const queueEnabled = true;
   const codeNeedsProject = activeTab === 'code' && !activeProjectPath;
 
   return (
@@ -264,9 +263,7 @@ export function ChatComposer({
               codeNeedsProject
                 ? 'Create a new project or open a project folder first.'
                 : isRunning
-                ? queueEnabled
-                  ? 'Kim is working — type now, Send adds to queue'
-                  : 'Kim is working — Send interrupts current task'
+                ? 'Kim is working — type now, Send adds to queue'
                 : attachedFiles.length > 0
                 ? 'Add a message or just send…'
                 : activeTab === 'code' && activeProjectPath
