@@ -151,6 +151,20 @@ class StdinApprovalBridge(UIBridge):
     async def confirm_action(self, tool_name: str, args: dict) -> bool:
         if self._cancelled.is_set():
             return False
+        # K3: when the shared stdin pump is running (runtime), approvals are
+        # routed through it (so steer lines don't get eaten by a raw readline).
+        # In unit tests the pump isn't started, so fall back to the legacy
+        # readline path which the existing tests patch sys.stdin for.
+        pump = get_stdin_pump()
+        if pump.is_running():
+            try:
+                data = await pump.next_approval(timeout=120.0)
+                return bool(data.get("approved", False))
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "HITL stdin approval failed (%s) — denying tool '%s'", exc, tool_name
+                )
+                return False
         loop = asyncio.get_running_loop()
         try:
             line: str = await asyncio.wait_for(
@@ -164,3 +178,76 @@ class StdinApprovalBridge(UIBridge):
                 "HITL stdin approval failed (%s) — denying tool '%s'", exc, tool_name
             )
             return False
+
+
+class StdinPump:
+    """K3: single background reader for the agent's stdin.
+
+    Routes JSON lines by ``type``:
+      - ``user_steer``  → the steer callback (agent injects as a user message)
+      - ``hitl_approve``/``hitl_approval`` → the approval queue (HITL gate)
+
+    A single reader avoids two consumers racing on stdin (steering vs approval).
+    """
+
+    def __init__(self) -> None:
+        self._approval_q: "asyncio.Queue[dict]" = asyncio.Queue()
+        self._steer_cb = None
+        self._started = False
+        self._loop = None
+
+    def is_running(self) -> bool:
+        return self._started
+
+    def set_steer_callback(self, cb) -> None:
+        self._steer_cb = cb
+
+    def _dispatch(self, data: dict) -> None:
+        """Route one parsed line. Pure enough to unit-test directly."""
+        kind = data.get("type")
+        if kind == "user_steer":
+            text = str(data.get("text", "")).strip()
+            if text and self._steer_cb is not None:
+                if self._loop is not None:
+                    self._loop.call_soon_threadsafe(self._steer_cb, text)
+                else:
+                    self._steer_cb(text)
+        elif kind in ("hitl_approve", "hitl_approval"):
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(self._approval_q.put_nowait, data)
+            else:
+                self._approval_q.put_nowait(data)
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
+        threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def _read_loop(self) -> None:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+            self._dispatch(data)
+
+    async def next_approval(self, timeout: float) -> dict:
+        return await asyncio.wait_for(self._approval_q.get(), timeout=timeout)
+
+
+_STDIN_PUMP: "StdinPump | None" = None
+
+
+def get_stdin_pump() -> StdinPump:
+    global _STDIN_PUMP
+    if _STDIN_PUMP is None:
+        _STDIN_PUMP = StdinPump()
+    return _STDIN_PUMP

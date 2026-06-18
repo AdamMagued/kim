@@ -7,6 +7,7 @@ from pathlib import Path
 import aiofiles
 
 from mcp_server.config import validate_path, PROJECT_ROOT
+from mcp_server.checkpoints import backup_pre_image
 
 # A data-URI is only treated as binary when it matches the WHOLE content
 # (anchored prefix, base64 body, no trailing junk). A text file that merely
@@ -32,6 +33,7 @@ async def handle_write_file(args: dict) -> str:
     path = validate_path(args["path"])
     content = args["content"]
     binary = bool(args.get("binary", False))
+    backup_pre_image(path)  # K1: checkpoint pre-image before mutating
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Binary path: explicit `binary` flag, or a clean whole-content data-URI.
@@ -110,6 +112,7 @@ async def handle_delete_file(args: dict) -> str:
         return f"ERROR: File not found: {path}"
     if path.is_dir():
         return "ERROR: Use a shell command to delete directories; delete_file only removes files."
+    backup_pre_image(path)  # K1: checkpoint pre-image before delete
     path.unlink()
     logger.info(f"delete_file: {path}")
     return f"Deleted: {path}"

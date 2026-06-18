@@ -1336,6 +1336,9 @@ async def handle_web_text(args: dict) -> str:
 
 
 async def handle_web_screenshot(args: dict) -> str:
+    from ..privacy import is_privacy_paused, PRIVACY_ERROR
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     page = await _page()
     full = bool(args.get("full_page", False))
     try:

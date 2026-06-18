@@ -176,6 +176,9 @@ export function StreamRenderer({
           <span className="kim-hitl-status__body">
             {detail} Tool: <strong>{hitlApprovalStatus.tool}</strong>. Risk: {hitlApprovalStatus.risk} ({hitlApprovalStatus.reason}).
           </span>
+          {hitlApprovalStatus.preview && (
+            <pre className="kim-hitl-status__preview"><code>{hitlApprovalStatus.preview}</code></pre>
+          )}
           {isPending && onHitlRespond && (
             <span className="kim-hitl-status__actions">
               <button

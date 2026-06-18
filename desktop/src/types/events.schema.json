@@ -129,7 +129,8 @@
           "type": "string",
           "description": "Risk level: high | medium. Determines UI prominence."
         },
-        "reason": { "type": "string", "description": "Machine-readable reason key (e.g. 'arbitrary_code_execution')." }
+        "reason": { "type": "string", "description": "Machine-readable reason key (e.g. 'arbitrary_code_execution')." },
+        "preview": { "type": "string", "description": "K6: human-readable preview — command string, unified diff (<=40 lines), or URL + element label. May be empty." }
       }
     },
     {

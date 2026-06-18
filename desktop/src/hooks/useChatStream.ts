@@ -79,6 +79,8 @@ export function useChatStream({
   const [hitlApprovalStatus, setHitlApprovalStatus] = useState<HitlApprovalStatus | null>(null);
   const [runFailure, setRunFailure] = useState<{ reason: string; recoverable: boolean; suggestion: string } | null>(null);
   const [rateLimitedState, setRateLimitedState] = useState<{ delay: number; attempt: number; max_retries: number } | null>(null);
+  // K1: checkpoint run id emitted by Rust at spawn — used by the revert action.
+  const [lastRunId, setLastRunId] = useState<string | null>(null);
 
   // Refs for tracking streams
   const activityCounterRef = useRef(0);
@@ -323,6 +325,7 @@ export function useChatStream({
     let unlistenTypedRateLimited: (() => void) | undefined;
     let unlistenTypedHitlRequest: (() => void) | undefined;
     let unlistenTypedHitlResult: (() => void) | undefined;
+    let unlistenRunId: (() => void) | undefined;
 
     // Typed IPC listeners (kim:* events). Post-V-1, activity/plan/step state is
     // derived from the legacy kim-agent-output stream via parsePlanFromActivity,
@@ -372,11 +375,12 @@ export function useChatStream({
 
     // HITL approval visibility. This is display-only for now; the approval
     // decision path still lives in the agent/UIBridge layer.
-    listen<{ tool: string; risk: string; reason: string }>('kim:hitl-approval-request', e => {
+    listen<{ tool: string; risk: string; reason: string; preview?: string }>('kim:hitl-approval-request', e => {
       setHitlApprovalStatus({
         tool: e.payload.tool,
         risk: e.payload.risk,
         reason: e.payload.reason,
+        preview: e.payload.preview, // K6
         approved: null,
       });
     }).then(fn => { unlistenTypedHitlRequest = fn; });
@@ -389,6 +393,9 @@ export function useChatStream({
         approved: e.payload.approved,
       }));
     }).then(fn => { unlistenTypedHitlResult = fn; });
+
+    listen<string>('kim-run-id', e => { setLastRunId(e.payload); }) // K1
+      .then(fn => { unlistenRunId = fn; });
 
     listen<{ reason: string; recoverable: boolean; suggestion: string }>('kim:run-failed', e => {
       setRunFailure(e.payload);
@@ -517,6 +524,7 @@ export function useChatStream({
       unlistenTypedRateLimited?.();
       unlistenTypedHitlRequest?.();
       unlistenTypedHitlResult?.();
+      unlistenRunId?.();
     };
   }, [appendRaw, flushActivityNow, clearActivityNow, setMessageReloadNonce, commitCurrentBrowserUrl]);
 
@@ -567,6 +575,7 @@ export function useChatStream({
     setRunFailure,
     rateLimitedState,
     setRateLimitedState,
+    lastRunId, // K1
 
     // Refs
     currentTaskRef,

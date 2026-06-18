@@ -209,6 +209,15 @@ export function useTaskRunner({
     void runPendingTask(failed);
   };
 
+  // K3: mid-run steering — inject text into the running agent instead of queuing.
+  const handleSteer = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    invoke('steer_task', { text: t })
+      .then(() => toast('Steering noted — Kim will fold it in next step.', 'info', 2500))
+      .catch(() => toast('Could not steer (no run active?).', 'warning', 3000));
+  };
+
   return {
     queuedTasks,
     setQueuedTasks,
@@ -216,5 +225,6 @@ export function useTaskRunner({
     runPendingTask,
     handleSubmit,
     handleRetryLast,
+    handleSteer,
   };
 }

@@ -127,6 +127,8 @@ export interface KimHitlApprovalRequestPayload {
   risk: string;
   /** Machine-readable reason key (e.g. 'arbitrary_code_execution'). */
   reason: string;
+  /** K6: human-readable preview — command string, unified diff (<=40 lines), or URL + element label. May be empty. */
+  preview: string;
 }
 
 /** Human approval decision sent back to the agent. */

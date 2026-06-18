@@ -1864,7 +1864,7 @@ pub(crate) async fn configure_codex_direct_provider(
 }
 
 pub(crate) mod subprocess;
-pub(crate) use subprocess::{find_python_interpreter, send_task, cancel_task, hitl_respond_approval, process_exists, send_signal};
+pub(crate) use subprocess::{find_python_interpreter, send_task, cancel_task, hitl_respond_approval, steer_task, process_exists, send_signal};
 
 // ---------------------------------------------------------------------------
 // Voice config (config.yaml — voice:/enabled, voice:/engine, voice:/voice_id)
@@ -1950,6 +1950,10 @@ pub fn run() {
             run_history::load_run_history,
             session_commands::get_app_version,
             session_commands::reveal_logs,
+            session_commands::set_privacy_pause,
+            session_commands::get_privacy_pause,
+            session_commands::revert_run,
+            session_commands::has_checkpoint,
             run_history::get_platform_info,
             run_history::run_update,
             browser_bridge::add_custom_provider_capability,
@@ -1972,6 +1976,7 @@ pub fn run() {
             send_task,
             cancel_task,
             hitl_respond_approval,
+            steer_task,
             voice_config::read_voice_config,
             voice_config::write_voice_config,
             relay::read_relay_config,

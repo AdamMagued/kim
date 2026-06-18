@@ -374,6 +374,78 @@ print(json.dumps(result))
     Ok(stdout)
 }
 
+/// K1: restore a run's pre-images. Shells the Python checkpoints helper, passing
+/// the run id via argv (never interpolated into source — see D5).
+#[tauri::command]
+pub async fn revert_run(run_id: String) -> Result<String, String> {
+    use tokio::process::Command;
+    let kim_root = crate::default_project_root();
+    let python = crate::find_python_interpreter(&kim_root)?;
+    let script = r#"
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from mcp_server.checkpoints import revert_run
+print(json.dumps(revert_run(sys.argv[2])))
+"#;
+    let output = Command::new(&python)
+        .arg("-c")
+        .arg(script)
+        .arg(kim_root.as_os_str())
+        .arg(&run_id)
+        .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
+        .output()
+        .await
+        .map_err(|e| format!("Failed to spawn Python for revert: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "revert_run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .map_err(|e| format!("Unexpected revert output: {e}"))?;
+    Ok(stdout)
+}
+
+/// K1: does a checkpoint exist for this run id?
+#[tauri::command]
+pub fn has_checkpoint(run_id: String) -> bool {
+    dirs::home_dir()
+        .map(|h| {
+            h.join(".kim")
+                .join("checkpoints")
+                .join(&run_id)
+                .join("manifest.jsonl")
+                .exists()
+        })
+        .unwrap_or(false)
+}
+
+/// K9: toggle the privacy-pause sentinel (`~/.kim/privacy_pause`). While present,
+/// the MCP server's screen-capture tools refuse to run.
+#[tauri::command]
+pub fn set_privacy_pause(on: bool) -> Result<(), String> {
+    let home = dirs::home_dir().ok_or_else(|| "No home directory".to_string())?;
+    let dir = home.join(".kim");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let sentinel = dir.join("privacy_pause");
+    if on {
+        std::fs::write(&sentinel, "1").map_err(|e| e.to_string())?;
+    } else {
+        let _ = std::fs::remove_file(&sentinel);
+    }
+    Ok(())
+}
+
+/// K9: report whether privacy pause is currently on.
+#[tauri::command]
+pub fn get_privacy_pause() -> bool {
+    dirs::home_dir()
+        .map(|h| h.join(".kim").join("privacy_pause").exists())
+        .unwrap_or(false)
+}
+
 /// Open the logs directory in the system file manager.
 /// Creates the directory if it doesn't exist yet.
 #[tauri::command]
