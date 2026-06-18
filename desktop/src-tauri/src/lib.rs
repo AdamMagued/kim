@@ -21,6 +21,7 @@ pub mod relay;
 pub mod run_history;
 pub mod schedule_commands;
 mod scheduler;
+mod speed_access;
 pub mod session_commands;
 pub mod voice_config;
 pub mod config;
@@ -1914,7 +1915,23 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // K2: global-shortcut plugin — Alt+Space toggles the quick-ask window.
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    use tauri_plugin_global_shortcut::ShortcutState;
+                    if event.state() == ShortcutState::Pressed {
+                        speed_access::toggle_quick_ask(app);
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
+            // K2/K7: register the quick-ask shortcut and build the system tray.
+            speed_access::register_quick_ask_shortcut(app.handle());
+            if let Err(e) = speed_access::build_tray(app.handle()) {
+                eprintln!("[Kim] tray init failed: {e}");
+            }
             #[cfg(target_os = "macos")]
             {
                 use tauri::window::{Effect, EffectState, EffectsBuilder};

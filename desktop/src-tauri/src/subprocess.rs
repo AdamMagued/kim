@@ -725,6 +725,8 @@ pub(crate) async fn send_task(
     if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
         *guard = child_pid;
     }
+    // K7: reflect the running task in the tray status line.
+    crate::speed_access::set_tray_status(&app_handle, Some(task.as_str()));
 
     // Store stdin handle for HITL approval round-trip (only for Kim orchestrator, not Codex).
     if !is_codex {
@@ -851,6 +853,8 @@ pub(crate) async fn send_task(
     if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
         *guard = None;
     }
+    // K7: tray back to idle.
+    crate::speed_access::set_tray_status(&app_handle, None);
     // Drop the HITL stdin handle so the pipe is closed.
     *hitl_stdin().lock().await = None;
     if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
