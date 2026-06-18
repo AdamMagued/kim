@@ -20,6 +20,7 @@ pub mod ollama;
 pub mod relay;
 pub mod run_history;
 pub mod schedule_commands;
+mod scheduler;
 pub mod session_commands;
 pub mod voice_config;
 pub mod config;
@@ -1932,6 +1933,8 @@ pub fn run() {
                 eprintln!("[Kim] Failed to start in-app browser bridge: {}", e);
             }
             start_bridge_file_watcher(app.handle().clone());
+            // D6: start the 60s in-app scheduler tick loop.
+            scheduler::start_scheduler(app.handle().clone());
             Ok(())
         })
         .manage(task_state)

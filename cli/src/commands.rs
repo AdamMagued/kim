@@ -377,6 +377,7 @@ async fn doctor(config: &KimConfig) -> CommandOutcome {
             )
         ),
         format!("Source root: {}", source_root_status()),
+        format!("Bridge token: {}", crate::provider::bridge_token_source()),
         format!(
             "python3: {}",
             command_status("python3", &["--version"]).await

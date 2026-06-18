@@ -1672,6 +1672,27 @@ pub(crate) fn capitalize(s: &str) -> String {
     }
 }
 
+/// D2: persist the active bridge token to `~/.kim/bridge_token` (0600 on unix)
+/// so the `kim` CLI can pair without any manual configuration.
+fn write_bridge_token_file(token: &str) {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let dir = home.join(".kim");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("bridge_token");
+    if std::fs::write(&path, token).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
 pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Result<(), String> {
     if WEBVIEW_BRIDGE_CFG.get().is_some() {
         return Ok(());
@@ -1722,12 +1743,18 @@ pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Resul
         token: token.clone(),
     });
 
-    // Write only base_url to kim_sessions/.bridge_url (no cleartext tokens on disk)
+    // Write only base_url to kim_sessions/.bridge_url (no cleartext tokens here)
     let sessions_dir = default_project_root().join("kim_sessions");
     let _ = std::fs::create_dir_all(&sessions_dir);
     let _ = std::fs::write(sessions_dir.join(".bridge_url"), &base_url);
     // Best-effort remove legacy cleartext token
     let _ = std::fs::remove_file(sessions_dir.join(".bridge_token"));
+
+    // D2: pair with the CLI by default. Whatever token we settled on (env, .env,
+    // or the random fallback) is written to ~/.kim/bridge_token with 0600 perms,
+    // overwritten on every bridge start. This is a *local-loopback* credential —
+    // it only authorizes requests to the 127.0.0.1 bridge on this machine.
+    write_bridge_token_file(&token);
 
     let app_config = app_handle.state::<crate::config::AppConfig>();
     let timeout_secs = app_config.bridge_timeout_secs;

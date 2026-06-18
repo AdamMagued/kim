@@ -205,7 +205,39 @@ async fn is_bridge_available(base_url: &str) -> bool {
 }
 
 fn bridge_token() -> Option<String> {
-    std::env::var("KIM_API_KEY")
+    // D2: env first, then the file the desktop bridge writes on every start.
+    if let Some(t) = std::env::var("KIM_API_KEY")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        return Some(t);
+    }
+    bridge_token_from_file()
+}
+
+/// D2: human-readable description of where (if anywhere) a bridge token was
+/// found, for `kim doctor`.
+pub fn bridge_token_source() -> String {
+    if std::env::var("KIM_API_KEY")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .is_some()
+    {
+        "env KIM_API_KEY".to_string()
+    } else if bridge_token_from_file().is_some() {
+        "~/.kim/bridge_token (paired with desktop)".to_string()
+    } else {
+        "none — start Kim desktop, or set KIM_API_KEY".to_string()
+    }
+}
+
+/// D2: read the local-loopback bridge token the desktop app persists to
+/// `~/.kim/bridge_token`, so a `kim` install pairs with desktop automatically.
+fn bridge_token_from_file() -> Option<String> {
+    let path = dirs::home_dir()?.join(".kim").join("bridge_token");
+    std::fs::read_to_string(path)
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())

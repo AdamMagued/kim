@@ -338,22 +338,25 @@ pub async fn prune_sessions(
     let max_days = max_age_days.unwrap_or(30);
     let strip_days = screenshot_strip_age_days.unwrap_or(2);
 
-    let script = format!(
-        r#"
+    // D5: pass root/args via argv, never interpolated into the source — a path
+    // containing a quote or backslash would otherwise break (or inject) the script.
+    let script = r#"
 import json, sys
-sys.path.insert(0, r"{root}")
+sys.path.insert(0, sys.argv[1])
 from orchestrator.session_store import SessionStore
-result = SessionStore.prune_old_sessions(max_age_days={max}, screenshot_strip_age_days={strip})
+result = SessionStore.prune_old_sessions(
+    max_age_days=int(sys.argv[2]),
+    screenshot_strip_age_days=int(sys.argv[3]),
+)
 print(json.dumps(result))
-"#,
-        root = kim_root.display(),
-        max = max_days,
-        strip = strip_days,
-    );
+"#;
 
     let output = Command::new(&python)
         .arg("-c")
-        .arg(&script)
+        .arg(script)
+        .arg(kim_root.as_os_str())
+        .arg(max_days.to_string())
+        .arg(strip_days.to_string())
         .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
         .output()
         .await
@@ -375,9 +378,23 @@ print(json.dumps(result))
 /// Creates the directory if it doesn't exist yet.
 #[tauri::command]
 pub fn reveal_logs() -> Result<(), String> {
-    let kim_root = crate::default_project_root();
-    let log_dir = kim_root.join("logs");
-    std::fs::create_dir_all(&log_dir).map_err(|e| format!("Failed to create logs dir: {e}"))?;
+    // D3: logs live under the repo `logs/` when writable, else `~/.kim/logs`
+    // (packaged/read-only installs). Reveal whichever actually exists, preferring
+    // an existing repo dir, then an existing fallback, then creating one.
+    let repo_logs = crate::default_project_root().join("logs");
+    let home_logs = dirs::home_dir().map(|h| h.join(".kim").join("logs"));
+    let log_dir = if repo_logs.is_dir() {
+        repo_logs
+    } else if let Some(h) = home_logs.as_ref().filter(|p| p.is_dir()) {
+        h.clone()
+    } else if std::fs::create_dir_all(&repo_logs).is_ok() {
+        repo_logs
+    } else if let Some(h) = home_logs {
+        std::fs::create_dir_all(&h).map_err(|e| format!("Failed to create logs dir: {e}"))?;
+        h
+    } else {
+        return Err("No writable logs directory found.".to_string());
+    };
 
     #[cfg(target_os = "macos")]
     std::process::Command::new("open")

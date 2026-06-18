@@ -360,17 +360,33 @@ class GeminiProvider(BaseProvider):
 
         parts = ((candidates[0].get("content") or {}).get("parts") or [])
         text_chunks: list[str] = []
+        tool_calls: list[dict] = []
+        # E1: collect ALL functionCall parts. The old code returned on the FIRST
+        # one, silently dropping any additional parallel calls (and trailing text).
         for part in parts:
             function_call = part.get("functionCall")
             if function_call and function_call.get("name"):
-                return {
-                    "type": "tool_call",
-                    "tool": function_call["name"],
-                    "args": function_call.get("args") or {},
-                    "usage": usage,
-                }
-            if part.get("text"):
+                tool_calls.append(
+                    {"tool": function_call["name"], "args": function_call.get("args") or {}}
+                )
+            elif part.get("text"):
                 text_chunks.append(str(part["text"]))
+        if len(tool_calls) == 1:
+            return {
+                "type": "tool_call",
+                "tool": tool_calls[0]["tool"],
+                "args": tool_calls[0]["args"],
+                "usage": usage,
+            }
+        if len(tool_calls) > 1:
+            # Match the batch shape claude.py / openai_provider.py use so the agent
+            # executes every call instead of discarding the extras.
+            return {
+                "type": "tool_call",
+                "tool": "batch",
+                "args": {"calls": tool_calls},
+                "usage": usage,
+            }
         return {"type": "text", "content": "".join(text_chunks), "usage": usage}
 
 
