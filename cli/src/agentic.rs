@@ -1,0 +1,290 @@
+//! P7: run the REAL Kim agent (orchestrator tool loop) from `kim chat` by
+//! spawning `python -m orchestrator.agent` and parsing its typed stdout protocol
+//! (the same one the desktop consumes). Falls back to plain chat when no Kim
+//! source root / Python is available.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::provider::AppEvent;
+use crate::markdown::render_markdown;
+
+/// One parsed line of the orchestrator's stdout protocol. Pure mapping target so
+/// it can be unit-tested without spawning anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentLine {
+    /// Dim status / thinking line.
+    Activity(String),
+    /// A tool invocation (`[TOOL] name(args)`).
+    Tool { name: String },
+    /// Final answer summary (`[SUCCESS]/[FAILED] ...`).
+    Answer(String),
+    /// Human-approval request.
+    Hitl {
+        tool: String,
+        risk: String,
+        reason: String,
+        preview: String,
+    },
+    /// Run finished (success flag).
+    Done(bool),
+    /// Provider error code.
+    ProviderError(String),
+    /// Anything we intentionally don't surface.
+    Ignore,
+}
+
+/// Parse a single stdout line from the orchestrator into an `AgentLine`.
+pub fn parse_agent_line(line: &str) -> AgentLine {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return AgentLine::Ignore;
+    }
+    // Typed JSON lines.
+    if trimmed.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return parse_typed(&v);
+        }
+        return AgentLine::Ignore;
+    }
+    // Plain text markers.
+    if let Some(rest) = trimmed.strip_prefix("[TOOL] ") {
+        let name = rest.split('(').next().unwrap_or(rest).trim().to_string();
+        return AgentLine::Tool { name };
+    }
+    if let Some(rest) = trimmed.strip_prefix("[SUCCESS] ") {
+        return AgentLine::Answer(rest.to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("[FAILED] ") {
+        return AgentLine::Answer(rest.to_string());
+    }
+    AgentLine::Ignore
+}
+
+fn parse_typed(v: &serde_json::Value) -> AgentLine {
+    let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    match t {
+        "status" => {
+            let msg = v.get("message").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if msg.is_empty() { AgentLine::Ignore } else { AgentLine::Activity(msg) }
+        }
+        "run_done" => AgentLine::Done(v.get("success").and_then(|x| x.as_bool()).unwrap_or(false)),
+        "provider_error" => AgentLine::ProviderError(
+            v.get("code").and_then(|x| x.as_str()).unwrap_or("error").to_string(),
+        ),
+        "hitl_approval_request" => AgentLine::Hitl {
+            tool: v.get("tool").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            risk: v.get("risk").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            reason: v.get("reason").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            preview: v.get("preview").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        },
+        // plan/step/done/stats/context/usage/ui_* — not surfaced in the terminal.
+        _ => AgentLine::Ignore,
+    }
+}
+
+/// Decide whether `kim chat` can run agentically: needs a Kim source root with
+/// the orchestrator, a Python interpreter, and a real (non-browser/desktop)
+/// provider. Returns (repo_root, python) when usable.
+pub fn agentic_available(provider: &str) -> Option<(PathBuf, PathBuf)> {
+    let p = provider.trim().to_lowercase();
+    if p == "desktop" || p.starts_with("browser") {
+        return None; // those route through the bridge, not the local agent
+    }
+    let root = crate::sessions::find_kim_repo_root()?;
+    if !root.join("orchestrator").join("agent.py").is_file() {
+        return None;
+    }
+    let python = find_python(&root)?;
+    Some((root, python))
+}
+
+/// Find a Python interpreter: repo venv first, then system.
+fn find_python(root: &Path) -> Option<PathBuf> {
+    let candidates = [
+        root.join("venv").join("bin").join("python"),
+        root.join("venv").join("Scripts").join("python.exe"),
+        root.join(".venv").join("bin").join("python"),
+        root.join(".venv").join("Scripts").join("python.exe"),
+    ];
+    for c in candidates {
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    for name in ["python3", "python"] {
+        if which(name).is_some() {
+            return Some(PathBuf::from(name));
+        }
+    }
+    None
+}
+
+fn which(name: &str) -> Option<PathBuf> {
+    let out = std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+        .arg(name)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.lines().next().map(|l| PathBuf::from(l.trim()))
+}
+
+/// Spawn the orchestrator and stream its events into `tx`. HITL requests prompt
+/// the terminal and write the decision back to the child stdin.
+pub async fn stream_agentic_request(
+    root: &Path,
+    python: &Path,
+    prompt: &str,
+    session_dir: &Path,
+    resume_session_id: Option<&str>,
+    tx: UnboundedSender<AppEvent>,
+) {
+    let mut cmd = Command::new(python);
+    cmd.args(["-m", "orchestrator.agent", "--task", prompt, "--session-dir"])
+        .arg(session_dir)
+        .current_dir(root)
+        .env("PYTHONPATH", root)
+        // Terminal HITL: the agent gates risky tools; we answer on stdin.
+        .env("KIM_HITL_RISK_THRESHOLD", "high")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if let Some(id) = resume_session_id {
+        cmd.arg("--resume").arg(id);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(AppEvent::Err(format!("Could not start Kim agent: {e}")));
+            return;
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = tx.send(AppEvent::Err("Kim agent produced no output stream.".into()));
+            return;
+        }
+    };
+    let mut child_stdin = child.stdin.take();
+    let mut lines = BufReader::new(stdout).lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        match parse_agent_line(&line) {
+            AgentLine::Activity(m) => { let _ = tx.send(AppEvent::ThoughtChunk(m)); }
+            AgentLine::Tool { name } => {
+                let _ = tx.send(AppEvent::ToolEvent { verb: "running".into(), target: name });
+            }
+            AgentLine::Answer(text) => {
+                let _ = tx.send(AppEvent::TextChunk(render_markdown(&text)));
+            }
+            AgentLine::ProviderError(code) => {
+                let _ = tx.send(AppEvent::Err(format!("provider error: {code}")));
+            }
+            AgentLine::Hitl { tool, risk, reason, preview } => {
+                let approved = prompt_hitl(&tool, &risk, &reason, &preview).await;
+                if let Some(stdin) = child_stdin.as_mut() {
+                    let payload = serde_json::json!({"type": "hitl_approve", "approved": approved});
+                    let _ = stdin.write_all(format!("{payload}\n").as_bytes()).await;
+                    let _ = stdin.flush().await;
+                }
+            }
+            AgentLine::Done(success) => { let _ = tx.send(AppEvent::Done(success)); }
+            AgentLine::Ignore => {}
+        }
+    }
+    // Process exited; ensure the turn ends even if no run_done line was seen.
+    let _ = child.wait().await;
+    let _ = tx.send(AppEvent::Done(true));
+}
+
+/// Blocking-ish terminal y/N approval prompt (off the async runtime).
+async fn prompt_hitl(tool: &str, risk: &str, reason: &str, preview: &str) -> bool {
+    let tool = tool.to_string();
+    let risk = risk.to_string();
+    let reason = reason.to_string();
+    let preview = preview.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{self, Write};
+        eprintln!("\n\x1b[33mApproval required\x1b[0m: {tool} (risk: {risk}; {reason})");
+        if !preview.is_empty() {
+            eprintln!("\x1b[2m{preview}\x1b[0m");
+        }
+        eprint!("Allow this action? [y/N] ");
+        let _ = io::stderr().flush();
+        let mut buf = String::new();
+        if io::stdin().read_line(&mut buf).is_err() {
+            return false;
+        }
+        matches!(buf.trim().to_lowercase().as_str(), "y" | "yes")
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_tool_line() {
+        assert_eq!(
+            parse_agent_line("[TOOL] list_dir({\"path\": \".\"})"),
+            AgentLine::Tool { name: "list_dir".into() }
+        );
+    }
+
+    #[test]
+    fn parses_success_and_failed_answers() {
+        assert_eq!(parse_agent_line("[SUCCESS] all done"), AgentLine::Answer("all done".into()));
+        assert_eq!(parse_agent_line("[FAILED] nope"), AgentLine::Answer("nope".into()));
+    }
+
+    #[test]
+    fn parses_typed_status_and_run_done() {
+        assert_eq!(
+            parse_agent_line(r#"{"type":"status","message":"thinking"}"#),
+            AgentLine::Activity("thinking".into())
+        );
+        assert_eq!(parse_agent_line(r#"{"type":"run_done","success":true}"#), AgentLine::Done(true));
+        assert_eq!(parse_agent_line(r#"{"type":"run_done","success":false}"#), AgentLine::Done(false));
+    }
+
+    #[test]
+    fn parses_hitl_request_with_preview() {
+        let line = r#"{"type":"hitl_approval_request","tool":"run_command","risk":"high","reason":"exec","preview":"rm -rf x"}"#;
+        assert_eq!(
+            parse_agent_line(line),
+            AgentLine::Hitl {
+                tool: "run_command".into(),
+                risk: "high".into(),
+                reason: "exec".into(),
+                preview: "rm -rf x".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_other_typed_and_blank() {
+        assert_eq!(parse_agent_line(r#"{"type":"stats","input":1}"#), AgentLine::Ignore);
+        assert_eq!(parse_agent_line(""), AgentLine::Ignore);
+        assert_eq!(parse_agent_line("   "), AgentLine::Ignore);
+        assert_eq!(parse_agent_line("random text"), AgentLine::Ignore);
+    }
+
+    #[test]
+    fn agentic_unavailable_for_browser_providers() {
+        assert!(agentic_available("browser:claude").is_none());
+        assert!(agentic_available("desktop").is_none());
+    }
+}

@@ -1,5 +1,7 @@
+mod agentic;
 mod commands;
 mod config;
+mod markdown;
 mod provider;
 mod sessions;
 
@@ -1020,6 +1022,23 @@ fn handle_repl_message(app: &mut App, message: String) -> Result<bool, Box<dyn s
     Ok(false)
 }
 
+/// P7: print a one-time note when chat falls back to plain (non-agentic) mode
+/// because no Kim source root was found.
+fn maybe_note_plain_chat(code_mode: bool, provider: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    if code_mode {
+        return;
+    }
+    let p = provider.trim().to_lowercase();
+    if p == "desktop" || p.starts_with("browser") {
+        return;
+    }
+    if crate::sessions::find_kim_repo_root().is_none() && !SHOWN.swap(true, Ordering::Relaxed) {
+        print_note("plain chat — no Kim source root found; run the installer for agentic tool-using chat.");
+    }
+}
+
 async fn stream_repl_turn(
     app: &mut App,
     prompt: String,
@@ -1037,9 +1056,30 @@ async fn stream_repl_turn(
     let code_mode = app.mode == AppMode::Code;
     let session_id = app.current_session_id.clone();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-    let handle = tokio::spawn(async move {
-        stream_kim_request(&config, &history, code_mode, &session_id, tx).await;
-    });
+
+    // P7: in chat mode, run the REAL Kim agent (tool loop) when a Kim source root
+    // + Python are available; otherwise fall back to plain LLM chat with a note.
+    let agentic = if code_mode {
+        None
+    } else {
+        crate::agentic::agentic_available(&config.provider)
+    };
+    let handle = if let Some((root, python)) = agentic {
+        let prompt2 = prompt.clone();
+        let sid = session_id.clone();
+        tokio::spawn(async move {
+            let session_dir = root.join("kim_sessions");
+            crate::agentic::stream_agentic_request(
+                &root, &python, &prompt2, &session_dir, Some(&sid), tx,
+            )
+            .await;
+        })
+    } else {
+        maybe_note_plain_chat(code_mode, &config.provider);
+        tokio::spawn(async move {
+            stream_kim_request(&config, &history, code_mode, &session_id, tx).await;
+        })
+    };
 
     // A6: Ctrl-C cancels the current generation instead of killing the CLI.
     // tokio::signal::ctrl_c fires only while we await here (between turns,
