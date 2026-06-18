@@ -170,6 +170,9 @@ pub struct SessionInfo {
     pub has_summary: bool,
     pub summary: Option<String>,
     pub session_type: String, // "kim" or "codex"
+    /// K4: user pin (from the `.meta.json` sidecar). Pinned float to top.
+    #[serde(default)]
+    pub pinned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_threads: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -651,7 +654,14 @@ pub(crate) fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<
             };
 
             let message_count = count_lines(&session_file).unwrap_or(0);
-            let title = infer_session_title(&session_file, summary.as_ref(), &session_id);
+            let mut title = infer_session_title(&session_file, summary.as_ref(), &session_id);
+            // K4: merge the user meta sidecar (title override + pin).
+            let (meta_title, pinned) = crate::session_commands::read_session_meta(&date_dir, &session_id);
+            if let Some(t) = meta_title {
+                if !t.trim().is_empty() {
+                    title = t;
+                }
+            }
 
             let browser_meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
             let BrowserSessionMeta {
@@ -669,6 +679,7 @@ pub(crate) fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<
                 has_summary,
                 summary,
                 session_type: session_type.to_string(),
+                pinned,
                 browser_threads: if browser_threads.is_empty() { None } else { Some(browser_threads) },
                 browser_last_site,
                 browser_threads_updated_at_ms,
@@ -1971,6 +1982,10 @@ pub fn run() {
             session_commands::get_privacy_pause,
             session_commands::revert_run,
             session_commands::has_checkpoint,
+            session_commands::rename_session,
+            session_commands::set_session_pinned,
+            session_commands::delete_session,
+            session_commands::search_sessions,
             run_history::get_platform_info,
             run_history::run_update,
             browser_bridge::add_custom_provider_capability,
@@ -2026,6 +2041,7 @@ pub fn run() {
             feedback::send_feedback,
             show_screenshot_flash,
             feedback::save_attachment,
+            feedback::region_screenshot,
             schedule_commands::list_scheduled_tasks,
             schedule_commands::add_scheduled_task,
             schedule_commands::update_scheduled_task,

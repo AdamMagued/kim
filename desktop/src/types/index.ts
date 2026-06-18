@@ -9,6 +9,8 @@ export interface SessionInfo {
   has_summary: boolean;
   summary?: string;
   session_type: 'kim' | 'codex';
+  /** K4: user pin from the meta sidecar. Pinned sessions float to top. */
+  pinned?: boolean;
   project_path?: string;
   browser_threads?: Record<string, string>;
   browser_last_site?: string;
