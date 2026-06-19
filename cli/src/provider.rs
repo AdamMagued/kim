@@ -1408,7 +1408,9 @@ mod tests {
         );
         let events = drain(&mut rx);
         assert!(
-            events.iter().any(|e| matches!(e, AppEvent::Err(m) if m.contains("not found"))),
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Err(m) if m.contains("not found"))),
             "expected an Err event, got {events:?}"
         );
     }
@@ -1417,14 +1419,12 @@ mod tests {
     fn openai_sse_surfaces_bare_string_error() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut parser = ThinkParser::new();
-        process_openai_sse_line(
-            r#"data: {"error":"upstream timed out"}"#,
-            &mut parser,
-            &tx,
-        );
+        process_openai_sse_line(r#"data: {"error":"upstream timed out"}"#, &mut parser, &tx);
         let events = drain(&mut rx);
         assert!(
-            events.iter().any(|e| matches!(e, AppEvent::Err(m) if m.contains("upstream timed out"))),
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Err(m) if m.contains("upstream timed out"))),
             "expected an Err event, got {events:?}"
         );
     }
@@ -1440,7 +1440,9 @@ mod tests {
         );
         let events = drain(&mut rx);
         assert!(
-            events.iter().any(|e| matches!(e, AppEvent::Err(m) if m.contains("Overloaded"))),
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Err(m) if m.contains("Overloaded"))),
             "expected an Err event, got {events:?}"
         );
     }
@@ -1453,14 +1455,16 @@ mod tests {
         let mut payload = "a".repeat(299);
         payload.push('🦀'); // 4-byte char straddling the 300-byte boundary
         payload.push_str(&"b".repeat(50));
-        let line = serde_json::json!({"type": "function_call_output", "output": payload})
-            .to_string();
+        let line =
+            serde_json::json!({"type": "function_call_output", "output": payload}).to_string();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         // Must not panic.
         process_codex_line(&line, &tx, false);
         let events = drain(&mut rx);
         assert!(
-            events.iter().any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.ends_with('…'))),
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.ends_with('…'))),
             "expected a truncated ThoughtChunk, got {events:?}"
         );
     }
@@ -1511,10 +1515,19 @@ mod tests {
     #[test]
     fn normalize_base_url_strips_v1_and_trailing_slash() {
         assert_eq!(normalize_base_url("http://host:11434"), "http://host:11434");
-        assert_eq!(normalize_base_url("http://host:11434/"), "http://host:11434");
-        assert_eq!(normalize_base_url("http://host:11434/v1"), "http://host:11434");
+        assert_eq!(
+            normalize_base_url("http://host:11434/"),
+            "http://host:11434"
+        );
+        assert_eq!(
+            normalize_base_url("http://host:11434/v1"),
+            "http://host:11434"
+        );
         // The A16 bug: a trailing slash after /v1 used to defeat the strip.
-        assert_eq!(normalize_base_url("http://host:11434/v1/"), "http://host:11434");
+        assert_eq!(
+            normalize_base_url("http://host:11434/v1/"),
+            "http://host:11434"
+        );
         assert_eq!(normalize_base_url("  http://host/v1/  "), "http://host");
     }
 
@@ -1527,10 +1540,20 @@ mod tests {
         parser.feed("reasoning here assistantfinalThe answer", &tx);
         parser.flush(&tx);
         let events = drain(&mut rx);
-        let thoughts: String = events.iter().filter_map(|e| match e {
-            AppEvent::ThoughtChunk(t) => Some(t.clone()), _ => None }).collect();
-        let answer: String = events.iter().filter_map(|e| match e {
-            AppEvent::TextChunk(t) => Some(t.clone()), _ => None }).collect();
+        let thoughts: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::ThoughtChunk(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        let answer: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::TextChunk(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(thoughts, "reasoning here ");
         assert_eq!(answer, "The answer");
         assert!(!thoughts.contains("assistantfinal") && !answer.contains("assistantfinal"));
@@ -1545,8 +1568,12 @@ mod tests {
         parser.feed("assistantfinalDONE", &tx);
         parser.flush(&tx);
         let events = drain(&mut rx);
-        assert!(events.iter().any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t == "think ")));
-        assert!(events.iter().any(|e| matches!(e, AppEvent::TextChunk(t) if t == "DONE")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t == "think ")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AppEvent::TextChunk(t) if t == "DONE")));
         assert!(events.iter().all(|e| match e {
             AppEvent::TextChunk(t) | AppEvent::ThoughtChunk(t) => !t.contains("assistantfinal"),
             _ => true,
@@ -1560,10 +1587,17 @@ mod tests {
         parser.feed("plain answer text", &tx);
         parser.flush(&tx);
         let events = drain(&mut rx);
-        let answer: String = events.iter().filter_map(|e| match e {
-            AppEvent::TextChunk(t) => Some(t.clone()), _ => None }).collect();
+        let answer: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::TextChunk(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(answer, "plain answer text");
-        assert!(!events.iter().any(|e| matches!(e, AppEvent::ThoughtChunk(_))));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ThoughtChunk(_))));
     }
 
     #[test]

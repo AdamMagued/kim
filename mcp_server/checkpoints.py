@@ -9,6 +9,8 @@ Run id comes from the ``KIM_RUN_ID`` env var (exported by the Rust spawn). When
 unset (standalone tool use), checkpointing is a no-op.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
