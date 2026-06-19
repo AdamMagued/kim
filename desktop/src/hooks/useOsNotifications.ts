@@ -34,8 +34,22 @@ async function notify(title: string, body: string): Promise<void> {
   }
 }
 
+/** Request notification permission once, eagerly (call at onboarding / first run
+ *  rather than at first task completion). (B8) */
+export function primeNotificationPermission(): void {
+  void checkPermission();
+}
+
+function windowIsFocused(): boolean {
+  try {
+    return document.visibilityState === 'visible' && document.hasFocus();
+  } catch {
+    return false;
+  }
+}
+
 interface UseOsNotificationsOptions {
-  /** Set to false to suppress all notifications (e.g. when window is focused). */
+  /** Set to false to suppress all notifications. */
   enabled?: boolean;
 }
 
@@ -44,25 +58,23 @@ export function useOsNotifications({ enabled = true }: UseOsNotificationsOptions
   useEffect(() => { enabledRef.current = enabled; }, [enabled]);
 
   useEffect(() => {
+    // B8: ask for permission up front, not at the first completed task.
+    primeNotificationPermission();
+
     const unlistenPromises: Promise<() => void>[] = [];
 
+    // B8: notify ONLY from kim:run-done (single source of truth) so a failed run
+    // no longer fires twice (run-done success=false + run-failed). Suppress while
+    // the window is focused — the user is already looking.
     unlistenPromises.push(
       listen<{ termination: string; success: boolean }>('kim:run-done', (e) => {
-        if (!enabledRef.current) return;
+        if (!enabledRef.current || windowIsFocused()) return;
         const { termination, success } = e.payload;
         if (success) {
           notify('Kim', 'Task completed successfully.').catch(() => {});
         } else {
           notify('Kim', `Task ended: ${termination}`).catch(() => {});
         }
-      }),
-    );
-
-    unlistenPromises.push(
-      listen<{ reason: string; recoverable: boolean }>('kim:run-failed', (e) => {
-        if (!enabledRef.current) return;
-        const { reason } = e.payload;
-        notify('Kim — task failed', reason.slice(0, 80)).catch(() => {});
       }),
     );
 

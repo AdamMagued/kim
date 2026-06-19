@@ -885,6 +885,6 @@ export function estimateCostUsd(provider: string, inputTokens: number, outputTok
 export function formatCostUsd(usd: number): string {
   if (usd === 0) return '$0.00';
   if (usd < 0.0001) return '<$0.0001';
-  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  // B14: the old `usd < 0.01` branch was identical to the default (toFixed(4)).
   return `$${usd.toFixed(4)}`;
 }

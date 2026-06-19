@@ -15,7 +15,16 @@ interface UseTaskRunnerProps {
   conversationId: string;
   onTaskDone: (sessionId?: string, completedSession?: SessionInfo) => void;
   resolveProvider: () => string;
-  browserCommandArgs: (targetSession?: SessionInfo | null, overrideSessionId?: string | null) => any;
+  browserCommandArgs: (
+    targetSession?: SessionInfo | null,
+    overrideSessionId?: string | null
+  ) => {
+    sessionId: string;
+    sessionDate: string | null;
+    sessionType: string;
+    kimDir: string | null;
+    codexDir: string | null;
+  };
   stream: ReturnType<typeof useChatStream>;
   scroll: ReturnType<typeof useSessionScroll>;
 }
