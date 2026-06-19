@@ -445,14 +445,17 @@ class KimAgent:
         """K3: queue a mid-run steering message (called from the stdin pump)."""
         text = (text or "").strip()
         if text:
+            if not hasattr(self, "_steer_inbox") or self._steer_inbox is None:
+                self._steer_inbox = []
             self._steer_inbox.append(text)
 
     def _drain_steers(self) -> None:
         """K3: fold queued steering messages into memory as user messages and
         emit a `steering noted` ack for each."""
-        if not self._steer_inbox:
+        # getattr-guarded: some test harnesses build KimAgent bypassing __init__.
+        pending = getattr(self, "_steer_inbox", None)
+        if not pending:
             return
-        pending = self._steer_inbox
         self._steer_inbox = []
         for text in pending:
             self.memory.add_user(f"[User steering mid-run]: {text}")
