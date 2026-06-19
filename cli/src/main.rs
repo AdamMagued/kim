@@ -1539,9 +1539,15 @@ mod tests {
         tx.send(AppEvent::TextChunk("4".to_string())).unwrap();
         tx.send(AppEvent::Done(false)).unwrap();
         drop(tx);
-        consume_turn_events(&mut app, rx, Instant::now(), save_into(&dir), std::future::pending::<()>())
-            .await
-            .unwrap();
+        consume_turn_events(
+            &mut app,
+            rx,
+            Instant::now(),
+            save_into(&dir),
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
 
         // (b) reply is in app.messages
         assert!(app
@@ -1573,12 +1579,19 @@ mod tests {
         app.push(MessageRole::User, "first question");
         save_into(&dir)(&app);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        tx.send(AppEvent::TextChunk("first answer".to_string())).unwrap();
+        tx.send(AppEvent::TextChunk("first answer".to_string()))
+            .unwrap();
         tx.send(AppEvent::Done(false)).unwrap();
         drop(tx);
-        consume_turn_events(&mut app, rx, Instant::now(), save_into(&dir), std::future::pending::<()>())
-            .await
-            .unwrap();
+        consume_turn_events(
+            &mut app,
+            rx,
+            Instant::now(),
+            save_into(&dir),
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
 
         // Resume into a fresh app from the saved file, then take turn 2.
         let file = dir.join(format!("{sid}.jsonl"));
@@ -1588,12 +1601,19 @@ mod tests {
         app2.push(MessageRole::User, "second question");
         save_into(&dir)(&app2);
         let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        tx2.send(AppEvent::TextChunk("second answer".to_string())).unwrap();
+        tx2.send(AppEvent::TextChunk("second answer".to_string()))
+            .unwrap();
         tx2.send(AppEvent::Done(false)).unwrap();
         drop(tx2);
-        consume_turn_events(&mut app2, rx2, Instant::now(), save_into(&dir), std::future::pending::<()>())
-            .await
-            .unwrap();
+        consume_turn_events(
+            &mut app2,
+            rx2,
+            Instant::now(),
+            save_into(&dir),
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
 
         let final_msgs = crate::sessions::load_session_messages(&file).unwrap();
         for expected in [
