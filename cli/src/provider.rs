@@ -1290,7 +1290,9 @@ mod tests {
         );
         let events = drain(&mut rx);
         assert!(
-            events.iter().any(|e| matches!(e, AppEvent::Err(m) if m.contains("not found"))),
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Err(m) if m.contains("not found"))),
             "expected an Err event, got {events:?}"
         );
     }
@@ -1299,14 +1301,12 @@ mod tests {
     fn openai_sse_surfaces_bare_string_error() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut parser = ThinkParser::new();
-        process_openai_sse_line(
-            r#"data: {"error":"upstream timed out"}"#,
-            &mut parser,
-            &tx,
-        );
+        process_openai_sse_line(r#"data: {"error":"upstream timed out"}"#, &mut parser, &tx);
         let events = drain(&mut rx);
         assert!(
-            events.iter().any(|e| matches!(e, AppEvent::Err(m) if m.contains("upstream timed out"))),
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Err(m) if m.contains("upstream timed out"))),
             "expected an Err event, got {events:?}"
         );
     }
@@ -1322,7 +1322,9 @@ mod tests {
         );
         let events = drain(&mut rx);
         assert!(
-            events.iter().any(|e| matches!(e, AppEvent::Err(m) if m.contains("Overloaded"))),
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Err(m) if m.contains("Overloaded"))),
             "expected an Err event, got {events:?}"
         );
     }
@@ -1335,14 +1337,16 @@ mod tests {
         let mut payload = "a".repeat(299);
         payload.push('🦀'); // 4-byte char straddling the 300-byte boundary
         payload.push_str(&"b".repeat(50));
-        let line = serde_json::json!({"type": "function_call_output", "output": payload})
-            .to_string();
+        let line =
+            serde_json::json!({"type": "function_call_output", "output": payload}).to_string();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         // Must not panic.
         process_codex_line(&line, &tx, false);
         let events = drain(&mut rx);
         assert!(
-            events.iter().any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.ends_with('…'))),
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.ends_with('…'))),
             "expected a truncated ThoughtChunk, got {events:?}"
         );
     }

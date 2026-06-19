@@ -1513,7 +1513,8 @@ mod tests {
         app.push(MessageRole::User, "first question");
         save_into(&dir)(&app);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        tx.send(AppEvent::TextChunk("first answer".to_string())).unwrap();
+        tx.send(AppEvent::TextChunk("first answer".to_string()))
+            .unwrap();
         tx.send(AppEvent::Done(false)).unwrap();
         drop(tx);
         consume_turn_events(&mut app, rx, Instant::now(), save_into(&dir))
@@ -1528,7 +1529,8 @@ mod tests {
         app2.push(MessageRole::User, "second question");
         save_into(&dir)(&app2);
         let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        tx2.send(AppEvent::TextChunk("second answer".to_string())).unwrap();
+        tx2.send(AppEvent::TextChunk("second answer".to_string()))
+            .unwrap();
         tx2.send(AppEvent::Done(false)).unwrap();
         drop(tx2);
         consume_turn_events(&mut app2, rx2, Instant::now(), save_into(&dir))
