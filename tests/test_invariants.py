@@ -193,10 +193,14 @@ class TestOsNotificationsHook:
         content = hook.read_text()
         assert "kim:run-done" in content, "hook must listen to kim:run-done event"
 
-    def test_hook_listens_run_failed(self):
+    def test_hook_notifies_on_failure(self):
+        # B8: the hook no longer subscribes to a separate kim:run-failed event —
+        # it notifies from kim:run-done as the single source of truth and surfaces
+        # failures via the success=false branch (avoids the old double-notify).
         hook = Path(__file__).parent.parent / "desktop/src/hooks/useOsNotifications.ts"
         content = hook.read_text()
-        assert "kim:run-failed" in content, "hook must listen to kim:run-failed event"
+        assert "kim:run-done" in content, "hook must listen to kim:run-done"
+        assert "success" in content, "hook must branch on the success flag to notify failures"
 
     def test_hook_uses_notification_plugin(self):
         hook = Path(__file__).parent.parent / "desktop/src/hooks/useOsNotifications.ts"
