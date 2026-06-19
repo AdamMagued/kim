@@ -10,8 +10,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::provider::AppEvent;
 use crate::markdown::render_markdown;
+use crate::provider::AppEvent;
 
 /// One parsed line of the orchestrator's stdout protocol. Pure mapping target so
 /// it can be unit-tested without spawning anything.
@@ -70,18 +70,45 @@ fn parse_typed(v: &serde_json::Value) -> AgentLine {
     let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
     match t {
         "status" => {
-            let msg = v.get("message").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            if msg.is_empty() { AgentLine::Ignore } else { AgentLine::Activity(msg) }
+            let msg = v
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if msg.is_empty() {
+                AgentLine::Ignore
+            } else {
+                AgentLine::Activity(msg)
+            }
         }
         "run_done" => AgentLine::Done(v.get("success").and_then(|x| x.as_bool()).unwrap_or(false)),
         "provider_error" => AgentLine::ProviderError(
-            v.get("code").and_then(|x| x.as_str()).unwrap_or("error").to_string(),
+            v.get("code")
+                .and_then(|x| x.as_str())
+                .unwrap_or("error")
+                .to_string(),
         ),
         "hitl_approval_request" => AgentLine::Hitl {
-            tool: v.get("tool").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            risk: v.get("risk").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            reason: v.get("reason").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            preview: v.get("preview").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            tool: v
+                .get("tool")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            risk: v
+                .get("risk")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            reason: v
+                .get("reason")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            preview: v
+                .get("preview")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
         },
         // plan/step/done/stats/context/usage/ui_* — not surfaced in the terminal.
         _ => AgentLine::Ignore,
@@ -148,16 +175,22 @@ pub async fn stream_agentic_request(
     tx: UnboundedSender<AppEvent>,
 ) {
     let mut cmd = Command::new(python);
-    cmd.args(["-m", "orchestrator.agent", "--task", prompt, "--session-dir"])
-        .arg(session_dir)
-        .current_dir(root)
-        .env("PYTHONPATH", root)
-        // Terminal HITL: the agent gates risky tools; we answer on stdin.
-        .env("KIM_HITL_RISK_THRESHOLD", "high")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+    cmd.args([
+        "-m",
+        "orchestrator.agent",
+        "--task",
+        prompt,
+        "--session-dir",
+    ])
+    .arg(session_dir)
+    .current_dir(root)
+    .env("PYTHONPATH", root)
+    // Terminal HITL: the agent gates risky tools; we answer on stdin.
+    .env("KIM_HITL_RISK_THRESHOLD", "high")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .kill_on_drop(true);
     if let Some(id) = resume_session_id {
         cmd.arg("--resume").arg(id);
     }
@@ -181,9 +214,14 @@ pub async fn stream_agentic_request(
 
     while let Ok(Some(line)) = lines.next_line().await {
         match parse_agent_line(&line) {
-            AgentLine::Activity(m) => { let _ = tx.send(AppEvent::ThoughtChunk(m)); }
+            AgentLine::Activity(m) => {
+                let _ = tx.send(AppEvent::ThoughtChunk(m));
+            }
             AgentLine::Tool { name } => {
-                let _ = tx.send(AppEvent::ToolEvent { verb: "running".into(), target: name });
+                let _ = tx.send(AppEvent::ToolEvent {
+                    verb: "running".into(),
+                    target: name,
+                });
             }
             AgentLine::Answer(text) => {
                 let _ = tx.send(AppEvent::TextChunk(render_markdown(&text)));
@@ -191,7 +229,12 @@ pub async fn stream_agentic_request(
             AgentLine::ProviderError(code) => {
                 let _ = tx.send(AppEvent::Err(format!("provider error: {code}")));
             }
-            AgentLine::Hitl { tool, risk, reason, preview } => {
+            AgentLine::Hitl {
+                tool,
+                risk,
+                reason,
+                preview,
+            } => {
                 let approved = prompt_hitl(&tool, &risk, &reason, &preview).await;
                 if let Some(stdin) = child_stdin.as_mut() {
                     let payload = serde_json::json!({"type": "hitl_approve", "approved": approved});
@@ -199,7 +242,9 @@ pub async fn stream_agentic_request(
                     let _ = stdin.flush().await;
                 }
             }
-            AgentLine::Done(success) => { let _ = tx.send(AppEvent::Done(success)); }
+            AgentLine::Done(success) => {
+                let _ = tx.send(AppEvent::Done(success));
+            }
             AgentLine::Ignore => {}
         }
     }
@@ -240,14 +285,22 @@ mod tests {
     fn parses_tool_line() {
         assert_eq!(
             parse_agent_line("[TOOL] list_dir({\"path\": \".\"})"),
-            AgentLine::Tool { name: "list_dir".into() }
+            AgentLine::Tool {
+                name: "list_dir".into()
+            }
         );
     }
 
     #[test]
     fn parses_success_and_failed_answers() {
-        assert_eq!(parse_agent_line("[SUCCESS] all done"), AgentLine::Answer("all done".into()));
-        assert_eq!(parse_agent_line("[FAILED] nope"), AgentLine::Answer("nope".into()));
+        assert_eq!(
+            parse_agent_line("[SUCCESS] all done"),
+            AgentLine::Answer("all done".into())
+        );
+        assert_eq!(
+            parse_agent_line("[FAILED] nope"),
+            AgentLine::Answer("nope".into())
+        );
     }
 
     #[test]
@@ -256,8 +309,14 @@ mod tests {
             parse_agent_line(r#"{"type":"status","message":"thinking"}"#),
             AgentLine::Activity("thinking".into())
         );
-        assert_eq!(parse_agent_line(r#"{"type":"run_done","success":true}"#), AgentLine::Done(true));
-        assert_eq!(parse_agent_line(r#"{"type":"run_done","success":false}"#), AgentLine::Done(false));
+        assert_eq!(
+            parse_agent_line(r#"{"type":"run_done","success":true}"#),
+            AgentLine::Done(true)
+        );
+        assert_eq!(
+            parse_agent_line(r#"{"type":"run_done","success":false}"#),
+            AgentLine::Done(false)
+        );
     }
 
     #[test]
@@ -276,7 +335,10 @@ mod tests {
 
     #[test]
     fn ignores_other_typed_and_blank() {
-        assert_eq!(parse_agent_line(r#"{"type":"stats","input":1}"#), AgentLine::Ignore);
+        assert_eq!(
+            parse_agent_line(r#"{"type":"stats","input":1}"#),
+            AgentLine::Ignore
+        );
         assert_eq!(parse_agent_line(""), AgentLine::Ignore);
         assert_eq!(parse_agent_line("   "), AgentLine::Ignore);
         assert_eq!(parse_agent_line("random text"), AgentLine::Ignore);

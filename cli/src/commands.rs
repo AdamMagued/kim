@@ -389,7 +389,10 @@ async fn doctor(config: &KimConfig) -> CommandOutcome {
 
     if config.provider == "ollama" {
         let base = crate::provider::normalize_base_url(&config.ollama_base_url);
-        lines.push(format!("Ollama server: {}", http_status(&base, "/api/tags").await));
+        lines.push(format!(
+            "Ollama server: {}",
+            http_status(&base, "/api/tags").await
+        ));
         // A8: doctor must verify the configured model is actually servable —
         // it previously reported "ok" while the selected model was missing.
         lines.push(format!(
