@@ -20,6 +20,8 @@ pub mod ollama;
 pub mod relay;
 pub mod run_history;
 pub mod schedule_commands;
+mod scheduler;
+mod speed_access;
 pub mod session_commands;
 pub mod voice_config;
 pub mod config;
@@ -168,6 +170,9 @@ pub struct SessionInfo {
     pub has_summary: bool,
     pub summary: Option<String>,
     pub session_type: String, // "kim" or "codex"
+    /// K4: user pin (from the `.meta.json` sidecar). Pinned float to top.
+    #[serde(default)]
+    pub pinned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_threads: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -649,7 +654,14 @@ pub(crate) fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<
             };
 
             let message_count = count_lines(&session_file).unwrap_or(0);
-            let title = infer_session_title(&session_file, summary.as_ref(), &session_id);
+            let mut title = infer_session_title(&session_file, summary.as_ref(), &session_id);
+            // K4: merge the user meta sidecar (title override + pin).
+            let (meta_title, pinned) = crate::session_commands::read_session_meta(&date_dir, &session_id);
+            if let Some(t) = meta_title {
+                if !t.trim().is_empty() {
+                    title = t;
+                }
+            }
 
             let browser_meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
             let BrowserSessionMeta {
@@ -667,6 +679,7 @@ pub(crate) fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<
                 has_summary,
                 summary,
                 session_type: session_type.to_string(),
+                pinned,
                 browser_threads: if browser_threads.is_empty() { None } else { Some(browser_threads) },
                 browser_last_site,
                 browser_threads_updated_at_ms,
@@ -1863,7 +1876,7 @@ pub(crate) async fn configure_codex_direct_provider(
 }
 
 pub(crate) mod subprocess;
-pub(crate) use subprocess::{find_python_interpreter, send_task, cancel_task, hitl_respond_approval, process_exists, send_signal};
+pub(crate) use subprocess::{find_python_interpreter, send_task, cancel_task, hitl_respond_approval, steer_task, process_exists, send_signal};
 
 // ---------------------------------------------------------------------------
 // Voice config (config.yaml — voice:/enabled, voice:/engine, voice:/voice_id)
@@ -1913,7 +1926,23 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // K2: global-shortcut plugin — Alt+Space toggles the quick-ask window.
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    use tauri_plugin_global_shortcut::ShortcutState;
+                    if event.state() == ShortcutState::Pressed {
+                        speed_access::toggle_quick_ask(app);
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
+            // K2/K7: register the quick-ask shortcut and build the system tray.
+            speed_access::register_quick_ask_shortcut(app.handle());
+            if let Err(e) = speed_access::build_tray(app.handle()) {
+                eprintln!("[Kim] tray init failed: {e}");
+            }
             #[cfg(target_os = "macos")]
             {
                 use tauri::window::{Effect, EffectState, EffectsBuilder};
@@ -1932,6 +1961,8 @@ pub fn run() {
                 eprintln!("[Kim] Failed to start in-app browser bridge: {}", e);
             }
             start_bridge_file_watcher(app.handle().clone());
+            // D6: start the 60s in-app scheduler tick loop.
+            scheduler::start_scheduler(app.handle().clone());
             Ok(())
         })
         .manage(task_state)
@@ -1947,6 +1978,14 @@ pub fn run() {
             run_history::load_run_history,
             session_commands::get_app_version,
             session_commands::reveal_logs,
+            session_commands::set_privacy_pause,
+            session_commands::get_privacy_pause,
+            session_commands::revert_run,
+            session_commands::has_checkpoint,
+            session_commands::rename_session,
+            session_commands::set_session_pinned,
+            session_commands::delete_session,
+            session_commands::search_sessions,
             run_history::get_platform_info,
             run_history::run_update,
             browser_bridge::add_custom_provider_capability,
@@ -1969,6 +2008,7 @@ pub fn run() {
             send_task,
             cancel_task,
             hitl_respond_approval,
+            steer_task,
             voice_config::read_voice_config,
             voice_config::write_voice_config,
             relay::read_relay_config,
@@ -2001,6 +2041,7 @@ pub fn run() {
             feedback::send_feedback,
             show_screenshot_flash,
             feedback::save_attachment,
+            feedback::region_screenshot,
             schedule_commands::list_scheduled_tasks,
             schedule_commands::add_scheduled_task,
             schedule_commands::update_scheduled_task,

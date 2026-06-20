@@ -203,6 +203,9 @@ class KimAgent:
                 and _os.environ.get("KIM_TAURI_MODE") == "1"):
             from orchestrator.ui_bridge import StdinApprovalBridge
             self._ui_bridge = StdinApprovalBridge()
+        # K3: mid-run steering inbox. Lines pushed by the stdin pump (runtime) or
+        # add_steer() (tests) are drained into memory before each LLM call.
+        self._steer_inbox: list[str] = []
         # Retry configuration for LLM API calls
         self._max_retries: int = int(config.get("max_retries", 5))
         self._retry_base_delay: float = float(config.get("retry_base_delay", 1.0))
@@ -438,6 +441,36 @@ class KimAgent:
     # Main loop
     # ------------------------------------------------------------------
 
+    def add_steer(self, text: str) -> None:
+        """K3: queue a mid-run steering message (called from the stdin pump)."""
+        text = (text or "").strip()
+        if text:
+            if not hasattr(self, "_steer_inbox") or self._steer_inbox is None:
+                self._steer_inbox = []
+            self._steer_inbox.append(text)
+
+    def _drain_steers(self) -> None:
+        """K3: fold queued steering messages into memory as user messages and
+        emit a `steering noted` ack for each."""
+        # getattr-guarded: some test harnesses build KimAgent bypassing __init__.
+        pending = getattr(self, "_steer_inbox", None)
+        if not pending:
+            return
+        self._steer_inbox = []
+        for text in pending:
+            self.memory.add_user(f"[User steering mid-run]: {text}")
+            try:
+                print(
+                    json.dumps(
+                        {"type": "status", "message": f"steering noted: {text[:60]}"},
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            except Exception:
+                pass
+
     async def run(self, task: str) -> dict:
         """
         Run the agent loop for a single task.
@@ -447,6 +480,16 @@ class KimAgent:
         """
         self._log("INFO", f"=== Starting task: {task!r} ===")
         print(json.dumps({"type": "status", "message": "Kim is working on it…"}, separators=(",", ":"), ensure_ascii=False), flush=True)
+        # K3: start the shared stdin pump so mid-run steer lines are captured.
+        import os as _os_run
+        if _os_run.environ.get("KIM_TAURI_MODE") == "1":
+            try:
+                from orchestrator.ui_bridge import get_stdin_pump
+                pump = get_stdin_pump()
+                pump.set_steer_callback(self.add_steer)
+                pump.start()
+            except Exception:
+                pass
         self._screenshot_hashes = []
         self._recent_action_sigs = []
         # Reset plan/step dedupe so a fresh PLAN block at the start of this
@@ -537,6 +580,8 @@ class KimAgent:
             except Exception:
                 pass  # trace write must never abort the agent run
 
+            # K3: fold any mid-run steering into memory before this LLM call.
+            self._drain_steers()
             request_messages = self.memory.get_messages()
             request_estimate = estimate_request_tokens(
                 request_messages,
@@ -885,6 +930,52 @@ class KimAgent:
         ]
         self._log("INFO", f"Loaded {len(self._tools)} MCP tools")
 
+    @staticmethod
+    def _build_approval_preview(name: str, args: dict) -> str:
+        """K6: human-readable preview for the approval card.
+
+        run_command → the command; write/edit → unified diff (≤40 lines); web
+        actions → URL + element label. Empty string when nothing useful.
+        """
+        args = args or {}
+        try:
+            if name in ("run_command", "shell", "execute_command"):
+                return str(args.get("command") or args.get("cmd") or "").strip()
+            if name in ("write_file", "create_file", "edit_file"):
+                path = str(args.get("path") or args.get("file_path") or "")
+                new = str(args.get("content", ""))
+                old = ""
+                try:
+                    from pathlib import Path as _P
+                    p = _P(path)
+                    if p.is_file():
+                        old = p.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    old = ""
+                import difflib
+                diff = list(difflib.unified_diff(
+                    old.splitlines(), new.splitlines(),
+                    fromfile=f"{path} (current)", tofile=f"{path} (new)", lineterm="",
+                ))
+                if len(diff) > 40:
+                    diff = diff[:40] + ["… (diff truncated)"]
+                return "\n".join(diff) if diff else f"(no textual change to {path})"
+            if name.startswith("web_") or name in ("navigate", "click_element"):
+                url = str(args.get("url") or args.get("href") or "")
+                label = str(
+                    args.get("label")
+                    or args.get("selector")
+                    or args.get("element_id")
+                    or ""
+                )
+                parts = [url]
+                if label:
+                    parts.append(f"→ {label}")
+                return " ".join(x for x in parts if x).strip()
+        except Exception:
+            pass
+        return ""
+
     async def _execute_tool(self, name: str, args: dict) -> str:
         import time as _time
 
@@ -909,6 +1000,7 @@ class KimAgent:
                     "tool": name,
                     "risk": _hitl_risk["level"],
                     "reason": _hitl_risk["reason"],
+                    "preview": self._build_approval_preview(name, args or {}),
                 }, separators=(",", ":"), ensure_ascii=False), flush=True)
                 _hitl_interactively_approved = await self._ui_bridge.confirm_action(name, args or {})
                 print(json.dumps({

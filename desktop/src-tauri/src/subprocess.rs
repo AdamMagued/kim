@@ -34,6 +34,24 @@ pub(crate) async fn hitl_respond_approval(approved: bool) -> Result<(), String> 
     }
 }
 
+/// K3: write a mid-run steering message to the running agent's stdin. Python's
+/// stdin pump folds it into memory as a user message before the next LLM call.
+#[tauri::command]
+pub(crate) async fn steer_task(text: String) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let payload = serde_json::json!({ "type": "user_steer", "text": text }).to_string();
+    let mut guard = hitl_stdin().lock().await;
+    if let Some(ref mut stdin) = *guard {
+        stdin
+            .write_all(format!("{payload}\n").as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())
+    } else {
+        Err("No agent stdin available for steering".to_string())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum KimEvent {
@@ -58,7 +76,14 @@ enum KimEvent {
     RunFailed { reason: String, recoverable: bool, suggestion: String },
     ProviderError { code: String, retryable: bool },
     RateLimited { delay: f64, attempt: u32, max_retries: u32 },
-    HitlApprovalRequest { tool: String, risk: String, reason: String },
+    HitlApprovalRequest {
+        tool: String,
+        risk: String,
+        reason: String,
+        // K6: optional preview (command / unified diff / URL+label).
+        #[serde(default)]
+        preview: String,
+    },
     HitlApprovalResult { tool: String, approved: bool },
 }
 
@@ -513,6 +538,23 @@ pub(crate) async fn send_task(
     } else {
         let python = find_python_interpreter(&kim_root)?;
         let mut c = Command::new(&python);
+        // K1: unique per-run id for file checkpoints (~/.kim/checkpoints/<id>).
+        let sess = resume_session_id.as_deref().unwrap_or("run");
+        let sess_safe: String = sess
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+            .collect();
+        let run_id = format!(
+            "{}-{}",
+            sess_safe,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        c.env("KIM_RUN_ID", &run_id);
+        // Let the frontend associate this run's pill with its checkpoint id.
+        let _ = app_handle.emit("kim-run-id", run_id.clone());
         // When the resolved interpreter is the bundled sidecar, invoke it
         // directly (it is a standalone executable, not a Python binary).
         // Otherwise use the standard `python -m orchestrator.agent` invocation.
@@ -683,6 +725,8 @@ pub(crate) async fn send_task(
     if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
         *guard = child_pid;
     }
+    // K7: reflect the running task in the tray status line.
+    crate::speed_access::set_tray_status(&app_handle, Some(task.as_str()));
 
     // Store stdin handle for HITL approval round-trip (only for Kim orchestrator, not Codex).
     if !is_codex {
@@ -752,8 +796,8 @@ pub(crate) async fn send_task(
                                     "max_retries": max_retries,
                                 }));
                             }
-                            KimEvent::HitlApprovalRequest { tool, risk, reason } => {
-                                let _ = app.emit("kim:hitl-approval-request", serde_json::json!({"tool": tool, "risk": risk, "reason": reason}));
+                            KimEvent::HitlApprovalRequest { tool, risk, reason, preview } => {
+                                let _ = app.emit("kim:hitl-approval-request", serde_json::json!({"tool": tool, "risk": risk, "reason": reason, "preview": preview}));
                             }
                             KimEvent::HitlApprovalResult { tool, approved } => {
                                 let _ = app.emit("kim:hitl-approval-result", serde_json::json!({"tool": tool, "approved": approved}));
@@ -809,6 +853,8 @@ pub(crate) async fn send_task(
     if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
         *guard = None;
     }
+    // K7: tray back to idle.
+    crate::speed_access::set_tray_status(&app_handle, None);
     // Drop the HITL stdin handle so the pipe is closed.
     *hitl_stdin().lock().await = None;
     if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
@@ -1075,10 +1121,11 @@ mod tests {
         let json = r#"{"type":"hitl_approval_request","tool":"run_command","risk":"high","reason":"arbitrary_code_execution"}"#;
         let event: KimEvent = serde_json::from_str(json).expect("hitl_approval_request should deserialize");
         match event {
-            KimEvent::HitlApprovalRequest { tool, risk, reason } => {
+            KimEvent::HitlApprovalRequest { tool, risk, reason, preview } => {
                 assert_eq!(tool, "run_command");
                 assert_eq!(risk, "high");
                 assert_eq!(reason, "arbitrary_code_execution");
+                assert_eq!(preview, ""); // absent in legacy line → default
             }
             _ => panic!("Expected HitlApprovalRequest, got {:?}", event),
         }

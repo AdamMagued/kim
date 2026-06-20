@@ -1,5 +1,6 @@
 import os
 import sys
+import fnmatch
 import logging
 from pathlib import Path
 import yaml
@@ -95,11 +96,33 @@ _SENSITIVE_PATHS: list[Path] = [
     _HOME / ".docker",
     _HOME / ".netrc",
     _HOME / ".config" / "gh",
-    # macOS-specific
+    # Cloud SDKs / secret stores (G2)
+    _HOME / ".config" / "gcloud",
+    _HOME / ".password-store",
+    # Browser profiles (cookies + saved sessions = account takeover) (G2)
+    _HOME / ".mozilla",
+    # macOS-specific. These are harmless no-op prefixes on other platforms
+    # (a path that never matches a real file), so they are listed
+    # unconditionally — matching the existing unconditional Keychains entry —
+    # rather than platform-guarded, which keeps them testable everywhere.
     _HOME / "Library" / "Keychains",
+    _HOME / "Library" / "Application Support" / "Google" / "Chrome",
+    _HOME / "Library" / "Application Support" / "Firefox",
+    _HOME / "Library" / "Application Support" / "Code",
 ]
-# Also deny any dotenv files in home
-_SENSITIVE_GLOBS = [".env", ".env.*"]
+# Secret-file name patterns denied at ANY depth inside an allowed root (G1).
+# Matched case-by-case against `p.name` via fnmatch in validate_path().
+_SENSITIVE_GLOBS = [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "id_rsa*",
+    "id_ed25519*",
+    "credentials",
+    ".npmrc",
+    ".pypirc",
+]
 
 
 def validate_path(path_str: str) -> Path:
@@ -137,11 +160,13 @@ def validate_path(path_str: str) -> Path:
         except ValueError:
             continue
 
-    # Check for dotenv files in home directory
-    if p.parent == _HOME and p.name.startswith(".env"):
-        raise PermissionError(
-            f"Path '{p}' is a dotenv file in the home directory — access denied"
-        )
+    # Check for secret files (.env, keys, credentials) at ANY depth (G1).
+    for pattern in _SENSITIVE_GLOBS:
+        if fnmatch.fnmatch(p.name, pattern):
+            raise PermissionError(
+                f"Path '{p}' matches sensitive file pattern '{pattern}' "
+                f"({p.name}) — access denied"
+            )
 
     return p
 

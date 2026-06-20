@@ -5,12 +5,16 @@ import json
 import logging
 import os
 
+from ..privacy import is_privacy_paused, PRIVACY_ERROR
+
 logger = logging.getLogger(__name__)
 
 
 
 
 async def handle_take_screenshot(args: dict) -> str:
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import mss
     from PIL import Image
 
@@ -94,6 +98,8 @@ async def handle_take_annotated_screenshot(args: dict) -> str:
     The grid markers are drawn ON the image only — the user's actual screen
     is never modified.
     """
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import mss
     from PIL import Image
     from mcp_server.tools.screen_annotator import annotate_screenshot

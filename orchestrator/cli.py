@@ -13,6 +13,32 @@ import argparse
 import json
 import logging
 import sys
+import tempfile
+from pathlib import Path
+
+
+def resolve_log_dir() -> Path:
+    """D3: pick the first writable log directory.
+
+    Repo `logs/` is preferred, but a packaged/installed checkout may be
+    read-only, so fall back to a per-user dir and finally the temp dir. Never
+    raises — logging must not crash startup.
+    """
+    candidates = [
+        Path(__file__).resolve().parent.parent / "logs",
+        Path.home() / ".kim" / "logs",
+        Path(tempfile.gettempdir()) / "kim-logs",
+    ]
+    for d in candidates:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / ".write_test"
+            probe.write_text("x")
+            probe.unlink()
+            return d
+        except Exception:
+            continue
+    return Path(tempfile.gettempdir())
 
 
 def _cli_provider_type(value: str) -> str:
@@ -61,11 +87,10 @@ async def _cli_main(args: argparse.Namespace) -> None:
 
     # Wire structured rotating file logs (logs/kim-YYYY-MM-DD.jsonl, 7-day retention)
     try:
-        from pathlib import Path
         from mcp_server.logger import setup_structured_logging, apply_log_retention
-        # Logs live alongside the repo root (where orchestrator/ and logs/ sit)
-        _repo_root = Path(__file__).resolve().parent.parent
-        _log_dir = _repo_root / "logs"
+        # D3: repo logs/ may be read-only (packaged/installed); fall back to a
+        # user-writable dir so logging never crashes startup.
+        _log_dir = resolve_log_dir()
         setup_structured_logging(log_dir=str(_log_dir), level=log_level, also_stderr=False)
         apply_log_retention(log_dir=str(_log_dir), keep_days=7)
     except Exception as _log_err:

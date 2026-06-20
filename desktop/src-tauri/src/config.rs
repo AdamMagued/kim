@@ -7,6 +7,7 @@ fn default_bridge_timeout_secs() -> u64 { 720 }
 fn default_screenshot_flash_duration_ms() -> u64 { 3300 }
 fn default_max_iterations() -> u32 { 25 }
 fn default_ipc_protocol() -> String { "legacy".to_string() }
+fn default_schedules_enabled() -> bool { true }
 
 fn default_model_map() -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -33,6 +34,10 @@ pub struct AppConfig {
 
     #[serde(default = "default_ipc_protocol")]
     pub ipc_protocol: String,
+
+    /// D6: master switch for the in-app scheduler tick loop.
+    #[serde(default = "default_schedules_enabled")]
+    pub schedules_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -43,6 +48,7 @@ impl Default for AppConfig {
             screenshot_flash_duration_ms: default_screenshot_flash_duration_ms(),
             max_iterations: default_max_iterations(),
             ipc_protocol: default_ipc_protocol(),
+            schedules_enabled: default_schedules_enabled(),
         }
     }
 }

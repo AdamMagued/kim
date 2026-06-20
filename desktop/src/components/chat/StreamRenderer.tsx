@@ -91,7 +91,6 @@ export interface StreamRendererProps {
   bottomRef: RefObject<HTMLDivElement | null>;
   newestMsgIdx: number | null;
   queuedTasks: PendingTask[];
-  interruptTask: PendingTask | null;
   lastRunTask: PendingTask | null;
   elapsed: number;
   handleRetryLast: () => void;
@@ -132,7 +131,6 @@ export function StreamRenderer({
   bottomRef,
   newestMsgIdx,
   queuedTasks,
-  interruptTask,
   lastRunTask,
   elapsed,
   handleRetryLast,
@@ -178,6 +176,9 @@ export function StreamRenderer({
           <span className="kim-hitl-status__body">
             {detail} Tool: <strong>{hitlApprovalStatus.tool}</strong>. Risk: {hitlApprovalStatus.risk} ({hitlApprovalStatus.reason}).
           </span>
+          {hitlApprovalStatus.preview && (
+            <pre className="kim-hitl-status__preview"><code>{hitlApprovalStatus.preview}</code></pre>
+          )}
           {isPending && onHitlRespond && (
             <span className="kim-hitl-status__actions">
               <button
@@ -225,13 +226,15 @@ export function StreamRenderer({
     );
   }
 
-  function renderWorkedFor(_idx: number, run: { activity: ActivityItem[]; durationSec: number }, showCost = false) {
+  function renderWorkedFor(_idx: number, run: { activity: ActivityItem[]; durationSec: number; provider?: string | null }, showCost = false) {
     const historyTrace = buildThinkingTrace(run.activity, parsePlanFromActivity(run.activity));
     const workedForTrace = traceToWorkedFor(historyTrace);
     const duration = run.durationSec > 0 ? formatDuration(run.durationSec) : '…';
-    const provider = resolveProvider();
-    const costUsd = showCost && tokenStats
-      ? estimateCostUsd(provider, tokenStats.input, tokenStats.output)
+    // B5: price with the provider THIS run used (not the currently-selected one).
+    // Runs persisted before the provider field was added hide the cost chip.
+    const runProvider = run.provider ?? null;
+    const costUsd = showCost && tokenStats && runProvider
+      ? estimateCostUsd(runProvider, tokenStats.input, tokenStats.output)
       : null;
     return (
       <div className="kim-msg-row kim-msg-row--assistant" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 6 }}>
@@ -254,6 +257,99 @@ export function StreamRenderer({
             {costUsd === 0 ? 'local · $0' : `~${formatCostUsd(costUsd)}`}
           </span>
         )}
+      </div>
+    );
+  }
+
+  // B3: render the raw 'agent-error' sentinel as a friendly message everywhere
+  // (previously only the new-chat branch did; the session branch leaked it raw).
+  function friendlyTaskError(err: string): string {
+    return err === 'agent-error'
+      ? 'Kim ran into a problem and had to stop. Check the activity above for clues, or try rephrasing your task.'
+      : err;
+  }
+
+  // B4: structured run-failure card — shared by both branches.
+  function renderRunFailure() {
+    if (!runFailure || isRunning) return null;
+    return (
+      <div className="kim-msg-row kim-msg-row--assistant">
+        <div
+          className="kim-run-failed-card"
+          role="alert"
+          style={{
+            background: 'var(--kim-surface)',
+            border: '1px solid var(--kim-red, #e05c5c)',
+            borderRadius: 12,
+            padding: '14px 16px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 8,
+            maxWidth: 520,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ color: 'var(--kim-red, #e05c5c)', fontSize: 16 }}>✕</span>
+            <span style={{ fontWeight: 500, fontSize: 13.5 }}>
+              {runFailure.reason === 'max_iterations'
+                ? 'Iteration limit reached'
+                : runFailure.reason === 'stuck'
+                ? 'Kim got stuck'
+                : runFailure.reason === 'need_help'
+                ? 'Kim needs help'
+                : runFailure.reason === 'conversational_loop'
+                ? 'Conversational loop detected'
+                : 'Task failed'}
+            </span>
+          </div>
+          <div style={{ fontSize: 12.5, color: 'var(--kim-text-2)', lineHeight: 1.55 }}>
+            {runFailure.suggestion}
+          </div>
+          {runFailure.recoverable && lastRunTask && (
+            <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+              <button
+                type="button"
+                className="kr-btn kr-btn-primary"
+                style={{ fontSize: 12, padding: '6px 12px' }}
+                onClick={() => void handleRetryLast()}
+              >
+                Retry
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // B4: rate-limited backoff banner — shared by both branches.
+  function renderRateLimited() {
+    if (!rateLimitedState || !isRunning) return null;
+    return (
+      <div className="kim-msg-row kim-msg-row--assistant">
+        <div
+          style={{
+            background: 'var(--kim-surface)',
+            border: '1px solid var(--kim-border)',
+            borderRadius: 10,
+            padding: '10px 14px',
+            fontSize: 12.5,
+            color: 'var(--kim-text-2)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            maxWidth: 400,
+          }}
+        >
+          <span style={{ fontSize: 14 }}>⏳</span>
+          <span>
+            Rate-limited — retrying in {rateLimitedState.delay}s
+            {rateLimitedState.attempt < rateLimitedState.max_retries
+              ? ` (attempt ${rateLimitedState.attempt}/${rateLimitedState.max_retries})`
+              : ''}
+            …
+          </span>
+        </div>
       </div>
     );
   }
@@ -305,7 +401,9 @@ export function StreamRenderer({
       <div className={`kim-chat${empty ? ' kim-chat--empty-hero' : ''}`}>
         {renderConnectorsChrome()}
 
-        <div className="kim-messages" ref={bottomRef as any}>
+        {/* B11: only the bottom sentinel gets bottomRef — binding it here too
+            made the scroll target mount-order-dependent. */}
+        <div className="kim-messages">
           {empty && (
             <div
               style={{
@@ -410,12 +508,12 @@ export function StreamRenderer({
             const collapsed = collapseMessages(liveHistory);
             let liveUserIdx = -1;
             let liveAsstRunIdx = -1;
-            return collapsed.map(({ msg, retries }, i) => {
+            return collapsed.map(({ msg, retries, srcIdx }, i) => {
               if (msg.role === 'user' && isRealUserMessage(msg)) liveUserIdx += 1;
               if (isIntermediateToolCall(msg)) return null;
               const showActivityAfter = msg.role === 'user' && isRealUserMessage(msg) &&
                 !collapsed.slice(i + 1).some(({ msg: m }) => m.role === 'assistant' && !isIntermediateToolCall(m));
-              let workedRun: { activity: ActivityItem[]; durationSec: number } | null = null;
+              let workedRun: { activity: ActivityItem[]; durationSec: number; provider?: string | null } | null = null;
               let workedRunIsLast = false;
               if (msg.role === 'assistant') {
                 liveAsstRunIdx += 1;
@@ -431,7 +529,7 @@ export function StreamRenderer({
                     typingAnimation={settings.typing_animation ?? 'none'}
                     onRetry={handleRetryLast}
                     retries={retries}
-                    onEdit={msg.role === 'user' ? (newText) => handleEditLiveMessage(i, newText) : undefined}
+                    onEdit={msg.role === 'user' ? (newText) => handleEditLiveMessage(srcIdx, newText) : undefined}
                   />
                   {showActivityAfter && <ActivityFeed activity={activity} elapsed={elapsed} />}
                 </div>
@@ -441,25 +539,13 @@ export function StreamRenderer({
 
           {renderHitlStatus()}
 
-          {/* Error / retry */}
-          {taskError && taskError !== 'agent-error' && (
+          {/* Error / retry — B4: suppress the legacy banner when the structured
+              run-failure card is shown for the same run (avoid double surface). */}
+          {taskError && !runFailure && (
             <div className="kim-msg-row kim-msg-row--assistant">
               <div className="kim-task-error" role="alert">
                 <span className="kim-task-error__icon">⚠</span>
-                <span>{taskError}</span>
-                {lastRunTask && (
-                  <button type="button" className="kim-task-error__retry" onClick={() => void handleRetryLast()}>
-                    Retry
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-          {taskError === 'agent-error' && (
-            <div className="kim-msg-row kim-msg-row--assistant">
-              <div className="kim-task-error" role="alert">
-                <span className="kim-task-error__icon">⚠</span>
-                <span>Kim ran into a problem and had to stop. Check the activity above for clues, or try rephrasing your task.</span>
+                <span>{friendlyTaskError(taskError)}</span>
                 {lastRunTask && (
                   <button type="button" className="kim-task-error__retry" onClick={() => void handleRetryLast()}>
                     Retry
@@ -469,90 +555,12 @@ export function StreamRenderer({
             </div>
           )}
 
-          {/* Structured run-failed card — rendered when Python emits kim:run_failed */}
-          {runFailure && !isRunning && (
-            <div className="kim-msg-row kim-msg-row--assistant">
-              <div
-                className="kim-run-failed-card"
-                role="alert"
-                style={{
-                  background: 'var(--kim-surface)',
-                  border: '1px solid var(--kim-red, #e05c5c)',
-                  borderRadius: 12,
-                  padding: '14px 16px',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 8,
-                  maxWidth: 520,
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span style={{ color: 'var(--kim-red, #e05c5c)', fontSize: 16 }}>✕</span>
-                  <span style={{ fontWeight: 500, fontSize: 13.5 }}>
-                    {runFailure.reason === 'max_iterations'
-                      ? 'Iteration limit reached'
-                      : runFailure.reason === 'stuck'
-                      ? 'Kim got stuck'
-                      : runFailure.reason === 'need_help'
-                      ? 'Kim needs help'
-                      : runFailure.reason === 'conversational_loop'
-                      ? 'Conversational loop detected'
-                      : 'Task failed'}
-                  </span>
-                </div>
-                <div style={{ fontSize: 12.5, color: 'var(--kim-text-2)', lineHeight: 1.55 }}>
-                  {runFailure.suggestion}
-                </div>
-                {runFailure.recoverable && lastRunTask && (
-                  <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-                    <button
-                      type="button"
-                      className="kr-btn kr-btn-primary"
-                      style={{ fontSize: 12, padding: '6px 12px' }}
-                      onClick={() => void handleRetryLast()}
-                    >
-                      Retry
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
+          {renderRunFailure()}
+          {renderRateLimited()}
 
-          {/* Rate-limited banner — shows while backing off, auto-clears after delay */}
-          {rateLimitedState && isRunning && (
-            <div className="kim-msg-row kim-msg-row--assistant">
-              <div
-                style={{
-                  background: 'var(--kim-surface)',
-                  border: '1px solid var(--kim-border)',
-                  borderRadius: 10,
-                  padding: '10px 14px',
-                  fontSize: 12.5,
-                  color: 'var(--kim-text-2)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  maxWidth: 400,
-                }}
-              >
-                <span style={{ fontSize: 14 }}>⏳</span>
-                <span>
-                  Rate-limited — retrying in {rateLimitedState.delay}s
-                  {rateLimitedState.attempt < rateLimitedState.max_retries
-                    ? ` (attempt ${rateLimitedState.attempt}/${rateLimitedState.max_retries})`
-                    : ''}
-                  …
-                </span>
-              </div>
-            </div>
-          )}
-
-          {(queuedTasks.length > 0 || interruptTask) && (
+          {queuedTasks.length > 0 && (
             <div className="kim-queue-indicator" role="status" aria-live="polite">
-              {interruptTask
-                ? 'Interrupt pending. Current task will be replaced when cancellation completes.'
-                : `${queuedTasks.length} queued message${queuedTasks.length === 1 ? '' : 's'} waiting.`}
+              {`${queuedTasks.length} queued message${queuedTasks.length === 1 ? '' : 's'} waiting.`}
             </div>
           )}
 
@@ -571,7 +579,7 @@ export function StreamRenderer({
             </div>
           )}
 
-          <div ref={bottomRef as any} />
+          <div ref={bottomRef} />
         </div>
 
         {renderPermissionToggle()}
@@ -642,7 +650,7 @@ export function StreamRenderer({
                   if (msg.role === 'user' && isRealUserMessage(msg)) userMsgIdx += 1;
                   if (isIntermediateToolCall(msg)) return null;
 
-                  let workedRun: { activity: ActivityItem[]; durationSec: number } | null = null;
+                  let workedRun: { activity: ActivityItem[]; durationSec: number; provider?: string | null } | null = null;
                   if (msg.role === 'assistant') {
                     const savedIdx = userMsgIdx - liveAsstCount;
                     workedRun = runHistory[savedIdx] ?? null;
@@ -676,12 +684,12 @@ export function StreamRenderer({
               const savedUserCount = messages.filter(isRealUserMessage).length;
               let liveUserMsgIdx = savedUserCount - 1;
               let liveAsstIdx = savedAsstCount;
-              return collapsed.map(({ msg, retries }, i) => {
+              return collapsed.map(({ msg, retries, srcIdx }, i) => {
                 if (msg.role === 'user' && isRealUserMessage(msg)) liveUserMsgIdx += 1;
                 if (isIntermediateToolCall(msg)) return null;
                 const showActivityAfter = msg.role === 'user' && isRealUserMessage(msg) &&
                   !collapsed.slice(i + 1).some(({ msg: m }) => m.role === 'assistant' && !isIntermediateToolCall(m));
-                let workedRun: { activity: ActivityItem[]; durationSec: number } | null = null;
+                let workedRun: { activity: ActivityItem[]; durationSec: number; provider?: string | null } | null = null;
                 let workedRunIsLast2 = false;
                 if (msg.role === 'assistant') {
                   workedRun = runHistory[liveAsstIdx] ?? null;
@@ -697,7 +705,7 @@ export function StreamRenderer({
                       typingAnimation={settings.typing_animation ?? 'none'}
                       onRetry={handleRetryLast}
                       retries={retries}
-                      onEdit={msg.role === 'user' ? (newText) => handleEditLiveMessage(i, newText) : undefined}
+                      onEdit={msg.role === 'user' ? (newText) => handleEditLiveMessage(srcIdx, newText) : undefined}
                     />
                     {showActivityAfter && <ActivityFeed activity={activity} elapsed={elapsed} />}
                   </div>
@@ -707,16 +715,23 @@ export function StreamRenderer({
 
             {renderHitlStatus()}
 
-            {taskError && (
+            {/* B4: render the structured failure + rate-limit surfaces in the
+                session branch too (previously only the new-chat branch had them). */}
+            {renderRunFailure()}
+            {renderRateLimited()}
+
+            {/* B3/B4: friendly agent-error text; suppressed when the structured
+                run-failure card already explains the same run. */}
+            {taskError && !runFailure && (
               <div className="kim-msg-row kim-msg-row--assistant">
                 <div style={{ maxWidth: '78%', minWidth: 0 }}>
-                  <SignalCard kind="error" text={taskError} onAction={handleRetryLast} actionLabel="Resend Task" />
+                  <SignalCard kind="error" text={friendlyTaskError(taskError)} onAction={handleRetryLast} actionLabel="Resend Task" />
                 </div>
               </div>
             )}
           </>
         )}
-        <div ref={bottomRef as any} />
+        <div ref={bottomRef} />
       </div>
 
       {renderPermissionToggle()}

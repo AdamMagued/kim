@@ -1,10 +1,18 @@
+import base64
 import logging
 import os
+import re
 from pathlib import Path
 
 import aiofiles
 
 from mcp_server.config import validate_path, PROJECT_ROOT
+from mcp_server.checkpoints import backup_pre_image
+
+# A data-URI is only treated as binary when it matches the WHOLE content
+# (anchored prefix, base64 body, no trailing junk). A text file that merely
+# starts with "data:...;base64," is written verbatim as text. (G3)
+_DATA_URI_RE = re.compile(r"^data:[^,]*;base64,(.*)$", re.DOTALL)
 
 logger = logging.getLogger(__name__)
 
@@ -21,25 +29,39 @@ async def handle_read_file(args: dict) -> str:
     return content
 
 
-import base64
-
 async def handle_write_file(args: dict) -> str:
     path = validate_path(args["path"])
     content = args["content"]
+    binary = bool(args.get("binary", False))
+    backup_pre_image(path)  # K1: checkpoint pre-image before mutating
     path.parent.mkdir(parents=True, exist_ok=True)
-    
-    if content.startswith("data:") and ";base64," in content:
+
+    # Binary path: explicit `binary` flag, or a clean whole-content data-URI.
+    match = _DATA_URI_RE.match(content)
+    if binary or match is not None:
+        if match is None:
+            # Caller asked for binary but content is not a data:...;base64, URI.
+            return (
+                "ERROR: binary=True requires content to be a 'data:<type>;base64,<data>' "
+                "URI; got non-data-URI content"
+            )
         try:
-            # Format: data:[<mediatype>][;base64],<data>
-            _, b64data = content.split(";base64,", 1)
-            binary_content = base64.b64decode(b64data)
+            # validate=True rejects whitespace/prose after the base64 body, so a
+            # text file that merely begins with the prefix falls through to text.
+            binary_content = base64.b64decode(match.group(1), validate=True)
             async with aiofiles.open(path, "wb") as f:
                 await f.write(binary_content)
             logger.info(f"write_file: {path} ({len(binary_content)} bytes)")
             return f"Written {len(binary_content)} bytes to {path}"
         except Exception as e:
-            logger.warning(f"Failed to decode base64 for {path}: {e}")
-            # Fall back to text if decoding fails
+            if binary:
+                # Explicit request to decode failed — surface it, don't silently
+                # write the data-URI string as text.
+                logger.warning(f"Failed to decode base64 for {path}: {e}")
+                return f"ERROR: failed to decode base64 content for {path}: {e}"
+            logger.debug(f"Content starts with data-URI but is not clean base64; "
+                         f"writing as text for {path}: {e}")
+            # Fall through to text write.
 
     async with aiofiles.open(path, "w", encoding="utf-8") as f:
         await f.write(content)
@@ -90,6 +112,7 @@ async def handle_delete_file(args: dict) -> str:
         return f"ERROR: File not found: {path}"
     if path.is_dir():
         return "ERROR: Use a shell command to delete directories; delete_file only removes files."
+    backup_pre_image(path)  # K1: checkpoint pre-image before delete
     path.unlink()
     logger.info(f"delete_file: {path}")
     return f"Deleted: {path}"

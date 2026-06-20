@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { SessionInfo, Settings } from '../types';
 import type { PendingTask } from '../components/chat/types';
@@ -15,10 +15,18 @@ interface UseTaskRunnerProps {
   conversationId: string;
   onTaskDone: (sessionId?: string, completedSession?: SessionInfo) => void;
   resolveProvider: () => string;
-  browserCommandArgs: (targetSession?: SessionInfo | null, overrideSessionId?: string | null) => any;
+  browserCommandArgs: (
+    targetSession?: SessionInfo | null,
+    overrideSessionId?: string | null
+  ) => {
+    sessionId: string;
+    sessionDate: string | null;
+    sessionType: string;
+    kimDir: string | null;
+    codexDir: string | null;
+  };
   stream: ReturnType<typeof useChatStream>;
   scroll: ReturnType<typeof useSessionScroll>;
-  handleCancel: () => void;
 }
 
 export function useTaskRunner({
@@ -32,10 +40,8 @@ export function useTaskRunner({
   browserCommandArgs,
   stream,
   scroll,
-  handleCancel,
 }: UseTaskRunnerProps) {
   const [queuedTasks, setQueuedTasks] = useState<PendingTask[]>([]);
-  const [interruptTask, setInterruptTask] = useState<PendingTask | null>(null);
 
   const makePendingTask = useCallback(
     (text: string, providerOverride?: string): PendingTask => {
@@ -164,20 +170,27 @@ export function useTaskRunner({
     [session, settings, activeTab, activeProjectPath, conversationId, onTaskDone, browserCommandArgs, scroll.setAutoFollowOutput]
   );
 
+  // B1: drain the queue when a run finishes. When isRunning transitions
+  // true → false and tasks are queued, dequeue the head and run it. (Previously
+  // queued tasks were appended but never executed — the queue UI lied.)
+  const prevRunningRef = useRef(stream.isRunning);
+  useEffect(() => {
+    const justFinished = prevRunningRef.current && !stream.isRunning;
+    prevRunningRef.current = stream.isRunning;
+    if (justFinished && queuedTasks.length > 0) {
+      const [next, ...rest] = queuedTasks;
+      setQueuedTasks(rest);
+      void runPendingTask(next);
+    }
+  }, [stream.isRunning, queuedTasks, runPendingTask]);
+
   const handleSubmit = (fullText: string) => {
     const task = makePendingTask(fullText);
 
     if (stream.isRunning) {
-      const queueEnabled = true;
-      if (queueEnabled) {
-        const nextCount = queuedTasks.length + 1;
-        setQueuedTasks(prev => [...prev, task]);
-        toast(`Queued message #${nextCount}. Kim will run it automatically next.`, 'info', 3000);
-      } else {
-        toast('Interrupting current task and replacing it with your latest message.', 'warning', 4500);
-        setInterruptTask(task);
-        void handleCancel();
-      }
+      const nextCount = queuedTasks.length + 1;
+      setQueuedTasks(prev => [...prev, task]);
+      toast(`Queued message #${nextCount}. Kim will run it automatically next.`, 'info', 3000);
       return;
     }
 
@@ -189,28 +202,29 @@ export function useTaskRunner({
     if (!failed) return;
 
     if (stream.isRunning) {
-      const queueEnabled = true;
-      if (queueEnabled) {
-        setQueuedTasks(prev => [...prev, failed]);
-        toast('Retry queued. It will run after the current task.', 'info', 3000);
-      } else {
-        toast('Retry will run after current task is interrupted.', 'warning', 4000);
-        setInterruptTask(failed);
-        void handleCancel();
-      }
+      setQueuedTasks(prev => [...prev, failed]);
+      toast('Retry queued. It will run after the current task.', 'info', 3000);
       return;
     }
     void runPendingTask(failed);
   };
 
+  // K3: mid-run steering — inject text into the running agent instead of queuing.
+  const handleSteer = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    invoke('steer_task', { text: t })
+      .then(() => toast('Steering noted — Kim will fold it in next step.', 'info', 2500))
+      .catch(() => toast('Could not steer (no run active?).', 'warning', 3000));
+  };
+
   return {
     queuedTasks,
     setQueuedTasks,
-    interruptTask,
-    setInterruptTask,
     makePendingTask,
     runPendingTask,
     handleSubmit,
     handleRetryLast,
+    handleSteer,
   };
 }

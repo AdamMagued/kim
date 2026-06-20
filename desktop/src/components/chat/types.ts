@@ -96,4 +96,6 @@ export interface HitlApprovalStatus {
   risk: string;
   reason: string;
   approved: boolean | null;
+  /** K6: optional preview (command / unified diff / URL+label). */
+  preview?: string;
 }

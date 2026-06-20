@@ -747,8 +747,12 @@ export function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | n
 // ── Message collapsing ────────────────────────────────────────────────────────
 
 export function collapseMessages(msgs: KimMessage[]) {
-  const res: {msg: KimMessage, retries: number}[] = [];
-  for (const msg of msgs) {
+  // B2: carry `srcIdx` — the index of each kept message in the ORIGINAL array —
+  // so callers can map a collapsed-array position back to the real message
+  // (editing used the collapsed index against the uncollapsed array → wrong msg).
+  const res: {msg: KimMessage, retries: number, srcIdx: number}[] = [];
+  for (let i = 0; i < msgs.length; i++) {
+    const msg = msgs[i];
     if (res.length > 0 && msg.role === 'assistant' && typeof msg.content === 'string') {
       const prev = res[res.length - 1];
       if (prev.msg.role === 'assistant' && typeof prev.msg.content === 'string') {
@@ -763,7 +767,7 @@ export function collapseMessages(msgs: KimMessage[]) {
         }
       }
     }
-    res.push({ msg, retries: 0 });
+    res.push({ msg, retries: 0, srcIdx: i });
   }
   return res;
 }
@@ -868,13 +872,19 @@ const PRICE_PER_1M: Record<string, { input: number; output: number }> = {
 };
 
 export function estimateCostUsd(provider: string, inputTokens: number, outputTokens: number): number {
-  const rates = PRICE_PER_1M[provider] ?? PRICE_PER_1M['claude'];
+  // B5: browser providers stream as `browser:claude` / `browser:chatgpt` etc.
+  // Those are free local sessions — normalize to the `browser` (zero-cost) key
+  // so they don't fall through to the default claude rate and show a fake cost.
+  const normalized = provider.trim().toLowerCase().startsWith('browser')
+    ? 'browser'
+    : provider;
+  const rates = PRICE_PER_1M[normalized] ?? PRICE_PER_1M['claude'];
   return (inputTokens * rates.input + outputTokens * rates.output) / 1_000_000;
 }
 
 export function formatCostUsd(usd: number): string {
   if (usd === 0) return '$0.00';
   if (usd < 0.0001) return '<$0.0001';
-  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  // B14: the old `usd < 0.01` branch was identical to the default (toFixed(4)).
   return `$${usd.toFixed(4)}`;
 }

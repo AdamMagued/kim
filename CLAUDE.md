@@ -9,6 +9,11 @@ Real app root is `kim-pro/`. Never modify anything outside `kim-pro/`.
 2. **CSS import order** in `desktop/src/index.css` is load-bearing (cascade). Do not reorder.
 3. **System-prompt f-strings**: examples inside f-strings need doubled braces `{{ }}`.
 4. After any Rust change, `tauri dev` needs a restart (hot-reload does not apply to Rust).
+5. **Secret-file sandbox**: `mcp_server/config.validate_path()` denies secret files
+   (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `credentials`, `.npmrc`,
+   `.pypirc`) at any depth and sensitive dirs (`.ssh`, `.aws`, browser profiles, cloud
+   SDKs, …). Don't weaken these globs/paths. Note: enforcement is filename/dir-based, not a
+   content scanner — secrets pasted into a normally-named file are not caught.
 
 ## Architecture pointer
 See `ARCHITECTURE.md` for the full layer diagram and IPC protocol spec.

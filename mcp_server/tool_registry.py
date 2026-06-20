@@ -91,12 +91,13 @@ _FILE_TOOLS: list[Tool] = [
     ),
     Tool(
         name="write_file",
-        description="Write text content to a file, creating parent directories if needed. Overwrites existing content.",
+        description="Write text content to a file, creating parent directories if needed. Overwrites existing content. To write binary, set binary=true and pass content as a 'data:<mediatype>;base64,<data>' URI.",
         inputSchema={
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path (absolute or relative to PROJECT_ROOT)"},
-                "content": {"type": "string", "description": "Text content to write"},
+                "content": {"type": "string", "description": "Text content to write, or a 'data:<mediatype>;base64,<data>' URI when binary=true"},
+                "binary": {"type": "boolean", "description": "When true, decode content as a data:...;base64,... URI and write raw bytes. Default false (write as text)."},
             },
             "required": ["path", "content"],
         },

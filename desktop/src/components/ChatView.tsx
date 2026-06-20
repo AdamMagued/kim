@@ -68,6 +68,11 @@ export function ChatView({
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(
     () => settings.permission_mode ?? 'full_auto'
   );
+  // B15: keep the per-session toggle in sync when the persistent default changes
+  // in Settings (the state initializer only ran once, so it silently diverged).
+  useEffect(() => {
+    setPermissionMode(settings.permission_mode ?? 'full_auto');
+  }, [settings.permission_mode]);
   const [connectorsClosing, setConnectorsClosing] = useState(false);
   const [browserProvider, setBrowserProvider] = useState('claude');
   const [conversationId] = useState(() => Math.random().toString(36).substring(7));
@@ -177,7 +182,6 @@ export function ChatView({
 
   const {
     queuedTasks,
-    interruptTask,
     handleSubmit,
     handleRetryLast,
   } = useTaskRunner({
@@ -191,7 +195,6 @@ export function ChatView({
     browserCommandArgs,
     stream,
     scroll,
-    handleCancel,
   });
 
   // ── Reset state when entering a new chat ─────────────────────────────────────
@@ -204,6 +207,13 @@ export function ChatView({
       stream.setContextState(null);
       stream.setElapsed(0);
       stream.hasSentMessageRef.current = false;
+      // B6: also clear live bubbles, failure/rate-limit cards, pending approval,
+      // and the retry target so stale UI can't bleed into a fresh chat.
+      stream.setLiveHistory([]);
+      stream.setRunFailure(null);
+      stream.setRateLimitedState(null);
+      stream.setHitlApprovalStatus(null);
+      stream.setLastFailedTask(null);
     }
   }, [newChatMode, stream.clearActivityNow]);
 
@@ -286,7 +296,7 @@ export function ChatView({
         }
       }
       if (onSettingsChange) {
-        onSettingsChange({ ...settings, provider: val as any });
+        onSettingsChange({ ...settings, provider: val as Settings['provider'] });
       }
     },
     [
@@ -375,11 +385,14 @@ export function ChatView({
   };
 
   const handleEditLiveMessage = (idx: number, newText: string) => {
-    stream.setLiveHistory(prev => {
-      const next = [...prev];
-      if (next[idx]) next[idx].content = newText;
-      return next;
-    });
+    // B2: `idx` is the real liveHistory index (via collapsed srcIdx). Edit is
+    // Claude-style: truncate the live exchange at this message and resend the
+    // edited text as a new turn. (Was: a cosmetic in-place mutation that edited
+    // the wrong message after retry-collapse and never reached the agent.)
+    const trimmed = newText.trim();
+    if (!trimmed) return;
+    stream.setLiveHistory(prev => prev.slice(0, idx));
+    handleSubmit(trimmed);
   };
 
   const renderComposer = (heroMode = false) => {
@@ -466,7 +479,6 @@ export function ChatView({
       bottomRef={scroll.bottomRef}
       newestMsgIdx={newestMsgIdx}
       queuedTasks={queuedTasks}
-      interruptTask={interruptTask}
       lastRunTask={stream.lastRunTaskRef.current}
       elapsed={stream.elapsed}
       handleRetryLast={handleRetryLast}

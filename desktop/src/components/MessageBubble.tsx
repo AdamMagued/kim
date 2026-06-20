@@ -157,47 +157,111 @@ function isBridgeFillerText(text: string): boolean {
 
 // ── Minimal markdown renderer ─────────────────────────────────────────────────
 
+/**
+ * F2: split text into fenced-code and prose segments by scanning for ``` fence
+ * PAIRS across the whole string FIRST. This preserves blank lines inside code
+ * blocks (the old code paragraph-split on /\n\n+/ before detecting fences, so a
+ * code block with a blank line was torn apart) and handles fences mid-paragraph.
+ */
+export function splitFences(text: string): { type: 'code' | 'text'; content: string }[] {
+  const out: { type: 'code' | 'text'; content: string }[] = [];
+  const fence = /```[^\n]*\n?([\s\S]*?)```/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = fence.exec(text)) !== null) {
+    if (m.index > last) out.push({ type: 'text', content: text.slice(last, m.index) });
+    out.push({ type: 'code', content: m[1].replace(/\n$/, '') });
+    last = fence.lastIndex;
+  }
+  if (last < text.length) out.push({ type: 'text', content: text.slice(last) });
+  return out;
+}
+
+/** F3: links are only followed for http/https/mailto; anything else (javascript:,
+ *  data:, file:, …) renders as plain text. */
+export function isSafeLinkUrl(url: string): boolean {
+  const u = url.trim().toLowerCase();
+  return u.startsWith('http://') || u.startsWith('https://') || u.startsWith('mailto:');
+}
+
+/** F3: classify an image src — inline-safe (data:/asset:/same-origin), a remote
+ *  https image (click-to-load), or blocked (any other scheme). */
+export function classifyImageSrc(src: string): 'inline' | 'remote' | 'blocked' {
+  const s = src.trim();
+  const u = s.toLowerCase();
+  if (u.startsWith('data:') || u.startsWith('asset:') || s.startsWith('/') || s.startsWith('./') || s.startsWith('../')) {
+    return 'inline';
+  }
+  if (u.startsWith('https://')) return 'remote';
+  return 'blocked';
+}
+
+/** Remote https image rendered behind a click-to-load placeholder so model/tool
+ *  output can't silently phone home (exfil/tracking channel). (F3) */
+function RemoteImage({ src, alt }: { src: string; alt: string }) {
+  const [load, setLoad] = useState(false);
+  if (load) return <img src={src} alt={alt} className="kim-bubble__img" />;
+  return (
+    <button
+      type="button"
+      className="kim-bubble__img-placeholder"
+      onClick={() => setLoad(true)}
+      title={src}
+    >
+      ▶ Load image{alt ? ` — ${alt}` : ''}
+    </button>
+  );
+}
+
 function renderText(text: string) {
-  const paragraphs = text.split(/\n\n+/);
+  const segments = splitFences(text);
   return (
     <div className="prose">
-      {paragraphs.map((para, i) => {
-        if (para.startsWith('```')) {
-          const lines = para.split('\n');
-          const code = lines
-            .slice(1, lines.lastIndexOf('```') === -1 ? undefined : lines.lastIndexOf('```'))
-            .join('\n');
-          return <pre key={i}><code>{code}</code></pre>;
+      {segments.flatMap((seg, si) => {
+        if (seg.type === 'code') {
+          return [<pre key={`c${si}`}><code>{seg.content}</code></pre>];
         }
+        const paragraphs = seg.content.split(/\n\n+/);
+        return paragraphs.map((para, i) => {
+          if (!para.trim()) return null;
+          // Image: ![alt](url) · Link: [text](url)
+          const parts = para.split(/(!?\[[^\]]*\]\([^)]+\))/g);
+          return (
+            <p key={`t${si}-${i}`}>
+              {parts.map((part, j) => {
+                const imgMatch = part.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
+                if (imgMatch) {
+                  const src = imgMatch[2].trim();
+                  const alt = imgMatch[1] || 'image';
+                  const kind = classifyImageSrc(src);
+                  if (kind === 'inline') {
+                    return <img key={j} src={src} alt={alt} className="kim-bubble__img" />;
+                  }
+                  if (kind === 'remote') {
+                    return <RemoteImage key={j} src={src} alt={alt} />;
+                  }
+                  return <span key={j}>{part}</span>; // blocked scheme → plain text
+                }
+                const linkMatch = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+                if (linkMatch) {
+                  if (isSafeLinkUrl(linkMatch[2])) {
+                    return <a key={j} href={linkMatch[2]} target="_blank" rel="noopener noreferrer" className="kim-bubble__link">{linkMatch[1]}</a>;
+                  }
+                  return <span key={j}>{linkMatch[1]}</span>; // unsafe scheme → plain text
+                }
 
-        // Simple link and image regex
-        // Image: ![alt](url)
-        // Link: [text](url)
-        const parts = para.split(/(!?\[[^\]]*\]\([^)]+\))/g);
-
-        return (
-          <p key={i}>
-            {parts.map((part, j) => {
-              const imgMatch = part.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
-              if (imgMatch) {
-                return <img key={j} src={imgMatch[2]} alt={imgMatch[1] || 'image'} className="kim-bubble__img" />;
-              }
-              const linkMatch = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-              if (linkMatch) {
-                return <a key={j} href={linkMatch[2]} target="_blank" rel="noopener noreferrer" className="kim-bubble__link">{linkMatch[1]}</a>;
-              }
-              
-              const lines = part.split('\n');
-              return (
-                <span key={j}>
-                  {lines.map((line, k) => (
-                    <span key={k}>{renderInlineMarkdown(line, `${j}-${k}`)}{k < lines.length - 1 && <br />}</span>
-                  ))}
-                </span>
-              );
-            })}
-          </p>
-        );
+                const lines = part.split('\n');
+                return (
+                  <span key={j}>
+                    {lines.map((line, k) => (
+                      <span key={k}>{renderInlineMarkdown(line, `${j}-${k}`)}{k < lines.length - 1 && <br />}</span>
+                    ))}
+                  </span>
+                );
+              })}
+            </p>
+          );
+        });
       })}
     </div>
   );

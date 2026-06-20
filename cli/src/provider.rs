@@ -162,11 +162,16 @@ pub async fn stream_kim_request(
     }
 
     // Chat mode: stream directly to the configured provider.
-    // Prepend the system prompt then call the appropriate streaming function.
-    let system = KIM_CHAT_SYSTEM_PROMPT;
+    // Prepend the system prompt (plus project KIM.md context, if present) then
+    // call the appropriate streaming function. (A12)
+    let mut system = KIM_CHAT_SYSTEM_PROMPT.to_string();
+    if let Some(kim_md) = load_kim_md() {
+        system.push_str("\n\n# Project context (from KIM.md)\n");
+        system.push_str(&kim_md);
+    }
     let mut full = vec![ChatMessage {
         role: "system".to_string(),
-        content: system.to_string(),
+        content: system,
     }];
     full.extend_from_slice(messages);
 
@@ -200,7 +205,39 @@ async fn is_bridge_available(base_url: &str) -> bool {
 }
 
 fn bridge_token() -> Option<String> {
-    std::env::var("KIM_API_KEY")
+    // D2: env first, then the file the desktop bridge writes on every start.
+    if let Some(t) = std::env::var("KIM_API_KEY")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        return Some(t);
+    }
+    bridge_token_from_file()
+}
+
+/// D2: human-readable description of where (if anywhere) a bridge token was
+/// found, for `kim doctor`.
+pub fn bridge_token_source() -> String {
+    if std::env::var("KIM_API_KEY")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .is_some()
+    {
+        "env KIM_API_KEY".to_string()
+    } else if bridge_token_from_file().is_some() {
+        "~/.kim/bridge_token (paired with desktop)".to_string()
+    } else {
+        "none — start Kim desktop, or set KIM_API_KEY".to_string()
+    }
+}
+
+/// D2: read the local-loopback bridge token the desktop app persists to
+/// `~/.kim/bridge_token`, so a `kim` install pairs with desktop automatically.
+fn bridge_token_from_file() -> Option<String> {
+    let path = dirs::home_dir()?.join(".kim").join("bridge_token");
+    std::fs::read_to_string(path)
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
@@ -265,13 +302,30 @@ async fn stream_via_bridge(
     if let Some(token) = bridge_token() {
         request = request.header("X-Kim-Token", token);
     }
-    match request.send().await {
+    // A13: /v1/task is non-streaming — it returns one blob after the whole run.
+    // Emit a heartbeat every ~5s so the user isn't staring at silence.
+    let response_future = async {
+        let resp = request.send().await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Ok::<(reqwest::StatusCode, String), reqwest::Error>((status, body))
+    };
+    tokio::pin!(response_future);
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+    heartbeat.tick().await; // consume the immediate first tick
+    let result = loop {
+        tokio::select! {
+            r = &mut response_future => break r,
+            _ = heartbeat.tick() => {
+                let _ = tx.send(AppEvent::ThoughtChunk("Kim desktop is working…".to_string()));
+            }
+        }
+    };
+    match result {
         Err(e) => {
             let _ = tx.send(AppEvent::Err(format!("Desktop bridge request failed: {e}")));
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        Ok((status, body)) => {
             if status.is_success() {
                 if let Ok(value) = serde_json::from_str::<Value>(&body) {
                     if let Some(response) = value.get("response").and_then(Value::as_str) {
@@ -317,7 +371,7 @@ async fn stream_openai_compatible(
         }
     };
     let base_url = if provider.name == "ollama" {
-        trim_base_url(&config.ollama_base_url)
+        format!("{}/v1", normalize_base_url(&config.ollama_base_url))
     } else {
         provider.default_base_url.to_string()
     };
@@ -508,6 +562,18 @@ fn sse_data_payload(line: &str) -> Option<&str> {
     line.strip_prefix("data:").map(str::trim_start)
 }
 
+/// Render an in-stream error payload into a user-facing message. Handles both
+/// an object with a `message` field and a bare string error. (A3)
+fn format_stream_error(err: &Value) -> String {
+    let detail = err
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| err.as_str().map(str::to_string))
+        .unwrap_or_else(|| err.to_string());
+    format!("Provider error: {detail}")
+}
+
 fn process_openai_sse_line(line: &str, parser: &mut ThinkParser, tx: &UnboundedSender<AppEvent>) {
     let Some(data) = sse_data_payload(line) else {
         return;
@@ -518,6 +584,12 @@ fn process_openai_sse_line(line: &str, parser: &mut ThinkParser, tx: &UnboundedS
     let Ok(json) = serde_json::from_str::<Value>(data) else {
         return;
     };
+    // In-stream provider errors (ollama/openai emit `{"error": ...}` mid-stream,
+    // e.g. model-not-found) must surface, not be silently dropped. (A3)
+    if let Some(err) = json.get("error") {
+        let _ = tx.send(AppEvent::Err(format_stream_error(err)));
+        return;
+    }
     let Some(choices) = json.get("choices").and_then(Value::as_array) else {
         return;
     };
@@ -608,6 +680,12 @@ fn process_anthropic_sse_line(
                 _ => {}
             }
         }
+        // Anthropic streams `{"type":"error","error":{...}}` events; surface
+        // them instead of dropping the stream silently. (A3)
+        Some("error") => {
+            let err = json.get("error").unwrap_or(&json);
+            let _ = tx.send(AppEvent::Err(format_stream_error(err)));
+        }
         _ => {}
     }
 }
@@ -615,6 +693,9 @@ fn process_anthropic_sse_line(
 /* ===========================================================
 <think> / </think> tag parser
 =========================================================== */
+
+/// gpt-oss harmony channel-boundary token fused into delta.content. (A4)
+const ASSISTANT_FINAL: &str = "assistantfinal";
 
 enum ThinkState {
     Normal,
@@ -639,15 +720,36 @@ impl ThinkParser {
         loop {
             match self.state {
                 ThinkState::Normal => {
-                    if let Some(pos) = self.buf.find("<think>") {
+                    let think_pos = self.buf.find("<think>");
+                    // gpt-oss "harmony" streams chain-of-thought in delta.content
+                    // ending with the fused token `assistantfinal`, then the
+                    // answer. Treat it as a channel boundary: text before → thought,
+                    // marker swallowed, text after → answer. (A4)
+                    let final_pos = self.buf.find(ASSISTANT_FINAL);
+                    let use_think = match (think_pos, final_pos) {
+                        (Some(tp), Some(fp)) => tp <= fp,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if use_think {
+                        let pos = think_pos.expect("think_pos present");
                         let before = self.buf[..pos].to_string();
                         if !before.is_empty() {
                             let _ = tx.send(AppEvent::TextChunk(before));
                         }
                         self.buf = self.buf[pos + 7..].to_string();
                         self.state = ThinkState::InThink;
+                    } else if let Some(pos) = final_pos {
+                        let before = self.buf[..pos].to_string();
+                        if !before.is_empty() {
+                            let _ = tx.send(AppEvent::ThoughtChunk(before));
+                        }
+                        self.buf = self.buf[pos + ASSISTANT_FINAL.len()..].to_string();
+                        // stay in Normal — what follows the marker is the answer.
                     } else {
-                        let flush_up_to = split_before_tail_chars(&self.buf, 6);
+                        // Hold back enough of the tail (>= marker length) so
+                        // `assistantfinal` can't be split across two flushes.
+                        let flush_up_to = split_before_tail_chars(&self.buf, 14);
                         if flush_up_to > 0 {
                             let to_flush = self.buf[..flush_up_to].to_string();
                             let _ = tx.send(AppEvent::TextChunk(to_flush));
@@ -897,11 +999,8 @@ fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: boo
             if let Some(output) = json.get("output").and_then(Value::as_str) {
                 let trimmed = output.trim();
                 if !trimmed.is_empty() {
-                    let display = if trimmed.len() > 300 {
-                        format!("{}…", &trimmed[..300])
-                    } else {
-                        trimmed.to_string()
-                    };
+                    // char-boundary-safe truncation — byte slicing panics mid-UTF-8 (A5)
+                    let display = crate::sessions::truncate(trimmed, 300);
                     let _ = tx.send(AppEvent::ThoughtChunk(display));
                 }
             }
@@ -927,11 +1026,8 @@ fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: boo
                         if let Some(output) = item.get("output").and_then(Value::as_str) {
                             let trimmed = output.trim();
                             if !trimmed.is_empty() {
-                                let display = if trimmed.len() > 300 {
-                                    format!("{}…", &trimmed[..300])
-                                } else {
-                                    trimmed.to_string()
-                                };
+                                // char-boundary-safe truncation (A5)
+                                let display = crate::sessions::truncate(trimmed, 300);
                                 let _ = tx.send(AppEvent::ThoughtChunk(display));
                             }
                         }
@@ -969,7 +1065,7 @@ async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent
         return None;
     }
 
-    let ollama_base = trim_base_url(&config.ollama_base_url);
+    let ollama_base = format!("{}/v1", normalize_base_url(&config.ollama_base_url));
     let mut child = match Command::new("python3")
         .args([tmp_path.to_string_lossy().as_ref(), ollama_base.as_str()])
         .stdout(std::process::Stdio::piped())
@@ -1143,13 +1239,53 @@ or run kim from inside the Kim repo directory."
     })
 }
 
-fn trim_base_url(base_url: &str) -> String {
+/// Normalize a provider base URL to a bare origin (no trailing slash, no `/v1`
+/// suffix). Callers append the endpoint they need (`/v1/chat/completions`,
+/// `/api/tags`, …). Handles trailing slashes and a `/v1/` suffix correctly. (A16)
+pub(crate) fn normalize_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.ends_with("/v1") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/v1")
+    trimmed
+        .strip_suffix("/v1")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// A12: load project context from the nearest KIM.md, walking up from cwd to the
+/// repo root (a dir with `.git` or `orchestrator/agent.py`). Capped at ~4KB.
+fn load_kim_md() -> Option<String> {
+    load_kim_md_from(&std::env::current_dir().ok()?)
+}
+
+fn load_kim_md_from(start: &Path) -> Option<String> {
+    const CAP: usize = 4096;
+    let mut dir = start.to_path_buf();
+    loop {
+        let candidate = dir.join("KIM.md");
+        if candidate.is_file() {
+            let mut content = std::fs::read_to_string(&candidate).ok()?;
+            if content.len() > CAP {
+                // char-boundary-safe truncation
+                let end = content
+                    .char_indices()
+                    .take_while(|(i, _)| *i < CAP)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                content.truncate(end);
+                content.push_str("\n…(KIM.md truncated at 4KB)");
+            }
+            return Some(content);
+        }
+        // Stop at the repo root (having checked KIM.md there) or filesystem root.
+        if dir.join(".git").exists() || dir.join("orchestrator").join("agent.py").exists() {
+            break;
+        }
+        if !dir.pop() {
+            break;
+        }
     }
+    None
 }
 
 const KIM_CHAT_SYSTEM_PROMPT: &str = "\
@@ -1248,6 +1384,220 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, AppEvent::TextChunk(t) if t == "done")));
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> Vec<AppEvent> {
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
+
+    // ── A3: in-stream provider errors surface as AppEvent::Err ──────────────
+
+    #[test]
+    fn openai_sse_surfaces_error_object() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        // ollama emits this when the requested model isn't pulled.
+        process_openai_sse_line(
+            r#"data: {"error":{"message":"model 'gpt-oss:20b-cloud' not found"}}"#,
+            &mut parser,
+            &tx,
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Err(m) if m.contains("not found"))),
+            "expected an Err event, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn openai_sse_surfaces_bare_string_error() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        process_openai_sse_line(r#"data: {"error":"upstream timed out"}"#, &mut parser, &tx);
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Err(m) if m.contains("upstream timed out"))),
+            "expected an Err event, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_surfaces_error_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        process_anthropic_sse_line(
+            r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            &mut parser,
+            &tx,
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Err(m) if m.contains("Overloaded"))),
+            "expected an Err event, got {events:?}"
+        );
+    }
+
+    // ── A5: char-boundary-safe truncation of tool output ────────────────────
+
+    #[test]
+    fn function_call_output_truncation_is_char_safe() {
+        // Byte 300 lands mid-emoji; byte slicing `&trimmed[..300]` would panic.
+        let mut payload = "a".repeat(299);
+        payload.push('🦀'); // 4-byte char straddling the 300-byte boundary
+        payload.push_str(&"b".repeat(50));
+        let line =
+            serde_json::json!({"type": "function_call_output", "output": payload}).to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Must not panic.
+        process_codex_line(&line, &tx, false);
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.ends_with('…'))),
+            "expected a truncated ThoughtChunk, got {events:?}"
+        );
+    }
+
+    // ── A12: KIM.md project context loading ─────────────────────────────────
+
+    #[test]
+    fn load_kim_md_reads_nearest_file_and_caps_size() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kim-md-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // .git marker so the walk stops here.
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        std::fs::write(tmp.join("KIM.md"), "# Project\nUse cargo test.").unwrap();
+        let got = load_kim_md_from(&tmp).expect("should find KIM.md");
+        assert!(got.contains("Use cargo test."));
+
+        // Oversized KIM.md is truncated with a note.
+        std::fs::write(tmp.join("KIM.md"), "x".repeat(9000)).unwrap();
+        let big = load_kim_md_from(&tmp).unwrap();
+        assert!(big.contains("truncated"));
+        assert!(big.len() < 9000);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn load_kim_md_returns_none_when_absent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kim-md-none-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        assert!(load_kim_md_from(&tmp).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── A16: base-URL normalization ─────────────────────────────────────────
+
+    #[test]
+    fn normalize_base_url_strips_v1_and_trailing_slash() {
+        assert_eq!(normalize_base_url("http://host:11434"), "http://host:11434");
+        assert_eq!(
+            normalize_base_url("http://host:11434/"),
+            "http://host:11434"
+        );
+        assert_eq!(
+            normalize_base_url("http://host:11434/v1"),
+            "http://host:11434"
+        );
+        // The A16 bug: a trailing slash after /v1 used to defeat the strip.
+        assert_eq!(
+            normalize_base_url("http://host:11434/v1/"),
+            "http://host:11434"
+        );
+        assert_eq!(normalize_base_url("  http://host/v1/  "), "http://host");
+    }
+
+    // ── A4: assistantfinal harmony boundary ─────────────────────────────────
+
+    #[test]
+    fn assistantfinal_splits_thought_and_answer_in_one_feed() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        parser.feed("reasoning here assistantfinalThe answer", &tx);
+        parser.flush(&tx);
+        let events = drain(&mut rx);
+        let thoughts: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::ThoughtChunk(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        let answer: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::TextChunk(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thoughts, "reasoning here ");
+        assert_eq!(answer, "The answer");
+        assert!(!thoughts.contains("assistantfinal") && !answer.contains("assistantfinal"));
+    }
+
+    #[test]
+    fn assistantfinal_marker_split_across_two_feeds() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        // Each feed is <= the 14-char tail-hold so nothing flushes prematurely.
+        parser.feed("think ", &tx);
+        parser.feed("assistantfinalDONE", &tx);
+        parser.flush(&tx);
+        let events = drain(&mut rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t == "think ")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AppEvent::TextChunk(t) if t == "DONE")));
+        assert!(events.iter().all(|e| match e {
+            AppEvent::TextChunk(t) | AppEvent::ThoughtChunk(t) => !t.contains("assistantfinal"),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn no_assistantfinal_marker_is_plain_text() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        parser.feed("plain answer text", &tx);
+        parser.flush(&tx);
+        let events = drain(&mut rx);
+        let answer: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::TextChunk(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answer, "plain answer text");
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ThoughtChunk(_))));
     }
 
     #[test]

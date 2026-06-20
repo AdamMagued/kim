@@ -1,8 +1,56 @@
 # Changelog
 
+All notable changes to this project are documented here. Format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
+[Semantic Versioning](https://semver.org/). Desktop app at 0.10.0; `kim` CLI at 0.3.0.
+
+## [0.10.0] / kim-cli [0.3.0] — 2026-06-19
+
+Production-readiness sweep from `DEEP_DIVE_AUDIT.md` (mission prompts 1–13).
+
+### Added
+- **Agentic `kim chat`** (P7): chat runs the REAL Kim agent tool loop in the
+  terminal when a Kim source root + Python are present (parses the orchestrator's
+  typed stdout protocol, streams dim activity lines, terminal `[y/N]` HITL,
+  Ctrl-C cancel, orchestrator-persisted sessions), with a dependency-free
+  terminal Markdown renderer; graceful fallback to plain chat.
+- **Trust & control** (P10): run checkpoints + `revert_run` (pre-image backups to
+  `~/.kim/checkpoints`, undoable revert), mid-run steering (stdin pump →
+  injected user message), approval previews (command / unified diff / URL+label),
+  privacy pause (sentinel blocks screen-capture tools).
+- **Speed & access** (P11): central command/action registry (⌘K palette core),
+  global quick-ask shortcut (Alt+Space) and system tray.
+- **Session & composer UX** (P12): session rename/pin/delete + full-text search
+  (Rust), paste-image + interactive region capture, run-as-Markdown export.
+- **Backend plumbing** (P9): CLI↔desktop bridge auto-pairing
+  (`~/.kim/bridge_token`, 0600), packaged-mode log fallback (`~/.kim/logs`),
+  collision-safe attachment storage, in-app 60s scheduler tick.
+- **Installer** (P4): prebuilt-binary-first install, optional Python provisioning,
+  `~/.kim_root` collision warning.
+
+### Changed
+- CLI polish (P1/P3/P6): chat persistence/resume, base-URL normalization,
+  one-shot commands, KIM.md project context, bridge heartbeat, live OpenAI model
+  list, chat-history budget, refreshed Claude model ids.
+- Frontend P0–P3 cleanup (P2/P5): streaming/HITL/rate-limit fixes, notification
+  de-dup + focus suppression, safer Markdown (fenced-code blank lines, URL/image
+  scheme sanitization), dead-code and `as any` removal.
+
+### Fixed
+- Gemini parallel tool calls no longer dropped (E1); off-by-one session clamp
+  (A17); attachment-path injection in `prune_sessions` (D5); numerous P0/P2 UI
+  bugs.
+
+### Security
+- **Path sandbox hardening** (P13 / G1–G3): `validate_path` denies secret files
+  (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `credentials`,
+  `.npmrc`, `.pypirc`) at any depth and more sensitive dirs (gcloud, mozilla,
+  password-store, Chrome/Firefox/VS Code profiles); strict whole-content data-URI
+  binary branch in `write_file`.
+
 ## Claw-style Compaction, WorkedForPill, Model Picker Polish (2026-05-18)
 
-### New: Claw-style Local Compaction for API Providers
+### New: Claw-style Local Compaction for API Providers (historical, pre-0.10.0)
 
 When a user types `/compact` with Ollama or any other API provider (Claude, OpenAI, etc.), Kim now uses the same deterministic, no-LLM compaction algorithm as the Claw binary instead of sending an extra LLM round-trip.
 
