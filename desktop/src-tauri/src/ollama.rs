@@ -518,7 +518,7 @@ end tell"#;
             .arg(script)
             .spawn()
             .map_err(|e| e.to_string())?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "windows")]
     {

@@ -374,11 +374,28 @@ print(json.dumps(result))
     Ok(stdout)
 }
 
+fn validate_run_id(run_id: &str) -> Result<(), String> {
+    if run_id.is_empty() {
+        return Err("run_id is empty".to_string());
+    }
+    if run_id.len() > 200 {
+        return Err("run_id is too long".to_string());
+    }
+    if !run_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("run_id contains illegal characters".to_string());
+    }
+    Ok(())
+}
+
 /// K1: restore a run's pre-images. Shells the Python checkpoints helper, passing
 /// the run id via argv (never interpolated into source — see D5).
 #[tauri::command]
 pub async fn revert_run(run_id: String) -> Result<String, String> {
     use tokio::process::Command;
+    validate_run_id(&run_id)?;
     let kim_root = crate::default_project_root();
     let python = crate::find_python_interpreter(&kim_root)?;
     let script = r#"
@@ -411,6 +428,9 @@ print(json.dumps(revert_run(sys.argv[2])))
 /// K1: does a checkpoint exist for this run id?
 #[tauri::command]
 pub fn has_checkpoint(run_id: String) -> bool {
+    if validate_run_id(&run_id).is_err() {
+        return false;
+    }
     dirs::home_dir()
         .map(|h| {
             h.join(".kim")
@@ -546,6 +566,7 @@ pub fn rename_session(
     kim_dir: Option<String>,
 ) -> Result<(), String> {
     crate::validate_session_id(&session_id)?;
+    crate::validate_session_id(&date)?;
     let date_dir = base_dir(&kim_dir).join(&date);
     write_session_meta(&date_dir, &session_id, Some(title), None)
 }
@@ -558,6 +579,7 @@ pub fn set_session_pinned(
     kim_dir: Option<String>,
 ) -> Result<(), String> {
     crate::validate_session_id(&session_id)?;
+    crate::validate_session_id(&date)?;
     let date_dir = base_dir(&kim_dir).join(&date);
     write_session_meta(&date_dir, &session_id, None, Some(pinned))
 }
@@ -586,6 +608,7 @@ pub fn delete_session(
     kim_dir: Option<String>,
 ) -> Result<usize, String> {
     crate::validate_session_id(&session_id)?;
+    crate::validate_session_id(&date)?;
     let date_dir = base_dir(&kim_dir).join(&date);
     let n = delete_session_files(&date_dir, &session_id);
     if n == 0 {
@@ -725,5 +748,13 @@ mod k4_tests {
         let base = tmp();
         assert!(search_in_dir(&base, "  ", 50, 1000).is_empty());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn run_id_validation_rejects_path_segments() {
+        assert!(validate_run_id("session-123_456").is_ok());
+        assert!(validate_run_id("../session-123").is_err());
+        assert!(validate_run_id("nested/session").is_err());
+        assert!(validate_run_id("").is_err());
     }
 }

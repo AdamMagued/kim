@@ -67,3 +67,14 @@ def test_no_run_id_is_noop(monkeypatch, tmp_path):
     f.write_text("x")
     cp.backup_pre_image(f)
     assert not (tmp_path / "checkpoints").exists()
+
+
+def test_invalid_run_id_cannot_escape_checkpoint_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(cp, "CHECKPOINT_ROOT", tmp_path / "checkpoints")
+    monkeypatch.setenv("KIM_RUN_ID", "../escape")
+    f = tmp_path / "d.txt"
+    f.write_text("x")
+    cp.backup_pre_image(f)
+    assert not (tmp_path / "checkpoints").exists()
+    assert not cp.has_checkpoint("../escape")
+    assert cp.revert_run("../escape")["error"] == "invalid_run_id"

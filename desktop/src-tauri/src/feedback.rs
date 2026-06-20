@@ -89,11 +89,6 @@ pub async fn save_attachment(filename: String, data_base64: String) -> Result<St
 #[tauri::command]
 pub async fn region_screenshot(app_handle: tauri::AppHandle) -> Result<String, String> {
     use tauri::Manager;
-    // Hide the main window so it isn't in the shot.
-    let main = app_handle.get_webview_window("main");
-    if let Some(ref w) = main {
-        let _ = w.hide();
-    }
     let base = std::env::temp_dir().join("kim_attachments");
     let dir = base.join(format!(
         "{}-region",
@@ -101,6 +96,13 @@ pub async fn region_screenshot(app_handle: tauri::AppHandle) -> Result<String, S
     ));
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let dest = dir.join("region.png");
+
+    // Hide only after all fallible setup above has succeeded, then restore before
+    // returning any capture result.
+    let main = app_handle.get_webview_window("main");
+    if let Some(ref w) = main {
+        let _ = w.hide();
+    }
 
     let result: Result<(), String> = (|| {
         #[cfg(target_os = "macos")]

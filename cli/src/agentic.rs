@@ -211,6 +211,7 @@ pub async fn stream_agentic_request(
     };
     let mut child_stdin = child.stdin.take();
     let mut lines = BufReader::new(stdout).lines();
+    let mut saw_done = false;
 
     while let Ok(Some(line)) = lines.next_line().await {
         match parse_agent_line(&line) {
@@ -243,14 +244,19 @@ pub async fn stream_agentic_request(
                 }
             }
             AgentLine::Done(success) => {
+                saw_done = true;
                 let _ = tx.send(AppEvent::Done(success));
             }
             AgentLine::Ignore => {}
         }
     }
     // Process exited; ensure the turn ends even if no run_done line was seen.
-    let _ = child.wait().await;
-    let _ = tx.send(AppEvent::Done(true));
+    // If the agent crashed before emitting structured completion, don't report
+    // the turn as a clean success.
+    let success = child.wait().await.map(|s| s.success()).unwrap_or(false);
+    if !saw_done {
+        let _ = tx.send(AppEvent::Done(success));
+    }
 }
 
 /// Blocking-ish terminal y/N approval prompt (off the async runtime).

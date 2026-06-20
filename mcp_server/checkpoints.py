@@ -14,16 +14,24 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
 CHECKPOINT_ROOT = Path.home() / ".kim" / "checkpoints"
 MAX_RUN_BYTES = 50 * 1024 * 1024
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
 
 
 def _run_id() -> str | None:
     rid = os.environ.get("KIM_RUN_ID", "").strip()
-    return rid or None
+    return rid if _RUN_ID_RE.fullmatch(rid) else None
+
+
+def _safe_run_dir(run_id: str) -> Path | None:
+    if not _RUN_ID_RE.fullmatch(run_id or ""):
+        return None
+    return CHECKPOINT_ROOT / run_id
 
 
 def _read_manifest(manifest: Path) -> list[dict]:
@@ -64,7 +72,9 @@ def backup_pre_image(path: Path, run_id: str | None = None) -> None:
         return
     try:
         path = Path(path)
-        run_dir = CHECKPOINT_ROOT / rid
+        run_dir = _safe_run_dir(rid)
+        if run_dir is None:
+            return
         run_dir.mkdir(parents=True, exist_ok=True)
         manifest = run_dir / "manifest.jsonl"
         key = str(path.resolve())
@@ -85,13 +95,16 @@ def backup_pre_image(path: Path, run_id: str | None = None) -> None:
 
 
 def has_checkpoint(run_id: str) -> bool:
-    return (CHECKPOINT_ROOT / run_id / "manifest.jsonl").exists()
+    run_dir = _safe_run_dir(run_id)
+    return bool(run_dir and (run_dir / "manifest.jsonl").exists())
 
 
 def revert_run(run_id: str) -> dict:
     """Restore all pre-images for ``run_id``. Current state of each path is first
     copied to ``<path>.kim-revert.bak`` so the revert is itself undoable."""
-    run_dir = CHECKPOINT_ROOT / run_id
+    run_dir = _safe_run_dir(run_id)
+    if run_dir is None:
+        return {"error": "invalid_run_id", "run_id": run_id}
     manifest = run_dir / "manifest.jsonl"
     if not manifest.exists():
         return {"error": "no_checkpoint", "run_id": run_id}
