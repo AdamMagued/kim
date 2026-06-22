@@ -557,11 +557,30 @@ class KimAgent:
         self._run_consecutive_continues: int = 0
         self._run_last_tool: Optional[str] = None
 
-        first_msg = {"role": "user", "content": f"Task: {task}"}
-        self.memory.add_user(f"Task: {task}")
-        self._session_store.append_message(first_msg)
-
         self._run_screenshot_b64: str = ""
+
+        # Browser web-chat models (Gemini/Claude/ChatGPT web) can't reliably emit a
+        # take_screenshot tool call, so a visual question like "what's on my screen?"
+        # would be answered blind. Proactively capture the screen on the first turn
+        # and attach it to the task message so the model actually sees the desktop.
+        first_content: Any = f"Task: {task}"
+        from orchestrator.providers.browser_provider import BrowserProvider
+        if isinstance(self.provider, BrowserProvider) and _looks_visual(task):
+            try:
+                shot_b64 = await self._take_screenshot()
+                if shot_b64:
+                    self._run_screenshot_b64 = shot_b64
+                    first_content = [
+                        {"type": "text", "text": f"Task: {task}"},
+                        {"type": "image", "data": shot_b64, "media_type": "image/png"},
+                    ]
+                    self._log("INFO", "Attached proactive screenshot for browser visual task")
+            except Exception as e:
+                self._log("WARN", f"Proactive screenshot for browser provider failed: {e}")
+
+        first_msg = {"role": "user", "content": first_content}
+        self.memory.add_user(first_content, has_screenshot=isinstance(first_content, list))
+        self._session_store.append_message(first_msg)
 
         for iteration in range(1, self.max_iterations + 1):
             # ── Cancellation check ──────────────────────────────────────
@@ -1686,6 +1705,22 @@ Rules:
             self._session_store.save_summary(summary_text)
         except Exception as e:
             logger.warning(f"Failed to save session summary: {e}")
+
+
+_VISUAL_TASK_RE = re.compile(
+    r"\b(?:"
+    r"on (?:my|the) (?:screen|desktop)|what'?s on (?:my|the)|what (?:do|can) you see|"
+    r"describe (?:my|the|this) (?:screen|desktop|display)|see (?:my|the) (?:screen|desktop)|"
+    r"look at (?:my|the) (?:screen|desktop)|what'?s open|which (?:apps?|windows?)|"
+    r"my screen|the screen|screenshot|screen ?shot|what am i (?:looking at|seeing)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_visual(task: str) -> bool:
+    """Heuristic: does this task ask about what's currently on the user's screen?"""
+    return bool(_VISUAL_TASK_RE.search(task or ""))
 
 
 def _provider_accepts_kwarg(fn: Any, name: str) -> bool:
