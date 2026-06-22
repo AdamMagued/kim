@@ -21,11 +21,43 @@ export function formatDuration(seconds: number): string {
   return s === 0 ? `${m}m` : `${m}m ${s}s`;
 }
 
-export function cleanActivityText(t: string): string {
-  let cleaned = t
-    .replace(/<think>[\s\S]*?<\/think>/gi, '')
-    .replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said|DeepSeek said):?\s*/ig, '')
+// Provider brands that must never surface in Kim's own narration. The assistant
+// always speaks as "Kim", regardless of which browser model is actually behind it.
+const PROVIDER_BRANDS = 'Gemini|Claude|ChatGPT|Grok|DeepSeek';
+
+/**
+ * Rewrite Kim-authored narration (status lines, thinking trace) so it reads as
+ * "Kim" and never exposes the underlying browser model — the user shouldn't feel
+ * like Kim is routing through Gemini/etc.
+ *
+ * NOTE: only use this on Kim's own framing text. Do NOT run it over a model's raw
+ * ANSWER, which may legitimately mention these names (e.g. "tell me about Gemini").
+ */
+export function speakAsKimNarration(t: string): string {
+  if (!t) return t;
+  const B = PROVIDER_BRANDS;
+  return t
+    // "Gemini is/still thinking… (3s)" → "Kim is thinking…"
+    .replace(new RegExp(`\\b(?:${B})\\s+(?:is\\s+)?(?:still\\s+)?thinking(?:…|\\.\\.\\.)?(?:\\s+\\(\\d+s\\))?`, 'gi'), 'Kim is thinking…')
+    // "sending to / routing through / via / from Gemini" → neutral
+    .replace(new RegExp(`\\b(?:sending to|routed through|routing through|powered by|via|using|through|from)\\s+(?:${B})\\b`, 'gi'), 'Kim is working')
+    // "Gemini said/says/responded/returned/replied/is/was" → "Kim"
+    .replace(new RegExp(`\\b(?:${B})\\s+(?:said|says|say|responded|responds|respond|returned|replied|replies|is|was)\\b`, 'gi'), 'Kim')
+    // possessive "Gemini's" → "Kim's"
+    .replace(new RegExp(`\\b(?:${B})'s\\b`, 'gi'), "Kim's")
+    // any remaining bare brand mention in narration → "Kim"
+    .replace(new RegExp(`\\b(?:${B})\\b`, 'g'), 'Kim')
+    // collapse a doubled "Kim Kim" the replacements can create
+    .replace(/\bKim\s+Kim\b/g, 'Kim')
     .trim();
+}
+
+export function cleanActivityText(t: string): string {
+  let cleaned = speakAsKimNarration(
+    t
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said|DeepSeek said):?\s*/ig, '')
+  ).trim();
   try {
     if (cleaned.startsWith('{') && cleaned.endsWith('}')) {
       const parsed = JSON.parse(cleaned);

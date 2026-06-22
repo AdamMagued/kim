@@ -1,6 +1,6 @@
 import type { ActivityItem, LivePlanParsed } from './types';
 import type { TraceItem, WorkedForTraceItem, WorkedForToolKind } from '../kim-ui';
-import { parseAnswerLine, friendlyError, parseLogLine } from './utils';
+import { parseAnswerLine, friendlyError, parseLogLine, speakAsKimNarration } from './utils';
 import { parseCodexItemCompleted } from './codexEvents';
 
 // ── Trace helpers (activity → ThinkingWithPlan format) ─────────────────────
@@ -181,16 +181,9 @@ export function parseAgentLine(line: string, id: number): ParsedAgentLine {
     return { type: 'none' };
   }
 
-  if (item.kind === 'status' && /\b(?:gemini|claude|chatgpt|grok|deepseek)\s+(?:is\s+)?(?:still\s+)?thinking/i.test(item.text)) {
-    item.text = item.text.replace(/\b(?:gemini|claude|chatgpt|grok|deepseek)\s+(?:is\s+)?(?:still\s+)?thinking(?:…|\.\.\.)?(?:\s+\(\d+s\))?/ig, 'Kim is thinking…');
-  }
-
-  // Replace any remaining provider brand mentions in status lines
+  // Normalize Kim's own narration so no underlying provider brand leaks through.
   if (item.kind === 'status') {
-    item.text = item.text
-      .replace(/\b(?:Gemini|Claude|ChatGPT|Grok|DeepSeek)\s+(?:is|says?|returned?|respond(?:s|ed)?)/gi, 'Kim')
-      .replace(/\bsending to (?:Gemini|Claude|ChatGPT|Grok|DeepSeek)\b/gi, 'Kim is working')
-      .replace(/\b(?:Gemini|Claude|ChatGPT|Grok|DeepSeek) responded?\b/gi, 'Response received');
+    item.text = speakAsKimNarration(item.text);
 
     // Strip JSON fragment leaks: lines that start with { or contain "text":
     if (/^\s*[{"\[]/.test(item.text) || /"text"\s*:/.test(item.text)) {
