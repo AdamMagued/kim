@@ -132,6 +132,7 @@ export function ChatView({
     onTaskDone,
     commitCurrentBrowserUrl,
     setMessageReloadNonce,
+    conversationId,
   });
 
   const {

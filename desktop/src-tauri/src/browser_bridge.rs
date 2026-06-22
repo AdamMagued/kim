@@ -236,7 +236,7 @@ pub(crate) fn emit_bridge_progress(app_handle: &tauri::AppHandle, req_id: &str, 
         guard.insert(req_id.to_string(), cleaned.clone());
     }
 
-    let _ = app_handle.emit("kim-agent-output", format!("[STATUS] {}", cleaned));
+    let _ = app_handle.emit("kim-agent-output", format!("[PROGRESS] {}", cleaned));
 }
 
 pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &tauri::AppHandle) {

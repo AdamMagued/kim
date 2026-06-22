@@ -54,6 +54,7 @@ export interface UseChatStreamProps {
   onTaskDone: (sessionId?: string, completedSession?: SessionInfo) => void;
   commitCurrentBrowserUrl: (preferredSite?: string | null, targetSession?: SessionInfo | null, overrideSessionId?: string | null) => Promise<void>;
   setMessageReloadNonce: React.Dispatch<React.SetStateAction<number>>;
+  conversationId?: string;
 }
 
 export function useChatStream({
@@ -62,6 +63,7 @@ export function useChatStream({
   onTaskDone,
   commitCurrentBrowserUrl,
   setMessageReloadNonce,
+  conversationId,
 }: UseChatStreamProps) {
   const [isRunning, setIsRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -128,9 +130,11 @@ export function useChatStream({
 
 
 
-  const activeResumeSessionId = session?.session_id ?? '';
+  const activeResumeSessionId = session?.session_id ?? conversationId ?? '';
   const activeResumeSessionIdRef = useRef(activeResumeSessionId);
-  useEffect(() => { activeResumeSessionIdRef.current = activeResumeSessionId; }, [activeResumeSessionId]);
+  useEffect(() => {
+    activeResumeSessionIdRef.current = session?.session_id ?? conversationId ?? '';
+  }, [session, conversationId]);
 
   // Deduplication functions
   const isDuplicate = useCallback((raw: string): boolean => {
@@ -479,6 +483,7 @@ export function useChatStream({
 
       if (!event.payload && !wasCancelled) {
         if (!hadNeedHelp) {
+          setLiveHistory(prev => prev.filter(m => m.role !== 'assistant'));
           setTaskError(
             providerErrorMessage(lastProviderErrorCodeRef.current)
               ?? terminationMessage(terminationReasonRef.current)

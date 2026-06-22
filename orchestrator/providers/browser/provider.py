@@ -296,12 +296,18 @@ class BrowserProvider(BaseProvider):
         clear_chat: bool = False,
         **kwargs,
     ) -> dict:
-        """Send a prompt via the browser UI and wait for the generation to finish."""
+        # Optimize prompt payload: if resuming an existing thread (url restored),
+        # the system prompt was already sent on the first turn of this session.
+        restore_status = os.environ.get("KIM_BROWSER_RESTORE_STATUS", "").strip().lower()
+        sent_sys = self._sent_system_prompt
+        if restore_status == "stored_thread" and len(messages) > 1:
+            sent_sys = True
+
         prompt, attachments, completion_hash, new_sent = format_prompt(
             messages,
             tools or [],
             system,
-            sent_system_prompt=self._sent_system_prompt,
+            sent_system_prompt=sent_sys,
             max_inject_chars=self._max_inject_chars,
             use_webview_bridge=self._use_webview_bridge,
         )
