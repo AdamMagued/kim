@@ -899,6 +899,21 @@ class KimAgent:
 
         self._log("DEBUG", f"Text (continuing): {content[:120]}")
 
+        # Browser chat providers (Gemini/Claude/ChatGPT web) answer conversationally
+        # and only inconsistently append the TASK_COMPLETE marker. A substantive prose
+        # reply with no tool call IS the answer — accept it directly. Firing another
+        # hidden browser turn just to coax the marker adds latency and, on a reused
+        # thread, can stall for the full bridge timeout (see issue: 2nd-turn hang).
+        # Genuine tool intents arrive as JSON tool calls handled earlier, so reaching
+        # here with prose means the model has answered.
+        from orchestrator.providers.browser_provider import BrowserProvider
+        if isinstance(self.provider, BrowserProvider) and content:
+            self._log("DEBUG", "Browser conversational reply accepted as TASK_COMPLETE")
+            await self._generate_and_save_summary(task, content)
+            return self._complete_run(
+                make_run_result(AgentTermination.TASK_COMPLETE, content, self._run_screenshot_b64)
+            )
+
         self._run_consecutive_continues += 1
         if self._run_consecutive_continues >= 3:
             msg = "NEED_HELP: Model is stuck in a conversational loop without calling tools."
@@ -1814,5 +1829,39 @@ async def mcp_agent_context(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # --- TEMP DEBUG (remove after diagnosing browser-provider crash): tee all
+    # stderr — logging AND uncaught tracebacks — to a file so the real error can
+    # be read off disk. The app only surfaces a generic message to the UI. ---
+    try:
+        import sys as _sys
+
+        _dbg_fh = open("/tmp/kim-stderr-debug.log", "a", buffering=1)
+        _dbg_fh.write(f"\n===== new run @ {__import__('datetime').datetime.now()} argv={_sys.argv[1:]} =====\n")
+
+        class _Tee:
+            def __init__(self, *streams):
+                self._streams = streams
+
+            def write(self, data):
+                for s in self._streams:
+                    try:
+                        s.write(data)
+                        s.flush()
+                    except Exception:
+                        pass
+                return len(data)
+
+            def flush(self):
+                for s in self._streams:
+                    try:
+                        s.flush()
+                    except Exception:
+                        pass
+
+        _sys.stderr = _Tee(_sys.stderr, _dbg_fh)
+    except Exception:
+        pass
+    # --- end temp debug ---
+
     from orchestrator.cli import _build_arg_parser, _cli_main
     asyncio.run(_cli_main(_build_arg_parser().parse_args()))
