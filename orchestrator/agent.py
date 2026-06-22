@@ -564,8 +564,7 @@ class KimAgent:
         # would be answered blind. Proactively capture the screen on the first turn
         # and attach it to the task message so the model actually sees the desktop.
         first_content: Any = f"Task: {task}"
-        from orchestrator.providers.browser_provider import BrowserProvider
-        if isinstance(self.provider, BrowserProvider) and _looks_visual(task):
+        if type(self.provider).__name__ == "BrowserProvider" and _looks_visual(task):
             try:
                 shot_b64 = await self._take_screenshot()
                 if shot_b64:
@@ -925,8 +924,7 @@ class KimAgent:
         # thread, can stall for the full bridge timeout (see issue: 2nd-turn hang).
         # Genuine tool intents arrive as JSON tool calls handled earlier, so reaching
         # here with prose means the model has answered.
-        from orchestrator.providers.browser_provider import BrowserProvider
-        if isinstance(self.provider, BrowserProvider) and content:
+        if type(self.provider).__name__ == "BrowserProvider" and content:
             self._log("DEBUG", "Browser conversational reply accepted as TASK_COMPLETE")
             await self._generate_and_save_summary(task, content)
             return self._complete_run(
@@ -1577,11 +1575,9 @@ Rules:
         messages are summarised locally and injected as a system sentinel; the
         verbatim recent tail is kept.
         """
-        from orchestrator.providers.browser_provider import BrowserProvider
-
         self._log("INFO", "[STATUS] Compacting this chat into a fresh checkpoint…")
 
-        if not isinstance(self.provider, BrowserProvider):
+        if type(self.provider).__name__ != "BrowserProvider":
             return await self._compact_api_provider()
 
         # ── Browser path (LLM-based) ──────────────────────────────────────
