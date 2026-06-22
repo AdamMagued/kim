@@ -275,24 +275,31 @@
     return '';
   };
 
-  const countResponseNodes = (cfg, siteKey) => {
+  // Return the ordered list of visible, non-user response container nodes.
+  // This is the authoritative source for "which DOM elements are responses",
+  // used to detect *new* turns by element identity rather than by text/count
+  // alone (text/count are fragile when a reused thread re-renders).
+  const getResponseNodes = (cfg, siteKey) => {
     if (siteKey === 'gemini') {
-      return Array.from(document.querySelectorAll('model-response')).filter(n => !!n && isVisible(n) && !isLikelyUserNode(n)).length;
+      return Array.from(document.querySelectorAll('model-response')).filter(n => !!n && isVisible(n) && !isLikelyUserNode(n));
     }
-    let count = 0;
     const seen = new Set();
+    const out = [];
     for (const sel of cfg.response_selectors || []) {
       try {
-        const nodes = Array.from(document.querySelectorAll(sel));
-        for (const n of nodes) {
+        for (const n of Array.from(document.querySelectorAll(sel))) {
           if (!n || seen.has(n) || !isVisible(n) || isLikelyUserNode(n)) continue;
           seen.add(n);
-          count++;
+          out.push(n);
         }
       } catch (_) {}
     }
-    return count;
+    return out;
   };
+
+  const nodeText = (n) => (n ? normalizeText(n.innerText || n.textContent || '') : '');
+
+  const countResponseNodes = (cfg, siteKey) => getResponseNodes(cfg, siteKey).length;
 
   // ── Prompt injection ─────────────────────────────────────────────────
   const injectPromptText = async (inputEl, promptText) => {
@@ -475,7 +482,9 @@
     window.__kimModelTier = modelTier;
     const siteKey = SITE_CONFIGS[site] ? site : 'claude';
     const cfg = SITE_CONFIGS[siteKey];
-    const baselineResponseCount = countResponseNodes(cfg, siteKey);
+    const baselineNodes = getResponseNodes(cfg, siteKey);
+    const baselineNodeSet = new Set(baselineNodes);
+    const baselineResponseCount = baselineNodes.length;
     const baselineResponseText = getLatestResponseText(cfg, siteKey) || '';
     const HARD_TIMEOUT = 120000;
     const hardDeadlineAt = Date.now() + HARD_TIMEOUT;
@@ -772,20 +781,100 @@
       let lastTextLength = 0;
       let idleCount = 0;
       let sawNewResponse = false;
+      let loops = 0;
+
+      // Identify the response that belongs to THIS turn by element identity:
+      // the newest visible response node that was not present at send time.
+      // Falling back to the generic latest-text only when no new node appears.
+      const findNewNode = () => {
+        const nodes = getResponseNodes(cfg, siteKey);
+        for (let i = nodes.length - 1; i >= 0; i--) {
+          if (!baselineNodeSet.has(nodes[i])) return nodes[i];
+        }
+        return null;
+      };
+      // Extract the ANSWER text from a response container. Reading a node's bare
+      // innerText is wrong on Gemini: <model-response> wraps a visually-hidden
+      // "Gemini said" a11y heading around the real content, so innerText yields
+      // "Gemini said …" (or just "Gemini said" before the body streams in). Drill
+      // into the content sub-node and strip any "<Provider> said" label.
+      const ANSWER_SUBSELECTORS = {
+        gemini: ['message-content', '.response-content', '.markdown-main-panel', '.markdown'],
+        claude: ['.font-claude-message', 'div.markdown', '.prose'],
+        chatgpt: ['div.markdown', '.prose'],
+        deepseek: ['div.ds-markdown'],
+        grok: ['.markdown', '.prose'],
+      };
+      const stripSaidLabel = (t) =>
+        (t || '').replace(/^\s*(?:Gemini|Claude|ChatGPT|Grok|DeepSeek|Assistant)\s+said:?\s*/i, '').trim();
+      const extractAnswerText = (node) => {
+        if (!node) return '';
+        const subs = ANSWER_SUBSELECTORS[siteKey];
+        if (subs) {
+          let best = '';
+          for (const s of subs) {
+            try {
+              for (const el of Array.from(node.querySelectorAll(s))) {
+                if (!isVisible(el)) continue;
+                const t = nodeText(el);
+                if (t.length > best.length) best = t;
+              }
+            } catch (_) {}
+          }
+          if (best) return stripSaidLabel(best);
+        }
+        return stripSaidLabel(nodeText(node));
+      };
+
+      // Authoritative text for this turn: prefer the new node's content; only fall
+      // back to generic latest-text if it differs from the baseline answer (so we
+      // never echo the PREVIOUS turn's response — the root cause of the dup bug).
+      const turnText = () => {
+        const nn = findNewNode();
+        if (nn) {
+          const t = extractAnswerText(nn);
+          // While the body is still streaming the node may only hold the "Gemini
+          // said" label; report empty so detection keeps waiting for real content.
+          return { text: t, fromNewNode: true };
+        }
+        const lt = getLatestResponseText(cfg, siteKey) || '';
+        return { text: (lt && lt !== baselineResponseText) ? lt : '', fromNewNode: false };
+      };
+
+      // Compact DOM snapshot for diagnostics — surfaced in the timeout error and
+      // logged periodically so a recurrence is debuggable from logs alone.
+      const diag = () => {
+        const nodes = getResponseNodes(cfg, siteKey);
+        const nn = findNewNode();
+        const txt = nn ? extractAnswerText(nn) : (getLatestResponseText(cfg, siteKey) || '');
+        return {
+          loops,
+          baseCount: baselineResponseCount,
+          nowCount: nodes.length,
+          newNode: !!nn,
+          rawLen: nn ? nodeText(nn).length : 0,
+          ansLen: txt.length,
+          hash: !!(completionHash && txt.includes(completionHash)),
+          stop: isAnyStopVisible(cfg),
+          sawNew: sawNewResponse,
+          idle: idleCount,
+          head: txt.slice(0, 60),
+        };
+      };
 
       while (Date.now() < hardDeadlineAt) {
         await new Promise(r => setTimeout(r, POLL_MS));
+        loops++;
         if (isSuperseded()) { console.log('[KimBridge] send superseded during response wait, bailing'); ipcEmit({ ok: false, event: 'error', req_id: reqId, error: 'Request superseded by newer send', site: siteKey }); return; }
 
-        const latestText = getLatestResponseText(cfg, siteKey) || '';
+        const { text: latestText, fromNewNode } = turnText();
         const latestCount = countResponseNodes(cfg, siteKey);
-        if (
-          latestCount > baselineResponseCount
-          || (latestText && latestText !== baselineResponseText)
-        ) {
+        if (fromNewNode || latestCount > baselineResponseCount || (latestText && latestText !== baselineResponseText)) {
           sawNewResponse = true;
         }
         reportProgress(latestText);
+        if (loops % 17 === 0) console.log('[KimBridge] poll diag', JSON.stringify(diag()));
+
         if (completionHash && latestText.includes(completionHash)) {
           responseText = latestText.replace(completionHash, '').trim();
           break;
@@ -798,9 +887,19 @@
           idleCount++;
         }
 
-        if (latestText && latestText.length > 0 && !isAnyStopVisible(cfg)) {
-          if (sawNewResponse && idleCount >= 10) { // 3 seconds of no text growth
-            console.log('[KimBridge] stop button gone and text idle. Falling back to latest text.');
+        // Idle fallback. When the stop button is gone, settle quickly (3s of no
+        // growth). The stop-button selector is per-site and can be unreliable on
+        // a reused thread, so we ALSO have a stop-independent backstop: if a new
+        // turn has clearly produced text and it has been stable for ~9s, accept
+        // it rather than hanging for the full 120s.
+        if (sawNewResponse && latestText.length > 0) {
+          if (!isAnyStopVisible(cfg) && idleCount >= 10) {
+            console.log('[KimBridge] stop gone + text idle — accepting turn text.', JSON.stringify(diag()));
+            responseText = latestText;
+            break;
+          }
+          if (idleCount >= 30) {
+            console.log('[KimBridge] text idle ~9s (stop-button ignored) — accepting turn text.', JSON.stringify(diag()));
             responseText = latestText;
             break;
           }
@@ -808,18 +907,14 @@
       }
 
       if (!responseText) {
-        // Last-ditch: try to grab whatever text is on the page
-        const lastTry = getLatestResponseText(cfg, siteKey) || '';
-        const lastTryCount = countResponseNodes(cfg, siteKey);
-        const hasNewTurn =
-          lastTryCount > baselineResponseCount
-          || (lastTry && lastTry !== baselineResponseText);
+        // Last-ditch: grab the new turn's text directly if present.
+        const { text: lastTry } = turnText();
         if (completionHash && lastTry.includes(completionHash)) {
           responseText = lastTry.replace(completionHash, '').trim();
-        } else if (lastTry.length > 0 && hasNewTurn) {
+        } else if (lastTry.length > 0) {
           responseText = lastTry;
         } else {
-          throw new Error(`Timed out waiting for completion hash in response (${HARD_TIMEOUT}ms); no new response turn detected`);
+          throw new Error(`Timed out waiting for completion hash in response (${HARD_TIMEOUT}ms); no new response turn detected — diag=${JSON.stringify(diag())}`);
         }
       }
 
@@ -868,7 +963,7 @@
 
   // ── Public API ─────────────────────────────────────────────────────────
   window.__kimBridge = {
-    _v: 10,
+    _v: 12,
     _lastHash: null, // Tracks the completion hash of the most recent request
     _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
     send,
