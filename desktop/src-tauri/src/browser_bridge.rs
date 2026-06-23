@@ -249,6 +249,9 @@ pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &ta
             "hasResponse": ipc_event.response.is_some(),
             "hasError": ipc_event.error.is_some(),
             "hasText": ipc_event.text.is_some(),
+            // Surface the full error string (carries bridge.js diag={...} on the
+            // 2nd-turn timeout) so failures are debuggable from bridge_debug.log.
+            "error": ipc_event.error,
         }),
     );
 

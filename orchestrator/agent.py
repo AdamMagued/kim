@@ -558,6 +558,7 @@ class KimAgent:
         self._run_last_tool: Optional[str] = None
 
         self._run_screenshot_b64: str = ""
+        self._suppress_screen_tools_first_turn: bool = False
 
         # Browser web-chat models (Gemini/Claude/ChatGPT web) can't reliably emit a
         # take_screenshot tool call, so a visual question like "what's on my screen?"
@@ -569,6 +570,7 @@ class KimAgent:
                 shot_b64 = await self._take_screenshot()
                 if shot_b64:
                     self._run_screenshot_b64 = shot_b64
+                    self._suppress_screen_tools_first_turn = True
                     first_content = [
                         {"type": "text", "text": f"Task: {task}"},
                         {"type": "image", "data": shot_b64, "media_type": "image/png"},
@@ -601,9 +603,19 @@ class KimAgent:
             # K3: fold any mid-run steering into memory before this LLM call.
             self._drain_steers()
             request_messages = self.memory.get_messages()
+
+            # A screenshot was attached to the first message — withhold the
+            # screen-reading tools on that turn so the model answers from the
+            # image instead of triggering a second round-trip (issue #4 hang).
+            call_tools = self._tools
+            if iteration == 1 and self._suppress_screen_tools_first_turn:
+                call_tools = [t for t in self._tools if t.get("name") not in _SCREEN_READ_TOOLS]
+                if len(call_tools) != len(self._tools):
+                    self._log("INFO", "Screenshot attached — withholding screen-read tools on first turn so the answer comes from the image")
+
             request_estimate = estimate_request_tokens(
                 request_messages,
-                tools=self._tools,
+                tools=call_tools,
                 system=system_prompt,
             )
 
@@ -612,7 +624,7 @@ class KimAgent:
                 clear_chat = self._clear_chat_on_next_call and iteration == 1
                 response = await self._call_with_retry(
                     messages=request_messages,
-                    tools=self._tools,
+                    tools=call_tools,
                     system=system_prompt,
                     clear_chat=clear_chat,
                 )
@@ -1717,6 +1729,14 @@ _VISUAL_TASK_RE = re.compile(
 def _looks_visual(task: str) -> bool:
     """Heuristic: does this task ask about what's currently on the user's screen?"""
     return bool(_VISUAL_TASK_RE.search(task or ""))
+
+
+# Screen-reading tools that become redundant once a screenshot is already attached
+# to the first message. Browser web-chat models (Gemini/etc.) tend to reach for
+# get_windows/take_screenshot anyway, which forces a second LLM round-trip back into
+# the chat thread — the exact path that hangs (issue #4). Withholding them on the
+# first turn forces the model to answer directly from the attached image.
+_SCREEN_READ_TOOLS = frozenset({"take_screenshot", "get_windows"})
 
 
 def _provider_accepts_kwarg(fn: Any, name: str) -> bool:

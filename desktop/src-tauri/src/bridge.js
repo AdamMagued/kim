@@ -760,7 +760,35 @@
       }
       console.log('[KimBridge] Message submitted via', sendClicked ? 'send button' : 'synthetic Enter');
 
-      // 4c. Record THIS request's hash AFTER submit so the NEXT request can wait for it
+      // 4c. Verify the message actually left the input. On a successful submit the
+      //     editor clears (or the stop button appears as generation starts). If our
+      //     prompt is STILL sitting in the input, the send didn't register — a known
+      //     failure on reused threads where the send button stays disabled and the
+      //     synthetic-Enter fallback only inserts a newline. That is the root cause
+      //     of the 2nd-turn 120s hang (issue #4): nothing was ever sent, so no reply
+      //     ever comes. Re-attempt the submit a few times before giving up.
+      //     Turn-1 (the working path) clears immediately, so this is a no-op there.
+      const minPromptLen = Math.min(8, normalizeText(effectivePrompt).length);
+      const stillHasPrompt = () => {
+        try { return promptMatchesInput(inputEl, effectivePrompt) || readInputText(inputEl).length >= minPromptLen; }
+        catch (_) { return false; }
+      };
+      for (let v = 0; v < 4; v++) {
+        await new Promise(r => setTimeout(r, 400));
+        if (isSuperseded()) { ipcEmit({ ok: false, event: 'error', req_id: reqId, error: 'Request superseded by newer send', site: siteKey }); return; }
+        if (isAnyStopVisible(cfg) || !stillHasPrompt()) break; // generating, or input cleared → sent
+        console.warn('[KimBridge] input not cleared after submit — re-attempting send (try ' + (v + 1) + ')');
+        inputEl.focus();
+        const reBtn = findElement(cfg.send_selectors || [], { visible: true, enabled: true });
+        if (reBtn) {
+          reBtn.click();
+        } else {
+          inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+          inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        }
+      }
+
+      // 4d. Record THIS request's hash AFTER submit so the NEXT request can wait for it
       if (completionHash) {
         window.__kimBridge._lastHash = completionHash;
       }
@@ -847,6 +875,8 @@
         const nodes = getResponseNodes(cfg, siteKey);
         const nn = findNewNode();
         const txt = nn ? extractAnswerText(nn) : (getLatestResponseText(cfg, siteKey) || '');
+        let inputLen = -1;
+        try { inputLen = readInputText(inputEl).length; } catch (_) {}
         return {
           loops,
           baseCount: baselineResponseCount,
@@ -858,6 +888,7 @@
           stop: isAnyStopVisible(cfg),
           sawNew: sawNewResponse,
           idle: idleCount,
+          inputLen, // >0 after send ⇒ message never left the input (send failed)
           head: txt.slice(0, 60),
         };
       };
@@ -874,6 +905,23 @@
         }
         reportProgress(latestText);
         if (loops % 17 === 0) console.log('[KimBridge] poll diag', JSON.stringify(diag()));
+
+        // Fail fast rather than burn the full 120s hard deadline on dead air. Only
+        // trips when NOTHING has appeared yet (sawNewResponse stays false the whole
+        // time) — a real generation flips sawNewResponse within a second or two of
+        // streaming, so this never aborts a genuine (even slow) response.
+        if (!sawNewResponse && !isAnyStopVisible(cfg)) {
+          let inputStuck = false;
+          try { inputStuck = readInputText(inputEl).length >= minPromptLen; } catch (_) {}
+          if (inputStuck && loops >= 33) {
+            // ~10s: prompt is still sitting in the editor → the send never registered.
+            throw new Error(`Send did not register — prompt still in the input, no generation started; diag=${JSON.stringify(diag())}`);
+          }
+          if (loops >= 130) {
+            // ~39s: input cleared (message left) but no reply node ever appeared.
+            throw new Error(`No response turn detected — nothing generated after ${loops} polls; diag=${JSON.stringify(diag())}`);
+          }
+        }
 
         if (completionHash && latestText.includes(completionHash)) {
           responseText = latestText.replace(completionHash, '').trim();
@@ -963,7 +1011,7 @@
 
   // ── Public API ─────────────────────────────────────────────────────────
   window.__kimBridge = {
-    _v: 12,
+    _v: 13,
     _lastHash: null, // Tracks the completion hash of the most recent request
     _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
     send,
