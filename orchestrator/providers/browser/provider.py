@@ -305,6 +305,10 @@ class BrowserProvider(BaseProvider):
         sent_sys = self._sent_system_prompt
         if restore_status == "stored_thread" and len(messages) > 1:
             sent_sys = True
+        # A cleared/fresh chat has no prior context — the system prompt (and the
+        # completion-hash protocol it establishes) MUST be re-sent in full.
+        if clear_chat:
+            sent_sys = False
 
         prompt, attachments, completion_hash, new_sent = format_prompt(
             messages,

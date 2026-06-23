@@ -607,6 +607,15 @@ class KimAgent:
         )
         self._session_store.append_message(first_msg)
 
+        # Browser web-chat threads submit reliably only on a FRESH chat: the first
+        # message of a session always sends, but submitting a follow-up into a reused
+        # thread is flaky — Gemini's send button doesn't always register programmatic
+        # input (diagnosed: prompt stuck in the editor, send never fires). The browser
+        # provider is free (no API tokens), so starting every message on a fresh chat
+        # and re-sending context is the right trade: reliable > the payload saving.
+        if type(self.provider).__name__ == "BrowserProvider":
+            self._clear_chat_on_next_call = True
+
         for iteration in range(1, self.max_iterations + 1):
             # ── Cancellation check ──────────────────────────────────────
             if self._is_cancelled():
