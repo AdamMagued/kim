@@ -564,18 +564,21 @@ class KimAgent:
         # take_screenshot tool call, so a visual question like "what's on my screen?"
         # would be answered blind. Proactively capture the screen on the first turn
         # and attach it to the task message so the model actually sees the desktop.
-        first_content: Any = f"Task: {task}"
+        first_content: Any = f"Task: {task}"   # what is shown in the chat bubble
+        llm_first_content: Any = None          # what the model receives, when it differs
         if type(self.provider).__name__ == "BrowserProvider" and _looks_visual(task):
-            # Browser web-chat models answer a visual question ("what's on my screen?")
-            # blind unless we hand them the screen. Use TWO independent channels so the
-            # feature does not depend on the flaky image upload landing in the web UI:
-            #   1. attach a screenshot to the message (rich, but the upload can fail), and
-            #   2. enumerate the open windows as TEXT and put it in the system prompt
-            #      (always reliable). Whichever lands, the model answers in one turn —
-            #      no screen-tool call, so no second round-trip into the chat (the #4 hang).
-            shot_b64 = ""
+            # Browser web-chat models (Gemini/etc.) answer a visual question blind: the
+            # hidden webview cannot reliably receive an image — the editor rejects
+            # programmatic/synthetic paste and execCommand('paste') is sandbox-blocked
+            # (verified live: execPasted=false). So deliver the screen as TEXT instead:
+            # enumerate the open windows and put that in the USER message — NOT the
+            # system prompt, which a reused thread skips on follow-up turns (verified:
+            # promptLen 331 vs 12059), which silently dropped it. One turn, no screen-
+            # tool call, so no second round-trip into the chat (the #4 hang). The window
+            # text + instruction go only into the model's copy, so the user's chat
+            # bubble stays clean.
             try:
-                shot_b64 = await self._take_screenshot()
+                self._run_screenshot_b64 = await self._take_screenshot()  # for the run record + visual feedback
             except Exception as e:
                 self._log("WARN", f"Proactive screenshot for browser provider failed: {e}")
             windows_text = ""
@@ -584,32 +587,24 @@ class KimAgent:
             except Exception as e:
                 self._log("WARN", f"get_windows for visual context failed: {e}")
 
-            if shot_b64 or windows_text:
+            if windows_text:
                 self._suppress_screen_tools_first_turn = True
-                if shot_b64:
-                    self._run_screenshot_b64 = shot_b64
-                    first_content = [
-                        {"type": "text", "text": f"Task: {task}"},
-                        {"type": "image", "data": shot_b64, "media_type": "image/png"},
-                    ]
-                # The screen context + "answer directly, don't call tools" instruction
-                # live in the SYSTEM prompt, not the user message, so they never leak
-                # into the user's visible chat bubble.
-                ctx = ["\n\n[SCREEN CONTEXT FOR THIS TURN]"]
-                if shot_b64:
-                    ctx.append("A screenshot of the user's current screen is attached to their message.")
-                if windows_text:
-                    ctx.append("Currently open windows on the user's screen:\n" + windows_text)
-                ctx.append(
-                    "Answer the user's question directly from the screenshot and/or the window "
-                    "list above. Do NOT call get_windows, take_screenshot, or any other tool — "
-                    "reply with TASK_COMPLETE: <your answer>."
+                llm_first_content = (
+                    f"Task: {task}\n\n"
+                    "[SCREEN CONTEXT — the user is asking about their screen. These are the "
+                    "windows currently open on it:]\n"
+                    f"{windows_text}\n\n"
+                    "Answer the user's question directly from this list. Do NOT call "
+                    "get_windows, take_screenshot, or any other tool — reply with "
+                    "TASK_COMPLETE: <your answer>."
                 )
-                system_prompt = system_prompt + "\n".join(ctx)
-                self._log("INFO", f"Visual browser turn — screenshot={'y' if shot_b64 else 'n'}, windows={'y' if windows_text else 'n'}")
+                self._log("INFO", "Visual browser turn — delivered screen as window-list text in the user message")
 
         first_msg = {"role": "user", "content": first_content}
-        self.memory.add_user(first_content, has_screenshot=isinstance(first_content, list))
+        self.memory.add_user(
+            llm_first_content if llm_first_content is not None else first_content,
+            has_screenshot=isinstance(first_content, list),
+        )
         self._session_store.append_message(first_msg)
 
         for iteration in range(1, self.max_iterations + 1):
