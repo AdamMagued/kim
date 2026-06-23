@@ -360,8 +360,10 @@ export function ProviderPicker({
         </button>
       )}
 
-      {isOllama && (
-        <div className="kim-provider-picker__ollama-inline" aria-label="Ollama quick settings">
+      {open && (
+        <div className="kim-provider-picker__panel" role="menu">
+          {isOllama && (
+            <div className="kim-provider-picker__ollama-section" aria-label="Ollama quick settings">
           <div className="kim-provider-picker__mode-switch" role="group" aria-label="Ollama mode">
             <button
               type="button"
@@ -516,11 +518,9 @@ export function ProviderPicker({
               </div>
             )
           )}
-        </div>
-      )}
+            </div>
+          )}
 
-      {open && (
-        <div className="kim-provider-picker__panel" role="menu">
           {/* ── Model provider ──────────────────────────────────────── */}
           <div className="kim-provider-picker__section-label">
             Model <span>local, cloud, browser, or API</span>

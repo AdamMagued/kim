@@ -302,11 +302,16 @@
    When the chat is in new-chat mode and no messages have been sent yet, the
    composer is rendered INSIDE the centered hero (not pinned to the bottom).
    Match the design's accent border + peach soft-ring shadow. */
-.kim-chat--empty-hero .kim-chat__output {
+.kim-chat--empty-hero .kim-messages {
+  /* Block layout collapses the hero's `margin:auto` to 0 (top-aligned); make
+   * it a centered flex column so the hero sits in the vertical middle like the
+   * reference. `overflow:visible` lets the provider dropdown open upward
+   * without being clipped by this scroll container. Only applies while empty. */
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  overflow: visible;
   padding: 24px 24px 40px;
 }
 /* ── Hero composer: two-row layout (textarea on top, controls below) ──── */
@@ -341,11 +346,7 @@
   font-size: 14.5px;
 }
 /* Single continuous separator between textarea and the bottom row.
- * Using a ::before pseudo on the box (rather than border-top on each grid
- * cell) so there is no visible gap where the column-gap sits.
- * Anchored from the BOTTOM so it's stable as the textarea grows. The bottom
- * row is ~34px tall (send button) + 10px box padding-bottom = 44px from the
- * box bottom — the line sits 4px above that. */
+ * Anchored from the BOTTOM so it's stable as the textarea grows. */
 .kim-composer__box--hero::before {
   content: "";
   position: absolute;

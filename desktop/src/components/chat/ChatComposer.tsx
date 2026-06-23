@@ -175,6 +175,18 @@ export function ChatComposer({
 
   const codeNeedsProject = activeTab === 'code' && !activeProjectPath;
 
+  const providerPicker = (
+    <ProviderPicker
+      resolvedProvider={resolveProvider()}
+      ollama={settings.ollama}
+      onChangeProvider={handleProviderChange}
+      onChangeOllamaMode={handleOllamaModeChange}
+      onChangeOllamaModel={handleOllamaModelChange}
+      onOpenOllamaSettings={() => onOpenSettings?.('ai')}
+      disabled={isRunning}
+    />
+  );
+
   return (
     <form
       onSubmit={handleFormSubmit}
@@ -406,15 +418,7 @@ export function ChatComposer({
                 <path d={heroMode ? 'M12 19V5M5 12l7-7 7 7' : 'M5 12h14M13 5l7 7-7 7'} />
               </svg>
             </button>
-            <ProviderPicker
-              resolvedProvider={resolveProvider()}
-              ollama={settings.ollama}
-              onChangeProvider={handleProviderChange}
-              onChangeOllamaMode={handleOllamaModeChange}
-              onChangeOllamaModel={handleOllamaModelChange}
-              onOpenOllamaSettings={() => onOpenSettings?.('ai')}
-              disabled={isRunning}
-            />
+            {providerPicker}
           </div>
         </div>
       </div>

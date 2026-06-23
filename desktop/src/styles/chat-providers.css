@@ -89,17 +89,46 @@
   background: rgba(239, 68, 68, 0.06);
 }
 
-.kim-provider-picker__ollama-inline {
-  display: inline-flex;
+/* Ollama Cloud/Local + model controls live inside the provider dropdown panel
+ * (the composer shows only the compact pill). Stacked vertically to fit the
+ * narrow dropdown without the horizontal overflow the old inline strip had. */
+.kim-provider-picker__ollama-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 6px 6px 12px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--kim-border);
+}
+.kim-provider-picker__ollama-section .kim-provider-picker__mode-switch {
+  width: 100%;
+}
+.kim-provider-picker__ollama-section .kim-provider-picker__mode-option {
+  flex: 1;
+  justify-content: center;
+}
+.kim-provider-picker__ollama-section .kim-provider-picker__model-field {
+  display: flex;
+  flex-direction: column;
   align-items: stretch;
-  gap: 8px;
+  gap: 6px;
+  flex: initial;
   min-width: 0;
-  flex: 1 1 520px;
-  padding: 5px;
-  border: 1px solid var(--kim-border);
-  background: color-mix(in srgb, var(--kim-bg-2) 88%, var(--kim-surface));
-  border-radius: 12px;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.025);
+  width: 100%;
+}
+.kim-provider-picker__ollama-section .kim-provider-picker__select-wrap {
+  width: 100%;
+}
+.kim-provider-picker__ollama-section .kim-provider-picker__enter-name-btn {
+  align-self: flex-start;
+  height: auto;
+}
+.kim-provider-picker__ollama-section .kim-provider-picker__model-meta {
+  white-space: normal;
+}
+.kim-provider-picker__ollama-section .kim-provider-picker__cloud-actions {
+  width: 100%;
+  justify-content: space-between;
 }
 .kim-provider-picker__mode-switch {
   display: inline-flex;
@@ -343,8 +372,9 @@
   position: absolute;
   bottom: calc(100% + 6px);
   top: auto;
-  left: 0;
+  left: auto;
   right: 0;
+  min-width: 268px;
   z-index: 200;
   background: var(--kim-surface, var(--bg-secondary, #1a1a1a));
   border: 1px solid var(--kim-border, var(--border));
@@ -354,8 +384,13 @@
   display: flex;
   flex-direction: column;
   gap: 0;
-  max-height: 70vh;
+  /* The panel opens UPWARD from a pill that can sit mid-screen (centered hero
+   * composer). 70vh was taller than the space above the pill, so the top of
+   * the list — including the Ollama controls — was clipped above the window
+   * with no way to scroll to it. Cap it to fit and scroll internally. */
+  max-height: min(70vh, 320px);
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .kim-provider-picker__section-label {
   display: flex;
@@ -724,5 +759,36 @@
 .kim-composer__account-error {
   font-size: 11px;
   color: var(--danger-hover);
+}
+
+/* ── Permission mode toggle ─────────────────────────────────────────────────── */
+.kim-permission-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 6px 24px 2px;
+}
+.kim-permission-toggle__btn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--kim-text-4);
+  border-radius: 8px;
+  padding: 5px 10px;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.kim-permission-toggle__btn:hover {
+  color: var(--kim-text-2);
+  background: var(--kim-surface);
+}
+.kim-permission-toggle__btn--active {
+  color: var(--kim-text);
+  background: var(--kim-surface);
+  border-color: var(--kim-border);
 }
 

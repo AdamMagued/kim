@@ -62,14 +62,17 @@ import logging
 import os
 import platform
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from playwright.async_api import (
-    Browser,
-    Page,
-    Playwright,
-    async_playwright,
-)
+# Playwright is only needed for the CDP fallback path (driving an external
+# Chrome). The primary desktop path is the in-app webview bridge (httpx), which
+# needs no playwright at all. Import it lazily so that selecting a browser
+# provider does not hard-crash with ModuleNotFoundError when playwright isn't
+# installed — the CDP path imports it on demand and degrades to a graceful
+# NEED_HELP if it's missing. Type-only names stay importable for type checkers
+# (annotations are already PEP 563 strings via `from __future__`).
+if TYPE_CHECKING:
+    from playwright.async_api import Browser, Page, Playwright
 
 from orchestrator.context_meter import IMAGE_TOKEN_ESTIMATE, estimate_text_tokens
 from orchestrator.providers.base import BaseProvider

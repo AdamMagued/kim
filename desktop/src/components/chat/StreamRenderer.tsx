@@ -394,7 +394,7 @@ export function StreamRenderer({
 
     const providerPillLabel =
       resolveProvider() === 'ollama'
-        ? `Ollama Cloud · ${settings.ollama.cloud_model || 'none'}`
+        ? `Ollama · ${settings.ollama.mode}`
         : providerLabel(resolveProvider());
 
     return (
@@ -467,6 +467,12 @@ export function StreamRenderer({
                     : 'Create a new project or open a project folder before typing.'
                   : 'Pick up where you left off, or start fresh.'}
               </p>
+
+              <div style={{ width: 'min(680px, 95%)' }}>
+                {renderComposer(true)}
+              </div>
+
+              {renderPermissionToggle()}
 
               <div
                 style={{
@@ -582,8 +588,8 @@ export function StreamRenderer({
           <div ref={bottomRef} />
         </div>
 
-        {renderPermissionToggle()}
-        {renderComposer(false)}
+        {!empty && renderPermissionToggle()}
+        {!empty && renderComposer(false)}
       </div>
     );
   }
