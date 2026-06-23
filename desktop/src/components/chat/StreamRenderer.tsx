@@ -229,6 +229,10 @@ export function StreamRenderer({
   function renderWorkedFor(_idx: number, run: { activity: ActivityItem[]; durationSec: number; provider?: string | null }, showCost = false) {
     const historyTrace = buildThinkingTrace(run.activity, parsePlanFromActivity(run.activity));
     const workedForTrace = traceToWorkedFor(historyTrace);
+    // Nothing meaningful happened (e.g. a plain conversational reply — no tools, no
+    // real reasoning steps): don't show an empty "Reasoning trace" panel, it just
+    // reads as internal clutter next to the answer.
+    if (workedForTrace.length === 0) return null;
     const duration = run.durationSec > 0 ? formatDuration(run.durationSec) : '…';
     // B5: price with the provider THIS run used (not the currently-selected one).
     // Runs persisted before the provider field was added hide the cost chip.

@@ -291,6 +291,8 @@ export const HIDDEN_SUBSTRINGS = [
   'stdin',
   // Backend routing/startup diagnostics that shouldn't render as thoughts
   'Routing to Codex',
+  // Internal run lifecycle status — not a user-facing reasoning step
+  'run ended:',
   // Native UI tool-result noise
   'No interactive controls', "title='", 'title="',
 ];
