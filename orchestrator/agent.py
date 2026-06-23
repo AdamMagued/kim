@@ -571,8 +571,19 @@ class KimAgent:
                 if shot_b64:
                     self._run_screenshot_b64 = shot_b64
                     self._suppress_screen_tools_first_turn = True
+                    # The image is attached below. Tell the model explicitly to answer
+                    # from it and NOT to call screen-reading tools — the system prompt
+                    # names get_windows by name, so models reach for it otherwise, which
+                    # forces a second round-trip into the chat thread (the #4 hang).
+                    visual_text = (
+                        f"Task: {task}\n\n"
+                        "A screenshot of the current screen is attached below. Answer the "
+                        "user's question directly from this image. Do NOT call get_windows, "
+                        "take_screenshot, or any other tool — just describe what you see and "
+                        "reply with TASK_COMPLETE: <answer>."
+                    )
                     first_content = [
-                        {"type": "text", "text": f"Task: {task}"},
+                        {"type": "text", "text": visual_text},
                         {"type": "image", "data": shot_b64, "media_type": "image/png"},
                     ]
                     self._log("INFO", "Attached proactive screenshot for browser visual task")

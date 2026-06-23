@@ -740,53 +740,42 @@
         throw new Error('Prompt changed after injection. Refusing to send a partial prompt.');
       }
 
-      // 4b. Submit via send button (preferred) or synthetic Enter (fallback).
-      inputEl.focus();
-      let sendClicked = false;
-      for (let attempt = 0; attempt < 15; attempt++) {
-        const sendBtn = findElement(cfg.send_selectors || [], { visible: true, enabled: true });
-        if (sendBtn) {
-          sendBtn.click();
-          sendClicked = true;
-          break;
-        }
-        await new Promise(r => setTimeout(r, 100));
-      }
-      if (!sendClicked) {
-        // Fallback: synthetic Enter
-        inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-        inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-        inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-      }
-      console.log('[KimBridge] Message submitted via', sendClicked ? 'send button' : 'synthetic Enter');
-
-      // 4c. Verify the message actually left the input. On a successful submit the
-      //     editor clears (or the stop button appears as generation starts). If our
-      //     prompt is STILL sitting in the input, the send didn't register — a known
-      //     failure on reused threads where the send button stays disabled and the
-      //     synthetic-Enter fallback only inserts a newline. That is the root cause
-      //     of the 2nd-turn 120s hang (issue #4): nothing was ever sent, so no reply
-      //     ever comes. Re-attempt the submit a few times before giving up.
-      //     Turn-1 (the working path) clears immediately, so this is a no-op there.
+      // 4b/4c. Submit and verify by the one reliable signal: the editor clearing.
+      //   IMPORTANT: do NOT use the stop button as a "sent" signal. On a reused
+      //   thread it reads as visible even when idle (confirmed via diag.stop=true
+      //   while nothing was generating) — that false positive is exactly what made
+      //   the old code skip its retry and hang the full 120s (issue #4). A successful
+      //   submit clears the contenteditable; if our prompt is still sitting there the
+      //   send never registered (send button disabled / synthetic Enter ignored), so
+      //   re-attempt until it clears. Turn-1 (working path) clears immediately.
       const minPromptLen = Math.min(8, normalizeText(effectivePrompt).length);
-      const stillHasPrompt = () => {
-        try { return promptMatchesInput(inputEl, effectivePrompt) || readInputText(inputEl).length >= minPromptLen; }
+      const inputCleared = () => {
+        try { return readInputText(inputEl).length < minPromptLen && !promptMatchesInput(inputEl, effectivePrompt); }
         catch (_) { return false; }
       };
-      for (let v = 0; v < 4; v++) {
-        await new Promise(r => setTimeout(r, 400));
-        if (isSuperseded()) { ipcEmit({ ok: false, event: 'error', req_id: reqId, error: 'Request superseded by newer send', site: siteKey }); return; }
-        if (isAnyStopVisible(cfg) || !stillHasPrompt()) break; // generating, or input cleared → sent
-        console.warn('[KimBridge] input not cleared after submit — re-attempting send (try ' + (v + 1) + ')');
+      const attemptSubmit = () => {
         inputEl.focus();
-        const reBtn = findElement(cfg.send_selectors || [], { visible: true, enabled: true });
-        if (reBtn) {
-          reBtn.click();
-        } else {
-          inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-          inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        // Prefer an enabled Send button; fall back to any visible one (the disabled
+        // flag often lags right after programmatic injection); then an Enter keypress.
+        const btn = findElement(cfg.send_selectors || [], { visible: true, enabled: true })
+                 || findElement(cfg.send_selectors || [], { visible: true });
+        if (btn) { try { btn.click(); return 'button'; } catch (_) {} }
+        for (const type of ['keydown', 'keypress', 'keyup']) {
+          inputEl.dispatchEvent(new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
         }
+        return 'enter';
+      };
+
+      let submitVia = attemptSubmit();
+      let sendConfirmed = inputCleared();
+      for (let v = 0; v < 6 && !sendConfirmed; v++) {
+        await new Promise(r => setTimeout(r, 350));
+        if (isSuperseded()) { ipcEmit({ ok: false, event: 'error', req_id: reqId, error: 'Request superseded by newer send', site: siteKey }); return; }
+        if (inputCleared()) { sendConfirmed = true; break; }
+        console.warn('[KimBridge] input not cleared after submit — re-attempting (try ' + (v + 1) + ')');
+        submitVia = attemptSubmit();
       }
+      console.log('[KimBridge] Message submitted via', submitVia, '— confirmed=' + sendConfirmed);
 
       // 4d. Record THIS request's hash AFTER submit so the NEXT request can wait for it
       if (completionHash) {
@@ -906,19 +895,20 @@
         reportProgress(latestText);
         if (loops % 17 === 0) console.log('[KimBridge] poll diag', JSON.stringify(diag()));
 
-        // Fail fast rather than burn the full 120s hard deadline on dead air. Only
-        // trips when NOTHING has appeared yet (sawNewResponse stays false the whole
-        // time) — a real generation flips sawNewResponse within a second or two of
-        // streaming, so this never aborts a genuine (even slow) response.
-        if (!sawNewResponse && !isAnyStopVisible(cfg)) {
+        // Fail fast rather than burn the full 120s hard deadline on dead air. Keyed
+        // off real signals only (NOT the stop button, which false-positives on reused
+        // threads). Only trips when NOTHING has appeared yet (sawNewResponse stays
+        // false) — a genuine generation flips sawNewResponse within a second or two of
+        // streaming, so this never aborts a real (even slow) response.
+        if (!sawNewResponse) {
           let inputStuck = false;
           try { inputStuck = readInputText(inputEl).length >= minPromptLen; } catch (_) {}
           if (inputStuck && loops >= 33) {
-            // ~10s: prompt is still sitting in the editor → the send never registered.
-            throw new Error(`Send did not register — prompt still in the input, no generation started; diag=${JSON.stringify(diag())}`);
+            // ~10s: our prompt is still sitting in the editor → the send never registered.
+            throw new Error(`Send did not register — prompt still in the input after ${loops} polls; diag=${JSON.stringify(diag())}`);
           }
-          if (loops >= 130) {
-            // ~39s: input cleared (message left) but no reply node ever appeared.
+          if (loops >= 200) {
+            // ~60s: input cleared (message left) but no reply node ever appeared.
             throw new Error(`No response turn detected — nothing generated after ${loops} polls; diag=${JSON.stringify(diag())}`);
           }
         }
@@ -1011,7 +1001,7 @@
 
   // ── Public API ─────────────────────────────────────────────────────────
   window.__kimBridge = {
-    _v: 13,
+    _v: 14,
     _lastHash: null, // Tracks the completion hash of the most recent request
     _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
     send,
