@@ -372,8 +372,11 @@
     return map[m] || (m.includes('/') ? m.split('/')[1].split('+')[0] : 'bin');
   };
 
+  // Returns { count, strategy, thumb } — count>0 ONLY when a real attachment chip
+  // actually appeared in the page. Each strategy is verified so a programmatic
+  // upload that the web UI silently ignores is not falsely reported as success.
   const injectAttachments = async (cfg, inputEl, attachments) => {
-    if (!attachments || !attachments.length) return 0;
+    if (!attachments || !attachments.length) return { count: 0, strategy: 'none', thumb: false };
     const files = [];
     for (let i = 0; i < attachments.length; i++) {
       try {
@@ -387,21 +390,33 @@
         files.push(new File([blob], name, { type: mime }));
       } catch (_) {}
     }
-    if (!files.length) return 0;
+    if (!files.length) return { count: 0, strategy: 'none', thumb: false };
 
-    // Find file input
+    // A real attachment chip / thumbnail appearing is the only proof the upload took.
+    const THUMB_SEL = 'img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view, '
+      + '[data-test-id*="image"], [aria-label*="Remove file"], [aria-label*="Remove attachment"]';
+    const baseThumbs = document.querySelectorAll(THUMB_SEL).length;
+    const thumbAppeared = async (ms) => {
+      let waited = 0;
+      while (waited < ms) {
+        await new Promise(r => setTimeout(r, 150));
+        waited += 150;
+        if (document.querySelectorAll(THUMB_SEL).length > baseThumbs) return true;
+      }
+      return false;
+    };
+
+    // Strategy 1: hidden file input. Many chat UIs ignore a programmatic file list
+    // (no trusted gesture), so we VERIFY a chip appears before trusting it.
     let fileInput = null;
     for (const sel of cfg.file_input_selectors || []) {
-      try {
-        const el = document.querySelector(sel);
-        if (el && el instanceof HTMLInputElement && el.type === 'file') { fileInput = el; break; }
-      } catch (_) {}
+      try { const el = document.querySelector(sel); if (el && el instanceof HTMLInputElement && el.type === 'file') { fileInput = el; break; } } catch (_) {}
     }
     if (!fileInput) {
       for (const sel of cfg.upload_button_selectors || []) {
         try {
           const btn = document.querySelector(sel);
-          if (btn) { btn.click(); await new Promise(r => setTimeout(r, 100)); }
+          if (btn) { btn.click(); await new Promise(r => setTimeout(r, 120)); }
           for (const fsel of cfg.file_input_selectors || []) {
             const fi = document.querySelector(fsel);
             if (fi && fi instanceof HTMLInputElement && fi.type === 'file') { fileInput = fi; break; }
@@ -411,70 +426,40 @@
       }
     }
     if (fileInput) {
-      const dt = new DataTransfer();
-      for (const f of files) dt.items.add(f);
-      try { fileInput.files = dt.files; } catch (_) {
-        try { Object.defineProperty(fileInput, 'files', { value: dt.files, configurable: true }); } catch (_) {}
-      }
-      fileInput.dispatchEvent(new Event('input', { bubbles: true }));
-      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-      await new Promise(r => setTimeout(r, 250));
-      return files.length;
+      try {
+        const dt = new DataTransfer();
+        for (const f of files) dt.items.add(f);
+        try { fileInput.files = dt.files; } catch (_) { try { Object.defineProperty(fileInput, 'files', { value: dt.files, configurable: true }); } catch (_) {} }
+        fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+        if (await thumbAppeared(2500)) { await dismissPopups(); return { count: files.length, strategy: 'file_input', thumb: true }; }
+      } catch (_) {}
     }
 
-    // Fallback: image paste. Two strategies in order:
-    //
-    // 1. document.execCommand('paste') — reads from the REAL system clipboard that
-    //    the Rust bridge pre-populated via osascript before evaluating this script.
-    //    This triggers a TRUSTED paste event (isTrusted: true) that Gemini's editor
-    //    accepts.  Synthetic ClipboardEvent is always isTrusted: false and is silently
-    //    rejected by Gemini's React/Lit frontend.
-    //
-    // 2. ClipboardEvent fallback — kept for sites (Claude, ChatGPT) that do honour
-    //    synthetic paste events.
-    //
-    // Returns 1 only when a thumbnail appears, 0 when all methods fail.
+    // Image paste strategies. The Rust bridge pre-populated the system clipboard with
+    // this PNG, so a TRUSTED execCommand('paste') is accepted by Gemini's editor; a
+    // synthetic ClipboardEvent (isTrusted:false) is silently dropped by Gemini but is
+    // honoured by Claude/ChatGPT — so we try both and verify each.
     const imageFile = files.find(f => String(f.type || '').startsWith('image/'));
     if (imageFile && inputEl) {
-      try {
-        inputEl.focus();
-        await new Promise(r => setTimeout(r, 100));
+      try { inputEl.focus(); await new Promise(r => setTimeout(r, 120)); } catch (_) {}
 
-        // Strategy 1: synthetic ClipboardEvent (isTrusted: false — may be ignored by some editors)
+      // Strategy 2: trusted paste from the real clipboard.
+      let execPasted = false;
+      try { execPasted = document.execCommand('paste'); } catch (_) {}
+      if (await thumbAppeared(4000)) { await dismissPopups(); return { count: 1, strategy: 'execCommand_paste', thumb: true, execPasted }; }
+
+      // Strategy 3: synthetic ClipboardEvent.
+      try {
         const dt = new DataTransfer();
         dt.items.add(imageFile);
-        const pasteEvent = new ClipboardEvent('paste', {
-          bubbles: true,
-          cancelable: true,
-          clipboardData: dt,
-        });
-        inputEl.dispatchEvent(pasteEvent);
-        console.log('[KimBridge] ClipboardEvent paste dispatched:', imageFile.name);
+        inputEl.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+      } catch (_) {}
+      if (await thumbAppeared(2500)) { await dismissPopups(); return { count: 1, strategy: 'synthetic_paste', thumb: true }; }
 
-        let waited = 0;
-        let thumbnailFound = false;
-        while (waited < 1000) {
-          await new Promise(r => setTimeout(r, 100));
-          waited += 100;
-          if (document.querySelector('img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view')) {
-            thumbnailFound = true;
-            break;
-          }
-        }
-        if (thumbnailFound) {
-          await dismissPopups();
-          console.log('[KimBridge] ClipboardEvent paste succeeded');
-          return 1;
-        }
-
-        // All methods failed — return 0 so send() can append a fallback note
-        console.warn('[KimBridge] All paste strategies failed after 2.5s — returning 0');
-        return 0;
-      } catch (e) {
-        console.warn('[KimBridge] injectAttachments error:', e);
-      }
+      return { count: 0, strategy: 'all_failed', thumb: false, execPasted };
     }
-    return 0;
+    return { count: 0, strategy: 'no_image', thumb: false };
   };
 
   // ── Main send function ───────────────────────────────────────────────
@@ -688,7 +673,17 @@
       }
       inputEl.focus();
 
-      const uploadedCount = await injectAttachments(cfg, inputEl, attachments);
+      const attachResult = await injectAttachments(cfg, inputEl, attachments);
+      const uploadedCount = (attachResult && attachResult.count) || 0;
+      // Instrument which upload strategy ran + whether a chip actually appeared + the
+      // live bridge version, so success/failure is diagnosable from bridge_debug.log.
+      // (Unknown 'attach_diag' event is logged by Rust then ignored — harmless.)
+      if (attachments && attachments.length) {
+        try {
+          ipcEmit({ ok: true, event: 'attach_diag', req_id: reqId, site: siteKey,
+            error: 'ATTACH _v=' + (window.__kimBridge && window.__kimBridge._v) + ' ' + JSON.stringify(attachResult) });
+        } catch (_) {}
+      }
 
       // 3. Inject text — verify with rAF loop instead of hardcoded sleep.
       // When attachments were expected but couldn't be injected (uploadedCount === 0),
@@ -1001,7 +996,7 @@
 
   // ── Public API ─────────────────────────────────────────────────────────
   window.__kimBridge = {
-    _v: 14,
+    _v: 15,
     _lastHash: null, // Tracks the completion hash of the most recent request
     _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
     send,

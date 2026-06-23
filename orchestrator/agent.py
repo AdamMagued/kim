@@ -566,29 +566,47 @@ class KimAgent:
         # and attach it to the task message so the model actually sees the desktop.
         first_content: Any = f"Task: {task}"
         if type(self.provider).__name__ == "BrowserProvider" and _looks_visual(task):
+            # Browser web-chat models answer a visual question ("what's on my screen?")
+            # blind unless we hand them the screen. Use TWO independent channels so the
+            # feature does not depend on the flaky image upload landing in the web UI:
+            #   1. attach a screenshot to the message (rich, but the upload can fail), and
+            #   2. enumerate the open windows as TEXT and put it in the system prompt
+            #      (always reliable). Whichever lands, the model answers in one turn —
+            #      no screen-tool call, so no second round-trip into the chat (the #4 hang).
+            shot_b64 = ""
             try:
                 shot_b64 = await self._take_screenshot()
-                if shot_b64:
-                    self._run_screenshot_b64 = shot_b64
-                    self._suppress_screen_tools_first_turn = True
-                    # The image is attached below. Tell the model explicitly to answer
-                    # from it and NOT to call screen-reading tools — the system prompt
-                    # names get_windows by name, so models reach for it otherwise, which
-                    # forces a second round-trip into the chat thread (the #4 hang).
-                    visual_text = (
-                        f"Task: {task}\n\n"
-                        "A screenshot of the current screen is attached below. Answer the "
-                        "user's question directly from this image. Do NOT call get_windows, "
-                        "take_screenshot, or any other tool — just describe what you see and "
-                        "reply with TASK_COMPLETE: <answer>."
-                    )
-                    first_content = [
-                        {"type": "text", "text": visual_text},
-                        {"type": "image", "data": shot_b64, "media_type": "image/png"},
-                    ]
-                    self._log("INFO", "Attached proactive screenshot for browser visual task")
             except Exception as e:
                 self._log("WARN", f"Proactive screenshot for browser provider failed: {e}")
+            windows_text = ""
+            try:
+                windows_text = (await self._execute_tool("get_windows", {}) or "").strip()
+            except Exception as e:
+                self._log("WARN", f"get_windows for visual context failed: {e}")
+
+            if shot_b64 or windows_text:
+                self._suppress_screen_tools_first_turn = True
+                if shot_b64:
+                    self._run_screenshot_b64 = shot_b64
+                    first_content = [
+                        {"type": "text", "text": f"Task: {task}"},
+                        {"type": "image", "data": shot_b64, "media_type": "image/png"},
+                    ]
+                # The screen context + "answer directly, don't call tools" instruction
+                # live in the SYSTEM prompt, not the user message, so they never leak
+                # into the user's visible chat bubble.
+                ctx = ["\n\n[SCREEN CONTEXT FOR THIS TURN]"]
+                if shot_b64:
+                    ctx.append("A screenshot of the user's current screen is attached to their message.")
+                if windows_text:
+                    ctx.append("Currently open windows on the user's screen:\n" + windows_text)
+                ctx.append(
+                    "Answer the user's question directly from the screenshot and/or the window "
+                    "list above. Do NOT call get_windows, take_screenshot, or any other tool — "
+                    "reply with TASK_COMPLETE: <your answer>."
+                )
+                system_prompt = system_prompt + "\n".join(ctx)
+                self._log("INFO", f"Visual browser turn — screenshot={'y' if shot_b64 else 'n'}, windows={'y' if windows_text else 'n'}")
 
         first_msg = {"role": "user", "content": first_content}
         self.memory.add_user(first_content, has_screenshot=isinstance(first_content, list))
