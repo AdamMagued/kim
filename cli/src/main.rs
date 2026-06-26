@@ -1069,12 +1069,14 @@ async fn stream_repl_turn(
     let handle = if let Some((root, python)) = agentic {
         let prompt2 = prompt.clone();
         let sid = session_id.clone();
+        let provider = config.provider.clone();
         tokio::spawn(async move {
             let session_dir = root.join("kim_sessions");
             crate::agentic::stream_agentic_request(
                 &root,
                 &python,
                 &prompt2,
+                &provider,
                 &session_dir,
                 Some(&sid),
                 tx,

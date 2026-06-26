@@ -958,7 +958,11 @@ class KimAgent:
         # parser picks it up via parseLogLine.
         self._emit_plan_markers(content)
 
-        _tc = re.search(r"\bTASK_COMPLETE:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
+        # DOTALL (not MULTILINE): the answer after TASK_COMPLETE: can span multiple
+        # lines (lists, code, paragraphs). MULTILINE's `(.+)$` stopped at the first
+        # line, truncating multi-line answers to their first line (e.g. a bullet list
+        # collapsed to "- Red"). Capture everything after the marker to the end.
+        _tc = re.search(r"\bTASK_COMPLETE:\s*(.+)\Z", content, re.IGNORECASE | re.DOTALL)
         if _tc:
             summary = _tc.group(1).strip()
             self._log("DEBUG", f"TASK_COMPLETE: {summary}")

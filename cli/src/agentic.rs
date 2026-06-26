@@ -170,6 +170,7 @@ pub async fn stream_agentic_request(
     root: &Path,
     python: &Path,
     prompt: &str,
+    provider: &str,
     session_dir: &Path,
     resume_session_id: Option<&str>,
     tx: UnboundedSender<AppEvent>,
@@ -180,6 +181,11 @@ pub async fn stream_agentic_request(
         "orchestrator.agent",
         "--task",
         prompt,
+        // Without this the orchestrator falls back to its default provider
+        // (browser), so a CLI configured for ollama would spawn the agent on the
+        // browser provider and crash. Forward the CLI's configured provider.
+        "--provider",
+        provider,
         "--session-dir",
     ])
     .arg(session_dir)
@@ -212,8 +218,18 @@ pub async fn stream_agentic_request(
     let mut child_stdin = child.stdin.take();
     let mut lines = BufReader::new(stdout).lines();
     let mut saw_done = false;
+    // The final answer is emitted as `[SUCCESS]/[FAILED] <text>` and is the LAST
+    // output; a multi-line answer spills onto following lines that match no marker.
+    // Buffer from the first answer line to EOF so multi-line answers aren't truncated
+    // to their first line.
+    let mut answer_buf: Option<String> = None;
 
     while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(buf) = answer_buf.as_mut() {
+            buf.push('\n');
+            buf.push_str(line.trim_end_matches(['\r', '\n']));
+            continue;
+        }
         match parse_agent_line(&line) {
             AgentLine::Activity(m) => {
                 let _ = tx.send(AppEvent::ThoughtChunk(m));
@@ -225,7 +241,7 @@ pub async fn stream_agentic_request(
                 });
             }
             AgentLine::Answer(text) => {
-                let _ = tx.send(AppEvent::TextChunk(render_markdown(&text)));
+                answer_buf = Some(text);
             }
             AgentLine::ProviderError(code) => {
                 let _ = tx.send(AppEvent::Err(format!("provider error: {code}")));
@@ -243,20 +259,28 @@ pub async fn stream_agentic_request(
                     let _ = stdin.flush().await;
                 }
             }
-            AgentLine::Done(success) => {
+            AgentLine::Done(_success) => {
+                // Do NOT emit AppEvent::Done here: the orchestrator prints the
+                // `[SUCCESS]/[FAILED] <answer>` line AFTER `run_done`, and the consumer
+                // breaks on Done — emitting it now drops the answer ("(no response)").
+                // Defer Done to end-of-stream so the answer is delivered first.
                 saw_done = true;
-                let _ = tx.send(AppEvent::Done(success));
             }
             AgentLine::Ignore => {}
         }
     }
-    // Process exited; ensure the turn ends even if no run_done line was seen.
-    // If the agent crashed before emitting structured completion, don't report
-    // the turn as a clean success.
-    let success = child.wait().await.map(|s| s.success()).unwrap_or(false);
-    if !saw_done {
-        let _ = tx.send(AppEvent::Done(success));
+    let _ = saw_done;
+    // Flush the (possibly multi-line) final answer now that we've read to EOF.
+    if let Some(buf) = answer_buf {
+        let trimmed = buf.trim();
+        if !trimmed.is_empty() {
+            let _ = tx.send(AppEvent::TextChunk(render_markdown(trimmed)));
+        }
     }
+    // Process exited (stdout EOF). End the turn. used_bridge=false: this is the local
+    // Python agent, not the desktop HTTP bridge (so we don't print "via Kim desktop").
+    let _ = child.wait().await;
+    let _ = tx.send(AppEvent::Done(false));
 }
 
 /// Blocking-ish terminal y/N approval prompt (off the async runtime).

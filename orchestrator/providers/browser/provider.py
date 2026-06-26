@@ -342,6 +342,13 @@ class BrowserProvider(BaseProvider):
             return self._attach_usage(result, estimated_usage)
 
         try:
+            # Playwright is imported lazily (module top only imports it under
+            # TYPE_CHECKING so selecting a browser provider doesn't hard-crash when
+            # playwright isn't installed). Import the runtime symbol here, where the
+            # CDP path actually needs it; a missing install degrades to the NEED_HELP
+            # below instead of a NameError.
+            from playwright.async_api import async_playwright
+
             async with async_playwright() as pw:
                 browser = await self._connect(pw)
                 page, site = await self._find_chat_page(browser)
