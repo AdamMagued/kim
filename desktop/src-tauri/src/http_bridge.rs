@@ -533,10 +533,21 @@ fn handle_webview_bridge_request(
                 tier = tier_json,
             );
 
+            // An image (screenshot) is pasted into the chat with a REAL Cmd+V
+            // (native_paste) — a trusted paste the editor accepts. That keystroke
+            // only lands if the provider webview is visible, frontmost and key, so
+            // for image sends we show + focus it instead of hiding it offscreen. The
+            // screenshot was already captured before this send, so showing the window
+            // now does not interfere with screen-capture tools.
+            let has_image_attachment = attachments.iter().any(|a| a.mime_type.starts_with("image/"));
+
             // The window stays offscreen (1x1 at -10000,-10000) during
             // headless operation.  JS keeps running at 1x1, no need to
             // show it to the user.
-            if should_keep_browser_visible() {
+            if has_image_attachment {
+                show_browser_window_impl(&app_handle);
+                let _ = window.set_focus();
+            } else if should_keep_browser_visible() {
                 show_browser_window_impl(&app_handle);
             } else if is_browser_window_offscreen(&window) {
                 if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
@@ -582,7 +593,10 @@ fn handle_webview_bridge_request(
             // during inputEl.focus() / send-button click. Without this, Stage
             // Manager swaps groups and Kim's window comes forward, breaking
             // observe_ui on the actual target app.
-            let saved_frontmost = save_frontmost_app();
+            // For image sends, keep the provider webview frontmost & key so the
+            // native_paste Cmd+V lands in its focused editor — do NOT restore the
+            // user's previous frontmost app until the paste is done.
+            let saved_frontmost = if has_image_attachment { None } else { save_frontmost_app() };
 
             if let Err(e) = window.eval(&bridge_call) {
                 respond_json(

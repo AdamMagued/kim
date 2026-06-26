@@ -313,6 +313,32 @@ pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &ta
             }
             notify_bridge_result();
         }
+        "native_paste" => {
+            // The bridge JS focused the chat editor and asked us to paste the image
+            // with a REAL Cmd+V. WKWebView blocks programmatic paste (execCommand
+            // returns false) and rejects synthetic ClipboardEvent (isTrusted:false),
+            // but a genuine keystroke is trusted and accepted. The PNG is already on
+            // the system clipboard (write_first_png_to_clipboard) and the webview is
+            // visible + frontmost + key for image sends, so the keystroke lands in the
+            // focused editor — the same trick the Playwright path uses via Cmd+V.
+            #[cfg(target_os = "macos")]
+            {
+                let req_id = ipc_event.req_id.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(150));
+                    let status = std::process::Command::new("osascript")
+                        .arg("-e")
+                        .arg(r#"tell application "System Events" to keystroke "v" using command down"#)
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    agent_debug_log("H1", "native_paste fired Cmd+V", serde_json::json!({
+                        "reqId": req_id,
+                        "ok": status,
+                    }));
+                });
+            }
+        }
         other => {
             eprintln!("[Kim] Unknown bridge IPC event type: {}", other);
         }

@@ -567,18 +567,19 @@ class KimAgent:
         first_content: Any = f"Task: {task}"   # what is shown in the chat bubble
         llm_first_content: Any = None          # what the model receives, when it differs
         if type(self.provider).__name__ == "BrowserProvider" and _looks_visual(task):
-            # Browser web-chat models (Gemini/etc.) answer a visual question blind: the
-            # hidden webview cannot reliably receive an image — the editor rejects
-            # programmatic/synthetic paste and execCommand('paste') is sandbox-blocked
-            # (verified live: execPasted=false). So deliver the screen as TEXT instead:
-            # enumerate the open windows and put that in the USER message — NOT the
-            # system prompt, which a reused thread skips on follow-up turns (verified:
-            # promptLen 331 vs 12059), which silently dropped it. One turn, no screen-
-            # tool call, so no second round-trip into the chat (the #4 hang). The window
-            # text + instruction go only into the model's copy, so the user's chat
-            # bubble stays clean.
+            # Visual question on a browser web-chat model. Capture the screen and:
+            #   1. attach it as an IMAGE so the bridge can paste it into the chat with a
+            #      real Cmd+V (a trusted paste the editor accepts — the window must be
+            #      visible/focused for this), giving true "what's on screen" vision; and
+            #   2. ALSO enumerate the open windows as a TEXT fallback, so if the image
+            #      paste fails the model can still answer from the window list.
+            # The image goes in the user's visible bubble; the window-list + the "answer
+            # directly, don't call tools" instruction go ONLY into the model's copy (kept
+            # out of the bubble) and live in the USER message — a reused thread skips the
+            # system prompt on follow-up turns, so context there would be dropped.
+            shot_b64 = ""
             try:
-                self._run_screenshot_b64 = await self._take_screenshot()  # for the run record + visual feedback
+                shot_b64 = await self._take_screenshot()
             except Exception as e:
                 self._log("WARN", f"Proactive screenshot for browser provider failed: {e}")
             windows_text = ""
@@ -587,18 +588,28 @@ class KimAgent:
             except Exception as e:
                 self._log("WARN", f"get_windows for visual context failed: {e}")
 
-            if windows_text:
+            if shot_b64 or windows_text:
                 self._suppress_screen_tools_first_turn = True
-                llm_first_content = (
-                    f"Task: {task}\n\n"
-                    "[SCREEN CONTEXT — the user is asking about their screen. These are the "
-                    "windows currently open on it:]\n"
-                    f"{windows_text}\n\n"
-                    "Answer the user's question directly from this list. Do NOT call "
-                    "get_windows, take_screenshot, or any other tool — reply with "
-                    "TASK_COMPLETE: <your answer>."
+                img_block = None
+                if shot_b64:
+                    self._run_screenshot_b64 = shot_b64
+                    img_block = {"type": "image", "data": shot_b64, "media_type": "image/png"}
+                ctx = [f"Task: {task}"]
+                if shot_b64:
+                    ctx.append("\nA screenshot of my screen is attached — describe what you actually see in it.")
+                if windows_text:
+                    ctx.append("\n[Fallback context — the open windows are:]\n" + windows_text)
+                ctx.append(
+                    "\nAnswer directly. Do NOT call get_windows, take_screenshot, or any other "
+                    "tool — reply with TASK_COMPLETE: <your answer>."
                 )
-                self._log("INFO", "Visual browser turn — delivered screen as window-list text in the user message")
+                llm_text = "\n".join(ctx)
+                if img_block:
+                    first_content = [{"type": "text", "text": f"Task: {task}"}, img_block]
+                    llm_first_content = [{"type": "text", "text": llm_text}, img_block]
+                else:
+                    llm_first_content = llm_text
+                self._log("INFO", f"Visual browser turn — image={'y' if shot_b64 else 'n'}, windows={'y' if windows_text else 'n'}")
 
         first_msg = {"role": "user", "content": first_content}
         self.memory.add_user(

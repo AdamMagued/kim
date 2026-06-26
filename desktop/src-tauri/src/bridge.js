@@ -375,7 +375,7 @@
   // Returns { count, strategy, thumb } — count>0 ONLY when a real attachment chip
   // actually appeared in the page. Each strategy is verified so a programmatic
   // upload that the web UI silently ignores is not falsely reported as success.
-  const injectAttachments = async (cfg, inputEl, attachments) => {
+  const injectAttachments = async (cfg, inputEl, attachments, requestNativePaste) => {
     if (!attachments || !attachments.length) return { count: 0, strategy: 'none', thumb: false };
     const files = [];
     for (let i = 0; i < attachments.length; i++) {
@@ -442,12 +442,22 @@
     // honoured by Claude/ChatGPT — so we try both and verify each.
     const imageFile = files.find(f => String(f.type || '').startsWith('image/'));
     if (imageFile && inputEl) {
-      try { inputEl.focus(); await new Promise(r => setTimeout(r, 120)); } catch (_) {}
+      try { inputEl.focus(); await new Promise(r => setTimeout(r, 150)); } catch (_) {}
 
-      // Strategy 2: trusted paste from the real clipboard.
+      // Strategy 1 (preferred): ask Rust to fire a REAL Cmd+V. WKWebView blocks
+      // execCommand('paste') (returns false) and rejects synthetic ClipboardEvent
+      // (isTrusted:false), but a genuine keystroke is trusted and accepted. The PNG is
+      // already on the system clipboard and (for image sends) the webview is visible +
+      // frontmost + key, so the keystroke lands in the editor we just focused.
+      if (typeof requestNativePaste === 'function') {
+        try { requestNativePaste(); } catch (_) {}
+        if (await thumbAppeared(5000)) { await dismissPopups(); return { count: 1, strategy: 'native_paste', thumb: true }; }
+      }
+
+      // Strategy 2: trusted paste from the real clipboard (other webviews).
       let execPasted = false;
       try { execPasted = document.execCommand('paste'); } catch (_) {}
-      if (await thumbAppeared(4000)) { await dismissPopups(); return { count: 1, strategy: 'execCommand_paste', thumb: true, execPasted }; }
+      if (await thumbAppeared(3000)) { await dismissPopups(); return { count: 1, strategy: 'execCommand_paste', thumb: true, execPasted }; }
 
       // Strategy 3: synthetic ClipboardEvent.
       try {
@@ -673,7 +683,8 @@
       }
       inputEl.focus();
 
-      const attachResult = await injectAttachments(cfg, inputEl, attachments);
+      const attachResult = await injectAttachments(cfg, inputEl, attachments,
+        () => ipcEmit({ ok: true, event: 'native_paste', req_id: reqId, site: siteKey }));
       const uploadedCount = (attachResult && attachResult.count) || 0;
       // Instrument which upload strategy ran + whether a chip actually appeared + the
       // live bridge version, so success/failure is diagnosable from bridge_debug.log.
@@ -996,7 +1007,7 @@
 
   // ── Public API ─────────────────────────────────────────────────────────
   window.__kimBridge = {
-    _v: 15,
+    _v: 16,
     _lastHash: null, // Tracks the completion hash of the most recent request
     _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
     send,
