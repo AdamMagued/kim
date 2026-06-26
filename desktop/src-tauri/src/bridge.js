@@ -406,8 +406,41 @@
       return false;
     };
 
-    // Strategy 1: hidden file input. Many chat UIs ignore a programmatic file list
-    // (no trusted gesture), so we VERIFY a chip appears before trusting it.
+    const imageFile = files.find(f => String(f.type || '').startsWith('image/'));
+
+    // Strategy 1 (preferred for the in-app webview): ask Rust to fire a REAL Cmd+V.
+    // WKWebView blocks execCommand('paste') and rejects synthetic ClipboardEvent, but a
+    // genuine keystroke is trusted and accepted. Do this FIRST — before touching the
+    // file input / upload button, which can steal focus or open a picker and make the
+    // keystroke miss the editor. The PNG is already on the clipboard and (for image
+    // sends) the webview is visible + frontmost + key.
+    if (imageFile && inputEl && typeof requestNativePaste === 'function') {
+      try { inputEl.focus(); } catch (_) {}
+      await new Promise(r => setTimeout(r, 150));
+      try { inputEl.focus(); } catch (_) {}            // re-assert focus right before the paste
+      const preThumbs = document.querySelectorAll(THUMB_SEL).length;
+      try { requestNativePaste(); } catch (_) {}
+      // The keystroke only fires ~400-500ms after this (IPC round-trip + Rust settle
+      // sleep), so wait PAST that before looking — otherwise we catch a pre-paste
+      // transient and declare success before the image is actually pasted (the race we
+      // diagnosed: thumb reported at +151ms while Cmd+V fired at +413ms).
+      await new Promise(r => setTimeout(r, 800));
+      let pasted = false;
+      for (let i = 0; i < 25; i++) {                   // poll up to ~5s more
+        if (document.querySelectorAll(THUMB_SEL).length > preThumbs) { pasted = true; break; }
+        await new Promise(r => setTimeout(r, 200));
+      }
+      if (pasted) {
+        // Let Gemini UPLOAD the image to its backend before we inject text and send —
+        // otherwise the message goes out without the picture attached.
+        await new Promise(r => setTimeout(r, 2000));
+        await dismissPopups();
+        return { count: 1, strategy: 'native_paste', thumb: true };
+      }
+      // native paste didn't visibly land — fall through to the legacy strategies.
+    }
+
+    // Strategy 2: hidden file input (other UIs). Verify a chip appears before trusting it.
     let fileInput = null;
     for (const sel of cfg.file_input_selectors || []) {
       try { const el = document.querySelector(sel); if (el && el instanceof HTMLInputElement && el.type === 'file') { fileInput = el; break; } } catch (_) {}
@@ -436,30 +469,13 @@
       } catch (_) {}
     }
 
-    // Image paste strategies. The Rust bridge pre-populated the system clipboard with
-    // this PNG, so a TRUSTED execCommand('paste') is accepted by Gemini's editor; a
-    // synthetic ClipboardEvent (isTrusted:false) is silently dropped by Gemini but is
-    // honoured by Claude/ChatGPT — so we try both and verify each.
-    const imageFile = files.find(f => String(f.type || '').startsWith('image/'));
+    // Strategy 3/4: execCommand / synthetic paste (other webviews that honour them).
     if (imageFile && inputEl) {
-      try { inputEl.focus(); await new Promise(r => setTimeout(r, 150)); } catch (_) {}
-
-      // Strategy 1 (preferred): ask Rust to fire a REAL Cmd+V. WKWebView blocks
-      // execCommand('paste') (returns false) and rejects synthetic ClipboardEvent
-      // (isTrusted:false), but a genuine keystroke is trusted and accepted. The PNG is
-      // already on the system clipboard and (for image sends) the webview is visible +
-      // frontmost + key, so the keystroke lands in the editor we just focused.
-      if (typeof requestNativePaste === 'function') {
-        try { requestNativePaste(); } catch (_) {}
-        if (await thumbAppeared(5000)) { await dismissPopups(); return { count: 1, strategy: 'native_paste', thumb: true }; }
-      }
-
-      // Strategy 2: trusted paste from the real clipboard (other webviews).
+      try { inputEl.focus(); await new Promise(r => setTimeout(r, 120)); } catch (_) {}
       let execPasted = false;
       try { execPasted = document.execCommand('paste'); } catch (_) {}
       if (await thumbAppeared(3000)) { await dismissPopups(); return { count: 1, strategy: 'execCommand_paste', thumb: true, execPasted }; }
 
-      // Strategy 3: synthetic ClipboardEvent.
       try {
         const dt = new DataTransfer();
         dt.items.add(imageFile);
@@ -1007,7 +1023,7 @@
 
   // ── Public API ─────────────────────────────────────────────────────────
   window.__kimBridge = {
-    _v: 16,
+    _v: 17,
     _lastHash: null, // Tracks the completion hash of the most recent request
     _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
     send,

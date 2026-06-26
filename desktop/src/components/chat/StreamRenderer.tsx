@@ -568,11 +568,19 @@ export function StreamRenderer({
           {renderRunFailure()}
           {renderRateLimited()}
 
-          {queuedTasks.length > 0 && (
-            <div className="kim-queue-indicator" role="status" aria-live="polite">
-              {`${queuedTasks.length} queued message${queuedTasks.length === 1 ? '' : 's'} waiting.`}
+          {/* Queued messages: show each as a real (dimmed, pending) user bubble so the
+              user sees what they sent immediately — not a bare count that pops the
+              message + reply in together only once it actually runs. */}
+          {queuedTasks.map((qt, qi) => (
+            <div key={`queued-${qt.id}`} className="kim-queued-msg" style={{ opacity: 0.55 }}>
+              <MessageBubble message={{ role: 'user', content: qt.text }} />
+              <div className="kim-queue-indicator" role="status" aria-live="polite">
+                {qi === 0
+                  ? 'Queued — sends automatically when the current reply finishes'
+                  : `Queued (#${qi + 1})`}
+              </div>
             </div>
-          )}
+          ))}
 
           {!autoFollowOutput && (activity.length > 0 || isRunning) && (
             <div className="kim-jump-latest-wrap">
