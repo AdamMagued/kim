@@ -921,7 +921,9 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
         }
         return;
     }
-    let _ = tx.send(AppEvent::Done(true));
+    // used_bridge only when codex ran against a browser provider via the Kim bridge
+    // service; local codex (ollama) is not "via Kim desktop".
+    let _ = tx.send(AppEvent::Done(is_browser));
 }
 
 fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: bool) {
