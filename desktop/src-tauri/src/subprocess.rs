@@ -1323,6 +1323,86 @@ mod tests {
         assert!(!is_bundled_orchestrator("/path/venv/bin/python"));
     }
 
+    // ── Regression: bundled_detection_by_basename ──────────────────────────────
+    // is_bundled_orchestrator must return true for every expected basename variant
+    // of the sidecar and false for the python interpreter names that can appear
+    // on PATH (python3 is the default system interpreter on macOS/Linux).
+    #[test]
+    fn bundled_detection_by_basename() {
+        // Bare sidecar name (development copy placed next to executable).
+        assert!(is_bundled_orchestrator("kim-orchestrator"));
+        // The Tauri bundle convention appends the platform triple.
+        assert!(is_bundled_orchestrator("kim-orchestrator-aarch64-apple-darwin"));
+        assert!(is_bundled_orchestrator("kim-orchestrator-x86_64-unknown-linux-gnu"));
+        assert!(is_bundled_orchestrator("kim-orchestrator-x86_64-pc-windows-msvc"));
+        // Any string that embeds the sidecar name is treated as bundled —
+        // this is intentional per the `contains` implementation.
+        assert!(is_bundled_orchestrator("prefix-kim-orchestrator-suffix"));
+
+        // Python interpreter names must never be treated as bundled.
+        assert!(!is_bundled_orchestrator("python3"));
+        assert!(!is_bundled_orchestrator("python"));
+        assert!(!is_bundled_orchestrator("py"));
+        // Unrelated orchestration tools must not match.
+        assert!(!is_bundled_orchestrator("orchestrator"));
+        assert!(!is_bundled_orchestrator("kim-agent"));
+    }
+
+    // ── Regression: bundled_detection_with_path_and_suffix ─────────────────────
+    // Detection must work when the sidecar is referenced via an absolute path and
+    // when the binary carries a .exe extension (Windows sidecar convention).
+    #[test]
+    fn bundled_detection_with_path_and_suffix() {
+        // Absolute path inside a macOS .app bundle.
+        assert!(is_bundled_orchestrator(
+            "/Applications/Kim.app/Contents/MacOS/kim-orchestrator"
+        ));
+        // Absolute path with Tauri platform-triple suffix (macOS arm64).
+        assert!(is_bundled_orchestrator(
+            "/Applications/Kim.app/Contents/MacOS/kim-orchestrator-aarch64-apple-darwin"
+        ));
+        // Absolute path on Linux.
+        assert!(is_bundled_orchestrator(
+            "/usr/local/lib/kim/kim-orchestrator-x86_64-unknown-linux-gnu"
+        ));
+        // Windows path — bare name with .exe extension.
+        assert!(is_bundled_orchestrator(
+            r"C:\Program Files\Kim\kim-orchestrator.exe"
+        ));
+        // Windows path — platform-triple + .exe extension.
+        assert!(is_bundled_orchestrator(
+            r"C:\Program Files\Kim\kim-orchestrator-x86_64-pc-windows-msvc.exe"
+        ));
+        // The .exe suffix alone (without "kim-orchestrator") must NOT match.
+        assert!(!is_bundled_orchestrator("python.exe"));
+        assert!(!is_bundled_orchestrator(r"C:\Python312\python.exe"));
+    }
+
+    // ── Regression: python_paths_not_bundled ───────────────────────────────────
+    // Any Python interpreter path returned by find_python_interpreter() in the
+    // non-sidecar code paths must NOT be classified as the bundled orchestrator.
+    #[test]
+    fn python_paths_not_bundled() {
+        // Project-local venv paths (both Unix and Windows layouts).
+        assert!(!is_bundled_orchestrator("/workspace/project/venv/bin/python"));
+        assert!(!is_bundled_orchestrator("/workspace/project/.venv/bin/python"));
+        assert!(!is_bundled_orchestrator(
+            r"C:\workspace\project\venv\Scripts\python.exe"
+        ));
+        assert!(!is_bundled_orchestrator(
+            r"C:\workspace\project\.venv\Scripts\python.exe"
+        ));
+        // Kim install-script home venv paths.
+        assert!(!is_bundled_orchestrator("/home/user/.kim_root/venv/bin/python"));
+        assert!(!is_bundled_orchestrator("/home/user/.kim/venv/bin/python"));
+        // Bare names as returned by system PATH fallback.
+        assert!(!is_bundled_orchestrator("python"));
+        assert!(!is_bundled_orchestrator("python3"));
+        // System-installed interpreters.
+        assert!(!is_bundled_orchestrator("/usr/bin/python3"));
+        assert!(!is_bundled_orchestrator("/usr/local/bin/python3"));
+    }
+
     #[test]
     fn test_find_bundled_orchestrator_absent_in_test() {
         // In the test binary context, there is no kim-orchestrator sidecar

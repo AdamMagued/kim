@@ -99,3 +99,86 @@ class AgentProviderErrorBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Pytest-style regression guards added for the four targeted behaviours
+# ---------------------------------------------------------------------------
+
+
+def test_auth_word_boundary_no_false_positive():
+    """'author', 'authority', and 'authenticated' must NOT trigger the auth branch."""
+    result_author = classify_provider_error(Exception("author of the book"))
+    assert result_author.code != "auth", (
+        "'author of the book' should not classify as auth (false positive via word boundary)"
+    )
+
+    result_authority = classify_provider_error(Exception("authority error"))
+    assert result_authority.code != "auth", (
+        "'authority error' should not classify as auth"
+    )
+
+    # 'authenticated' describes a success state; it must not be treated as an auth failure.
+    result_authenticated = classify_provider_error(Exception("user is authenticated"))
+    assert result_authenticated.code != "auth", (
+        "'authenticated' is a success state and must not classify as auth"
+    )
+
+
+def test_auth_and_oauth_word_match():
+    """Standalone 'auth' and 'oauth' tokens (and explicit markers) → auth, retryable=False."""
+    # bare 'auth' token with word boundaries on both sides
+    r = classify_provider_error(Exception("please auth again"))
+    assert r.code == "auth"
+    assert r.retryable is False
+
+    # 'oauth' as a standalone token
+    r_oauth = classify_provider_error(Exception("oauth token expired"))
+    assert r_oauth.code == "auth"
+    assert r_oauth.retryable is False
+
+    # explicit markers that are always auth
+    for msg in (
+        "sign in to continue",
+        "invalid api key provided",
+        "forbidden: access denied",
+        "unauthorized request",
+        "missing credential",
+    ):
+        r = classify_provider_error(Exception(msg))
+        assert r.code == "auth", f"Expected 'auth' for message: {msg!r}, got {r.code!r}"
+        assert r.retryable is False, f"Auth error must not be retryable for: {msg!r}"
+
+
+def test_http_400_digit_bounded():
+    """'400 bad request' → invalid_request; 'error 4001' must NOT match that branch."""
+    r_400 = classify_provider_error(Exception("400 bad request"))
+    assert r_400.code == "invalid_request", (
+        f"'400 bad request' should be invalid_request, got {r_400.code!r}"
+    )
+
+    r_4001 = classify_provider_error(Exception("error 4001"))
+    assert r_4001.code != "invalid_request", (
+        "'error 4001' must not match the 400 digit-bounded pattern and become invalid_request"
+    )
+
+
+def test_server_and_rate_codes():
+    """429 / 'rate limit' → rate_limit retryable; digit-bounded 500/502/503/529 → server_error retryable."""
+    # rate-limit via numeric code
+    r_429 = classify_provider_error(Exception("HTTP 429 Too Many Requests"))
+    assert r_429.code == "rate_limit"
+    assert r_429.retryable is True
+
+    # rate-limit via text phrase
+    r_rl = classify_provider_error(Exception("rate limit exceeded"))
+    assert r_rl.code == "rate_limit"
+    assert r_rl.retryable is True
+
+    # server error codes — each must be digit-bounded and retryable
+    for code in ("500", "502", "503", "529"):
+        r = classify_provider_error(Exception(f"provider returned {code} error"))
+        assert r.code == "server_error", (
+            f"HTTP {code} should be server_error, got {r.code!r}"
+        )
+        assert r.retryable is True, f"server_error for {code} must be retryable"

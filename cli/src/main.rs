@@ -1537,9 +1537,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        consume_turn_events, parse_cli_args, prompt_file_references, prompt_with_file_references,
-        provider_is_ready, provider_is_ready_with_env, split_shellish_tokens, App, AppEvent,
-        AppMode, CliCommand, MessageRole, ViewState,
+        consume_turn_events, new_session_id, parse_cli_args, prompt_file_references,
+        prompt_with_file_references, provider_is_ready, provider_is_ready_with_env,
+        split_shellish_tokens, App, AppEvent, AppMode, CliCommand, MessageRole, ViewState,
     };
     use crate::config::KimConfig;
     use std::path::{Path, PathBuf};
@@ -2001,5 +2001,80 @@ mod tests {
             } => assert_eq!(p, "one two three"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // ── session_id regression guards ─────────────────────────────────────────
+
+    /// The session ID must embed the current process ID so that two `kim`
+    /// processes starting in the same millisecond never share an ID and
+    /// therefore never clobber each other's session files.
+    #[test]
+    fn session_id_includes_pid() {
+        let id = new_session_id();
+        let pid = std::process::id();
+        // Expected format: "session-<millis>-<pid>-<n>"
+        assert!(
+            id.starts_with("session-"),
+            "id must start with 'session-', got: {id}"
+        );
+        let pid_str = pid.to_string();
+        assert!(
+            id.contains(&pid_str),
+            "id must contain the current PID ({pid_str}), got: {id}"
+        );
+        // Structural check: exactly 4 dash-separated parts.
+        let parts: Vec<&str> = id.splitn(4, '-').collect();
+        assert_eq!(
+            parts.len(),
+            4,
+            "id must have 4 dash-separated parts (session-<millis>-<pid>-<n>), got: {id}"
+        );
+        assert_eq!(parts[0], "session");
+        assert!(
+            parts[1].parse::<u128>().is_ok(),
+            "second part must be a millisecond timestamp, got: {}",
+            parts[1]
+        );
+        assert_eq!(
+            parts[2], pid_str,
+            "third part must be the PID, got: {}",
+            parts[2]
+        );
+        assert!(
+            parts[3].parse::<u64>().is_ok(),
+            "fourth part must be the counter, got: {}",
+            parts[3]
+        );
+    }
+
+    /// Two successive calls within the same process must produce distinct IDs
+    /// because the atomic counter suffix increments on every call.
+    #[test]
+    fn session_ids_distinct_within_process() {
+        let id1 = new_session_id();
+        let id2 = new_session_id();
+        assert_ne!(
+            id1, id2,
+            "successive new_session_id() calls must return distinct IDs"
+        );
+        // The counter suffix (last segment) of id2 must be exactly one higher
+        // than that of id1.
+        let n1: u64 = id1
+            .rsplit('-')
+            .next()
+            .expect("id1 must have a counter suffix")
+            .parse()
+            .expect("counter suffix must be a u64");
+        let n2: u64 = id2
+            .rsplit('-')
+            .next()
+            .expect("id2 must have a counter suffix")
+            .parse()
+            .expect("counter suffix must be a u64");
+        assert_eq!(
+            n2,
+            n1 + 1,
+            "counter suffix must increment by 1 between calls (got {n1} then {n2})"
+        );
     }
 }

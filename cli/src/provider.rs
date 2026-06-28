@@ -995,13 +995,7 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
         let bypass_sandbox =
             std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1");
         let cwd_str = cwd.to_string_lossy().into_owned();
-        let mut codex_args: Vec<String> = vec!["exec".into(), "--json".into()];
-        if bypass_sandbox {
-            codex_args.push("--dangerously-bypass-approvals-and-sandbox".into());
-        }
-        codex_args.push("-C".into());
-        codex_args.push(cwd_str);
-        codex_args.push(prompt.to_string());
+        let codex_args = build_codex_args(prompt, &cwd_str, bypass_sandbox);
         match Command::new("codex")
             .args(&codex_args)
             .env("OPENAI_API_KEY", "ollama")
@@ -1256,6 +1250,21 @@ async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent
         let _ = child.wait().await;
     });
     Some(port)
+}
+
+/// Build the argv list passed to `codex exec`. Extracted for testability (#1).
+/// Always produces `["exec", "--json", …, "-C", cwd, prompt]`.
+/// The `--dangerously-bypass-approvals-and-sandbox` flag is inserted only when
+/// `bypass` is true (opt-in via `KIM_CODEX_BYPASS_SANDBOX=1`).
+fn build_codex_args(prompt: &str, cwd: &str, bypass: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec!["exec".into(), "--json".into()];
+    if bypass {
+        args.push("--dangerously-bypass-approvals-and-sandbox".into());
+    }
+    args.push("-C".into());
+    args.push(cwd.to_string());
+    args.push(prompt.to_string());
+    args
 }
 
 fn write_codex_config(proxy_port: u16, model: &str, codex_home: &std::path::Path) -> Result<(), String> {
@@ -1826,5 +1835,130 @@ mod tests {
     fn resolve_api_key_both_absent_returns_empty_driving_login_error() {
         // Empty result causes the "Run /login <provider> first." error, which is correct.
         assert!(resolve_api_key(None, None).is_empty());
+    }
+
+    // ── codex_args_bypass_gated (#1) ─────────────────────────────────────────
+    // Regression guard: the sandbox-bypass flag must be gated behind `bypass=true`
+    // and must never appear when `bypass=false`. The argv must always terminate
+    // with `-C <cwd> <prompt>` regardless of the bypass setting.
+
+    #[test]
+    fn codex_args_bypass_gated() {
+        let prompt = "fix the bug";
+        let cwd = "/home/user/project";
+
+        // bypass=false: the dangerous flag must NOT appear.
+        let no_bypass = build_codex_args(prompt, cwd, false);
+        assert!(
+            !no_bypass
+                .iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "bypass=false must not include the bypass flag; got {no_bypass:?}"
+        );
+        // argv must end: -C <cwd> <prompt>
+        let n = no_bypass.len();
+        assert!(n >= 3, "expected at least 3 args; got {no_bypass:?}");
+        assert_eq!(&no_bypass[n - 3], "-C", "second-to-last pair must start with -C");
+        assert_eq!(&no_bypass[n - 2], cwd, "cwd must be the penultimate arg");
+        assert_eq!(&no_bypass[n - 1], prompt, "prompt must be the last arg");
+
+        // bypass=true: the flag must appear, and argv must still end correctly.
+        let with_bypass = build_codex_args(prompt, cwd, true);
+        assert!(
+            with_bypass
+                .iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "bypass=true must include the bypass flag; got {with_bypass:?}"
+        );
+        let n = with_bypass.len();
+        assert!(n >= 3);
+        assert_eq!(&with_bypass[n - 3], "-C");
+        assert_eq!(&with_bypass[n - 2], cwd);
+        assert_eq!(&with_bypass[n - 1], prompt);
+    }
+
+    // ── anthropic_max_tokens_constant (#24) ──────────────────────────────────
+    // Regression guard: the constant must be the corrected 8192 value (not the
+    // former magic number 8096) and must propagate into the request body JSON.
+
+    #[test]
+    fn anthropic_max_tokens_constant() {
+        assert_eq!(
+            ANTHROPIC_MAX_TOKENS, 8192u32,
+            "ANTHROPIC_MAX_TOKENS must be 8192 (was previously the wrong value 8096)"
+        );
+        // Verify the constant produces the correct numeric value when serialised
+        // into a JSON request body (matches the `json!` call in stream_anthropic).
+        let body = serde_json::json!({ "max_tokens": ANTHROPIC_MAX_TOKENS });
+        assert_eq!(
+            body["max_tokens"].as_u64().unwrap(),
+            8192u64,
+            "max_tokens in request body must equal 8192"
+        );
+    }
+
+    // ── read_run_result_parses_trailing_line ─────────────────────────────────
+    // Regression guard: earlier JSONL lines must be ignored; only the trailing
+    // `run_result` line is returned as (summary, success).
+
+    #[test]
+    fn read_run_result_parses_trailing_line() {
+        use std::io::Write as _;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        // Earlier lines that do NOT contain run_result must be ignored.
+        tmp.write_all(b"{\"type\":\"text\",\"content\":\"earlier line\"}\n")
+            .unwrap();
+        tmp.write_all(b"{\"type\":\"tool_call\",\"name\":\"read_file\"}\n")
+            .unwrap();
+        // Trailing run_result line is the one that should be returned.
+        tmp.write_all(
+            b"{\"type\":\"run_result\",\"summary\":\"task complete\",\"success\":true}\n",
+        )
+        .unwrap();
+        tmp.flush().unwrap();
+
+        let (summary, success) =
+            read_run_result(tmp.path()).expect("should parse the trailing run_result line");
+        assert_eq!(summary, "task complete");
+        assert!(success, "success flag should be true");
+    }
+
+    // ── find_session_file_direct_and_dated ───────────────────────────────────
+    // Regression guard: find_session_file must locate a session JSONL both
+    // directly under sessions_dir AND inside a date-named subdirectory.
+
+    #[test]
+    fn find_session_file_direct_and_dated() {
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let session_id = "test-session-abc123";
+
+        // Case 1: file sitting directly under sessions_dir.
+        let direct = sessions_dir.path().join(format!("{session_id}.jsonl"));
+        std::fs::write(&direct, b"").unwrap();
+        let found = find_session_file(
+            sessions_dir.path().to_str().unwrap(),
+            session_id,
+        );
+        assert_eq!(
+            found.as_deref(),
+            Some(direct.as_path()),
+            "should find file directly under sessions_dir"
+        );
+        std::fs::remove_file(&direct).unwrap();
+
+        // Case 2: file nested inside a date subdirectory.
+        let date_dir = sessions_dir.path().join("2024-01-15");
+        std::fs::create_dir_all(&date_dir).unwrap();
+        let dated = date_dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(&dated, b"").unwrap();
+        let found = find_session_file(
+            sessions_dir.path().to_str().unwrap(),
+            session_id,
+        );
+        assert_eq!(
+            found.as_deref(),
+            Some(dated.as_path()),
+            "should find file inside a date subdir"
+        );
     }
 }

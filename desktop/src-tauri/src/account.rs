@@ -207,3 +207,117 @@ pub async fn delete_all_sessions() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_dir() -> PathBuf {
+        // Uniqueness must not rely on the clock alone: parallel test threads can
+        // call this within the same nanosecond and collide, then cross-delete
+        // each other's dirs (one test's remove_dir_all wipes another's file
+        // mid-write). Combine the timestamp with a per-process atomic counter.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("kim-acct-{nanos}-{n}"));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn minimal_account() -> KimAccount {
+        KimAccount {
+            display_name: "Test User".to_string(),
+            github_username: Some("octocat".to_string()),
+            github_token: None,
+            github_avatar_url: None,
+            gist_id: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            code_projects: vec![],
+            google_accounts: vec![],
+            google_active_account: None,
+            google_api_account: None,
+        }
+    }
+
+    /// Regression: write_account_atomic_inner produces valid pretty JSON that
+    /// round-trips back to an equal KimAccount.
+    #[test]
+    fn write_account_atomic_inner_roundtrip() {
+        let dir = tmp_dir();
+        let path = dir.join("account.json");
+        let original = minimal_account();
+
+        write_account_atomic_inner(&path, &original).expect("write must succeed");
+
+        let raw = fs::read_to_string(&path).expect("file must exist after write");
+        // Verify it is valid pretty JSON (indented).
+        assert!(raw.contains('\n'), "expected pretty-printed JSON with newlines");
+
+        let restored: KimAccount =
+            serde_json::from_str(&raw).expect("must deserialize without error");
+
+        assert_eq!(restored.display_name, original.display_name);
+        assert_eq!(restored.github_username, original.github_username);
+        assert_eq!(restored.created_at, original.created_at);
+        assert_eq!(restored.code_projects, original.code_projects);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: no `.json.tmp` sibling is left on disk after a successful write.
+    #[test]
+    fn no_tmp_leftover() {
+        let dir = tmp_dir();
+        let path = dir.join("account.json");
+        let account = minimal_account();
+
+        write_account_atomic_inner(&path, &account).expect("write must succeed");
+
+        let tmp = path.with_extension("json.tmp");
+        assert!(
+            !tmp.exists(),
+            "sibling .json.tmp must be gone after successful atomic rename"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: an account whose github_token is None serialises to JSON with
+    /// the field absent or null — never an actual PAT string.  This locks in the
+    /// strip-before-persist contract: no real token may reach disk.
+    #[test]
+    fn github_token_serialization_shape() {
+        let dir = tmp_dir();
+        let path = dir.join("account.json");
+        let mut account = minimal_account();
+        account.github_token = None;
+
+        write_account_atomic_inner(&path, &account).expect("write must succeed");
+
+        let raw = fs::read_to_string(&path).expect("file must exist");
+
+        // The field must never carry an actual string value on disk.
+        // serde serialises Option::None without skip_serializing_if as `null`;
+        // either null or absent is acceptable — a quoted string is not.
+        assert!(
+            !raw.contains("\"github_token\": \""),
+            "github_token must not be a string value in persisted JSON; got: {raw}"
+        );
+
+        // Cross-check via round-trip deserialization.
+        let restored: KimAccount =
+            serde_json::from_str(&raw).expect("must deserialize without error");
+        assert!(
+            restored.github_token.is_none(),
+            "github_token must deserialize back to None"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

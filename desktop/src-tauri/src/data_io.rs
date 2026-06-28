@@ -485,3 +485,174 @@ pub async fn restore_from_gist(
 
     Err("Gist found but kim_account.json was empty or invalid.".to_string())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod zip_import_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Build a temp directory unique per test invocation.
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "kim-data-io-{}-{}",
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Write a ZIP archive to `dest` containing the given (name, content) entries.
+    fn make_zip(dest: &Path, entries: &[(&str, &[u8])]) {
+        use zip::write::FileOptions;
+        let file = std::fs::File::create(dest).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // zip_traversal_entries_skipped
+    //
+    // A ZIP containing path-traversal names must not cause any file to be
+    // created outside `base`.  The function must return Ok (it skips, not
+    // errors) and the entries must not land on disk outside `base`.
+    // ------------------------------------------------------------------
+    #[test]
+    fn zip_traversal_entries_skipped() {
+        let work = tmp_dir("traversal");
+        let zip_path = work.join("evil.zip");
+        let base = work.join("sessions");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Target path that would escape `base` if not blocked.
+        let escape_target = work.join("escaped.jsonl");
+
+        make_zip(
+            &zip_path,
+            &[
+                // classic double-dot traversal
+                ("../../escaped.jsonl", b"bad dotdot"),
+                // absolute Unix path
+                ("/etc/passwd.jsonl", b"bad abs unix"),
+                // Windows absolute path
+                ("C:\\windows\\system32\\evil.jsonl", b"bad drive"),
+            ],
+        );
+
+        let result = import_from_zip(&zip_path, &base);
+        assert!(result.is_ok(), "import_from_zip must not error on traversal entries: {:?}", result);
+
+        // Nothing should have been written outside base.
+        assert!(
+            !escape_target.exists(),
+            "traversal entry '../../escaped.jsonl' must not create a file outside base"
+        );
+        // The base itself should be essentially empty (0 .jsonl files written).
+        let written: Vec<_> = walkdir_jsonl(&base);
+        assert!(
+            written.is_empty(),
+            "no .jsonl files should have been extracted from a purely-malicious zip, found: {:?}",
+            written
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    // ------------------------------------------------------------------
+    // safe_entries_extracted
+    //
+    // A normal relative .jsonl entry must be extracted under `base`.
+    // ------------------------------------------------------------------
+    #[test]
+    fn safe_entries_extracted() {
+        let work = tmp_dir("safe");
+        let zip_path = work.join("good.zip");
+        let base = work.join("sessions");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let content = b"{\"role\":\"user\",\"content\":\"hello\"}\n";
+        make_zip(&zip_path, &[("2026-06-28/session-abc.jsonl", content)]);
+
+        let result = import_from_zip(&zip_path, &base);
+        assert!(result.is_ok(), "import_from_zip failed on safe entry: {:?}", result);
+
+        let dest = base.join("2026-06-28").join("session-abc.jsonl");
+        assert!(
+            dest.exists(),
+            "safe relative entry must be extracted to base/date/file.jsonl"
+        );
+        let written = std::fs::read(&dest).unwrap();
+        assert_eq!(written, content, "extracted content must match original");
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    // ------------------------------------------------------------------
+    // no_dir_created_for_traversal_name
+    //
+    // A traversal entry must not cause directory creation outside `base`.
+    // The validation check in import_from_zip must fire before any
+    // fs::create_dir_all call for the traversal path.
+    // ------------------------------------------------------------------
+    #[test]
+    fn no_dir_created_for_traversal_name() {
+        let work = tmp_dir("nodir");
+        let zip_path = work.join("evil2.zip");
+        let base = work.join("sessions");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // A directory that must never be created outside base.
+        let evil_dir = work.join("evil_dir");
+
+        make_zip(
+            &zip_path,
+            &[
+                // This would expand to <base>/../../evil_dir/data.jsonl which
+                // walks out of base.
+                ("../../evil_dir/data.jsonl", b"bad"),
+            ],
+        );
+
+        let result = import_from_zip(&zip_path, &base);
+        assert!(result.is_ok(), "import_from_zip must not error on traversal entry: {:?}", result);
+
+        assert!(
+            !evil_dir.exists(),
+            "traversal entry must not create directory outside base: {:?} exists",
+            evil_dir
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    // ------------------------------------------------------------------
+    // Helper: collect all .jsonl files under a directory tree.
+    // ------------------------------------------------------------------
+    fn walkdir_jsonl(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for e in entries.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walkdir_jsonl(&p));
+                } else if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+}

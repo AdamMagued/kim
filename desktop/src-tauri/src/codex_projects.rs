@@ -344,6 +344,91 @@ pub(crate) fn mirror_latest_claw_session_to_codex(project_path: &Path) -> Option
     Some(dest)
 }
 
+#[cfg(test)]
+mod codex_projects_tests {
+    use super::*;
+    use crate::account::KimAccount;
+
+    fn minimal_account() -> KimAccount {
+        KimAccount {
+            display_name: "Test User".to_string(),
+            github_username: None,
+            github_token: None,
+            github_avatar_url: None,
+            gist_id: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            code_projects: vec![],
+            google_accounts: vec![],
+            google_active_account: None,
+            google_api_account: None,
+        }
+    }
+
+    /// write_account_atomic writes valid JSON that round-trips back to an equal KimAccount.
+    #[test]
+    fn write_account_atomic_produces_valid_json() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let acct_path = dir.path().join("account.json");
+        let account = minimal_account();
+
+        write_account_atomic(&acct_path, &account).expect("write_account_atomic failed");
+
+        assert!(acct_path.exists(), "account.json should exist after write");
+        let raw = std::fs::read_to_string(&acct_path).expect("failed to read account.json");
+        let parsed: KimAccount =
+            serde_json::from_str(&raw).expect("written file is not valid JSON / not a KimAccount");
+
+        assert_eq!(parsed.display_name, account.display_name);
+        assert_eq!(parsed.created_at, account.created_at);
+        assert_eq!(parsed.code_projects, account.code_projects);
+    }
+
+    /// After a successful write_account_atomic the sibling .json.tmp file must not exist.
+    #[test]
+    fn no_tmp_file_left_on_success() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let acct_path = dir.path().join("account.json");
+        let account = minimal_account();
+
+        write_account_atomic(&acct_path, &account).expect("write_account_atomic failed");
+
+        let tmp_path = acct_path.with_extension("json.tmp");
+        assert!(
+            !tmp_path.exists(),
+            ".json.tmp sibling should not exist after successful write"
+        );
+    }
+
+    /// Calling write_account_atomic twice replaces previous contents (last write wins).
+    #[test]
+    fn overwrites_existing_file() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let acct_path = dir.path().join("account.json");
+
+        let mut account_v1 = minimal_account();
+        account_v1.display_name = "Version One".to_string();
+        write_account_atomic(&acct_path, &account_v1).expect("first write failed");
+
+        let mut account_v2 = minimal_account();
+        account_v2.display_name = "Version Two".to_string();
+        account_v2.code_projects = vec!["/some/project".to_string()];
+        write_account_atomic(&acct_path, &account_v2).expect("second write failed");
+
+        let raw = std::fs::read_to_string(&acct_path).expect("failed to read account.json");
+        let parsed: KimAccount = serde_json::from_str(&raw).expect("not valid JSON");
+
+        assert_eq!(
+            parsed.display_name, "Version Two",
+            "second write should overwrite the first"
+        );
+        assert_eq!(
+            parsed.code_projects,
+            vec!["/some/project".to_string()],
+            "code_projects from second write should be present"
+        );
+    }
+}
+
 pub(crate) fn newest_codex_session(project_path: &Path) -> Option<crate::CompletedCodexSession> {
     let sessions_dir = project_path.join(".codex").join("sessions");
     let date_entries = fs::read_dir(&sessions_dir).ok()?;

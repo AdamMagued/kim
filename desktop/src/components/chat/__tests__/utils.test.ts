@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { estimateCostUsd, formatCostUsd, collapseMessages } from '../utils';
+import { estimateCostUsd, formatCostUsd, collapseMessages, friendlyError, parseLogLine } from '../utils';
 
 describe('estimateCostUsd', () => {
   it('returns 0 for ollama (local)', () => {
@@ -83,5 +83,111 @@ describe('collapseMessages srcIdx (B2)', () => {
     ] as any;
     const collapsed = collapseMessages(msgs);
     expect(collapsed.map(c => c.srcIdx)).toEqual([0, 1, 2]);
+  });
+});
+
+const GENERIC_FALLBACK = 'Something went wrong. Check your settings and try again.';
+
+describe('friendlyError — sensitive detail rejection', () => {
+  it('friendlyError_rejects_sensitive_detail: file path triggers fallback', () => {
+    // A slash-separated path segment is sensitive and must never surface in the UI.
+    expect(friendlyError('process died at /home/user/project/run')).toBe(GENERIC_FALLBACK);
+  });
+
+  it('friendlyError_rejects_sensitive_detail: Traceback keyword triggers fallback', () => {
+    expect(friendlyError('Traceback (most recent call last)')).toBe(GENERIC_FALLBACK);
+  });
+
+  it('friendlyError_rejects_sensitive_detail: File "..." reference triggers fallback', () => {
+    expect(friendlyError('File "/opt/project/main.py", line 42, in run')).toBe(GENERIC_FALLBACK);
+  });
+
+  it('friendlyError_rejects_sensitive_detail: .py reference triggers fallback', () => {
+    expect(friendlyError('Exception raised in runner.py:88')).toBe(GENERIC_FALLBACK);
+  });
+
+  it('friendlyError_rejects_sensitive_detail: JS stack frame triggers fallback', () => {
+    // Matches /^\s*at\s+\S+\s+\(/ after cleaning prefixes.
+    expect(friendlyError('at Object.callFn (bundle.js:1:100)')).toBe(GENERIC_FALLBACK);
+  });
+});
+
+describe('friendlyError — short clean message passthrough', () => {
+  it('friendlyError_keeps_short_clean_message: plain short message is returned verbatim', () => {
+    expect(friendlyError('Workspace folder not found')).toBe('Workspace folder not found');
+  });
+
+  it('friendlyError_keeps_short_clean_message: [INFO]/orchestrator prefix is stripped', () => {
+    // The cleaner strips [LEVEL] tags and orchestrator.xxx: prefixes before returning.
+    const result = friendlyError('[INFO] orchestrator.runner: Task is complete');
+    expect(result).toBe('Task is complete');
+    expect(result).not.toContain('[INFO]');
+    expect(result).not.toContain('orchestrator');
+  });
+
+  it('friendlyError_keeps_short_clean_message: [ERROR] prefix is stripped', () => {
+    const result = friendlyError('[ERROR] Something specific happened');
+    expect(result).toBe('Something specific happened');
+  });
+
+  it('friendlyError_keeps_short_clean_message: messages >=200 chars fall back to generic', () => {
+    const long = 'A'.repeat(200);
+    expect(friendlyError(long)).toBe(GENERIC_FALLBACK);
+  });
+});
+
+describe('parseLogLine — balanced-paren arg extraction', () => {
+  it('parseLogLine_balanced_paren_args: extracts full args when JSON exceeds 200 chars', () => {
+    // Build a [TOOL] line whose JSON args string is well over 200 chars.
+    // If extraction naively truncated at 200 chars the JSON.parse would fail and
+    // the label would fall back to `Reading \`\`` (empty basename).
+    const longDir = 'a'.repeat(180);
+    const longPath = `/some/${longDir}/deep/target_file.txt`;
+    const argsJson = JSON.stringify({ path: longPath });
+    // Sanity-check that the args themselves are over 200 chars so the test is meaningful.
+    expect(argsJson.length).toBeGreaterThan(200);
+
+    const rawLine = `[TOOL] read_file(${argsJson})`;
+    const result = parseLogLine(rawLine, 1);
+    expect(result).not.toBeNull();
+    expect(result?.kind).toBe('tool');
+    // The label uses basename(), so it should contain the filename, not empty string.
+    expect(result?.text).toContain('target_file.txt');
+  });
+
+  it('parseLogLine_balanced_paren_args: nested parens in string args do not confuse scanner', () => {
+    // A command that contains parentheses inside a string should still be balanced correctly.
+    const cmd = 'echo "result (ok)"';
+    const argsJson = JSON.stringify({ command: cmd });
+    const rawLine = `[TOOL] run_command(${argsJson})`;
+    const result = parseLogLine(rawLine, 2);
+    expect(result).not.toBeNull();
+    expect(result?.kind).toBe('tool');
+    expect(result?.text).toContain('echo');
+  });
+});
+
+describe('estimateCostUsd — provider normalization regression', () => {
+  it('estimateCostUsd_null_for_unknown_provider: mystery provider returns null', () => {
+    expect(estimateCostUsd('mystery', 1_000_000, 1_000_000)).toBeNull();
+    expect(estimateCostUsd('gpt-4-turbo', 500_000, 200_000)).toBeNull();
+  });
+
+  it('estimateCostUsd_null_for_unknown_provider: browser:claude normalizes to zero-cost', () => {
+    // browser:* providers are free local sessions and must not be billed at claude rates.
+    expect(estimateCostUsd('browser:claude', 2_000_000, 2_000_000)).toBe(0);
+    expect(estimateCostUsd('BROWSER:CLAUDE', 1_000_000, 1_000_000)).toBe(0);
+  });
+
+  it('estimateCostUsd_null_for_unknown_provider: known providers compute a positive number', () => {
+    // openai: $2.50/1M input, $10.00/1M output
+    const openaiCost = estimateCostUsd('openai', 1_000_000, 1_000_000);
+    expect(openaiCost).not.toBeNull();
+    expect(openaiCost!).toBeCloseTo(12.5, 5);
+
+    // gemini: $1.25/1M input, $5.00/1M output
+    const geminiCost = estimateCostUsd('gemini', 1_000_000, 1_000_000);
+    expect(geminiCost).not.toBeNull();
+    expect(geminiCost!).toBeCloseTo(6.25, 5);
   });
 });

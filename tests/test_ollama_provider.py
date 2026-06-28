@@ -4,6 +4,7 @@ from unittest.mock import patch
 from orchestrator.providers.ollama import (
     DEFAULT_OLLAMA_CLOUD_MODEL,
     OllamaProvider,
+    _accumulate_tool_call_delta,
     _normalize_image_data,
     _normalize_tool_arguments,
     _parse_num_ctx,
@@ -221,6 +222,71 @@ class ToolResultMessageContractTests(unittest.TestCase):
         result = _tool_result_message("user", "[Tool result: take_screenshot]\n")
         self.assertIsNotNone(result)
         self.assertEqual(result["content"], "")
+
+
+class AccumulateToolCallDeltaTests(unittest.TestCase):
+    """Regression tests for _accumulate_tool_call_delta streaming accumulator."""
+
+    def test_wholeblock_dict_arguments_stored(self):
+        """A whole-block dict 'arguments' is stored as-is on first occurrence."""
+        acc: dict = {}
+        delta = {"function": {"name": "read_file", "arguments": {"path": "a.txt"}}}
+        _accumulate_tool_call_delta(acc, delta)
+        self.assertEqual(acc["function"]["arguments"], {"path": "a.txt"})
+
+    def test_wholeblock_dict_arguments_not_overwritten_by_second_chunk(self):
+        """A second whole-block dict chunk must NOT overwrite the already-stored dict."""
+        acc: dict = {}
+        _accumulate_tool_call_delta(acc, {"function": {"name": "read_file", "arguments": {"path": "a.txt"}}})
+        _accumulate_tool_call_delta(acc, {"function": {"arguments": {"path": "other.txt"}}})
+        # First chunk wins for dict arguments.
+        self.assertEqual(acc["function"]["arguments"], {"path": "a.txt"})
+
+    def test_delta_string_fragments_concatenated(self):
+        """Multiple string 'arguments' deltas are concatenated in arrival order."""
+        acc: dict = {}
+        _accumulate_tool_call_delta(acc, {"function": {"name": "shell_run", "arguments": '{"cmd":'}})
+        _accumulate_tool_call_delta(acc, {"function": {"arguments": '"ls"}'}})
+        self.assertEqual(acc["function"]["arguments"], '{"cmd":"ls"}')
+
+    def test_name_and_index_handling(self):
+        """Function name is captured from the delta; different 'index' values go to separate slots."""
+        tool_calls: list[dict] = []
+
+        # First tool call at index 0.
+        delta0 = {"index": 0, "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'}}
+        idx = delta0.get("index", 0)
+        while len(tool_calls) <= idx:
+            tool_calls.append({})
+        _accumulate_tool_call_delta(tool_calls[idx], delta0)
+
+        # Second tool call at index 1.
+        delta1 = {"index": 1, "function": {"name": "shell_run", "arguments": '{"cmd":"ls"}'}}
+        idx = delta1.get("index", 0)
+        while len(tool_calls) <= idx:
+            tool_calls.append({})
+        _accumulate_tool_call_delta(tool_calls[idx], delta1)
+
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["function"]["name"], "read_file")
+        self.assertEqual(tool_calls[0]["function"]["arguments"], '{"path":"a.txt"}')
+        self.assertEqual(tool_calls[1]["function"]["name"], "shell_run")
+        self.assertEqual(tool_calls[1]["function"]["arguments"], '{"cmd":"ls"}')
+
+    def test_top_level_id_type_preserved(self):
+        """id and type from the first chunk that carries them are not overwritten by later chunks."""
+        acc: dict = {}
+        _accumulate_tool_call_delta(
+            acc,
+            {"id": "call_42", "type": "function", "function": {"name": "foo", "arguments": ""}},
+        )
+        # Second chunk also has id/type — they must be ignored.
+        _accumulate_tool_call_delta(
+            acc,
+            {"id": "call_99", "type": "other", "function": {"arguments": '{"x":1}'}},
+        )
+        self.assertEqual(acc["id"], "call_42")
+        self.assertEqual(acc["type"], "function")
 
 
 if __name__ == "__main__":

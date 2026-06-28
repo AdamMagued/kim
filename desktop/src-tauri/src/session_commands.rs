@@ -798,4 +798,100 @@ mod k4_tests {
         assert!(validate_run_id("nested/session").is_err());
         assert!(validate_run_id("").is_err());
     }
+
+    // ── Regression guards for delete_session_files (context.json / runs.json /
+    //    wildcard sidecars / isolation between session ids) ────────────────────
+
+    /// All six fixed-name sidecars are removed and the returned count matches.
+    #[test]
+    fn delete_session_files_removes_fixed_sidecars() {
+        let base = tmp();
+        let date_dir = base.join("2026-06-28");
+        fs::create_dir_all(&date_dir).unwrap();
+        let id = "abc-123";
+        let fixed = [
+            format!("{id}.jsonl"),
+            format!("{id}.summary.txt"),
+            format!("{id}.meta.json"),
+            format!("{id}.browser.json"),
+            format!("{id}.context.json"),
+            format!("{id}.runs.json"),
+        ];
+        for name in &fixed {
+            fs::write(date_dir.join(name), "x").unwrap();
+        }
+        let n = delete_session_files(&date_dir, id);
+        assert_eq!(n, 6, "expected 6 fixed sidecars removed, got {n}");
+        for name in &fixed {
+            assert!(
+                !date_dir.join(name).exists(),
+                "{name} should have been deleted"
+            );
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Wildcard sidecars (<id>.compact.*.json and <id>.roll.*.jsonl) are also
+    /// removed by the directory-scan path.
+    #[test]
+    fn delete_session_files_removes_wildcards() {
+        let base = tmp();
+        let date_dir = base.join("2026-06-28");
+        fs::create_dir_all(&date_dir).unwrap();
+        let id = "sess-wild";
+        // At least one fixed file so deletion does not return 0.
+        fs::write(date_dir.join(format!("{id}.jsonl")), "{}").unwrap();
+        // Wildcard sidecars.
+        let compact = format!("{id}.compact.v1.json");
+        let roll1 = format!("{id}.roll.2026-06-28.jsonl");
+        let roll2 = format!("{id}.roll.2026-06-27.jsonl");
+        fs::write(date_dir.join(&compact), "{}").unwrap();
+        fs::write(date_dir.join(&roll1), "{}").unwrap();
+        fs::write(date_dir.join(&roll2), "{}").unwrap();
+
+        let n = delete_session_files(&date_dir, id);
+        // 1 fixed (.jsonl) + 1 compact + 2 roll = 4 total.
+        assert_eq!(n, 4, "expected 4 files removed, got {n}");
+        assert!(!date_dir.join(&compact).exists(), "compact sidecar should be gone");
+        assert!(!date_dir.join(&roll1).exists(), "roll sidecar 1 should be gone");
+        assert!(!date_dir.join(&roll2).exists(), "roll sidecar 2 should be gone");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Files belonging to a different session id, and files with non-matching
+    /// names, are not touched when deleting a specific session.
+    #[test]
+    fn unrelated_files_untouched() {
+        let base = tmp();
+        let date_dir = base.join("2026-06-28");
+        fs::create_dir_all(&date_dir).unwrap();
+
+        let target = "target-session";
+        let other = "other-session";
+
+        // Target session files.
+        fs::write(date_dir.join(format!("{target}.jsonl")), "{}").unwrap();
+        fs::write(date_dir.join(format!("{target}.context.json")), "{}").unwrap();
+
+        // Other session files — must survive.
+        let other_jsonl = date_dir.join(format!("{other}.jsonl"));
+        let other_meta = date_dir.join(format!("{other}.meta.json"));
+        let other_roll = date_dir.join(format!("{other}.roll.2026-06-28.jsonl"));
+        fs::write(&other_jsonl, "{}").unwrap();
+        fs::write(&other_meta, "{}").unwrap();
+        fs::write(&other_roll, "{}").unwrap();
+
+        // A completely unrelated file — must survive.
+        let unrelated = date_dir.join("README.txt");
+        fs::write(&unrelated, "hello").unwrap();
+
+        let n = delete_session_files(&date_dir, target);
+        assert_eq!(n, 2, "expected 2 target files removed, got {n}");
+
+        assert!(other_jsonl.exists(), "other session jsonl must be untouched");
+        assert!(other_meta.exists(), "other session meta must be untouched");
+        assert!(other_roll.exists(), "other session roll must be untouched");
+        assert!(unrelated.exists(), "unrelated file must be untouched");
+        let _ = fs::remove_dir_all(&base);
+    }
 }

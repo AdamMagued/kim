@@ -939,6 +939,148 @@ def test_no_tools_path_uses_complete_run():
     )
 
 
+def test_load_session_concatenates_rolls():
+    """load_session must return rolled-segment messages in stamp order then live file.
+
+    Given <id>.roll.<stamp1>.jsonl, <id>.roll.<stamp2>.jsonl and the live
+    <id>.jsonl all in the same date directory, the returned list must be the
+    concatenation: roll-stamp1 messages, roll-stamp2 messages, live messages —
+    in that chronological stamp order.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        base = Path(tmp_dir)
+        date_dir = base / "2026-01-01"
+        sid = "rollconcat"
+
+        # roll segment 1 (earlier stamp)
+        roll1 = date_dir / f"{sid}.roll.20260101T100000Z.jsonl"
+        roll1.parent.mkdir(parents=True, exist_ok=True)
+        roll1.write_text(
+            json.dumps({"role": "user", "content": "roll1-msg1"}) + "\n"
+            + json.dumps({"role": "assistant", "content": "roll1-msg2"}) + "\n",
+            encoding="utf-8",
+        )
+
+        # roll segment 2 (later stamp)
+        roll2 = date_dir / f"{sid}.roll.20260101T110000Z.jsonl"
+        roll2.write_text(
+            json.dumps({"role": "user", "content": "roll2-msg1"}) + "\n",
+            encoding="utf-8",
+        )
+
+        # live file
+        live = date_dir / f"{sid}.jsonl"
+        live.write_text(
+            json.dumps({"role": "assistant", "content": "live-msg1"}) + "\n",
+            encoding="utf-8",
+        )
+
+        messages = SessionStore.load_session(sid, base_dir=base)
+        assert len(messages) == 4
+        assert messages[0]["content"] == "roll1-msg1"
+        assert messages[1]["content"] == "roll1-msg2"
+        assert messages[2]["content"] == "roll2-msg1"
+        assert messages[3]["content"] == "live-msg1"
+
+
+def test_find_session_file_resolves_roll_only():
+    """find_session_file must return the expected live-file path when only rolled
+    segments exist and the live file has been fully rotated away.
+
+    The returned path need not exist on disk; callers use it to locate the
+    session directory.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        base = Path(tmp_dir)
+        date_dir = base / "2026-01-02"
+        sid = "rollonly"
+
+        # Create a rolled segment but NOT the live file
+        roll_file = date_dir / f"{sid}.roll.20260102T090000Z.jsonl"
+        roll_file.parent.mkdir(parents=True, exist_ok=True)
+        roll_file.write_text(
+            json.dumps({"role": "user", "content": "rolled msg"}) + "\n",
+            encoding="utf-8",
+        )
+
+        result = SessionStore.find_session_file(sid, base_dir=base)
+        expected = date_dir / f"{sid}.jsonl"
+        assert result == expected
+        # The live file itself must NOT exist on disk (it was rotated away)
+        assert not expected.exists()
+
+
+def test_enumeration_excludes_roll():
+    """list_sessions and iter_trace_events must skip .roll. files so rolled
+    segments never appear as phantom sessions in the sidebar or trace queries.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        base = Path(tmp_dir)
+        date_dir = base / "2026-01-03"
+        date_dir.mkdir(parents=True, exist_ok=True)
+
+        live_sid = "realsession"
+        roll_sid = "realsession"
+
+        # Live file
+        live = date_dir / f"{live_sid}.jsonl"
+        live.write_text(
+            json.dumps({"role": "user", "content": "real"}) + "\n",
+            encoding="utf-8",
+        )
+
+        # Rolled segment for the same session (must be excluded from enumeration)
+        roll = date_dir / f"{roll_sid}.roll.20260103T080000Z.jsonl"
+        roll.write_text(
+            json.dumps({"type": "run_started", "task": "phantom"}) + "\n",
+            encoding="utf-8",
+        )
+
+        # list_sessions must not produce a separate entry for the roll file
+        sessions = SessionStore.list_sessions(base_dir=base)
+        session_paths = [s["path"] for s in sessions]
+        assert all(".roll." not in p for p in session_paths), (
+            f"list_sessions returned a .roll. entry: {session_paths}"
+        )
+        # Exactly one session entry (the live file)
+        assert len(sessions) == 1
+
+        # iter_trace_events must not emit records from the roll file directly
+        events = SessionStore.iter_trace_events(base_dir=base, event_type="run_started")
+        # No run_started event should appear from the roll file via iter_trace_events;
+        # the live file contains no run_started records, so the list is empty.
+        for event in events:
+            assert ".roll." not in event.get("session_id", ""), (
+                f"iter_trace_events returned an event sourced from a roll file: {event}"
+            )
+
+
+def test_strip_images_handles_none_content():
+    """_strip_images_for_disk on a message with content=None must drop keys that
+    begin with '_' (internal metadata) rather than returning the message verbatim.
+    """
+    msg = {
+        "role": "assistant",
+        "_has_screenshot": True,
+        "_internal_flag": "debug-only",
+        "content": None,
+    }
+    result = _strip_images_for_disk(msg)
+
+    # Non-underscore keys must be preserved
+    assert result["role"] == "assistant"
+    # content=None is preserved (it is not an image block)
+    assert "content" in result
+    assert result["content"] is None
+    # Underscore-prefixed internal keys must be stripped
+    assert "_has_screenshot" not in result, (
+        "_strip_images_for_disk returned _has_screenshot for content=None message"
+    )
+    assert "_internal_flag" not in result, (
+        "_strip_images_for_disk returned _internal_flag for content=None message"
+    )
+
+
 def test_strip_images_does_not_leak_internal_metadata_keys():
     """_strip_images_for_disk must remove _-prefixed internal keys from all content types."""
     # String content

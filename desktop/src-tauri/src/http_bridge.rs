@@ -1943,3 +1943,148 @@ pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Resul
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests for the /v1/task argv builder logic
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirror the argv-building logic that lives inside the `/v1/task` HTTP handler
+    /// (http_bridge.rs lines ~1087-1098).  The handler calls
+    /// `crate::subprocess::is_bundled_orchestrator` to decide whether to prepend
+    /// `-m orchestrator.agent`, then appends `--task` and `--session-dir`.
+    ///
+    /// Keeping the mirror here (rather than calling the handler directly) lets us
+    /// exercise the decision branch in isolation without needing a Tauri AppHandle.
+    fn build_task_argv(interpreter: &str, task: &str, session_dir: &str) -> Vec<String> {
+        let mut args: Vec<String> = vec![];
+        if !crate::subprocess::is_bundled_orchestrator(interpreter) {
+            args.push("-m".to_string());
+            args.push("orchestrator.agent".to_string());
+        }
+        args.push("--task".to_string());
+        args.push(task.to_string());
+        args.push("--session-dir".to_string());
+        args.push(session_dir.to_string());
+        args
+    }
+
+    /// Regression: a bundled sidecar interpreter must NOT receive `-m orchestrator.agent`
+    /// because it is a standalone executable, not a Python binary.
+    /// Previously, every kimctl /v1/task spawn passed the flag unconditionally and
+    /// caused an immediate "No module named orchestrator" failure.
+    #[test]
+    fn bundled_omits_module_flag() {
+        let bundled_paths = [
+            "kim-orchestrator",
+            "kim-orchestrator-aarch64-apple-darwin",
+            "/Applications/Kim.app/Contents/MacOS/kim-orchestrator-aarch64-apple-darwin",
+            "/usr/local/lib/kim/kim-orchestrator-x86_64-unknown-linux-gnu",
+        ];
+
+        for interpreter in bundled_paths {
+            let argv = build_task_argv(interpreter, "do something", "/tmp/sessions");
+            assert!(
+                !argv.contains(&"-m".to_string()),
+                "bundled interpreter {:?} must NOT receive '-m' flag, got: {:?}",
+                interpreter,
+                argv,
+            );
+            assert!(
+                !argv.contains(&"orchestrator.agent".to_string()),
+                "bundled interpreter {:?} must NOT receive 'orchestrator.agent', got: {:?}",
+                interpreter,
+                argv,
+            );
+        }
+    }
+
+    /// Regression: a plain Python interpreter MUST receive `-m orchestrator.agent`
+    /// so that the orchestrator package is located on PYTHONPATH.
+    /// Without this flag every kimctl task silently failed to import the module.
+    #[test]
+    fn python_includes_module_flag() {
+        let python_paths = [
+            "python3",
+            "python",
+            "/usr/bin/python3",
+            "/home/user/.kim/venv/bin/python",
+            "/path/venv/bin/python3.11",
+        ];
+
+        for interpreter in python_paths {
+            let argv = build_task_argv(interpreter, "do something", "/tmp/sessions");
+            let m_pos = argv.iter().position(|a| a == "-m");
+            let module_pos = argv.iter().position(|a| a == "orchestrator.agent");
+
+            assert!(
+                m_pos.is_some(),
+                "python interpreter {:?} must receive '-m' flag, got: {:?}",
+                interpreter,
+                argv,
+            );
+            assert!(
+                module_pos.is_some(),
+                "python interpreter {:?} must receive 'orchestrator.agent', got: {:?}",
+                interpreter,
+                argv,
+            );
+            // The two flags must be adjacent: `-m orchestrator.agent`
+            assert_eq!(
+                m_pos.unwrap() + 1,
+                module_pos.unwrap(),
+                "'-m' must immediately precede 'orchestrator.agent' for {:?}",
+                interpreter,
+            );
+        }
+    }
+
+    /// Regression: regardless of interpreter type, the built argv must carry
+    /// `--task <task>` and `--session-dir <dir>` so the orchestrator receives
+    /// the user's request and stores its state in the right location.
+    #[test]
+    fn task_and_session_args_present() {
+        let cases = [
+            // (interpreter, expected_has_module_flag)
+            ("kim-orchestrator-aarch64-apple-darwin", false),
+            ("/usr/bin/python3", true),
+        ];
+        let task_value = "write a hello world script";
+        let session_dir_value = "/home/user/.kim/sessions";
+
+        for (interpreter, _) in cases {
+            let argv = build_task_argv(interpreter, task_value, session_dir_value);
+
+            let task_pos = argv.iter().position(|a| a == "--task");
+            assert!(
+                task_pos.is_some(),
+                "interpreter {:?}: '--task' missing from argv {:?}",
+                interpreter,
+                argv,
+            );
+            assert_eq!(
+                argv.get(task_pos.unwrap() + 1).map(String::as_str),
+                Some(task_value),
+                "interpreter {:?}: value after '--task' must be the task string",
+                interpreter,
+            );
+
+            let sdir_pos = argv.iter().position(|a| a == "--session-dir");
+            assert!(
+                sdir_pos.is_some(),
+                "interpreter {:?}: '--session-dir' missing from argv {:?}",
+                interpreter,
+                argv,
+            );
+            assert_eq!(
+                argv.get(sdir_pos.unwrap() + 1).map(String::as_str),
+                Some(session_dir_value),
+                "interpreter {:?}: value after '--session-dir' must be the session dir",
+                interpreter,
+            );
+        }
+    }
+}

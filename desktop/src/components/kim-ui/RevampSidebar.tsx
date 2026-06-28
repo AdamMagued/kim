@@ -54,7 +54,7 @@ export function sessionKey(s: SessionInfo): string {
   return s.session_key ?? `${s.session_type}:${s.date}:${s.session_id}`;
 }
 
-function groupByDate(sessions: SessionInfo[]): { label: string; items: SessionInfo[] }[] {
+export function groupByDate(sessions: SessionInfo[]): { label: string; items: SessionInfo[] }[] {
   const today = new Date();
   const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
   const startOfYesterday = startOfToday - 86_400_000;
@@ -92,7 +92,7 @@ function groupByDate(sessions: SessionInfo[]): { label: string; items: SessionIn
     .map(([label, items]) => ({ label, items }));
 }
 
-function formatTime(date: string): string {
+export function formatTime(date: string): string {
   // Parse date-only strings as LOCAL midnight (same fix as groupByDate).
   let ts: number;
   const localMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);

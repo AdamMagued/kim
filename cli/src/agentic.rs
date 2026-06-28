@@ -379,4 +379,105 @@ mod tests {
         assert!(agentic_available("browser:claude").is_none());
         assert!(agentic_available("desktop").is_none());
     }
+
+    // ── new regression guards ────────────────────────────────────────────────
+
+    /// find_python must return the repo venv interpreter when a `venv/bin/python`
+    /// (or `venv/Scripts/python.exe` on Windows) file exists inside the root,
+    /// without falling through to the system-wide shim.
+    #[test]
+    fn find_python_prefers_venv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // Create the venv directory tree and a stub python file.
+        #[cfg(not(windows))]
+        let venv_python = root.join("venv").join("bin").join("python");
+        #[cfg(windows)]
+        let venv_python = root.join("venv").join("Scripts").join("python.exe");
+
+        std::fs::create_dir_all(venv_python.parent().unwrap())
+            .expect("create venv bin dir");
+        std::fs::write(&venv_python, b"#!/bin/sh\nexec python3 \"$@\"\n")
+            .expect("write stub python");
+
+        let found = find_python(root).expect("find_python should return a path");
+        assert_eq!(
+            found, venv_python,
+            "find_python must return the venv interpreter, got {found:?}"
+        );
+    }
+
+    /// [SUCCESS] and [FAILED] prefix lines must both map to AgentLine::Answer
+    /// carrying exactly the text that follows the marker (no extra whitespace
+    /// stripping beyond what trim_end_matches does on the raw line).
+    #[test]
+    fn parse_agent_line_answer_marker() {
+        // Basic success case.
+        assert_eq!(
+            parse_agent_line("[SUCCESS] task complete"),
+            AgentLine::Answer("task complete".into()),
+            "[SUCCESS] should yield Answer"
+        );
+        // Failed case — same variant, different payload.
+        assert_eq!(
+            parse_agent_line("[FAILED] could not read file"),
+            AgentLine::Answer("could not read file".into()),
+            "[FAILED] should yield Answer"
+        );
+        // Payload with internal spaces preserved.
+        assert_eq!(
+            parse_agent_line("[SUCCESS] done  with  spaces"),
+            AgentLine::Answer("done  with  spaces".into()),
+            "internal spaces in payload must be preserved"
+        );
+        // Trailing CR+LF stripped, marker still recognised.
+        assert_eq!(
+            parse_agent_line("[FAILED] timeout\r\n"),
+            AgentLine::Answer("timeout".into()),
+            "trailing CRLF should be stripped before matching"
+        );
+    }
+
+    /// Typed JSON lines for status / run_done / provider_error must map to their
+    /// respective AgentLine variants with the correct payload.
+    #[test]
+    fn parse_agent_line_activity_and_done() {
+        // status → Activity
+        assert_eq!(
+            parse_agent_line(r#"{"type":"status","message":"reading files"}"#),
+            AgentLine::Activity("reading files".into()),
+            "status with message should be Activity"
+        );
+        // Empty status message → Ignore (not Activity with empty string)
+        assert_eq!(
+            parse_agent_line(r#"{"type":"status","message":""}"#),
+            AgentLine::Ignore,
+            "status with empty message should be Ignore"
+        );
+        // run_done success=true → Done(true)
+        assert_eq!(
+            parse_agent_line(r#"{"type":"run_done","success":true}"#),
+            AgentLine::Done(true),
+            "run_done success:true should be Done(true)"
+        );
+        // run_done success=false → Done(false)
+        assert_eq!(
+            parse_agent_line(r#"{"type":"run_done","success":false}"#),
+            AgentLine::Done(false),
+            "run_done success:false should be Done(false)"
+        );
+        // provider_error with code → ProviderError(code)
+        assert_eq!(
+            parse_agent_line(r#"{"type":"provider_error","code":"rate_limit"}"#),
+            AgentLine::ProviderError("rate_limit".into()),
+            "provider_error should carry the code string"
+        );
+        // provider_error missing code → falls back to "error"
+        assert_eq!(
+            parse_agent_line(r#"{"type":"provider_error"}"#),
+            AgentLine::ProviderError("error".into()),
+            "provider_error without code field should default to 'error'"
+        );
+    }
 }
