@@ -46,6 +46,13 @@ export function useSessionLoader({
     lastLoadedSessionIdRef.current = session.session_id;
     setLoadError(null);
 
+    // Codex run durations come from load_run_history; the run groups come from
+    // load_session_messages. The two invokes race: if load_run_history resolves first
+    // it patches an empty codexRuns, then the groupCodexMessages(...) overwrite clobbers
+    // it (durations lost → "…" pills). Capture the runs so the group build can merge
+    // durations in regardless of which resolves first.
+    let capturedCodexRuns: Array<{ durationSec: number }> | null = null;
+
     if (isSessionChange && !isSeamlessTransition) {
       setLoadingMessages(true);
       stream.setLiveHistory([]);
@@ -65,6 +72,7 @@ export function useSessionLoader({
           if (lastLoadedSessionIdRef.current !== session.session_id) return;
           if (runs && Array.isArray(runs)) {
             stream.setRunHistory(runs);
+            capturedCodexRuns = runs;
             if (runs.length > 0) {
               setCodexRuns(prev =>
                 prev.map((run, i) =>
@@ -120,7 +128,18 @@ export function useSessionLoader({
         setMessages(displayMsgs);
 
         if (session.session_type === 'codex') {
-          setCodexRuns(groupCodexMessages(msgs));
+          const grouped = groupCodexMessages(msgs);
+          // Merge durations captured from load_run_history (if it already resolved),
+          // so the codex "Worked for …" pills show the real duration, not 0.
+          setCodexRuns(
+            capturedCodexRuns
+              ? grouped.map((run, i) =>
+                  capturedCodexRuns![i]?.durationSec > 0
+                    ? { ...run, durationSec: capturedCodexRuns![i].durationSec }
+                    : run
+                )
+              : grouped
+          );
         } else {
           setCodexRuns([]);
         }
