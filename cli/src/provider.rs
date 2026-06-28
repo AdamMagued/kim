@@ -1049,6 +1049,8 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
             let _ = tx.send(AppEvent::Err(
                 "codex produced no output. Check that ollama is running and the model name is correct.".to_string(),
             ));
+        } else if !exit_ok {
+            let _ = tx.send(AppEvent::Err("codex exited with a non-zero status.".to_string()));
         }
         return;
     }

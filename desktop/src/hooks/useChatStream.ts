@@ -249,6 +249,7 @@ export function useChatStream({
     switch (parsed.type) {
       case 'answer':
       case 'codex_agent_message':
+        if (!parsed.payload.trim()) break;
         answerReceivedThisRunRef.current = true;
         setLiveHistory(prev => {
           const last = prev[prev.length - 1];
@@ -460,8 +461,13 @@ export function useChatStream({
       const wasCancelled = cancelFlagRef.current;
       const hadNeedHelp = needHelpFlagRef.current;
       doneHandledRef.current = true;
-      cancelFlagRef.current = false;
-      setIsCancelled(false); // Fix 4: keep state in sync with ref
+      // NOTE: do NOT reset cancelFlagRef.current here. On a user cancel the
+      // backend often emits kim-agent-done before kim-agent-cancelled, and React
+      // batches this callback's state updates so useTaskRunner's queue-drain
+      // passive effect only runs after this callback returns. Clearing the ref
+      // now would make that effect read `false` and auto-run the next queued
+      // task, defeating Stop. The flag is reset by the next runPendingTask().
+      setIsCancelled(false);
       needHelpFlagRef.current = false;
       setIsRunning(false);
       setCancelling(false);

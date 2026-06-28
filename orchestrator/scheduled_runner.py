@@ -21,10 +21,10 @@ verifies that mcp and orchestrator.agent are importable via the resolved
 interpreter.  Failure returns a RunDueResult with error set; record_run is
 never called.
 
-record_run is called atomically within a cross-process runner lock (after
-passing preflight) to prevent duplicate task launches when a timer tick races
-a manual run_due_scheduled_task call.  The lock is released before Popen so
-it is never held during the slow subprocess spawn.
+record_run and Popen are both called while still holding the cross-process
+runner lock so that the task slot is claimed atomically before the lock is
+released.  Popen is non-blocking (fork+exec returns immediately; the child
+runs asynchronously), so the lock is held for only a brief moment.
 
 Active agent PIDs are tracked in a registry file so subsequent invocations can
 reap orphaned/runaway processes that exceed _AGENT_MAX_WALL_SECONDS.
@@ -388,11 +388,11 @@ def run_next_due_task(
     Returns None when no tasks are due.
     Returns a RunDueResult describing the outcome otherwise.
 
-    The due-check, preflight, and record_run are performed while holding a
-    cross-process advisory lock so that a timer tick and a manual
+    The due-check, preflight, Popen, and record_run are all performed while
+    holding a cross-process advisory lock so that a timer tick and a manual
     run_due_scheduled_task call cannot both see the same task as due and
-    launch duplicate agents.  The lock is released before Popen so it is
-    never held during the slow subprocess spawn.
+    launch duplicate agents.  Popen is non-blocking (fork+exec returns
+    immediately), so the lock is held for only a brief moment during spawn.
 
     _interpreter_override: inject a specific interpreter path (tests only).
     """
@@ -406,13 +406,18 @@ def run_next_due_task(
     _reap_stale_agents(kim_root)
 
     # ------------------------------------------------------------------
-    # Atomic section: hold the cross-process runner lock across the
-    # due-check → provider-filter → preflight sequence.
-    # record_run is intentionally called AFTER a successful Popen so that
-    # a spawn failure does not advance next_run_at.
-    # Variables set inside the with-block (task, result, python, env,
-    # provider) remain accessible after it exits.
+    # Atomic section: hold the cross-process runner lock across the entire
+    # due-check → provider-filter → preflight → Popen → record_run sequence.
+    # Keeping Popen and record_run inside the lock means the task slot is
+    # claimed (next_run_at advanced) before the lock is released, so a
+    # concurrent process (e.g. a timer tick racing a manual run) that
+    # acquires the lock next will see the task as no longer due and will not
+    # spawn a duplicate agent.  Popen itself is non-blocking — it fork+execs
+    # and returns immediately — so the lock is held for only a brief moment.
+    # record_run is only called after a successful Popen, preserving the
+    # invariant that a spawn failure does not advance next_run_at.
     # ------------------------------------------------------------------
+    proc = None  # set inside the lock on successful spawn
     try:
         with _runner_exclusive_lock(kim_root):
             due = store.due_tasks(as_of=as_of)
@@ -464,6 +469,56 @@ def run_next_due_task(
                 result.error = preflight_err
                 return result
 
+            # Build args and open the log file before spawning.
+            args = [python, "-m", "orchestrator.agent", "--task", task.task, "--provider", provider]
+            if session_dir is not None:
+                args += ["--session-dir", str(session_dir)]
+
+            log_path = _make_run_log_path(kim_root, task.id)
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_fh = log_path.open("w")
+            except OSError as exc:
+                result.error = f"could not open run log {log_path}: {exc}"
+                return result
+
+            # Spawn the agent.  Popen is non-blocking (fork+exec returns
+            # immediately; the child runs asynchronously), so the lock is
+            # held for only a brief moment here.
+            try:
+                proc = subprocess.Popen(
+                    args,
+                    cwd=str(kim_root),
+                    env=env,
+                    stdout=log_fh,
+                    stderr=log_fh,
+                )
+            except OSError as exc:
+                log_fh.close()
+                try:
+                    log_path.unlink()
+                except OSError:
+                    pass
+                result.error = f"spawn failed: {exc}"
+                return result
+
+            log_fh.close()
+            result.launched = True
+            result.log_file = str(log_path)
+
+            # Advance next_run_at now that the agent is successfully running.
+            # This runs inside the lock so a concurrent process cannot observe
+            # the task as still-due and spawn a duplicate.
+            # Anchor to as_of (the due-check time) rather than wall-clock now,
+            # so catch-up/replay runs advance next_run_at from the scheduled
+            # instant instead of drifting to the moment the runner happened to fire.
+            try:
+                recorded = store.record_run(task.id, ran_at=as_of)
+            except TimeoutError as exc:
+                result.error = f"record_run failed: {exc}"
+                return result
+            result.recorded = recorded is not None
+
     except TimeoutError as exc:
         # Runner lock could not be acquired — treat as a transient error so the
         # task remains due and will be retried on the next timer tick.
@@ -473,56 +528,11 @@ def run_next_due_task(
             error=f"runner lock timeout: {exc}",
         )
 
-    # ------------------------------------------------------------------
-    # Spawn outside the lock so we do not hold it during the slow Popen.
-    # task, result, python, env, provider are all set above.
-    # ------------------------------------------------------------------
-    args = [python, "-m", "orchestrator.agent", "--task", task.task, "--provider", provider]
-    if session_dir is not None:
-        args += ["--session-dir", str(session_dir)]
-
-    log_path = _make_run_log_path(kim_root, task.id)
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_fh = log_path.open("w")
-    except OSError as exc:
-        result.error = f"could not open run log {log_path}: {exc}"
-        return result
-
-    try:
-        proc = subprocess.Popen(
-            args,
-            cwd=str(kim_root),
-            env=env,
-            stdout=log_fh,
-            stderr=log_fh,
-        )
-    except OSError as exc:
-        log_fh.close()
-        try:
-            log_path.unlink()
-        except OSError:
-            pass
-        result.error = f"spawn failed: {exc}"
-        return result
-
-    log_fh.close()
-    result.launched = True
-    result.log_file = str(log_path)
-
-    # Register the PID so future invocations can enforce the wall-clock timeout.
-    _register_agent_pid(kim_root, task.id, int(proc.pid))
-
-    # Advance next_run_at now that the agent is successfully running.
-    # Anchor to as_of (the due-check time) rather than wall-clock now, so
-    # catch-up/replay runs advance next_run_at from the scheduled instant
-    # instead of drifting to the moment the runner happened to fire.
-    try:
-        recorded = store.record_run(task.id, ran_at=as_of)
-    except TimeoutError as exc:
-        result.error = f"record_run failed: {exc}"
-        return result
-    result.recorded = recorded is not None
+    # Register the PID outside the lock — bookkeeping only; does not affect
+    # the due-check race.  proc is guaranteed set here (all early returns above
+    # happen before the Popen or via return inside the with-block).
+    if proc is not None:
+        _register_agent_pid(kim_root, task.id, int(proc.pid))
 
     return result
 

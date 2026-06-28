@@ -1045,6 +1045,7 @@ fn handle_webview_bridge_request(
             let python = match find_python_interpreter(&kim_root) {
                 Ok(p) => p,
                 Err(e) => {
+                    BRIDGE_TASK_STARTING.store(false, Ordering::Release);
                     respond_json(request, 500, serde_json::json!({"ok": false, "error": e}));
                     return;
                 }

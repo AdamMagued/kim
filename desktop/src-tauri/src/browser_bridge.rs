@@ -130,7 +130,7 @@ pub(crate) fn open_browser_signin_window_with_visibility(
                     eprintln!(
                         "[Kim] Failed to parse bridge IPC event: {} — payload: {}",
                         e,
-                        &payload_str[..payload_str.len().min(200)]
+                        payload_str.chars().take(200).collect::<String>()
                     );
                 }
             }
@@ -216,7 +216,8 @@ pub(crate) fn clean_bridge_progress_text(text: &str) -> Option<String> {
     }
 
     if cleaned.len() > 280 {
-        cleaned.truncate(277);
+        let cut = (0..=277).rev().find(|&i| cleaned.is_char_boundary(i)).unwrap_or(0);
+        cleaned.truncate(cut);
         cleaned.push_str("...");
     }
 

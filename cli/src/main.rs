@@ -405,6 +405,13 @@ fn choose_start_mode(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             "c" | "code" | "1" => {
+                if app.config.provider == "openai" {
+                    println!(
+                        "{}",
+                        paint_dim("Code mode does not support OpenAI. Switch provider first: /provider ollama or /provider claude.")
+                    );
+                    continue;
+                }
                 app.set_mode(AppMode::Code);
                 break;
             }

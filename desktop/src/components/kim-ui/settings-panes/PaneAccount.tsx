@@ -187,6 +187,8 @@ function PaneAccount({
       } finally {
         setSaving(false);
       }
+    } else {
+      setNameVal(account.display_name);
     }
     setEditingName(false);
   }

@@ -405,12 +405,15 @@ pub(crate) async fn start_schedule_timer(
                 //   1. TaskState (set by subprocess.rs run_task for IPC/interactive runs)
                 //   2. BRIDGE_TASK_PID / is_bridge_task_running (set by http_bridge.rs for
                 //      kimctl /v1/task runs - those never touch TaskState)
-                if let Some(task_state) = app_handle.try_state::<crate::TaskState>() {
-                    let guard = task_state.lock().await;
-                    if guard.pid.is_some() || guard.starting {
-                        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                        continue;
-                    }
+                let busy = if let Some(task_state) = app_handle.try_state::<crate::TaskState>() {
+                    let g = task_state.lock().await;
+                    g.pid.is_some() || g.starting
+                } else {
+                    false
+                };
+                if busy {
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    continue;
                 }
                 if crate::is_bridge_task_running() {
                     tokio::time::sleep(std::time::Duration::from_secs(interval)).await;

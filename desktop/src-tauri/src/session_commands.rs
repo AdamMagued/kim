@@ -42,6 +42,7 @@ pub async fn delete_sessions(
         crate::validate_session_id(&session_id)?;
 
         let mut deleted = false;
+        let mut had_hard_failure = false;
 
         let dirs_to_search: Vec<PathBuf> = {
             let mut v = vec![kim_dir
@@ -68,6 +69,7 @@ pub async fn delete_sessions(
                     if jsonl_path.exists() {
                         match std::fs::remove_file(&jsonl_path) {
                             Err(e) => {
+                                had_hard_failure = true;
                                 failures.push(format!(
                                     "Failed to delete session file {}: {}",
                                     session_id, e
@@ -90,7 +92,7 @@ pub async fn delete_sessions(
             }
         }
 
-        if !deleted && failures.is_empty() {
+        if !deleted && !had_hard_failure {
             failures.push(format!("Session {} not found for deletion.", session_id));
         }
     }

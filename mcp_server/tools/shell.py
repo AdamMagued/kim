@@ -269,7 +269,7 @@ def _check_single_segment(cmd: str) -> str | None:
             wrapped_name = _basename(wrapped)
             if wrapped_name in _DENY_COMMANDS:
                 return f"BLOCKED: '{wrapped_name}' is a blocked command"
-            wrapped_index = tokens.index(wrapped)
+            wrapped_index = next(i for i in range(1, len(tokens)) if tokens[i] == wrapped)
             if wrapped_name in {"sudo", "doas", "command", "env", "nohup", "nice", "time", "sh", "bash", "zsh", "fish"}:
                 nested_msg = _check_single_segment(" ".join(tokens[wrapped_index:]))
                 if nested_msg:

@@ -293,14 +293,95 @@ import ipaddress
 import urllib.parse
 
 
+def _whatwg_ipv4_part(tok: str) -> int:
+    """Parse one IPv4 host part the way the WHATWG URL parser does.
+
+    Base is selected by prefix: ``0x``/``0X`` -> hex, a leading ``0`` (len>1)
+    -> octal, otherwise decimal. (Plain ``int(tok, 0)`` rejects leading-zero
+    octal like ``0177`` — the gap that let ``0177.0.0.1`` slip past the old
+    SSRF check — so the base is chosen explicitly here.)
+
+    Raises ValueError if the token is not a valid numeric part.
+    """
+    if not tok:
+        raise ValueError("empty IPv4 part")
+    if tok[:2] in ("0x", "0X"):
+        return int(tok, 16)
+    if tok[0] == "0" and len(tok) > 1:
+        return int(tok, 8)
+    return int(tok, 10)
+
+
+def _parse_host_as_ip(host: str):
+    """Try to parse *host* as a numeric IP address in any encoding browsers accept.
+
+    Mirrors the WHATWG URL IPv4 parser so the SSRF check sees the SAME address
+    Chromium will actually dial. Covers:
+    - Standard dotted-decimal IPv4 / IPv6 literals ('127.0.0.1', '::1').
+    - Bare integer in decimal/hex/octal ('2130706433', '0x7f000001', '017700000001').
+    - Dotted notation with non-decimal octets ('0177.0.0.1', '0x7f.0.0.1').
+    - Short dotted forms where the final part absorbs the remaining bytes
+      ('127.1' -> 127.0.0.1, '127.0.1' -> 127.0.0.1, '10.1' -> 10.0.0.1).
+
+    Returns an ipaddress.IPv4Address or IPv6Address on success.
+    Raises ValueError if the host cannot be interpreted as any numeric IP literal
+    (i.e. it is a DNS domain name).
+    """
+    # Fast path: standard dotted-decimal IPv4 or IPv6 literal.
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+
+    # WHATWG IPv4: 1-4 dot-separated parts, each in any base; a single trailing
+    # empty part (host ending in '.') is tolerated. The last part absorbs all
+    # remaining low-order bytes, so fewer than 4 parts is valid.
+    parts = host.split(".")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    if not (1 <= len(parts) <= 4):
+        raise ValueError(f"Not a numeric IP literal: {host!r}")
+    try:
+        nums = [_whatwg_ipv4_part(p) for p in parts]
+    except ValueError:
+        raise ValueError(f"Not a numeric IP literal: {host!r}")
+
+    n = len(nums)
+    # Every part except the last is a single octet (<256); the last part holds
+    # the remaining (4 - (n-1)) bytes.
+    if any(x < 0 or x > 255 for x in nums[:-1]):
+        raise ValueError(f"Not a numeric IP literal: {host!r}")
+    last_max = 256 ** (4 - (n - 1))
+    if not (0 <= nums[-1] < last_max):
+        raise ValueError(f"Not a numeric IP literal: {host!r}")
+
+    value = nums[-1]
+    for i, octet in enumerate(nums[:-1]):
+        value += octet << (8 * (3 - i))
+    if not (0 <= value <= 0xFFFFFFFF):
+        raise ValueError(f"Not a numeric IP literal: {host!r}")
+    return ipaddress.ip_address(value)
+
+
 def _is_ssrf_target(url: str) -> bool:
-    """Return True if the URL resolves to a loopback/private/link-local address (#51)."""
+    """Return True if the URL resolves to a loopback/private/link-local address (#51).
+
+    Closes the bypass where integer/hex/octal IP encodings (e.g. 2130706433,
+    0x7f000001, 0177.0.0.1) were passed through because ipaddress.ip_address()
+    raised ValueError on them, causing the except branch to classify them as
+    safe domain names.  _parse_host_as_ip() normalises all browser-accepted
+    numeric forms before the loopback/private checks run.
+    """
     try:
         parsed = urllib.parse.urlparse(url)
         host = parsed.hostname or ""
-        # Strip IPv6 brackets
+        # Strip IPv6 brackets that urlparse leaves on literal addresses.
         host = host.strip("[]")
-        addr = ipaddress.ip_address(host)
+        try:
+            addr = _parse_host_as_ip(host)
+        except ValueError:
+            # Host is a DNS domain name — allow it (DNS-rebind is out of scope here).
+            return False
         return (
             addr.is_loopback
             or addr.is_private
@@ -308,9 +389,9 @@ def _is_ssrf_target(url: str) -> bool:
             or addr.is_reserved
             or addr.is_multicast
         )
-    except ValueError:
-        # hostname is a domain name — allow it (DNS-rebind protection is out of scope here)
-        return False
+    except Exception:
+        # Malformed URL: default-deny to be safe.
+        return True
 
 
 async def handle_web_open(args: dict) -> str:

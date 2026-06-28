@@ -147,7 +147,17 @@ export function RevampSidebar({
   onCycleTheme,
   onOpenConnectors,
 }: Props) {
-  const grouped = useMemo(() => groupByDate(kimSessions), [kimSessions]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const filteredSessions = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return kimSessions;
+    return kimSessions.filter((s) => {
+      const title = (s.title ?? '').toLowerCase();
+      const id = (s.session_id ?? '').toLowerCase();
+      return title.includes(q) || id.includes(q);
+    });
+  }, [kimSessions, searchQuery]);
+  const grouped = useMemo(() => groupByDate(filteredSessions), [filteredSessions]);
   const [codexProjects, setCodexProjects] = useState<CodexProject[]>([]);
   const projectPaths = useMemo(() => account.code_projects ?? [], [account.code_projects]);
   const [openProjects, setOpenProjects] = useState<string[]>([]);
@@ -502,6 +512,8 @@ export function RevampSidebar({
           type="search"
           placeholder="Search sessions"
           aria-label="Search sessions"
+          value={searchQuery}
+          onChange={(e) => { setSearchQuery(e.target.value); }}
           style={{
             background: 'none',
             border: 'none',

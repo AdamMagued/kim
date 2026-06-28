@@ -887,6 +887,30 @@ class KimAgent:
         # Strip "Thought for Xs" reasoning preamble that some models prepend.
         content = re.sub(r'^Thought for \d+s\s*\n?', '', content, flags=re.IGNORECASE).strip()
 
+        # Check for terminal markers BEFORE attempting JSON tool-call extraction.
+        # A model's completion/summary message may embed tool-JSON in its prose
+        # (e.g. "I removed it by calling {"tool": "delete_file", ...}") — if we
+        # run _extract_json_tool_call first, that JSON gets executed rather than
+        # the run completing.  Terminal markers always take priority.
+        _tc_early = re.search(r"\bTASK_COMPLETE:\s*(.+)\Z", content, re.IGNORECASE | re.DOTALL)
+        if _tc_early:
+            self.memory.add_assistant(content)
+            self._session_store.append_message({"role": "assistant", "content": content})
+            self._emit_plan_markers(content)
+            summary = _tc_early.group(1).strip()
+            self._log("DEBUG", f"TASK_COMPLETE: {summary}")
+            await self._generate_and_save_summary(task, summary)
+            return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, summary, self._run_screenshot_b64))
+
+        _nh_early = re.search(r"\bNEED_HELP:\s*(.+)\Z", content, re.IGNORECASE | re.DOTALL)
+        if _nh_early:
+            self.memory.add_assistant(content)
+            self._session_store.append_message({"role": "assistant", "content": content})
+            self._emit_plan_markers(content)
+            reason = _nh_early.group(1).strip()
+            self._log("DEBUG", f"NEED_HELP: {reason}")
+            return self._complete_run(make_run_result(AgentTermination.NEED_HELP, f"NEED_HELP: {reason}", self._run_screenshot_b64))
+
         # Some models (e.g. gpt-oss:20b) cannot use native tool_calls and
         # instead emit {"tool": "...", "args": {...}} as plain text.
         # Parse and execute it so it never pollutes chat history.
@@ -1341,6 +1365,21 @@ class KimAgent:
                 kwargs = {}
                 if clear_chat and _provider_accepts_kwarg(self.provider.complete, "clear_chat"):
                     kwargs["clear_chat"] = True
+                # Use a provider-aware outer timeout so the cap is never shorter
+                # than the provider's own internal budget.
+                # - BrowserProvider: bridge path polls for up to _BRIDGE_TIMEOUT_S=720s;
+                #   CDP path waits up to RESPONSE_WAIT_S+GENERATION_WAIT_S≈1200s.
+                #   Use 1260s (1200+60s margin) so the internal timeouts always fire first.
+                # - OllamaProvider: httpx streaming client uses _timeout_s=600s.
+                #   Use 660s (600+60s margin).
+                # - All other providers (API-backed): keep the conservative 300s cap.
+                _provider_cls = type(self.provider).__name__
+                if _provider_cls == "BrowserProvider":
+                    _outer_timeout = 1260.0
+                elif _provider_cls == "OllamaProvider":
+                    _outer_timeout = 660.0
+                else:
+                    _outer_timeout = 300.0
                 response = await asyncio.wait_for(
                     self.provider.complete(
                         messages=messages,
@@ -1348,7 +1387,7 @@ class KimAgent:
                         system=system,
                         **kwargs,
                     ),
-                    timeout=300.0,
+                    timeout=_outer_timeout,
                 )
                 try:
                     self._session_store.append_llm_event(
@@ -1371,7 +1410,7 @@ class KimAgent:
                 # so the classifier always sees a named, retryable TimeoutError.
                 _exc_to_classify: Exception = e
                 if isinstance(e, asyncio.TimeoutError) and not isinstance(e, TimeoutError):
-                    _exc_to_classify = TimeoutError(f"LLM provider call timed out after {300.0}s")
+                    _exc_to_classify = TimeoutError(f"LLM provider call timed out after {_outer_timeout}s")
                 provider_error = classify_provider_error(_exc_to_classify)
                 try:
                     self._session_store.append_llm_event(

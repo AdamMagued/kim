@@ -143,11 +143,14 @@ def parse_schedule_expr(expr: str) -> timedelta:
         unit = m.group(2).lower()
         if n < 1:
             raise ValueError(f"@every interval must be >= 1, got {n}")
-        if unit == "m":
-            return timedelta(minutes=n)
-        if unit == "h":
-            return timedelta(hours=n)
-        return timedelta(days=n)
+        try:
+            if unit == "m":
+                return timedelta(minutes=n)
+            if unit == "h":
+                return timedelta(hours=n)
+            return timedelta(days=n)
+        except OverflowError:
+            raise ValueError(f"@every interval out of range: {n}{unit}")
 
     raise ValueError(
         f"Unrecognised schedule expression {expr!r}. "
