@@ -539,7 +539,11 @@ fn handle_webview_bridge_request(
             // for image sends we show + focus it instead of hiding it offscreen. The
             // screenshot was already captured before this send, so showing the window
             // now does not interfere with screen-capture tools.
-            let has_image_attachment = attachments.iter().any(|a| a.mime_type.starts_with("image/"));
+            // Only PNG drives the native-paste path: write_first_png_to_clipboard stages
+            // only PNG, so a non-PNG image here would fire Cmd+V against a STALE clipboard
+            // (pasting whatever the user had copied). Non-PNG images use the file-input /
+            // synthetic-paste strategies instead. Screenshots are always PNG.
+            let has_image_attachment = attachments.iter().any(|a| a.mime_type == "image/png");
 
             // The window stays offscreen (1x1 at -10000,-10000) during
             // headless operation.  JS keeps running at 1x1, no need to
@@ -1042,8 +1046,13 @@ fn handle_webview_bridge_request(
             let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();
 
             let mut cmd = std::process::Command::new(&python);
-            cmd.args(["-m", "orchestrator.agent"])
-                .arg("--task")
+            // When the resolved interpreter is the bundled sidecar it's a standalone
+            // executable, not a Python binary — invoke it directly (matches the canonical
+            // spawn in subprocess.rs). Otherwise `<python> -m orchestrator.agent`.
+            if !crate::subprocess::is_bundled_orchestrator(&python) {
+                cmd.args(["-m", "orchestrator.agent"]);
+            }
+            cmd.arg("--task")
                 .arg(&parsed.task)
                 .arg("--session-dir")
                 .arg(session_dir.to_string_lossy().to_string())
@@ -1056,6 +1065,14 @@ fn handle_webview_bridge_request(
                 .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit());
+            // Own process group so a later /v1/cancel (kill -TERM -<pid>) reaps the whole
+            // process tree (MCP server, browser/Playwright helpers), not just the parent
+            // Python — mirrors subprocess.rs. Without this the children are orphaned.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
+            }
 
             if let Ok(guard) = KIM_PREFERRED_SITE.get_or_init(|| StdMutex::new(None)).lock() {
                 if let Some(site) = &*guard {

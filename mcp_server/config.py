@@ -150,19 +150,23 @@ def validate_path(path_str: str) -> Path:
             f"Path '{p}' is outside allowed directories: {[str(a) for a in ALLOWED_PATHS]}"
         )
 
-    # Check against sensitive path deny list
+    # Check against sensitive path deny list — CASE-INSENSITIVELY. macOS/Windows
+    # filesystems are case-insensitive, so ~/.AWS/CREDENTIALS resolves to the same
+    # on-disk file as ~/.aws/credentials; a case-sensitive comparison (the old
+    # relative_to / fnmatch) let case-varied paths slip past the deny-list. Path.resolve
+    # canonicalizes symlinks and .. but NOT case, so we must lower-case explicitly.
+    p_low = str(p).lower()
     for sensitive in _SENSITIVE_PATHS:
-        try:
-            p.relative_to(sensitive)
+        s_low = str(sensitive).lower()
+        if p_low == s_low or p_low.startswith(s_low + os.sep) or p_low.startswith(s_low + "/"):
             raise PermissionError(
                 f"Path '{p}' is inside sensitive directory '{sensitive}' — access denied"
             )
-        except ValueError:
-            continue
 
-    # Check for secret files (.env, keys, credentials) at ANY depth (G1).
+    # Check for secret files (.env, keys, credentials) at ANY depth (G1), case-insensitively.
+    name_low = p.name.lower()
     for pattern in _SENSITIVE_GLOBS:
-        if fnmatch.fnmatch(p.name, pattern):
+        if fnmatch.fnmatch(name_low, pattern.lower()):
             raise PermissionError(
                 f"Path '{p}' matches sensitive file pattern '{pattern}' "
                 f"({p.name}) — access denied"

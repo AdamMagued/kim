@@ -126,7 +126,11 @@ def parse_response(text: str, completion_hash: str) -> dict:
     text = re.sub(r'</?tool_call>', '', text).strip()
 
     for prefix in ("TASK_COMPLETE:", "NEED_HELP:"):
-        m = re.search(r"\b" + re.escape(prefix) + r"\s*(.+)$", text, re.IGNORECASE | re.MULTILINE)
+        # DOTALL (not MULTILINE): the answer after the marker can span multiple lines
+        # (lists, code, paragraphs). MULTILINE's `(.+)$` stopped at the first line,
+        # truncating multi-line browser answers to one line (e.g. a bullet list →
+        # "Here are the colors:"). Capture everything after the marker to the end.
+        m = re.search(r"\b" + re.escape(prefix) + r"\s*(.+)\Z", text, re.IGNORECASE | re.DOTALL)
         if m:
             return {"type": "text", "content": f"{prefix} {m.group(1).strip()}"}
 

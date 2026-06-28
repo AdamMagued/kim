@@ -414,7 +414,9 @@
     // file input / upload button, which can steal focus or open a picker and make the
     // keystroke miss the editor. The PNG is already on the clipboard and (for image
     // sends) the webview is visible + frontmost + key.
-    if (imageFile && inputEl && typeof requestNativePaste === 'function') {
+    // Only PNG: Rust stages only PNG to the system clipboard, so firing Cmd+V for a
+    // non-PNG image would paste whatever was already on the clipboard (stale/wrong).
+    if (imageFile && imageFile.type === 'image/png' && inputEl && typeof requestNativePaste === 'function') {
       try { inputEl.focus(); } catch (_) {}
       await new Promise(r => setTimeout(r, 150));
       try { inputEl.focus(); } catch (_) {}            // re-assert focus right before the paste
@@ -1023,7 +1025,7 @@
 
   // ── Public API ─────────────────────────────────────────────────────────
   window.__kimBridge = {
-    _v: 17,
+    _v: 18,
     _lastHash: null, // Tracks the completion hash of the most recent request
     _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
     send,

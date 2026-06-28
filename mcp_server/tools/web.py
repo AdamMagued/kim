@@ -300,7 +300,17 @@ async def handle_web_open(args: dict) -> str:
 
     if not url:
         return "ERROR: url is required"
-    if not url.startswith(("http://", "https://", "file://", "about:", "chrome://", "data:")):
+    # Security: the controlled browser must NOT read local files or privileged
+    # pages. file://, chrome://, about:, view-source:, filesystem: would bypass the
+    # path sandbox entirely — e.g. open_url("file:///Users/<u>/.ssh/id_rsa") followed
+    # by web_text() exfiltrates any file with no approval gate. Only http(s) (and
+    # inline data:) are permitted.
+    if url.lower().startswith(("file:", "chrome:", "about:", "view-source:", "filesystem:")):
+        return (
+            "ERROR: refusing to open a local or privileged URL scheme. "
+            "Only http(s) URLs are allowed."
+        )
+    if not url.startswith(("http://", "https://", "data:")):
         url = "https://" + url
 
     page = await _page()
