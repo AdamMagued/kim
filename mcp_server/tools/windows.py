@@ -46,7 +46,7 @@ def _applescript_quote(s: str) -> str:
 
 async def _get_windows_win() -> str:
     import pygetwindow as gw
-    windows = gw.getAllWindows()
+    windows = gw.getAllWindows()  # type: ignore[attr-defined]  # Windows-only pygetwindow API
     lines = []
     for w in windows:
         if w.title.strip():
@@ -59,7 +59,7 @@ async def _get_windows_win() -> str:
 
 async def _focus_window_win(title: str) -> str:
     import pygetwindow as gw
-    matches = gw.getWindowsWithTitle(title)
+    matches = gw.getWindowsWithTitle(title)  # type: ignore[attr-defined]  # Windows-only pygetwindow API
     if not matches:
         return f"ERROR: No window found with title containing '{title}'"
     win = matches[0]
@@ -71,7 +71,7 @@ async def _focus_window_win(title: str) -> str:
 
 async def _resize_window_win(title: str, x: int, y: int, width: int, height: int) -> str:
     import pygetwindow as gw
-    matches = gw.getWindowsWithTitle(title)
+    matches = gw.getWindowsWithTitle(title)  # type: ignore[attr-defined]  # Windows-only pygetwindow API
     if not matches:
         return f"ERROR: No window found with title containing '{title}'"
     win = matches[0]

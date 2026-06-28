@@ -425,7 +425,7 @@ async def handle_web_open(args: dict) -> str:
 
     # Track any origin-scoped route we add so we can remove it after navigation.
     _auth_route_pattern: str | None = None
-    _auth_route_handler = None
+    _auth_route_handler: Any = None
 
     if username and password:
         # BrowserContext.set_http_credentials() does not exist in Playwright (#50).
@@ -438,9 +438,10 @@ async def handle_web_open(args: dict) -> str:
         creds_b64 = base64.b64encode(f"{username}:{password}".encode()).decode()
         auth_header_value = f"Basic {creds_b64}"
 
-        async def _auth_route_handler(route, request):
+        async def _do_auth_route(route, request):
             await route.continue_(headers={**request.headers, "Authorization": auth_header_value})
 
+        _auth_route_handler = _do_auth_route
         _auth_route_pattern = f"{origin_prefix}/**"
         await page.route(_auth_route_pattern, _auth_route_handler)
     else:

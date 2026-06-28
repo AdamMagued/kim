@@ -529,7 +529,8 @@ def _accumulate_tool_call_delta(acc: dict, delta: dict) -> None:
     Both cases are handled: dict arguments are stored as-is on the first
     occurrence; string fragments are concatenated.
     """
-    fn_delta = delta.get("function") if isinstance(delta.get("function"), dict) else {}
+    _fn = delta.get("function")
+    fn_delta: dict = _fn if isinstance(_fn, dict) else {}
     acc_fn: dict = acc.setdefault("function", {"name": "", "arguments": ""})
 
     name = str(fn_delta.get("name") or "").strip()
