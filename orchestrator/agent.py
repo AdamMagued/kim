@@ -36,16 +36,13 @@ import io
 import json
 import logging
 import os
-import platform
 import random
 import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, Optional
 
-import yaml
 from dotenv import load_dotenv
 from mcp import ClientSession
 
@@ -75,33 +72,9 @@ _COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
 
 
 # ---------------------------------------------------------------------------
-# OS detection (used by system prompt and operational guidelines)
+# OS detection (extracted to orchestrator/agent_env.py)
 # ---------------------------------------------------------------------------
-
-def _detect_os() -> tuple[str, str, str]:
-    """Return (os_display_name, launch_example, path_style)."""
-    system = platform.system()
-    if system == "Darwin":
-        return (
-            "macOS",
-            "`open -a 'TextEdit'`",
-            "POSIX paths (e.g. /Users/...)",
-        )
-    elif system == "Linux":
-        return (
-            "Linux",
-            "`xdg-open` or `gedit`",
-            "POSIX paths (e.g. /home/...)",
-        )
-    else:
-        return (
-            "Windows",
-            "`start notepad.exe`",
-            "Windows paths (e.g. C:\\...)",
-        )
-
-
-_OS_NAME, _LAUNCH_EXAMPLE, _PATH_STYLE = _detect_os()
+from orchestrator.agent_env import _detect_os, _OS_NAME, _LAUNCH_EXAMPLE, _PATH_STYLE  # noqa: E402,F401
 
 # ---------------------------------------------------------------------------
 # Tool name normalization (extracted to orchestrator/tool_utils.py)
@@ -119,33 +92,9 @@ from orchestrator.ui_bridge import UIBridge  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Config loading
+# Config loading (extracted to orchestrator/agent_config.py)
 # ---------------------------------------------------------------------------
-
-_DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
-
-
-def load_config(path: Optional[str] = None) -> dict:
-    cfg_path = Path(path) if path else _DEFAULT_CONFIG_PATH
-    if not cfg_path.exists():
-        logger.warning(f"config.yaml not found at {cfg_path}, using defaults")
-        return {}
-    with open(cfg_path) as f:
-        return yaml.safe_load(f) or {}
-
-
-def _resolve_hitl_threshold(config: dict, env_val: Optional[str] = None) -> Optional[str]:
-    """Return the HITL risk threshold from config or env var.
-
-    Accepts "high", "medium", or "low".  Config key wins over env var.
-    Any other value (including None / empty string) disables the gate.
-    """
-    raw = config.get("hitl_risk_threshold") or env_val
-    if raw is None:
-        return None
-    normalized = str(raw).strip().lower()
-    return normalized if normalized in ("high", "medium", "low") else None
-
+from orchestrator.agent_config import _DEFAULT_CONFIG_PATH, load_config, _resolve_hitl_threshold  # noqa: E402,F401
 
 # ---------------------------------------------------------------------------
 # MCP client (extracted to orchestrator/mcp_client.py)
@@ -1884,28 +1833,10 @@ Rules:
             logger.warning(f"Failed to save session summary: {e}")
 
 
-_VISUAL_TASK_RE = re.compile(
-    r"\b(?:"
-    r"on (?:my|the) (?:screen|desktop)|what'?s on (?:my|the)|what (?:do|can) you see|"
-    r"describe (?:my|the|this) (?:screen|desktop|display)|see (?:my|the) (?:screen|desktop)|"
-    r"look at (?:my|the) (?:screen|desktop)|what'?s open|which (?:apps?|windows?)|"
-    r"my screen|the screen|screenshot|screen ?shot|what am i (?:looking at|seeing)"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def _looks_visual(task: str) -> bool:
-    """Heuristic: does this task ask about what's currently on the user's screen?"""
-    return bool(_VISUAL_TASK_RE.search(task or ""))
-
-
-# Screen-reading tools that become redundant once a screenshot is already attached
-# to the first message. Browser web-chat models (Gemini/etc.) tend to reach for
-# get_windows/take_screenshot anyway, which forces a second LLM round-trip back into
-# the chat thread — the exact path that hangs (issue #4). Withholding them on the
-# first turn forces the model to answer directly from the attached image.
-_SCREEN_READ_TOOLS = frozenset({"take_screenshot", "get_windows"})
+# ---------------------------------------------------------------------------
+# Visual-task detection (extracted to orchestrator/visual_task.py)
+# ---------------------------------------------------------------------------
+from orchestrator.visual_task import _VISUAL_TASK_RE, _looks_visual, _SCREEN_READ_TOOLS  # noqa: E402,F401
 
 
 def _provider_accepts_kwarg(fn: Any, name: str) -> bool:
@@ -1931,62 +1862,10 @@ def _usage_int(usage: dict, *keys: str) -> Optional[int]:
     return None
 
 
-def _build_compact_prompt(messages: list[dict]) -> str:
-    transcript = []
-    for idx, msg in enumerate(messages, start=1):
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "image":
-                    parts.append("[image omitted]")
-                elif isinstance(item, dict):
-                    parts.append(str(item.get("text") or item.get("content") or item))
-                else:
-                    parts.append(str(item))
-            content_text = "\n".join(parts)
-        else:
-            content_text = str(content)
-        if len(content_text) > 3000:
-            content_text = content_text[:1400] + "\n…[middle trimmed for compact prompt]…\n" + content_text[-1400:]
-        transcript.append(f"[{idx}] {role}:\n{content_text}")
-
-    return (
-        "Compact this Kim Pro conversation into a durable handoff artifact. "
-        "Preserve concrete decisions, user preferences, file paths, commands, "
-        "provider/session details, errors, NEED_HELP outcomes, and open questions.\n\n"
-        "Return ONLY valid JSON with this shape:\n"
-        '{"summary":"...","decisions":["..."],"paths":["..."],'
-        '"open_questions":["..."],"need_help":["..."],"next_steps":["..."]}\n\n'
-        "Transcript:\n"
-        + "\n\n---\n\n".join(transcript)
-    )
-
-
-def _parse_compact_json(raw: str) -> dict[str, Any]:
-    if not raw:
-        return {"summary": "Conversation compacted, but the model returned an empty summary."}
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-    if match:
-        try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    return {"summary": cleaned[:8000]}
-
+# ---------------------------------------------------------------------------
+# Compact prompt helpers (extracted to orchestrator/compact_prompt.py)
+# ---------------------------------------------------------------------------
+from orchestrator.compact_prompt import _build_compact_prompt, _parse_compact_json  # noqa: E402,F401
 
 # ---------------------------------------------------------------------------
 # Convenience context manager
