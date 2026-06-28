@@ -17,7 +17,7 @@ interface UseBrowserRestoreProps {
   localProvider: string | null;
   browserProvider: string;
   resolveProvider: () => string;
-  browserCommandArgs: (targetSession?: SessionInfo | null, overrideSessionId?: string | null) => any;
+  browserCommandArgs: (targetSession?: SessionInfo | null, overrideSessionId?: string | null) => Record<string, unknown>;
 }
 
 export function useBrowserRestore({

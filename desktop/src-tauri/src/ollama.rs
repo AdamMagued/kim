@@ -199,7 +199,10 @@ async fn ollama_context_from_ps(model: &str) -> Option<u32> {
 }
 
 async fn ollama_context_from_show(base_url: &str, model: &str) -> Option<u32> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
     let resp = client
         .post(format!("{}/api/show", base_url.trim_end_matches('/')))
         .json(&serde_json::json!({ "model": model }))
@@ -218,7 +221,10 @@ async fn ollama_context_from_show(base_url: &str, model: &str) -> Option<u32> {
 }
 
 async fn ollama_version(base_url: &str) -> Result<Option<String>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
     let resp = client
         .get(format!("{}/api/version", base_url.trim_end_matches('/')))
         .send()
@@ -232,7 +238,10 @@ async fn ollama_version(base_url: &str) -> Result<Option<String>, String> {
 }
 
 pub(crate) async fn ollama_tags(base_url: &str) -> Result<Vec<OllamaModelInfo>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
     let resp = client
         .get(format!("{}/api/tags", base_url.trim_end_matches('/')))
         .send()
@@ -259,7 +268,10 @@ pub(crate) async fn ollama_tags(base_url: &str) -> Result<Vec<OllamaModelInfo>, 
 }
 
 async fn ollama_chat_probe(base_url: &str, model: &str) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
     let resp = client
         .post(format!("{}/api/chat", base_url.trim_end_matches('/')))
         .json(&serde_json::json!({
@@ -431,10 +443,13 @@ pub async fn ollama_get_status(
         })
         .unwrap_or(false);
 
+    // For status polling in cloud mode, use a lightweight liveness check
+    // (version endpoint) instead of sending a real generation request on
+    // every poll, which would incur token cost/latency on metered cloud.
+    // Explicit model validation is available via `ollama_test_model`.
     let (cloud_connected, cloud_message) = if selected_mode == "cloud" {
-        let probe_model = selected.clone().unwrap_or(ollama_fallback);
-        match ollama_chat_probe(&base_url, &probe_model).await {
-            Ok(()) => (true, Some("Connected to Ollama".to_string())),
+        match ollama_version(&base_url).await {
+            Ok(_) => (true, Some("Connected to Ollama".to_string())),
             Err(detail) => (false, Some(friendly_ollama_cloud_message(&detail))),
         }
     } else {

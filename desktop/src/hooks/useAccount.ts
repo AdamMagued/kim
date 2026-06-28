@@ -6,7 +6,6 @@ interface UseAccountReturn {
   account: KimAccount | null;
   loading: boolean;
   setAccount: (account: KimAccount) => Promise<void>;
-  clearAccount: () => void;
 }
 
 export function useAccount(): UseAccountReturn {
@@ -25,9 +24,5 @@ export function useAccount(): UseAccountReturn {
     setAccountState(next);
   }, []);
 
-  const clearAccount = useCallback(() => {
-    setAccountState(null);
-  }, []);
-
-  return { account, loading, setAccount, clearAccount };
+  return { account, loading, setAccount };
 }

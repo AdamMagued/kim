@@ -81,6 +81,7 @@ class OpenAIProvider(BaseProvider):
             if oai_tools:
                 kwargs["tools"] = oai_tools
                 kwargs["tool_choice"] = "auto"
+            kwargs["timeout"] = 180.0
 
             response = await self._client.chat.completions.create(**kwargs)
         except openai.RateLimitError:

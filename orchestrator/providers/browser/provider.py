@@ -144,8 +144,8 @@ class BrowserProvider(BaseProvider):
         if self._gemini_authuser is None:
             self._gemini_authuser = self._load_active_gemini_authuser_from_account()
 
-        self._managed_pw = None
-        self._managed_browser = None
+        # _managed_pw / _managed_browser removed: they were set but never read
+        # and never explicitly closed, causing resource leaks (#43).
 
         # ── Persistent session directory ────────────────────────────────
         project_root = Path(
@@ -204,7 +204,10 @@ class BrowserProvider(BaseProvider):
         )
 
     def reset_session(self) -> None:
-        pass
+        """Clear per-session state so a fresh task gets a clean system prompt and tab."""
+        self._sent_system_prompt = False
+        self._last_chat_page_url = None
+        self._last_chat_site = None
 
     def _estimate_prompt_usage(self, prompt: str, attachments: list[dict]) -> dict:
         image_count = sum(
@@ -396,12 +399,18 @@ class BrowserProvider(BaseProvider):
 
                 logger.info(f"[STATUS] Sending message to {site}…")
                 raw_response = await self._send_and_wait(page, cfg, prompt, site, completion_hash)
+                # Pass known_tools so the parser can reject prompt-injected fake tool
+                # calls whose names aren't in the schema the agent actually has (#38).
+                known = {t["name"] for t in (tools or [])} if tools else None
                 return self._attach_usage(
-                    parse_response(raw_response, completion_hash),
+                    parse_response(raw_response, completion_hash, known_tools=known),
                     estimated_usage,
                 )
-        except Exception as e:
-            logger.error(f"BrowserProvider.complete failed: {e}", exc_info=True)
+        except (ConnectionError, OSError, RuntimeError) as e:
+            # Only genuine browser-connection / IO failures are mapped to NEED_HELP;
+            # all other exceptions (KeyError, TypeError, programming bugs) propagate
+            # to the caller's retry / classify_provider_error path (#37).
+            logger.error(f"BrowserProvider.complete browser connection failed: {e}", exc_info=True)
             return self._attach_usage(
                 {"type": "text", "content": f"NEED_HELP: Browser connection failed — {e}"},
                 estimated_usage,
@@ -519,22 +528,10 @@ class BrowserProvider(BaseProvider):
                 )
             await context.new_page()
 
-        self._managed_context = context
         logger.info(
             f"Headless Chromium ready — {len(context.pages)} page(s) loaded"
         )
         return context  # type: ignore[return-value]
-
-    async def _list_pages(self, browser) -> list[str]:
-        pages: list[str] = []
-        if hasattr(browser, 'contexts'):
-            for ctx in browser.contexts:
-                for page in ctx.pages:
-                    pages.append(page.url)
-        elif hasattr(browser, 'pages'):
-            for page in browser.pages:
-                pages.append(page.url)
-        return pages
 
     async def _find_chat_page(self, browser) -> tuple[Optional[Page], Optional[str]]:
         ordered = [

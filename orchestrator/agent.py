@@ -488,8 +488,8 @@ class KimAgent:
                 pump = get_stdin_pump()
                 pump.set_steer_callback(self.add_steer)
                 pump.start()
-            except Exception:
-                pass
+            except Exception as _pump_err:
+                logger.warning("stdin pump start failed: %s", _pump_err)
         self._screenshot_hashes = []
         self._recent_action_sigs = []
         # Reset plan/step dedupe so a fresh PLAN block at the start of this
@@ -731,8 +731,9 @@ class KimAgent:
         tool_args = response.get("args", {})
         if raw_tool_name != tool_name:
             self._log("INFO", f"Normalized tool name '{raw_tool_name}' -> '{tool_name}'")
-        self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]})")
-        print(f"[TOOL] {tool_name}({json.dumps(tool_args)[:120]})", flush=True)
+        _arg_keys = list(tool_args.keys()) if isinstance(tool_args, dict) else []
+        self._log("TOOL", f"{tool_name}(keys={_arg_keys})")
+        print(f"[TOOL] {tool_name}(keys={_arg_keys})", flush=True)
 
         # Model tried to call task_complete as a tool — treat it as TASK_COMPLETE: text
         if tool_name in ("task_complete", "TASK_COMPLETE"):
@@ -939,14 +940,37 @@ class KimAgent:
                 self._emit_plan_markers(thinking)
             tool_name = _normalize_tool_name(_json_call['tool'])
             tool_args = _json_call['args']
-            self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]}) [text-json]")
-            print(f"[TOOL] {tool_name}({json.dumps(tool_args)[:120]})", flush=True)
+            _tj_arg_keys = list(tool_args.keys()) if isinstance(tool_args, dict) else []
+            self._log("TOOL", f"{tool_name}(keys={_tj_arg_keys}) [text-json]")
+            print(f"[TOOL] {tool_name}(keys={_tj_arg_keys})", flush=True)
             self._run_consecutive_continues = 0
+            # Preview gate — same as native tool calls (#27)
+            if self._is_preview_mode() and self._ui_bridge:
+                self._log("INFO", f"[Preview/text-json] Waiting for confirmation: {tool_name}")
+                confirmed = await self._ui_bridge.confirm_action(tool_name, tool_args)
+                if not confirmed:
+                    self._log("WARN", f"Action denied by user: {tool_name}")
+                    self.memory.add_user(
+                        f"[User denied the action: {tool_name}]. "
+                        "Choose a different approach that does not require this action."
+                    )
+                    return None
             result_text = await self._execute_tool(tool_name, tool_args)
             self._run_last_tool = tool_name
             user_content = f"[Tool result: {tool_name}]\n{result_text}"
             self.memory.add_user(user_content)
             self._session_store.append_message({"role": "user", "content": user_content})
+            # Loop guard — same as native tool calls (#27)
+            if self._note_repeated_action(tool_name, tool_args, result_text):
+                nudge = (
+                    "[Loop guard] You have made the same tool call with identical "
+                    "arguments and received an identical result 3 times in a row. "
+                    "This approach is not working — change strategy: use a different "
+                    "tool or different arguments, or stop and ask via NEED_HELP."
+                )
+                self._log("WARN", "Repeated identical action 3x (text-json) — nudging model to change approach")
+                self.memory.add_user(nudge)
+                self._session_store.append_message({"role": "user", "content": nudge})
             return None
 
         self.memory.add_assistant(content)
@@ -1011,7 +1035,7 @@ class KimAgent:
     # ------------------------------------------------------------------
 
     async def _refresh_tools(self) -> None:
-        result = await self.session.list_tools()
+        result = await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
         self._tools = [
             {
                 "name": t.name,
@@ -1064,8 +1088,8 @@ class KimAgent:
                 if label:
                     parts.append(f"→ {label}")
                 return " ".join(x for x in parts if x).strip()
-        except Exception:
-            pass
+        except Exception as _preview_err:
+            logger.debug("_build_approval_preview failed: %s", _preview_err)
         return ""
 
     async def _execute_tool(self, name: str, args: dict) -> str:
@@ -1158,9 +1182,15 @@ class KimAgent:
         output = ""
 
         try:
-            result = await self.session.call_tool(name=name, arguments=args)
+            result = await asyncio.wait_for(
+                self.session.call_tool(name=name, arguments=args),
+                timeout=120.0,
+            )
             parts = [c.text for c in result.content if hasattr(c, "text")]
             output = "\n".join(parts) if parts else "(no output)"
+        except asyncio.TimeoutError:
+            logger.error(f"MCP tool '{name}' timed out after 120s")
+            output = f"ERROR calling {name}: timed out after 120s"
         except Exception as e:
             logger.error(f"MCP tool '{name}' failed: {e}", exc_info=True)
             output = f"ERROR calling {name}: {e}"
@@ -1271,11 +1301,14 @@ class KimAgent:
                 kwargs = {}
                 if clear_chat and _provider_accepts_kwarg(self.provider.complete, "clear_chat"):
                     kwargs["clear_chat"] = True
-                response = await self.provider.complete(
-                    messages=messages,
-                    tools=tools,
-                    system=system,
-                    **kwargs,
+                response = await asyncio.wait_for(
+                    self.provider.complete(
+                        messages=messages,
+                        tools=tools,
+                        system=system,
+                        **kwargs,
+                    ),
+                    timeout=300.0,
                 )
                 try:
                     self._session_store.append_llm_event(
@@ -1292,6 +1325,7 @@ class KimAgent:
                 return response
             except Exception as e:
                 last_error = e
+                # classify_provider_error handles asyncio.TimeoutError → code="timeout", retryable=True.
                 provider_error = classify_provider_error(e)
                 try:
                     self._session_store.append_llm_event(
@@ -1324,7 +1358,9 @@ class KimAgent:
                     "attempt": attempt,
                     "max_retries": self._max_retries,
                 }, separators=(",", ":"), ensure_ascii=False), flush=True)
-                await asyncio.sleep(delay)
+                # Do NOT sleep on the final attempt — the raise immediately follows (#31)
+                if attempt < self._max_retries:
+                    await asyncio.sleep(delay)
 
         raise last_error  # type: ignore[misc]
 
@@ -1361,8 +1397,8 @@ class KimAgent:
                     )
                     if event:
                         print(json.dumps(event, separators=(",", ":"), ensure_ascii=False), flush=True)
-            except Exception:
-                pass
+            except Exception as _rf_err:
+                logger.debug("run_failed event emit failed: %s", _rf_err)
 
         return result
 
@@ -1868,25 +1904,6 @@ def _parse_compact_json(raw: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Fallback direct screenshot
-# ---------------------------------------------------------------------------
-
-def _direct_screenshot(scale: float = 0.75) -> str:
-    import mss
-    from PIL import Image
-
-    with mss.mss() as sct:
-        shot = sct.grab(sct.monitors[1])
-        img = Image.frombytes("RGB", shot.size, shot.rgb)
-    if scale != 1.0:
-        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    img.close()
-    return base64.b64encode(buf.getvalue()).decode()
-
-
-# ---------------------------------------------------------------------------
 # Convenience context manager
 # ---------------------------------------------------------------------------
 
@@ -1928,39 +1945,5 @@ async def mcp_agent_context(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # --- TEMP DEBUG (remove after diagnosing browser-provider crash): tee all
-    # stderr — logging AND uncaught tracebacks — to a file so the real error can
-    # be read off disk. The app only surfaces a generic message to the UI. ---
-    try:
-        import sys as _sys
-
-        _dbg_fh = open("/tmp/kim-stderr-debug.log", "a", buffering=1)
-        _dbg_fh.write(f"\n===== new run @ {__import__('datetime').datetime.now()} argv={_sys.argv[1:]} =====\n")
-
-        class _Tee:
-            def __init__(self, *streams):
-                self._streams = streams
-
-            def write(self, data):
-                for s in self._streams:
-                    try:
-                        s.write(data)
-                        s.flush()
-                    except Exception:
-                        pass
-                return len(data)
-
-            def flush(self):
-                for s in self._streams:
-                    try:
-                        s.flush()
-                    except Exception:
-                        pass
-
-        _sys.stderr = _Tee(_sys.stderr, _dbg_fh)
-    except Exception:
-        pass
-    # --- end temp debug ---
-
     from orchestrator.cli import _build_arg_parser, _cli_main
     asyncio.run(_cli_main(_build_arg_parser().parse_args()))

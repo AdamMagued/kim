@@ -54,14 +54,10 @@ for p in _raw_allowed:
 if PROJECT_ROOT not in ALLOWED_PATHS:
     ALLOWED_PATHS.append(PROJECT_ROOT)
 
-BLOCKED_COMMANDS: list[str] = _cfg.get("shell", {}).get("blocked_commands", [
-    "rm -rf /", "format c:", "del /S /Q C:\\", "rd /S /Q C:\\"
-])
-
 SHELL_TIMEOUT: int = int(_cfg.get("shell", {}).get("timeout", 30))
 _shell_sandbox_env = os.environ.get("KIM_SHELL_SANDBOX_MODE")
 if _shell_sandbox_env is None:
-    SHELL_SANDBOX_MODE: bool = bool(_cfg.get("shell", {}).get("sandbox_mode", False))
+    SHELL_SANDBOX_MODE: bool = bool(_cfg.get("shell", {}).get("sandbox_mode", True))
 else:
     SHELL_SANDBOX_MODE = _shell_sandbox_env.strip().lower() in {"1", "true", "yes", "on"}
 CODE_TIMEOUT: int = int(_cfg.get("code_timeout", 30))
@@ -109,6 +105,18 @@ _SENSITIVE_PATHS: list[Path] = [
     _HOME / "Library" / "Application Support" / "Google" / "Chrome",
     _HOME / "Library" / "Application Support" / "Firefox",
     _HOME / "Library" / "Application Support" / "Code",
+    # Linux browser/session stores (cookies + saved sessions = account takeover).
+    # Listed unconditionally for the same reason as the macOS paths above —
+    # a non-existent path is a harmless no-op on platforms that don't have it.
+    _HOME / ".config" / "google-chrome",
+    _HOME / ".config" / "chromium",
+    _HOME / ".config" / "Code",
+    # Windows AppData paths. On POSIX these expand to non-existent paths and
+    # never match, so no platform guard is needed.
+    _HOME / "AppData" / "Roaming" / "Google" / "Chrome" / "User Data",
+    _HOME / "AppData" / "Roaming" / "Mozilla" / "Firefox" / "Profiles",
+    _HOME / "AppData" / "Roaming" / "Code",
+    _HOME / "AppData" / "Local" / "Google" / "Chrome" / "User Data",
 ]
 # Secret-file name patterns denied at ANY depth inside an allowed root (G1).
 # Matched case-by-case against `p.name` via fnmatch in validate_path().

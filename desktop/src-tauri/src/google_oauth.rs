@@ -17,9 +17,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpListener;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const KEYRING_SERVICE: &str = "kim.google.oauth";
@@ -116,13 +116,6 @@ fn oauth_client_id() -> Result<String, String> {
         .ok_or_else(|| "KIM_GOOGLE_OAUTH_CLIENT_ID is not configured for this Kim build.".to_string())
 }
 
-fn oauth_client_secret() -> Option<String> {
-    option_env!("KIM_GOOGLE_OAUTH_CLIENT_SECRET")
-        .map(str::to_string)
-        .or_else(|| std::env::var("KIM_GOOGLE_OAUTH_CLIENT_SECRET").ok())
-        .filter(|s| !s.trim().is_empty())
-}
-
 fn quota_project() -> Option<String> {
     option_env!("KIM_GOOGLE_CLOUD_PROJECT")
         .map(str::to_string)
@@ -206,7 +199,32 @@ fn system_open_url(url: &str) -> Result<(), String> {
 }
 
 fn wait_for_loopback_callback(listener: TcpListener, expected_state: String) -> Result<String, String> {
-    let (mut stream, _) = listener.accept().map_err(|e| format!("OAuth callback failed: {e}"))?;
+    // Set a 5-minute timeout so abandoning consent doesn't block the thread forever.
+    const TIMEOUT: Duration = Duration::from_secs(300);
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("OAuth callback setup failed: {e}"))?;
+    let deadline = Instant::now() + TIMEOUT;
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(conn) => break conn,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(
+                        "Google sign-in timed out after 5 minutes. Please try again.".to_string(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("OAuth callback failed: {e}")),
+        }
+    };
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| format!("OAuth callback stream setup failed: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| format!("OAuth callback stream setup failed: {e}"))?;
     let mut buf = [0u8; 8192];
     let n = stream.read(&mut buf).map_err(|e| format!("OAuth callback read failed: {e}"))?;
     let request = String::from_utf8_lossy(&buf[..n]);
@@ -240,16 +258,13 @@ fn wait_for_loopback_callback(listener: TcpListener, expected_state: String) -> 
 
 async fn exchange_code_for_token(code: &str, redirect_uri: &str, verifier: &str) -> Result<TokenResponse, String> {
     let client_id = oauth_client_id()?;
-    let mut form = vec![
+    let form = vec![
         ("client_id", client_id),
         ("code", code.to_string()),
         ("code_verifier", verifier.to_string()),
         ("redirect_uri", redirect_uri.to_string()),
         ("grant_type", "authorization_code".to_string()),
     ];
-    if let Some(secret) = oauth_client_secret() {
-        form.push(("client_secret", secret));
-    }
     Client::new()
         .post(GOOGLE_TOKEN_URL)
         .form(&form)
@@ -265,14 +280,11 @@ async fn exchange_code_for_token(code: &str, redirect_uri: &str, verifier: &str)
 
 async fn refresh_access_token(secret: &GoogleOAuthSecret) -> Result<TokenResponse, String> {
     let client_id = oauth_client_id()?;
-    let mut form = vec![
+    let form = vec![
         ("client_id", client_id),
         ("refresh_token", secret.refresh_token.clone()),
         ("grant_type", "refresh_token".to_string()),
     ];
-    if let Some(client_secret) = oauth_client_secret() {
-        form.push(("client_secret", client_secret));
-    }
     Client::new()
         .post(GOOGLE_TOKEN_URL)
         .form(&form)
@@ -300,30 +312,10 @@ async fn fetch_userinfo(access_token: &str) -> Result<UserInfoResponse, String> 
         .map_err(|e| format!("Could not parse Google account email: {e}"))
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct GcpProject {
-    name: Option<String>,
-    project_id: Option<String>,
-    state: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 struct CreateProjectRequest {
     project_id: String,
     name: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct CreateProjectResponse {
-    name: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Serialize)]
-struct ServiceEnablementRequest {
-    service_ids: Vec<String>,
 }
 
 async fn create_gcp_project(access_token: &str, project_id: &str) -> Result<(), String> {

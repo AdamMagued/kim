@@ -15,6 +15,7 @@ returns a clean OS_LIMITATION error message so the LLM can adapt.
 import asyncio
 import logging
 import re
+import urllib.parse
 import webbrowser
 
 from mcp_server.os_utils import CURRENT_OS, IS_WINDOWS, IS_MACOS, IS_LINUX, check_tool_available
@@ -202,7 +203,15 @@ async def _run_cmd(cmd: list[str]) -> tuple[int, str, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except (asyncio.TimeoutError, TimeoutError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        raise
     return (
         proc.returncode or 0,
         stdout.decode("utf-8", errors="replace").strip(),
@@ -384,6 +393,9 @@ async def handle_resize_window(args: dict) -> str:
 
 async def handle_open_url(args: dict) -> str:
     url = str(args["url"])
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return f"ERROR: URL scheme '{parsed.scheme}' is not allowed; only http and https are permitted"
     try:
         webbrowser.open(url)
         logger.info(f"open_url: {url}")

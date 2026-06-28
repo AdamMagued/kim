@@ -1,10 +1,14 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { useAuthStatus } from '../hooks/useAuthStatus';
 import { toast } from './Toast';
+import { BROWSER_PROVIDERS, API_PROVIDERS, OLLAMA_CLOUD_DEFAULT_MODEL } from '../types';
 
-// ── Types (mirror RevampSettings.tsx / src-tauri OllamaStatus) ────────────
+// ── Types ────────────────────────────────────────────────────────────────────
+// BROWSER_PROVIDERS and API_PROVIDERS are imported from ../types (single source of truth).
+
 interface OllamaModelInfo {
   name: string;
   size: number;
@@ -48,20 +52,6 @@ interface ProviderPickerProps {
   disabled?: boolean;
 }
 
-const BROWSER_PROVIDERS: { id: string; label: string }[] = [
-  { id: 'claude',   label: 'Claude' },
-  { id: 'chatgpt',  label: 'ChatGPT' },
-  { id: 'gemini',   label: 'Gemini' },
-  { id: 'grok',     label: 'Grok' },
-  { id: 'deepseek', label: 'DeepSeek' },
-];
-
-const API_PROVIDERS: { id: string; label: string }[] = [
-  { id: 'claude',   label: 'Claude API' },
-  { id: 'openai',   label: 'OpenAI API' },
-  { id: 'gemini',   label: 'Gemini API' },
-  { id: 'deepseek', label: 'DeepSeek API' },
-];
 
 /**
  * Unified provider/model picker. Replaces the older AuthIndicator chip with a
@@ -89,6 +79,14 @@ export function ProviderPicker({
   const [customModelMode, setCustomModelMode] = useState(false);
   const customInputRef = useRef<HTMLInputElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  // Timer ref for the post-signin Ollama refresh (finding #2: clear on unmount).
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    };
+  }, []);
 
   // Currently active provider category — derived from resolvedProvider.
   const isBrowser = resolvedProvider.startsWith('browser:');
@@ -229,7 +227,7 @@ export function ProviderPicker({
     ];
   }, [ollama.mode, ollama.cloud_model, ollama.local_model, ollamaStatus]);
   const selectedOllamaModel = ollama.mode === 'cloud'
-    ? (ollama.cloud_model || 'gpt-oss:120b-cloud')
+    ? (ollama.cloud_model || OLLAMA_CLOUD_DEFAULT_MODEL)
     : ollama.local_model;
   const selectedOllamaModelInfo = inlineOllamaModels.find(m => m.name === selectedOllamaModel);
   const selectedOllamaMeta = [
@@ -438,7 +436,7 @@ export function ProviderPicker({
                       <option value="">No local models</option>
                     )}
                     {ollama.mode === 'cloud' && inlineOllamaModels.length === 0 && (
-                      <option value="gpt-oss:120b-cloud">gpt-oss:120b-cloud</option>
+                      <option value={OLLAMA_CLOUD_DEFAULT_MODEL}>{OLLAMA_CLOUD_DEFAULT_MODEL}</option>
                     )}
                     {inlineOllamaModels.map(model => (
                       <option key={`${ollama.mode}-${model.name}`} value={model.name}>
@@ -497,7 +495,8 @@ export function ProviderPicker({
                       try {
                         await invoke('ollama_signin');
                         toast('Opening Ollama sign-in...', 'info', 2500);
-                        setTimeout(() => { void refreshOllama(); }, 800);
+                        if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+                        refreshTimerRef.current = setTimeout(() => { void refreshOllama(); }, 800);
                       } catch (err) {
                         toast(`Could not open Ollama sign-in: ${err}`, 'error', 4000);
                       }
@@ -506,15 +505,14 @@ export function ProviderPicker({
                     Sign in
                   </button>
                 )}
-                <a
-                  href="https://ollama.com/settings"
-                  target="_blank"
-                  rel="noreferrer"
+                <button
+                  type="button"
                   className="kim-provider-picker__usage-link"
                   title="View cloud usage on ollama.com"
+                  onClick={() => void openUrl('https://ollama.com/settings')}
                 >
                   View usage ↗
-                </a>
+                </button>
               </div>
             )
           )}

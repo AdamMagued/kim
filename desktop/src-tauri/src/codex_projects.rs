@@ -6,10 +6,29 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use crate::account::{KimAccount, account_path};
 use crate::data_io::unix_secs_to_utc_iso;
+
+/// Serialises all read-modify-write access to account.json within this process.
+static ACCOUNT_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Write `account` atomically: serialise to a sibling `.tmp` file, then rename.
+/// The rename is atomic on POSIX (same filesystem); on Windows it is a best-effort
+/// replace via `fs::rename` (atomic enough for our use-case given the mutex guard).
+fn write_account_atomic(acct_path: &Path, account: &KimAccount) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(account).map_err(|e| e.to_string())?;
+    let tmp_path = acct_path.with_extension("json.tmp");
+    fs::write(&tmp_path, &json).map_err(|e| e.to_string())?;
+    fs::rename(&tmp_path, acct_path).map_err(|e| {
+        // Best-effort cleanup; ignore secondary error.
+        let _ = fs::remove_file(&tmp_path);
+        e.to_string()
+    })?;
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CodexSession {
@@ -101,6 +120,8 @@ pub async fn list_codex_projects(project_paths: Vec<String>) -> Result<Vec<Codex
 #[tauri::command]
 pub async fn add_code_project(path: String) -> Result<Vec<String>, String> {
     let acct_path = account_path();
+    let _guard = ACCOUNT_FILE_LOCK.lock().map_err(|e| e.to_string())?;
+
     let mut account: KimAccount = if acct_path.exists() {
         let raw = fs::read_to_string(&acct_path).map_err(|e| e.to_string())?;
         serde_json::from_str(&raw).map_err(|e| e.to_string())?
@@ -117,8 +138,7 @@ pub async fn add_code_project(path: String) -> Result<Vec<String>, String> {
         account.code_projects.push(canonical);
     }
 
-    let json = serde_json::to_string_pretty(&account).map_err(|e| e.to_string())?;
-    fs::write(&acct_path, json).map_err(|e| e.to_string())?;
+    write_account_atomic(&acct_path, &account)?;
     Ok(account.code_projects)
 }
 
@@ -126,6 +146,8 @@ pub async fn add_code_project(path: String) -> Result<Vec<String>, String> {
 #[tauri::command]
 pub async fn remove_code_project(path: String) -> Result<Vec<String>, String> {
     let acct_path = account_path();
+    let _guard = ACCOUNT_FILE_LOCK.lock().map_err(|e| e.to_string())?;
+
     let mut account: KimAccount = if acct_path.exists() {
         let raw = fs::read_to_string(&acct_path).map_err(|e| e.to_string())?;
         serde_json::from_str(&raw).map_err(|e| e.to_string())?
@@ -135,8 +157,7 @@ pub async fn remove_code_project(path: String) -> Result<Vec<String>, String> {
 
     account.code_projects.retain(|p| p != &path);
 
-    let json = serde_json::to_string_pretty(&account).map_err(|e| e.to_string())?;
-    fs::write(&acct_path, json).map_err(|e| e.to_string())?;
+    write_account_atomic(&acct_path, &account)?;
     Ok(account.code_projects)
 }
 

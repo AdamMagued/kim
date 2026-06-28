@@ -1,5 +1,10 @@
 use std::path::{Path, PathBuf};
 
+/// Maximum output tokens requested from the Anthropic API (#24).
+/// 8192 is the published output-token limit for Claude-3 and later models.
+/// Formerly hardcoded inline as the slightly-wrong magic number 8096.
+const ANTHROPIC_MAX_TOKENS: u32 = 8192;
+
 use base64::Engine;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -589,7 +594,7 @@ async fn stream_anthropic(
 
     let mut body = json!({
         "model": config.model,
-        "max_tokens": 8096,
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
         "stream": true,
         "messages": request_messages,
     });
@@ -949,20 +954,30 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
             Some(p) => p,
             None => return,
         };
-        if let Err(e) = write_codex_config(proxy_port, &config.model) {
+        // Use a per-process directory so concurrent runs don't clobber each other
+        // and the path is not globally guessable (#23).  Without tempfile crate
+        // available, we use the PID as a distinguishing suffix.
+        let kim_codex_home = std::env::temp_dir()
+            .join(format!("kim_codex_{}", std::process::id()));
+        if let Err(e) = write_codex_config(proxy_port, &config.model, &kim_codex_home) {
             let _ = tx.send(AppEvent::Err(format!("Failed to write codex config: {e}")));
             return;
         }
-        let kim_codex_home = std::env::temp_dir().join("kim_codex_home");
+        // Gate the sandbox-bypass flag behind an explicit opt-in env var (#1).
+        // Passing it unconditionally disabled the Codex approval gate for every
+        // CLI user, even those who didn't need it.
+        let bypass_sandbox =
+            std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1");
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let mut codex_args: Vec<String> = vec!["exec".into(), "--json".into()];
+        if bypass_sandbox {
+            codex_args.push("--dangerously-bypass-approvals-and-sandbox".into());
+        }
+        codex_args.push("-C".into());
+        codex_args.push(cwd_str);
+        codex_args.push(prompt.to_string());
         match Command::new("codex")
-            .args([
-                "exec",
-                "--json",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "-C",
-                &cwd.to_string_lossy(),
-                prompt,
-            ])
+            .args(&codex_args)
             .env("OPENAI_API_KEY", "ollama")
             .env("CODEX_HOME", &kim_codex_home)
             .stdout(std::process::Stdio::piped())
@@ -1209,9 +1224,8 @@ async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent
     Some(port)
 }
 
-fn write_codex_config(proxy_port: u16, model: &str) -> Result<(), String> {
-    let codex_home = std::env::temp_dir().join("kim_codex_home");
-    std::fs::create_dir_all(&codex_home)
+fn write_codex_config(proxy_port: u16, model: &str, codex_home: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(codex_home)
         .map_err(|e| format!("Cannot create kim codex home {}: {e}", codex_home.display()))?;
     let config_path = codex_home.join("config.toml");
     let content = format!(

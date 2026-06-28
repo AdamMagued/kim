@@ -427,7 +427,23 @@ export function PaneSchedule({
     }
   }
 
-  useEffect(() => { void refresh(); }, []);
+  useEffect(() => {
+    let cancelled = false;
+    async function run() {
+      setLoading(true);
+      setError(null);
+      try {
+        const json = await invoke<string>('list_scheduled_tasks', { enabledOnly: false });
+        if (!cancelled) setTasks(parseTaskList(json));
+      } catch (e) {
+        if (!cancelled) setError(extractInvokeError(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    void run();
+    return () => { cancelled = true; };
+  }, []);
 
   async function refreshTimerStatus() {
     try {
@@ -443,7 +459,24 @@ export function PaneSchedule({
     }
   }
 
-  useEffect(() => { void refreshTimerStatus(); }, []);
+  useEffect(() => {
+    let cancelled = false;
+    async function run() {
+      try {
+        const status = await invoke<ScheduleTimerStatus>('get_schedule_timer_status');
+        if (!cancelled) setTimerStatus(parseTimerStatus(status));
+      } catch (e) {
+        if (!cancelled) setTimerStatus({
+          running: false,
+          interval_seconds: 0,
+          tick_count: 0,
+          last_error: extractInvokeError(e),
+        });
+      }
+    }
+    void run();
+    return () => { cancelled = true; };
+  }, []);
 
   async function handleAdd(form: AddFormState) {
     setAdding(true);

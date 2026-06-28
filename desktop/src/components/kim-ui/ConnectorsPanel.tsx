@@ -144,7 +144,6 @@ export function ConnectorsPanel({ connectors, onClose, onConnect, onManage }: Pr
               fontFamily: 'inherit',
             }}
           />
-          <span className="kr-kbd">⌘K</span>
         </div>
         <div style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 4 }}>
           {cats.map((c) => (

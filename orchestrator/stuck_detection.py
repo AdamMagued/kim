@@ -30,14 +30,30 @@ def screenshot_signature(screenshot_b64: str) -> tuple | str:
         return hashlib.md5(screenshot_b64.encode()).hexdigest()
 
 
-def signatures_similar(a: tuple | str, b: tuple | str) -> bool:
-    """True when two perceptual signatures differ by ≤ 8 thumbnail pixels (~3%)."""
+def signatures_similar(
+    a: tuple | str,
+    b: tuple | str,
+    *,
+    pixel_diff_threshold: int = 1,
+    max_differing_pixels: int = 4,
+) -> bool:
+    """True when two perceptual signatures differ by ≤ *max_differing_pixels* thumbnail
+    pixels, counting only pixels whose absolute luminance-level difference exceeds
+    *pixel_diff_threshold*.
+
+    Defaults (tunable via kwargs):
+      pixel_diff_threshold=1  — ignore single-level noise; raise to suppress more noise
+      max_differing_pixels=4  — ~1.6% of a 16×16 grid; lower → more sensitive to change
+
+    Reducing *max_differing_pixels* from the previous value of 8 cuts false-positives
+    on incrementally-changing screens where only a handful of pixels shift per frame.
+    """
     if isinstance(a, str) or isinstance(b, str):
         return a == b
     if len(a) != len(b):
         return False
-    differing = sum(1 for x, y in zip(a, b) if abs(x - y) > 1)
-    return differing <= 8
+    differing = sum(1 for x, y in zip(a, b) if abs(x - y) > pixel_diff_threshold)
+    return differing <= max_differing_pixels
 
 
 def is_stuck(hashes: list, screenshot_b64: str) -> bool:

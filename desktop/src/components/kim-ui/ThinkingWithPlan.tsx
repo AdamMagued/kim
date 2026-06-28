@@ -1,5 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import type { PlanStep } from './CollapsiblePlan';
+
+export type PlanStepStatus = 'done' | 'active' | 'pending' | 'todo';
+
+export interface PlanStep {
+  status: PlanStepStatus;
+  text: string;
+}
 
 export type TraceItem =
   | { kind: 'thought'; text: string; active?: boolean }

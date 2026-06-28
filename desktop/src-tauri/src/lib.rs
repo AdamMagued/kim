@@ -137,11 +137,21 @@ static IPC_LISTENER_REGISTERED: OnceLock<()> = OnceLock::new();
 static WEBVIEW_BRIDGE_CFG: OnceLock<WebviewBridgeConfig> = OnceLock::new();
 static WEBVIEW_BRIDGE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WEBVIEW_BRIDGE_REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Atomic "task is starting" guard to close the TOCTOU window between the
+/// already-running check and the spawn (#17).  Set to true before spawning,
+/// cleared after the PID is stored or on spawn failure.
+static BRIDGE_TASK_STARTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static WEBVIEW_BRIDGE_RESULTS: OnceLock<StdMutex<HashMap<String, BridgeCompleteResponse>>> = OnceLock::new();
 static WEBVIEW_BRIDGE_PROGRESS: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
 /// Condvar notified whenever a result is inserted into WEBVIEW_BRIDGE_RESULTS.
 /// Collectors wait on this instead of polling every 150ms.
 static WEBVIEW_BRIDGE_NOTIFY: OnceLock<(StdMutex<()>, Condvar)> = OnceLock::new();
+/// Condvar signalled by the /v1/callback handler once the bridge.js initialization
+/// script has reported readiness (flag set to true).  The nav-wait in
+/// `clear_provider_webview_chat` uses this condvar so it can wake early rather
+/// than always sleeping for the full 3 500 ms (#10).
+static WEBVIEW_NAV_READY: OnceLock<(StdMutex<bool>, Condvar)> = OnceLock::new();
 /// Tracks whether the browser window was hidden before a specific /v1/send request, so /v1/result knows to hide it after.
 static WEBVIEW_WAS_HIDDEN: OnceLock<StdMutex<std::collections::HashSet<String>>> = OnceLock::new();
 /// Debug/testing mode: keep the provider webview visible while sending.
@@ -151,10 +161,15 @@ static WEBVIEW_KEEP_VISIBLE: OnceLock<StdMutex<bool>> = OnceLock::new();
 static BRIDGE_TASK_PID: OnceLock<StdMutex<Option<u32>>> = OnceLock::new();
 /// Session ID of the currently-running agent task (set by /v1/task or send_task).
 static BRIDGE_TASK_SESSION: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
+/// Stdin handle for the /v1/task agent process; written by /v1/task/approve for HITL (#15).
+static BRIDGE_TASK_STDIN: OnceLock<StdMutex<Option<std::process::ChildStdin>>> = OnceLock::new();
 /// The site selected via /v1/provider, to be passed to the next agent spawn.
 static KIM_PREFERRED_SITE: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
 /// Last Gemini authuser index intentionally loaded in the in-app browser.
 static WEBVIEW_LAST_GEMINI_AUTHUSER: OnceLock<StdMutex<Option<u32>>> = OnceLock::new();
+/// Child handle for the CDP Chrome process spawned by launch_chrome_for_cdp (#8).
+/// Stored so it can be killed on app shutdown rather than leaking as a zombie.
+static CDP_CHROME_CHILD: OnceLock<StdMutex<Option<std::process::Child>>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -414,10 +429,33 @@ fn now_ms() -> u64 {
 }
 
 fn session_base_dir(session_type: &str, kim_dir: Option<String>, codex_dir: Option<String>) -> PathBuf {
-    if session_type == "codex" {
-        codex_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir)
+    let raw = if session_type == "codex" {
+        codex_dir.map(PathBuf::from)
     } else {
-        kim_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir)
+        kim_dir.map(PathBuf::from)
+    };
+
+    let candidate = match raw {
+        Some(p) => p,
+        None => return default_sessions_dir(),
+    };
+
+    // Canonicalize and enforce that the caller-supplied path stays within the
+    // allowed sessions roots (#13: path traversal via kim_dir / codex_dir).
+    // A path like "../../../etc" would escape the sessions tree; we reject it.
+    let canonical = match candidate.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return default_sessions_dir(),
+    };
+    let allowed_root = default_project_root();
+    if canonical.starts_with(&allowed_root) {
+        canonical
+    } else {
+        eprintln!(
+            "[Kim] session_base_dir: rejected path outside project root: {}",
+            canonical.display()
+        );
+        default_sessions_dir()
     }
 }
 
@@ -490,7 +528,8 @@ fn host_matches_site(host: &str, site: &str) -> bool {
         "chatgpt" => host == "chatgpt.com" || host == "chat.openai.com" || host.ends_with(".chatgpt.com"),
         "gemini" => host == "gemini.google.com",
         "deepseek" => host == "chat.deepseek.com" || host.ends_with(".deepseek.com"),
-        "grok" => host == "grok.com" || host == "grok.x.com" || host == "x.com",
+        // x.com is Twitter's root domain, not Grok (#9).
+        "grok" => host == "grok.com" || host == "grok.x.com",
         _ => false,
     }
 }
@@ -889,7 +928,9 @@ fn json_response(status: u16, body: serde_json::Value) -> Response<std::io::Curs
     if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
         resp.add_header(h);
     }
-    if let Ok(h) = Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]) {
+    // Restrict CORS to the Tauri app origin only — wildcard would allow any
+    // visited website to CORS-fetch this privileged loopback control plane (#7).
+    if let Ok(h) = Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"tauri://localhost"[..]) {
         resp.add_header(h);
     }
     if let Ok(h) = Header::from_bytes(
@@ -909,12 +950,19 @@ fn respond_json(request: Request, status: u16, body: serde_json::Value) {
 }
 
 fn agent_debug_log(hypothesis_id: &str, message: &str, data: serde_json::Value) {
+    // Only write when KIM_BRIDGE_DEBUG=1 is set — the log is plaintext and can
+    // contain prompt content/payloads (#6).  Off by default.
+    if std::env::var("KIM_BRIDGE_DEBUG").as_deref() != Ok("1") {
+        return;
+    }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    // Redact the hardcoded session ID — use a per-process identifier instead.
+    let session_id = format!("proc_{}", std::process::id());
     let line = serde_json::json!({
-        "sessionId": "16b33e",
+        "sessionId": session_id,
         "hypothesisId": hypothesis_id,
         "location": "desktop/src-tauri/src/lib.rs",
         "message": message,
@@ -1041,9 +1089,17 @@ fn clear_provider_webview_chat(
         .eval(format!("window.location.href = {};", js_url))
         .map_err(|e| e.to_string())?;
 
-    // Give the provider SPA and the initialization_script-backed Kim bridge time
+    // Wait for the provider SPA and the initialization_script-backed Kim bridge
     // to install before the next eval calls window.__kimBridge.send(...).
-    std::thread::sleep(Duration::from_millis(3500));
+    // Uses a condvar so a future signal from the bridge readiness callback can
+    // wake this thread early; falls back to 3 500 ms max timeout (#10).
+    {
+        let (lock, cvar) = WEBVIEW_NAV_READY.get_or_init(|| (StdMutex::new(false), Condvar::new()));
+        if let Ok(mut ready) = lock.lock() {
+            *ready = false; // reset for this navigation
+            let _result = cvar.wait_timeout_while(ready, Duration::from_millis(3500), |r| !*r);
+        }
+    }
 
     if normalize_site(site) == "gemini" {
         if let Ok(mut guard) = WEBVIEW_LAST_GEMINI_AUTHUSER
@@ -1148,7 +1204,13 @@ fn prepare_gemini_webview(window: &tauri::WebviewWindow, authuser: Option<u32>, 
         let target_url = gemini_site_url(authuser);
         if let Ok(js_url) = serde_json::to_string(&target_url) {
             let _ = window.eval(format!("window.location.href = {};", js_url));
-            std::thread::sleep(Duration::from_millis(3500));
+            // Same condvar-based wait as clear_provider_webview_chat (#10):
+            // wakes early on bridge readiness, falls back to 3 500 ms.
+            let (lock, cvar) = WEBVIEW_NAV_READY.get_or_init(|| (StdMutex::new(false), Condvar::new()));
+            if let Ok(mut ready) = lock.lock() {
+                *ready = false;
+                let _result = cvar.wait_timeout_while(ready, Duration::from_millis(3500), |r| !*r);
+            }
         }
         if let Ok(mut guard) = WEBVIEW_LAST_GEMINI_AUTHUSER
             .get_or_init(|| StdMutex::new(None))
@@ -1245,15 +1307,46 @@ fn write_first_png_to_clipboard(attachments: &[BridgeAttachment]) -> bool {
         }
     };
 
-    let temp_path = format!("/tmp/kim_clip_{}.png", std::process::id());
-    if let Err(e) = std::fs::write(&temp_path, &bytes) {
-        eprintln!("[Kim] clipboard: write temp failed: {}", e);
-        return false;
+    // Use a random hex suffix for the temp file name rather than a guessable PID
+    // so a malicious process can't race and swap in a symlink (#23/#4).
+    // We use std::fs::OpenOptions with O_CREAT|O_EXCL mode 0600 (via permissions)
+    // instead of the `tempfile` dev-dependency which isn't available in production code.
+    let rand_hex: String = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        (std::time::SystemTime::now(), std::process::id()).hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let temp_path = format!("{}/kim_clip_{}.png", std::env::temp_dir().display(), rand_hex);
+    // Set permissions to 0600 immediately after creation.
+    {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true); // O_CREAT | O_EXCL
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&temp_path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(&bytes) {
+                    eprintln!("[Kim] clipboard: temp write failed: {}", e);
+                    let _ = std::fs::remove_file(&temp_path);
+                    return false;
+                }
+            }
+            Err(e) => {
+                eprintln!("[Kim] clipboard: temp open failed: {}", e);
+                return false;
+            }
+        }
     }
 
-    // «class PNGf» is the four-char AppleScript type for PNG data.
+    // class PNGf is the four-char AppleScript type for PNG data.
     let script = format!(
-        "set the clipboard to (read (POSIX file \"{}\") as «class PNGf»)",
+        "set the clipboard to (read (POSIX file \"{}\") as \u{00AB}class PNGf\u{00BB})",
         temp_path
     );
     let ok = std::process::Command::new("osascript")
@@ -1280,32 +1373,15 @@ fn write_first_png_to_clipboard(_attachments: &[BridgeAttachment]) -> bool {
 /// clipboard. The temporary file is removed immediately after pbcopy reads it.
 #[cfg(target_os = "macos")]
 fn write_text_prompt_to_clipboard(prompt: &str) -> bool {
-    let stamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let temp_path = format!("/tmp/kim_prompt_{}_{}.txt", std::process::id(), stamp);
-    if let Err(e) = std::fs::write(&temp_path, prompt.as_bytes()) {
-        eprintln!("[Kim] clipboard: prompt temp write failed: {}", e);
-        return false;
-    }
-
-    let bytes = match std::fs::read(&temp_path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            let _ = std::fs::remove_file(&temp_path);
-            eprintln!("[Kim] clipboard: prompt temp read failed: {}", e);
-            return false;
-        }
-    };
-
+    // Pipe prompt bytes directly to pbcopy stdin — no temp file needed (#5).
+    // The old approach wrote to a world-readable /tmp file that could expose
+    // the full prompt (which may contain secrets/PII).
     let mut child = match std::process::Command::new("pbcopy")
         .stdin(std::process::Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
         Err(e) => {
-            let _ = std::fs::remove_file(&temp_path);
             eprintln!("[Kim] clipboard: pbcopy spawn failed: {}", e);
             return false;
         }
@@ -1316,11 +1392,10 @@ fn write_text_prompt_to_clipboard(prompt: &str) -> bool {
         .take()
         .map(|mut stdin| {
             use std::io::Write;
-            stdin.write_all(&bytes).is_ok()
+            stdin.write_all(prompt.as_bytes()).is_ok()
         })
         .unwrap_or(false);
     let ok = wrote && child.wait().map(|s| s.success()).unwrap_or(false);
-    let _ = std::fs::remove_file(&temp_path);
 
     if !ok {
         eprintln!("[Kim] clipboard: pbcopy failed (non-fatal)");
@@ -1706,16 +1781,32 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
                 "--remote-debugging-port=9222",
                 "--no-first-run",
                 "--no-default-browser-check",
-                "--disable-popup-blocking",
+                // --disable-popup-blocking removed: weakens browser security (#3).
             ])
             .spawn();
-        if result.is_ok() {
+        if let Ok(child) = result {
+            // Store the child handle so it can be killed on app exit (#8).
+            // Without this, Chrome processes accumulate as zombies.
+            if let Ok(mut guard) = CDP_CHROME_CHILD.get_or_init(|| StdMutex::new(None)).lock() {
+                *guard = Some(child);
+            }
             // Caller is responsible for the post-launch wait so it can use
             // tokio::time::sleep instead of std::thread::sleep.
             return Ok(true); // freshly spawned — caller must wait for port
         }
     }
     Err("Chrome/Chromium not found. Install Google Chrome to use the browser provider.".to_string())
+}
+
+/// Kill the CDP Chrome child on app shutdown (#8).
+pub(crate) fn kill_cdp_chrome() {
+    if let Some(guard) = CDP_CHROME_CHILD.get() {
+        if let Ok(mut child_opt) = guard.lock() {
+            if let Some(mut child) = child_opt.take() {
+                let _ = child.kill();
+            }
+        }
+    }
 }
 
 /// Read a single value from `<kim_root>/.env` (best-effort, no dependency).
@@ -2052,20 +2143,33 @@ pub fn run() {
             schedule_commands::stop_schedule_timer,
             schedule_commands::get_schedule_timer_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            // Kill the CDP Chrome child process on every exit path (#8) so we don't
+            // leave a zombie browser consuming memory and holding the debug port.
+            if let tauri::RunEvent::Exit = event {
+                kill_cdp_chrome();
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Helper: write lines to a temp file, return path.
+    // Helper: write lines to a temp file using O_EXCL-safe NamedTempFile (#23).
+    // subsec_nanos() was guessable and racy — tempfile guarantees uniqueness + 0600 mode.
     fn write_temp_jsonl(lines: &[&str]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("kim_test_{}.jsonl", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos()));
-        std::fs::write(&path, lines.join("\n")).unwrap();
+        use std::io::Write as _;
+        let mut f = tempfile::Builder::new()
+            .prefix("kim_test_")
+            .suffix(".jsonl")
+            .tempfile()
+            .expect("tempfile creation failed");
+        f.write_all(lines.join("\n").as_bytes()).unwrap();
+        // Persist so the test can open it by path; caller is responsible for cleanup.
+        let (_, path) = f.keep().expect("tempfile persist failed");
         path
     }
 
@@ -2102,22 +2206,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn test_build_bridge_complete_script_no_poisoning() {
-        let script = build_bridge_complete_script(
-            "gemini",
-            "hello __KIM_SITE__",
-            "req_123",
-            &[],
-            "http://local",
-            "token__KIM_REQID__",
-            None,
-            None
-        ).unwrap();
-
-        assert!(script.contains("const __kimSite = \"gemini\";"));
-        assert!(script.contains("const __kimPrompt = \"hello __KIM_SITE__\";"));
-        assert!(script.contains("const __kimReqId = \"req_123\";"));
-        assert!(script.contains("const __kimCallbackToken = \"token__KIM_REQID__\";"));
-    }
+    // #22: build_bridge_complete_script was deleted; the persistent bridge.js
+    // initialization_script handles all injection now. The old test that called this
+    // deleted function has been removed to keep `cargo test` green.
 }

@@ -261,11 +261,23 @@ fn executable_from_env(key: &str, kind: CodeBackendKind) -> Option<CodeBackend> 
 }
 
 fn executable_on_path(name: &str, kind: CodeBackendKind) -> Option<CodeBackend> {
-    let out = std::process::Command::new("which").arg(name).output().ok()?;
+    // Use the platform-appropriate PATH search command (#20).
+    #[cfg(target_os = "windows")]
+    let search_cmd = ("where", name);
+    #[cfg(not(target_os = "windows"))]
+    let search_cmd = ("which", name);
+
+    let out = std::process::Command::new(search_cmd.0).arg(search_cmd.1).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // `where` on Windows returns one match per line; take the first.
+    let s = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if s.is_empty() {
         None
     } else {
@@ -453,10 +465,21 @@ pub(crate) async fn send_task(
                 // Tell run_codex_subtask exactly which codex binary to spawn,
                 // so it doesn't have to repeat the search dance.
                 .env("CODEX_BIN", code_bin.to_string_lossy().to_string())
+                // Signal Tauri mode so codex_bridge_service emits a HITL
+                // approval request before spawning Codex (#2). Stdin pipe is
+                // required for the Python side to receive the approval decision.
+                .env("KIM_TAURI_MODE", "1")
+                .stdin(Stdio::piped())
                 // Forward webview-bridge creds so BrowserProvider can drive
                 // the in-app sign-in window in headless mode if configured.
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            // Map permission_mode → KIM_HITL_RISK_THRESHOLD (same vocab as send_task).
+            match permission_mode.as_deref().unwrap_or("full_auto") {
+                "ask_risky" => { c.env("KIM_HITL_RISK_THRESHOLD", "high"); }
+                "ask_always" => { c.env("KIM_HITL_RISK_THRESHOLD", "medium"); }
+                _ => {} // full_auto: no gate
+            }
             c
         } else {
             // ── Direct API mode ──────────────────────────────────────────
@@ -467,9 +490,13 @@ pub(crate) async fn send_task(
                 // so Codex bypasses its own ChatGPT account auth entirely and
                 // routes through the local Ollama daemon instead.
                 c.arg("exec")
-                    .arg("--json")
-                    .arg("--dangerously-bypass-approvals-and-sandbox")
-                    .arg("-C").arg(target_root.to_string_lossy().to_string())
+                    .arg("--json");
+                // Gate the sandbox-bypass flag behind an explicit opt-in env var (#1).
+                // Default: sandboxed + approvals enabled.
+                if std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1") {
+                    c.arg("--dangerously-bypass-approvals-and-sandbox");
+                }
+                c.arg("-C").arg(target_root.to_string_lossy().to_string())
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());

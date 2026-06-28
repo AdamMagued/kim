@@ -11,11 +11,16 @@ export interface ToastMessage {
 
 let _idCounter = 0;
 let _setToasts: React.Dispatch<React.SetStateAction<ToastMessage[]>> | null = null;
+const _preMount: ToastMessage[] = [];
 
 export function toast(text: string, kind: ToastKind = 'info', duration = 4000) {
-  if (!_setToasts) return;
   const id = ++_idCounter;
-  _setToasts(prev => [...prev, { id, kind, text, duration }]);
+  const msg: ToastMessage = { id, kind, text, duration };
+  if (!_setToasts) {
+    _preMount.push(msg);
+    return;
+  }
+  _setToasts(prev => [...prev, msg]);
 }
 
 function CheckIcon() {
@@ -91,6 +96,9 @@ export function ToastProvider() {
 
   useEffect(() => {
     _setToasts = setToasts;
+    if (_preMount.length > 0) {
+      setToasts(prev => [...prev, ..._preMount.splice(0)]);
+    }
     return () => { _setToasts = null; };
   }, []);
 

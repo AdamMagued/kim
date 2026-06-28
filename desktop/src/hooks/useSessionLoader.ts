@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { SessionInfo, KimMessage, Settings } from '../types';
-import type { CodexRunGroup } from '../components/chat/types';
+import type { CodexRunGroup, ActivityItem } from '../components/chat/types';
 import { collapseMessages, groupCodexMessages, isIntermediateToolCall } from '../components/chat/utils';
 import { toast } from '../components/Toast';
 import type { useChatStream } from './useChatStream';
@@ -52,7 +52,7 @@ export function useSessionLoader({
       stream.setRunHistory([]);
       setCodexRuns([]);
 
-      invoke<any[]>('load_run_history', {
+      invoke<Array<{ activity: ActivityItem[]; durationSec: number; provider?: string | null }>>('load_run_history', {
         sessionId: session.session_id,
         sessionDate: session.date || null,
         kimDir: settings.kim_sessions_dir || null,
@@ -62,6 +62,7 @@ export function useSessionLoader({
             : settings.codex_sessions_dir || null,
       })
         .then(runs => {
+          if (lastLoadedSessionIdRef.current !== session.session_id) return;
           if (runs && Array.isArray(runs)) {
             stream.setRunHistory(runs);
             if (runs.length > 0) {
@@ -88,10 +89,20 @@ export function useSessionLoader({
           : settings.codex_sessions_dir || null,
     })
       .then(msgs => {
+        if (lastLoadedSessionIdRef.current !== session.session_id) return;
         const prev = prevMsgCountRef.current.get(session.session_id) ?? 0;
         const displayMsgs = msgs.filter(m => m.role !== 'compact_summary');
-        const lastAssistantIdx = displayMsgs.reduceRight(
+        // Detection uses RAW indices (prevMsgCount is a raw message count). But
+        // newestMsgIdx is consumed against collapseMessages(...) in StreamRenderer, so the
+        // OUTPUT index must be in COLLAPSED space — otherwise the "newest" highlight/
+        // animation lands on the wrong bubble whenever a retry collapses earlier messages.
+        const lastAssistantIdxRaw = displayMsgs.reduceRight(
           (found, m, i) => (found === -1 && m.role === 'assistant' ? i : found),
+          -1
+        );
+        const collapsedDisplay = collapseMessages(displayMsgs);
+        const lastAssistantIdxCollapsed = collapsedDisplay.reduceRight(
+          (found, c, i) => (found === -1 && c.msg.role === 'assistant' ? i : found),
           -1
         );
         if (
@@ -99,9 +110,9 @@ export function useSessionLoader({
           !isSeamlessTransition &&
           prev > 0 &&
           displayMsgs.length > prev &&
-          lastAssistantIdx >= prev
+          lastAssistantIdxRaw >= prev
         ) {
-          setNewestMsgIdx(lastAssistantIdx);
+          setNewestMsgIdx(lastAssistantIdxCollapsed);
         } else {
           setNewestMsgIdx(null);
         }
@@ -131,6 +142,7 @@ export function useSessionLoader({
         }
       })
       .catch(() => {
+        if (lastLoadedSessionIdRef.current !== session.session_id) return;
         // B12: don't silently swallow — surface so the user isn't left with a
         // bare "No messages" with no explanation.
         setMessages([]);
@@ -138,7 +150,7 @@ export function useSessionLoader({
         toast("Couldn't read this session file.", 'error', 4000);
       })
       .finally(() => {
-        if (isSessionChange && !isSeamlessTransition) setLoadingMessages(false);
+        if (isSessionChange && !isSeamlessTransition && lastLoadedSessionIdRef.current === session.session_id) setLoadingMessages(false);
       });
   }, [session, settings.kim_sessions_dir, settings.codex_sessions_dir, messageReloadNonce]);
 

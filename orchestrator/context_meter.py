@@ -123,7 +123,10 @@ class ContextMeter:
         output_tokens: int = 0,
     ) -> ContextSnapshot:
         tokens = max(0, int(tokens or 0))
-        self.cumulative_input += tokens
+        # Stateless APIs re-send the full conversation history on every turn, so
+        # summing input counts grows ~quadratically and produces spurious WARN/CRITICAL
+        # phases. Use the most-recent request size as the window-fill estimate instead.
+        self.cumulative_input = tokens
         return self.snapshot(
             last_input=tokens,
             last_output=max(0, int(output_tokens or 0)),

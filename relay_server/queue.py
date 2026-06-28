@@ -65,6 +65,13 @@ STALE_RUNNING_S = int(os.environ.get("STALE_RUNNING_S", 600))   # 10 min
 # their camera at it.
 PAIR_CODE_TTL_S = int(os.environ.get("PAIR_CODE_TTL_S", 300))   # 5 min
 
+# How long a device_token stays valid before it must be re-paired.
+DEVICE_TOKEN_TTL_S = int(os.environ.get("DEVICE_TOKEN_TTL_S", 7776000))  # 90 days
+
+# Minimum seconds between last_seen DB writes for the same device.
+# Avoids a synchronous DB write on every authenticated request.
+_LAST_SEEN_THROTTLE_S = int(os.environ.get("LAST_SEEN_THROTTLE_S", "60"))
+
 # Length of the alphabet-only pairing code we render in the QR. Six chars from
 # an unambiguous alphabet gives ~10^9 possibilities — collisions are negligible
 # during the 5-minute window and the code is short enough to retype by hand.
@@ -93,11 +100,12 @@ ON tasks (status, priority DESC, created_at ASC);
 
 _CREATE_DEVICES = """
 CREATE TABLE IF NOT EXISTS devices (
-    id            TEXT PRIMARY KEY,
-    device_token  TEXT UNIQUE NOT NULL,
-    device_name   TEXT NOT NULL,
-    paired_at     TIMESTAMP NOT NULL,
-    last_seen     TIMESTAMP
+    id                TEXT PRIMARY KEY,
+    device_token      TEXT UNIQUE NOT NULL,
+    device_name       TEXT NOT NULL,
+    paired_at         TIMESTAMP NOT NULL,
+    last_seen         TIMESTAMP,
+    token_expires_at  TIMESTAMP
 );
 """
 
@@ -135,6 +143,13 @@ class TaskDB:
         await self._db.execute(_CREATE_DEVICES)
         await self._db.execute(_CREATE_DEVICES_INDEX)
         await self._db.execute(_CREATE_PAIRINGS)
+        # Migrate pre-existing installs: add token_expires_at if not present.
+        try:
+            await self._db.execute(
+                "ALTER TABLE devices ADD COLUMN token_expires_at TIMESTAMP"
+            )
+        except Exception:
+            pass  # column already exists — ignore
         await self._db.commit()
         logger.info(f"TaskDB initialised: {self._path}")
 
@@ -153,7 +168,7 @@ class TaskDB:
             (task_id, task, priority),
         )
         await self._db.commit()
-        logger.info(f"Enqueued task {task_id!r} priority={priority}: {task[:60]}")
+        logger.info(f"Enqueued task {task_id!r} priority={priority} len={len(task)}")
         return task_id
 
     async def dequeue(self) -> dict | None:
@@ -267,7 +282,7 @@ class TaskDB:
                     (pair_code, _iso(now), _iso(expires)),
                 )
                 await self._db.commit()
-                logger.info(f"Pairing code created: {pair_code} (expires {_iso(expires)})")
+                logger.info(f"Pairing code created: [REDACTED] (expires {_iso(expires)})")
                 return {"pair_code": pair_code, "expires_at": _iso(expires)}
             except aiosqlite.IntegrityError:
                 continue
@@ -275,40 +290,61 @@ class TaskDB:
 
     async def complete_pairing(self, pair_code: str, device_name: str) -> dict | None:
         """
-        Redeem a `pair_code` and create a device record. Returns
+        Atomically redeem a `pair_code` and create a device record. Returns
         `{"device_token": str, "device_id": str}` on success, or `None` if the
         code is unknown / expired / already claimed.
-        """
-        await self._expire_stale_pairings(commit=False)
-        async with self._db.execute(
-            "SELECT pair_code, expires_at, claimed_at FROM pending_pairings WHERE pair_code=?",
-            (pair_code,),
-        ) as cur:
-            row = await cur.fetchone()
-        if row is None:
-            return None
-        if row["claimed_at"] is not None:
-            return None
-        # SQLite stores ISO strings; compare lexically is safe for our format.
-        if _iso(datetime.now(timezone.utc)) > str(row["expires_at"]):
-            return None
 
+        Uses BEGIN IMMEDIATE so that two concurrent calls for the same code
+        cannot both succeed: only the first will find `claimed_at IS NULL` and
+        win the conditional UPDATE; the second gets rowcount=0 and rolls back.
+        """
         device_id = uuid4().hex
         device_token = secrets.token_urlsafe(32)
-        now = _iso(datetime.now(timezone.utc))
-        await self._db.execute(
-            """
-            INSERT INTO devices (id, device_token, device_name, paired_at, last_seen)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (device_id, device_token, device_name, now, now),
-        )
-        await self._db.execute(
-            "UPDATE pending_pairings SET claimed_at=?, device_id=? WHERE pair_code=?",
-            (now, device_id, pair_code),
-        )
-        await self._db.commit()
-        logger.info(f"Pairing {pair_code!r} completed → device {device_id} ({device_name!r})")
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            await self._expire_stale_pairings(commit=False)
+            async with self._db.execute(
+                "SELECT pair_code, expires_at, claimed_at FROM pending_pairings WHERE pair_code=?",
+                (pair_code,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                await self._db.rollback()
+                return None
+            if row["claimed_at"] is not None:
+                await self._db.rollback()
+                return None
+            # SQLite stores ISO strings; compare lexically is safe for our format.
+            if _iso(datetime.now(timezone.utc)) > str(row["expires_at"]):
+                await self._db.rollback()
+                return None
+
+            now = _iso(datetime.now(timezone.utc))
+            token_expires = _iso(
+                datetime.now(timezone.utc) + timedelta(seconds=DEVICE_TOKEN_TTL_S)
+            )
+            await self._db.execute(
+                """
+                INSERT INTO devices (id, device_token, device_name, paired_at, last_seen, token_expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (device_id, device_token, device_name, now, now, token_expires),
+            )
+            # Conditional UPDATE guards against a concurrent redemption that
+            # slipped past the SELECT above under high concurrency.
+            cur2 = await self._db.execute(
+                "UPDATE pending_pairings SET claimed_at=?, device_id=? WHERE pair_code=? AND claimed_at IS NULL",
+                (now, device_id, pair_code),
+            )
+            if cur2.rowcount != 1:
+                await self._db.rollback()
+                return None
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
+
+        logger.info(f"Pairing [REDACTED] completed → device {device_id} ({device_name!r})")
         return {"device_token": device_token, "device_id": device_id}
 
     async def get_pairing_status(self, pair_code: str) -> dict | None:
@@ -339,25 +375,54 @@ class TaskDB:
 
     async def lookup_device_by_token(self, token: str) -> dict | None:
         """
-        Return `{"id", "device_name", "paired_at"}` if `token` matches a paired
-        device, else None. Also refreshes `last_seen` as a side effect so the
-        admin UI can show "last active 12s ago".
+        Return `{"id", "device_name", "paired_at", "device_token"}` if `token`
+        matches a non-expired paired device, else None.
+
+        The caller (auth.py) MUST re-verify `device_token` with
+        `secrets.compare_digest` to ensure constant-time comparison at the
+        Python layer.
+
+        `last_seen` is refreshed at most once per `_LAST_SEEN_THROTTLE_S`
+        seconds to avoid a synchronous DB write on every authenticated request.
         """
         if not token:
             return None
         async with self._db.execute(
-            "SELECT id, device_name, paired_at FROM devices WHERE device_token=?",
+            "SELECT id, device_name, paired_at, last_seen, device_token, token_expires_at"
+            " FROM devices WHERE device_token=?",
             (token,),
         ) as cur:
             row = await cur.fetchone()
         if row is None:
             return None
-        await self._db.execute(
-            "UPDATE devices SET last_seen=? WHERE id=?",
-            (_iso(datetime.now(timezone.utc)), row["id"]),
-        )
-        await self._db.commit()
-        return {"id": row["id"], "device_name": row["device_name"], "paired_at": row["paired_at"]}
+        # Reject tokens past their expiry date (Finding 4).
+        if row["token_expires_at"] is not None:
+            if _iso(datetime.now(timezone.utc)) > str(row["token_expires_at"]):
+                return None
+        # Throttle last_seen writes: skip if updated recently (Finding 5).
+        do_write = True
+        last_seen = row["last_seen"]
+        if last_seen is not None:
+            try:
+                ls_dt = datetime.fromisoformat(str(last_seen).rstrip("Z")).replace(
+                    tzinfo=timezone.utc
+                )
+                if (datetime.now(timezone.utc) - ls_dt).total_seconds() < _LAST_SEEN_THROTTLE_S:
+                    do_write = False
+            except (ValueError, TypeError):
+                pass
+        if do_write:
+            await self._db.execute(
+                "UPDATE devices SET last_seen=? WHERE id=?",
+                (_iso(datetime.now(timezone.utc)), row["id"]),
+            )
+            await self._db.commit()
+        return {
+            "id": row["id"],
+            "device_name": row["device_name"],
+            "paired_at": row["paired_at"],
+            "device_token": row["device_token"],  # returned for constant-time compare in auth.py
+        }
 
     async def list_devices(self) -> list[dict]:
         async with self._db.execute(

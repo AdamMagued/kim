@@ -26,6 +26,7 @@ COMPACT_RESUME_INSTRUCTION = (
 
 PRESERVE_RECENT_MESSAGES = 6
 MAX_ESTIMATED_TOKENS = 10_000
+IMAGE_TOKEN_ESTIMATE = 1500  # consistent with context_meter.py
 
 
 # ---------------------------------------------------------------------------
@@ -113,13 +114,19 @@ def _split_existing_summary(messages: list[dict]) -> tuple[str, list[dict]]:
 def _estimate_message_tokens(msg: dict) -> int:
     content = msg.get("content", "")
     if isinstance(content, list):
-        text = " ".join(
-            item.get("text", "") if isinstance(item, dict) else str(item)
-            for item in content
-        )
+        total = 0
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "image":
+                    total += IMAGE_TOKEN_ESTIMATE
+                else:
+                    total += len(item.get("text", "")) // 4 + 1
+            else:
+                total += len(str(item)) // 4 + 1
+        return max(1, total)
     else:
         text = str(content or "")
-    return max(1, len(text) // 4 + 1)
+        return max(1, len(text) // 4 + 1)
 
 
 def _is_tool_result(msg: dict) -> bool:
@@ -136,6 +143,12 @@ def _is_tool_call(msg: dict) -> bool:
     if msg.get("role") != "assistant":
         return False
     content = msg.get("content", "")
+    if isinstance(content, list):
+        # Structured content: check if any item is a tool_call dict
+        return any(
+            isinstance(item, dict) and item.get("type") == "tool_call"
+            for item in content
+        )
     text = content if isinstance(content, str) else str(content)
     try:
         parsed = json.loads(text)

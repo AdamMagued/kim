@@ -268,9 +268,9 @@ class CronStore:
     defensive: a missing or corrupt file returns an empty store rather than
     raising.  Writes are atomic (temp-file + os.replace).
 
-    All methods are synchronous; the store is not safe for concurrent writes
-    from multiple processes.  For the current Tauri one-task-at-a-time model
-    this is sufficient.
+    All methods are synchronous; concurrent writes from multiple processes are
+    serialised via `_exclusive_lock` (a file-system advisory lock).  For the
+    current Tauri one-task-at-a-time model this is sufficient.
     """
 
     def __init__(self, store_file: Optional[Path] = None) -> None:

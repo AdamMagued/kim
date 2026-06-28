@@ -111,6 +111,21 @@ export function OnboardingFlow({ onComplete }: Props) {
     };
     try {
       await invoke('save_account', { account });
+      // SECURITY NOTE — PAT STILL WRITTEN TO account.json (PARTIAL MITIGATION ONLY):
+      // `account` above includes `github_token`, and `save_account` persists the whole
+      // KimAccount struct to account.json in plain text. This is a KNOWN INCOMPLETE FIX.
+      //
+      // Full remediation requires a Rust-side change that does NOT yet exist:
+      //   1. Add a `store_github_pat(token: String)` Tauri command backed by
+      //      tauri-plugin-keychain (macOS Keychain / Windows Credential Store / libsecret).
+      //   2. Call that command here instead of including the token in `account`.
+      //   3. Strip `github_token` from the KimAccount type and save_account path so
+      //      the field never reaches account.json.
+      //
+      // Until that Rust work is done, the only mitigation here is scrubbing the PAT
+      // from React component state after the Rust layer has already consumed it, so the
+      // token does not linger in JS heap beyond this call.
+      setToken('');
       // Exit animation before calling onComplete
       setLeaving(true);
       setTimeout(() => onComplete(account), 500);

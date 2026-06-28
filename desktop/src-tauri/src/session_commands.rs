@@ -36,6 +36,8 @@ pub async fn delete_sessions(
     kim_dir: Option<String>,
     codex_dir: Option<String>,
 ) -> Result<(), String> {
+    let mut failures: Vec<String> = Vec::new();
+
     for session_id in session_ids {
         crate::validate_session_id(&session_id)?;
 
@@ -64,17 +66,23 @@ pub async fn delete_sessions(
                     }
                     let jsonl_path = date_dir.join(format!("{}.jsonl", session_id));
                     if jsonl_path.exists() {
-                        if let Err(e) = std::fs::remove_file(&jsonl_path) {
-                            eprintln!("Failed to delete session file {}: {}", session_id, e);
-                        } else {
-                            deleted = true;
-                            let summary_path = date_dir.join(format!("{}.summary.txt", session_id));
-                            if summary_path.exists() {
-                                let _ = std::fs::remove_file(&summary_path);
+                        match std::fs::remove_file(&jsonl_path) {
+                            Err(e) => {
+                                failures.push(format!(
+                                    "Failed to delete session file {}: {}",
+                                    session_id, e
+                                ));
                             }
-                            let browser_meta_path = date_dir.join(crate::browser_session_meta_filename(&session_id));
-                            if browser_meta_path.exists() {
-                                let _ = std::fs::remove_file(&browser_meta_path);
+                            Ok(()) => {
+                                deleted = true;
+                                let summary_path = date_dir.join(format!("{}.summary.txt", session_id));
+                                if summary_path.exists() {
+                                    let _ = std::fs::remove_file(&summary_path);
+                                }
+                                let browser_meta_path = date_dir.join(crate::browser_session_meta_filename(&session_id));
+                                if browser_meta_path.exists() {
+                                    let _ = std::fs::remove_file(&browser_meta_path);
+                                }
                             }
                         }
                     }
@@ -82,12 +90,16 @@ pub async fn delete_sessions(
             }
         }
 
-        if !deleted {
-            eprintln!("Session {} not found for deletion.", session_id);
+        if !deleted && failures.is_empty() {
+            failures.push(format!("Session {} not found for deletion.", session_id));
         }
     }
 
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 #[tauri::command]

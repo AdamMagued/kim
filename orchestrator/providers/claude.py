@@ -44,6 +44,7 @@ class AnthropicProvider(BaseProvider):
                 system=system,
                 tools=claude_tools,  # pyright: ignore[reportArgumentType]
                 messages=claude_messages,  # pyright: ignore[reportArgumentType]
+                timeout=180.0,
             )
         except anthropic.RateLimitError:
             raise

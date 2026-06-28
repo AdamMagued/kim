@@ -83,26 +83,32 @@ def test_budget_overflow_single_large_input():
 
 
 def test_budget_overflow_cumulative():
-    """Multiple small inputs that cumulatively exceed budget trigger critical."""
+    """Each add_input reflects the most-recent request window size (not a running sum).
+    The meter uses the last request size as the current-window estimate, so the final
+    call with 20 tokens reports 20 (ok), not an accumulated 100."""
     meter = ContextMeter(budget=100)
     meter.add_input(40, source="test", estimated=False)
     meter.add_input(40, source="test", estimated=False)
     snap = meter.add_input(20, source="test", estimated=False)
-    assert snap.cumulative_input == 100
-    assert snap.phase == "critical"  # 100/100 = 1.0 >= 0.95
+    assert snap.cumulative_input == 20
+    assert snap.phase == "ok"  # 20/100 = 0.20 < 0.80
 
 
 def test_budget_warn_to_critical_transition():
-    """Meter transitions from ok → warn → critical as tokens accumulate."""
+    """Each call sets the current-window size independently; phase is determined
+    by the most-recent request size relative to budget."""
     meter = ContextMeter(budget=1000)
     snap1 = meter.add_input(500, source="test", estimated=False)
-    assert snap1.phase == "ok"  # 50%
+    assert snap1.phase == "ok"   # 500/1000 = 50%
+    assert snap1.cumulative_input == 500
 
-    snap2 = meter.add_input(310, source="test", estimated=False)
-    assert snap2.phase == "warn"  # 81%
+    snap2 = meter.add_input(810, source="test", estimated=False)
+    assert snap2.phase == "warn"  # 810/1000 = 81%
+    assert snap2.cumulative_input == 810
 
-    snap3 = meter.add_input(200, source="test", estimated=False)
-    assert snap3.phase == "critical"  # 101%
+    snap3 = meter.add_input(1010, source="test", estimated=False)
+    assert snap3.phase == "critical"  # 1010/1000 = 101%
+    assert snap3.cumulative_input == 1010
 
 
 def test_reset_after_compact_resets_cumulative():

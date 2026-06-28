@@ -73,7 +73,7 @@ export interface StreamRendererProps {
   messages: KimMessage[];
   loadingMessages: boolean;
   liveHistory: { role: 'user' | 'assistant'; content: string }[];
-  runHistory: { activity: ActivityItem[]; durationSec: number }[];
+  runHistory: { activity: ActivityItem[]; durationSec: number; provider?: string | null }[];
   codexRuns: CodexRunGroup[];
   taskError: string | null;
   hitlApprovalStatus: HitlApprovalStatus | null;
@@ -531,7 +531,7 @@ export function StreamRenderer({
                 workedRunIsLast = liveAsstRunIdx === runHistory.length - 1;
               }
               return (
-                <div key={`live-${i}`}>
+                <div key={`live-${srcIdx}`}>
                   {workedRun && renderWorkedFor(liveUserIdx, workedRun, workedRunIsLast)}
                   <MessageBubble
                     message={msg}
@@ -664,7 +664,7 @@ export function StreamRenderer({
                 let userMsgIdx = -1;
                 const liveAsstCount = collapseMessages(liveHistory)
                   .filter(({ msg }) => msg.role === 'assistant' && !isIntermediateToolCall(msg)).length;
-                return collapsed.map(({ msg, retries }, i) => {
+                return collapsed.map(({ msg, retries, srcIdx }, i) => {
                   if (msg.role === 'user' && isRealUserMessage(msg)) userMsgIdx += 1;
                   if (isIntermediateToolCall(msg)) return null;
 
@@ -679,7 +679,7 @@ export function StreamRenderer({
                   }
 
                   return (
-                    <div key={i}>
+                    <div key={`msg-${srcIdx}`}>
                       {workedRun && renderWorkedFor(userMsgIdx, workedRun)}
                       <MessageBubble
                         message={msg}
@@ -715,7 +715,7 @@ export function StreamRenderer({
                   liveAsstIdx += 1;
                 }
                 return (
-                  <div key={`live-${i}`}>
+                  <div key={`live-${srcIdx}`}>
                     {workedRun && renderWorkedFor(liveUserMsgIdx, workedRun, workedRunIsLast2)}
                     <MessageBubble
                       message={msg}

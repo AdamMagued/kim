@@ -142,6 +142,13 @@ pub async fn read_relay_config(project_root: Option<String>) -> Result<RelayConf
 
 #[tauri::command]
 pub async fn write_relay_url(url: String, project_root: Option<String>) -> Result<(), String> {
+    let trimmed = url.trim();
+    // Allow clearing the URL (empty string = relay disabled) but reject any
+    // non-https value so a bad URL can never be persisted and later used to
+    // leak the PC API key.
+    if !trimmed.is_empty() {
+        require_https(trimmed)?;
+    }
     let path = crate::config_yaml_path(project_root);
     let original = if path.exists() {
         fs::read_to_string(&path).map_err(|e| e.to_string())?
@@ -177,6 +184,19 @@ fn trim_url(url: &str) -> &str {
     url.trim().trim_end_matches('/')
 }
 
+/// Reject relay URLs that are not https to prevent sending the PC API key in
+/// cleartext or to an attacker-controlled endpoint via an http:// URL.
+fn require_https(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err(format!(
+            "Relay URL must start with https:// (got {:?}). \
+             Refusing to send API key over an insecure connection.",
+            url
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn relay_pair_init(project_root: Option<String>) -> Result<RelayPairInit, String> {
     let cfg = read_relay_config(project_root.clone()).await?;
@@ -186,6 +206,7 @@ pub async fn relay_pair_init(project_root: Option<String>) -> Result<RelayPairIn
             "No relay URL configured. Set `relay.url` in config.yaml before pairing.".into(),
         );
     }
+    require_https(url)?;
     let pc_key = read_pc_api_key(project_root);
     if pc_key.is_empty() {
         return Err(
@@ -236,6 +257,7 @@ pub async fn relay_pair_status(
     if url.is_empty() {
         return Err("No relay URL configured.".into());
     }
+    require_https(url)?;
     let pc_key = read_pc_api_key(project_root);
     if pc_key.is_empty() {
         return Err("RELAY_PC_API_KEY isn't set.".into());

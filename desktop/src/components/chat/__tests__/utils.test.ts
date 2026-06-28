@@ -27,10 +27,8 @@ describe('estimateCostUsd', () => {
     expect(cost).toBeCloseTo(0.27, 5);
   });
 
-  it('falls back to claude rates for unknown provider', () => {
-    const knownCost = estimateCostUsd('claude', 500_000, 200_000);
-    const unknownCost = estimateCostUsd('unknown-provider', 500_000, 200_000);
-    expect(unknownCost).toBeCloseTo(knownCost, 10);
+  it('returns null for unknown provider (no fabricated cost)', () => {
+    expect(estimateCostUsd('unknown-provider', 500_000, 200_000)).toBeNull();
   });
 
   it('handles zero tokens', () => {

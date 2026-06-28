@@ -125,12 +125,15 @@ class ConversationMemory:
             summary = self._messages[0]
             rest = self._messages[1:]
             max_rest = self.max_messages - 1
-            if len(rest) <= max_rest:
-                return
             excess = len(rest) - max_rest
             for i in range(excess, len(rest)):
                 if rest[i]["role"] == "user":
-                    self._messages = [summary] + rest[i:]
+                    # If this user message is a tool result, include the
+                    # preceding assistant tool_call to avoid orphaning it.
+                    start = i
+                    if self._is_tool_result(rest[i]) and i > 0:
+                        start = i - 1
+                    self._messages = [summary] + rest[start:]
                     return
             self._messages = [summary] + rest[-1:]
             return
@@ -139,12 +142,34 @@ class ConversationMemory:
         # Find the first user message within the allowed window
         for i in range(excess, len(self._messages)):
             if self._messages[i]["role"] == "user":
-                self._messages = self._messages[i:]
+                # If this user message is a tool result, include the
+                # preceding assistant tool_call to avoid orphaning it.
+                start = i
+                if self._is_tool_result(self._messages[i]) and i > 0:
+                    start = i - 1
+                self._messages = self._messages[start:]
                 return
 
         # If no user message is found in the trailing portion,
         # keep at least the very last message rather than emptying.
         self._messages = self._messages[-1:]
+
+    def _is_tool_result(self, msg: dict) -> bool:
+        """Return True if *msg* is a user-role tool-result message.
+
+        Tool results are user messages whose text content begins with
+        ``[Tool result:`` — the format used by the orchestrator's tool
+        dispatcher when it injects results back into the conversation.
+        """
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content.startswith("[Tool result:")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    if item.get("text", "").startswith("[Tool result:"):
+                        return True
+        return False
 
     def _apply_screenshot_policy(self) -> list[dict]:
         """

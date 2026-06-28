@@ -83,8 +83,12 @@ export function useChatStream({
   const [rateLimitedState, setRateLimitedState] = useState<{ delay: number; attempt: number; max_retries: number } | null>(null);
   // K1: checkpoint run id emitted by Rust at spawn — used by the revert action.
   const [lastRunId, setLastRunId] = useState<string | null>(null);
+  // Fix 4: promote to state so consumers re-render when cancel status changes
+  const [isCancelled, setIsCancelled] = useState(false);
 
   // Refs for tracking streams
+  // Fix 3: mirror runHistory in a ref so the IPC persist call can live outside the state updater
+  const runHistoryRef = useRef<{ activity: ActivityItem[]; durationSec: number; provider?: string | null }[]>([]);
   const activityCounterRef = useRef(0);
   const activityRef = useRef<ActivityItem[]>([]);
   const activityFlushTimerRef = useRef<number | null>(null);
@@ -122,11 +126,23 @@ export function useChatStream({
   const onTaskDoneRef = useRef(onTaskDone);
   useEffect(() => { onTaskDoneRef.current = onTaskDone; }, [onTaskDone]);
 
+  // commitCurrentBrowserUrl changes identity on every session / chat-tab switch (it
+  // closes over browserCommandArgs → session/activeTab/conversationId). Keep it in a
+  // ref so the big listener-wiring effect below doesn't tear down and re-register all
+  // ~16 Tauri listeners on each switch — the async listen().then(unlisten) pattern can
+  // miss the unsubscribe if it re-runs before the promise resolves, leaking duplicate
+  // handlers that append activity/answers twice.
+  const commitCurrentBrowserUrlRef = useRef(commitCurrentBrowserUrl);
+  useEffect(() => { commitCurrentBrowserUrlRef.current = commitCurrentBrowserUrl; }, [commitCurrentBrowserUrl]);
+
   const sessionRef = useRef(session);
   useEffect(() => { sessionRef.current = session; }, [session]);
 
   const settingsRef = useRef(settings);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
+
+  // Fix 3: keep runHistoryRef in sync so the updater stays pure
+  useEffect(() => { runHistoryRef.current = runHistory; }, [runHistory]);
 
 
 
@@ -315,6 +331,10 @@ export function useChatStream({
 
   // ── Event Listener Wiring ─────────────────────────────────────────────────
   useEffect(() => {
+    // Fix 2: track whether this effect instance has been cleaned up so that
+    // listen() promises resolving after unmount immediately call their unlisten fn
+    // instead of assigning to a stale variable (preventing duplicate handlers).
+    let cancelled = false;
     let unlistenOutput: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
     let unlistenDone: (() => void) | undefined;
@@ -355,11 +375,11 @@ export function useChatStream({
         source: e.payload.source,
         estimate: e.payload.estimate,
       });
-    }).then(fn => { unlistenTypedContext = fn; });
+    }).then(fn => { if (!cancelled) unlistenTypedContext = fn; else fn(); });
 
     listen<{ input: number; output: number; total: number }>('kim:stats', e => {
       setTokenStats({ input: e.payload.input, output: e.payload.output, total: e.payload.total });
-    }).then(fn => { unlistenTypedStats = fn; });
+    }).then(fn => { if (!cancelled) unlistenTypedStats = fn; else fn(); });
 
     // Typed run lifecycle events — capture-only in current slice.
     // terminationReasonRef gives the kim-agent-done handler richer context;
@@ -367,7 +387,7 @@ export function useChatStream({
     // remaining Tier 2b gap documented in HARNESS_ROADMAP.md.
     listen<{ termination: string; success: boolean }>('kim:run-done', e => {
       terminationReasonRef.current = e.payload.termination;
-    }).then(fn => { unlistenTypedRunDone = fn; });
+    }).then(fn => { if (!cancelled) unlistenTypedRunDone = fn; else fn(); });
 
     // Capture provider error code for future UI surfacing (Tier 2e remaining gap).
     // Not surfaced via setTaskError here because the taskError string is rendered
@@ -375,7 +395,7 @@ export function useChatStream({
     // needed before a structured code can be shown to the user.
     listen<{ code: string; retryable: boolean }>('kim:provider-error', e => {
       lastProviderErrorCodeRef.current = e.payload.code;
-    }).then(fn => { unlistenTypedProviderError = fn; });
+    }).then(fn => { if (!cancelled) unlistenTypedProviderError = fn; else fn(); });
 
     // HITL approval visibility. This is display-only for now; the approval
     // decision path still lives in the agent/UIBridge layer.
@@ -387,23 +407,26 @@ export function useChatStream({
         preview: e.payload.preview, // K6
         approved: null,
       });
-    }).then(fn => { unlistenTypedHitlRequest = fn; });
+    }).then(fn => { if (!cancelled) unlistenTypedHitlRequest = fn; else fn(); });
 
     listen<{ tool: string; approved: boolean }>('kim:hitl-approval-result', e => {
       setHitlApprovalStatus(prev => ({
         tool: e.payload.tool,
         risk: prev?.tool === e.payload.tool ? prev.risk : 'high',
         reason: prev?.tool === e.payload.tool ? prev.reason : 'approval_result',
+        // Carry the preview over so the command/diff preview doesn't vanish the moment
+        // the user clicks Approve/Deny (StreamRenderer only renders it when set).
+        preview: prev?.tool === e.payload.tool ? prev.preview : undefined,
         approved: e.payload.approved,
       }));
-    }).then(fn => { unlistenTypedHitlResult = fn; });
+    }).then(fn => { if (!cancelled) unlistenTypedHitlResult = fn; else fn(); });
 
     listen<string>('kim-run-id', e => { setLastRunId(e.payload); }) // K1
-      .then(fn => { unlistenRunId = fn; });
+      .then(fn => { if (!cancelled) unlistenRunId = fn; else fn(); });
 
     listen<{ reason: string; recoverable: boolean; suggestion: string }>('kim:run-failed', e => {
       setRunFailure(e.payload);
-    }).then(fn => { unlistenTypedRunFailed = fn; });
+    }).then(fn => { if (!cancelled) unlistenTypedRunFailed = fn; else fn(); });
 
     listen<{ delay: number; attempt: number; max_retries: number }>('kim:rate-limited', e => {
       setRateLimitedState(e.payload);
@@ -413,7 +436,7 @@ export function useChatStream({
         rateLimitTimerRef.current = null;
         setRateLimitedState(null);
       }, (e.payload.delay + 1) * 1000);
-    }).then(fn => { unlistenTypedRateLimited = fn; });
+    }).then(fn => { if (!cancelled) unlistenTypedRateLimited = fn; else fn(); });
 
     listen<{ action: 'screenshot_flash' | 'show' }>('kim:ui', e => {
       if (e.payload.action === 'screenshot_flash' && isRunningRef.current) {
@@ -422,15 +445,15 @@ export function useChatStream({
       } else if (e.payload.action === 'show' && isRunningRef.current) {
         invoke('show_main_window').catch(() => {});
       }
-    }).then(fn => { unlistenTypedUi = fn; });
+    }).then(fn => { if (!cancelled) unlistenTypedUi = fn; else fn(); });
 
     listen<string>('kim-agent-output', event => {
       appendRaw(event.payload);
-    }).then(fn => { unlistenOutput = fn; });
+    }).then(fn => { if (!cancelled) unlistenOutput = fn; else fn(); });
 
     listen<string>('kim-agent-error', event => {
       appendRaw(`[err] ${event.payload}`);
-    }).then(fn => { unlistenError = fn; });
+    }).then(fn => { if (!cancelled) unlistenError = fn; else fn(); });
 
     listen<boolean>('kim-agent-done', event => {
       invoke('set_task_active_mode', { active: false }).catch(() => {});
@@ -438,6 +461,7 @@ export function useChatStream({
       const hadNeedHelp = needHelpFlagRef.current;
       doneHandledRef.current = true;
       cancelFlagRef.current = false;
+      setIsCancelled(false); // Fix 4: keep state in sync with ref
       needHelpFlagRef.current = false;
       setIsRunning(false);
       setCancelling(false);
@@ -452,23 +476,24 @@ export function useChatStream({
       const activitySnapshot = activityRef.current;
 
       if (event.payload && !wasCancelled && activitySnapshot.length > 0) {
-        setRunHistory(prev => {
-          const next = [...prev, { activity: activitySnapshot, durationSec, provider: currentTaskRef.current?.provider ?? null }];
-          const completedCodeSession = completedCodeSessionRef.current;
-          const sid = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
-          if (sid) {
-            invoke('save_run_history', {
-              sessionId: sid,
-              sessionDate: completedCodeSession?.date ?? sessionRef.current?.date ?? null,
-              kimDir: settingsRef.current.kim_sessions_dir || null,
-              codexDir: completedCodeSession?.project_path
-                ? `${completedCodeSession.project_path}/.codex/sessions`
-                : settingsRef.current.codex_sessions_dir || null,
-              runs: next,
-            }).catch(() => {});
-          }
-          return next;
-        });
+        // Fix 3: compute next outside the updater so React's StrictMode/concurrent
+        // double-invocation of updater functions cannot trigger duplicate IPC writes.
+        const newRunEntry = { activity: activitySnapshot, durationSec, provider: currentTaskRef.current?.provider ?? null };
+        const next = [...runHistoryRef.current, newRunEntry];
+        setRunHistory(next);
+        const completedCodeSession = completedCodeSessionRef.current;
+        const sid = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
+        if (sid) {
+          invoke('save_run_history', {
+            sessionId: sid,
+            sessionDate: completedCodeSession?.date ?? sessionRef.current?.date ?? null,
+            kimDir: settingsRef.current.kim_sessions_dir || null,
+            codexDir: completedCodeSession?.project_path
+              ? `${completedCodeSession.project_path}/.codex/sessions`
+              : settingsRef.current.codex_sessions_dir || null,
+            runs: next,
+          }).catch(() => {});
+        }
       }
       clearActivityNow();
       setMessageReloadNonce(v => v + 1);
@@ -476,14 +501,19 @@ export function useChatStream({
       const completedCodeSession = completedCodeSessionRef.current ?? undefined;
       const completedSessionId = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
       const runProviderSite = browserSiteFromProvider(currentTaskRef.current?.provider);
-      void commitCurrentBrowserUrl(runProviderSite, completedCodeSession ?? sessionRef.current, completedSessionId);
+      void commitCurrentBrowserUrlRef.current(runProviderSite, completedCodeSession ?? sessionRef.current, completedSessionId);
 
       onTaskDoneRef.current(completedSessionId, completedCodeSession);
       completedCodeSessionRef.current = null;
 
       if (!event.payload && !wasCancelled) {
         if (!hadNeedHelp) {
-          setLiveHistory(prev => prev.filter(m => m.role !== 'assistant'));
+          // Fix 1: only strip the failed run's assistant output; keep prior good answers
+          // by finding the last user message and slicing everything after it off.
+          setLiveHistory(prev => {
+            const lastUserIdx = prev.map(m => m.role).lastIndexOf('user');
+            return lastUserIdx === -1 ? [] : prev.slice(0, lastUserIdx + 1);
+          });
           setTaskError(
             providerErrorMessage(lastProviderErrorCodeRef.current)
               ?? terminationMessage(terminationReasonRef.current)
@@ -497,23 +527,27 @@ export function useChatStream({
         setLastFailedTask(null);
       }
       currentTaskRef.current = null;
-    }).then(fn => { unlistenDone = fn; });
+    }).then(fn => { if (!cancelled) unlistenDone = fn; else fn(); });
 
     listen<SessionInfo>('kim-agent-code-session', event => {
       completedCodeSessionRef.current = event.payload;
-    }).then(fn => { unlistenCodeSession = fn; });
+    }).then(fn => { if (!cancelled) unlistenCodeSession = fn; else fn(); });
 
     listen<boolean>('kim-agent-cancelled', () => {
       invoke('set_task_active_mode', { active: false }).catch(() => {});
       cancelFlagRef.current = true;
+      setIsCancelled(true); // Fix 4: keep state in sync with ref
       appendRaw('⏹ Task cancelled');
       setIsRunning(false);
       setCancelling(false);
       setHitlApprovalStatus(null);
       currentTaskRef.current = null;
-    }).then(fn => { unlistenCancelled = fn; });
+    }).then(fn => { if (!cancelled) unlistenCancelled = fn; else fn(); });
 
     return () => {
+      // Fix 2: mark this effect instance as dead so any in-flight listen() promises
+      // that resolve after this cleanup immediately call their unlisten fn.
+      cancelled = true;
       unlistenOutput?.();
       unlistenError?.();
       unlistenDone?.();
@@ -531,7 +565,9 @@ export function useChatStream({
       unlistenTypedHitlResult?.();
       unlistenRunId?.();
     };
-  }, [appendRaw, flushActivityNow, clearActivityNow, setMessageReloadNonce, commitCurrentBrowserUrl]);
+    // commitCurrentBrowserUrl intentionally omitted — accessed via ref so this effect
+    // registers listeners once and doesn't re-run (and leak handlers) on session switch.
+  }, [appendRaw, flushActivityNow, clearActivityNow, setMessageReloadNonce]);
 
   // Derived state to satisfy Prompt 8 explicit signature
   const traceItems = buildThinkingTrace(activity, parsePlanFromActivity(activity));
@@ -541,7 +577,7 @@ export function useChatStream({
   const lastStatus = activity.filter(a => a.kind === 'status').slice(-1)[0]?.text ?? '';
   const contextUsage = contextState?.percent ?? 0;
   const isDone = !isRunning;
-  const isCancelled = cancelFlagRef.current;
+  // isCancelled is now proper state (Fix 4) — declared above with useState
 
   return {
     // Explicit Prompt 8 properties

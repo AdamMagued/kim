@@ -126,12 +126,19 @@ _FILE_TOOLS: list[Tool] = [
     ),
 ]
 
-_FILE_DISPATCH = {
+_FILE_READ_DISPATCH = {
     "read_file": handle_read_file,
-    "write_file": handle_write_file,
     "list_dir": handle_list_dir,
+}
+
+_FILE_WRITE_DISPATCH = {
+    "write_file": handle_write_file,
     "delete_file": handle_delete_file,
 }
+
+# Merged for DISPATCH aggregation – preserves existing behavior when no tier
+# filter is active.
+_FILE_DISPATCH = {**_FILE_READ_DISPATCH, **_FILE_WRITE_DISPATCH}
 
 
 # ── Shell execution ──────────────────────────────────────────────────────────
@@ -1037,15 +1044,16 @@ for _d in (
 # remain the full unfiltered sets so default behavior is unchanged.
 
 TIER_DISPATCH: dict[str, dict] = {
-    "file":     _FILE_DISPATCH,
-    "shell":    _SHELL_DISPATCH,
-    "screen":   _SCREEN_DISPATCH,
-    "web":      _WEB_DISPATCH,
-    "mouse":    _MOUSE_DISPATCH,
-    "keyboard": _KEYBOARD_DISPATCH,
-    "windows":  _WINDOW_DISPATCH,
-    "git":      _GIT_DISPATCH,
-    "code":     _CODE_DISPATCH,
-    "search":   _SEARCH_DISPATCH,
-    "memory":   _MEMORY_DISPATCH,
+    "file_read":  _FILE_READ_DISPATCH,
+    "file_write": _FILE_WRITE_DISPATCH,
+    "shell":      _SHELL_DISPATCH,
+    "screen":     _SCREEN_DISPATCH,
+    "web":        _WEB_DISPATCH,
+    "mouse":      _MOUSE_DISPATCH,
+    "keyboard":   _KEYBOARD_DISPATCH,
+    "windows":    _WINDOW_DISPATCH,
+    "git":        _GIT_DISPATCH,
+    "code":       _CODE_DISPATCH,
+    "search":     _SEARCH_DISPATCH,
+    "memory":     _MEMORY_DISPATCH,
 }

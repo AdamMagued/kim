@@ -296,9 +296,18 @@ fn import_from_zip(src: &Path, base: &Path) -> Result<String, String> {
             continue;
         }
 
+        // Guard against path traversal attacks (e.g. "../../etc/passwd" in the ZIP).
+        // Validate path components first (before any fs::create_dir_all) to prevent
+        // directory creation outside base even when the file write would be skipped.
+        if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {
+            continue;
+        }
+        if name.len() >= 2 && name.as_bytes()[1] == b':' {
+            continue;
+        }
+
         let dest = base.join(&name);
 
-        // Guard against path traversal attacks (e.g. "../../etc/passwd" in the ZIP).
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             if let (Ok(canon_dest_parent), Ok(canon_base)) = (parent.canonicalize(), base.canonicalize()) {

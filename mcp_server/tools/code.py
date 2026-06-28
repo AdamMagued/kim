@@ -95,21 +95,26 @@ def _find_node() -> str:
     raise RuntimeError("OS_LIMITATION: node not installed")
 
 
-# Inline code blocklist patterns (#4)
+# Inline code blocklist patterns.
+# WARNING: This blocklist provides only shallow defence-in-depth; it cannot
+# replace a real OS-level sandbox (finding 4).  Patterns scan the *full*
+# code string — no truncation — to prevent padding-based bypasses.
 _CODE_BLOCKLIST = [
     re.compile(r"\bos\.system\b"),
     re.compile(r"\bsubprocess\b"),
-    re.compile(r"__import__\s*\(\s*['\"]os['\"]\s*\)"),
+    re.compile(r"__import__\s*\("),
     re.compile(r"\beval\s*\("),
     re.compile(r"\bexec\s*\("),
+    # Catch `import os` / `import os as o` style alias bypasses (finding 4)
+    re.compile(r"\bimport\s+os\b"),
+    re.compile(r"\bfrom\s+os\b"),
 ]
 
 
 def _check_code_blocked(code: str) -> str | None:
-    """Scan the first 4KB of inline code for dangerous patterns."""
-    snippet = code[:4096]
+    """Scan *all* inline code for dangerous patterns (no truncation — finding 4)."""
     for pat in _CODE_BLOCKLIST:
-        if pat.search(snippet):
+        if pat.search(code):
             return f"BLOCKED: Inline code contains blocked pattern '{pat.pattern}'"
     return None
 
@@ -148,6 +153,17 @@ async def handle_run_python(args: dict) -> str:
             return f"ERROR: File not found: {resolved}"
         if not str(resolved).endswith(".py"):
             return f"ERROR: Expected a .py file, got: {resolved.name}"
+
+        # Scan file content against the inline blocklist so that an attacker
+        # cannot bypass inline checks by writing a .py file and then executing
+        # it with run_python(file=...) (finding 4).
+        try:
+            file_content = resolved.read_text(encoding="utf-8", errors="replace")
+            block_msg = _check_code_blocked(file_content)
+            if block_msg:
+                return block_msg
+        except OSError as e:
+            return f"ERROR: Cannot read file for security scan: {e}"
 
         return await _run_exec([python, str(resolved)], cwd=cwd, timeout=timeout)
 
@@ -210,6 +226,11 @@ async def handle_run_node(args: dict) -> str:
         return await _run_exec([node, str(resolved)], cwd=cwd, timeout=timeout)
 
     elif code:
+        # Apply the same inline-code blocklist used by run_python (finding 4)
+        block_msg = _check_code_blocked(code)
+        if block_msg:
+            return block_msg
+
         # Execute inline snippet with restricted flags
         return await _run_exec(
             [node, "--disable-proto=delete", "-e", code],

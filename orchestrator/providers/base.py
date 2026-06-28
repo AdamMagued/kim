@@ -89,10 +89,13 @@ def classify_provider_error(error: Exception) -> ProviderError:
     if isinstance(error, ProviderError):
         return error
 
+    import re as _re_provider_error
+
     message = str(error)
     lowered = message.lower()
     error_type = type(error).__name__.lower()
 
+    # Exact-substring markers that are unambiguous on their own.
     auth_markers = (
         "sign in",
         "unauthorized",
@@ -101,14 +104,16 @@ def classify_provider_error(error: Exception) -> ProviderError:
         "api key",
         "apikey",
         "access token",
-        "oauth",
         "credential",
-        "auth",
     )
-    if isinstance(error, PermissionError) or any(marker in lowered for marker in auth_markers):
+    # "auth" and "oauth" need word boundaries to avoid false positives such as
+    # 'author', 'authority', or 'authenticated' (which is a success state).
+    _AUTH_WORD_RE = _re_provider_error.compile(r"\b(auth|oauth)\b")
+    if isinstance(error, PermissionError) or any(marker in lowered for marker in auth_markers) or _AUTH_WORD_RE.search(lowered):
         return ProviderError("auth", message, retryable=False)
 
-    if isinstance(error, ValueError) or "invalid request" in lowered or "bad request" in lowered or "400" in lowered:
+    # Use a digit-bounded pattern for 400 to avoid matching strings like "error 4001".
+    if isinstance(error, ValueError) or "invalid request" in lowered or "bad request" in lowered or _re_provider_error.search(r"(?<!\d)400(?!\d)", lowered):
         return ProviderError("invalid_request", message, retryable=False)
 
     if "rate" in lowered and "limit" in lowered:
@@ -116,7 +121,6 @@ def classify_provider_error(error: Exception) -> ProviderError:
     if "429" in lowered or "ratelimit" in error_type:
         return ProviderError("rate_limit", message, retryable=True)
 
-    import re as _re_provider_error
     for code in ("500", "502", "503", "529"):
         if _re_provider_error.search(r"(?<![\d])" + code + r"(?![\d])", lowered):
             return ProviderError("server_error", message, retryable=True)

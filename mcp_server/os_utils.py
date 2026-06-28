@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import platform
 import re
+import shlex
 import shutil
 
 logger = logging.getLogger(__name__)
@@ -96,10 +97,11 @@ _BUILTIN_MAP_UNIX: dict[str, str] = {
     "type": "cat",
     "copy": "cp",
     "move": "mv",
-    "del": "rm",
+    # "del" and "rmdir" are intentionally omitted: blindly translating destructive
+    # Windows verbs (del /F /Q *, rmdir /S /Q C:\) to rm / rm -rf passes Windows-
+    # style flags as Unix paths and can produce dangerous commands.
     "ren": "mv",
     "mkdir": "mkdir -p",
-    "rmdir": "rm -rf",
     "tasklist": "ps aux",
     "ipconfig": "ifconfig",
     "findstr": "grep",
@@ -128,15 +130,15 @@ def _translate_start_command(app: str) -> str | None:
     if IS_MACOS:
         mac_app = _APP_MAP_MAC.get(app_lower)
         if mac_app:
-            return f"open -a '{mac_app}'"
-        # If it looks like a path or URL, just open it
-        return f"open {app.strip()}"
+            return f"open -a {shlex.quote(mac_app)}"
+        # If it looks like a path or URL, just open it (quoted to handle spaces/special chars)
+        return f"open {shlex.quote(app.strip())}"
 
     if IS_LINUX:
         linux_app = _APP_MAP_LINUX.get(app_lower)
         if linux_app:
             return linux_app
-        return f"xdg-open {app.strip()}"
+        return f"xdg-open {shlex.quote(app.strip())}"
 
     return None  # Windows — no translation needed
 
@@ -177,17 +179,33 @@ def _translate_powershell(cmd: str) -> str | None:
     Translate a 'powershell ...' or 'powershell.exe ...' invocation.
     On non-Windows, we try to extract the -Command argument and run it
     through bash instead, with translated commands where possible.
+
+    Returns None when the command cannot be reliably translated (multi-statement
+    scripts, no -Command flag, or inner command not recognised).  Callers should
+    treat None as an untranslatable error, NOT as a no-op.
     """
     if IS_WINDOWS:
         return None
 
     # Extract the -Command portion
     m = re.search(r'-Command\s+["\']?(.+?)(?:["\']?\s*$)', cmd, re.IGNORECASE)
-    if m:
-        inner = m.group(1)
-        # Try to translate the inner command
-        translated = translate_command(inner)
-        return translated if translated != inner else inner
+    if not m:
+        # No -Command flag — cannot safely translate (may be -File, -EncodedCommand, …)
+        return None
+
+    inner = m.group(1)
+
+    # Refuse to blindly run multi-statement scripts; the individual statements
+    # are PowerShell cmdlets that have no reliable one-to-one bash mapping.
+    if any(sep in inner for sep in (";", "|", "&&", "||", "\n")):
+        return None
+
+    # Try to translate the single inner command
+    translated = translate_command(inner)
+    # Only return the translation when it actually changed; otherwise we'd
+    # silently run an untranslated PowerShell cmdlet in bash.
+    if translated != inner:
+        return translated
 
     return None
 
@@ -225,9 +243,13 @@ def translate_command(cmd: str) -> str:
         if translated:
             logger.info(f"[os_utils] Translated PowerShell → '{translated}'")
             return translated
-        # If we can't translate, warn and return a clear error command
+        # If we can't translate, return a command that exits non-zero so callers
+        # see a real failure rather than a success-looking echo exit-0.
         logger.warning(f"[os_utils] Cannot translate PowerShell command on {CURRENT_OS}")
-        return f"echo 'ERROR: PowerShell is not available on {CURRENT_OS}. Please use bash/zsh instead.'"
+        msg = shlex.quote(
+            f"ERROR: PowerShell is not available on {CURRENT_OS}. Please use bash/zsh instead."
+        )
+        return f"bash -c 'echo {msg} >&2; exit 1'"
 
     # 3) Direct .exe invocation → platform equivalent
     m_exe = _RE_WIN_EXE.match(stripped)

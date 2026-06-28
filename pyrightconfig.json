@@ -3,7 +3,7 @@
     "orchestrator/providers",
     "mcp_server"
   ],
-  "pythonVersion": "3.9",
+  "pythonVersion": "3.12",
   "typeCheckingMode": "basic",
   "reportMissingImports": "none",
   "reportMissingModuleSource": "none"

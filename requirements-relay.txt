@@ -1,8 +1,11 @@
 # Minimal dependencies for the relay server only.
-# Use this for the Docker image so it stays small (~50 MB).
+# Version pinning (#56): compatible-release pins (~=) prevent major-version
+# breakage. For reproducible Docker builds, generate a pinned lockfile:
+#   pip install -r requirements-relay.txt && pip freeze > requirements-relay-lock.txt
+# Use the lockfile for the Docker image so it stays small (~50 MB).
 # The full requirements.txt is for the local PC agent.
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-pydantic>=2.0.0
-aiosqlite>=0.20.0
-python-dotenv>=1.0.0
+fastapi~=0.115
+uvicorn[standard]~=0.30
+pydantic~=2.0
+aiosqlite~=0.20
+python-dotenv~=1.0

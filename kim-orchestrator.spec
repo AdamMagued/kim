@@ -117,7 +117,13 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,    # None = current arch; set 'universal2' for Mac fat binary
+    # Code-signing (#63): set codesign_identity and entitlements_file before
+    # distributing.  Required for Gatekeeper on macOS 10.15+ and App Store.
+    # Obtain a "Developer ID Application" cert from developer.apple.com, then:
+    #   codesign --deep --options runtime --sign "Developer ID Application: <Name> (<TeamID>)"
+    #            --entitlements entitlements.plist dist/kim-orchestrator-<triple>
+    # For Windows use signtool.exe with an EV code-signing cert.
     codesign_identity=None,   # TODO(human): set to your Developer ID for notarization
-    entitlements_file=None,   # TODO(human): add entitlements for hardened runtime
+    entitlements_file=None,   # TODO(human): add entitlements.plist for hardened runtime
     onefile=True,        # Single self-contained binary — required for Tauri sidecar
 )

@@ -28,11 +28,54 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Secret redaction
+# ---------------------------------------------------------------------------
+
+_REDACT_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # OpenAI / Anthropic style keys  (sk-...)
+    (re.compile(r"sk-[A-Za-z0-9_\-]{10,}", re.ASCII), "sk-***REDACTED***"),
+    # GitHub personal-access / fine-grained tokens
+    (re.compile(r"ghp_[A-Za-z0-9]{10,}", re.ASCII), "ghp_***REDACTED***"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{10,}", re.ASCII), "github_pat_***REDACTED***"),
+    # AWS access key IDs
+    (re.compile(r"AKIA[A-Z0-9]{16}", re.ASCII), "AKIA***REDACTED***"),
+    # Bearer / Authorization header values
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9\-._~+/]{8,}={0,2}"), r"\1***REDACTED***"),
+    # Slack tokens
+    (re.compile(r"xox[bpas]-[A-Za-z0-9\-]{10,}", re.ASCII), "xox***REDACTED***"),
+    # PEM blocks (private keys, certs) — collapse the whole block
+    (re.compile(
+        r"-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----",
+        re.MULTILINE,
+    ), "***REDACTED PEM BLOCK***"),
+]
+
+
+def _redact(text: str) -> str:
+    """Return *text* with known secret patterns replaced by redaction markers."""
+    for pattern, replacement in _REDACT_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _redact_value(value: object) -> object:
+    """Redact a log-entry value; recurse into dicts/lists, stringify others."""
+    if isinstance(value, str):
+        return _redact(value)
+    if isinstance(value, dict):
+        return {k: _redact_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    # For non-string scalars (int, bool, …) there is nothing to redact.
+    return value
 
 
 class JSONLineHandler(logging.Handler):
@@ -62,7 +105,13 @@ class JSONLineHandler(logging.Handler):
                     pass
             self._current_date = today
             filepath = self._log_dir / f"kim_{today}.jsonl"
-            self._file = open(filepath, "a", encoding="utf-8")
+            # Open with mode 0o600 so only the owner can read the log file.
+            fd = os.open(
+                filepath,
+                os.O_CREAT | os.O_WRONLY | os.O_APPEND,
+                0o600,
+            )
+            self._file = open(fd, "a", encoding="utf-8")
         return self._file
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -74,7 +123,7 @@ class JSONLineHandler(logging.Handler):
                     ).isoformat(),
                     "level": record.levelname,
                     "logger": record.name,
-                    "message": record.getMessage(),
+                    "message": _redact(record.getMessage()),
                     "module": record.module,
                     "function": record.funcName,
                     "line": record.lineno,
@@ -84,8 +133,11 @@ class JSONLineHandler(logging.Handler):
                 if record.exc_info and record.exc_info[0] is not None:
                     entry["exception"] = {
                         "type": record.exc_info[0].__name__,
-                        "message": str(record.exc_info[1]),
-                        "traceback": traceback.format_exception(*record.exc_info),
+                        "message": _redact(str(record.exc_info[1])),
+                        "traceback": [
+                            _redact(line)
+                            for line in traceback.format_exception(*record.exc_info)
+                        ],
                     }
 
                 # Include any extra fields set via logger.info("msg", extra={...})
@@ -97,7 +149,7 @@ class JSONLineHandler(logging.Handler):
                     "msecs", "taskName",
                 }
                 extras = {
-                    k: v for k, v in record.__dict__.items()
+                    k: _redact_value(v) for k, v in record.__dict__.items()
                     if k not in standard_attrs and not k.startswith("_")
                 }
                 if extras:
@@ -165,7 +217,7 @@ def setup_structured_logging(
             )
             root.addHandler(stderr_handler)
 
-    root.setLevel(min(level, root.level) if root.level != logging.WARNING else level)
+    root.setLevel(level)
 
     logging.getLogger("kim.logger").info(
         f"Structured logging initialized: {log_dir}/kim_*.jsonl"

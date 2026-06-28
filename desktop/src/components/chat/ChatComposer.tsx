@@ -83,12 +83,20 @@ export function ChatComposer({
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
   };
 
+  const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB — kept in memory as base64
+  const MAX_TEXT_BYTES = 512 * 1024;        // 512 KB — inlined into prompt tokens
+  const MAX_BINARY_BYTES = 10 * 1024 * 1024; // 10 MB — saved to disk as base64
+
   const processFiles = async (files: FileList | File[]) => {
     const arr = Array.from(files);
     const results: AttachedFile[] = [];
     for (const file of arr) {
       const sizeLabel = fmtBytes(file.size);
       if (file.type.startsWith('image/')) {
+        if (file.size > MAX_IMAGE_BYTES) {
+          toast(`${file.name} is too large (max ${fmtBytes(MAX_IMAGE_BYTES)}).`, 'warning', 4000);
+          continue;
+        }
         const base64 = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => {
@@ -114,6 +122,10 @@ export function ChatComposer({
           file.name
         )
       ) {
+        if (file.size > MAX_TEXT_BYTES) {
+          toast(`${file.name} is too large to inline (max ${fmtBytes(MAX_TEXT_BYTES)}). Attach a smaller excerpt.`, 'warning', 4000);
+          continue;
+        }
         const content = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => resolve(reader.result as string);
@@ -124,6 +136,10 @@ export function ChatComposer({
       } else if (file.type.startsWith('audio/') || file.type.startsWith('video/')) {
         toast(`${file.name}: audio and video files are not supported.`, 'warning', 4000);
       } else {
+        if (file.size > MAX_BINARY_BYTES) {
+          toast(`${file.name} is too large (max ${fmtBytes(MAX_BINARY_BYTES)}).`, 'warning', 4000);
+          continue;
+        }
         const base64 = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => {
@@ -163,7 +179,10 @@ export function ChatComposer({
     const attachmentPrefix = buildAttachmentPrefix(attachedFiles);
     const fullText = attachmentPrefix ? `${attachmentPrefix}\n${text}` : text;
 
-    // Reset composer state
+    // Reset composer state — revoke object URLs before clearing
+    attachedFiles.forEach(f => {
+      if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+    });
     setTaskInput('');
     setAttachedFiles([]);
     if (textareaRef.current) {

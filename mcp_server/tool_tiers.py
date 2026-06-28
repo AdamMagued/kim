@@ -5,17 +5,26 @@ Set KIM_ENABLED_TOOL_TIERS to a comma-separated list of tier names to expose
 only those tools to the agent.  Unset (or empty) means all tools are exposed
 -- default behavior is unchanged.
 
-Granular tiers (one per existing tool group):
-    file, shell, screen, web, mouse, keyboard, windows, git, code, search, memory
+Granular tiers (one per tool group):
+    file_read, file_write, shell, screen, web, mouse, keyboard, windows,
+    git, code, search, memory
+
+    file_read  -- read_file, list_dir  (no mutation)
+    file_write -- write_file, delete_file
+    shell      -- run_command, run_powershell  (arbitrary execution; opt-in only)
 
 Compound aliases (expand to the granular tiers listed):
-    core    -> file, shell, search
+    file    -> file_read, file_write   (backward-compat; no exec)
+    core    -> file_read, file_write, search   (no exec -- shell must be added explicitly)
     ui      -> screen, mouse, keyboard, windows
     browser -> web
 
 Example:
     export KIM_ENABLED_TOOL_TIERS=core,git
-    # Exposes: file + shell + search + git tools only
+    # Exposes: file_read + file_write + search + git tools (no shell exec)
+
+    export KIM_ENABLED_TOOL_TIERS=core,git,shell
+    # Exposes the above plus run_command / run_powershell
 """
 
 from __future__ import annotations
@@ -28,7 +37,11 @@ logger = logging.getLogger(__name__)
 # Compound aliases expand to multiple granular tier names.
 # These match the vocabulary used in HARNESS_ROADMAP.md.
 TIER_ALIASES: dict[str, tuple[str, ...]] = {
-    "core":    ("file", "shell", "search"),
+    # "file" kept for backward compatibility; resolves to read+write without exec.
+    "file":    ("file_read", "file_write"),
+    # "core" no longer includes "shell" -- arbitrary execution must be opted in
+    # explicitly by adding "shell" to KIM_ENABLED_TOOL_TIERS.
+    "core":    ("file_read", "file_write", "search"),
     "ui":      ("screen", "mouse", "keyboard", "windows"),
     "browser": ("web",),
 }

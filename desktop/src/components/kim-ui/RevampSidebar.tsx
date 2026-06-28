@@ -46,9 +46,11 @@ interface Props {
   theme?: Theme;
   /** Cycle theme: light → system → dark → light. */
   onCycleTheme?: () => void;
+  /** Open the Connectors panel explicitly — avoids global custom-event dispatch. */
+  onOpenConnectors?: () => void;
 }
 
-function sessionKey(s: SessionInfo): string {
+export function sessionKey(s: SessionInfo): string {
   return s.session_key ?? `${s.session_type}:${s.date}:${s.session_id}`;
 }
 
@@ -128,6 +130,7 @@ export function RevampSidebar({
   sessionRefreshNonce,
   theme,
   onCycleTheme,
+  onOpenConnectors,
 }: Props) {
   const grouped = useMemo(() => groupByDate(kimSessions), [kimSessions]);
   const [codexProjects, setCodexProjects] = useState<CodexProject[]>([]);
@@ -478,9 +481,6 @@ export function RevampSidebar({
           <path d="M8 8l2.5 2.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
         </svg>
         <span style={{ color: 'var(--kim-text-3)', fontSize: 12.5 }}>Search sessions</span>
-        <span className="kr-kbd" style={{ marginLeft: 'auto' }}>
-          ⌘K
-        </span>
       </div>
 
       {/* Projects (Code tab only) */}
@@ -878,7 +878,7 @@ export function RevampSidebar({
                 whiteSpace: 'nowrap',
               }}
             >
-              {account.display_name || 'adam'}
+              {account.display_name || 'User'}
             </div>
             <div
               style={{
@@ -954,7 +954,7 @@ export function RevampSidebar({
               label="Connectors"
               onClick={() => {
                 setAcctMenuOpen(false);
-                window.dispatchEvent(new CustomEvent('kim-open-connectors'));
+                onOpenConnectors?.();
               }}
             />
             {onCycleTheme && (

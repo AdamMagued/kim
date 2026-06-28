@@ -139,20 +139,22 @@ class AliasExpansionTests(unittest.TestCase):
     # Build a tier_dispatch that mirrors the real granular tier names so alias
     # expansion can be exercised without importing mcp.
     _ALIAS_DISPATCH = {
-        "file":     {"read_file": None},
-        "shell":    {"run_command": None},
-        "search":   {"search_in_files": None},
-        "screen":   {"take_screenshot": None},
-        "mouse":    {"click": None},
-        "keyboard": {"type_text": None},
-        "windows":  {"get_windows": None},
-        "web":      {"web_open": None},
+        "file_read":  {"read_file": None},
+        "file_write": {"write_file": None},
+        "shell":      {"run_command": None},
+        "search":     {"search_in_files": None},
+        "screen":     {"take_screenshot": None},
+        "mouse":      {"click": None},
+        "keyboard":   {"type_text": None},
+        "windows":    {"get_windows": None},
+        "web":        {"web_open": None},
     }
 
-    def test_core_alias_expands_to_file_shell_search(self):
+    def test_core_alias_expands_to_file_read_file_write_search_no_shell(self):
+        # 'core' intentionally excludes 'shell' -- arbitrary execution is opt-in.
         result = filter_tools(self._ALIAS_DISPATCH, frozenset({"core"}))
         self.assertIn("read_file", result)
-        self.assertIn("run_command", result)
+        self.assertNotIn("run_command", result)
         self.assertIn("search_in_files", result)
         self.assertNotIn("take_screenshot", result)
 
@@ -239,10 +241,10 @@ class StaticRegistryTests(unittest.TestCase):
         idx = self.source.find("TIER_DISPATCH")
         self.assertGreater(idx, 0)
         tier_section = self.source[idx: idx + 1200]
-        for var in ("_FILE_DISPATCH", "_SHELL_DISPATCH", "_SCREEN_DISPATCH",
-                    "_WEB_DISPATCH", "_MOUSE_DISPATCH", "_KEYBOARD_DISPATCH",
-                    "_WINDOW_DISPATCH", "_GIT_DISPATCH", "_CODE_DISPATCH",
-                    "_SEARCH_DISPATCH", "_MEMORY_DISPATCH"):
+        for var in ("_FILE_READ_DISPATCH", "_FILE_WRITE_DISPATCH", "_SHELL_DISPATCH",
+                    "_SCREEN_DISPATCH", "_WEB_DISPATCH", "_MOUSE_DISPATCH",
+                    "_KEYBOARD_DISPATCH", "_WINDOW_DISPATCH", "_GIT_DISPATCH",
+                    "_CODE_DISPATCH", "_SEARCH_DISPATCH", "_MEMORY_DISPATCH"):
             self.assertIn(var, tier_section,
                           f"{var} not found in TIER_DISPATCH definition")
 

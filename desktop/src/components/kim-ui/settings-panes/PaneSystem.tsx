@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
@@ -219,8 +219,19 @@ function PaneData({
   const [exportState, setExportState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
   const [gistState, setGistState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
   const [statusMsg, setStatusMsg] = useState('');
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const hasGitHub = !!account.github_token;
+
+  // Timer refs — finding #2: clear on unmount to prevent setState-after-unmount.
+  const exportTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const statusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (exportTimerRef.current) clearTimeout(exportTimerRef.current);
+      if (gistTimerRef.current) clearTimeout(gistTimerRef.current);
+      if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
+    };
+  }, []);
 
   async function handleExport(format: 'zip' | 'json' | 'markdown') {
     setExportState('working');
@@ -229,7 +240,8 @@ function PaneData({
       const path = await invoke<string>('export_data', { format });
       setExportState('done');
       setStatusMsg(`Saved to ${path}`);
-      setTimeout(() => {
+      if (exportTimerRef.current) clearTimeout(exportTimerRef.current);
+      exportTimerRef.current = setTimeout(() => {
         setExportState('idle');
         setStatusMsg('');
       }, 3000);
@@ -239,18 +251,23 @@ function PaneData({
     }
   }
 
-  async function handleImport(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const filePath = (file as File & { path?: string }).path ?? file.name;
+  // finding #5: File.path is non-standard and absent in the Tauri webview.
+  // Use openDialog() to obtain a real filesystem path instead.
+  async function handleImport() {
     try {
-      const result = await invoke<string>('import_data', { filePath });
+      const selected = await openDialog({
+        multiple: false,
+        title: 'Select import file',
+        filters: [{ name: 'Backup', extensions: ['zip', 'json'] }],
+      });
+      if (!selected || typeof selected !== 'string') return;
+      const result = await invoke<string>('import_data', { filePath: selected });
       setStatusMsg(result);
-      setTimeout(() => setStatusMsg(''), 3000);
+      if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
+      statusTimerRef.current = setTimeout(() => setStatusMsg(''), 3000);
     } catch (err) {
       setStatusMsg(`Import failed: ${String(err)}`);
     }
-    if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
   async function handleGistBackup() {
@@ -265,7 +282,8 @@ function PaneData({
         await onAccountChange({ ...account, gist_id: gistId });
       }
       setGistState('done');
-      setTimeout(() => setGistState('idle'), 2000);
+      if (gistTimerRef.current) clearTimeout(gistTimerRef.current);
+      gistTimerRef.current = setTimeout(() => setGistState('idle'), 2000);
     } catch (err) {
       setGistState('error');
       setStatusMsg(`Backup failed: ${String(err)}`);
@@ -279,7 +297,8 @@ function PaneData({
       const restored = await invoke<KimAccount>('restore_from_gist', { token: account.github_token, gistId: account.gist_id });
       await onAccountChange({ ...restored, github_token: account.github_token });
       setGistState('done');
-      setTimeout(() => setGistState('idle'), 2000);
+      if (gistTimerRef.current) clearTimeout(gistTimerRef.current);
+      gistTimerRef.current = setTimeout(() => setGistState('idle'), 2000);
     } catch (err) {
       setGistState('error');
       setStatusMsg(`Restore failed: ${String(err)}`);
@@ -368,13 +387,12 @@ function PaneData({
       </div>
 
       <SectionLabel>import</SectionLabel>
-      <button type="button" className="kr-btn" onClick={() => fileInputRef.current?.click()} style={{ width: '100%', justifyContent: 'center' }}>
+      <button type="button" className="kr-btn" onClick={() => void handleImport()} style={{ width: '100%', justifyContent: 'center' }}>
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
           <path d="M6 11V3M3 6l3-3 3 3M1.5 1h9" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
         Import from file (.zip or .json)
       </button>
-      <input ref={fileInputRef} type="file" accept=".zip,.json" style={{ display: 'none' }} onChange={handleImport} />
 
       {statusMsg && (
         <div

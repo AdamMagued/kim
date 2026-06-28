@@ -14,6 +14,9 @@ set -euo pipefail
 #   KIM_SOURCE_DIR     Where the source checkout lives for remote installs.
 #   KIM_BIN_DIR        Where the kim executable is installed.
 
+# Override KIM_REPO_URL to point at a different fork (#66).
+# Override KIM_INSTALL_BRANCH to pin a specific release tag rather than
+# tracking main (no integrity guarantee on main HEAD, #59).
 KIM_REPO_URL="${KIM_REPO_URL:-https://github.com/AdamMagued/kim.git}"
 KIM_INSTALL_BRANCH="${KIM_INSTALL_BRANCH:-main}"
 KIM_SOURCE_DIR="${KIM_SOURCE_DIR:-${HOME}/.kim/source}"

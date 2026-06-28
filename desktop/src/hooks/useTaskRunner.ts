@@ -29,6 +29,8 @@ interface UseTaskRunnerProps {
   scroll: ReturnType<typeof useSessionScroll>;
 }
 
+let _taskCounter = 0;
+
 export function useTaskRunner({
   session,
   settings,
@@ -46,7 +48,7 @@ export function useTaskRunner({
   const makePendingTask = useCallback(
     (text: string, providerOverride?: string): PendingTask => {
       return {
-        id: Date.now() + Math.floor(Math.random() * 1000),
+        id: ++_taskCounter,
         text,
         provider: providerOverride ?? resolveProvider(),
       };
