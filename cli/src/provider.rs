@@ -332,9 +332,32 @@ async fn stream_via_bridge(
                         let _ = tx.send(AppEvent::TextChunk(response.to_string()));
                     } else if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
                     {
-                        let _ = tx.send(AppEvent::ThoughtChunk(format!(
-                            "Desktop agent started session {session_id}."
-                        )));
+                        // /v1/task is async: it returns the session id immediately and runs
+                        // the agent on the desktop, streaming output to the desktop UI. Poll
+                        // the session's run_result so the CLI surfaces the actual answer
+                        // instead of just "session started / (no response)".
+                        let sessions_dir = value
+                            .get("sessions_dir")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        match poll_bridge_session_answer(&sessions_dir, session_id, &tx).await {
+                            Some((answer, _success)) if !answer.trim().is_empty() => {
+                                let _ = tx.send(AppEvent::TextChunk(crate::markdown::render_markdown(
+                                    answer.trim(),
+                                )));
+                            }
+                            Some(_) => {
+                                let _ = tx.send(AppEvent::Err(
+                                    "Kim desktop finished but returned no answer.".to_string(),
+                                ));
+                            }
+                            None => {
+                                let _ = tx.send(AppEvent::Err(format!(
+                                    "Kim desktop task timed out (session {session_id}); it may still be running in the desktop app."
+                                )));
+                            }
+                        }
                     } else {
                         let _ = tx.send(AppEvent::TextChunk(body));
                     }
@@ -349,6 +372,79 @@ async fn stream_via_bridge(
             }
         }
     }
+}
+
+/// `/v1/task` runs the agent asynchronously on the desktop and only returns a
+/// session id. Poll that session's JSONL file for the final `run_result` and return
+/// `(summary, success)`. Emits a heartbeat every ~5s while waiting; gives up after 5min.
+async fn poll_bridge_session_answer(
+    sessions_dir: &str,
+    session_id: &str,
+    tx: &UnboundedSender<AppEvent>,
+) -> Option<(String, bool)> {
+    use std::time::{Duration, Instant};
+    if sessions_dir.is_empty() {
+        return None;
+    }
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut last_beat = Instant::now();
+    loop {
+        if let Some(path) = find_session_file(sessions_dir, session_id) {
+            if let Some(res) = read_run_result(&path) {
+                return Some(res);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if last_beat.elapsed() >= Duration::from_secs(5) {
+            let _ = tx.send(AppEvent::ThoughtChunk("Kim desktop is working…".to_string()));
+            last_beat = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+    }
+}
+
+/// Locate `<sessions_dir>/<date>/<session_id>.jsonl` (date subdir varies).
+fn find_session_file(sessions_dir: &str, session_id: &str) -> Option<PathBuf> {
+    let base = Path::new(sessions_dir);
+    let direct = base.join(format!("{session_id}.jsonl"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    for entry in std::fs::read_dir(base).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            let f = p.join(format!("{session_id}.jsonl"));
+            if f.is_file() {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// Read the trailing `run_result` line; returns `(summary, success)` once present.
+fn read_run_result(path: &Path) -> Option<(String, bool)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() || !line.contains("\"run_result\"") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if v.get("type").and_then(Value::as_str) == Some("run_result") {
+                let summary = v
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let success = v.get("success").and_then(Value::as_bool).unwrap_or(false);
+                return Some((summary, success));
+            }
+        }
+    }
+    None
 }
 
 /* ===========================================================
