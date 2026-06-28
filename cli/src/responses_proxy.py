@@ -7,13 +7,14 @@ Codex CLI uses the Responses API; this proxy lets it talk to ollama
 Usage: python3 responses_proxy.py <ollama_base_url>
 Prints the port it bound to on the first line of stdout, then serves.
 """
-import json, sys, uuid, socket, traceback
+import json, os, sys, uuid, socket, tempfile, traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 TARGET = sys.argv[1].rstrip("/")  # e.g. http://127.0.0.1:11434/v1
-_LOG = open("/tmp/kim_proxy.log", "a", buffering=1)
+_log_path = os.environ.get("KIM_LOG", os.path.join(tempfile.gettempdir(), "kim_proxy.log"))
+_LOG = open(_log_path, "a", buffering=1)
 
 def _log(*args):
     import datetime

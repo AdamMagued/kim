@@ -315,6 +315,8 @@ export function ProviderPicker({
         onClick={() => !disabled && setOpen(v => !v)}
         disabled={disabled}
         title="Change provider"
+        aria-haspopup="true"
+        aria-expanded={open}
       >
         <span
           className="kim-provider-picker__dot"
@@ -359,7 +361,7 @@ export function ProviderPicker({
       )}
 
       {open && (
-        <div className="kim-provider-picker__panel" role="menu">
+        <div className="kim-provider-picker__panel">
           {isOllama && (
             <div className="kim-provider-picker__ollama-section" aria-label="Ollama quick settings">
           <div className="kim-provider-picker__mode-switch" role="group" aria-label="Ollama mode">
@@ -425,6 +427,7 @@ export function ProviderPicker({
               <>
                 <span className="kim-provider-picker__select-wrap">
                   <select
+                    aria-label="Ollama model"
                     value={selectedOllamaModel}
                     disabled={disabled || !ollamaStatus?.running || inlineOllamaModels.length === 0}
                     onChange={e => {

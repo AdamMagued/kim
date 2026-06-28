@@ -70,16 +70,73 @@ _OPERATOR_SPLIT_RE = re.compile(r"&&|\|\||[;|\n\r&]")
 # keeps working in sandbox tests.
 _REDIR_OP_RE = re.compile(r"^\d*>>?$|^&>>?$")
 
+# Regex that matches a leading redirect-operator prefix inside a no-space token
+# like '>/etc/passwd' or '>>/abs/path' (finding 1).  The captured remainder after
+# the prefix is the redirect target and must be validated like the space-separated
+# form.  Covers \d*>> ?, &>> ?, and < (input redirect).
+_REDIR_PREFIX_RE = re.compile(r"^(\d*>>?|&>>?|<)")
+
 _SANDBOX_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
+# Env vars that can be used for code injection even in non-sandboxed mode.
+# An operator may disable the sandbox for legitimate reasons, but the child
+# process should still never inherit dynamic-linker or interpreter-path
+# overrides that a compromised parent environment might carry (finding 2,
+# part c — 'Never inherit full parent env for non-sandboxed runs').
+_DANGEROUS_ENV_VARS = frozenset({
+    # Dynamic linker / runtime injection (Linux)
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
+    # Dynamic linker / runtime injection (macOS)
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+    # Python startup and module-path manipulation
+    "PYTHONSTARTUP", "PYTHONPATH",
+    # Node.js / Ruby / Perl module paths
+    "NODE_PATH", "RUBYLIB", "PERL5LIB", "PERLLIB",
+})
 
-def _sandbox_enabled(args: dict) -> bool:
-    if "sandbox_mode" in args:
-        return bool(args.get("sandbox_mode"))
+
+def _filtered_env() -> dict[str, str]:
+    """Return a copy of the parent env with injection-vector variables removed.
+
+    Used for non-sandbox subprocess runs so that a poisoned parent environment
+    (e.g. LD_PRELOAD pointing at a malicious shared library) cannot affect
+    child processes even when the operator has disabled the full sandbox
+    (finding 2, part c).
+    """
+    return {k: v for k, v in os.environ.items() if k not in _DANGEROUS_ENV_VARS}
+
+
+def _sandbox_enabled() -> bool:
+    """Return the operator-level sandbox mode flag.
+
+    Intentionally does NOT accept model-supplied args — sandbox_mode must be
+    set via operator/server config (SHELL_SANDBOX_MODE) only (finding 2).
+    """
     return SHELL_SANDBOX_MODE
 
 
 def _sandbox_env() -> dict[str, str]:
+    """Build a minimal, safe environment for sandboxed subprocess execution.
+
+    POSIX: restricts PATH to standard system directories, sets HOME/TMPDIR.
+    Windows: uses the Windows-appropriate equivalents so cmd.exe can start
+    (finding 3).
+    """
+    if IS_WINDOWS:
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        env: dict[str, str] = {
+            "Path": rf"{system_root}\System32;{system_root}",
+            "SystemRoot": system_root,
+            "TEMP": tempfile.gettempdir(),
+            "TMP": tempfile.gettempdir(),
+            "USERPROFILE": str(PROJECT_ROOT),
+        }
+        # Preserve ComSpec so cmd.exe knows its own path
+        comspec = os.environ.get("ComSpec")
+        if comspec:
+            env["ComSpec"] = comspec
+        return env
+    # POSIX (macOS / Linux) — unchanged behaviour
     env = {
         "PATH": _SANDBOX_PATH,
         "HOME": str(PROJECT_ROOT),
@@ -142,9 +199,21 @@ def _check_single_segment(cmd: str) -> str | None:
     # Redirection to an absolute path or parent-directory traversal is blocked
     # (finding 1a).  Relative redirects (`printf probe > file`) are allowed so
     # the sandbox write-isolation test keeps passing.
+    #
+    # Two forms must be caught:
+    #   Space-separated : tokens[i] == '>'  and tokens[i+1] == '/etc/passwd'
+    #   No-space        : tokens[i] == '>/etc/passwd'  (single merged token)
     for i, tok in enumerate(tokens):
+        # Space-separated form: standalone operator followed by separate target
         if _REDIR_OP_RE.match(tok) and i + 1 < len(tokens):
             target = tokens[i + 1]
+            if target.startswith("/") or ".." in target:
+                return "BLOCKED: Redirection to absolute path or parent traversal"
+        # No-space form: operator prefix merged with target in the same token
+        # e.g. '>/etc/passwd', '>>/abs/p', '2>/dev/null', '< /etc/shadow'
+        m = _REDIR_PREFIX_RE.match(tok)
+        if m and m.end() < len(tok):
+            target = tok[m.end():]
             if target.startswith("/") or ".." in target:
                 return "BLOCKED: Redirection to absolute path or parent traversal"
 
@@ -273,8 +342,12 @@ async def handle_run_command(args: dict) -> str:
     cmd = args["cmd"]
     cwd = str(args.get("cwd", str(PROJECT_ROOT)))
     timeout = int(args.get("timeout", SHELL_TIMEOUT))
-    allow_chaining = bool(args.get("allow_chaining", False))
-    sandbox_mode = _sandbox_enabled(args)
+    # allow_chaining and sandbox_mode are operator/server-config-only values —
+    # never read from model-supplied args (finding 2).  Any model-injected copy
+    # of these keys is silently ignored here; additionalProperties:false on the
+    # schema prevents them from being accepted in the first place.
+    allow_chaining = False
+    sandbox_mode = _sandbox_enabled()
 
     block_msg = _check_blocked(cmd, allow_chaining=allow_chaining)
     if block_msg:
@@ -308,7 +381,9 @@ async def handle_run_command(args: dict) -> str:
             env = _sandbox_env()
         else:
             exec_cwd = cwd
-            env = None
+            # Never inherit the full parent env — strip injection-vector vars
+            # even in non-sandbox mode (finding 2, part c).
+            env = _filtered_env()
 
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -357,7 +432,8 @@ async def handle_run_powershell(args: dict) -> str:
     """
     script = args["script"]
     timeout = int(args.get("timeout", SHELL_TIMEOUT))
-    sandbox_mode = _sandbox_enabled(args)
+    # sandbox_mode is operator/server-config-only — never from model args (finding 2).
+    sandbox_mode = _sandbox_enabled()
 
     block_msg = _check_blocked(script, allow_chaining=True)  # PS scripts naturally chain
     if block_msg:
@@ -390,7 +466,9 @@ async def handle_run_powershell(args: dict) -> str:
             env = _sandbox_env()
         else:
             exec_cwd = str(PROJECT_ROOT)
-            env = None
+            # Never inherit the full parent env — strip injection-vector vars
+            # even in non-sandbox mode (finding 2, part c).
+            env = _filtered_env()
 
         ps_args = [
             ps_exe,

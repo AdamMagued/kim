@@ -115,14 +115,27 @@ async def mcp_session_context(config: dict):
 
     async with AsyncExitStack() as stack:
         sessions = []
+        internal_params = server_list[0]  # always the Kim MCP server
+        internal_ok = False
         for params in server_list:
             try:
                 transport = await stack.enter_async_context(stdio_client(params))
                 read_stream, write_stream = transport
                 session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
                 sessions.append(session)
+                if params is internal_params:
+                    internal_ok = True
             except Exception as e:
                 logger.error(f"Failed to start MCP server {params.command}: {e}")
+                if params is internal_params:
+                    raise RuntimeError(
+                        "Core Kim MCP server (mcp_server.server) failed to start — "
+                        "OS-control tools are unavailable. Aborting."
+                    ) from e
+
+        if not internal_ok:
+            # Should not be reachable (the loop raises above), but guard anyway.
+            raise RuntimeError("Core Kim MCP server did not start; cannot continue.")
 
         if not sessions:
             raise RuntimeError("No MCP servers could be started.")

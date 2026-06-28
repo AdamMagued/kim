@@ -102,7 +102,8 @@ export function OnboardingFlow({ onComplete }: Props) {
     const account: KimAccount = {
       display_name: name.trim(),
       github_username: githubUser?.login,
-      github_token: githubUser ? token.trim() : undefined,
+      // github_token intentionally omitted — stored in OS keychain via
+      // store_github_token below, never written to account.json.
       github_avatar_url: githubUser?.avatar_url,
       gist_id: undefined,
       created_at: new Date().toISOString(),
@@ -110,25 +111,25 @@ export function OnboardingFlow({ onComplete }: Props) {
       google_active_account: undefined,
     };
     try {
+      // Persist PAT to OS keychain (macOS Keychain / Windows Credential Manager /
+      // Linux Secret Service) before saving the account record.  The Rust
+      // save_account command strips github_token before writing account.json so
+      // the secret never touches disk even if callers include it.
+      if (githubUser && token.trim()) {
+        await invoke('store_github_token', { token: token.trim() });
+      }
       await invoke('save_account', { account });
-      // SECURITY NOTE — PAT STILL WRITTEN TO account.json (PARTIAL MITIGATION ONLY):
-      // `account` above includes `github_token`, and `save_account` persists the whole
-      // KimAccount struct to account.json in plain text. This is a KNOWN INCOMPLETE FIX.
-      //
-      // Full remediation requires a Rust-side change that does NOT yet exist:
-      //   1. Add a `store_github_pat(token: String)` Tauri command backed by
-      //      tauri-plugin-keychain (macOS Keychain / Windows Credential Store / libsecret).
-      //   2. Call that command here instead of including the token in `account`.
-      //   3. Strip `github_token` from the KimAccount type and save_account path so
-      //      the field never reaches account.json.
-      //
-      // Until that Rust work is done, the only mitigation here is scrubbing the PAT
-      // from React component state after the Rust layer has already consumed it, so the
-      // token does not linger in JS heap beyond this call.
       setToken('');
+      // Build the account object for in-memory state, including github_token so
+      // the app state is fully hydrated without needing a separate load_account
+      // round-trip.  save_account (above) already stripped the token from disk.
+      const accountForState: KimAccount = {
+        ...account,
+        ...(githubUser && token.trim() ? { github_token: token.trim() } : {}),
+      };
       // Exit animation before calling onComplete
       setLeaving(true);
-      setTimeout(() => onComplete(account), 500);
+      setTimeout(() => onComplete(accountForState), 500);
     } catch {
       setSaving(false);
     }
@@ -169,7 +170,9 @@ export function OnboardingFlow({ onComplete }: Props) {
               <div className="kim-ob__input-row">
                 <input
                   ref={nameInputRef}
+                  id="ob-name"
                   type="text"
+                  aria-label="Your name"
                   placeholder="Your name…"
                   autoComplete="given-name"
                   spellCheck={false}
@@ -239,7 +242,9 @@ export function OnboardingFlow({ onComplete }: Props) {
 
             <div className="kim-ob__token-row">
               <input
+                id="ob-github-token"
                 type="password"
+                aria-label="GitHub personal access token"
                 placeholder="ghp_…"
                 spellCheck={false}
                 value={token}

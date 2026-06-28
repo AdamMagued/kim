@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { KimMessage, ContentBlock, ToolUseBlock, ToolResultBlock, TypingAnimation } from '../types';
 import { ToolUseCard, ToolResultCard, SignalCard } from './ToolCallCard';
@@ -79,6 +79,7 @@ function UserBubble({ text, onEdit }: { text: string; onEdit?: (newText: string)
           <textarea
             ref={taRef}
             className="kim-bubble__edit-textarea"
+            aria-label="Edit message"
             value={draft}
             onChange={e => {
               setDraft(e.target.value);
@@ -326,6 +327,7 @@ export function AnimatedText({
 }) {
   const containerRef = useRef<HTMLSpanElement>(null);
   const [done, setDone] = useState(!active || animation === 'none');
+  const renderedText = useMemo(() => renderText(text), [text]);
 
   useEffect(() => {
     if (!active || animation === 'none') return;
@@ -405,7 +407,7 @@ export function AnimatedText({
   }, [text, animation, active]);
 
   if (done || !active || animation === 'none') {
-    return <>{renderText(text)}</>;
+    return <>{renderedText}</>;
   }
 
   return <span ref={containerRef} className="kim-anim-root" />;
@@ -425,7 +427,7 @@ interface Props {
   onEdit?: (newText: string) => void;
 }
 
-export function MessageBubble({ message, animate = false, typingAnimation = 'none', onRetry, retries = 0, onEdit }: Props) {
+export const MessageBubble = React.memo(function MessageBubble({ message, animate = false, typingAnimation = 'none', onRetry, retries = 0, onEdit }: Props) {
   const isUser   = message.role === 'user';
   const isSystem = message.role === 'system';
 
@@ -650,4 +652,4 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
       </div>
     </div>
   );
-}
+});

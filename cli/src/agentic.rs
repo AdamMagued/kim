@@ -132,7 +132,7 @@ pub fn agentic_available(provider: &str) -> Option<(PathBuf, PathBuf)> {
 }
 
 /// Find a Python interpreter: repo venv first, then system.
-fn find_python(root: &Path) -> Option<PathBuf> {
+pub fn find_python(root: &Path) -> Option<PathBuf> {
     let candidates = [
         root.join("venv").join("bin").join("python"),
         root.join("venv").join("Scripts").join("python.exe"),

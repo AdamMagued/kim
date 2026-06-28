@@ -134,7 +134,12 @@ export default function App() {
   const [appVersion, setAppVersion] = useState('0.1.0');
   const [updateInfo, setUpdateInfo] = useState<GithubRelease | null>(null);
   const [showUpdate, setShowUpdate] = useState(false);
+  const [updateStage, setUpdateStage] = useState<'idle' | 'updating' | 'done' | 'error'>('idle');
   const silentCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ref through which App calls ChatView's internal openConnectors without a
+  // global CustomEvent bus. ChatView writes its stable openConnectors callback
+  // here on mount; App reads it when the sidebar or header button is clicked.
+  const openConnectorsRef = useRef<(() => void) | null>(null);
   useEffect(() => {
     return () => {
       if (silentCheckTimerRef.current !== null) clearTimeout(silentCheckTimerRef.current);
@@ -235,6 +240,7 @@ export default function App() {
         // Delay slightly so the app has time to finish loading
         silentCheckTimerRef.current = setTimeout(() => {
           toast(`Kim ${latest} is available — you're on ${currentVersion}. Click to update.`, 'info', 8000);
+          setUpdateStage('idle');
           setShowUpdate(true);
         }, 2000);
       }
@@ -253,12 +259,14 @@ export default function App() {
       else if (mod && e.key.toLowerCase() === 'b') { e.preventDefault(); setSidebarCollapsed(v => !v); }
       else if (e.key === 'Escape') {
         if (showSettings) setShowSettings(false);
-        else if (showUpdate) setShowUpdate(false);
+        // Only dismiss the UpdateModal via Escape when the update has not yet
+        // started — mirrors UpdateModal's own backdrop-click guard (line 55).
+        else if (showUpdate && updateStage === 'idle') setShowUpdate(false);
       }
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [showSettings, showUpdate]);
+  }, [showSettings, showUpdate, updateStage]);
 
   function handleSettingsChange(next: Settings) {
     setSettings(next);
@@ -303,7 +311,7 @@ export default function App() {
   }
 
   function openConnectors() {
-    window.dispatchEvent(new CustomEvent('kim-open-connectors'));
+    openConnectorsRef.current?.();
   }
 
   function handleRemoveProject(path: string) {
@@ -409,6 +417,7 @@ export default function App() {
       const latest = data.tag_name.replace(/^v/, '');
       if (compareSemver(latest, appVersion) > 0) {
         setUpdateInfo(data);
+        setUpdateStage('idle');
         setShowUpdate(true);
       } else {
         toast(`You're on the latest version (v${appVersion}).`, 'success');
@@ -569,6 +578,7 @@ export default function App() {
           onSelectProject={handleSelectProject}
           recentSessions={activeTab === 'code' ? codexSessions : kimSessions}
           onSelectSession={handleSelectSession}
+          openConnectorsRef={openConnectorsRef}
         />
       </main>
 
@@ -591,6 +601,7 @@ export default function App() {
           latestVersion={updateInfo.tag_name.replace(/^v/, '')}
           releaseNotes={updateInfo.body ?? ''}
           onDismiss={() => setShowUpdate(false)}
+          onStageChange={setUpdateStage}
         />
       )}
 

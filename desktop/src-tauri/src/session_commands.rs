@@ -559,8 +559,16 @@ fn write_session_meta(
     }
     obj.insert("pinned".into(), serde_json::Value::Bool(pinned));
     fs::create_dir_all(date_dir).map_err(|e| e.to_string())?;
-    let p = date_dir.join(format!("{session_id}.meta.json"));
-    fs::write(p, serde_json::Value::Object(obj).to_string()).map_err(|e| e.to_string())
+    let dest = date_dir.join(format!("{session_id}.meta.json"));
+    // Atomic write: write to a sibling tmp file then rename so concurrent
+    // readers never see a partial file.
+    let tmp = date_dir.join(format!("{session_id}.meta.json.tmp"));
+    fs::write(&tmp, serde_json::Value::Object(obj).to_string())
+        .map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &dest).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        e.to_string()
+    })
 }
 
 fn base_dir(kim_dir: &Option<String>) -> PathBuf {
@@ -596,18 +604,39 @@ pub fn set_session_pinned(
     write_session_meta(&date_dir, &session_id, None, Some(pinned))
 }
 
-/// Remove a session's JSONL + summary + meta + browser-meta. Returns files removed.
+/// Remove a session's JSONL + summary + meta + browser-meta + all sidecar files.
+/// Returns count of files removed.
 pub(crate) fn delete_session_files(date_dir: &Path, session_id: &str) -> usize {
-    let candidates = [
+    // Fixed-name sidecars.
+    let fixed = [
         format!("{session_id}.jsonl"),
         format!("{session_id}.summary.txt"),
         format!("{session_id}.meta.json"),
         format!("{session_id}.browser.json"),
+        format!("{session_id}.context.json"),
+        format!("{session_id}.runs.json"),
     ];
     let mut n = 0;
-    for name in candidates {
+    for name in &fixed {
         if fs::remove_file(date_dir.join(name)).is_ok() {
             n += 1;
+        }
+    }
+    // Wildcard sidecars: <id>.compact.*.json and <id>.roll.*.jsonl.
+    // Scan the directory so we don't need an external glob crate.
+    let compact_prefix = format!("{session_id}.compact.");
+    let roll_prefix = format!("{session_id}.roll.");
+    if let Ok(entries) = fs::read_dir(date_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let fname = entry.file_name();
+            let fname_str = fname.to_string_lossy();
+            let is_compact = fname_str.starts_with(&compact_prefix)
+                && fname_str.ends_with(".json");
+            let is_roll = fname_str.starts_with(&roll_prefix)
+                && fname_str.ends_with(".jsonl");
+            if (is_compact || is_roll) && fs::remove_file(entry.path()).is_ok() {
+                n += 1;
+            }
         }
     }
     n

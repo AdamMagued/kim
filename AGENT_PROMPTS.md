@@ -1,5 +1,10 @@
 # Kim — Agent Execution Prompts
 
+> **STATUS: COMPLETED / SUPERSEDED**
+> All prompts in this file (Phases -1 through 7) have been executed and merged.
+> The playbook that governs active ongoing work is **`PRODUCTION_ROADMAP.md`** (authoritative).
+> This file is retained as a decision archive — do not re-run these prompts.
+
 Each prompt below is self-contained. To use one, tell an agent:
 > "Read `kim-pro/AGENT_PROMPTS.md` and execute Prompt N."
 
@@ -162,7 +167,7 @@ TO_BE_DONE.md
 **Step 6 — Rewrite `ARCHITECTURE.md`:** Replace the current stale content with a description of the actual running system:
 - Tauri 2 desktop app structure (Rust backend + React 19 frontend)
 - Rust module layout (lib.rs, ollama.rs, relay.rs, google_oauth.rs, build.rs)
-- Python orchestrator + MCP server (KimAgent loop, MCP stdio transport, 31 tools)
+- Python orchestrator + MCP server (KimAgent loop, MCP stdio transport, 50 tools)
 - IPC event protocol: the 5 Tauri events and the stdout text protocol (`[STATUS]`, `[PLAN]{json}`, `[STEP N]:{json}`, `[DONE N]`, `[CONTEXT]{json}`, `[UI] SCREENSHOT_FLASH`, `[UI] SHOW`)
 - Codex bridge flow (5 layers: Tauri → run_codex_bridge.py → codex_bridge.py → _CodexProxy → Codex CLI → BrowserProvider)
 - Browser provider behavior and `[END_OF_RESPONSE_{hash}]` sentinel

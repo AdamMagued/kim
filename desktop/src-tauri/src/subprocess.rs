@@ -1,5 +1,6 @@
 use crate::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tauri::State;
@@ -355,9 +356,20 @@ pub(crate) async fn send_task(
     use tokio::process::Command;
 
     // Refuse to start a second task if one is already running or spawning.
+    // This is a fast early-reject; the authoritative gate is the reserve block below.
     {
         let guard = state.lock().await;
-        if guard.pid.is_some() || guard.starting {
+        let bridge_pid_running = BRIDGE_TASK_PID
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(process_exists)
+            .unwrap_or(false);
+        if guard.pid.is_some() || guard.starting
+            || BRIDGE_TASK_STARTING.load(Ordering::Acquire)
+            || bridge_pid_running
+        {
             return Err("A task is already running. Stop it before starting a new one.".to_string());
         }
     }
@@ -723,10 +735,30 @@ pub(crate) async fn send_task(
 
     // Reserve the runner slot immediately before spawning. Command setup can be
     // slow, and two frontend invocations can otherwise both pass the initial
-    // pid check and spawn separate agents.
+    // pid check and spawn separate agents. BRIDGE_TASK_STARTING is the shared
+    // gate with /v1/task — both paths claim it atomically, so only one can win.
+    // After claiming, we also check BRIDGE_TASK_PID because /v1/task clears
+    // BRIDGE_TASK_STARTING once its PID is stored, meaning a running /v1/task
+    // has BRIDGE_TASK_STARTING=false but BRIDGE_TASK_PID=Some(pid).
     {
         let mut guard = state.lock().await;
         if guard.pid.is_some() || guard.starting {
+            return Err("A task is already running. Stop it before starting a new one.".to_string());
+        }
+        // swap returns the *previous* value; if it was already true, /v1/task owns it — bail.
+        if BRIDGE_TASK_STARTING.swap(true, Ordering::AcqRel) {
+            return Err("A task is already running. Stop it before starting a new one.".to_string());
+        }
+        // /v1/task may have cleared BRIDGE_TASK_STARTING but still be running (PID set).
+        let bridge_running = BRIDGE_TASK_PID
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(process_exists)
+            .unwrap_or(false);
+        if bridge_running {
+            BRIDGE_TASK_STARTING.store(false, Ordering::Release);
             return Err("A task is already running. Stop it before starting a new one.".to_string());
         }
         guard.starting = true;
@@ -737,6 +769,8 @@ pub(crate) async fn send_task(
         Err(e) => {
             let mut guard = state.lock().await;
             guard.starting = false;
+            // Release the shared spawn gate so /v1/task can proceed after our failure.
+            BRIDGE_TASK_STARTING.store(false, Ordering::Release);
             return Err(format!("Failed to start Kim: {}", e));
         }
     };
@@ -752,11 +786,20 @@ pub(crate) async fn send_task(
     if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
         *guard = child_pid;
     }
+    // PID is now set — release the BRIDGE_TASK_STARTING gate so the /v1/task guard
+    // sees a running PID rather than the "starting" flag going forward.
+    BRIDGE_TASK_STARTING.store(false, Ordering::Release);
     // K7: reflect the running task in the tray status line.
     crate::speed_access::set_tray_status(&app_handle, Some(task.as_str()));
 
-    // Store stdin handle for HITL approval round-trip (only for Kim orchestrator, not Codex).
-    if !is_codex {
+    // Store stdin handle for HITL approval round-trip.
+    // Always stored for the Kim orchestrator path (!is_codex).
+    // Also stored for the Codex browser-bridge path (is_codex && is_browser_provider):
+    // codex_bridge_service emits hitl_approval_request on stdout before spawning Codex
+    // and reads the approval from stdin, so the round-trip requires a live handle here.
+    // Direct Codex CLI runs (is_codex && !is_browser_provider) use Stdio::null on stdin
+    // and never emit HITL requests, so they are intentionally excluded.
+    if !is_codex || is_browser_provider {
         *hitl_stdin().lock().await = child.stdin.take();
     }
 

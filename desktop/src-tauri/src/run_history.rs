@@ -61,9 +61,33 @@ pub async fn save_run_history(
         .ok_or_else(|| "Could not locate a session directory to save runs.json into".to_string())?;
 
     let path = dir.join(format!("{}.runs.json", session_id));
+    let tmp_path = dir.join(format!("{}.runs.json.tmp", session_id));
     let body = serde_json::to_string(&runs).map_err(|e| e.to_string())?;
-    fs::write(&path, body).map_err(|e| e.to_string())?;
-    Ok(())
+
+    // Atomic write: write to a same-directory temp file, then rename over the
+    // target.  A crash mid-write leaves the previous .runs.json intact rather
+    // than producing a truncated/empty file.
+    fs::write(&tmp_path, body).map_err(|e| e.to_string())?;
+    match fs::rename(&tmp_path, &path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            #[cfg(target_os = "windows")]
+            {
+                // Windows rename does not overwrite existing files. Fall back to
+                // remove+rename; this is not perfectly atomic, but still avoids
+                // exposing a partially-written JSON file.
+                if path.exists() {
+                    fs::remove_file(&path).map_err(|remove_err| remove_err.to_string())?;
+                }
+                fs::rename(&tmp_path, &path).map_err(|rename_err| rename_err.to_string())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = fs::remove_file(&tmp_path);
+                Err(e.to_string())
+            }
+        }
+    }
 }
 
 #[tauri::command]

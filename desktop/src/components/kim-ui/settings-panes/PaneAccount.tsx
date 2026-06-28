@@ -199,6 +199,10 @@ function PaneAccount({
       const user = await invoke<{ login: string; name: string | null; avatar_url: string }>('verify_github_pat', {
         token: token.trim(),
       });
+      // Store PAT in OS keychain before updating account state.
+      // save_account (called by onAccountChange) also strips github_token from
+      // account.json, so the secret never touches disk.
+      await invoke('store_github_token', { token: token.trim() });
       await onAccountChange({
         ...account,
         github_token: token.trim(),
@@ -217,6 +221,8 @@ function PaneAccount({
 
   async function disconnectGitHub() {
     if (!confirm('Disconnect GitHub? Gist sync will stop working.')) return;
+    // Remove PAT from OS keychain.
+    await invoke('delete_github_token').catch(() => {});
     await onAccountChange({
       ...account,
       github_token: undefined,
@@ -288,6 +294,8 @@ function PaneAccount({
           {editingName ? (
             <input
               autoFocus
+              id="account-display-name"
+              aria-label="Display name"
               value={nameVal}
               onChange={(e) => setNameVal(e.target.value)}
               onBlur={() => void saveName()}
@@ -355,7 +363,9 @@ function PaneAccount({
             <span style={{ color: 'var(--kim-accent)' }}>github.com/settings/tokens</span>.
           </div>
           <input
+            id="account-github-pat"
             type="password"
+            aria-label="GitHub personal access token"
             className="kr-input"
             placeholder="ghp_…"
             value={token}
@@ -459,7 +469,9 @@ function PaneAccount({
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
         <input
+          id="account-google-email"
           type="email"
+          aria-label="Google account email"
           className="kr-input"
           placeholder="you@gmail.com"
           value={googleEmail}

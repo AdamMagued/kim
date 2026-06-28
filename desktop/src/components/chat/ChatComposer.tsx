@@ -312,12 +312,13 @@ export function ChatComposer({
           />
 
           {heroMode && (
-            <div className="kim-composer__left-tools" aria-hidden="true">
+            <div className="kim-composer__left-tools">
               <button
                 type="button"
                 className="kim-composer__tool-btn"
                 disabled
                 tabIndex={-1}
+                aria-hidden="true"
                 aria-label="Notifications"
               >
                 <svg
@@ -339,6 +340,7 @@ export function ChatComposer({
                 className="kim-composer__tool-btn"
                 disabled
                 tabIndex={-1}
+                aria-hidden="true"
                 aria-label="System prompt"
               >
                 <svg
@@ -356,7 +358,7 @@ export function ChatComposer({
               <button
                 type="button"
                 className="kim-composer__tool-btn"
-                tabIndex={-1}
+                tabIndex={0}
                 aria-label="Attach file"
                 onClick={() => fileInputRef.current?.click()}
               >

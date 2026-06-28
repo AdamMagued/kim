@@ -387,9 +387,6 @@ class KimAgent:
         if usage:
             try:
                 self._log("INFO", f"[USAGE] {json.dumps(usage, ensure_ascii=False, separators=(',', ':'))}")
-                _usage_typed: dict = {"type": "usage"}
-                _usage_typed.update(usage)
-                print(json.dumps(_usage_typed, ensure_ascii=False, separators=(",", ":")), flush=True)
             except Exception:
                 logger.debug("Failed to serialize usage payload", exc_info=True)
 
@@ -478,6 +475,15 @@ class KimAgent:
         Returns:
             {"success": bool, "summary": str, "screenshot": str (base64)}
         """
+        # Attach run_id / session_id to every log line for this run.
+        try:
+            from orchestrator.obs_logging import init_logging as _init_logging
+            _run_id = getattr(self._session_store, "session_id", "") or ""
+            _sess_id = str(getattr(self, "_resume_session_id", "") or "")
+            _init_logging(run_id=_run_id, session_id=_sess_id)
+        except Exception:
+            pass  # logging must never crash startup
+
         self._log("INFO", f"=== Starting task: {task!r} ===")
         print(json.dumps({"type": "status", "message": "Kim is working on it…"}, separators=(",", ":"), ensure_ascii=False), flush=True)
         # K3: start the shared stdin pump so mid-run steer lines are captured.
@@ -538,16 +544,23 @@ class KimAgent:
         else:
             self.memory.clear()
 
-        await self._refresh_tools()
-        if not self._tools:
+        try:
+            await self._refresh_tools()
+            if not self._tools:
+                return self._complete_run(make_run_result(
+                    AgentTermination.PROVIDER_FAILED,
+                    "No MCP tools available",
+                    "",
+                ))
+            self._emit_context_snapshot()
+            system_prompt = self._build_system_prompt(task)
+        except Exception as _startup_err:
+            self._log("ERROR", f"Agent startup failed: {_startup_err}")
             return self._complete_run(make_run_result(
                 AgentTermination.PROVIDER_FAILED,
-                "No MCP tools available",
+                f"Agent startup failed: {_startup_err}",
                 "",
             ))
-
-        self._emit_context_snapshot()
-        system_prompt = self._build_system_prompt(task)
         # Inject compact summary (if present) at the top of the system prompt so
         # all API providers receive it without embedding a system-role message in
         # the messages list (which Anthropic's API does not permit).
@@ -556,6 +569,7 @@ class KimAgent:
             system_prompt = compact_ctx + "\n\n---\n\n" + system_prompt
         self._run_consecutive_continues: int = 0
         self._run_last_tool: Optional[str] = None
+        self._run_iteration: int = 0
 
         self._run_screenshot_b64: str = ""
         self._suppress_screen_tools_first_turn: bool = False
@@ -628,6 +642,7 @@ class KimAgent:
             self._clear_chat_on_next_call = True
 
         for iteration in range(1, self.max_iterations + 1):
+            self._run_iteration = iteration
             # ── Cancellation check ──────────────────────────────────────
             if self._is_cancelled():
                 self._log("WARN", "Task cancelled by user")
@@ -657,12 +672,6 @@ class KimAgent:
                 if len(call_tools) != len(self._tools):
                     self._log("INFO", "Screenshot attached — withholding screen-read tools on first turn so the answer comes from the image")
 
-            request_estimate = estimate_request_tokens(
-                request_messages,
-                tools=call_tools,
-                system=system_prompt,
-            )
-
             # ── LLM call with retry ─────────────────────────────────────
             try:
                 clear_chat = self._clear_chat_on_next_call and iteration == 1
@@ -687,8 +696,21 @@ class KimAgent:
                 return self._complete_run(make_run_result(AgentTermination.PROVIDER_FAILED, need_help, self._run_screenshot_b64))
 
             # ── Track token/context usage ────────────────────────────────
+            # Compute the request-size estimate lazily — only when the provider
+            # did not return exact input_tokens (avoids re-serializing ~50 tool
+            # schemas on every iteration when real usage is already available).
+            _usage = response.get("usage", {})
+            _has_exact_input = bool(
+                _usage.get("input") or _usage.get("input_tokens") or _usage.get("prompt_tokens")
+            ) and not bool(
+                _usage.get("estimated") or _usage.get("estimate") or _usage.get("is_estimate")
+            )
+            request_estimate = (
+                None if _has_exact_input
+                else estimate_request_tokens(request_messages, tools=call_tools, system=system_prompt)
+            )
             self._track_context_usage(
-                response.get("usage", {}),
+                _usage,
                 fallback_input_tokens=request_estimate,
                 fallback_source=type(self.provider).__name__,
             )
@@ -753,9 +775,6 @@ class KimAgent:
                     {"role": "user", "content": "[Tool result: batch]\nERROR: 'calls' must be a list."})
                 return None
 
-            _BATCH_SAFE = {"read_file", "list_dir", "git_status", "git_diff",
-                           "git_log", "search_in_files", "find_files",
-                           "get_screen_info", "get_windows", "observe_ui"}
             batch_results = []
             aborted_after = -1
             ok = True
@@ -769,15 +788,9 @@ class KimAgent:
                 sub_tool = _normalize_tool_name(raw_sub_tool)
                 sub_args = call.get("args", {})
 
-                if sub_tool not in _BATCH_SAFE:
-                    batch_results.append(
-                        f"Call {idx} ({raw_sub_tool}): ERROR: Tool '{raw_sub_tool}' "
-                        f"is not safe for batching. Allowed: {', '.join(_BATCH_SAFE)}."
-                    )
-                    ok = False
-                    aborted_after = idx
-                    break
-
+                # Non-safe (mutating) sub-tools are run sequentially just like
+                # safe ones — the preview/HITL gate below provides the same
+                # user-confirmation opportunity as the single-tool code path.
                 if self._is_preview_mode() and self._ui_bridge:
                     confirmed = await self._ui_bridge.confirm_action(sub_tool, sub_args)
                     if not confirmed:
@@ -842,66 +855,13 @@ class KimAgent:
                 AgentTermination.NEED_HELP, summary, self._run_screenshot_b64,
             ))
 
-        # Only include a screenshot if the LLM explicitly called take_screenshot
-        if tool_name == "take_screenshot":
-            screenshot_b64 = result_text
-            if screenshot_b64.startswith("data:image/png;base64,"):
-                screenshot_b64 = screenshot_b64[len("data:image/png;base64,"):]
-            self._run_screenshot_b64 = screenshot_b64
-
-            # Stuck detection
-            if self._is_stuck(screenshot_b64) and iteration > 3:
-                self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
-                return self._complete_run(make_run_result(
-                    AgentTermination.STUCK,
-                    "STUCK: Screen not changing after repeated actions.",
-                    screenshot_b64,
-                ))
-
-            user_content = [
-                {"type": "text", "text": f"[Tool result: {tool_name}]\nScreenshot captured."},
-                {"type": "image", "data": screenshot_b64, "media_type": "image/png"},
-            ]
-            self.memory.add_user(user_content, has_screenshot=True)
-            self._session_store.append_message({"role": "user", "content": user_content})
-
-        elif tool_name == "take_annotated_screenshot":
-            # Parse the JSON result to extract annotated image + grid
-            try:
-                ann_data = json.loads(result_text)
-            except (json.JSONDecodeError, TypeError):
-                ann_data = {}
-
-            ann_image_b64 = ann_data.get("image", "")
-            if ann_image_b64.startswith("data:image/png;base64,"):
-                ann_image_b64 = ann_image_b64[len("data:image/png;base64,"):]
-            self._run_screenshot_b64 = ann_image_b64
-
-            # Build text context with the grid mapping + instructions
-            grid_map = ann_data.get("grid", {})
-            instructions = ann_data.get("instructions", "")
-            screen_w = ann_data.get("screen_width", "?")
-            screen_h = ann_data.get("screen_height", "?")
-            grid_text = (
-                f"[Tool result: {tool_name}]\n"
-                f"Annotated screenshot captured (screen: {screen_w}×{screen_h}).\n"
-                f"{instructions}\n\n"
-                f"Grid marker coordinates (label → [x, y] in real screen pixels):\n"
-                f"{json.dumps(grid_map, separators=(',', ':'))}"
-            )
-
-            if ann_image_b64:
-                user_content = [
-                    {"type": "text", "text": grid_text},
-                    {"type": "image", "data": ann_image_b64, "media_type": "image/png"},
-                ]
-                self.memory.add_user(user_content, has_screenshot=True)
-                self._session_store.append_message({"role": "user", "content": user_content})
-            else:
-                # Fallback: no image, just text
-                self.memory.add_user(grid_text)
-                self._session_store.append_message({"role": "user", "content": grid_text})
-
+        # Route screenshot tools through the shared helper (handles prefix-strip,
+        # _run_screenshot_b64 update, stuck check, and image-block storage).
+        # Non-screenshot tools store a plain text result.
+        if tool_name in ("take_screenshot", "take_annotated_screenshot"):
+            _stuck_result = self._store_screenshot_result(tool_name, result_text)
+            if _stuck_result is not None:
+                return _stuck_result
         else:
             user_content = f"[Tool result: {tool_name}]\n{result_text}"
             self.memory.add_user(user_content)
@@ -957,9 +917,16 @@ class KimAgent:
                     return None
             result_text = await self._execute_tool(tool_name, tool_args)
             self._run_last_tool = tool_name
-            user_content = f"[Tool result: {tool_name}]\n{result_text}"
-            self.memory.add_user(user_content)
-            self._session_store.append_message({"role": "user", "content": user_content})
+            # Route screenshot tools through the shared helper (prefix-strip,
+            # _run_screenshot_b64 update, stuck check, image-block storage).
+            if tool_name in ("take_screenshot", "take_annotated_screenshot"):
+                _stuck_result = self._store_screenshot_result(tool_name, result_text)
+                if _stuck_result is not None:
+                    return _stuck_result
+            else:
+                user_content = f"[Tool result: {tool_name}]\n{result_text}"
+                self.memory.add_user(user_content)
+                self._session_store.append_message({"role": "user", "content": user_content})
             # Loop guard — same as native tool calls (#27)
             if self._note_repeated_action(tool_name, tool_args, result_text):
                 nudge = (
@@ -993,7 +960,7 @@ class KimAgent:
             await self._generate_and_save_summary(task, summary)
             return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, summary, self._run_screenshot_b64))
 
-        _nh = re.search(r"\bNEED_HELP:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
+        _nh = re.search(r"\bNEED_HELP:\s*(.+)\Z", content, re.IGNORECASE | re.DOTALL)
         if _nh:
             reason = _nh.group(1).strip()
             self._log("DEBUG", f"NEED_HELP: {reason}")
@@ -1028,6 +995,79 @@ class KimAgent:
             "TASK_COMPLETE: <one-sentence summary>. "
             "If more work is needed, call the next tool — do not reply with conversational text. "
             "For UI state, use observe_ui first; avoid screenshots unless essential.")
+        return None
+
+    # ------------------------------------------------------------------
+    # Screenshot result helper (shared by native tool path and text-JSON path)
+    # ------------------------------------------------------------------
+
+    def _store_screenshot_result(self, tool_name: str, result_text: str) -> Optional[dict]:
+        """Store a take_screenshot or take_annotated_screenshot result to memory/session.
+
+        Handles data-URI prefix stripping, _run_screenshot_b64 update, stuck
+        detection, and image-block formatting.  Returns a run-result dict when
+        stuck is detected (caller should return it), or None to continue.
+        Called from both the native tool path and the text-JSON tool path so
+        both paths get identical screenshot handling.
+        """
+        iteration = getattr(self, "_run_iteration", 0)
+
+        if tool_name == "take_screenshot":
+            screenshot_b64 = result_text
+            if screenshot_b64.startswith("data:image/png;base64,"):
+                screenshot_b64 = screenshot_b64[len("data:image/png;base64,"):]
+            self._run_screenshot_b64 = screenshot_b64
+
+            # Stuck detection
+            if self._is_stuck(screenshot_b64) and iteration > 3:
+                self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
+                return self._complete_run(make_run_result(
+                    AgentTermination.STUCK,
+                    "STUCK: Screen not changing after repeated actions.",
+                    screenshot_b64,
+                ))
+
+            user_content = [
+                {"type": "text", "text": f"[Tool result: {tool_name}]\nScreenshot captured."},
+                {"type": "image", "data": screenshot_b64, "media_type": "image/png"},
+            ]
+            self.memory.add_user(user_content, has_screenshot=True)
+            self._session_store.append_message({"role": "user", "content": user_content})
+
+        else:  # take_annotated_screenshot
+            try:
+                ann_data = json.loads(result_text)
+            except (json.JSONDecodeError, TypeError):
+                ann_data = {}
+
+            ann_image_b64 = ann_data.get("image", "")
+            if ann_image_b64.startswith("data:image/png;base64,"):
+                ann_image_b64 = ann_image_b64[len("data:image/png;base64,"):]
+            self._run_screenshot_b64 = ann_image_b64
+
+            grid_map = ann_data.get("grid", {})
+            instructions = ann_data.get("instructions", "")
+            screen_w = ann_data.get("screen_width", "?")
+            screen_h = ann_data.get("screen_height", "?")
+            grid_text = (
+                f"[Tool result: {tool_name}]\n"
+                f"Annotated screenshot captured (screen: {screen_w}×{screen_h}).\n"
+                f"{instructions}\n\n"
+                f"Grid marker coordinates (label → [x, y] in real screen pixels):\n"
+                f"{json.dumps(grid_map, separators=(',', ':'))}"
+            )
+
+            if ann_image_b64:
+                user_content = [
+                    {"type": "text", "text": grid_text},
+                    {"type": "image", "data": ann_image_b64, "media_type": "image/png"},
+                ]
+                self.memory.add_user(user_content, has_screenshot=True)
+                self._session_store.append_message({"role": "user", "content": user_content})
+            else:
+                self.memory.add_user(grid_text)
+                self._session_store.append_message({"role": "user", "content": grid_text})
+
         return None
 
     # ------------------------------------------------------------------
@@ -1325,8 +1365,14 @@ class KimAgent:
                 return response
             except Exception as e:
                 last_error = e
-                # classify_provider_error handles asyncio.TimeoutError → code="timeout", retryable=True.
-                provider_error = classify_provider_error(e)
+                # On Python ≤3.10, asyncio.TimeoutError is NOT a subclass of the
+                # builtin TimeoutError and its str() is "" — classify_provider_error
+                # would fall through to code="unknown"/non-retryable.  Normalise here
+                # so the classifier always sees a named, retryable TimeoutError.
+                _exc_to_classify: Exception = e
+                if isinstance(e, asyncio.TimeoutError) and not isinstance(e, TimeoutError):
+                    _exc_to_classify = TimeoutError(f"LLM provider call timed out after {300.0}s")
+                provider_error = classify_provider_error(_exc_to_classify)
                 try:
                     self._session_store.append_llm_event(
                         "errored",

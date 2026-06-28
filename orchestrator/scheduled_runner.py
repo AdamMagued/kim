@@ -37,6 +37,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -134,11 +135,104 @@ def _runner_exclusive_lock(kim_root: Path, timeout: float = _RUNNER_LOCK_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
+# Platform-aware process existence check (Finding 1)
+# ---------------------------------------------------------------------------
+
+def _pid_exists(pid: int) -> bool:
+    """Return True if *pid* refers to a running process.
+
+    On POSIX, uses signal 0 (no signal is actually sent — raises OSError if
+    the process is gone).
+
+    On Windows, os.kill(pid, 0) calls TerminateProcess in CPython for any
+    signal other than CTRL_C / CTRL_BREAK, which would kill every scheduled
+    agent on each tick.  Instead we try psutil.pid_exists first (lightweight),
+    then fall back to a raw OpenProcess(SYNCHRONIZE) call via ctypes.  Neither
+    path sends any signal or kills the target process.
+    """
+    if sys.platform == "win32":
+        # Prefer psutil when available — it handles zombie / access-denied
+        # cases correctly.
+        try:
+            import psutil  # type: ignore[import]
+            return psutil.pid_exists(pid)
+        except ImportError:
+            pass
+        # Fallback: OpenProcess with SYNCHRONIZE (0x100000) succeeds when the
+        # process exists even if we lack full access rights.
+        import ctypes
+        SYNCHRONIZE = 0x100000
+        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)  # type: ignore[attr-defined]
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
+            return True
+        return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
+# ---------------------------------------------------------------------------
 # PID registry for orphan reaping
 # ---------------------------------------------------------------------------
 
 def _pid_registry_path(kim_root: Path) -> Path:
     return kim_root / "logs" / "scheduled_runs" / ".running_pids.json"
+
+
+@contextlib.contextmanager
+def _pid_registry_lock(kim_root: Path, timeout: float = _RUNNER_LOCK_TIMEOUT):
+    """Advisory file lock that serialises reads and writes to .running_pids.json
+    (Finding 2).  Uses the same spin-on-Windows / flock-on-POSIX pattern as
+    _runner_exclusive_lock but targets a separate lock file so it never blocks
+    the main runner lock.
+    """
+    lock_path = kim_root / "logs" / "scheduled_runs" / ".pids.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                break
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"scheduled_runner: could not acquire PID registry lock "
+                        f"{lock_path} within {timeout}s"
+                    )
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
+    else:
+        import fcntl  # noqa: PLC0415 — POSIX only
+        with open(lock_path, "a") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _write_pid_registry_atomic(reg_path: Path, data: list) -> None:
+    """Write *data* to *reg_path* atomically via tmp file + os.replace (Finding 2)."""
+    text = json.dumps(data).encode()
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=reg_path.parent, prefix=".pids_tmp")
+    try:
+        os.write(tmp_fd, text)
+        os.close(tmp_fd)
+        os.replace(tmp_name, str(reg_path))
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def _reap_stale_agents(
@@ -148,59 +242,73 @@ def _reap_stale_agents(
     """Read the PID registry and kill any scheduled-agent processes that have
     exceeded *timeout_seconds* of wall-clock runtime.  Finished or vanished
     processes are pruned from the registry regardless of their runtime.
+
+    The entire read-modify-write is performed under _pid_registry_lock (Finding 2)
+    and the write is atomic via tmp + os.replace.  The existence probe uses
+    _pid_exists so it does not accidentally kill processes on Windows (Finding 1).
     """
     reg_path = _pid_registry_path(kim_root)
     if not reg_path.exists():
         return
-    try:
-        entries: list = json.loads(reg_path.read_text())
-    except (OSError, ValueError):
-        return
 
-    now_ts = time.time()
-    surviving = []
-    for entry in entries:
-        pid = entry.get("pid")
-        if pid is None:
-            continue
-        started = entry.get("started_at", now_ts)
-        elapsed = now_ts - started
-        try:
-            os.kill(pid, 0)  # signal 0: existence probe; raises OSError if gone
-        except OSError:
-            continue  # already exited — drop from registry
-        if elapsed > timeout_seconds:
+    try:
+        with _pid_registry_lock(kim_root):
             try:
-                os.kill(pid, 9)
+                entries: list = json.loads(reg_path.read_text())
+            except (OSError, ValueError):
+                return
+
+            now_ts = time.time()
+            surviving = []
+            for entry in entries:
+                pid = entry.get("pid")
+                if pid is None:
+                    continue
+                started = entry.get("started_at", now_ts)
+                elapsed = now_ts - started
+                if not _pid_exists(pid):
+                    continue  # already exited — drop from registry
+                if elapsed > timeout_seconds:
+                    try:
+                        os.kill(pid, 9)
+                    except OSError:
+                        pass
+                    # drop from registry after kill (do not append to surviving)
+                else:
+                    surviving.append(entry)
+
+            try:
+                _write_pid_registry_atomic(reg_path, surviving)
             except OSError:
                 pass
-            # drop from registry after kill (do not append to surviving)
-        else:
-            surviving.append(entry)
-
-    try:
-        reg_path.write_text(json.dumps(surviving))
-    except OSError:
-        pass
+    except TimeoutError:
+        pass  # lock contention — skip reap this tick; not fatal
 
 
 def _register_agent_pid(kim_root: Path, task_id: str, pid: int) -> None:
     """Append a running-agent PID entry to the registry so future invocations
     can reap it if it exceeds the wall-clock timeout.
+
+    The entire read-modify-write is performed under _pid_registry_lock (Finding 2)
+    and the write is atomic via tmp + os.replace.
     """
     reg_path = _pid_registry_path(kim_root)
     reg_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        existing: list = (
-            json.loads(reg_path.read_text()) if reg_path.exists() else []
-        )
-    except (OSError, ValueError):
-        existing = []
-    existing.append({"task_id": task_id, "pid": int(pid), "started_at": time.time()})
-    try:
-        reg_path.write_text(json.dumps(existing))
-    except (OSError, TypeError, ValueError):
-        pass
+        with _pid_registry_lock(kim_root):
+            try:
+                existing: list = (
+                    json.loads(reg_path.read_text()) if reg_path.exists() else []
+                )
+            except (OSError, ValueError):
+                existing = []
+            existing.append({"task_id": task_id, "pid": int(pid), "started_at": time.time()})
+            try:
+                _write_pid_registry_atomic(reg_path, existing)
+            except (OSError, TypeError, ValueError):
+                pass
+    except TimeoutError:
+        pass  # lock contention — PID unregistered; reap on next tick may miss it
 
 
 # ---------------------------------------------------------------------------
@@ -406,8 +514,11 @@ def run_next_due_task(
     _register_agent_pid(kim_root, task.id, int(proc.pid))
 
     # Advance next_run_at now that the agent is successfully running.
+    # Anchor to as_of (the due-check time) rather than wall-clock now, so
+    # catch-up/replay runs advance next_run_at from the scheduled instant
+    # instead of drifting to the moment the runner happened to fire.
     try:
-        recorded = store.record_run(task.id)
+        recorded = store.record_run(task.id, ran_at=as_of)
     except TimeoutError as exc:
         result.error = f"record_run failed: {exc}"
         return result

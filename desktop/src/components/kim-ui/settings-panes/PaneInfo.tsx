@@ -40,17 +40,8 @@ function PaneMCP() {
         </div>
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+      <div style={{ marginBottom: 12 }}>
         <SectionLabel>built-in tools · {BUILT_IN_TOOLS.length}</SectionLabel>
-        <span
-          style={{
-            fontSize: 11,
-            color: 'var(--kim-green)',
-            fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
-          }}
-        >
-          ● all connected
-        </span>
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 22 }}>
         {BUILT_IN_TOOLS.map(([n, d]) => (
@@ -71,14 +62,8 @@ function PaneMCP() {
         ))}
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+      <div style={{ marginBottom: 10 }}>
         <SectionLabel>custom servers</SectionLabel>
-        <button type="button" className="kr-btn">
-          <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
-            <path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-          </svg>
-          Add server
-        </button>
       </div>
       <div
         style={{
@@ -199,6 +184,7 @@ function PaneFeedback() {
         onChange={(e) => setMessage(e.target.value)}
         placeholder="Tell us what's on your mind…"
         rows={6}
+        aria-label="Your feedback message"
         className="kr-input"
         style={{
           fontFamily: 'inherit',
@@ -213,6 +199,7 @@ function PaneFeedback() {
         type="email"
         className="kr-input"
         placeholder="you@example.com"
+        aria-label="Email address (optional)"
         value={contact}
         onChange={(e) => setContact(e.target.value)}
         style={{ marginBottom: 16 }}

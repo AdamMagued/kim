@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 
 mod google_oauth;
 pub mod account;
+pub mod secrets;
 pub mod codex_projects;
 pub mod data_io;
 pub mod feedback;
@@ -986,7 +987,7 @@ fn normalize_site(site: &str) -> String {
         "claude" | "claude.ai" => "claude".to_string(),
         "chatgpt" | "openai" | "gpt" => "chatgpt".to_string(),
         "gemini" | "google" => "gemini".to_string(),
-        "deepseek" => "deepseek".to_string(),
+        "deepseek" | "deepseek-browser" => "deepseek".to_string(),
         "grok" => "grok".to_string(),
         other if !other.is_empty() => other.to_string(),
         _ => "claude".to_string(),
@@ -1746,7 +1747,15 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
     use std::net::TcpStream;
     use std::process::Command as StdCommand;
 
-    let port_open = TcpStream::connect("127.0.0.1:9222").is_ok();
+    // Honour KIM_REAL_BROWSER_CDP_PORT so the Rust launcher matches the Python
+    // side (web.py already reads this variable).  Default: 9222.
+    let cdp_port: u16 = std::env::var("KIM_REAL_BROWSER_CDP_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|&p| p != 0)
+        .unwrap_or(9222);
+
+    let port_open = TcpStream::connect(format!("127.0.0.1:{cdp_port}")).is_ok();
     if port_open {
         return Ok(false); // already running, no wait needed
     }
@@ -1775,10 +1784,11 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
 
     for chrome in candidates {
         let user_data_arg = format!("--user-data-dir={}", user_data_str);
+        let cdp_port_arg = format!("--remote-debugging-port={cdp_port}");
         let result = StdCommand::new(chrome)
             .args([
                 user_data_arg.as_str(),
-                "--remote-debugging-port=9222",
+                cdp_port_arg.as_str(),
                 "--no-first-run",
                 "--no-default-browser-check",
                 // --disable-popup-blocking removed: weakens browser security (#3).
@@ -2116,6 +2126,9 @@ pub fn run() {
             account::clear_account,
             account::reset_onboarding,
             account::delete_all_sessions,
+            secrets::store_github_token,
+            secrets::get_github_token,
+            secrets::delete_github_token,
             ollama::ollama_get_status,
             ollama::ollama_test_model,
             ollama::ollama_signin,

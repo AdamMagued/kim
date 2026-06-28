@@ -56,6 +56,10 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
 
+    permissions:
+      contents: write      # create releases and upload release assets
+      id-token: write      # cosign OIDC keyless signing for CLI binaries
+
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4 (#59)
 
@@ -95,23 +99,43 @@ jobs:
         working-directory: desktop
         run: npm ci --prefer-offline --no-audit
 
-      # ── Code signing (#60) ───────────────────────────────────────────────
-      # TODO(human): Wire platform-specific code signing here.
-      #
-      # macOS: Requires an Apple Developer ID certificate.
-      #   1. Store the certificate as APPLE_CERTIFICATE (base64 P12) and
-      #      APPLE_CERTIFICATE_PASSWORD in repository secrets.
-      #   2. Set APPLE_ID, APPLE_PASSWORD (app-specific), and APPLE_TEAM_ID
-      #      secrets for notarization.
-      #   3. Pass signing env vars to the tauri-action step below.
-      #   See: https://tauri.app/distribute/sign/macos/
-      #
-      # Windows: Requires a code-signing certificate (.pfx) or an EV cert.
-      #   1. Store the cert as TAURI_SIGNING_PRIVATE_KEY / _KEY_PASSWORD.
-      #   2. Pass signing env vars to the tauri-action step below.
-      #   See: https://tauri.app/distribute/sign/windows/
-      #
-      # Until certs are provisioned, binaries are unsigned (see release notes).
+      # ── macOS certificate import ─────────────────────────────────────────
+      # Imports the Apple Developer ID certificate into a short-lived keychain
+      # so tauri-action can codesign and notarize the .app / .dmg bundles.
+      # Required secrets: APPLE_CERTIFICATE (base64-encoded P12),
+      #                   APPLE_CERTIFICATE_PASSWORD.
+      # Notarization secrets: APPLE_ID, APPLE_PASSWORD (app-specific),
+      #                       APPLE_TEAM_ID, APPLE_SIGNING_IDENTITY.
+      # See: https://tauri.app/distribute/sign/macos/
+      # Step is a no-op (prints a notice) when APPLE_CERTIFICATE is not set.
+      - name: Import Apple certificate (macOS)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [[ -z "$APPLE_CERTIFICATE" ]]; then
+            echo "::notice::APPLE_CERTIFICATE secret not set — macOS codesigning skipped."
+            exit 0
+          fi
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/productsign
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list \
+            -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
 
       # ── Upload raw binaries on workflow_dispatch (dry run) ────────────────
       - name: Build (dry run — upload artifact)
@@ -119,6 +143,13 @@ jobs:
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5  # v0 (#59)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS codesign / notarize — no-op when secrets are absent
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: desktop
           args: ${{ matrix.args }}
@@ -129,6 +160,13 @@ jobs:
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5  # v0 (#59)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS codesign / notarize — no-op when secrets are absent
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: desktop
           tagName: ${{ github.ref_name }}
@@ -146,12 +184,14 @@ jobs:
             | Linux (Debian/Ubuntu) | `kim_*_amd64.deb` | `kim-cli-*-linux-x86_64` |
             | Linux (other) | `kim_*_amd64.AppImage` | `kim-cli-*-linux-x86_64` |
 
-            > **Note:** Binaries are currently unsigned (#60 — see workflow for signing TODO).
-            > macOS users: right-click → Open the first time.
-            > Windows users: click "More info" → "Run anyway".
-            >
-            > To distribute signed builds, configure Apple Developer ID / Windows EV
-            > certificate secrets and remove this note.
+            > **Signing:** Desktop builds are codesigned and notarized when
+            > `APPLE_CERTIFICATE`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`,
+            > `APPLE_PASSWORD`, and `APPLE_TEAM_ID` repository secrets are set.
+            > CLI binaries on tagged releases include Sigstore transparency-log
+            > signatures (`.sig` / `.pem` files) verifiable with
+            > `cosign verify-blob --signature <file>.sig --certificate <file>.pem <binary>`.
+            > If codesigning secrets are not configured, macOS Gatekeeper will
+            > prompt on first launch: right-click → Open.
 
             ### What is Kim?
             Kim is a local AI agent that controls your computer —
@@ -161,6 +201,17 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # ── Keychain cleanup ─────────────────────────────────────────────────
+      # Always runs on macOS to delete the ephemeral keychain regardless of
+      # whether the build succeeded or failed.
+      - name: Delete temporary Apple keychain (macOS)
+        if: always() && matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          if [[ -n "${{ env.KEYCHAIN_PATH }}" ]]; then
+            security delete-keychain "${{ env.KEYCHAIN_PATH }}" || true
+          fi
 
       # ── KimCLI binary ─────────────────────────────────────────────────────
 
@@ -199,6 +250,24 @@ jobs:
           cp "${SRC}" "${DEST}"
           echo "path=${DEST}" >> "$GITHUB_OUTPUT"
 
+      # ── Sigstore / cosign signing for CLI binary ─────────────────────────
+      # Signs the CLI binary using keyless OIDC signing via Sigstore, which
+      # requires no long-lived secret — the runner's OIDC token is sufficient.
+      # Produces <binary>.sig and <binary>.pem published alongside the binary.
+      # Verify with: cosign verify-blob --signature <f>.sig --certificate <f>.pem <binary>
+      - name: Install cosign
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da  # v3.7.0 (#59)
+
+      - name: Sign KimCLI binary (cosign keyless)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          cosign sign-blob --yes \
+            --output-signature "${{ steps.cli-stage.outputs.path }}.sig" \
+            --output-certificate "${{ steps.cli-stage.outputs.path }}.pem" \
+            "${{ steps.cli-stage.outputs.path }}"
+
       - name: Upload KimCLI artifact (dry run)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4 (#59)
@@ -221,4 +290,7 @@ jobs:
           # assets, one published with only the CLI binary).
           draft: true
           make_latest: false
-          files: ${{ steps.cli-stage.outputs.path }}
+          files: |
+            ${{ steps.cli-stage.outputs.path }}
+            ${{ steps.cli-stage.outputs.path }}.sig
+            ${{ steps.cli-stage.outputs.path }}.pem

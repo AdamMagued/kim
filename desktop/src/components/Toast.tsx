@@ -73,10 +73,12 @@ function ToastItem({ t, onRemove }: { t: ToastMessage; onRemove: (id: number) =>
     return () => { clearTimeout(show); clearTimeout(hide); };
   }, [t.id, t.duration, onRemove]);
 
+  const role = t.kind === 'error' || t.kind === 'warning' ? 'alert' : 'status';
+
   return (
     <div
       className={`kim-toast kim-toast--${t.kind}${visible ? ' kim-toast--visible' : ''}`}
-      role="status"
+      role={role}
     >
       <span className="kim-toast__icon">{ICONS[t.kind]}</span>
       <span className="kim-toast__text">{t.text}</span>

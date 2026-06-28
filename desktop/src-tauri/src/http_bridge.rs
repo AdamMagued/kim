@@ -1822,7 +1822,7 @@ fn url_to_site(url: &str) -> &'static str {
         "gemini"
     } else if url.contains("deepseek.com") {
         "deepseek"
-    } else if url.contains("grok.x.com") || url.contains("x.com/i/grok") {
+    } else if url.contains("grok.com") || url.contains("grok.x.com") || url.contains("x.com/i/grok") {
         "grok"
     } else if url.contains("claude.ai") {
         "claude"

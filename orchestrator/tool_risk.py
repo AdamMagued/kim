@@ -169,9 +169,15 @@ def classify_tool_risk(name: str, args: Optional[dict] = None) -> dict:
       "level"  — "high", "medium", or "low"
       "reason" — stable reason code (see module docstring)
 
-    The args parameter is accepted for future arg-level refinement but
-    is not currently used.  Pass it anyway so callers don't need updating.
+    The args parameter enables arg-level refinement (e.g. lint_file --fix).
+    Pass it anyway so callers don't need updating.
     """
+    # Arg-level refinement: lint_file is read-only for a plain check, but
+    # fix=True rewrites the file in place (ruff --fix). Treat that as a file
+    # write so HITL gating applies — previously it was always classified
+    # read_only and silently auto-approved despite mutating the file.
+    if name == "lint_file" and args is not None and coerce_hitl_bool(args.get("fix")):
+        return {"level": "high", "reason": "file_write"}
     if name in _HIGH_RISK:
         return {"level": "high", "reason": _TOOL_REASON.get(name, "irreversible")}
     if name in _MEDIUM_RISK:

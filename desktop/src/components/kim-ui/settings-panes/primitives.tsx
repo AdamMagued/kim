@@ -76,8 +76,17 @@ function Row({
   );
 }
 
-function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
-  return <button type="button" className={`kr-toggle${on ? ' kr-on' : ''}`} onClick={onClick} aria-pressed={on} />;
+function Toggle({ on, onClick, ariaLabel }: { on: boolean; onClick: () => void; ariaLabel?: string }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      className={`kr-toggle${on ? ' kr-on' : ''}`}
+      onClick={onClick}
+      aria-checked={on}
+      aria-label={ariaLabel}
+    />
+  );
 }
 
 export { PaneHeader, SectionLabel, Row, Toggle };

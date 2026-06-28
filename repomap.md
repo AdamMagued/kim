@@ -48,9 +48,20 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 ## desktop/src-tauri/src (Rust Tauri backend)
 
 - `main.rs` — Rust application bootstrap and Tauri build initialization
-- `lib.rs` — Tauri 2 desktop shell; sets up core command mapping, WebView window parameters, and invokes child processes
+- `lib.rs` — Tauri 2 desktop shell; sets up core command mapping, WebView window parameters, and module declarations
 - `google_oauth.rs` — Google OAuth 2.0 PKCE desktop flow handling Google profile linkings
-- `account.rs`, `codex_projects.rs`, `data_io.rs`, `feedback.rs`, `ollama.rs`, `relay.rs`, `run_history.rs`, `session_commands.rs`, `voice_config.rs` — Modular Rust Tauri commands registered into the main handler
+- `http_bridge.rs` — `tiny_http` server exposing `/v1/*` endpoints (task spawn, split send/receive for browser provider, WebView state controls, health probe)
+- `browser_bridge.rs` — Manages the persistent in-app WebView automaton window and injects `bridge.js` for browser-provider interception
+- `bridge.js` — Injected JavaScript (loaded via `include_str!`) that intercepts fetch/XHR inside Claude/ChatGPT/Gemini and routes through the HTTP bridge
+- `subprocess.rs` — Agent subprocess spawning, Python executable discovery, process group management, and task cancel/kill logic
+- `window_manager.rs` — Task-active window mode, show/hide main window, screenshot flash window lifecycle
+- `updater.rs` — Tauri auto-update check logic
+- `config.rs` — `AppConfig` struct; deserializes `config.yaml` into Tauri managed state
+- `provider_auth.rs` — Provider authentication helpers (API key validation, token storage)
+- `schedule_commands.rs`, `scheduler.rs` — Scheduled task commands and background scheduler management
+- `secrets.rs` — Secure secret retrieval helpers
+- `speed_access.rs` — Quick-access shortcut commands
+- `account.rs`, `codex_projects.rs`, `data_io.rs`, `feedback.rs`, `ollama.rs`, `relay.rs`, `run_history.rs`, `session_commands.rs`, `voice_config.rs` — Additional Tauri command modules registered into the main handler
 
 ---
 
@@ -63,7 +74,15 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 - `mcp_client.py` — Stdio-based client connection launcher mapping tool calls
 - `ui_bridge.py` — Formatted stdout output logger mapping data streams
 - `tool_utils.py` — Normalizer for tool calls and JSON responses extraction
-- `task_queue.py` — Task queue coordinator for relay integrations
+- `tool_errors.py` — Tool error classification helpers
+- `tool_risk.py` — Risk tier definitions mirroring `mcp_server/tool_tiers.py`
+- `stuck_detection.py` — Detects agent runloop stuck conditions and triggers recovery
+- `interaction_policy.py` — Policy logic for human-in-the-loop interaction gates
+- `codex_bridge_service.py` — Consolidated Codex bridge launcher (replaced legacy `run_codex_bridge.py` entrypoint; imports `mcp_server/tools/codex_bridge.py` which still exists pending final verification); manages `_CodexProxy` lifecycle with `atexit`/SIGTERM cleanup
+- `scheduled_runner.py` — Background runner for scheduled/cron agent tasks
+- `cron_store.py` — Persistent cron schedule storage
+- `obs_logging.py` — Observability / structured logging helpers
+- `compare.py` — Utility for comparing agent outputs across runs
 
 **LLM providers:**
 - `providers/base.py` — Core provider abstract classes and initialization maps
@@ -87,14 +106,14 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 
 **Session management:**
 - `session_store.py` — JSONL session logging, message caches, and runs log sidecars
-- `archive/relay_worker.py` — Legacy phone-to-PC relay task poller client (archived)
+- `archive/relay_worker.py` — Legacy phone-to-PC relay task poller client (archived; `relay_server/` remains active)
 
 ---
 
-## mcp_server (Model Context Protocol server — 31 tools)
+## mcp_server (Model Context Protocol server — 50 tools)
 
 - `server.py` — Stdio transport MCP server router; processes incoming tool calls
-- `tool_registry.py` — Central catalog and schema definitions for the 31 OS-control tools
+- `tool_registry.py` — Central catalog and schema definitions for the 50 OS-control tools (source of truth: `len(TOOLS)` at startup)
 - `config.py` — Environment variables and config.yaml loader
 - `logger.py` — JSON structured logger outputting execution histories
 - `os_utils.py` — Platform translator adapting file, process, and system commands to Windows/macOS/Linux
@@ -114,6 +133,9 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 - `tools/git.py` — Sandboxed Git status, diffs, commits, branches, and logs execution
 - `tools/code.py` — Local runtime builders for Python and NodeJS snippets with linter hooks
 - `tools/search.py` — Quick local file searchers (ripgrep / file finder)
+- `tools/github.py` — GitHub API tool integration (PR, issue, and repo operations)
+- `tools/memory.py` — Agent memory store/recall tools
+- `tools/ui_observe.py` — UI observation tools for accessibility and element inspection
 
 ---
 
@@ -123,15 +145,6 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 - `auth.py` — Simple API-key verification middleware
 - `queue.py` — Local SQLite queue storing queued tasks
 - `models.py` — Pydantic schemas validating task states
-
----
-
-## extension (Chrome extension browser scraper)
-
-- `manifest.json` — Chrome extension descriptors mapping permissions and scripts to Claude/ChatGPT/Gemini
-- `background.js` — Core extension worker coordinating page loads, DOM scrape outputs, and Tauri bridge posts
-- `content_claude.js`, `content_chatgpt.js`, `content_gemini.js`, `content_deepseek.js` — Target DOM scrapers translating visual page state to JSON feeds
-- `popup.js` — Status UI controlling extension scraper toggles and service links
 
 ---
 

@@ -101,12 +101,29 @@ _BUILTIN_MAP_UNIX: dict[str, str] = {
     # Windows verbs (del /F /Q *, rmdir /S /Q C:\) to rm / rm -rf passes Windows-
     # style flags as Unix paths and can produce dangerous commands.
     "ren": "mv",
-    "mkdir": "mkdir -p",
+    # "mkdir" intentionally omitted: Windows mkdir has no slash-flags, so its
+    # only argument is always a path.  The only time a mkdir argument starts with
+    # '/' is a Unix absolute path (e.g. `mkdir /tmp/newdir`), which must NOT be
+    # rewritten to `mkdir -p`.  There is no reliable heuristic to distinguish a
+    # Windows relative path from a Unix path, so we leave mkdir untranslated and
+    # let the native command run unchanged on every platform.
     "tasklist": "ps aux",
     "ipconfig": "ifconfig",
     "findstr": "grep",
     "where": "which",
 }
+
+# These commands exist natively on Unix with different semantics:
+#   type   — shell built-in that resolves commands, not a file-display tool
+#   where  — non-standard on Unix; some distros ship it with different behaviour
+# Only translate them when the invocation is clearly Windows-shaped, i.e. at
+# least one argument starts with '/' (Windows flag style such as /P, /F, /Q).
+#
+# Note: `mkdir` was previously in this set but has been removed.  Windows mkdir
+# carries no slash-flags, so the only time a mkdir argument begins with '/' is a
+# Unix absolute path — the opposite of what the guard intends.  mkdir is now
+# omitted from _BUILTIN_MAP_UNIX entirely; see comment there.
+_WINDOWS_SHAPED_ONLY: frozenset[str] = frozenset({"type", "where"})
 
 # ─── Regex patterns for command interception ─────────────────────────────────
 
@@ -169,7 +186,15 @@ def _translate_builtin(cmd_parts: list[str]) -> str | None:
     first = cmd_parts[0].lower()
     unix_equiv = _BUILTIN_MAP_UNIX.get(first)
     if unix_equiv:
-        rest = " ".join(cmd_parts[1:])
+        args = cmd_parts[1:]
+        # For commands that overlap with native Unix names, only translate when
+        # the invocation is clearly Windows-shaped (has a /flag-style argument).
+        # This prevents clobbering e.g. `type ls`, `where foo`
+        # which are all valid native-Unix invocations with different semantics.
+        if first in _WINDOWS_SHAPED_ONLY:
+            if not any(a.startswith("/") for a in args):
+                return None
+        rest = " ".join(args)
         return f"{unix_equiv} {rest}".strip()
     return None
 

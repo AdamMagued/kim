@@ -7,6 +7,17 @@ Provides code execution and linting tools:
   - lint_file:   Run ruff or flake8 on a Python file
 
 Uses os_utils for cross-platform safety and availability checks.
+
+Security layers (defence-in-depth, outermost first):
+  1. HITL gate — run_python / run_node are HIGH risk in tool_risk.py; any
+     hitl_risk_threshold >= high requires human approval before execution.
+  2. Minimal environment — all subprocesses receive a restricted allowlist env
+     that strips provider API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.).
+  3. OS sandbox — network is disabled via sandbox-exec (macOS) or bwrap (Linux)
+     when the binary is available; logs a WARNING and continues without it
+     (fail-open) so tests pass on boxes without these tools.
+  4. Code blocklists — Python and Node pattern lists catch common dangerous
+     calls; kept as defence-in-depth only, NOT the sole control.
 """
 
 from __future__ import annotations
@@ -14,14 +25,161 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 import tempfile
 import os
 
 from mcp_server.config import PROJECT_ROOT, CODE_TIMEOUT, SHELL_TIMEOUT, validate_path
-from mcp_server.os_utils import check_tool_available
+from mcp_server.os_utils import check_tool_available, IS_MACOS, IS_LINUX
 
 logger = logging.getLogger(__name__)
 
+# ── Minimal sandbox environment ───────────────────────────────────────────────
+
+_SANDBOX_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def _minimal_env(extra: dict | None = None) -> dict[str, str]:
+    """Build a minimal allowlist env that strips provider API keys.
+
+    All code-execution subprocesses use this instead of inheriting os.environ
+    so that OPENAI_API_KEY, ANTHROPIC_API_KEY, and similar secrets are never
+    visible to executed code (finding 1).
+    """
+    env: dict[str, str] = {
+        "PATH": _SANDBOX_PATH,
+        "HOME": str(PROJECT_ROOT),
+        "TMPDIR": tempfile.gettempdir(),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+    }
+    lc_all = os.environ.get("LC_ALL", "")
+    if lc_all:
+        env["LC_ALL"] = lc_all
+    if extra:
+        env.update(extra)
+    return env
+
+
+# ── OS-level sandbox wrapping ─────────────────────────────────────────────────
+
+def _sandbox_wrap_cmd(cmd: list[str]) -> list[str]:
+    """Wrap cmd with an OS sandbox that disables network access (findings 2 & 3).
+
+    macOS: sandbox-exec with a minimal seatbelt profile that allows everything
+    except outbound/inbound network connections.
+
+    Linux: bubblewrap (bwrap) with --unshare-net.
+
+    Both paths are fail-open: if no sandbox binary is found the original cmd
+    is returned unchanged and a loud WARNING is emitted so the CI log captures
+    the degraded state.  The remaining layers (HITL gate + minimal env +
+    blocklists) still apply.
+    """
+    if IS_MACOS and shutil.which("sandbox-exec"):
+        # Network is denied; filesystem and process operations remain allowed
+        # so the interpreter can read its own libraries.
+        profile = "(version 1)(allow default)(deny network*)"
+        return ["sandbox-exec", "-p", profile] + cmd
+
+    if IS_LINUX and shutil.which("bwrap"):
+        return [
+            "bwrap",
+            "--ro-bind", "/", "/",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--tmpfs", "/tmp",
+            "--unshare-net",
+            "--die-with-parent",
+        ] + cmd
+
+    logger.warning(
+        "code sandbox: no OS-level sandbox binary found (sandbox-exec / bwrap); "
+        "running without network isolation — minimal-env + HITL + blocklist remain active"
+    )
+    return cmd
+
+
+# ── Python code blocklist ─────────────────────────────────────────────────────
+
+# WARNING: This blocklist is defence-in-depth only.  It is NOT the primary
+# control — bypassable via importlib.import_module('os'), pathlib, urllib, etc.
+# The OS sandbox (network disabled) and minimal env are the real controls.
+# Patterns scan the *full* code string to prevent padding-based bypasses.
+_CODE_BLOCKLIST = [
+    re.compile(r"\bos\.system\b"),
+    re.compile(r"\bsubprocess\b"),
+    re.compile(r"__import__\s*\("),
+    re.compile(r"\beval\s*\("),
+    re.compile(r"\bexec\s*\("),
+    # Catch `import os` / `import os as o` style alias bypasses
+    re.compile(r"\bimport\s+os\b"),
+    re.compile(r"\bfrom\s+os\b"),
+]
+
+
+def _check_code_blocked(code: str) -> str | None:
+    """Scan *all* inline Python code for dangerous patterns (no truncation)."""
+    for pat in _CODE_BLOCKLIST:
+        if pat.search(code):
+            return f"BLOCKED: Inline code contains blocked pattern '{pat.pattern}'"
+    return None
+
+
+# ── Node.js code blocklist ────────────────────────────────────────────────────
+
+# Node has unblocked access to child_process, fs, net etc. via require/import
+# unless explicitly denied (finding 3).  These patterns catch the straightforward
+# forms; the OS sandbox (no network) and minimal env handle the rest.
+_NODE_DANGEROUS_MODULES = (
+    "child_process", "fs", "net", "http", "https",
+    "dgram", "vm", "worker_threads", "os", "v8",
+)
+_NODE_MODULE_RE = "(?:" + "|".join(re.escape(m) for m in _NODE_DANGEROUS_MODULES) + ")"
+
+_NODE_BLOCKLIST = [
+    # require('child_process'), require("fs"), etc.
+    re.compile(r"require\s*\(\s*['\"]" + _NODE_MODULE_RE + r"['\"]\s*\)"),
+    # import x from 'child_process' / import('fs')
+    re.compile(r"(?:import\b[^;'\"]*\bfrom\s*['\"]|import\s*\()" + _NODE_MODULE_RE + r"['\"]"),
+    # process.binding() — low-level internal bindings bypass the module system
+    re.compile(r"\bprocess\.binding\s*\("),
+]
+
+
+def _check_node_blocked(code: str) -> str | None:
+    """Scan Node.js code for dangerous require/import patterns (no truncation)."""
+    for pat in _NODE_BLOCKLIST:
+        if pat.search(code):
+            return f"BLOCKED: Node.js code contains blocked pattern '{pat.pattern}'"
+    return None
+
+
+# ── Interpreter resolution ────────────────────────────────────────────────────
+
+def _find_python() -> str:
+    """Return the absolute path of the best available Python executable.
+
+    Resolved against the *real* PATH before it is restricted so the venv
+    interpreter is found; the returned absolute path works even under the
+    minimal env (finding 1 regression guard).
+    """
+    for name in ("python3", "python"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return "python3"  # fallback: let it error naturally
+
+
+def _find_node() -> str:
+    """Return the absolute path of the best available Node.js executable."""
+    for name in ("node", "nodejs"):
+        path = shutil.which(name)
+        if path:
+            return path
+    raise RuntimeError("OS_LIMITATION: node not installed")
+
+
+# ── Core subprocess runner ────────────────────────────────────────────────────
 
 async def _run_exec(
     cmd: list[str],
@@ -29,16 +187,18 @@ async def _run_exec(
     timeout: int | None = None,
     extra_env: dict | None = None,
 ) -> str:
-    """Run a command via create_subprocess_exec and return formatted output."""
+    """Run a command via create_subprocess_exec and return formatted output.
+
+    Always uses a minimal allowlist environment (finding 1): caller's extra_env
+    is merged ON TOP of the allowlist, never on top of os.environ.
+    """
     resolved_cwd = cwd or str(PROJECT_ROOT)
     resolved_timeout = timeout or CODE_TIMEOUT
 
     logger.info(f"code exec: {' '.join(cmd)} (cwd={resolved_cwd})")
 
-    env = None
-    if extra_env:
-        import os as _os
-        env = {**_os.environ, **extra_env}
+    # Always build the restricted env; extra_env overrides individual keys only.
+    env = _minimal_env(extra_env)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -78,50 +238,14 @@ async def _run_exec(
         return f"ERROR: {e}"
 
 
-def _find_python() -> str:
-    """Find the best available Python executable."""
-    # Prefer python3 on Unix, python on Windows
-    for name in ("python3", "python"):
-        if check_tool_available(name):
-            return name
-    return "python3"  # fallback, let it error naturally
-
-
-def _find_node() -> str:
-    """Find the best available Node.js executable."""
-    for name in ("node", "nodejs"):
-        if check_tool_available(name):
-            return name
-    raise RuntimeError("OS_LIMITATION: node not installed")
-
-
-# Inline code blocklist patterns.
-# WARNING: This blocklist provides only shallow defence-in-depth; it cannot
-# replace a real OS-level sandbox (finding 4).  Patterns scan the *full*
-# code string — no truncation — to prevent padding-based bypasses.
-_CODE_BLOCKLIST = [
-    re.compile(r"\bos\.system\b"),
-    re.compile(r"\bsubprocess\b"),
-    re.compile(r"__import__\s*\("),
-    re.compile(r"\beval\s*\("),
-    re.compile(r"\bexec\s*\("),
-    # Catch `import os` / `import os as o` style alias bypasses (finding 4)
-    re.compile(r"\bimport\s+os\b"),
-    re.compile(r"\bfrom\s+os\b"),
-]
-
-
-def _check_code_blocked(code: str) -> str | None:
-    """Scan *all* inline code for dangerous patterns (no truncation — finding 4)."""
-    for pat in _CODE_BLOCKLIST:
-        if pat.search(code):
-            return f"BLOCKED: Inline code contains blocked pattern '{pat.pattern}'"
-    return None
-
+# ── Tool handlers ─────────────────────────────────────────────────────────────
 
 async def handle_run_python(args: dict) -> str:
     """
     Execute Python code.
+
+    Risk tier: HIGH (== HITL-gated when hitl_risk_threshold >= high).
+    Security layers: HITL gate → minimal env → OS sandbox → Python blocklist.
 
     Accepts either:
       - 'file': path to a .py file (relative to PROJECT_ROOT or absolute)
@@ -134,7 +258,7 @@ async def handle_run_python(args: dict) -> str:
     cwd = args.get("cwd", str(PROJECT_ROOT))
     timeout = int(args.get("timeout", CODE_TIMEOUT))
 
-    # Validate cwd (#4)
+    # Validate cwd
     try:
         validate_path(cwd)
     except PermissionError as e:
@@ -154,9 +278,7 @@ async def handle_run_python(args: dict) -> str:
         if not str(resolved).endswith(".py"):
             return f"ERROR: Expected a .py file, got: {resolved.name}"
 
-        # Scan file content against the inline blocklist so that an attacker
-        # cannot bypass inline checks by writing a .py file and then executing
-        # it with run_python(file=...) (finding 4).
+        # Scan file content against the blocklist — defence-in-depth.
         try:
             file_content = resolved.read_text(encoding="utf-8", errors="replace")
             block_msg = _check_code_blocked(file_content)
@@ -165,17 +287,19 @@ async def handle_run_python(args: dict) -> str:
         except OSError as e:
             return f"ERROR: Cannot read file for security scan: {e}"
 
-        return await _run_exec([python, str(resolved)], cwd=cwd, timeout=timeout)
+        cmd = _sandbox_wrap_cmd([python, str(resolved)])
+        return await _run_exec(cmd, cwd=cwd, timeout=timeout)
 
     elif code:
-        # Check for dangerous patterns in inline code
+        # Check for dangerous patterns in inline code (defence-in-depth)
         block_msg = _check_code_blocked(code)
         if block_msg:
             return block_msg
 
         # Execute in isolated mode: -I strips user site-packages, no PYTHONSTARTUP
+        cmd = _sandbox_wrap_cmd([python, "-I", "-c", code])
         return await _run_exec(
-            [python, "-I", "-c", code],
+            cmd,
             cwd=cwd,
             timeout=timeout,
             extra_env={"PYTHONNOUSERSITE": "1"},
@@ -189,6 +313,9 @@ async def handle_run_node(args: dict) -> str:
     """
     Execute JavaScript/Node.js code.
 
+    Risk tier: HIGH (== HITL-gated when hitl_risk_threshold >= high).
+    Security layers: HITL gate → minimal env → OS sandbox → Node blocklist.
+
     Accepts either:
       - 'file': path to a .js file (relative to PROJECT_ROOT or absolute)
       - 'code': inline JavaScript code snippet to execute
@@ -200,7 +327,7 @@ async def handle_run_node(args: dict) -> str:
     cwd = args.get("cwd", str(PROJECT_ROOT))
     timeout = int(args.get("timeout", CODE_TIMEOUT))
 
-    # Validate cwd (#4)
+    # Validate cwd
     try:
         validate_path(cwd)
     except PermissionError as e:
@@ -223,20 +350,33 @@ async def handle_run_node(args: dict) -> str:
         if not str(resolved).endswith((".js", ".mjs", ".cjs")):
             return f"ERROR: Expected a .js file, got: {resolved.name}"
 
-        return await _run_exec([node, str(resolved)], cwd=cwd, timeout=timeout)
+        # Scan file content against the Node blocklist — defence-in-depth.
+        try:
+            file_content = resolved.read_text(encoding="utf-8", errors="replace")
+            block_msg = _check_node_blocked(file_content)
+            if block_msg:
+                return block_msg
+        except OSError as e:
+            return f"ERROR: Cannot read file for security scan: {e}"
+
+        cmd = _sandbox_wrap_cmd([node, str(resolved)])
+        return await _run_exec(cmd, cwd=cwd, timeout=timeout)
 
     elif code:
-        # Apply the same inline-code blocklist used by run_python (finding 4)
+        # Check for dangerous patterns in inline Node.js code (defence-in-depth)
+        block_msg = _check_node_blocked(code)
+        if block_msg:
+            return block_msg
+
+        # Apply the Python inline blocklist too as belt-and-suspenders for
+        # cross-runtime patterns (eval/exec tokens look the same in JS).
         block_msg = _check_code_blocked(code)
         if block_msg:
             return block_msg
 
         # Execute inline snippet with restricted flags
-        return await _run_exec(
-            [node, "--disable-proto=delete", "-e", code],
-            cwd=cwd,
-            timeout=timeout,
-        )
+        cmd = _sandbox_wrap_cmd([node, "--disable-proto=delete", "-e", code])
+        return await _run_exec(cmd, cwd=cwd, timeout=timeout)
 
     else:
         return "ERROR: Provide either 'file' (path to .js file) or 'code' (inline JavaScript snippet)."

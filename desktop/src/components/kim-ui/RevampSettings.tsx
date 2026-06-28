@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { Settings, KimAccount } from '../../types';
 import { PaneSchedule } from '../settings/SchedulePane';
 import { PaneHeader } from './settings-panes/primitives';
@@ -155,11 +155,54 @@ const PANE_META: Record<PaneId, { title: string; subtitle: string }> = {
 export function RevampSettings(props: Props) {
   const { settings, onChange, onClose, appVersion, onCheckUpdate, account, onAccountChange, initialPane } = props;
   const [active, setActive] = useState<PaneId>(initialPane ?? 'appearance');
+  const modalRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
-  // Close on Escape
+  // Save trigger focus, focus first element on open, restore on close
+  useEffect(() => {
+    previousFocusRef.current = document.activeElement as HTMLElement;
+    const modal = modalRef.current;
+    if (modal) {
+      const focusable = modal.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      );
+      if (focusable.length > 0) focusable[0].focus();
+    }
+    return () => {
+      previousFocusRef.current?.focus();
+    };
+  }, []);
+
+  // Close on Escape; trap Tab/Shift+Tab within modal
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') {
+        onClose();
+        return;
+      }
+      if (e.key === 'Tab') {
+        const modal = modalRef.current;
+        if (!modal) return;
+        const focusable = Array.from(
+          modal.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+          ),
+        );
+        if (focusable.length === 0) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (e.shiftKey) {
+          if (document.activeElement === first) {
+            e.preventDefault();
+            last.focus();
+          }
+        } else {
+          if (document.activeElement === last) {
+            e.preventDefault();
+            first.focus();
+          }
+        }
+      }
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -188,6 +231,7 @@ export function RevampSettings(props: Props) {
       aria-labelledby="kim-revamp-settings-title"
     >
       <div
+        ref={modalRef}
         className="kr-glass"
         style={{
           width: 'min(1100px, 100%)',
@@ -230,10 +274,11 @@ export function RevampSettings(props: Props) {
             <span style={{ fontWeight: 600, fontSize: 15, letterSpacing: '-0.01em' }}>Settings</span>
           </div>
           {NAV.map((n) => (
-            <div
+            <button
               key={n.id}
               className="kr-row-hover"
               onClick={() => setActive(n.id)}
+              aria-current={active === n.id ? 'page' : undefined}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -243,14 +288,20 @@ export function RevampSettings(props: Props) {
                 cursor: 'pointer',
                 background: active === n.id ? 'var(--kim-surface)' : 'transparent',
                 color: active === n.id ? 'var(--kim-text)' : 'var(--kim-text-2)',
+                borderTop: 'none',
+                borderRight: 'none',
+                borderBottom: 'none',
                 borderLeft: active === n.id ? '2px solid var(--kim-accent)' : '2px solid transparent',
                 marginLeft: -2,
                 fontSize: 13.5,
+                width: '100%',
+                textAlign: 'left',
+                fontFamily: 'inherit',
               }}
             >
               <NavIcon name={n.icon} />
               <span>{n.label}</span>
-            </div>
+            </button>
           ))}
         </div>
 

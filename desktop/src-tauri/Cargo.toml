@@ -24,7 +24,7 @@ serde_yaml = "0.9"
 tokio = { version = "1", features = ["process", "io-util", "rt", "sync", "time", "macros"] }
 dirs = "5"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-zip = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 tiny_http = "0.12"
 base64 = "0.22"
 keyring = "2"

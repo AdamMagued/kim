@@ -68,7 +68,15 @@ function groupByDate(sessions: SessionInfo[]): { label: string; items: SessionIn
   };
 
   for (const s of sessions) {
-    const ts = Date.parse(s.date);
+    // Parse date-only strings ('YYYY-MM-DD') as LOCAL midnight to match local bucket boundaries.
+    // Date.parse('YYYY-MM-DD') yields UTC midnight, which shifts the day for negative-offset users.
+    let ts: number;
+    const localMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s.date);
+    if (localMatch) {
+      ts = new Date(Number(localMatch[1]), Number(localMatch[2]) - 1, Number(localMatch[3])).getTime();
+    } else {
+      ts = Date.parse(s.date);
+    }
     if (Number.isNaN(ts)) {
       groups.Earlier.push(s);
       continue;
@@ -85,7 +93,14 @@ function groupByDate(sessions: SessionInfo[]): { label: string; items: SessionIn
 }
 
 function formatTime(date: string): string {
-  const ts = Date.parse(date);
+  // Parse date-only strings as LOCAL midnight (same fix as groupByDate).
+  let ts: number;
+  const localMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (localMatch) {
+    ts = new Date(Number(localMatch[1]), Number(localMatch[2]) - 1, Number(localMatch[3])).getTime();
+  } else {
+    ts = Date.parse(date);
+  }
   if (Number.isNaN(ts)) return '';
   const d = new Date(ts);
   const today = new Date();
@@ -429,6 +444,7 @@ export function RevampSidebar({
           type="button"
           className={activeTab === 'chat' ? 'kr-on' : ''}
           onClick={() => onTabChange('chat')}
+          aria-pressed={activeTab === 'chat'}
           style={{ flex: 1 }}
         >
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
@@ -446,6 +462,7 @@ export function RevampSidebar({
           type="button"
           className={activeTab === 'code' ? 'kr-on' : ''}
           onClick={() => onTabChange('code')}
+          aria-pressed={activeTab === 'code'}
           style={{ flex: 1 }}
         >
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
@@ -464,7 +481,7 @@ export function RevampSidebar({
       </div>
 
       {/* Search */}
-      <div
+      <label
         style={{
           display: 'flex',
           alignItems: 'center',
@@ -474,14 +491,29 @@ export function RevampSidebar({
           background: 'var(--kim-bg-2)',
           border: '1px solid var(--kim-border)',
           borderRadius: 9,
+          cursor: 'text',
         }}
       >
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" style={{ color: 'var(--kim-text-3)' }}>
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" style={{ color: 'var(--kim-text-3)', flexShrink: 0 }} aria-hidden="true">
           <circle cx="5" cy="5" r="3.5" stroke="currentColor" strokeWidth="1.2" />
           <path d="M8 8l2.5 2.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
         </svg>
-        <span style={{ color: 'var(--kim-text-3)', fontSize: 12.5 }}>Search sessions</span>
-      </div>
+        <input
+          type="search"
+          placeholder="Search sessions"
+          aria-label="Search sessions"
+          style={{
+            background: 'none',
+            border: 'none',
+            outline: 'none',
+            color: 'var(--kim-text-3)',
+            fontSize: 12.5,
+            flex: 1,
+            minWidth: 0,
+            fontFamily: 'inherit',
+          }}
+        />
+      </label>
 
       {/* Projects (Code tab only) */}
       {activeTab === 'code' && (
@@ -768,10 +800,12 @@ export function RevampSidebar({
                     const isActive = activeSessionId === sessionKey(s);
                     const title = s.title?.trim() || s.session_id;
                     return (
-                      <div
+                      <button
                         key={sessionKey(s)}
+                        type="button"
                         className="kr-row-hover"
                         onClick={() => onSelectSession(s)}
+                        aria-current={isActive ? 'true' : undefined}
                         style={{
                           display: 'flex',
                           alignItems: 'center',
@@ -780,8 +814,15 @@ export function RevampSidebar({
                           borderRadius: 8,
                           cursor: 'pointer',
                           background: isActive ? 'var(--kim-surface)' : 'transparent',
+                          borderTop: 'none',
+                          borderRight: 'none',
+                          borderBottom: 'none',
                           borderLeft: isActive ? '2px solid var(--kim-accent)' : '2px solid transparent',
                           marginLeft: -2,
+                          width: 'calc(100% + 2px)',
+                          color: 'inherit',
+                          font: 'inherit',
+                          textAlign: 'left',
                         }}
                       >
                         <span
@@ -809,7 +850,7 @@ export function RevampSidebar({
                             {formatTime(s.date)}
                           </span>
                         )}
-                      </div>
+                      </button>
                     );
                   })}
                 </div>

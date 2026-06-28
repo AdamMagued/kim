@@ -466,7 +466,7 @@ class GeminiProvider(BaseProvider):
             }
         if len(tool_calls) > 1:
             # Match the batch shape claude.py / openai_provider.py use so the agent
-            # executes every call instead of discarding the extras.
+            # sequences every call (including mutating tools via preview/HITL gate).
             return {
                 "type": "tool_call",
                 "tool": "batch",

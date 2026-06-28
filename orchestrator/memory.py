@@ -100,7 +100,7 @@ class ConversationMemory:
             role = m["role"]
             if role == "compact_summary":
                 continue  # exposed via self.compact_summary instead
-            result.append({"role": role, "content": m["content"]})
+            result.append({"role": role, "content": copy.deepcopy(m["content"])})
         return result
 
     def __len__(self) -> int:

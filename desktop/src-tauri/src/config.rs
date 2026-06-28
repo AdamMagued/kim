@@ -6,7 +6,7 @@ use serde::Deserialize;
 fn default_bridge_timeout_secs() -> u64 { 720 }
 fn default_screenshot_flash_duration_ms() -> u64 { 3300 }
 fn default_max_iterations() -> u32 { 25 }
-fn default_ipc_protocol() -> String { "legacy".to_string() }
+fn default_ipc_protocol() -> String { "typed".to_string() }
 fn default_schedules_enabled() -> bool { true }
 
 fn default_model_map() -> HashMap<String, String> {
@@ -108,7 +108,7 @@ ipc_protocol: typed
         assert_eq!(config.max_iterations, 25);
         assert_eq!(config.bridge_timeout_secs, 720);
         assert_eq!(config.screenshot_flash_duration_ms, 3300);
-        assert_eq!(config.ipc_protocol, "legacy");
+        assert_eq!(config.ipc_protocol, "typed");
     }
 
     #[test]
@@ -133,7 +133,7 @@ ipc_protocol: typed
         let config = load_config(Path::new("/nonexistent/path/config.yaml"));
         assert_eq!(config.max_iterations, 25);
         assert_eq!(config.bridge_timeout_secs, 720);
-        assert_eq!(config.ipc_protocol, "legacy");
+        assert_eq!(config.ipc_protocol, "typed");
     }
 
     #[test]

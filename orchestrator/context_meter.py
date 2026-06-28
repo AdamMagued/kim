@@ -225,6 +225,30 @@ def estimate_content_tokens(content: Any) -> int:
     return estimate_text_tokens(str(content))
 
 
+# Cache the tools-schema token count between iterations.
+# The tools list rarely changes within a run so we avoid re-serializing it
+# (~50 schemas, ~8 KB) on every iteration.  The cache is keyed by the
+# object identity and length of the list; any list replacement or length
+# change invalidates the entry.  A single entry suffices because the agent
+# uses one tools list per run.
+_tools_token_cache: dict[tuple[int, int], int] = {}
+
+
+def _tools_token_count(tools: list[dict]) -> int:
+    """Return the serialized token count for a tools list, with caching."""
+    key = (id(tools), len(tools))
+    cached = _tools_token_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        count = estimate_text_tokens(json.dumps(tools, separators=(",", ":")))
+    except TypeError:
+        count = estimate_text_tokens(str(tools))
+    _tools_token_cache.clear()   # keep at most one entry
+    _tools_token_cache[key] = count
+    return count
+
+
 def estimate_request_tokens(
     messages: list[dict] | None,
     *,
@@ -234,10 +258,7 @@ def estimate_request_tokens(
     """Estimate a full provider request from canonical messages, system, tools."""
     total = estimate_text_tokens(system)
     if tools:
-        try:
-            total += estimate_text_tokens(json.dumps(tools, separators=(",", ":")))
-        except TypeError:
-            total += estimate_text_tokens(str(tools))
+        total += _tools_token_count(tools)
     for message in messages or []:
         total += 4  # per-message wrapper overhead
         total += estimate_text_tokens(str(message.get("role", "")))

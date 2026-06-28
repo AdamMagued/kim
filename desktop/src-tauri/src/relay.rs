@@ -26,8 +26,9 @@ fn extract_block_scalar<'a>(yaml: &'a str, block: &str, key: &str) -> Option<&'a
     let key_prefix = format!("{}:", key);
     let mut in_block = false;
     for line in yaml.lines() {
-        if !line.starts_with(char::is_whitespace) && line.trim_end().ends_with(':') {
-            in_block = line.trim_end() == block_marker;
+        if !line.starts_with(char::is_whitespace) {
+            // Any non-indented line ends the previous block.
+            in_block = line.trim_end().ends_with(':') && line.trim_end() == block_marker;
             continue;
         }
         if in_block {
@@ -55,11 +56,12 @@ fn upsert_block_scalar(yaml: &str, block: &str, key: &str, value: &str) -> Strin
     let mut replaced = false;
 
     for line in yaml.lines() {
-        if !line.starts_with(char::is_whitespace) && line.trim_end().ends_with(':') {
+        if !line.starts_with(char::is_whitespace) {
+            // Any non-indented line ends the previous block.
             if in_block {
                 block_end = Some(out.len());
             }
-            in_block = line.trim_end() == block_marker;
+            in_block = line.trim_end().ends_with(':') && line.trim_end() == block_marker;
             if in_block {
                 block_start = Some(out.len());
             }
@@ -68,9 +70,9 @@ fn upsert_block_scalar(yaml: &str, block: &str, key: &str, value: &str) -> Strin
         }
 
         if in_block {
-            let trimmed = line.trim_start();
+            let trimmed = line.trim_start_matches([' ', '\t']);
             let indent = line.len() - trimmed.len();
-            if indent == 2 && trimmed.starts_with(&key_prefix) {
+            if (1..=4).contains(&indent) && trimmed.starts_with(&key_prefix) {
                 out.push(format!("  {}: {}", key, value));
                 replaced = true;
                 continue;

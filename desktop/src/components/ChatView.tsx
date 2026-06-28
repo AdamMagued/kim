@@ -41,6 +41,9 @@ interface Props {
   onSelectProject?: (path: string) => void;
   recentSessions?: SessionInfo[];
   onSelectSession?: (s: SessionInfo) => void;
+  /** Mutable ref written by App; ChatView stores its openConnectors callback here
+   *  so App can trigger the panel without a global CustomEvent bus. */
+  openConnectorsRef?: { current: (() => void) | null };
 }
 
 export function ChatView({
@@ -59,6 +62,7 @@ export function ChatView({
   recentSessions,
   onSelectSession,
   onSelectProject,
+  openConnectorsRef,
 }: Props) {
   const [localProvider, setLocalProvider] = useState<string | null>(null);
   const [messageReloadNonce, setMessageReloadNonce] = useState(0);
@@ -357,11 +361,13 @@ export function ChatView({
     }, 260);
   }, [connectorsClosing, connectorsOpen]);
 
+  // Register the stable openConnectors callback with the ref supplied by App so
+  // it can open the panel without a global CustomEvent bus.
   useEffect(() => {
-    function onOpen() { openConnectors(); }
-    window.addEventListener('kim-open-connectors', onOpen);
-    return () => window.removeEventListener('kim-open-connectors', onOpen);
-  }, [openConnectors]);
+    if (!openConnectorsRef) return;
+    openConnectorsRef.current = openConnectors;
+    return () => { openConnectorsRef.current = null; };
+  }, [openConnectors, openConnectorsRef]);
 
   const handlePickCodeProject = async (mode: 'create' | 'open') => {
     try {

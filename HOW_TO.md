@@ -48,7 +48,7 @@ Until V-1 lands: also emit the legacy text line from `ui_bridge.py` and add a re
 
 1. **`mcp_server/tools/web.py`** — main web tool handlers (`web_fill_form`, `web_observe`, etc.).
 2. **`mcp_server/tools/web_element_scoring.py`** — element resolver, synonym table, scoring logic.
-3. **`mcp_server/sites/site_configs.py`** — per-site overrides and `FORM_SCHEMA` definitions.
+3. **`orchestrator/providers/browser/site_configs.py`** — per-site overrides and `FORM_SCHEMA` definitions.
 4. **`tests/evals/<fixture>.py`** — add or update a fixture-driven eval for the bug scenario.
 5. **`tests/test_web_tools.py`** — unit test for the specific fix.
 

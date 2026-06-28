@@ -911,6 +911,10 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let is_browser = config.provider.to_ascii_lowercase().starts_with("browser");
 
+    // Holds the exclusive temp dir for the codex CODEX_HOME so it outlives the
+    // if-else block and stays alive until child.wait() completes (#23).
+    let mut _codex_temp_dir: Option<tempfile::TempDir> = None;
+
     let mut child = if is_browser {
         // Browser provider: launch the Kim codex bridge service.
         // Resolve the Kim source root so `python3 -m orchestrator.codex_bridge_service`
@@ -922,7 +926,17 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
                 return;
             }
         };
-        match Command::new("python3")
+        let python = match crate::agentic::find_python(&kim_root) {
+            Some(p) => p,
+            None => {
+                let _ = tx.send(AppEvent::Err(
+                    "No Python interpreter found (tried venv, python3, python). \
+                     Install Python 3 and retry.".to_string(),
+                ));
+                return;
+            }
+        };
+        match Command::new(&python)
             .args([
                 "-m",
                 "orchestrator.codex_bridge_service",
@@ -954,11 +968,23 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
             Some(p) => p,
             None => return,
         };
-        // Use a per-process directory so concurrent runs don't clobber each other
-        // and the path is not globally guessable (#23).  Without tempfile crate
-        // available, we use the PID as a distinguishing suffix.
-        let kim_codex_home = std::env::temp_dir()
-            .join(format!("kim_codex_{}", std::process::id()));
+        // Use an exclusive randomized temp dir so concurrent runs don't clobber
+        // each other and the path is not pre-creatable by a local attacker (#23).
+        let kim_codex_dir = match tempfile::Builder::new()
+            .prefix("kim_codex_")
+            .tempdir()
+        {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(AppEvent::Err(format!(
+                    "Failed to create codex temp dir: {e}"
+                )));
+                return;
+            }
+        };
+        let kim_codex_home = kim_codex_dir.path().to_path_buf();
+        // Keep the TempDir alive until child.wait() finishes (#23).
+        _codex_temp_dir = Some(kim_codex_dir);
         if let Err(e) = write_codex_config(proxy_port, &config.model, &kim_codex_home) {
             let _ = tx.send(AppEvent::Err(format!("Failed to write codex config: {e}")));
             return;
@@ -1178,8 +1204,16 @@ async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent
         return None;
     }
 
+    // Resolve a Python interpreter the same way agentic.rs does: venv first,
+    // then system python3/python — avoids hardcoding "python3" which is absent
+    // on Windows.
+    let python = {
+        let root_opt = crate::sessions::find_kim_repo_root();
+        let root = root_opt.unwrap_or_else(|| std::path::PathBuf::from("."));
+        crate::agentic::find_python(&root).unwrap_or_else(|| std::path::PathBuf::from("python3"))
+    };
     let ollama_base = format!("{}/v1", normalize_base_url(&config.ollama_base_url));
-    let mut child = match Command::new("python3")
+    let mut child = match Command::new(&python)
         .args([tmp_path.to_string_lossy().as_ref(), ollama_base.as_str()])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1189,7 +1223,7 @@ async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(AppEvent::Err(format!(
-                "Failed to start responses proxy (python3 required): {e}"
+                "Failed to start responses proxy (Python interpreter not found): {e}"
             )));
             return None;
         }

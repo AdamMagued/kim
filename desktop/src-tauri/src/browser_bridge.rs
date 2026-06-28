@@ -545,8 +545,8 @@ pub(crate) fn run_bridge_completion_once(
     site: &str,
     prompt: &str,
     attachments: &[BridgeAttachment],
-    callback_url: &str,
-    callback_token: &str,
+    _callback_url: &str,
+    _callback_token: &str,
     completion_hash: Option<&str>,
     model_tier: Option<&str>,
 ) -> Result<BridgeCompleteResponse, String> {

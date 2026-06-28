@@ -23,7 +23,7 @@ See `PRODUCTION_ROADMAP.md` for the current work backlog and sequencing.
 | Directory | Guide | What's there |
 |---|---|---|
 | `orchestrator/` | `orchestrator/CLAUDE.md` | Agent loop, providers, session store |
-| `mcp_server/` | `mcp_server/CLAUDE.md` | 31 OS-control tools, tool registry |
+| `mcp_server/` | `mcp_server/CLAUDE.md` | 50 OS-control tools, tool registry |
 | `desktop/src/` | `desktop/src/CLAUDE.md` | React UI, IPC event consumers |
 | `desktop/src-tauri/` | `desktop/src-tauri/CLAUDE.md` | Rust shell, subprocess mgmt |
 

@@ -1,0 +1,10 @@
+# Optional voice / TTS dependencies for Kim's audio output.
+# Install only when voice features are needed:
+#   pip install -r requirements-voice.txt
+#
+# kokoro: lightweight local TTS engine (default voice backend)
+# sounddevice: cross-platform audio playback
+# soundfile: audio file I/O (required by kokoro)
+kokoro~=0.9
+sounddevice~=0.5
+soundfile~=0.12

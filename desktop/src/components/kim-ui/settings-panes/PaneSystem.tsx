@@ -144,11 +144,15 @@ function PathRow({
   onPick: () => void;
   onChange: (v: string) => void;
 }) {
+  const inputId = `path-row-${label.toLowerCase().replace(/\s+/g, '-')}`;
   return (
     <div style={{ marginBottom: 18 }}>
-      <SectionLabel>{label}</SectionLabel>
+      <label htmlFor={inputId} className="kr-eyebrow" style={{ display: 'block', marginBottom: 12 }}>
+        {label}
+      </label>
       <div style={{ display: 'flex', gap: 8 }}>
         <input
+          id={inputId}
           className="kr-input"
           style={{ flex: 1 }}
           value={value}

@@ -77,6 +77,14 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
   const [showModelDetails, setShowModelDetails] = useState(false);
   const [showOllamaAdvanced, setShowOllamaAdvanced] = useState(false);
 
+  // Raw text for the context-budget number input so intermediate keystrokes
+  // (e.g. typing "50000" one digit at a time) are not reverted by React's
+  // controlled-input mechanism.  Clamped to >=10 000 on blur (finding #1).
+  const [rawBudget, setRawBudget] = useState<string>(String(settings.context_budget_tokens ?? 200_000));
+  useEffect(() => {
+    setRawBudget(String(settings.context_budget_tokens ?? 200_000));
+  }, [settings.context_budget_tokens]);
+
   // Sign-in refresh timers — tracked so they can be cancelled if the pane unmounts
   // before the delays fire (finding #2: setState-after-unmount).
   const signInTimersRef = useRef<ReturnType<typeof window.setTimeout>[]>([]);
@@ -332,6 +340,7 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
             <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginBottom: 6 }}>model</div>
             <select
               className="kr-input"
+              aria-label="Ollama model"
               value={selectedModel}
               onChange={(e) => {
                 if (settings.ollama.mode === 'cloud') {
@@ -355,6 +364,7 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
             <input
               className="kr-input"
               style={{ marginTop: 8 }}
+              aria-label="Custom model name"
               value={selectedModel}
               onChange={(e) => {
                 if (settings.ollama.mode === 'cloud') {
@@ -391,6 +401,7 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
                 <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginBottom: 6 }}>base url</div>
                 <input
                   className="kr-input"
+                  aria-label="Ollama base URL"
                   value={settings.ollama.base_url}
                   onChange={(e) => updateOllama({ base_url: e.target.value })}
                   placeholder="http://localhost:11434"
@@ -423,6 +434,7 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
                   type="number"
                   min={0}
                   step={1024}
+                  aria-label="Context limit override"
                   value={settings.ollama.context_limit_override ?? ''}
                   onChange={(e) => {
                     const raw = e.target.value.trim();
@@ -582,13 +594,13 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
         title="Queue messages while Kim is working"
         subtitle="Off: a new send interrupts the current task. On: sends queue and run in order."
       >
-        <Toggle on={settings.allow_message_queue} onClick={() => update('allow_message_queue', !settings.allow_message_queue)} />
+        <Toggle on={settings.allow_message_queue} onClick={() => update('allow_message_queue', !settings.allow_message_queue)} ariaLabel="Queue messages while Kim is working" />
       </Row>
       <Row
         title="Keep browser visible while running"
         subtitle="Testing only — leaves the provider window on-screen so you can watch what Kim does."
       >
-        <Toggle on={settings.keep_browser_visible} onClick={() => update('keep_browser_visible', !settings.keep_browser_visible)} />
+        <Toggle on={settings.keep_browser_visible} onClick={() => update('keep_browser_visible', !settings.keep_browser_visible)} ariaLabel="Keep browser visible while running" />
       </Row>
 
       <SectionLabel>context budget</SectionLabel>
@@ -605,16 +617,20 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
           type="number"
           min={10_000}
           step={1000}
-          value={settings.context_budget_tokens ?? 200_000}
+          value={rawBudget}
           onChange={(e) => {
+            setRawBudget(e.target.value);
             const n = Number.parseInt(e.target.value, 10);
-            if (Number.isFinite(n) && n >= 10_000) update('context_budget_tokens', n);
+            if (Number.isFinite(n) && n > 0) update('context_budget_tokens', n);
           }}
           onBlur={(e) => {
             const n = Number.parseInt(e.target.value, 10);
-            if (!Number.isFinite(n) || n < 10_000) update('context_budget_tokens', 200_000);
+            const clamped = Number.isFinite(n) && n >= 10_000 ? n : 200_000;
+            update('context_budget_tokens', clamped);
+            setRawBudget(String(clamped));
           }}
           className="kr-input"
+          aria-label="Cumulative input tokens budget"
         />
         <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginTop: 8, lineHeight: 1.5 }}>
           Kim warns when cumulative input crosses ~80% / ~95% of this budget, then offers to compact.

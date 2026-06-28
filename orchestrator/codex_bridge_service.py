@@ -229,6 +229,21 @@ async def _run_async(args: argparse.Namespace) -> int:
                 "OPENAI_API_KEY": proxy._bearer_token,
                 "OPENAI_BASE_URL": f"http://127.0.0.1:{proxy_port}/v1",
             }
+            # On Windows the POSIX vars above are absent; forward the essentials
+            # so the codex child process can locate system tools and temp storage.
+            if sys.platform == "win32":
+                _WIN_PASSTHROUGH = (
+                    "SystemRoot",
+                    "ComSpec",
+                    "USERPROFILE",
+                    "TEMP",
+                    "TMP",
+                    # Windows uses "Path" (mixed-case) in addition to "PATH".
+                    "Path",
+                )
+                for _var in _WIN_PASSTHROUGH:
+                    if _var in os.environ:
+                        env[_var] = os.environ[_var]
             # --dangerously-bypass-approvals-and-sandbox requires explicit opt-in (#1).
             bypass_flag = os.environ.get("KIM_CODEX_BYPASS_SANDBOX", "").strip()
             cmd = [

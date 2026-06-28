@@ -155,6 +155,10 @@ _SHELL_TOOLS: list[Tool] = [
                 "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 30},
             },
             "required": ["cmd"],
+            # additionalProperties:false prevents the model from injecting
+            # undeclared keys such as sandbox_mode or allow_chaining, which
+            # could otherwise disable security controls (finding 2).
+            "additionalProperties": False,
         },
     ),
     Tool(
@@ -167,6 +171,8 @@ _SHELL_TOOLS: list[Tool] = [
                 "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 30},
             },
             "required": ["script"],
+            # additionalProperties:false prevents sandbox_mode injection (finding 2).
+            "additionalProperties": False,
         },
     ),
 ]

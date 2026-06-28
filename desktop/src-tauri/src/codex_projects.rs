@@ -155,7 +155,11 @@ pub async fn remove_code_project(path: String) -> Result<Vec<String>, String> {
         return Err("No account found".to_string());
     };
 
-    account.code_projects.retain(|p| p != &path);
+    let canonical = PathBuf::from(&path)
+        .canonicalize()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.clone());
+    account.code_projects.retain(|p| p != &canonical && p != &path);
 
     write_account_atomic(&acct_path, &account)?;
     Ok(account.code_projects)

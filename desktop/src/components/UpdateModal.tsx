@@ -7,13 +7,19 @@ interface Props {
   latestVersion: string;
   releaseNotes: string;
   onDismiss: () => void;
+  /** Called whenever the internal update stage changes so that the parent can
+   *  gate keyboard shortcuts (e.g. Escape) on whether a dismiss is safe. */
+  onStageChange?: (stage: Stage) => void;
 }
 
 type Stage = 'idle' | 'updating' | 'done' | 'error';
 
-export function UpdateModal({ currentVersion, latestVersion, releaseNotes, onDismiss }: Props) {
+export function UpdateModal({ currentVersion, latestVersion, releaseNotes, onDismiss, onStageChange }: Props) {
   const [platform, setPlatform] = useState('');
   const [stage, setStage] = useState<Stage>('idle');
+
+  // Notify parent whenever stage changes so it can gate dismiss shortcuts.
+  useEffect(() => { onStageChange?.(stage); }, [stage, onStageChange]);
   const [progress, setProgress] = useState<string[]>([]);
   const [errorMsg, setErrorMsg] = useState('');
   const progressRef = useRef<HTMLDivElement>(null);

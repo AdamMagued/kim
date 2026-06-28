@@ -432,8 +432,8 @@ class BrowserProvider(BaseProvider):
         self._sent_system_prompt = new_sent
         return prompt, attachments, completion_hash
 
-    def _parse_response(self, text, completion_hash):
-        return parse_response(text, completion_hash)
+    def _parse_response(self, text, completion_hash, known_tools=None):
+        return parse_response(text, completion_hash, known_tools=known_tools)
 
     def _strip_transport_markers(self, text, completion_hash):
         return strip_transport_markers(text, completion_hash)
@@ -458,20 +458,25 @@ class BrowserProvider(BaseProvider):
             logger.info("CDP unavailable — auto-launching headless Chromium")
             return await self._auto_launch(pw)
 
+        # Derive the port from the configured CDP URL so the help text matches
+        # what the provider actually tries to connect to (#3).
+        import urllib.parse as _urlparse
+        _cdp_port = _urlparse.urlparse(self._cdp_url).port or 9222
+
         sys_name = platform.system()
         if sys_name == "Darwin":
             launch_cmd = (
                 '/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome '
-                f'--remote-debugging-port=9222 --user-data-dir="{self._user_data_dir}"'
+                f'--remote-debugging-port={_cdp_port} --user-data-dir="{self._user_data_dir}"'
             )
         elif sys_name == "Linux":
             launch_cmd = (
-                f'google-chrome --remote-debugging-port=9222 '
+                f'google-chrome --remote-debugging-port={_cdp_port} '
                 f'--user-data-dir="{self._user_data_dir}"'
             )
         else:
             launch_cmd = (
-                f'chrome.exe --remote-debugging-port=9222 '
+                f'chrome.exe --remote-debugging-port={_cdp_port} '
                 f'--user-data-dir="{self._user_data_dir}"'
             )
         raise ConnectionError(

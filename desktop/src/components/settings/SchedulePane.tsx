@@ -305,6 +305,7 @@ function AddForm({
             onChange={(e) => set('task', e.target.value)}
             disabled={adding}
             autoFocus
+            aria-label="Task"
           />
         </div>
         <div>
@@ -315,6 +316,7 @@ function AddForm({
             value={form.expr}
             onChange={(e) => set('expr', e.target.value)}
             disabled={adding}
+            aria-label="Schedule expression"
           />
         </div>
       </div>
@@ -326,6 +328,7 @@ function AddForm({
           onChange={(e) => set('provider', e.target.value)}
           disabled={adding}
           style={{ cursor: 'pointer' }}
+          aria-label="Provider"
         >
           {PROVIDER_OPTIONS.map((o) => (
             <option key={o.value} value={o.value}>

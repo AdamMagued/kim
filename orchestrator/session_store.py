@@ -335,8 +335,10 @@ class SessionStore:
         )
 
     def save_summary(self, summary: str) -> None:
-        """Write a human-readable summary alongside the JSONL file."""
-        self.summary_file.write_text(summary.strip() + "\n", encoding="utf-8")
+        """Write a human-readable summary alongside the JSONL file (atomic)."""
+        tmp = self.summary_file.with_suffix(self.summary_file.suffix + ".tmp")
+        tmp.write_text(summary.strip() + "\n", encoding="utf-8")
+        os.replace(tmp, self.summary_file)
         logger.info(f"Session summary saved: {self.summary_file}")
 
     def load_context_state(self) -> dict:
@@ -395,7 +397,12 @@ class SessionStore:
         session_id: str,
         base_dir: Optional[Path] = None,
     ) -> Optional[Path]:
-        """Return the JSONL path for a session ID if it exists."""
+        """Return the JSONL path for a session ID if it exists.
+
+        Also returns the expected live-file path when only rolled segments
+        exist (i.e. every append crossed the 50 MB cap and the live file has
+        been rotated away) so callers can still resolve the session directory.
+        """
         base = Path(base_dir) if base_dir else _DEFAULT_BASE_DIR
         if not base.exists():
             return None
@@ -405,6 +412,10 @@ class SessionStore:
                 continue
             candidate = date_dir / f"{session_id}.jsonl"
             if candidate.exists():
+                return candidate
+            # Session may consist entirely of rolled segments — return the
+            # expected live-file path so callers can locate the date directory.
+            if any(date_dir.glob(f"{session_id}.roll.*.jsonl")):
                 return candidate
         return None
 
@@ -426,16 +437,28 @@ class SessionStore:
         Load all messages from a session JSONL file.
 
         Searches all date directories for the given session_id.
+        Rolled segments (<id>.roll.<stamp>.jsonl, produced when the live file
+        exceeds the 50 MB cap) are concatenated in chronological stamp order
+        before the live file so the full transcript is recovered on resume.
         Returns the messages in order, ready to be loaded into
         ConversationMemory.
         """
         candidate = SessionStore.find_session_file(session_id, base_dir=base_dir)
-        if candidate:
-            return _read_jsonl(candidate)
+        if candidate is None:
+            if warn_if_missing:
+                logger.info(f"Session not found: {session_id}")
+            return []
 
-        if warn_if_missing:
-            logger.info(f"Session not found: {session_id}")
-        return []
+        session_dir = candidate.parent
+        # Collect rolled segments in chronological order (stamp sorts lexicographically)
+        roll_files = sorted(session_dir.glob(f"{session_id}.roll.*.jsonl"))
+        messages: list[dict] = []
+        for roll_file in roll_files:
+            messages.extend(_read_jsonl(roll_file))
+        # Append the live file if it exists (may not exist if every write was rolled)
+        if candidate.exists():
+            messages.extend(_read_jsonl(candidate))
+        return messages
 
     @staticmethod
     def load_trace_events(
@@ -491,6 +514,8 @@ class SessionStore:
             if not date_dir.is_dir():
                 continue
             for session_file in sorted(date_dir.glob("*.jsonl"), reverse=True):
+                if ".roll." in session_file.name:
+                    continue  # rolled segments are read via load_session, not enumerated separately
                 session_id = session_file.stem
                 for record in _read_jsonl(session_file):
                     if "role" in record:
@@ -689,6 +714,8 @@ class SessionStore:
             if not date_dir.is_dir():
                 continue
             for jsonl_file in sorted(date_dir.glob("*.jsonl"), reverse=True):
+                if ".roll." in jsonl_file.name:
+                    continue  # rolled segments are not standalone sessions
                 session_id = jsonl_file.stem
                 summary_file = date_dir / f"{session_id}.summary.txt"
                 context_file = date_dir / f"{session_id}.context.json"

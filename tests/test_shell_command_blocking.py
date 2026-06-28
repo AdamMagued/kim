@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from unittest.mock import patch
 
 import pytest
 
@@ -110,12 +111,15 @@ def test_safe_commands_not_blocked(cmd):
 
 @pytest.mark.asyncio
 async def test_run_command_default_uses_requested_cwd():
-    result = await handle_run_command({
-        "cmd": "pwd",
-        "cwd": str(PROJECT_ROOT),
-        "timeout": 5,
-        "sandbox_mode": False,
-    })
+    # sandbox_mode is now operator-config-only (not accepted as a model arg).
+    # Patch the module-level flag so the handler runs in non-sandbox mode,
+    # which lets the requested cwd take effect (finding 2 regression fix).
+    with patch("mcp_server.tools.shell.SHELL_SANDBOX_MODE", False):
+        result = await handle_run_command({
+            "cmd": "pwd",
+            "cwd": str(PROJECT_ROOT),
+            "timeout": 5,
+        })
     assert "exit_code: 0" in result
     assert str(PROJECT_ROOT) in result
     assert "sandbox: enabled" not in result
@@ -123,12 +127,14 @@ async def test_run_command_default_uses_requested_cwd():
 
 @pytest.mark.asyncio
 async def test_run_command_sandbox_ignores_requested_cwd(tmp_path):
-    result = await handle_run_command({
-        "cmd": "pwd",
-        "cwd": str(tmp_path),
-        "timeout": 5,
-        "sandbox_mode": True,
-    })
+    # Patch sandbox on explicitly so the test is not dependent on the
+    # default config value (finding 2: sandbox_mode arg is now ignored).
+    with patch("mcp_server.tools.shell.SHELL_SANDBOX_MODE", True):
+        result = await handle_run_command({
+            "cmd": "pwd",
+            "cwd": str(tmp_path),
+            "timeout": 5,
+        })
     assert "exit_code: 0" in result
     assert "sandbox: enabled" in result
     assert str(tmp_path) not in result
@@ -138,12 +144,12 @@ async def test_run_command_sandbox_ignores_requested_cwd(tmp_path):
 @pytest.mark.asyncio
 async def test_run_command_sandbox_does_not_write_into_requested_cwd(tmp_path):
     target = tmp_path / "sandbox-leak-check.txt"
-    result = await handle_run_command({
-        "cmd": f"printf probe > {target.name}",
-        "cwd": str(tmp_path),
-        "timeout": 5,
-        "sandbox_mode": True,
-    })
+    with patch("mcp_server.tools.shell.SHELL_SANDBOX_MODE", True):
+        result = await handle_run_command({
+            "cmd": f"printf probe > {target.name}",
+            "cwd": str(tmp_path),
+            "timeout": 5,
+        })
     assert "exit_code: 0" in result
     assert not target.exists()
 
