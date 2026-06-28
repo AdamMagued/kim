@@ -26,6 +26,8 @@ pub mod voice_config;
 pub mod config;
 pub(crate) mod http_bridge;
 pub mod browser_bridge;
+mod screenshot_flash;
+mod codex_bridge;
 pub mod provider_auth;
 pub(crate) use browser_bridge::*;
 mod paths;
@@ -40,7 +42,9 @@ pub(crate) use http_util::*;
 // Re-export commonly used types/helpers from submodules so remaining lib.rs
 // code (session listing, run history, codex file-bridge) can use them unqualified.
 use codex_projects::{mirror_latest_claw_session_to_codex, newest_codex_session};
-use http_bridge::{capitalize, start_webview_bridge_server, start_bridge_file_watcher, show_screenshot_flash};
+use http_bridge::{capitalize, start_webview_bridge_server};
+use codex_bridge::start_bridge_file_watcher;
+use screenshot_flash::show_screenshot_flash;
 use ollama::ollama_tags;
 
 // ---------------------------------------------------------------------------
