@@ -1088,10 +1088,10 @@ pub(crate) fn send_signal(pid: u32, force: bool) -> std::io::Result<()> {
     }
     let status = cmd.status()?;
     if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("taskkill failed with {}", status),
-        ));
+        return Err(std::io::Error::other(format!(
+            "taskkill failed with {}",
+            status
+        )));
     }
     Ok(())
 }
@@ -1286,8 +1286,10 @@ mod tests {
         assert!(result.is_ok());
         let found = result.unwrap();
         // venv/ comes first in the candidate list
+        let found_path = PathBuf::from(&found);
         assert!(
-            found.contains("/venv/") && !found.contains("/.venv/"),
+            found_path.starts_with(root.join("venv"))
+                && !found_path.starts_with(root.join(".venv")),
             "Expected venv/ to be preferred over .venv/, got: {}",
             found
         );

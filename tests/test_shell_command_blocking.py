@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -22,6 +23,11 @@ from mcp_server.tools.shell import (
     _sandbox_env,
     handle_run_command,
 )
+
+# Platform-aware test commands
+# Windows: 'echo %CD%' is a cmd.exe builtin that prints the cwd without any quoting issues.
+# POSIX:   'pwd' is the standard shell builtin.
+_CWD_CMD = "echo %CD%" if sys.platform == "win32" else "pwd"
 
 
 # ── Newline / CR injection bypass ─────────────────────────────────────────────
@@ -122,7 +128,7 @@ async def test_run_command_default_uses_requested_cwd():
     # which lets the requested cwd take effect (finding 2 regression fix).
     with patch("mcp_server.tools.shell.SHELL_SANDBOX_MODE", False):
         result = await handle_run_command({
-            "cmd": "pwd",
+            "cmd": _CWD_CMD,
             "cwd": str(PROJECT_ROOT),
             "timeout": 5,
         })
@@ -137,7 +143,7 @@ async def test_run_command_sandbox_ignores_requested_cwd(tmp_path):
     # default config value (finding 2: sandbox_mode arg is now ignored).
     with patch("mcp_server.tools.shell.SHELL_SANDBOX_MODE", True):
         result = await handle_run_command({
-            "cmd": "pwd",
+            "cmd": _CWD_CMD,
             "cwd": str(tmp_path),
             "timeout": 5,
         })
@@ -152,7 +158,7 @@ async def test_run_command_sandbox_does_not_write_into_requested_cwd(tmp_path):
     target = tmp_path / "sandbox-leak-check.txt"
     with patch("mcp_server.tools.shell.SHELL_SANDBOX_MODE", True):
         result = await handle_run_command({
-            "cmd": f"printf probe > {target.name}",
+            "cmd": f"printf probe > {target.name}" if sys.platform != "win32" else f"cmd /c echo probe > {target.name}",
             "cwd": str(tmp_path),
             "timeout": 5,
         })
@@ -162,8 +168,15 @@ async def test_run_command_sandbox_does_not_write_into_requested_cwd(tmp_path):
 
 def test_sandbox_env_uses_restricted_path():
     env = _sandbox_env()
-    assert env["PATH"] == _SANDBOX_PATH
-    assert os.getcwd() not in env["PATH"]
+    # On Windows the sandbox env uses "Path" (mixed-case) instead of "PATH".
+    path_val = env.get("PATH") or env.get("Path") or env.get("path")
+    if sys.platform == "win32":
+        # Windows sandbox uses "Path"; just assert it is set and restricted
+        assert path_val is not None
+        assert os.getcwd() not in (path_val or "")
+    else:
+        assert env["PATH"] == _SANDBOX_PATH
+        assert os.getcwd() not in env["PATH"]
 
 
 def test_shell_sandbox_env_override_enables_mode(monkeypatch):

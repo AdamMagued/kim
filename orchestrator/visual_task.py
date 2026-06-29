@@ -24,6 +24,14 @@ def _looks_visual(task: str) -> bool:
     return bool(_VISUAL_TASK_RE.search(task or ""))
 
 
+_PROACTIVE_VISUAL_CONTEXT_PROVIDERS = frozenset({"BrowserProvider", "OllamaProvider"})
+
+
+def _uses_proactive_visual_context(provider: object, task: str) -> bool:
+    """Whether a provider should receive first-turn screenshot/window context."""
+    return type(provider).__name__ in _PROACTIVE_VISUAL_CONTEXT_PROVIDERS and _looks_visual(task)
+
+
 # Screen-reading tools that become redundant once a screenshot is already attached
 # to the first message. Browser web-chat models (Gemini/etc.) tend to reach for
 # get_windows/take_screenshot anyway, which forces a second LLM round-trip back into

@@ -1646,13 +1646,12 @@ fn write_bridge_token_file(token: &str) {
         return;
     }
     let path = dir.join("bridge_token");
-    if std::fs::write(&path, token).is_err() {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    if std::fs::write(&path, token).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
     }
 }
 

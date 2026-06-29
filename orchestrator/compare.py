@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -246,7 +247,7 @@ async def compare_providers(
         save_dir = root / "kim_comparisons"
 
     written_path: Optional[Path] = None
-    if str(save_dir) not in ("/dev/null", ""):
+    if str(save_dir) not in ("/dev/null", "", os.devnull):
         try:
             written_path = _save_comparison(comparison, save_dir)
             logger.info("compare_providers: saved to %s", written_path)

@@ -222,7 +222,11 @@ class OllamaProvider(BaseProvider):
                 if had_image:
                     new_content.append({
                         "type": "text",
-                        "text": "[Screenshot captured but this model does not support vision. Use observe_ui or run_command to get UI context instead.]",  # noqa: E501
+                        "text": (
+                            "[Screenshot unavailable: this model does not support vision. "
+                            "Answer from the open-window fallback in the task message and begin with "
+                            "\"I couldn't grab a screenshot, but you have these windows open:\".]"
+                        ),
                     })
                 cleaned.append({**msg, "content": new_content})
             else:

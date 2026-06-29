@@ -149,31 +149,6 @@ pub(crate) fn open_browser_signin_window_with_visibility(
     Ok("Opened in Kim browser window".to_string())
 }
 
-#[tauri::command]
-pub(crate) async fn add_custom_provider_capability(url: String, app_handle: tauri::AppHandle) -> Result<(), String> {
-    use tauri::Manager;
-    use tauri::ipc::CapabilityBuilder;
-
-    let parsed = tauri::Url::parse(&url).map_err(|e| e.to_string())?;
-    let origin = parsed.origin().ascii_serialization();
-    let capability_url = format!("{}/*", origin);
-
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default() // avoids panic if system clock is before epoch (#21)
-        .as_nanos();
-    let cap_id = format!("kim-custom-bridge-{}", nanos);
-
-    let cap = CapabilityBuilder::new(cap_id)
-        .remote(capability_url)
-        .window("kim-browser-signin")
-        .permission("core:default")
-        .permission("core:event:allow-emit");
-
-    app_handle.add_capability(cap).map_err(|e| format!("Failed to add runtime capability: {}", e))?;
-    Ok(())
-}
-
 /// Handle an IPC event from the persistent JS bridge.
 /// Inserts results into the shared store and wakes up any waiting collector.
 pub(crate) fn clean_bridge_progress_text(text: &str) -> Option<String> {

@@ -71,19 +71,16 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2 (#59)
         with:
-          workspaces: ./desktop/src-tauri -> target
+          workspaces: . -> target
 
       - name: cargo check
-        working-directory: desktop/src-tauri
-        run: cargo check
+        run: cargo check -p desktop
 
       - name: cargo clippy
-        working-directory: desktop/src-tauri
-        run: cargo clippy -- -D warnings
+        run: cargo clippy -p desktop -- -D warnings
 
       - name: cargo test
-        working-directory: desktop/src-tauri
-        run: cargo test
+        run: cargo test -p desktop
 
   # ── Rust CLI: fmt + check + test (no Tauri/WebKit deps) ──────────────────
   rust-cli:
@@ -101,16 +98,16 @@ jobs:
       - name: Rust cache (cli)
         uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2 (#59)
         with:
-          workspaces: ./cli -> target
+          workspaces: . -> target
 
       - name: cargo fmt check
         run: cargo fmt --manifest-path cli/Cargo.toml -- --check
 
       - name: cargo check
-        run: cargo check --manifest-path cli/Cargo.toml
+        run: cargo check -p kim-cli
 
       - name: cargo test
-        run: cargo test --manifest-path cli/Cargo.toml -- --test-threads=1
+        run: cargo test -p kim-cli -- --test-threads=1
 
   # ── Python: lint + pytest ──────────────────────────────────────────────────
   python:

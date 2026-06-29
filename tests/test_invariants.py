@@ -196,6 +196,17 @@ class TestRelayFeatureFlag:
         )
 
 
+class TestVoiceFeatureFlag:
+    """Voice stays dormant until its agent runtime is deliberately restored."""
+
+    def test_voice_flag_defaults_to_false(self):
+        src = Path(__file__).parent.parent / "mcp_server/config.py"
+        content = src.read_text()
+        assert '_cfg.get("voice_enabled", False)' in content, (
+            "VOICE_ENABLED must default to False while the agent voice runtime is removed"
+        )
+
+
 # ---------------------------------------------------------------------------
 # 5. II-F OS notifications hook wiring invariants
 # ---------------------------------------------------------------------------

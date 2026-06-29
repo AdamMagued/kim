@@ -234,8 +234,10 @@ class TestCmdBuilderRuntime(unittest.IsolatedAsyncioTestCase):
         # _sent_system_prompt attr expected by run_codex_subtask
         provider._sent_system_prompt = False
 
-        # Use a real file so shutil.which / isabs path succeeds
-        fake_binary = "/usr/bin/true"  # always exists on macOS/Linux
+        # Use a real file so the binary-found check (os.path.exists) passes.
+        # sys.executable always exists on every platform (macOS/Linux/Windows).
+        import sys as _sys
+        fake_binary = _sys.executable
 
         base_env = dict(os.environ)
         base_env.pop("KIM_CODEX_BYPASS_SANDBOX", None)

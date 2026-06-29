@@ -541,7 +541,7 @@ end tell"#;
             .args(["/C", "start", "", "cmd", "/K", "ollama signin"])
             .spawn()
             .map_err(|e| e.to_string())?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {

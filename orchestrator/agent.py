@@ -523,13 +523,12 @@ class KimAgent:
         self._run_screenshot_b64: str = ""
         self._suppress_screen_tools_first_turn: bool = False
 
-        # Browser web-chat models (Gemini/Claude/ChatGPT web) can't reliably emit a
-        # take_screenshot tool call, so a visual question like "what's on my screen?"
-        # would be answered blind. Proactively capture the screen on the first turn
-        # and attach it to the task message so the model actually sees the desktop.
+        # Browser web-chat and Ollama models cannot always receive a screenshot for
+        # a visual question. Attach the real image when possible and include an honest
+        # open-window fallback for paths/models where the image cannot reach the model.
         first_content: Any = f"Task: {task}"   # what is shown in the chat bubble
         llm_first_content: Any = None          # what the model receives, when it differs
-        if type(self.provider).__name__ == "BrowserProvider" and _looks_visual(task):
+        if _uses_proactive_visual_context(self.provider, task):
             # Visual question on a browser web-chat model. Capture the screen and:
             #   1. attach it as an IMAGE so the bridge can paste it into the chat with a
             #      real Cmd+V (a trusted paste the editor accepts — the window must be
@@ -559,12 +558,19 @@ class KimAgent:
                     img_block = {"type": "image", "data": shot_b64, "media_type": "image/png"}
                 ctx = [f"Task: {task}"]
                 if shot_b64:
-                    ctx.append("\nA screenshot of my screen is attached — describe what you actually see in it.")
+                    ctx.append(
+                        "\nA screenshot of my screen is attached. If you can access the image, "
+                        "describe what you actually see in it."
+                    )
                 if windows_text:
                     ctx.append("\n[Fallback context — the open windows are:]\n" + windows_text)
                 ctx.append(
-                    "\nAnswer directly. Do NOT call get_windows, take_screenshot, or any other "
-                    "tool — reply with TASK_COMPLETE: <your answer>."
+                    "\nIf you cannot access the screenshot, or you received a note that this model "
+                    "does not support vision, answer only from the fallback window list and MUST begin "
+                    "with: I couldn't grab a screenshot, but you have these windows open:. If you can "
+                    "access the screenshot, describe the real image and do not use that disclaimer. "
+                    "Answer directly. Do NOT call get_windows, take_screenshot, or any other tool — "
+                    "reply with TASK_COMPLETE: <your answer>."
                 )
                 llm_text = "\n".join(ctx)
                 if img_block:
@@ -1836,7 +1842,12 @@ Rules:
 # ---------------------------------------------------------------------------
 # Visual-task detection (extracted to orchestrator/visual_task.py)
 # ---------------------------------------------------------------------------
-from orchestrator.visual_task import _VISUAL_TASK_RE, _looks_visual, _SCREEN_READ_TOOLS  # noqa: E402,F401
+from orchestrator.visual_task import (  # noqa: E402,F401
+    _SCREEN_READ_TOOLS,
+    _VISUAL_TASK_RE,
+    _looks_visual,
+    _uses_proactive_visual_context,
+)
 
 
 def _provider_accepts_kwarg(fn: Any, name: str) -> bool:

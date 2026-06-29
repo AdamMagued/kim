@@ -8,15 +8,7 @@ export const CONNECTORS: Connector[] = [
     initials: 'L',
     category: 'Productivity',
     desc: 'Read and update tickets, projects, and cycles.',
-    tools: 14,
-    scopes: ['read:issues', 'write:issues', 'read:projects'],
-    lastUsed: '12 min ago',
-    state: 'connected',
-    activity: [
-      { text: 'Updated KIM-218 → In Review', time: '12m' },
-      { text: 'Created KIM-241', time: '1h' },
-      { text: 'Fetched current cycle', time: '3h' },
-    ],
+    state: 'available',
   },
   {
     id: 'github',

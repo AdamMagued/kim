@@ -1,9 +1,8 @@
-//! Session listing, deletion, summarization, and message loading.
+//! Session listing, summarization, deletion, and message loading.
 //!
 //! Extracted from lib.rs (Phase 8 restructure).
-//! Public Tauri commands: `list_sessions`, `delete_sessions`,
-//! `delete_all_sessions`, `prune_sessions`,
-//! `summarize_session`, `load_session_messages`, `get_app_version`.
+//! Public Tauri commands include `list_sessions`, `delete_session`,
+//! `summarize_session`, `load_session_messages`, and `get_app_version`.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -28,80 +27,6 @@ pub async fn list_sessions(
     }
 
     Ok(sessions)
-}
-
-#[tauri::command]
-pub async fn delete_sessions(
-    session_ids: Vec<String>,
-    kim_dir: Option<String>,
-    codex_dir: Option<String>,
-) -> Result<(), String> {
-    let mut failures: Vec<String> = Vec::new();
-
-    for session_id in session_ids {
-        crate::validate_session_id(&session_id)?;
-
-        let mut deleted = false;
-        let mut had_hard_failure = false;
-
-        let dirs_to_search: Vec<PathBuf> = {
-            let mut v = vec![kim_dir
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(crate::default_sessions_dir)];
-            if let Some(codex_path) = &codex_dir {
-                v.push(PathBuf::from(codex_path));
-            }
-            v
-        };
-
-        for base in &dirs_to_search {
-            if !base.exists() {
-                continue;
-            }
-            if let Ok(entries) = std::fs::read_dir(base) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let date_dir = entry.path();
-                    if !date_dir.is_dir() {
-                        continue;
-                    }
-                    let jsonl_path = date_dir.join(format!("{}.jsonl", session_id));
-                    if jsonl_path.exists() {
-                        match std::fs::remove_file(&jsonl_path) {
-                            Err(e) => {
-                                had_hard_failure = true;
-                                failures.push(format!(
-                                    "Failed to delete session file {}: {}",
-                                    session_id, e
-                                ));
-                            }
-                            Ok(()) => {
-                                deleted = true;
-                                let summary_path = date_dir.join(format!("{}.summary.txt", session_id));
-                                if summary_path.exists() {
-                                    let _ = std::fs::remove_file(&summary_path);
-                                }
-                                let browser_meta_path = date_dir.join(crate::browser_session_meta_filename(&session_id));
-                                if browser_meta_path.exists() {
-                                    let _ = std::fs::remove_file(&browser_meta_path);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !deleted && !had_hard_failure {
-            failures.push(format!("Session {} not found for deletion.", session_id));
-        }
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures.join("; "))
-    }
 }
 
 #[tauri::command]
@@ -334,128 +259,6 @@ pub async fn load_session_messages(
     Err(format!("Session not found: {}", session_id))
 }
 
-/// Apply the retention policy: strip screenshots from sessions older than
-/// `screenshot_strip_age_days` and delete sessions older than `max_age_days`.
-/// Delegates to the Python SessionStore.prune_old_sessions via a subprocess call,
-/// so config and Python helper logic stay in one place.
-///
-/// Returns a JSON string: {"stripped": N, "deleted": N}.
-#[tauri::command]
-pub async fn prune_sessions(
-    max_age_days: Option<u32>,
-    screenshot_strip_age_days: Option<u32>,
-) -> Result<String, String> {
-    use tokio::process::Command;
-    let kim_root = crate::default_project_root();
-    let python = crate::find_python_interpreter(&kim_root)?;
-
-    let max_days = max_age_days.unwrap_or(30);
-    let strip_days = screenshot_strip_age_days.unwrap_or(2);
-
-    // D5: pass root/args via argv, never interpolated into the source — a path
-    // containing a quote or backslash would otherwise break (or inject) the script.
-    let script = r#"
-import json, sys
-sys.path.insert(0, sys.argv[1])
-from orchestrator.session_store import SessionStore
-result = SessionStore.prune_old_sessions(
-    max_age_days=int(sys.argv[2]),
-    screenshot_strip_age_days=int(sys.argv[3]),
-)
-print(json.dumps(result))
-"#;
-
-    let output = Command::new(&python)
-        .arg("-c")
-        .arg(script)
-        .arg(kim_root.as_os_str())
-        .arg(max_days.to_string())
-        .arg(strip_days.to_string())
-        .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
-        .output()
-        .await
-        .map_err(|e| format!("Failed to spawn Python for prune: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("prune_sessions failed: {stderr}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    // Validate it's JSON before returning
-    serde_json::from_str::<serde_json::Value>(&stdout)
-        .map_err(|e| format!("Unexpected prune output: {e}"))?;
-    Ok(stdout)
-}
-
-fn validate_run_id(run_id: &str) -> Result<(), String> {
-    if run_id.is_empty() {
-        return Err("run_id is empty".to_string());
-    }
-    if run_id.len() > 200 {
-        return Err("run_id is too long".to_string());
-    }
-    if !run_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err("run_id contains illegal characters".to_string());
-    }
-    Ok(())
-}
-
-/// K1: restore a run's pre-images. Shells the Python checkpoints helper, passing
-/// the run id via argv (never interpolated into source — see D5).
-#[tauri::command]
-pub async fn revert_run(run_id: String) -> Result<String, String> {
-    use tokio::process::Command;
-    validate_run_id(&run_id)?;
-    let kim_root = crate::default_project_root();
-    let python = crate::find_python_interpreter(&kim_root)?;
-    let script = r#"
-import json, sys
-sys.path.insert(0, sys.argv[1])
-from mcp_server.checkpoints import revert_run
-print(json.dumps(revert_run(sys.argv[2])))
-"#;
-    let output = Command::new(&python)
-        .arg("-c")
-        .arg(script)
-        .arg(kim_root.as_os_str())
-        .arg(&run_id)
-        .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
-        .output()
-        .await
-        .map_err(|e| format!("Failed to spawn Python for revert: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "revert_run failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    serde_json::from_str::<serde_json::Value>(&stdout)
-        .map_err(|e| format!("Unexpected revert output: {e}"))?;
-    Ok(stdout)
-}
-
-/// K1: does a checkpoint exist for this run id?
-#[tauri::command]
-pub fn has_checkpoint(run_id: String) -> bool {
-    if validate_run_id(&run_id).is_err() {
-        return false;
-    }
-    dirs::home_dir()
-        .map(|h| {
-            h.join(".kim")
-                .join("checkpoints")
-                .join(&run_id)
-                .join("manifest.jsonl")
-                .exists()
-        })
-        .unwrap_or(false)
-}
-
 /// K9: toggle the privacy-pause sentinel (`~/.kim/privacy_pause`). While present,
 /// the MCP server's screen-capture tools refuse to run.
 #[tauri::command]
@@ -546,64 +349,11 @@ pub(crate) fn read_session_meta(date_dir: &Path, session_id: &str) -> (Option<St
     (title, pinned)
 }
 
-fn write_session_meta(
-    date_dir: &Path,
-    session_id: &str,
-    set_title: Option<String>,
-    set_pinned: Option<bool>,
-) -> Result<(), String> {
-    let (cur_title, cur_pinned) = read_session_meta(date_dir, session_id);
-    let title = set_title.or(cur_title);
-    let pinned = set_pinned.unwrap_or(cur_pinned);
-    let mut obj = serde_json::Map::new();
-    if let Some(t) = title {
-        obj.insert("title".into(), serde_json::Value::String(t));
-    }
-    obj.insert("pinned".into(), serde_json::Value::Bool(pinned));
-    fs::create_dir_all(date_dir).map_err(|e| e.to_string())?;
-    let dest = date_dir.join(format!("{session_id}.meta.json"));
-    // Atomic write: write to a sibling tmp file then rename so concurrent
-    // readers never see a partial file.
-    let tmp = date_dir.join(format!("{session_id}.meta.json.tmp"));
-    fs::write(&tmp, serde_json::Value::Object(obj).to_string())
-        .map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &dest).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        e.to_string()
-    })
-}
-
 fn base_dir(kim_dir: &Option<String>) -> PathBuf {
     kim_dir
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(crate::default_sessions_dir)
-}
-
-#[tauri::command]
-pub fn rename_session(
-    session_id: String,
-    date: String,
-    title: String,
-    kim_dir: Option<String>,
-) -> Result<(), String> {
-    crate::validate_session_id(&session_id)?;
-    crate::validate_session_id(&date)?;
-    let date_dir = base_dir(&kim_dir).join(&date);
-    write_session_meta(&date_dir, &session_id, Some(title), None)
-}
-
-#[tauri::command]
-pub fn set_session_pinned(
-    session_id: String,
-    date: String,
-    pinned: bool,
-    kim_dir: Option<String>,
-) -> Result<(), String> {
-    crate::validate_session_id(&session_id)?;
-    crate::validate_session_id(&date)?;
-    let date_dir = base_dir(&kim_dir).join(&date);
-    write_session_meta(&date_dir, &session_id, None, Some(pinned))
 }
 
 /// Remove a session's JSONL + summary + meta + browser-meta + all sidecar files.
@@ -660,78 +410,6 @@ pub fn delete_session(
     Ok(n)
 }
 
-#[derive(serde::Serialize)]
-pub struct SearchHit {
-    pub session_id: String,
-    pub date: String,
-    pub title: String,
-    pub snippet: String,
-}
-
-/// Grep title + message content across a sessions base dir. Caps results and
-/// wall-clock so the sidebar stays responsive on large histories.
-pub(crate) fn search_in_dir(base: &Path, query: &str, cap: usize, budget_ms: u128) -> Vec<SearchHit> {
-    let q = query.trim().to_lowercase();
-    let mut hits = Vec::new();
-    if q.is_empty() || !base.exists() {
-        return hits;
-    }
-    let start = std::time::Instant::now();
-    let Ok(date_dirs) = fs::read_dir(base) else {
-        return hits;
-    };
-    let mut dirs: Vec<PathBuf> = date_dirs
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name())); // newest first
-    for date_dir in dirs {
-        let date = date_dir.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let Ok(files) = fs::read_dir(&date_dir) else { continue };
-        for entry in files.filter_map(|e| e.ok()) {
-            if hits.len() >= cap || start.elapsed().as_millis() > budget_ms {
-                return hits;
-            }
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            if !name.ends_with(".jsonl") || name.contains(".summary") {
-                continue;
-            }
-            let session_id = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-            let (meta_title, _) = read_session_meta(&date_dir, &session_id);
-            let title = meta_title.unwrap_or_else(|| session_id.clone());
-            let content = fs::read_to_string(&path).unwrap_or_default();
-            let hay = format!("{}\n{}", title, content).to_lowercase();
-            if let Some(idx) = hay.find(&q) {
-                let snippet_src = if title.to_lowercase().contains(&q) { &title } else { &content };
-                let snippet = make_snippet(snippet_src, &q).unwrap_or_else(|| {
-                    let s = hay.get(idx..(idx + 60).min(hay.len())).unwrap_or("");
-                    s.to_string()
-                });
-                hits.push(SearchHit { session_id, date: date.clone(), title, snippet });
-            }
-        }
-    }
-    hits
-}
-
-fn make_snippet(text: &str, q: &str) -> Option<String> {
-    let lower = text.to_lowercase();
-    let idx = lower.find(q)?;
-    let start = idx.saturating_sub(30);
-    let end = (idx + q.len() + 30).min(text.len());
-    // snap to char boundaries
-    let start = (0..=start).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
-    let end = (end..=text.len()).find(|i| text.is_char_boundary(*i)).unwrap_or(text.len());
-    Some(text[start..end].replace('\n', " ").trim().to_string())
-}
-
-#[tauri::command]
-pub fn search_sessions(query: String, kim_dir: Option<String>) -> Result<Vec<SearchHit>, String> {
-    Ok(search_in_dir(&base_dir(&kim_dir), &query, 50, 200))
-}
-
 #[cfg(test)]
 mod k4_tests {
     use super::*;
@@ -753,52 +431,16 @@ mod k4_tests {
         let id = "sess1";
         fs::write(date_dir.join(format!("{id}.jsonl")), "{}").unwrap();
         fs::write(date_dir.join(format!("{id}.summary.txt")), "s").unwrap();
-        write_session_meta(&date_dir, id, Some("Title".into()), Some(true)).unwrap();
+        fs::write(
+            date_dir.join(format!("{id}.meta.json")),
+            r#"{"title":"Title","pinned":true}"#,
+        )
+        .unwrap();
         let n = delete_session_files(&date_dir, id);
         assert_eq!(n, 3);
         assert!(!date_dir.join(format!("{id}.jsonl")).exists());
         assert!(!date_dir.join(format!("{id}.meta.json")).exists());
         let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn search_matches_title_and_body_and_caps() {
-        let base = tmp();
-        let date_dir = base.join("2026-06-18");
-        fs::create_dir_all(&date_dir).unwrap();
-        // body match
-        fs::write(date_dir.join("a.jsonl"), r#"{"role":"user","content":"fix the login bug"}"#).unwrap();
-        // title match (via meta)
-        fs::write(date_dir.join("b.jsonl"), "{}").unwrap();
-        write_session_meta(&date_dir, "b", Some("Login redesign".into()), None).unwrap();
-        // no match
-        fs::write(date_dir.join("c.jsonl"), r#"{"role":"user","content":"weather report"}"#).unwrap();
-
-        let hits = search_in_dir(&base, "login", 50, 1000);
-        let ids: Vec<_> = hits.iter().map(|h| h.session_id.as_str()).collect();
-        assert!(ids.contains(&"a"));
-        assert!(ids.contains(&"b"));
-        assert!(!ids.contains(&"c"));
-
-        // cap respected
-        let capped = search_in_dir(&base, "login", 1, 1000);
-        assert_eq!(capped.len(), 1);
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn empty_query_returns_nothing() {
-        let base = tmp();
-        assert!(search_in_dir(&base, "  ", 50, 1000).is_empty());
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn run_id_validation_rejects_path_segments() {
-        assert!(validate_run_id("session-123_456").is_ok());
-        assert!(validate_run_id("../session-123").is_err());
-        assert!(validate_run_id("nested/session").is_err());
-        assert!(validate_run_id("").is_err());
     }
 
     // ── Regression guards for delete_session_files (context.json / runs.json /

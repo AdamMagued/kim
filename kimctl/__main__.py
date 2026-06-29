@@ -761,7 +761,7 @@ def cmd_compare(args):
     no_save = getattr(args, "no_save", False)
     save_dir_arg = getattr(args, "save_dir", None)
     if no_save:
-        save_dir = Path("/dev/null")
+        save_dir = Path(os.devnull)
     elif save_dir_arg:
         save_dir = Path(save_dir_arg)
     else:

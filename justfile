@@ -16,7 +16,7 @@ check:
     TSC_PID=$!
 
     echo "=== Rust ==="
-    (cd desktop/src-tauri && cargo check 2>&1) &
+    (cargo check -p desktop 2>&1) &
     CARGO_PID=$!
 
     echo "=== Python (fast) ==="
@@ -54,10 +54,11 @@ test:
     python -m pytest tests/ -q --tb=short
     echo "=== TypeScript ==="
     cd desktop && npm run test && npx tsc --noEmit
+    cd ..
     echo "=== Rust ==="
-    cd src-tauri && cargo test
+    cargo test -p desktop
     echo "=== CLI Rust ==="
-    cd ../../cli && cargo test -- --test-threads=1
+    cargo test -p kim-cli -- --test-threads=1
 
 # Web automation evals only
 test-web:

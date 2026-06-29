@@ -1476,15 +1476,18 @@ pub(crate) fn split_shellish_tokens(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quote = None;
-    let mut escaped = false;
-    for ch in input.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
         if ch == '\\' {
-            escaped = true;
+            if chars
+                .peek()
+                .is_some_and(|next| next.is_whitespace() || matches!(*next, '\'' | '"'))
+            {
+                current.push(chars.next().expect("peeked character must exist"));
+            } else {
+                // Preserve Windows path separators (for example C:\\Users).
+                current.push(ch);
+            }
             continue;
         }
         if quote == Some(ch) {
@@ -1502,9 +1505,6 @@ pub(crate) fn split_shellish_tokens(input: &str) -> Vec<String> {
             continue;
         }
         current.push(ch);
-    }
-    if escaped {
-        current.push('\\');
     }
     if !current.is_empty() {
         tokens.push(current);

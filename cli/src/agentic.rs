@@ -396,8 +396,7 @@ mod tests {
         #[cfg(windows)]
         let venv_python = root.join("venv").join("Scripts").join("python.exe");
 
-        std::fs::create_dir_all(venv_python.parent().unwrap())
-            .expect("create venv bin dir");
+        std::fs::create_dir_all(venv_python.parent().unwrap()).expect("create venv bin dir");
         std::fs::write(&venv_python, b"#!/bin/sh\nexec python3 \"$@\"\n")
             .expect("write stub python");
 

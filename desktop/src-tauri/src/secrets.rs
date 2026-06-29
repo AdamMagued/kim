@@ -5,8 +5,7 @@
 //!   Windows — Credential Manager
 //!   Linux  — Secret Service (libsecret) / kernel keystore
 //!
-//! Public Tauri commands: `store_github_token`, `get_github_token`,
-//! `delete_github_token`.
+//! Public Tauri commands: `store_github_token`, `delete_github_token`.
 //! Internal helper: `load_token_from_keychain` (called by `account::load_account`
 //! to hydrate the in-memory struct without exposing the keychain to the frontend
 //! via an extra round-trip).
@@ -24,17 +23,6 @@ fn entry() -> Result<Entry, String> {
 #[tauri::command]
 pub async fn store_github_token(token: String) -> Result<(), String> {
     entry()?.set_password(&token).map_err(|e| e.to_string())
-}
-
-/// Retrieve the GitHub PAT from the OS keychain.
-/// Returns `None` when no entry has been stored yet.
-#[tauri::command]
-pub async fn get_github_token() -> Result<Option<String>, String> {
-    match entry()?.get_password() {
-        Ok(t) => Ok(Some(t)),
-        Err(KeyringError::NoEntry) => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
 }
 
 /// Delete the GitHub PAT from the OS keychain (idempotent: no error if absent).

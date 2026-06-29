@@ -1,16 +1,6 @@
 use tauri::Manager;
 
 #[tauri::command]
-pub(crate) async fn hide_main_window(app_handle: tauri::AppHandle) -> Result<(), String> {
-    // Hide only the "main" window so the screenshot-flash overlay stays visible.
-    // app_handle.hide() would hide every window including the flash overlay.
-    if let Some(win) = app_handle.get_webview_window("main") {
-        let _ = win.hide();
-    }
-    Ok(())
-}
-
-#[tauri::command]
 pub(crate) async fn show_main_window(app_handle: tauri::AppHandle) -> Result<(), String> {
     if let Some(win) = app_handle.get_webview_window("main") {
         let _ = win.show();

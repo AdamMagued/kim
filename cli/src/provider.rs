@@ -348,9 +348,9 @@ async fn stream_via_bridge(
                             .to_string();
                         match poll_bridge_session_answer(&sessions_dir, session_id, &tx).await {
                             Some((answer, _success)) if !answer.trim().is_empty() => {
-                                let _ = tx.send(AppEvent::TextChunk(crate::markdown::render_markdown(
-                                    answer.trim(),
-                                )));
+                                let _ = tx.send(AppEvent::TextChunk(
+                                    crate::markdown::render_markdown(answer.trim()),
+                                ));
                             }
                             Some(_) => {
                                 let _ = tx.send(AppEvent::Err(
@@ -403,7 +403,9 @@ async fn poll_bridge_session_answer(
             return None;
         }
         if last_beat.elapsed() >= Duration::from_secs(5) {
-            let _ = tx.send(AppEvent::ThoughtChunk("Kim desktop is working…".to_string()));
+            let _ = tx.send(AppEvent::ThoughtChunk(
+                "Kim desktop is working…".to_string(),
+            ));
             last_beat = Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -931,7 +933,8 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
             None => {
                 let _ = tx.send(AppEvent::Err(
                     "No Python interpreter found (tried venv, python3, python). \
-                     Install Python 3 and retry.".to_string(),
+                     Install Python 3 and retry."
+                        .to_string(),
                 ));
                 return;
             }
@@ -970,10 +973,7 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
         };
         // Use an exclusive randomized temp dir so concurrent runs don't clobber
         // each other and the path is not pre-creatable by a local attacker (#23).
-        let kim_codex_dir = match tempfile::Builder::new()
-            .prefix("kim_codex_")
-            .tempdir()
-        {
+        let kim_codex_dir = match tempfile::Builder::new().prefix("kim_codex_").tempdir() {
             Ok(d) => d,
             Err(e) => {
                 let _ = tx.send(AppEvent::Err(format!(
@@ -992,8 +992,7 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
         // Gate the sandbox-bypass flag behind an explicit opt-in env var (#1).
         // Passing it unconditionally disabled the Codex approval gate for every
         // CLI user, even those who didn't need it.
-        let bypass_sandbox =
-            std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1");
+        let bypass_sandbox = std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1");
         let cwd_str = cwd.to_string_lossy().into_owned();
         let codex_args = build_codex_args(prompt, &cwd_str, bypass_sandbox);
         match Command::new("codex")
@@ -1050,7 +1049,9 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
                 "codex produced no output. Check that ollama is running and the model name is correct.".to_string(),
             ));
         } else if !exit_ok {
-            let _ = tx.send(AppEvent::Err("codex exited with a non-zero status.".to_string()));
+            let _ = tx.send(AppEvent::Err(
+                "codex exited with a non-zero status.".to_string(),
+            ));
         }
         return;
     }
@@ -1269,7 +1270,11 @@ fn build_codex_args(prompt: &str, cwd: &str, bypass: bool) -> Vec<String> {
     args
 }
 
-fn write_codex_config(proxy_port: u16, model: &str, codex_home: &std::path::Path) -> Result<(), String> {
+fn write_codex_config(
+    proxy_port: u16,
+    model: &str,
+    codex_home: &std::path::Path,
+) -> Result<(), String> {
     std::fs::create_dir_all(codex_home)
         .map_err(|e| format!("Cannot create kim codex home {}: {e}", codex_home.display()))?;
     let config_path = codex_home.join("config.toml");
@@ -1860,7 +1865,11 @@ mod tests {
         // argv must end: -C <cwd> <prompt>
         let n = no_bypass.len();
         assert!(n >= 3, "expected at least 3 args; got {no_bypass:?}");
-        assert_eq!(&no_bypass[n - 3], "-C", "second-to-last pair must start with -C");
+        assert_eq!(
+            &no_bypass[n - 3],
+            "-C",
+            "second-to-last pair must start with -C"
+        );
         assert_eq!(&no_bypass[n - 2], cwd, "cwd must be the penultimate arg");
         assert_eq!(&no_bypass[n - 1], prompt, "prompt must be the last arg");
 
@@ -1937,10 +1946,7 @@ mod tests {
         // Case 1: file sitting directly under sessions_dir.
         let direct = sessions_dir.path().join(format!("{session_id}.jsonl"));
         std::fs::write(&direct, b"").unwrap();
-        let found = find_session_file(
-            sessions_dir.path().to_str().unwrap(),
-            session_id,
-        );
+        let found = find_session_file(sessions_dir.path().to_str().unwrap(), session_id);
         assert_eq!(
             found.as_deref(),
             Some(direct.as_path()),
@@ -1953,10 +1959,7 @@ mod tests {
         std::fs::create_dir_all(&date_dir).unwrap();
         let dated = date_dir.join(format!("{session_id}.jsonl"));
         std::fs::write(&dated, b"").unwrap();
-        let found = find_session_file(
-            sessions_dir.path().to_str().unwrap(),
-            session_id,
-        );
+        let found = find_session_file(sessions_dir.path().to_str().unwrap(), session_id);
         assert_eq!(
             found.as_deref(),
             Some(dated.as_path()),

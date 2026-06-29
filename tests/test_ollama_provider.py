@@ -182,6 +182,24 @@ gpt-oss:120b-cloud      abc123          73 GB     100% GPU     4 minutes from no
         )
         self.assertEqual(converted[0]["images"], ["img1", "img2"])
 
+    def test_text_only_fallback_is_honest_and_uses_window_context(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        cleaned = provider._strip_images_from_messages(
+            [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[Fallback context — the open windows are:]\nEditor"},
+                    {"type": "image", "data": "abc123", "media_type": "image/png"},
+                ],
+            }]
+        )
+
+        text = " ".join(item["text"] for item in cleaned[0]["content"])
+        self.assertIn("I couldn't grab a screenshot, but you have these windows open:", text)
+        self.assertIn("open-window fallback", text)
+        self.assertNotIn("observe_ui", text)
+        self.assertNotIn("run_command", text)
+
 
 class ToolResultMessageContractTests(unittest.TestCase):
     """Contract tests for _tool_result_message schema correctness.

@@ -88,8 +88,9 @@ def test_find_interpreter_prefers_venv_over_dot_venv(tmp_path):
         (d / "python").write_text("#!/bin/sh\n")
 
     result = find_interpreter(tmp_path)
-    assert "/.venv/" not in result
-    assert "/venv/" in result
+    # Use os.sep-agnostic checks so the test passes on Windows too
+    assert os.path.sep + ".venv" + os.path.sep not in result
+    assert os.path.sep + "venv" + os.path.sep in result.replace("\\", "/").replace("/", os.path.sep) or "venv" in Path(result).parts
 
 
 def test_find_interpreter_dot_venv_fallback(tmp_path):

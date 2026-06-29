@@ -79,9 +79,7 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2 (#59)
         with:
-          workspaces: |
-            ./desktop/src-tauri -> target
-            ./cli -> target
+          workspaces: . -> target
 
       # ── Linux system libs (WebKit2GTK + friends) ─────────────────────────
       - name: Install Linux system deps
@@ -238,14 +236,14 @@ jobs:
           if [[ -n "${{ matrix.rust-target }}" ]]; then
             EXTRA="--target ${{ matrix.rust-target }}"
           fi
-          cargo build --manifest-path cli/Cargo.toml --release $EXTRA
+          cargo build -p kim-cli --release $EXTRA
 
       - name: Stage KimCLI binary
         id: cli-stage
         shell: bash
         run: |
           mkdir -p cli-dist
-          SRC="cli/${{ matrix.cli-target-dir }}/${{ matrix.cli-bin }}"
+          SRC="${{ matrix.cli-target-dir }}/${{ matrix.cli-bin }}"
           DEST="cli-dist/${{ steps.cli-asset.outputs.filename }}"
           cp "${SRC}" "${DEST}"
           echo "path=${DEST}" >> "$GITHUB_OUTPUT"

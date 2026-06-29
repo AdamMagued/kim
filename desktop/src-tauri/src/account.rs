@@ -11,11 +11,6 @@ use serde::{Deserialize, Serialize};
 
 /// Guards `save_account` against concurrent full-overwrites.
 ///
-/// Note: `codex_projects.rs` has its own `ACCOUNT_FILE_LOCK` for its
-/// `add_code_project` / `remove_code_project` paths.  The two locks are
-/// independent, so cross-module lost-updates are theoretically possible.
-/// In practice those paths don't overlap (save_account is triggered by the
-/// settings UI; add/remove_code_project is triggered by the Code-tab picker).
 /// The atomic tmp+rename below makes every individual write crash-safe
 /// regardless of lock ordering.
 static ACCOUNT_SAVE_LOCK: StdMutex<()> = StdMutex::new(());

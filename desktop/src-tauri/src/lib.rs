@@ -687,82 +687,8 @@ async fn show_browser_window(app_handle: tauri::AppHandle) -> Result<(), String>
 }
 
 pub(crate) mod window_manager;
-pub(crate) use window_manager::{hide_main_window, show_main_window, set_task_active_mode};
+pub(crate) use window_manager::{show_main_window, set_task_active_mode};
 pub(crate) mod updater;
-
-#[tauri::command]
-async fn hide_browser_window(app_handle: tauri::AppHandle) -> Result<(), String> {
-    let label = "kim-browser-signin";
-    if let Some(win) = app_handle.get_webview_window(label) {
-        hide_browser_window_offscreen(&win);
-
-        // Refocus the main app window.
-        if let Some(main_win) = app_handle.get_webview_window("main") {
-            let _ = main_win.show();
-            let _ = main_win.set_focus();
-        }
-        let _ = app_handle.emit("kim-browser-hidden", true);
-        Ok(())
-    } else {
-        Ok(())
-    }
-}
-
-#[tauri::command]
-async fn set_browser_keep_visible(keep_visible: bool, app_handle: tauri::AppHandle) -> Result<(), String> {
-    if let Ok(mut guard) = WEBVIEW_KEEP_VISIBLE.get_or_init(|| StdMutex::new(false)).lock() {
-        *guard = keep_visible;
-    }
-
-    if keep_visible && app_handle.get_webview_window("kim-browser-signin").is_some() {
-        show_browser_window_impl(&app_handle);
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn navigate_browser_window_if_open(url: String, app_handle: tauri::AppHandle) -> Result<bool, String> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return Err("URL cannot be empty.".to_string());
-    }
-    if browser_url_site(trimmed).is_none() {
-        return Err("Refusing to navigate the provider browser to a non-provider URL.".to_string());
-    }
-
-    if let Some(existing) = app_handle.get_webview_window("kim-browser-signin") {
-        let task_running = is_bridge_task_running();
-
-        if task_running {
-            return Err(
-                "Cannot navigate the provider browser while Kim is running a task; this would lose LLM context."
-                    .to_string(),
-            );
-        }
-
-        let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
-        let _ = existing.eval(format!("window.location.href = {};", js_url));
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-
-#[tauri::command]
-async fn get_browser_current_url(app_handle: tauri::AppHandle) -> Result<Option<String>, String> {
-    if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
-        let url = webview_current_href(&win);
-        if url.trim().is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(url))
-        }
-    } else {
-        Ok(None)
-    }
-}
 
 #[tauri::command]
 async fn session_browser_meta_read(
@@ -1256,8 +1182,6 @@ pub fn run() {
         .manage(config)
         .invoke_handler(tauri::generate_handler![
             session_commands::list_sessions,
-            session_commands::delete_sessions,
-            session_commands::prune_sessions,
             session_commands::load_session_messages,
             session_commands::summarize_session,
             run_history::save_run_history,
@@ -1266,29 +1190,18 @@ pub fn run() {
             session_commands::reveal_logs,
             session_commands::set_privacy_pause,
             session_commands::get_privacy_pause,
-            session_commands::revert_run,
-            session_commands::has_checkpoint,
-            session_commands::rename_session,
-            session_commands::set_session_pinned,
             session_commands::delete_session,
-            session_commands::search_sessions,
             run_history::get_platform_info,
             run_history::run_update,
-            browser_bridge::add_custom_provider_capability,
             browser_bridge::open_browser_signin_window,
-            navigate_browser_window_if_open,
-            get_browser_current_url,
             session_browser_meta_read,
             session_browser_meta_write,
             session_browser_url_commit,
             restore_browser_for_session,
             show_browser_window,
-            hide_browser_window,
-            set_browser_keep_visible,
             provider_auth::provider_check_auth,
             provider_auth::provider_signin,
             provider_auth::provider_signout,
-            hide_main_window,
             show_main_window,
             set_task_active_mode,
             send_task,
@@ -1305,14 +1218,12 @@ pub fn run() {
             google_oauth::google_oauth_start,
             google_oauth::google_oauth_disconnect,
             google_oauth::google_oauth_test,
-            google_oauth::google_oauth_setup_free_tier_project,
             account::load_account,
             account::save_account,
             account::clear_account,
             account::reset_onboarding,
             account::delete_all_sessions,
             secrets::store_github_token,
-            secrets::get_github_token,
             secrets::delete_github_token,
             ollama::ollama_get_status,
             ollama::ollama_test_model,
@@ -1324,13 +1235,10 @@ pub fn run() {
             data_io::backup_to_gist,
             data_io::restore_from_gist,
             codex_projects::list_codex_projects,
-            codex_projects::add_code_project,
-            codex_projects::remove_code_project,
             codex_projects::open_in_finder,
             feedback::send_feedback,
             show_screenshot_flash,
             feedback::save_attachment,
-            feedback::region_screenshot,
             schedule_commands::list_scheduled_tasks,
             schedule_commands::add_scheduled_task,
             schedule_commands::update_scheduled_task,

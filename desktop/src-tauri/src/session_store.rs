@@ -65,6 +65,7 @@ pub(crate) fn write_browser_session_meta_to_dir(
         Err(e) => {
             #[cfg(target_os = "windows")]
             {
+                let _ = &e;
                 // Windows rename does not overwrite existing files. Fall back to
                 // remove+rename; this is not perfectly atomic, but still avoids
                 // exposing a partially-written JSON file.

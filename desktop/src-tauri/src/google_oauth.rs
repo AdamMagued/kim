@@ -312,60 +312,6 @@ async fn fetch_userinfo(access_token: &str) -> Result<UserInfoResponse, String> 
         .map_err(|e| format!("Could not parse Google account email: {e}"))
 }
 
-#[derive(Debug, Serialize)]
-struct CreateProjectRequest {
-    project_id: String,
-    name: String,
-}
-
-async fn create_gcp_project(access_token: &str, project_id: &str) -> Result<(), String> {
-    // https://cloud.google.com/resource-manager/reference/rest/v1/projects/create
-    let body = CreateProjectRequest {
-        project_id: project_id.to_string(),
-        name: "Kim Gemini".to_string(),
-    };
-    let client = Client::new();
-    let resp = client
-        .post("https://cloudresourcemanager.googleapis.com/v1/projects")
-        .bearer_auth(access_token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to create GCP project: {e}"))?;
-    
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_else(|_| "unknown error".to_string());
-        Err(format!("Failed to create GCP project (HTTP {status}): {body}"))
-    }
-}
-
-async fn enable_gemini_api(access_token: &str, project_id: &str) -> Result<(), String> {
-    // https://cloud.google.com/service-usage/docs/reference/rest/v1/services/enable
-    let url = format!(
-        "https://serviceusage.googleapis.com/v1/projects/{}/services/generativelanguage.googleapis.com:enable",
-        project_id
-    );
-    let client = Client::new();
-    let resp = client
-        .post(&url)
-        .bearer_auth(access_token)
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to enable Gemini API: {e}"))?;
-    
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_else(|_| "unknown error".to_string());
-        Err(format!("Failed to enable Gemini API (HTTP {status}): {body}"))
-    }
-}
-
 pub async fn google_oauth_env_for_agent() -> Result<AgentGoogleOAuthEnv, String> {
     let secret = read_secret()?.ok_or_else(|| "Google for Kim is not connected.".to_string())?;
     let refreshed = refresh_access_token(&secret).await?;
@@ -483,46 +429,3 @@ pub async fn google_oauth_test() -> Result<GoogleOAuthStatus, String> {
     })
 }
 
-#[tauri::command]
-pub async fn google_oauth_setup_free_tier_project() -> Result<GoogleOAuthStatus, String> {
-    let mut secret = read_secret()?.ok_or_else(|| "Google for Kim is not connected.".to_string())?;
-    
-    // If already has a project, skip creation
-    if secret.project_id.is_some() {
-        return Ok(GoogleOAuthStatus {
-            connected: true,
-            email: secret.email.clone(),
-            expires_at: None,
-            project_id: secret.project_id.clone(),
-            needs_reauth: false,
-            error: None,
-        });
-    }
-    
-    // Generate a new project ID
-    let random_suffix = random_string(6).to_lowercase();
-    let project_id = format!("kim-gemini-{}", random_suffix);
-    
-    // Refresh token to get a fresh access token
-    let token_resp = refresh_access_token(&secret).await?;
-    let access_token = &token_resp.access_token;
-    
-    // Create the GCP project
-    create_gcp_project(access_token, &project_id).await?;
-    
-    // Enable Gemini API on the project
-    enable_gemini_api(access_token, &project_id).await?;
-    
-    // Update secret with the project ID
-    secret.project_id = Some(project_id.clone());
-    write_secret(&secret)?;
-    
-    Ok(GoogleOAuthStatus {
-        connected: true,
-        email: secret.email,
-        expires_at: None,
-        project_id: Some(project_id),
-        needs_reauth: false,
-        error: None,
-    })
-}

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -305,10 +306,10 @@ async def test_compare_skip_save_with_devnull(tmp_path):
         task="task",
         providers=["ollama"],
         config={},
-        save_dir=Path("/dev/null"),
+        save_dir=Path(os.devnull),
         _session_factory=factory,
     )
-    # /dev/null path → no file created (save suppressed) and saved_path is None
+    # os.devnull path → no file created (save suppressed) and saved_path is None
     assert len(results) == 1
     assert saved_path is None
 

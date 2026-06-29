@@ -92,13 +92,20 @@ main() {
   local root
   root="$(resolve_source_root)"
   local cli_dir="${root}/cli"
+  local target_dir
+  target_dir="$(cargo metadata --format-version 1 --manifest-path "${root}/Cargo.toml" --no-deps \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+  if [[ -z "${target_dir}" ]]; then
+    say "Could not resolve the Cargo workspace target directory."
+    exit 1
+  fi
 
   say "Building Kim CLI from ${cli_dir}"
-  cargo build --manifest-path "${cli_dir}/Cargo.toml" --release
+  cargo build --manifest-path "${root}/Cargo.toml" -p kim-cli --release
 
   say "Installing kim -> ${KIM_BIN_DIR}/kim"
   mkdir -p "${KIM_BIN_DIR}"
-  cp "${cli_dir}/target/release/kim" "${KIM_BIN_DIR}/kim"
+  cp "${target_dir}/release/kim" "${KIM_BIN_DIR}/kim"
   chmod +x "${KIM_BIN_DIR}/kim"
 
   mkdir -p "${HOME}/.kim"
