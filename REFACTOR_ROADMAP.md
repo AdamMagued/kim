@@ -3,6 +3,11 @@
 Status as of branch `audit-fixes`. The bug-fix campaign and the **gate-verifiable** refactors
 (god-file splits of `agent.py`, `lib.rs`, `http_bridge.rs`; pyright cleanup) are **done and green**.
 
+**Update (2026-06-29):** R-4 (#17) and R-5 (#18) are now **implemented, committed, and pushed** to
+`origin/audit-fixes` (commits `a59578a`, `e5820a7`) — static-gate-verified but their **live-Tauri
+verification is still pending** (see each section). R-1/R-2/R-3/R-6/R-7 remain open (= issues
+#14/#15/#16, #19, #20; plus #13 risky-runtime checklist and #21 ollama window-list).
+
 The items below were deliberately **NOT auto-applied**. They change runtime contracts (IPC wire
 format, process control flow, build layout, or config defaults) that `cargo`/`tsc`/`pytest`
 **cannot** verify — a wrong change here compiles and passes unit tests but breaks the running app.
@@ -30,14 +35,38 @@ launching the Tauri app (`npm run tauri dev`) and exercising the affected flow.
 - VERIFY IN APP: GUI send + kimctl run; concurrent trigger reserves a single runner; cancel kills cleanly.
 
 ## R-4. Relocate the codex engine out of `mcp_server/tools/`  (MEDIUM risk)
-- The 1207-LOC codex engine lives downstream of the orchestrator that imports it via a `sys.path`
-  hack (dependency runs backwards). Move to a proper package; fix the import path.
-- VERIFY: codex/Code-tab flow runs end-to-end after the move.
+**✅ DONE — commit `a59578a` (issue #17). Static gates green; live-app run STILL PENDING.**
+- `git mv mcp_server/tools/codex_bridge.py → codex_engine/engine.py` (new top-level package + empty
+  `__init__`). `orchestrator/codex_bridge_service.py` now forward-imports `from codex_engine.engine
+  import …`; the `sys.path` insert and the `# noqa: E402` markers are gone.
+- ⚠️ Kept `_HERE`/`_REPO` in `codex_bridge_service.py` — `_REPO` also resolves the default
+  `config.yaml` (line ~93), so deleting lines 34–38 wholesale (as the issue text literally says) would
+  `NameError`. Only the `sys.path` insertion was removed.
+- Also added `codex_engine` to `pyrightconfig.json` `include` + `kim-orchestrator.spec` `datas`
+  (both outside the issue's file list) to preserve type-check + PyInstaller-bundle parity.
+- Verified: codex suite 44/44, full pytest green, pyright 0/0, and `python -m
+  orchestrator.codex_bridge_service --help` resolves from the repo-root cwd AND a foreign cwd with
+  `PYTHONPATH=kim_root` (proves the hack was dead weight). flake8 clean on touched files.
+- LEFT (VERIFY): `npm run tauri dev` → run a Code-tab Codex task end-to-end; confirm the bridge spawns
+  and routes through Kim's BrowserProvider, and the Code tab never uses OpenAI auth/gpt-5.5.
 
 ## R-5. Unify the 4 divergent config loaders → single source  (MEDIUM risk)
-- `config.rs` (hand-rolled YAML), Python loaders, etc. disagree on defaults (`use_real_browser`
-  opposite polarity; `provider` differs 4 ways). Pick canonical defaults (a behavior decision),
-  centralize. VERIFY: defaults match intended behavior on a fresh config.
+**✅ DONE — commit `e5820a7` (issue #18). Static gates green; live-app run STILL PENDING.**
+- Canonical defaults chosen: `provider=ollama`, `use_real_browser=false`. Shared
+  `DEFAULT_PROVIDER="ollama"` in `orchestrator/agent_config.py` (used by `agent.py` + `cli.py`, was
+  inline `"claude"` at both); `DEFAULT_USE_REAL_BROWSER=False` in `mcp_server/config.py` (flipped from
+  `True`); added the missing `claude` entry to `config.rs default_model_map()`; `config.yaml.example`
+  provider `browser → ollama`; new `tests/test_config_parity.py` (11 tests) locking provider +
+  use_real_browser across Python constants, the YAML template, `subprocess.rs`, `cli/src/config.rs`,
+  `index.ts`, and the Rust model map. Mutation-tested + CI-deterministic.
+- ⚠️ Gotcha for whoever continues: **`config.yaml` is GITIGNORED** (`.gitignore:26`). The tracked
+  template is `config.yaml.example`; on a fresh install the in-code defaults govern — NOT `config.yaml`,
+  contrary to the issue's "config.yaml ships with every install". The runtime `config.yaml` is the
+  user's local instance (left untouched).
+- Behavior change: the no-explicit-provider default goes `claude`/`browser` → `ollama` (the decided value).
+- LEFT (VERIFY): `npm run tauri dev`; delete the `provider`/`use_real_browser` keys (or rename the local
+  config.yaml) to exercise the fresh-config path; confirm `ollama` wins and the dedicated Kim Chromium is
+  used (not the user's real Chrome over CDP). A `tauri dev` restart is required after the `.rs` change.
 
 ## R-6. Cargo workspace for `desktop/src-tauri` + `cli`  (MEDIUM risk, build-system)
 - Share deps/lockfile, single `cargo test`. VERIFY: `cargo build`, Tauri bundle, and `cli` install
