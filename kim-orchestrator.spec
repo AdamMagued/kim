@@ -1,7 +1,7 @@
 # kim-orchestrator.spec — PyInstaller build specification
 #
-# Bundles orchestrator/ + mcp_server/ into a single executable sidecar
-# for the Tauri desktop app.
+# Bundles orchestrator/ + mcp_server/ + codex_engine/ into a single executable
+# sidecar for the Tauri desktop app.
 #
 # Usage (from repo root):
 #   pip install pyinstaller
@@ -44,6 +44,10 @@ a = Analysis(
         (str(REPO_ROOT / 'mcp_server'), 'mcp_server'),
         # Include orchestrator package so relative imports work inside the frozen app
         (str(REPO_ROOT / 'orchestrator'), 'orchestrator'),
+        # Codex bridge engine: top-level package imported by the spawned
+        # orchestrator.codex_bridge_service. Bundled so the frozen app can run
+        # browser-backed Codex tasks (previously shipped inside mcp_server/tools/).
+        (str(REPO_ROOT / 'codex_engine'), 'codex_engine'),
         # Default config file so the agent can find its defaults when no config.yaml
         # exists in the installation directory.
         (str(REPO_ROOT / 'config.yaml.example'), '.'),
@@ -117,7 +121,13 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,    # None = current arch; set 'universal2' for Mac fat binary
+    # Code-signing (#63): set codesign_identity and entitlements_file before
+    # distributing.  Required for Gatekeeper on macOS 10.15+ and App Store.
+    # Obtain a "Developer ID Application" cert from developer.apple.com, then:
+    #   codesign --deep --options runtime --sign "Developer ID Application: <Name> (<TeamID>)"
+    #            --entitlements entitlements.plist dist/kim-orchestrator-<triple>
+    # For Windows use signtool.exe with an EV code-signing cert.
     codesign_identity=None,   # TODO(human): set to your Developer ID for notarization
-    entitlements_file=None,   # TODO(human): add entitlements for hardened runtime
+    entitlements_file=None,   # TODO(human): add entitlements.plist for hardened runtime
     onefile=True,        # Single self-contained binary — required for Tauri sidecar
 )

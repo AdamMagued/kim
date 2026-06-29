@@ -222,7 +222,8 @@ pub fn load_session_messages(path: &Path) -> Result<Vec<UiMessage>, String> {
         let message_role = match role {
             Some("user") => MessageRole::User,
             Some("assistant") => MessageRole::Assistant,
-            Some("system" | "compact_summary") | None if record_type == Some("compaction") => {
+            Some("system") => MessageRole::System,
+            Some("compact_summary") | None if record_type == Some("compaction") => {
                 MessageRole::System
             }
             _ => continue,

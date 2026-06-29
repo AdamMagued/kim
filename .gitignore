@@ -74,3 +74,6 @@ Desktop.ini
 # ── Kim internal tool dirs (not user code) ────────────────────────────────────
 .omx/
 .clawd-agents/
+
+# ── graphify code graph (generated/regenerable; see repomap.md to rebuild) ─────
+graphify-out/

@@ -128,9 +128,15 @@ class OllamaProvider(BaseProvider):
         tools: list[dict],
         system: str,
     ) -> dict[str, Any]:
-        model = await self._resolve_selected_model()
+        # Fetch tags once for local mode; both _resolve_selected_model and
+        # _validate_model need the tag list and would otherwise each make a
+        # separate HTTP round-trip.
+        cached_tags: list[dict] | None = None
+        if self._mode == "local":
+            cached_tags = await self._fetch_tags()
+        model = await self._resolve_selected_model(tags=cached_tags)
         await self._ensure_daemon_running()
-        await self._validate_model(model)
+        await self._validate_model(model, tags=cached_tags)
 
         # Proactively strip images for models we know don't support vision.
         if self._vision_cache.get(model) is False:
@@ -233,13 +239,14 @@ class OllamaProvider(BaseProvider):
                     "Ollama is installed but not running. Start Ollama, then try again."
                 ) from exc
 
-    async def _resolve_selected_model(self) -> str:
+    async def _resolve_selected_model(self, tags: list[dict] | None = None) -> str:
         if self._mode == "cloud":
             return self._cloud_model or DEFAULT_OLLAMA_CLOUD_MODEL
         if self._local_model:
             return self._local_model
 
-        tags = await self._fetch_tags()
+        if tags is None:
+            tags = await self._fetch_tags()
         if tags:
             first = str((tags[0] or {}).get("name") or "").strip()
             if first:
@@ -249,7 +256,7 @@ class OllamaProvider(BaseProvider):
             "No local Ollama models are installed. Pull a model in Settings → AI → Ollama, then try again."
         )
 
-    async def _validate_model(self, model: str) -> None:
+    async def _validate_model(self, model: str, tags: list[dict] | None = None) -> None:
         if self._mode == "cloud":
             if not model.strip():
                 raise EnvironmentError(
@@ -257,7 +264,8 @@ class OllamaProvider(BaseProvider):
                 )
             return
 
-        tags = await self._fetch_tags()
+        if tags is None:
+            tags = await self._fetch_tags()
         names = {
             str(item.get("name") or "").strip().lower()
             for item in tags
@@ -402,9 +410,15 @@ class OllamaProvider(BaseProvider):
                     chunk = msg.get("content")
                     if isinstance(chunk, str) and chunk:
                         pieces.append(chunk)
-                    tc = msg.get("tool_calls")
-                    if isinstance(tc, list) and tc:
-                        tool_calls = [x for x in tc if isinstance(x, dict)]
+                    tc_deltas = msg.get("tool_calls")
+                    if isinstance(tc_deltas, list):
+                        for delta in tc_deltas:
+                            if not isinstance(delta, dict):
+                                continue
+                            idx = delta.get("index", 0)
+                            while len(tool_calls) <= idx:
+                                tool_calls.append({})
+                            _accumulate_tool_call_delta(tool_calls[idx], delta)
                     if item.get("done") is True:
                         final_obj = item
 
@@ -504,6 +518,38 @@ class OllamaProvider(BaseProvider):
             _parse_num_ctx(payload.get("parameters"))
             or _parse_num_ctx(payload.get("modelfile"))
         )
+
+
+def _accumulate_tool_call_delta(acc: dict, delta: dict) -> None:
+    """Merge a streaming tool-call delta into an accumulator entry.
+
+    Whole-block servers (current Ollama default) send a single chunk that
+    contains the full tool call with a dict for ``arguments``.  Delta-streaming
+    servers send name/arguments as string fragments across multiple chunks.
+    Both cases are handled: dict arguments are stored as-is on the first
+    occurrence; string fragments are concatenated.
+    """
+    _fn = delta.get("function")
+    fn_delta: dict = _fn if isinstance(_fn, dict) else {}
+    acc_fn: dict = acc.setdefault("function", {"name": "", "arguments": ""})
+
+    name = str(fn_delta.get("name") or "").strip()
+    if name:
+        acc_fn["name"] = name
+
+    args = fn_delta.get("arguments")
+    if isinstance(args, str):
+        # Delta-streaming: concatenate argument fragments.
+        existing = acc_fn.get("arguments", "")
+        acc_fn["arguments"] = (existing if isinstance(existing, str) else "") + args
+    elif isinstance(args, dict) and not acc_fn.get("arguments"):
+        # Whole-block: use the dict directly (only on first/only chunk).
+        acc_fn["arguments"] = args
+
+    # Preserve top-level fields (id, type) from the first chunk that has them.
+    for key in ("id", "type"):
+        if key in delta and key not in acc:
+            acc[key] = delta[key]
 
 
 def _normalize_tool_arguments(raw: Any) -> dict[str, Any]:

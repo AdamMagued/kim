@@ -83,13 +83,23 @@ load_builtin_connectors()
 _ACTIVE_CONNECTORS = enabled_connectors(ENABLED_CONNECTOR_IDS)
 for _c in _ACTIVE_CONNECTORS:
     for _tool in _c.tools:
+        # Subject connector tools to the same tier filter as built-in tools.
+        if _enabled_names is not None and _tool.name not in _enabled_names:
+            logger.debug(
+                "Connector %s tool %s excluded by KIM_ENABLED_TOOL_TIERS",
+                _c.id, _tool.name,
+            )
+            continue
         _TOOLS.append(_tool)
     for _name, _handler in _c.handlers.items():
+        # Skip handlers whose tool was excluded by the tier filter.
+        if _enabled_names is not None and _name not in _enabled_names:
+            continue
         if _name in _DISPATCH:
-            logger.warning(
-                "Connector %s tool %s collides with existing dispatch entry; "
-                "overriding.",
-                _c.id, _name,
+            raise RuntimeError(
+                f"Connector {_c.id!r} tool {_name!r} collides with an existing "
+                f"dispatch entry. Rename the connector tool or disable the "
+                f"conflicting built-in via KIM_ENABLED_TOOL_TIERS."
             )
         _DISPATCH[_name] = _handler
 if _ACTIVE_CONNECTORS:

@@ -4,6 +4,7 @@ Tests for orchestrator.scheduled_runner.
 Covers:
   - is_allowed_provider allowlist
   - find_interpreter: prefers venv > .venv > PATH
+  - find_interpreter: falls back to sys.executable (absolute, PATH-hijack guard)
   - run_next_due_task: no due tasks
   - run_next_due_task: provider refused (allowlist violation)
   - run_next_due_task: dry_run
@@ -14,8 +15,10 @@ Covers:
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -102,6 +105,52 @@ def test_find_interpreter_falls_back_to_path(tmp_path):
     # No venv dirs - should return python3/python from PATH or sys.executable.
     result = find_interpreter(tmp_path)
     assert result  # non-empty string
+
+
+def test_find_interpreter_falls_back_to_sys_executable(tmp_path):
+    """No venv present → must return sys.executable exactly (absolute path, PATH-hijack guard).
+
+    find_interpreter must never return a bare name like 'python' or 'python3'
+    that could be intercepted by a PATH-injected binary.  The only safe fallback
+    is sys.executable, which CPython always sets to an absolute resolved path.
+    """
+    result = find_interpreter(tmp_path)
+    assert result == sys.executable, (
+        f"expected sys.executable ({sys.executable!r}), got {result!r}"
+    )
+    assert os.path.isabs(result), (
+        f"fallback interpreter must be an absolute path (PATH-hijack guard), got {result!r}"
+    )
+
+
+def test_is_allowed_provider_allowlist():
+    """Focused spot-check: canonical allowed values are accepted; unknown/None handled correctly.
+
+    This consolidates the regression guard in one named function so that
+    any change to _ALLOWED_RE or is_allowed_provider immediately surfaces here.
+    """
+    # Allowed: empty / None -> defaults to ollama
+    assert is_allowed_provider(None) is True
+    assert is_allowed_provider("") is True
+    assert is_allowed_provider("   ") is True
+    # Allowed: explicit supported providers
+    assert is_allowed_provider("ollama") is True
+    assert is_allowed_provider("OLLAMA") is True
+    assert is_allowed_provider("ollama-cloud") is True
+    assert is_allowed_provider("browser") is True
+    assert is_allowed_provider("browser:chatgpt") is True
+    assert is_allowed_provider("browser:gemini") is True
+    # Rejected: cloud/commercial providers must never run scheduled tasks
+    assert is_allowed_provider("openai") is False
+    assert is_allowed_provider("claude") is False
+    assert is_allowed_provider("gemini") is False
+    assert is_allowed_provider("deepseek") is False
+    assert is_allowed_provider("gpt-4") is False
+    assert is_allowed_provider("gpt5.5") is False
+    assert is_allowed_provider("anthropic") is False
+    # Rejected: unknown/custom values
+    assert is_allowed_provider("custom-llm") is False
+    assert is_allowed_provider("my-provider") is False
 
 
 # ---------------------------------------------------------------------------

@@ -1,9 +1,18 @@
 import logging
 
+from ..privacy import is_privacy_paused, PRIVACY_ERROR
+
 logger = logging.getLogger(__name__)
+
+# Input clamps
+_MAX_PRESSES = 50
+_MIN_INTERVAL = 0.05
+_MAX_INTERVAL = 5.0
 
 
 async def handle_type_text(args: dict) -> str:
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import pyautogui
     import pyperclip
     import sys
@@ -22,6 +31,8 @@ async def handle_type_text(args: dict) -> str:
 
 
 async def handle_hotkey(args: dict) -> str:
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import pyautogui
     keys = args["keys"]
     if isinstance(keys, str):
@@ -36,10 +47,12 @@ async def handle_hotkey(args: dict) -> str:
 
 
 async def handle_key_press(args: dict) -> str:
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import pyautogui
     key = str(args["key"])
-    presses = int(args.get("presses", 1))
-    interval = float(args.get("interval", 0.1))
+    presses = max(1, min(int(args.get("presses", 1)), _MAX_PRESSES))
+    interval = max(_MIN_INTERVAL, min(float(args.get("interval", 0.1)), _MAX_INTERVAL))
     try:
         pyautogui.press(key, presses=presses, interval=interval)
         logger.info(f"key_press: {key} x{presses}")

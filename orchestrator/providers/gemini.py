@@ -316,13 +316,99 @@ class GeminiProvider(BaseProvider):
             declarations.append(declaration)
         return [{"functionDeclarations": declarations}] if declarations else []
 
+    # JSON Schema type → Gemini Schema type
+    _JSON_TO_GEMINI_TYPE: dict[str, str] = {
+        "string": "STRING",
+        "number": "NUMBER",
+        "integer": "INTEGER",
+        "boolean": "BOOLEAN",
+        "array": "ARRAY",
+        "object": "OBJECT",
+        "null": "STRING",  # lone null type; practical fallback
+    }
+
     def _convert_schema_json(self, schema: dict) -> dict[str, Any]:
-        raw_type = str(schema.get("type", "object" if "properties" in schema else "string")).lower()
-        out: dict[str, Any] = {"type": raw_type.upper()}
+        # $ref cannot be resolved without the full document; fall back to OBJECT.
+        if "$ref" in schema:
+            logger.debug(
+                "_convert_schema_json: $ref '%s' cannot be resolved; falling back to OBJECT",
+                schema["$ref"],
+            )
+            out: dict[str, Any] = {"type": "OBJECT"}
+            if "description" in schema:
+                out["description"] = schema["description"]
+            return out
+
+        # anyOf / oneOf: Gemini v1beta supports anyOf natively.
+        # Treat oneOf the same way (Gemini has no oneOf; anyOf is the closest match).
+        for combiner in ("anyOf", "oneOf"):
+            if combiner not in schema:
+                continue
+            sub_schemas = schema[combiner]
+            if not isinstance(sub_schemas, list) or not sub_schemas:
+                break
+            # Separate null-only entries from real types to detect nullability.
+            non_null = [s for s in sub_schemas if s.get("type") != "null"]
+            is_nullable = len(non_null) < len(sub_schemas)
+            if len(non_null) == 1:
+                # Common case: T | null  →  single type + nullable flag
+                converted = self._convert_schema_json(non_null[0])
+                if is_nullable:
+                    converted["nullable"] = True
+                if "description" in schema and "description" not in converted:
+                    converted["description"] = schema["description"]
+                return converted
+            # Multiple real alternatives → emit as Gemini anyOf
+            out = {"anyOf": [self._convert_schema_json(s) for s in non_null]}
+            if is_nullable:
+                out["nullable"] = True
+            if "description" in schema:
+                out["description"] = schema["description"]
+            return out
+
+        # allOf: best-effort merge of properties/required from all sub-schemas.
+        if "allOf" in schema:
+            sub_schemas = schema["allOf"]
+            if isinstance(sub_schemas, list) and sub_schemas:
+                merged_props: dict[str, Any] = {}
+                merged_required: list[str] = []
+                for sub in sub_schemas:
+                    converted_sub = self._convert_schema_json(sub)
+                    merged_props.update(converted_sub.get("properties") or {})
+                    merged_required.extend(converted_sub.get("required") or [])
+                out = {"type": "OBJECT"}
+                if merged_props:
+                    out["properties"] = merged_props
+                if merged_required:
+                    # deduplicate while preserving order
+                    out["required"] = list(dict.fromkeys(merged_required))
+                if "description" in schema:
+                    out["description"] = schema["description"]
+                return out
+
+        # Determine base type; JSON Schema allows "type" to be a list (e.g. ["string", "null"]).
+        raw_type_field = schema.get("type", "object" if "properties" in schema else "string")
+        is_nullable = bool(schema.get("nullable", False))
+
+        if isinstance(raw_type_field, list):
+            non_null_types = [t for t in raw_type_field if t != "null"]
+            if "null" in raw_type_field:
+                is_nullable = True
+            raw_type = str(non_null_types[0]).lower() if non_null_types else "string"
+        else:
+            raw_type = str(raw_type_field).lower()
+
+        gemini_type = self._JSON_TO_GEMINI_TYPE.get(raw_type, "STRING")
+        out = {"type": gemini_type}
+
+        if is_nullable:
+            out["nullable"] = True
         if "description" in schema:
             out["description"] = schema["description"]
         if "enum" in schema:
             out["enum"] = [str(v) for v in schema["enum"]]
+        if "format" in schema:
+            out["format"] = schema["format"]
         if raw_type == "array" and "items" in schema:
             out["items"] = self._convert_schema_json(schema["items"])
         if raw_type == "object":
@@ -380,7 +466,7 @@ class GeminiProvider(BaseProvider):
             }
         if len(tool_calls) > 1:
             # Match the batch shape claude.py / openai_provider.py use so the agent
-            # executes every call instead of discarding the extras.
+            # sequences every call (including mutating tools via preview/HITL gate).
             return {
                 "type": "tool_call",
                 "tool": "batch",

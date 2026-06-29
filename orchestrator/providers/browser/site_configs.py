@@ -6,12 +6,17 @@ for each supported site. Also defines shared constants used across the
 browser provider modules.
 """
 
+import os
 import platform
 
 # Modifier key: Cmd on Mac, Ctrl everywhere else
 MOD_KEY = "Meta" if platform.system() == "Darwin" else "Control"
 
-CDP_URL = "http://localhost:9222"
+# CDP port for the user's real Chrome session.  Matches the env var read by
+# mcp_server/tools/web.py (_REAL_BROWSER_CDP_PORT) so both sides agree on the
+# port without extra config (#3).  Override via KIM_REAL_BROWSER_CDP_PORT.
+_CDP_PORT = int(os.environ.get("KIM_REAL_BROWSER_CDP_PORT", "9222"))
+CDP_URL = f"http://localhost:{_CDP_PORT}"
 RESPONSE_WAIT_S = 600
 GENERATION_WAIT_S = 600
 _VERIFY_MIN_CHARS = 20

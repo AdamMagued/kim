@@ -70,6 +70,16 @@ def annotate_screenshot(
             Pixel coordinates of each marker in **real screen space** (if
             original_width/height were provided) or image space otherwise.
     """
+    # Validate grid dimensions against available labels before doing any work
+    max_cols = len(_COL_LABELS)
+    if not (1 <= grid_cols <= max_cols):
+        raise ValueError(
+            f"grid_cols must be between 1 and {max_cols} (got {grid_cols}). "
+            f"Supported column labels: {_COL_LABELS}"
+        )
+    if grid_rows < 1:
+        raise ValueError(f"grid_rows must be at least 1 (got {grid_rows}).")
+
     # Work on a copy so the caller keeps the original
     annotated = img.copy()
     draw = ImageDraw.Draw(annotated)

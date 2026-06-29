@@ -139,20 +139,22 @@ class AliasExpansionTests(unittest.TestCase):
     # Build a tier_dispatch that mirrors the real granular tier names so alias
     # expansion can be exercised without importing mcp.
     _ALIAS_DISPATCH = {
-        "file":     {"read_file": None},
-        "shell":    {"run_command": None},
-        "search":   {"search_in_files": None},
-        "screen":   {"take_screenshot": None},
-        "mouse":    {"click": None},
-        "keyboard": {"type_text": None},
-        "windows":  {"get_windows": None},
-        "web":      {"web_open": None},
+        "file_read":  {"read_file": None},
+        "file_write": {"write_file": None},
+        "shell":      {"run_command": None},
+        "search":     {"search_in_files": None},
+        "screen":     {"take_screenshot": None},
+        "mouse":      {"click": None},
+        "keyboard":   {"type_text": None},
+        "windows":    {"get_windows": None},
+        "web":        {"web_open": None},
     }
 
-    def test_core_alias_expands_to_file_shell_search(self):
+    def test_core_alias_expands_to_file_read_file_write_search_no_shell(self):
+        # 'core' intentionally excludes 'shell' -- arbitrary execution is opt-in.
         result = filter_tools(self._ALIAS_DISPATCH, frozenset({"core"}))
         self.assertIn("read_file", result)
-        self.assertIn("run_command", result)
+        self.assertNotIn("run_command", result)
         self.assertIn("search_in_files", result)
         self.assertNotIn("take_screenshot", result)
 
@@ -239,10 +241,10 @@ class StaticRegistryTests(unittest.TestCase):
         idx = self.source.find("TIER_DISPATCH")
         self.assertGreater(idx, 0)
         tier_section = self.source[idx: idx + 1200]
-        for var in ("_FILE_DISPATCH", "_SHELL_DISPATCH", "_SCREEN_DISPATCH",
-                    "_WEB_DISPATCH", "_MOUSE_DISPATCH", "_KEYBOARD_DISPATCH",
-                    "_WINDOW_DISPATCH", "_GIT_DISPATCH", "_CODE_DISPATCH",
-                    "_SEARCH_DISPATCH", "_MEMORY_DISPATCH"):
+        for var in ("_FILE_READ_DISPATCH", "_FILE_WRITE_DISPATCH", "_SHELL_DISPATCH",
+                    "_SCREEN_DISPATCH", "_WEB_DISPATCH", "_MOUSE_DISPATCH",
+                    "_KEYBOARD_DISPATCH", "_WINDOW_DISPATCH", "_GIT_DISPATCH",
+                    "_CODE_DISPATCH", "_SEARCH_DISPATCH", "_MEMORY_DISPATCH"):
             self.assertIn(var, tier_section,
                           f"{var} not found in TIER_DISPATCH definition")
 
@@ -358,6 +360,127 @@ class RegistryCoverageTests(unittest.TestCase):
                         f"and tier {tier_name!r}"
                     )
                 seen[tool_name] = tier_name
+
+
+# ---------------------------------------------------------------------------
+# Regression guards for the four requested behavioral contracts
+# ---------------------------------------------------------------------------
+
+class TierRegressionTests(unittest.TestCase):
+    """Regression guards for the four core tier-filtering behaviors.
+
+    Uses a dispatch table that mirrors the real granular tiers with the full
+    set of tool names needed to exercise all four contracts.
+    """
+
+    _DISPATCH = {
+        "file_read":  {"read_file": None, "list_dir": None},
+        "file_write": {"write_file": None, "delete_file": None},
+        "shell":      {"run_command": None, "run_powershell": None},
+        "search":     {"search_in_files": None, "find_files": None},
+        "screen":     {"take_screenshot": None},
+        "web":        {"web_open": None},
+    }
+
+    # Behavior 1: core_excludes_shell
+    # 'core' resolves to file_read + file_write + search; shell must be opted in.
+
+    def test_core_excludes_shell_run_command(self):
+        result = filter_tools(self._DISPATCH, frozenset({"core"}))
+        self.assertNotIn("run_command", result)
+
+    def test_core_excludes_shell_run_powershell(self):
+        result = filter_tools(self._DISPATCH, frozenset({"core"}))
+        self.assertNotIn("run_powershell", result)
+
+    def test_core_includes_file_read_tools(self):
+        result = filter_tools(self._DISPATCH, frozenset({"core"}))
+        self.assertIn("read_file", result)
+        self.assertIn("list_dir", result)
+
+    def test_core_includes_file_write_tools(self):
+        result = filter_tools(self._DISPATCH, frozenset({"core"}))
+        self.assertIn("write_file", result)
+        self.assertIn("delete_file", result)
+
+    def test_core_includes_search_tools(self):
+        result = filter_tools(self._DISPATCH, frozenset({"core"}))
+        self.assertIn("search_in_files", result)
+
+    # Behavior 2: shell_opt_in_exposes_exec
+    # 'core,shell' additionally exposes run_command and run_powershell.
+
+    def test_shell_opt_in_exposes_run_command(self):
+        result = filter_tools(self._DISPATCH, frozenset({"core", "shell"}))
+        self.assertIn("run_command", result)
+
+    def test_shell_opt_in_exposes_run_powershell(self):
+        result = filter_tools(self._DISPATCH, frozenset({"core", "shell"}))
+        self.assertIn("run_powershell", result)
+
+    def test_shell_opt_in_preserves_core_tools(self):
+        result = filter_tools(self._DISPATCH, frozenset({"core", "shell"}))
+        self.assertIn("read_file", result)
+        self.assertIn("write_file", result)
+        self.assertIn("search_in_files", result)
+
+    # Behavior 3: file_alias_backward_compat
+    # 'file' alias resolves to file_read + file_write only (no exec).
+
+    def test_file_alias_includes_read_file(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file"}))
+        self.assertIn("read_file", result)
+
+    def test_file_alias_includes_write_file(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file"}))
+        self.assertIn("write_file", result)
+
+    def test_file_alias_excludes_run_command(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file"}))
+        self.assertNotIn("run_command", result)
+
+    def test_file_alias_excludes_run_powershell(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file"}))
+        self.assertNotIn("run_powershell", result)
+
+    def test_file_alias_in_tier_aliases_dict(self):
+        self.assertIn("file", TIER_ALIASES)
+        self.assertEqual(set(TIER_ALIASES["file"]), {"file_read", "file_write"})
+
+    # Behavior 4: file_read_vs_file_write_split
+    # file_read -> read_file, list_dir only; file_write -> write_file, delete_file only.
+
+    def test_file_read_tier_includes_read_file(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file_read"}))
+        self.assertIn("read_file", result)
+
+    def test_file_read_tier_includes_list_dir(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file_read"}))
+        self.assertIn("list_dir", result)
+
+    def test_file_read_tier_excludes_write_file(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file_read"}))
+        self.assertNotIn("write_file", result)
+
+    def test_file_read_tier_excludes_delete_file(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file_read"}))
+        self.assertNotIn("delete_file", result)
+
+    def test_file_write_tier_includes_write_file(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file_write"}))
+        self.assertIn("write_file", result)
+
+    def test_file_write_tier_includes_delete_file(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file_write"}))
+        self.assertIn("delete_file", result)
+
+    def test_file_write_tier_excludes_read_file(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file_write"}))
+        self.assertNotIn("read_file", result)
+
+    def test_file_write_tier_excludes_list_dir(self):
+        result = filter_tools(self._DISPATCH, frozenset({"file_write"}))
+        self.assertNotIn("list_dir", result)
 
 
 if __name__ == "__main__":

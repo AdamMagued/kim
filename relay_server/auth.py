@@ -82,7 +82,15 @@ async def _matches_device(key: str | None) -> bool:
     if len(key) < 16:
         return False
     device = await db.lookup_device_by_token(key)
-    return device is not None
+    if device is None:
+        return False
+    # Re-verify with constant-time comparison at the Python layer, mirroring
+    # the pattern used for static keys above (secrets.compare_digest).
+    # `device["device_token"]` is the value fetched from the DB for the matched
+    # row; the comparison will always be True here, but using compare_digest
+    # ensures the check is timing-safe even if the DB equality is not.
+    stored = device.get("device_token", "")
+    return bool(stored and secrets.compare_digest(key, stored))
 
 
 async def require_phone_key(key: str | None = Security(_api_key_header)) -> None:

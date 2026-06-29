@@ -48,8 +48,37 @@ export function PairingModal({ open, onClose, projectRoot }: PairingModalProps) 
   const [phase, setPhase] = useState<Phase>({ kind: 'loading' });
   const pollRef = useRef<number | null>(null);
   const mountedRef = useRef(true);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const prevFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => () => { mountedRef.current = false; }, []);
+
+  // Accessibility: save/restore focus and handle Escape to dismiss.
+  useEffect(() => {
+    if (!open) return;
+
+    prevFocusRef.current = document.activeElement as HTMLElement | null;
+
+    // Defer so the element is in the DOM before we focus it.
+    const rafId = requestAnimationFrame(() => {
+      dialogRef.current?.focus();
+    });
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      document.removeEventListener('keydown', handleKeyDown);
+      prevFocusRef.current?.focus();
+      prevFocusRef.current = null;
+    };
+  }, [open, onClose]);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current !== null) {
@@ -131,10 +160,18 @@ export function PairingModal({ open, onClose, projectRoot }: PairingModalProps) 
 
   return (
     <div className="kim-modal-backdrop" onClick={onClose}>
-      <div className="kim-modal kim-pairing-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={dialogRef}
+        className="kim-modal kim-pairing-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="kim-pairing-modal-title"
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="kim-modal__header">
           <div>
-            <div className="kim-modal__title">Pair a phone</div>
+            <div id="kim-pairing-modal-title" className="kim-modal__title">Pair a phone</div>
             <div className="kim-pairing-modal__subtitle">
               Scan from Kim on your phone (Settings → Phone Relay).
             </div>

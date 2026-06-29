@@ -29,6 +29,8 @@ interface UseTaskRunnerProps {
   scroll: ReturnType<typeof useSessionScroll>;
 }
 
+let _taskCounter = 0;
+
 export function useTaskRunner({
   session,
   settings,
@@ -46,7 +48,7 @@ export function useTaskRunner({
   const makePendingTask = useCallback(
     (text: string, providerOverride?: string): PendingTask => {
       return {
-        id: Date.now() + Math.floor(Math.random() * 1000),
+        id: ++_taskCounter,
         text,
         provider: providerOverride ?? resolveProvider(),
       };
@@ -173,14 +175,24 @@ export function useTaskRunner({
   // B1: drain the queue when a run finishes. When isRunning transitions
   // true → false and tasks are queued, dequeue the head and run it. (Previously
   // queued tasks were appended but never executed — the queue UI lied.)
+  // Fix: distinguish a user cancel from a natural completion. When cancelFlagRef
+  // is set, the user explicitly hit Stop — discard the queue rather than
+  // auto-running the next message, which contradicts the Stop intent.
   const prevRunningRef = useRef(stream.isRunning);
   useEffect(() => {
     const justFinished = prevRunningRef.current && !stream.isRunning;
     prevRunningRef.current = stream.isRunning;
     if (justFinished && queuedTasks.length > 0) {
-      const [next, ...rest] = queuedTasks;
-      setQueuedTasks(rest);
-      void runPendingTask(next);
+      if (stream.cancelFlagRef.current) {
+        // Task was cancelled by the user — clear the queue instead of running
+        // queued messages. cancelFlagRef stays true until the next runPendingTask
+        // call resets it, so this check is safe here.
+        setQueuedTasks([]);
+      } else {
+        const [next, ...rest] = queuedTasks;
+        setQueuedTasks(rest);
+        void runPendingTask(next);
+      }
     }
   }, [stream.isRunning, queuedTasks, runPendingTask]);
 

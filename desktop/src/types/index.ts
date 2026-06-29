@@ -99,6 +99,13 @@ export interface GoogleApiAccount {
 export interface KimAccount {
   display_name: string;
   github_username?: string;
+  /**
+   * @security Known limitation: this token is stored in plaintext in the local
+   * account JSON file. Migrating it to the OS keychain requires new Rust
+   * `keychain_store` / `keychain_load` commands (outside the React layer).
+   * Do not log or transmit this value. See PRODUCTION_ROADMAP.md for the
+   * keychain migration task.
+   */
   github_token?: string;
   github_avatar_url?: string;
   gist_id?: string;
@@ -179,6 +186,9 @@ export interface Settings {
   permission_mode: PermissionMode;
 }
 
+/** Default Ollama cloud model used as fallback when no model is selected. */
+export const OLLAMA_CLOUD_DEFAULT_MODEL = 'gpt-oss:120b-cloud';
+
 export const DEFAULT_SETTINGS: Settings = {
   kim_sessions_dir: '',
   codex_sessions_dir: '',
@@ -199,15 +209,41 @@ export const DEFAULT_SETTINGS: Settings = {
     base_url: 'http://localhost:11434',
     mode: 'cloud',
     local_model: '',
-    cloud_model: 'gpt-oss:120b-cloud',
+    cloud_model: OLLAMA_CLOUD_DEFAULT_MODEL,
     connected: false,
     cloud_connected: false,
     context_limit_override: null,
   },
 };
 
-// ── Agent events ─────────────────────────────────────────────────────────────
+// ── Shared provider constants ─────────────────────────────────────────────────
 
-export interface AgentOutputEvent {
-  line: string;
-}
+/**
+ * All selectable providers shown in the AI settings pane (default-provider grid).
+ * Single source of truth — import this instead of redeclaring locally.
+ */
+export const ALL_PROVIDERS: { value: Provider; title: string; sub: string }[] = [
+  { value: 'ollama',   title: 'Ollama',    sub: 'local/cloud · no API key' },
+  { value: 'browser',  title: 'Browser',   sub: 'via browser · no API key' },
+  { value: 'claude',   title: 'Claude',    sub: 'Anthropic' },
+  { value: 'openai',   title: 'OpenAI',    sub: 'OpenAI' },
+  { value: 'gemini',   title: 'Gemini',    sub: 'Google' },
+  { value: 'deepseek', title: 'DeepSeek',  sub: 'DeepSeek' },
+];
+
+/** Browser providers Kim can sign into. */
+export const BROWSER_PROVIDERS: { id: string; label: string }[] = [
+  { id: 'claude',   label: 'Claude' },
+  { id: 'chatgpt',  label: 'ChatGPT' },
+  { id: 'gemini',   label: 'Gemini' },
+  { id: 'grok',     label: 'Grok' },
+  { id: 'deepseek', label: 'DeepSeek' },
+];
+
+/** API providers that require a key in settings. */
+export const API_PROVIDERS: { id: string; label: string }[] = [
+  { id: 'claude',   label: 'Claude API' },
+  { id: 'openai',   label: 'OpenAI API' },
+  { id: 'gemini',   label: 'Gemini API' },
+  { id: 'deepseek', label: 'DeepSeek API' },
+];

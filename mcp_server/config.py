@@ -54,14 +54,10 @@ for p in _raw_allowed:
 if PROJECT_ROOT not in ALLOWED_PATHS:
     ALLOWED_PATHS.append(PROJECT_ROOT)
 
-BLOCKED_COMMANDS: list[str] = _cfg.get("shell", {}).get("blocked_commands", [
-    "rm -rf /", "format c:", "del /S /Q C:\\", "rd /S /Q C:\\"
-])
-
 SHELL_TIMEOUT: int = int(_cfg.get("shell", {}).get("timeout", 30))
 _shell_sandbox_env = os.environ.get("KIM_SHELL_SANDBOX_MODE")
 if _shell_sandbox_env is None:
-    SHELL_SANDBOX_MODE: bool = bool(_cfg.get("shell", {}).get("sandbox_mode", False))
+    SHELL_SANDBOX_MODE: bool = bool(_cfg.get("shell", {}).get("sandbox_mode", True))
 else:
     SHELL_SANDBOX_MODE = _shell_sandbox_env.strip().lower() in {"1", "true", "yes", "on"}
 CODE_TIMEOUT: int = int(_cfg.get("code_timeout", 30))
@@ -70,8 +66,14 @@ LOG_LEVEL: str = _cfg.get("logging", {}).get("level", "INFO")
 BROWSER_HEADLESS: bool = bool(
     _cfg.get("browser_provider", {}).get("browser_headless", False)
 )
+# Canonical fallback for `use_real_browser` when the key is absent from
+# config.yaml. False keeps Kim on its dedicated managed Chromium instead of
+# silently attaching to the user's real Chrome over CDP — a privacy change a
+# missing key should never trigger. Mirrors the shipped `config.yaml`
+# (`use_real_browser: false`); see tests/test_config_parity.py.
+DEFAULT_USE_REAL_BROWSER: bool = False
 USE_REAL_BROWSER: bool = bool(
-    _cfg.get("use_real_browser", True)
+    _cfg.get("use_real_browser", DEFAULT_USE_REAL_BROWSER)
 )
 VOICE_ENABLED: bool = bool(_cfg.get("voice_enabled", False))
 
@@ -109,6 +111,18 @@ _SENSITIVE_PATHS: list[Path] = [
     _HOME / "Library" / "Application Support" / "Google" / "Chrome",
     _HOME / "Library" / "Application Support" / "Firefox",
     _HOME / "Library" / "Application Support" / "Code",
+    # Linux browser/session stores (cookies + saved sessions = account takeover).
+    # Listed unconditionally for the same reason as the macOS paths above —
+    # a non-existent path is a harmless no-op on platforms that don't have it.
+    _HOME / ".config" / "google-chrome",
+    _HOME / ".config" / "chromium",
+    _HOME / ".config" / "Code",
+    # Windows AppData paths. On POSIX these expand to non-existent paths and
+    # never match, so no platform guard is needed.
+    _HOME / "AppData" / "Roaming" / "Google" / "Chrome" / "User Data",
+    _HOME / "AppData" / "Roaming" / "Mozilla" / "Firefox" / "Profiles",
+    _HOME / "AppData" / "Roaming" / "Code",
+    _HOME / "AppData" / "Local" / "Google" / "Chrome" / "User Data",
 ]
 # Secret-file name patterns denied at ANY depth inside an allowed root (G1).
 # Matched case-by-case against `p.name` via fnmatch in validate_path().
@@ -150,19 +164,23 @@ def validate_path(path_str: str) -> Path:
             f"Path '{p}' is outside allowed directories: {[str(a) for a in ALLOWED_PATHS]}"
         )
 
-    # Check against sensitive path deny list
+    # Check against sensitive path deny list — CASE-INSENSITIVELY. macOS/Windows
+    # filesystems are case-insensitive, so ~/.AWS/CREDENTIALS resolves to the same
+    # on-disk file as ~/.aws/credentials; a case-sensitive comparison (the old
+    # relative_to / fnmatch) let case-varied paths slip past the deny-list. Path.resolve
+    # canonicalizes symlinks and .. but NOT case, so we must lower-case explicitly.
+    p_low = str(p).lower()
     for sensitive in _SENSITIVE_PATHS:
-        try:
-            p.relative_to(sensitive)
+        s_low = str(sensitive).lower()
+        if p_low == s_low or p_low.startswith(s_low + os.sep) or p_low.startswith(s_low + "/"):
             raise PermissionError(
                 f"Path '{p}' is inside sensitive directory '{sensitive}' — access denied"
             )
-        except ValueError:
-            continue
 
-    # Check for secret files (.env, keys, credentials) at ANY depth (G1).
+    # Check for secret files (.env, keys, credentials) at ANY depth (G1), case-insensitively.
+    name_low = p.name.lower()
     for pattern in _SENSITIVE_GLOBS:
-        if fnmatch.fnmatch(p.name, pattern):
+        if fnmatch.fnmatch(name_low, pattern.lower()):
             raise PermissionError(
                 f"Path '{p}' matches sensitive file pattern '{pattern}' "
                 f"({p.name}) — access denied"

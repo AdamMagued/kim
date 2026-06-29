@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { KimMessage, ContentBlock, ToolUseBlock, ToolResultBlock, TypingAnimation } from '../types';
 import { ToolUseCard, ToolResultCard, SignalCard } from './ToolCallCard';
@@ -79,6 +79,7 @@ function UserBubble({ text, onEdit }: { text: string; onEdit?: (newText: string)
           <textarea
             ref={taRef}
             className="kim-bubble__edit-textarea"
+            aria-label="Edit message"
             value={draft}
             onChange={e => {
               setDraft(e.target.value);
@@ -124,6 +125,14 @@ function UserBubble({ text, onEdit }: { text: string; onEdit?: (newText: string)
 // Wraps an assistant bubble with a hover-revealed Copy button.
 function AssistantBubbleActions({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== null) clearTimeout(timerRef.current);
+    };
+  }, []);
+
   if (!text.trim()) return null;
   return (
     <div className="kim-bubble-actions kim-bubble-actions--assistant">
@@ -135,7 +144,8 @@ function AssistantBubbleActions({ text }: { text: string }) {
         onClick={async () => {
           await copyText(text);
           setCopied(true);
-          setTimeout(() => setCopied(false), 1400);
+          if (timerRef.current !== null) clearTimeout(timerRef.current);
+          timerRef.current = setTimeout(() => setCopied(false), 1400);
         }}
       >
         {copied ? <CheckIcon /> : <CopyIcon />}
@@ -317,6 +327,7 @@ export function AnimatedText({
 }) {
   const containerRef = useRef<HTMLSpanElement>(null);
   const [done, setDone] = useState(!active || animation === 'none');
+  const renderedText = useMemo(() => renderText(text), [text]);
 
   useEffect(() => {
     if (!active || animation === 'none') return;
@@ -396,7 +407,7 @@ export function AnimatedText({
   }, [text, animation, active]);
 
   if (done || !active || animation === 'none') {
-    return <>{renderText(text)}</>;
+    return <>{renderedText}</>;
   }
 
   return <span ref={containerRef} className="kim-anim-root" />;
@@ -416,7 +427,7 @@ interface Props {
   onEdit?: (newText: string) => void;
 }
 
-export function MessageBubble({ message, animate = false, typingAnimation = 'none', onRetry, retries = 0, onEdit }: Props) {
+export const MessageBubble = React.memo(function MessageBubble({ message, animate = false, typingAnimation = 'none', onRetry, retries = 0, onEdit }: Props) {
   const isUser   = message.role === 'user';
   const isSystem = message.role === 'system';
 
@@ -490,7 +501,7 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
         <div className="kim-msg-row kim-msg-row--assistant">
           <div className="kim-bubble-wrap kim-bubble-wrap--assistant">
             <div className="kim-bubble-wrap__inner">
-              {resultBlocks.map((b, i) => <ToolResultCard key={i} block={b} />)}
+              {resultBlocks.map((b) => <ToolResultCard key={b.tool_use_id} block={b} />)}
             </div>
           </div>
         </div>
@@ -600,8 +611,14 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
     );
   }
 
-  const textBlocks    = (content.filter(b => b && typeof b === 'object' && b.type === 'text') as Array<{ type: 'text'; text: string }>)
-    .filter(b => !isBridgeFillerText(b.text));
+  // Retain the original content-array index as a stable key so that the
+  // bridge-filler filter removing an item doesn't shift indices and attach
+  // AnimatedText animation state to the wrong block.
+  const textBlocks = (
+    content
+      .map((b, origIdx) => ({ b, origIdx }))
+      .filter(({ b }) => b && typeof b === 'object' && b.type === 'text') as Array<{ b: { type: 'text'; text: string }; origIdx: number }>
+  ).filter(({ b }) => !isBridgeFillerText(b.text));
   const toolUseBlocks = content.filter(isToolUse);
   const toolResultBlocks = content.filter(isToolResult);
   const hasText  = textBlocks.length > 0;
@@ -609,7 +626,7 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
 
   if (!hasText && !hasTools) return null;
 
-  const fullAssistantText = textBlocks.map(b => b.text.replace(/^TASK_COMPLETE:\s*/i, '')).join('\n\n');
+  const fullAssistantText = textBlocks.map(({ b }) => b.text.replace(/^TASK_COMPLETE:\s*/i, '')).join('\n\n');
 
   return (
     <div className="kim-msg-row kim-msg-row--assistant">
@@ -617,8 +634,8 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
         <div className="kim-bubble-wrap__inner">
           {hasText && (
             <div className={`kim-bubble kim-bubble--assistant${hasTools ? ' kim-bubble--assistant-group-top' : ''}`}>
-              {textBlocks.map((b, i) => (
-                <div key={i}>
+              {textBlocks.map(({ b, origIdx }, i) => (
+                <div key={origIdx}>
                   <AnimatedText
                     text={b.text.replace(/^TASK_COMPLETE:\s*/i, '')}
                     animation={typingAnimation}
@@ -629,10 +646,10 @@ export function MessageBubble({ message, animate = false, typingAnimation = 'non
             </div>
           )}
           {toolUseBlocks.map(b => <ToolUseCard key={b.id} block={b} />)}
-          {toolResultBlocks.map((b, i) => <ToolResultCard key={i} block={b} />)}
+          {toolResultBlocks.map((b) => <ToolResultCard key={b.tool_use_id} block={b} />)}
         </div>
         {hasText && <AssistantBubbleActions text={fullAssistantText} />}
       </div>
     </div>
   );
-}
+});

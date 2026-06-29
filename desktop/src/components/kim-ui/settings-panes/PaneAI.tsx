@@ -1,19 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl as openExternal } from '@tauri-apps/plugin-opener';
-import type { Settings, Provider } from '../../../types';
+import type { Settings } from '../../../types';
+import { ALL_PROVIDERS } from '../../../types';
 import { toast } from '../../Toast';
 import { SectionLabel, Row, Toggle } from './primitives';
-
-const PROVIDERS: { value: Provider; title: string; sub: string }[] = [
-  { value: 'ollama', title: 'Ollama', sub: 'local/cloud · no API key' },
-  { value: 'browser', title: 'Browser', sub: 'via browser · no API key' },
-  { value: 'claude', title: 'Claude', sub: 'Anthropic' },
-  { value: 'openai', title: 'GPT-4o', sub: 'OpenAI' },
-  { value: 'gemini', title: 'Gemini', sub: 'Google' },
-  { value: 'deepseek', title: 'DeepSeek', sub: 'DeepSeek' },
-];
 
 const OLLAMA_SUGGESTED_LOCAL_MODELS: OllamaModelInfo[] = [
   { name: 'llama3.2:3b', size: 0, family: 'llama', parameter_size: '3B', quantization_level: null, cloud: false, installed: false },
@@ -85,6 +77,22 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
   const [showModelDetails, setShowModelDetails] = useState(false);
   const [showOllamaAdvanced, setShowOllamaAdvanced] = useState(false);
 
+  // Raw text for the context-budget number input so intermediate keystrokes
+  // (e.g. typing "50000" one digit at a time) are not reverted by React's
+  // controlled-input mechanism.  Clamped to >=10 000 on blur (finding #1).
+  const [rawBudget, setRawBudget] = useState<string>(String(settings.context_budget_tokens ?? 200_000));
+  useEffect(() => {
+    setRawBudget(String(settings.context_budget_tokens ?? 200_000));
+  }, [settings.context_budget_tokens]);
+
+  // Sign-in refresh timers — tracked so they can be cancelled if the pane unmounts
+  // before the delays fire (finding #2: setState-after-unmount).
+  const signInTimersRef = useRef<ReturnType<typeof window.setTimeout>[]>([]);
+  useEffect(() => {
+    const timers = signInTimersRef.current;
+    return () => { timers.forEach(id => window.clearTimeout(id)); };
+  }, []);
+
   async function refreshOllamaStatus() {
     setOllamaBusy(prev => (prev === 'pulling' ? prev : 'refreshing'));
     setOllamaError(null);
@@ -130,24 +138,36 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
   ]);
 
   useEffect(() => {
-    let unlistenProgress: (() => void) | undefined;
-    let unlistenFinished: (() => void) | undefined;
+    // Use the cancelled-flag + async/await pattern so cleanup runs correctly
+    // even when the pane unmounts before the listen() promises resolve
+    // (finding #1: race between unlisten assignment and cleanup).
+    let unlistenProgress: (() => void) | null = null;
+    let unlistenFinished: (() => void) | null = null;
+    let cancelled = false;
 
-    listen<OllamaPullProgress>('ollama-pull-progress', (event) => {
-      setOllamaPullLog((prev) => [...prev.slice(-24), event.payload.line]);
-    }).then((fn) => { unlistenProgress = fn; });
-
-    listen<OllamaPullFinished>('ollama-pull-finished', (event) => {
-      setOllamaBusy('idle');
-      if (event.payload.success) {
-        toast(`Pulled ${event.payload.model}.`, 'success', 3000);
-        void refreshOllamaStatus();
-      } else {
-        setOllamaError(event.payload.error ?? `Could not pull ${event.payload.model}.`);
-      }
-    }).then((fn) => { unlistenFinished = fn; });
+    void (async () => {
+      try {
+        unlistenProgress = await listen<OllamaPullProgress>('ollama-pull-progress', (event) => {
+          if (!cancelled) setOllamaPullLog((prev) => [...prev.slice(-24), event.payload.line]);
+        });
+      } catch { /* not in Tauri test env */ }
+      try {
+        unlistenFinished = await listen<OllamaPullFinished>('ollama-pull-finished', (event) => {
+          if (!cancelled) {
+            setOllamaBusy('idle');
+            if (event.payload.success) {
+              toast(`Pulled ${event.payload.model}.`, 'success', 3000);
+              void refreshOllamaStatus();
+            } else {
+              setOllamaError(event.payload.error ?? `Could not pull ${event.payload.model}.`);
+            }
+          }
+        });
+      } catch { /* not in Tauri test env */ }
+    })();
 
     return () => {
+      cancelled = true;
       unlistenProgress?.();
       unlistenFinished?.();
     };
@@ -182,7 +202,7 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
     <>
       <SectionLabel>default provider</SectionLabel>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 28 }}>
-        {PROVIDERS.map((p) => {
+        {ALL_PROVIDERS.map((p) => {
           const on = settings.provider === p.value;
           return (
             <button
@@ -274,8 +294,8 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
                   try {
                     await invoke('ollama_signin');
                     toast('Ollama sign-in launched. Finish the Ollama flow, then Kim will re-check the daemon.', 'info', 5000);
-                    window.setTimeout(() => { void refreshOllamaStatus(); }, 2500);
-                    window.setTimeout(() => { void refreshOllamaStatus(); }, 7000);
+                    signInTimersRef.current.push(window.setTimeout(() => { void refreshOllamaStatus(); }, 2500));
+                    signInTimersRef.current.push(window.setTimeout(() => { void refreshOllamaStatus(); }, 7000));
                   } catch (err) {
                     setOllamaError(String(err));
                   } finally {
@@ -320,6 +340,7 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
             <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginBottom: 6 }}>model</div>
             <select
               className="kr-input"
+              aria-label="Ollama model"
               value={selectedModel}
               onChange={(e) => {
                 if (settings.ollama.mode === 'cloud') {
@@ -343,6 +364,7 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
             <input
               className="kr-input"
               style={{ marginTop: 8 }}
+              aria-label="Custom model name"
               value={selectedModel}
               onChange={(e) => {
                 if (settings.ollama.mode === 'cloud') {
@@ -379,6 +401,7 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
                 <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginBottom: 6 }}>base url</div>
                 <input
                   className="kr-input"
+                  aria-label="Ollama base URL"
                   value={settings.ollama.base_url}
                   onChange={(e) => updateOllama({ base_url: e.target.value })}
                   placeholder="http://localhost:11434"
@@ -411,6 +434,7 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
                   type="number"
                   min={0}
                   step={1024}
+                  aria-label="Context limit override"
                   value={settings.ollama.context_limit_override ?? ''}
                   onChange={(e) => {
                     const raw = e.target.value.trim();
@@ -570,13 +594,13 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
         title="Queue messages while Kim is working"
         subtitle="Off: a new send interrupts the current task. On: sends queue and run in order."
       >
-        <Toggle on={settings.allow_message_queue} onClick={() => update('allow_message_queue', !settings.allow_message_queue)} />
+        <Toggle on={settings.allow_message_queue} onClick={() => update('allow_message_queue', !settings.allow_message_queue)} ariaLabel="Queue messages while Kim is working" />
       </Row>
       <Row
         title="Keep browser visible while running"
         subtitle="Testing only — leaves the provider window on-screen so you can watch what Kim does."
       >
-        <Toggle on={settings.keep_browser_visible} onClick={() => update('keep_browser_visible', !settings.keep_browser_visible)} />
+        <Toggle on={settings.keep_browser_visible} onClick={() => update('keep_browser_visible', !settings.keep_browser_visible)} ariaLabel="Keep browser visible while running" />
       </Row>
 
       <SectionLabel>context budget</SectionLabel>
@@ -593,16 +617,20 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
           type="number"
           min={10_000}
           step={1000}
-          value={settings.context_budget_tokens ?? 200_000}
+          value={rawBudget}
           onChange={(e) => {
+            setRawBudget(e.target.value);
             const n = Number.parseInt(e.target.value, 10);
-            if (Number.isFinite(n) && n >= 10_000) update('context_budget_tokens', n);
+            if (Number.isFinite(n) && n > 0) update('context_budget_tokens', n);
           }}
           onBlur={(e) => {
             const n = Number.parseInt(e.target.value, 10);
-            if (!Number.isFinite(n) || n < 10_000) update('context_budget_tokens', 200_000);
+            const clamped = Number.isFinite(n) && n >= 10_000 ? n : 200_000;
+            update('context_budget_tokens', clamped);
+            setRawBudget(String(clamped));
           }}
           className="kr-input"
+          aria-label="Cumulative input tokens budget"
         />
         <div style={{ fontSize: 12, color: 'var(--kim-text-3)', marginTop: 8, lineHeight: 1.5 }}>
           Kim warns when cumulative input crosses ~80% / ~95% of this budget, then offers to compact.

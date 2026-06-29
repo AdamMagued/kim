@@ -44,6 +44,7 @@ class AnthropicProvider(BaseProvider):
                 system=system,
                 tools=claude_tools,  # pyright: ignore[reportArgumentType]
                 messages=claude_messages,  # pyright: ignore[reportArgumentType]
+                timeout=180.0,
             )
         except anthropic.RateLimitError:
             raise
@@ -51,6 +52,10 @@ class AnthropicProvider(BaseProvider):
             raise  # 401 — bad key; non-retryable
         except anthropic.PermissionDeniedError:
             raise  # 403 — non-retryable
+        except anthropic.APITimeoutError as e:
+            # Re-raise as builtin TimeoutError so classify_provider_error marks it
+            # retryable regardless of Python version (isinstance check works on all).
+            raise TimeoutError(str(e) or "Anthropic API timed out") from e
         except anthropic.APIError as e:
             logger.error(f"Anthropic API error: {e}")
             raise
@@ -130,7 +135,8 @@ class AnthropicProvider(BaseProvider):
 
         if len(tool_blocks) > 1:
             # Claude returned multiple tool_use blocks — wrap as a batch call
-            # so the agent executes all of them rather than silently dropping extras.
+            # so the agent executes all of them sequentially (including mutating
+            # tools, which go through the normal preview/HITL gate).
             logger.debug("Claude returned %d parallel tool_use blocks; wrapping as batch", len(tool_blocks))
             return {
                 "type": "tool_call",

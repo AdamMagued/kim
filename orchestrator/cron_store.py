@@ -143,11 +143,14 @@ def parse_schedule_expr(expr: str) -> timedelta:
         unit = m.group(2).lower()
         if n < 1:
             raise ValueError(f"@every interval must be >= 1, got {n}")
-        if unit == "m":
-            return timedelta(minutes=n)
-        if unit == "h":
-            return timedelta(hours=n)
-        return timedelta(days=n)
+        try:
+            if unit == "m":
+                return timedelta(minutes=n)
+            if unit == "h":
+                return timedelta(hours=n)
+            return timedelta(days=n)
+        except OverflowError:
+            raise ValueError(f"@every interval out of range: {n}{unit}")
 
     raise ValueError(
         f"Unrecognised schedule expression {expr!r}. "
@@ -268,9 +271,9 @@ class CronStore:
     defensive: a missing or corrupt file returns an empty store rather than
     raising.  Writes are atomic (temp-file + os.replace).
 
-    All methods are synchronous; the store is not safe for concurrent writes
-    from multiple processes.  For the current Tauri one-task-at-a-time model
-    this is sufficient.
+    All methods are synchronous; concurrent writes from multiple processes are
+    serialised via `_exclusive_lock` (a file-system advisory lock).  For the
+    current Tauri one-task-at-a-time model this is sufficient.
     """
 
     def __init__(self, store_file: Optional[Path] = None) -> None:

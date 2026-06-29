@@ -49,8 +49,27 @@ class TestToolRegistryParity(unittest.TestCase):
         self.assertFalse(non_callable, f"Dispatch entries that are not callable: {non_callable}")
 
     def test_tool_count_matches_architecture_doc(self):
-        """Regression: the Architecture doc says 31 tools. Alert if count drifts below baseline."""
-        self.assertGreaterEqual(len(_TOOLS), 31, f"Tool count dropped below baseline: {len(_TOOLS)} < 31")
+        """Regression: the documented tool count in ARCHITECTURE.md must equal len(TOOLS).
+
+        Parses the canonical number from the doc (e.g. '**50 OS-control tools**') so
+        that any drift — doc updated without touching the registry, or vice versa —
+        causes an immediate failure.  Update the doc when adding/removing tools.
+        """
+        arch_doc = Path(__file__).parent.parent / "ARCHITECTURE.md"
+        text = arch_doc.read_text()
+        match = re.search(r"\*\*(\d+) OS-control tools\*\*", text)
+        self.assertIsNotNone(
+            match,
+            "Could not find '**N OS-control tools**' in ARCHITECTURE.md — "
+            "update the doc to use that exact phrase",
+        )
+        doc_count = int(match.group(1))
+        self.assertEqual(
+            doc_count,
+            len(_TOOLS),
+            f"ARCHITECTURE.md documents {doc_count} tools but tool_registry has "
+            f"{len(_TOOLS)}. Update the doc or the registry so they agree.",
+        )
 
 
 # ---------------------------------------------------------------------------

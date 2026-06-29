@@ -359,5 +359,118 @@ class StaticRiskCoverageTests(unittest.TestCase):
         self.assertEqual(result["level"], "low")
 
 
+class LintFileArgRefinementTests(unittest.TestCase):
+    """Regression guards for the lint_file fix=True → high/file_write refinement.
+
+    These tests encode the arg-level classification added to classify_tool_risk:
+    a plain lint check stays read-only / auto-approvable, but passing fix=True
+    (or any truthy coercion of that arg) escalates to high/file_write so the
+    HITL gate fires before the file is mutated in place.
+    """
+
+    # ── Behavior 1: fix=True is classified high/file_write ────────────────
+
+    def test_lint_file_fix_true_is_high_file_write(self):
+        result = classify_tool_risk("lint_file", {"fix": True})
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["reason"], "file_write")
+
+    # ── Behavior 2: fix absent or False stays read-only (not high) ────────
+
+    def test_lint_file_no_args_stays_read_only(self):
+        result = classify_tool_risk("lint_file", {})
+        self.assertNotEqual(result["level"], "high")
+        self.assertEqual(result["level"], "low")
+        self.assertEqual(result["reason"], "read_only")
+
+    def test_lint_file_fix_false_stays_read_only(self):
+        result = classify_tool_risk("lint_file", {"fix": False})
+        self.assertNotEqual(result["level"], "high")
+        self.assertEqual(result["level"], "low")
+        self.assertEqual(result["reason"], "read_only")
+
+    def test_lint_file_fix_none_stays_read_only(self):
+        result = classify_tool_risk("lint_file", {"fix": None})
+        self.assertNotEqual(result["level"], "high")
+        self.assertEqual(result["level"], "low")
+
+    # ── Behavior 3: truthy string values for fix are coerced to high ──────
+
+    def test_lint_file_fix_string_true_is_high(self):
+        result = classify_tool_risk("lint_file", {"fix": "true"})
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["reason"], "file_write")
+
+    def test_lint_file_fix_string_1_is_high(self):
+        result = classify_tool_risk("lint_file", {"fix": "1"})
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["reason"], "file_write")
+
+    def test_lint_file_fix_string_yes_is_high(self):
+        result = classify_tool_risk("lint_file", {"fix": "yes"})
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["reason"], "file_write")
+
+    def test_lint_file_fix_string_on_is_high(self):
+        result = classify_tool_risk("lint_file", {"fix": "on"})
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["reason"], "file_write")
+
+    def test_lint_file_fix_string_TRUE_uppercase_is_high(self):
+        result = classify_tool_risk("lint_file", {"fix": "TRUE"})
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["reason"], "file_write")
+
+    def test_lint_file_fix_int_1_is_high(self):
+        result = classify_tool_risk("lint_file", {"fix": 1})
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["reason"], "file_write")
+
+    def test_lint_file_fix_string_false_stays_read_only(self):
+        result = classify_tool_risk("lint_file", {"fix": "false"})
+        self.assertNotEqual(result["level"], "high")
+
+    def test_lint_file_fix_string_0_stays_read_only(self):
+        result = classify_tool_risk("lint_file", {"fix": "0"})
+        self.assertNotEqual(result["level"], "high")
+
+
+class BaseClassificationRegressionTests(unittest.TestCase):
+    """Regression guards confirming that the lint_file arg-refinement branch
+    did NOT alter the pre-existing tier assignments for other tools.
+
+    Each assertion here is a deliberate canary: if a refactor accidentally
+    moves delete_file, run_command, or write_file to a different tier these
+    tests will catch it immediately.
+    """
+
+    # ── Behavior 4: pre-existing tiers are unchanged ──────────────────────
+
+    def test_delete_file_remains_high_after_refinement_branch(self):
+        result = classify_tool_risk("delete_file", {})
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["reason"], "file_deletion")
+
+    def test_run_command_remains_high_after_refinement_branch(self):
+        result = classify_tool_risk("run_command", {"cmd": "ls"})
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["reason"], "arbitrary_code_execution")
+
+    def test_write_file_remains_medium_after_refinement_branch(self):
+        result = classify_tool_risk("write_file", {"path": "out.txt", "content": "x"})
+        self.assertEqual(result["level"], "medium")
+        self.assertEqual(result["reason"], "file_write")
+
+    def test_git_commit_remains_high_after_refinement_branch(self):
+        result = classify_tool_risk("git_commit", {"message": "chore: bump"})
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["reason"], "git_history_change")
+
+    def test_read_file_remains_low_after_refinement_branch(self):
+        result = classify_tool_risk("read_file", {"path": "foo.txt"})
+        self.assertEqual(result["level"], "low")
+        self.assertEqual(result["reason"], "read_only")
+
+
 if __name__ == "__main__":
     unittest.main()

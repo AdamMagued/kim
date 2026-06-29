@@ -1,5 +1,10 @@
 use std::path::{Path, PathBuf};
 
+/// Maximum output tokens requested from the Anthropic API (#24).
+/// 8192 is the published output-token limit for Claude-3 and later models.
+/// Formerly hardcoded inline as the slightly-wrong magic number 8096.
+const ANTHROPIC_MAX_TOKENS: u32 = 8192;
+
 use base64::Engine;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -332,9 +337,32 @@ async fn stream_via_bridge(
                         let _ = tx.send(AppEvent::TextChunk(response.to_string()));
                     } else if let Some(session_id) = value.get("session_id").and_then(Value::as_str)
                     {
-                        let _ = tx.send(AppEvent::ThoughtChunk(format!(
-                            "Desktop agent started session {session_id}."
-                        )));
+                        // /v1/task is async: it returns the session id immediately and runs
+                        // the agent on the desktop, streaming output to the desktop UI. Poll
+                        // the session's run_result so the CLI surfaces the actual answer
+                        // instead of just "session started / (no response)".
+                        let sessions_dir = value
+                            .get("sessions_dir")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        match poll_bridge_session_answer(&sessions_dir, session_id, &tx).await {
+                            Some((answer, _success)) if !answer.trim().is_empty() => {
+                                let _ = tx.send(AppEvent::TextChunk(crate::markdown::render_markdown(
+                                    answer.trim(),
+                                )));
+                            }
+                            Some(_) => {
+                                let _ = tx.send(AppEvent::Err(
+                                    "Kim desktop finished but returned no answer.".to_string(),
+                                ));
+                            }
+                            None => {
+                                let _ = tx.send(AppEvent::Err(format!(
+                                    "Kim desktop task timed out (session {session_id}); it may still be running in the desktop app."
+                                )));
+                            }
+                        }
                     } else {
                         let _ = tx.send(AppEvent::TextChunk(body));
                     }
@@ -349,6 +377,79 @@ async fn stream_via_bridge(
             }
         }
     }
+}
+
+/// `/v1/task` runs the agent asynchronously on the desktop and only returns a
+/// session id. Poll that session's JSONL file for the final `run_result` and return
+/// `(summary, success)`. Emits a heartbeat every ~5s while waiting; gives up after 5min.
+async fn poll_bridge_session_answer(
+    sessions_dir: &str,
+    session_id: &str,
+    tx: &UnboundedSender<AppEvent>,
+) -> Option<(String, bool)> {
+    use std::time::{Duration, Instant};
+    if sessions_dir.is_empty() {
+        return None;
+    }
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut last_beat = Instant::now();
+    loop {
+        if let Some(path) = find_session_file(sessions_dir, session_id) {
+            if let Some(res) = read_run_result(&path) {
+                return Some(res);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if last_beat.elapsed() >= Duration::from_secs(5) {
+            let _ = tx.send(AppEvent::ThoughtChunk("Kim desktop is working…".to_string()));
+            last_beat = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+    }
+}
+
+/// Locate `<sessions_dir>/<date>/<session_id>.jsonl` (date subdir varies).
+fn find_session_file(sessions_dir: &str, session_id: &str) -> Option<PathBuf> {
+    let base = Path::new(sessions_dir);
+    let direct = base.join(format!("{session_id}.jsonl"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    for entry in std::fs::read_dir(base).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            let f = p.join(format!("{session_id}.jsonl"));
+            if f.is_file() {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// Read the trailing `run_result` line; returns `(summary, success)` once present.
+fn read_run_result(path: &Path) -> Option<(String, bool)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() || !line.contains("\"run_result\"") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if v.get("type").and_then(Value::as_str) == Some("run_result") {
+                let summary = v
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let success = v.get("success").and_then(Value::as_bool).unwrap_or(false);
+                return Some((summary, success));
+            }
+        }
+    }
+    None
 }
 
 /* ===========================================================
@@ -493,7 +594,7 @@ async fn stream_anthropic(
 
     let mut body = json!({
         "model": config.model,
-        "max_tokens": 8096,
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
         "stream": true,
         "messages": request_messages,
     });
@@ -810,6 +911,10 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let is_browser = config.provider.to_ascii_lowercase().starts_with("browser");
 
+    // Holds the exclusive temp dir for the codex CODEX_HOME so it outlives the
+    // if-else block and stays alive until child.wait() completes (#23).
+    let mut _codex_temp_dir: Option<tempfile::TempDir> = None;
+
     let mut child = if is_browser {
         // Browser provider: launch the Kim codex bridge service.
         // Resolve the Kim source root so `python3 -m orchestrator.codex_bridge_service`
@@ -821,7 +926,17 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
                 return;
             }
         };
-        match Command::new("python3")
+        let python = match crate::agentic::find_python(&kim_root) {
+            Some(p) => p,
+            None => {
+                let _ = tx.send(AppEvent::Err(
+                    "No Python interpreter found (tried venv, python3, python). \
+                     Install Python 3 and retry.".to_string(),
+                ));
+                return;
+            }
+        };
+        match Command::new(&python)
             .args([
                 "-m",
                 "orchestrator.codex_bridge_service",
@@ -853,20 +968,36 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
             Some(p) => p,
             None => return,
         };
-        if let Err(e) = write_codex_config(proxy_port, &config.model) {
+        // Use an exclusive randomized temp dir so concurrent runs don't clobber
+        // each other and the path is not pre-creatable by a local attacker (#23).
+        let kim_codex_dir = match tempfile::Builder::new()
+            .prefix("kim_codex_")
+            .tempdir()
+        {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(AppEvent::Err(format!(
+                    "Failed to create codex temp dir: {e}"
+                )));
+                return;
+            }
+        };
+        let kim_codex_home = kim_codex_dir.path().to_path_buf();
+        // Keep the TempDir alive until child.wait() finishes (#23).
+        _codex_temp_dir = Some(kim_codex_dir);
+        if let Err(e) = write_codex_config(proxy_port, &config.model, &kim_codex_home) {
             let _ = tx.send(AppEvent::Err(format!("Failed to write codex config: {e}")));
             return;
         }
-        let kim_codex_home = std::env::temp_dir().join("kim_codex_home");
+        // Gate the sandbox-bypass flag behind an explicit opt-in env var (#1).
+        // Passing it unconditionally disabled the Codex approval gate for every
+        // CLI user, even those who didn't need it.
+        let bypass_sandbox =
+            std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1");
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let codex_args = build_codex_args(prompt, &cwd_str, bypass_sandbox);
         match Command::new("codex")
-            .args([
-                "exec",
-                "--json",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "-C",
-                &cwd.to_string_lossy(),
-                prompt,
-            ])
+            .args(&codex_args)
             .env("OPENAI_API_KEY", "ollama")
             .env("CODEX_HOME", &kim_codex_home)
             .stdout(std::process::Stdio::piped())
@@ -918,10 +1049,14 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
             let _ = tx.send(AppEvent::Err(
                 "codex produced no output. Check that ollama is running and the model name is correct.".to_string(),
             ));
+        } else if !exit_ok {
+            let _ = tx.send(AppEvent::Err("codex exited with a non-zero status.".to_string()));
         }
         return;
     }
-    let _ = tx.send(AppEvent::Done(true));
+    // used_bridge only when codex ran against a browser provider via the Kim bridge
+    // service; local codex (ollama) is not "via Kim desktop".
+    let _ = tx.send(AppEvent::Done(is_browser));
 }
 
 fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: bool) {
@@ -1065,8 +1200,16 @@ async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent
         return None;
     }
 
+    // Resolve a Python interpreter the same way agentic.rs does: venv first,
+    // then system python3/python — avoids hardcoding "python3" which is absent
+    // on Windows.
+    let python = {
+        let root_opt = crate::sessions::find_kim_repo_root();
+        let root = root_opt.unwrap_or_else(|| std::path::PathBuf::from("."));
+        crate::agentic::find_python(&root).unwrap_or_else(|| std::path::PathBuf::from("python3"))
+    };
     let ollama_base = format!("{}/v1", normalize_base_url(&config.ollama_base_url));
-    let mut child = match Command::new("python3")
+    let mut child = match Command::new(&python)
         .args([tmp_path.to_string_lossy().as_ref(), ollama_base.as_str()])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1076,7 +1219,7 @@ async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(AppEvent::Err(format!(
-                "Failed to start responses proxy (python3 required): {e}"
+                "Failed to start responses proxy (Python interpreter not found): {e}"
             )));
             return None;
         }
@@ -1111,9 +1254,23 @@ async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent
     Some(port)
 }
 
-fn write_codex_config(proxy_port: u16, model: &str) -> Result<(), String> {
-    let codex_home = std::env::temp_dir().join("kim_codex_home");
-    std::fs::create_dir_all(&codex_home)
+/// Build the argv list passed to `codex exec`. Extracted for testability (#1).
+/// Always produces `["exec", "--json", …, "-C", cwd, prompt]`.
+/// The `--dangerously-bypass-approvals-and-sandbox` flag is inserted only when
+/// `bypass` is true (opt-in via `KIM_CODEX_BYPASS_SANDBOX=1`).
+fn build_codex_args(prompt: &str, cwd: &str, bypass: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec!["exec".into(), "--json".into()];
+    if bypass {
+        args.push("--dangerously-bypass-approvals-and-sandbox".into());
+    }
+    args.push("-C".into());
+    args.push(cwd.to_string());
+    args.push(prompt.to_string());
+    args
+}
+
+fn write_codex_config(proxy_port: u16, model: &str, codex_home: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(codex_home)
         .map_err(|e| format!("Cannot create kim codex home {}: {e}", codex_home.display()))?;
     let config_path = codex_home.join("config.toml");
     let content = format!(
@@ -1680,5 +1837,130 @@ mod tests {
     fn resolve_api_key_both_absent_returns_empty_driving_login_error() {
         // Empty result causes the "Run /login <provider> first." error, which is correct.
         assert!(resolve_api_key(None, None).is_empty());
+    }
+
+    // ── codex_args_bypass_gated (#1) ─────────────────────────────────────────
+    // Regression guard: the sandbox-bypass flag must be gated behind `bypass=true`
+    // and must never appear when `bypass=false`. The argv must always terminate
+    // with `-C <cwd> <prompt>` regardless of the bypass setting.
+
+    #[test]
+    fn codex_args_bypass_gated() {
+        let prompt = "fix the bug";
+        let cwd = "/home/user/project";
+
+        // bypass=false: the dangerous flag must NOT appear.
+        let no_bypass = build_codex_args(prompt, cwd, false);
+        assert!(
+            !no_bypass
+                .iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "bypass=false must not include the bypass flag; got {no_bypass:?}"
+        );
+        // argv must end: -C <cwd> <prompt>
+        let n = no_bypass.len();
+        assert!(n >= 3, "expected at least 3 args; got {no_bypass:?}");
+        assert_eq!(&no_bypass[n - 3], "-C", "second-to-last pair must start with -C");
+        assert_eq!(&no_bypass[n - 2], cwd, "cwd must be the penultimate arg");
+        assert_eq!(&no_bypass[n - 1], prompt, "prompt must be the last arg");
+
+        // bypass=true: the flag must appear, and argv must still end correctly.
+        let with_bypass = build_codex_args(prompt, cwd, true);
+        assert!(
+            with_bypass
+                .iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "bypass=true must include the bypass flag; got {with_bypass:?}"
+        );
+        let n = with_bypass.len();
+        assert!(n >= 3);
+        assert_eq!(&with_bypass[n - 3], "-C");
+        assert_eq!(&with_bypass[n - 2], cwd);
+        assert_eq!(&with_bypass[n - 1], prompt);
+    }
+
+    // ── anthropic_max_tokens_constant (#24) ──────────────────────────────────
+    // Regression guard: the constant must be the corrected 8192 value (not the
+    // former magic number 8096) and must propagate into the request body JSON.
+
+    #[test]
+    fn anthropic_max_tokens_constant() {
+        assert_eq!(
+            ANTHROPIC_MAX_TOKENS, 8192u32,
+            "ANTHROPIC_MAX_TOKENS must be 8192 (was previously the wrong value 8096)"
+        );
+        // Verify the constant produces the correct numeric value when serialised
+        // into a JSON request body (matches the `json!` call in stream_anthropic).
+        let body = serde_json::json!({ "max_tokens": ANTHROPIC_MAX_TOKENS });
+        assert_eq!(
+            body["max_tokens"].as_u64().unwrap(),
+            8192u64,
+            "max_tokens in request body must equal 8192"
+        );
+    }
+
+    // ── read_run_result_parses_trailing_line ─────────────────────────────────
+    // Regression guard: earlier JSONL lines must be ignored; only the trailing
+    // `run_result` line is returned as (summary, success).
+
+    #[test]
+    fn read_run_result_parses_trailing_line() {
+        use std::io::Write as _;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        // Earlier lines that do NOT contain run_result must be ignored.
+        tmp.write_all(b"{\"type\":\"text\",\"content\":\"earlier line\"}\n")
+            .unwrap();
+        tmp.write_all(b"{\"type\":\"tool_call\",\"name\":\"read_file\"}\n")
+            .unwrap();
+        // Trailing run_result line is the one that should be returned.
+        tmp.write_all(
+            b"{\"type\":\"run_result\",\"summary\":\"task complete\",\"success\":true}\n",
+        )
+        .unwrap();
+        tmp.flush().unwrap();
+
+        let (summary, success) =
+            read_run_result(tmp.path()).expect("should parse the trailing run_result line");
+        assert_eq!(summary, "task complete");
+        assert!(success, "success flag should be true");
+    }
+
+    // ── find_session_file_direct_and_dated ───────────────────────────────────
+    // Regression guard: find_session_file must locate a session JSONL both
+    // directly under sessions_dir AND inside a date-named subdirectory.
+
+    #[test]
+    fn find_session_file_direct_and_dated() {
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let session_id = "test-session-abc123";
+
+        // Case 1: file sitting directly under sessions_dir.
+        let direct = sessions_dir.path().join(format!("{session_id}.jsonl"));
+        std::fs::write(&direct, b"").unwrap();
+        let found = find_session_file(
+            sessions_dir.path().to_str().unwrap(),
+            session_id,
+        );
+        assert_eq!(
+            found.as_deref(),
+            Some(direct.as_path()),
+            "should find file directly under sessions_dir"
+        );
+        std::fs::remove_file(&direct).unwrap();
+
+        // Case 2: file nested inside a date subdirectory.
+        let date_dir = sessions_dir.path().join("2024-01-15");
+        std::fs::create_dir_all(&date_dir).unwrap();
+        let dated = date_dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(&dated, b"").unwrap();
+        let found = find_session_file(
+            sessions_dir.path().to_str().unwrap(),
+            session_id,
+        );
+        assert_eq!(
+            found.as_deref(),
+            Some(dated.as_path()),
+            "should find file inside a date subdir"
+        );
     }
 }

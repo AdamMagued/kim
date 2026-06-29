@@ -75,18 +75,21 @@ class UIBridge:
         """
         Pause execution and ask the UI for confirmation.
         If cancelled, returns False immediately.
-        If the UI takes > 60 s (or no UI is attached), auto-allows.
+        If the UI takes > 60 s (or no UI is attached), auto-denies (fail-closed).
+        This applies to both preview confirms and HITL high-risk approvals.
         """
         if self._cancelled.is_set():
             return False
         event: threading.Event = threading.Event()
-        result: list[bool] = [True]
+        result: list[bool] = [False]
         self._confirm_queue.put_nowait((tool_name, args, event, result))
         # Wait without blocking the asyncio event loop
         loop = asyncio.get_running_loop()
         timed_out = not await loop.run_in_executor(None, lambda: event.wait(timeout=60.0))
         if timed_out:
-            logging.getLogger(__name__).warning("Confirmation timed out after 60 s — auto-allowing")
+            logging.getLogger(__name__).warning(
+                "Confirmation timed out after 60 s — auto-denying tool '%s'", tool_name
+            )
         return result[0]
 
     def resolve_confirm(

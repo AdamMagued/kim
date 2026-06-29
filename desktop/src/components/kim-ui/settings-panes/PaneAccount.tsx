@@ -20,6 +20,9 @@ function PaneAccount({
 }) {
   const [nameVal, setNameVal] = useState(account.display_name);
   const [editingName, setEditingName] = useState(false);
+  // finding #4: separate boolean for form visibility so the secret value never
+  // doubles as a UI sentinel (previously `token === 'show'` triggered the form).
+  const [showTokenForm, setShowTokenForm] = useState(false);
   const [token, setToken] = useState('');
   const [verifying, setVerifying] = useState(false);
   const [tokenError, setTokenError] = useState('');
@@ -184,6 +187,8 @@ function PaneAccount({
       } finally {
         setSaving(false);
       }
+    } else {
+      setNameVal(account.display_name);
     }
     setEditingName(false);
   }
@@ -196,6 +201,10 @@ function PaneAccount({
       const user = await invoke<{ login: string; name: string | null; avatar_url: string }>('verify_github_pat', {
         token: token.trim(),
       });
+      // Store PAT in OS keychain before updating account state.
+      // save_account (called by onAccountChange) also strips github_token from
+      // account.json, so the secret never touches disk.
+      await invoke('store_github_token', { token: token.trim() });
       await onAccountChange({
         ...account,
         github_token: token.trim(),
@@ -203,6 +212,7 @@ function PaneAccount({
         github_avatar_url: user.avatar_url,
       });
       setToken('');
+      setShowTokenForm(false);
       toast(`Connected as ${user.login}`, 'success', 2500);
     } catch (err) {
       setTokenError(String(err));
@@ -213,6 +223,8 @@ function PaneAccount({
 
   async function disconnectGitHub() {
     if (!confirm('Disconnect GitHub? Gist sync will stop working.')) return;
+    // Remove PAT from OS keychain.
+    await invoke('delete_github_token').catch(() => {});
     await onAccountChange({
       ...account,
       github_token: undefined,
@@ -284,6 +296,8 @@ function PaneAccount({
           {editingName ? (
             <input
               autoFocus
+              id="account-display-name"
+              aria-label="Display name"
               value={nameVal}
               onChange={(e) => setNameVal(e.target.value)}
               onBlur={() => void saveName()}
@@ -330,13 +344,13 @@ function PaneAccount({
             </button>
           </div>
         ) : (
-          <button type="button" className="kr-btn kr-btn-primary" onClick={() => setToken('show')}>
+          <button type="button" className="kr-btn kr-btn-primary" onClick={() => setShowTokenForm(true)}>
             Connect
           </button>
         )}
       </Row>
 
-      {!account.github_token && token === 'show' && (
+      {!account.github_token && showTokenForm && (
         <div
           style={{
             background: 'var(--kim-surface)',
@@ -351,10 +365,12 @@ function PaneAccount({
             <span style={{ color: 'var(--kim-accent)' }}>github.com/settings/tokens</span>.
           </div>
           <input
+            id="account-github-pat"
             type="password"
+            aria-label="GitHub personal access token"
             className="kr-input"
             placeholder="ghp_…"
-            value={token === 'show' ? '' : token}
+            value={token}
             onChange={(e) => setToken(e.target.value)}
             style={{ marginBottom: 10 }}
           />
@@ -362,10 +378,10 @@ function PaneAccount({
             <div style={{ fontSize: 12, color: 'var(--kim-red)', marginBottom: 10 }}>{tokenError}</div>
           )}
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-            <button type="button" className="kr-btn" onClick={() => { setToken(''); setTokenError(''); }}>
+            <button type="button" className="kr-btn" onClick={() => { setShowTokenForm(false); setToken(''); setTokenError(''); }}>
               Cancel
             </button>
-            <button type="button" className="kr-btn kr-btn-primary" onClick={verifyAndConnect} disabled={verifying || !token.trim() || token === 'show'}>
+            <button type="button" className="kr-btn kr-btn-primary" onClick={verifyAndConnect} disabled={verifying || !token.trim()}>
               {verifying ? 'Verifying…' : 'Connect'}
             </button>
           </div>
@@ -455,7 +471,9 @@ function PaneAccount({
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
         <input
+          id="account-google-email"
           type="email"
+          aria-label="Google account email"
           className="kr-input"
           placeholder="you@gmail.com"
           value={googleEmail}

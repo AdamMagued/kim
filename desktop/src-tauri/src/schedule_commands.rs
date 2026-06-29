@@ -17,7 +17,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 // ---------------------------------------------------------------------------
 // Shared subprocess helper
@@ -396,6 +396,30 @@ pub(crate) async fn start_schedule_timer(
         let handle = tokio::spawn(async move {
             let kim_root = default_project_root();
             loop {
+                // Guard: skip this tick if an interactive or bridge task is
+                // already running, matching the guard in scheduler.rs:51-56.
+                // Avoids launching a scheduled task concurrently with a live
+                // agent run (second-agent race).
+                //
+                // Two agent-tracking paths must both be checked:
+                //   1. TaskState (set by subprocess.rs run_task for IPC/interactive runs)
+                //   2. BRIDGE_TASK_PID / is_bridge_task_running (set by http_bridge.rs for
+                //      kimctl /v1/task runs - those never touch TaskState)
+                let busy = if let Some(task_state) = app_handle.try_state::<crate::TaskState>() {
+                    let g = task_state.lock().await;
+                    g.pid.is_some() || g.starting
+                } else {
+                    false
+                };
+                if busy {
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    continue;
+                }
+                if crate::is_bridge_task_running() {
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    continue;
+                }
+
                 let tick_result =
                     tokio::task::spawn_blocking({
                         let kim_root = kim_root.clone();

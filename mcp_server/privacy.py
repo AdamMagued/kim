@@ -23,4 +23,6 @@ def is_privacy_paused() -> bool:
     try:
         return PRIVACY_SENTINEL.exists()
     except Exception:
-        return False
+        # Fail closed: if we cannot determine whether privacy is paused,
+        # treat it as paused so capture does not proceed unexpectedly.
+        return True

@@ -1,15 +1,25 @@
 import asyncio
 import logging
 
+from ..privacy import is_privacy_paused, PRIVACY_ERROR
+
 logger = logging.getLogger(__name__)
+
+# Input clamps
+_MAX_CLICKS = 10
+_MAX_DURATION = 10.0
+_MIN_DURATION = 0.0
+_MAX_SCROLL_CLICKS = 50
 
 
 async def handle_click(args: dict) -> str:
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import pyautogui
     x = int(args["x"])
     y = int(args["y"])
     button = str(args.get("button", "left"))
-    clicks = int(args.get("clicks", 1))
+    clicks = max(1, min(int(args.get("clicks", 1)), _MAX_CLICKS))
     try:
         pyautogui.click(x=x, y=y, button=button, clicks=clicks, interval=0.1)
         logger.info(f"click: ({x},{y}) button={button} clicks={clicks}")
@@ -20,6 +30,8 @@ async def handle_click(args: dict) -> str:
 
 
 async def handle_double_click(args: dict) -> str:
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import pyautogui
     x = int(args["x"])
     y = int(args["y"])
@@ -33,6 +45,8 @@ async def handle_double_click(args: dict) -> str:
 
 
 async def handle_right_click(args: dict) -> str:
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import pyautogui
     x = int(args["x"])
     y = int(args["y"])
@@ -46,12 +60,14 @@ async def handle_right_click(args: dict) -> str:
 
 
 async def handle_drag(args: dict) -> str:
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import pyautogui
     x1 = int(args["x1"])
     y1 = int(args["y1"])
     x2 = int(args["x2"])
     y2 = int(args["y2"])
-    duration = float(args.get("duration", 0.5))
+    duration = max(_MIN_DURATION, min(float(args.get("duration", 0.5)), _MAX_DURATION))
     try:
         pyautogui.moveTo(x1, y1)
         await asyncio.sleep(0.1)
@@ -64,10 +80,12 @@ async def handle_drag(args: dict) -> str:
 
 
 async def handle_scroll(args: dict) -> str:
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import pyautogui
     x = int(args.get("x", -1))
     y = int(args.get("y", -1))
-    clicks = int(args.get("clicks", 3))
+    clicks = max(1, min(int(args.get("clicks", 3)), _MAX_SCROLL_CLICKS))
     direction = str(args.get("direction", "up"))
     amount = clicks if direction == "up" else -clicks
     try:

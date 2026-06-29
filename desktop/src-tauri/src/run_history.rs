@@ -61,9 +61,33 @@ pub async fn save_run_history(
         .ok_or_else(|| "Could not locate a session directory to save runs.json into".to_string())?;
 
     let path = dir.join(format!("{}.runs.json", session_id));
+    let tmp_path = dir.join(format!("{}.runs.json.tmp", session_id));
     let body = serde_json::to_string(&runs).map_err(|e| e.to_string())?;
-    fs::write(&path, body).map_err(|e| e.to_string())?;
-    Ok(())
+
+    // Atomic write: write to a same-directory temp file, then rename over the
+    // target.  A crash mid-write leaves the previous .runs.json intact rather
+    // than producing a truncated/empty file.
+    fs::write(&tmp_path, body).map_err(|e| e.to_string())?;
+    match fs::rename(&tmp_path, &path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            #[cfg(target_os = "windows")]
+            {
+                // Windows rename does not overwrite existing files. Fall back to
+                // remove+rename; this is not perfectly atomic, but still avoids
+                // exposing a partially-written JSON file.
+                if path.exists() {
+                    fs::remove_file(&path).map_err(|remove_err| remove_err.to_string())?;
+                }
+                fs::rename(&tmp_path, &path).map_err(|rename_err| rename_err.to_string())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = fs::remove_file(&tmp_path);
+                Err(e.to_string())
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -103,18 +127,52 @@ pub fn get_platform_info() -> String {
     }
 }
 
+/// Expected git remote host for update integrity checks.
+/// Updates are rejected if the configured remote URL does not match this host,
+/// guarding against a tampered local git config pointing at a rogue mirror.
+const EXPECTED_REMOTE_HOST: &str = "github.com";
+
 #[tauri::command]
 pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     let kim_root = crate::default_project_root();
 
+    let git_cmd = if cfg!(target_os = "windows") { "git.exe" } else { "git" };
+
+    // --- Supply-chain integrity: verify remote URL before pulling -----------------
+    // Reject the update if the configured 'origin' remote does not point at the
+    // expected host.  This prevents a tampered local git config (or a poisoned
+    // DNS entry) from silently substituting a rogue upstream.
+    let remote_out = std::process::Command::new(git_cmd)
+        .args(["remote", "get-url", "origin"])
+        .current_dir(&kim_root)
+        .output()
+        .map_err(|e| format!("git not found — make sure Git is installed: {e}"))?;
+
+    let remote_url = String::from_utf8_lossy(&remote_out.stdout).trim().to_string();
+    if remote_out.status.success() {
+        // Accept https://github.com/... and git@github.com:...
+        let host_ok = remote_url.contains(EXPECTED_REMOTE_HOST);
+        if !host_ok {
+            return Err(format!(
+                "Update aborted: remote origin '{remote_url}' does not match expected host '{EXPECTED_REMOTE_HOST}'. \
+                 Verify your git remote configuration before updating."
+            ));
+        }
+    } else {
+        // Could not read remote (detached HEAD, no remote, etc.); proceed with warning.
+        let _ = app_handle.emit(
+            "kim-update-progress",
+            "Warning: could not verify remote URL — proceeding with caution.",
+        );
+    }
+
     let _ = app_handle.emit("kim-update-progress", "Pulling latest source from GitHub…");
 
-    let git_cmd = if cfg!(target_os = "windows") { "git.exe" } else { "git" };
     let git_out = std::process::Command::new(git_cmd)
         .args(["pull", "--ff-only"])
         .current_dir(&kim_root)
         .output()
-        .map_err(|e| format!("git not found — make sure Git is installed: {e}"))?;
+        .map_err(|e| format!("git pull failed to spawn: {e}"))?;
 
     if !git_out.status.success() {
         let stderr = String::from_utf8_lossy(&git_out.stderr);
@@ -130,6 +188,37 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     if already_latest {
         let _ = app_handle.emit("kim-update-progress", "Source is already up to date — no restart needed.");
         return Ok(());
+    }
+
+    // --- Supply-chain integrity: best-effort GPG commit signature verification ----
+    // `git verify-commit` requires GPG and a trusted key in the local keyring.
+    // We emit a warning rather than hard-failing because most self-hosted
+    // deployments do not have a signing key imported.  Operators who want to
+    // enforce signed commits should set `commit.gpgSign` and import the project
+    // key; in that case `git pull --ff-only` itself will refuse unsigned commits.
+    let verify_out = std::process::Command::new(git_cmd)
+        .args(["verify-commit", "HEAD"])
+        .current_dir(&kim_root)
+        .output();
+
+    match verify_out {
+        Ok(out) if out.status.success() => {
+            let _ = app_handle.emit("kim-update-progress", "Commit signature verified.");
+        }
+        Ok(out) => {
+            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let _ = app_handle.emit(
+                "kim-update-progress",
+                format!("Warning: commit signature could not be verified ({msg}). \
+                         Import the project GPG key to enforce verification."),
+            );
+        }
+        Err(e) => {
+            let _ = app_handle.emit(
+                "kim-update-progress",
+                format!("Warning: git verify-commit unavailable ({e}) — skipping signature check."),
+            );
+        }
     }
 
     let _ = app_handle.emit("kim-update-progress", "Updating Python dependencies…");
@@ -179,7 +268,14 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
                 }
             }
         }
-        std::process::exit(0);
+        // Use app_handle.exit() instead of std::process::exit() so that Tauri's
+        // cleanup handlers and Rust Drop implementations run before the process
+        // terminates.  std::process::exit() skips all of this.
+        // Note: app_handle.exit() returns () and does NOT diverge (it schedules
+        // exit asynchronously), so we must explicitly return Ok(()) here so the
+        // function's return type (Result<(), String>) is satisfied.
+        app_handle.exit(0);
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {

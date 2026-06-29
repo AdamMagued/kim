@@ -90,10 +90,9 @@ pub async fn save_attachment(filename: String, data_base64: String) -> Result<St
 pub async fn region_screenshot(app_handle: tauri::AppHandle) -> Result<String, String> {
     use tauri::Manager;
     let base = std::env::temp_dir().join("kim_attachments");
-    let dir = base.join(format!(
-        "{}-region",
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
-    ));
+    let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let n = ATTACHMENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = base.join(format!("{ms}-{n}-region"));
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let dest = dir.join("region.png");
 

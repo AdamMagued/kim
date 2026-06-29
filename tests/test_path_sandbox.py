@@ -182,5 +182,92 @@ class WriteFileBinaryTests(_AllowExtraPathMixin, unittest.TestCase):
         self.assertEqual((self.tmp / "blob.bin").read_bytes(), raw)
 
 
+# ── Regression: case-insensitive secret-file glob matching ────────────────────
+
+
+class CaseInsensitiveSecretGlobTests(unittest.TestCase):
+    """Behaviour 1 — secret-file globs must fire regardless of filename case."""
+
+    def test_uppercase_credentials_denied(self):
+        # AWS/CREDENTIALS — upper-cased name must still match the 'credentials' glob.
+        with self.assertRaises(PermissionError):
+            validate_path("AWS/CREDENTIALS")
+
+    def test_uppercase_dotenv_denied(self):
+        # .ENV — upper-cased name must still match the '.env' glob.
+        with self.assertRaises(PermissionError):
+            validate_path(".ENV")
+
+    def test_uppercase_id_rsa_denied(self):
+        # ID_RSA — upper-cased name must still match the 'id_rsa*' glob.
+        with self.assertRaises(PermissionError):
+            validate_path("ID_RSA")
+
+
+# ── Regression: case-insensitive sensitive-directory matching ─────────────────
+
+
+class CaseInsensitiveSensitiveDirTests(_AllowExtraPathMixin, unittest.TestCase):
+    """Behaviour 2 — sensitive-dir deny list must block upper/mixed-case variants."""
+
+    extra_paths = [_HOME]
+
+    def test_uppercase_aws_dir_denied(self):
+        # ~/.AWS/credentials — dir name upper-cased; must still be blocked via
+        # the lower-cased prefix comparison in validate_path().
+        target = _HOME / ".AWS" / "credentials"
+        with self.assertRaises(PermissionError):
+            validate_path(str(target))
+
+    def test_lowercase_google_chrome_library_denied(self):
+        # macOS Library path with 'google'/'chrome' lower-cased — must still
+        # be blocked because the comparison is done after lowercasing both sides.
+        target = _HOME / "Library" / "Application Support" / "google" / "chrome" / "Cookies"
+        with self.assertRaises(PermissionError):
+            validate_path(str(target))
+
+
+# ── Regression: Linux and Windows browser-profile paths are denied ────────────
+
+
+class LinuxWindowsBrowserPathTests(_AllowExtraPathMixin, unittest.TestCase):
+    """Behaviour 3 — newly-listed Linux/Windows browser paths must be blocked."""
+
+    extra_paths = [_HOME]
+
+    def test_linux_google_chrome_config_denied(self):
+        # Linux Chrome profile under ~/.config/google-chrome.
+        target = _HOME / ".config" / "google-chrome" / "Default" / "History"
+        with self.assertRaises(PermissionError):
+            validate_path(str(target))
+
+    def test_windows_chrome_appdata_roaming_denied(self):
+        # Windows Chrome profile under AppData/Roaming (listed unconditionally).
+        target = (
+            _HOME / "AppData" / "Roaming" / "Google" / "Chrome" / "User Data" / "Default"
+        )
+        with self.assertRaises(PermissionError):
+            validate_path(str(target))
+
+
+# ── Regression: normal project files must still be allowed ────────────────────
+
+
+class AllowedPathPassesTests(unittest.TestCase):
+    """Behaviour 4 — deny-list additions must not over-block ordinary project files."""
+
+    def test_normal_project_file_passes(self):
+        from mcp_server.config import PROJECT_ROOT
+
+        # A regular Python source file inside PROJECT_ROOT must pass without error.
+        p = validate_path(str(PROJECT_ROOT / "mcp_server" / "config.py"))
+        self.assertEqual(p.name, "config.py")
+
+    def test_plain_text_file_passes(self):
+        # A relative non-secret filename must resolve and validate cleanly.
+        p = validate_path("notes.txt")
+        self.assertEqual(p.name, "notes.txt")
+
+
 if __name__ == "__main__":
     unittest.main()

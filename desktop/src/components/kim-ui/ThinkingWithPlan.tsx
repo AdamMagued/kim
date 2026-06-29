@@ -1,5 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import type { PlanStep } from './CollapsiblePlan';
+
+export type PlanStepStatus = 'done' | 'active' | 'pending' | 'todo';
+
+export interface PlanStep {
+  status: PlanStepStatus;
+  text: string;
+}
 
 export type TraceItem =
   | { kind: 'thought'; text: string; active?: boolean }
@@ -31,6 +37,7 @@ function verbColor(verb: string): string {
 function InlinePlanBlock({ plan, look = 'card' }: { plan: Extract<TraceItem, { kind: 'plan' }>; look?: 'card' | 'compact' }) {
   const allDone = plan.items.length > 0 && plan.items.every((i) => i.status === 'done');
   const [open, setOpen] = useState(true);
+  const panelId = `kim-plan-${plan.title.replace(/\s+/g, '-').toLowerCase()}`;
 
   // Auto-collapse once every step is checked off
   useEffect(() => {
@@ -58,6 +65,8 @@ function InlinePlanBlock({ plan, look = 'card' }: { plan: Extract<TraceItem, { k
       <button
         type="button"
         onClick={() => setOpen(!open)}
+        aria-expanded={open}
+        aria-controls={panelId}
         style={{
           width: '100%',
           display: 'flex',
@@ -150,7 +159,7 @@ function InlinePlanBlock({ plan, look = 'card' }: { plan: Extract<TraceItem, { k
         )}
       </button>
       {open && (
-        <div style={{ padding: isCard ? '4px 18px 16px 18px' : '2px 12px 10px', borderTop: '1px solid var(--kim-border)' }}>
+        <div id={panelId} style={{ padding: isCard ? '4px 18px 16px 18px' : '2px 12px 10px', borderTop: '1px solid var(--kim-border)' }}>
           {plan.items.map((it, i) => {
             if (isCard) {
               return (
@@ -288,7 +297,7 @@ function InlinePlanBlock({ plan, look = 'card' }: { plan: Extract<TraceItem, { k
   );
 }
 
-export function ThinkingWithPlan({ trace, duration = '0:23', steps, planLook = 'card', style, className, live = true }: Props) {
+export function ThinkingWithPlan({ trace, duration = '', steps, planLook = 'card', style, className, live = true }: Props) {
   const explicitActive = trace.findIndex((i) => 'active' in i && (i as { active?: boolean }).active);
   const streamItems = trace.map((it, i) => ({ ...it, i })).filter((it) => it.kind !== 'plan');
   const lastItem = streamItems[streamItems.length - 1] as { i: number } | undefined;

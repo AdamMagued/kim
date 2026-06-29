@@ -23,18 +23,25 @@ export function useTheme(initial: Theme = 'light') {
     return stored ?? initial;
   });
 
-  const resolvedTheme: 'dark' | 'light' =
-    theme === 'system' ? getSystemTheme() : theme;
+  const [resolvedTheme, setResolvedTheme] = useState<'dark' | 'light'>(() =>
+    theme === 'system' ? getSystemTheme() : theme
+  );
 
   useEffect(() => {
-    applyTheme(resolvedTheme);
-  }, [resolvedTheme]);
+    const resolved = theme === 'system' ? getSystemTheme() : theme;
+    setResolvedTheme(resolved);
+    applyTheme(resolved);
+  }, [theme]);
 
   // React to OS-level theme changes when "system" is selected
   useEffect(() => {
     if (theme !== 'system') return;
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
-    const handler = () => applyTheme(getSystemTheme());
+    const handler = () => {
+      const resolved = getSystemTheme();
+      setResolvedTheme(resolved);
+      applyTheme(resolved);
+    };
     mq.addEventListener('change', handler);
     return () => mq.removeEventListener('change', handler);
   }, [theme]);

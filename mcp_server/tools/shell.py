@@ -3,7 +3,9 @@ Kim MCP Server — Shell Execution Tools
 
 Provides run_command and run_powershell tools with:
   - Blocked-command filtering (shlex-based, exact-match deny set)
-  - Metacharacter rejection for command chaining
+  - Metacharacter rejection for command chaining, process substitution, and
+    subshell grouping
+  - Per-segment vetting when allow_chaining=True (finding 2)
   - Cross-platform command translation via os_utils
   - Platform-aware PowerShell / bash fallback
 """
@@ -28,11 +30,19 @@ from mcp_server.os_utils import (
 
 logger = logging.getLogger(__name__)
 
-# ── Deny sets (#2 — stronger shell blocklist) ─────────────────────────────────
+# ── Deny sets ─────────────────────────────────────────────────────────────────
 
-# Commands that are unconditionally blocked (first token after shlex.split)
+# Commands that are unconditionally blocked (first token after shlex.split).
+# Includes network-transfer tools that can exfiltrate secret files in a single
+# call, bypassing the validate_path sandbox (finding 3, partial — cat/cp/mv
+# require a tier-based confirmation system outside this module's scope).
 _DENY_COMMANDS = frozenset({
+    # Destructive filesystem tools
     "rm", "rmdir", "del", "format", "diskpart", "mkfs", "dd", "shred",
+    # Truncation (finding 5)
+    "truncate",
+    # Network / exfiltration tools (finding 3, partial)
+    "curl", "wget", "scp", "rsync", "nc", "netcat",
 })
 
 # Regex patterns that catch common destructive payloads even in arguments
@@ -42,22 +52,91 @@ _DENY_PATTERNS = [
     re.compile(r"\bdd\b.*\bif=/dev/zero\b"),  # dd if=/dev/zero
 ]
 
-# Metacharacters that enable command chaining / injection.
-# \n and \r are included because the POSIX shell treats newline identically
-# to semicolon as a command separator, making them a bypass vector for the
-# allow_chaining=False guard when the string is passed to create_subprocess_shell.
-_CHAIN_METACHAR_RE = re.compile(r"[;|&`\n\r]|\$\(")
+# Fast-path metacharacter regex: catches chaining, command/process substitution.
+# NOTE: bare '>' and '<' (plain redirection) are intentionally excluded here —
+# existing callers depend on redirection working (e.g. `printf x > file`).
+# Process substitution '<(...)' / '>(' is caught by the '<\(' / '>\(' patterns.
+# \n and \r are included: POSIX shells treat newline like ';' as a separator.
+_CHAIN_METACHAR_RE = re.compile(r"[;|&`\n\r]|\$\(|<\(|>\(")
+
+# Operator-level split used to isolate individual segments when chaining is
+# allowed.  '&&' and '||' must appear before the single-char alternatives so
+# the two-char forms consume both characters first (finding 2).
+_OPERATOR_SPLIT_RE = re.compile(r"&&|\|\||[;|\n\r&]")
+
+# Regex for shell redirection operators after shlex.split (e.g. ">", ">>", "2>", "&>").
+# Used to detect redirections targeting absolute paths (finding 1a).
+# Plain redirection to a *relative* name is allowed so that `printf probe > file`
+# keeps working in sandbox tests.
+_REDIR_OP_RE = re.compile(r"^\d*>>?$|^&>>?$")
+
+# Regex that matches a leading redirect-operator prefix inside a no-space token
+# like '>/etc/passwd' or '>>/abs/path' (finding 1).  The captured remainder after
+# the prefix is the redirect target and must be validated like the space-separated
+# form.  Covers \d*>> ?, &>> ?, and < (input redirect).
+_REDIR_PREFIX_RE = re.compile(r"^(\d*>>?|&>>?|<)")
 
 _SANDBOX_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
+# Env vars that can be used for code injection even in non-sandboxed mode.
+# An operator may disable the sandbox for legitimate reasons, but the child
+# process should still never inherit dynamic-linker or interpreter-path
+# overrides that a compromised parent environment might carry (finding 2,
+# part c — 'Never inherit full parent env for non-sandboxed runs').
+_DANGEROUS_ENV_VARS = frozenset({
+    # Dynamic linker / runtime injection (Linux)
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
+    # Dynamic linker / runtime injection (macOS)
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+    # Python startup and module-path manipulation
+    "PYTHONSTARTUP", "PYTHONPATH",
+    # Node.js / Ruby / Perl module paths
+    "NODE_PATH", "RUBYLIB", "PERL5LIB", "PERLLIB",
+})
 
-def _sandbox_enabled(args: dict) -> bool:
-    if "sandbox_mode" in args:
-        return bool(args.get("sandbox_mode"))
+
+def _filtered_env() -> dict[str, str]:
+    """Return a copy of the parent env with injection-vector variables removed.
+
+    Used for non-sandbox subprocess runs so that a poisoned parent environment
+    (e.g. LD_PRELOAD pointing at a malicious shared library) cannot affect
+    child processes even when the operator has disabled the full sandbox
+    (finding 2, part c).
+    """
+    return {k: v for k, v in os.environ.items() if k not in _DANGEROUS_ENV_VARS}
+
+
+def _sandbox_enabled() -> bool:
+    """Return the operator-level sandbox mode flag.
+
+    Intentionally does NOT accept model-supplied args — sandbox_mode must be
+    set via operator/server config (SHELL_SANDBOX_MODE) only (finding 2).
+    """
     return SHELL_SANDBOX_MODE
 
 
 def _sandbox_env() -> dict[str, str]:
+    """Build a minimal, safe environment for sandboxed subprocess execution.
+
+    POSIX: restricts PATH to standard system directories, sets HOME/TMPDIR.
+    Windows: uses the Windows-appropriate equivalents so cmd.exe can start
+    (finding 3).
+    """
+    if IS_WINDOWS:
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        env: dict[str, str] = {
+            "Path": rf"{system_root}\System32;{system_root}",
+            "SystemRoot": system_root,
+            "TEMP": tempfile.gettempdir(),
+            "TMP": tempfile.gettempdir(),
+            "USERPROFILE": str(PROJECT_ROOT),
+        }
+        # Preserve ComSpec so cmd.exe knows its own path
+        comspec = os.environ.get("ComSpec")
+        if comspec:
+            env["ComSpec"] = comspec
+        return env
+    # POSIX (macOS / Linux) — unchanged behaviour
     env = {
         "PATH": _SANDBOX_PATH,
         "HOME": str(PROJECT_ROOT),
@@ -84,25 +163,26 @@ def _first_non_option(tokens: list[str], start: int = 0) -> str | None:
     return None
 
 
-def _check_blocked(cmd: str, allow_chaining: bool = False) -> str | None:
-    """Check if a command should be blocked. Returns an error message or None."""
-    cmd_stripped = cmd.strip()
+def _check_single_segment(cmd: str) -> str | None:
+    """Vet one already-isolated command segment (no chaining metacharacters
+    expected at this level).  Returns an error string or None if safe."""
+    cmd_clean = cmd.strip()
+    if not cmd_clean:
+        return None
 
-    # 1. Check for dangerous regex patterns in raw command
-    for pat in _DENY_PATTERNS:
-        if pat.search(cmd_stripped):
-            return f"BLOCKED: Command matches dangerous pattern"
+    # Subshell group: an unquoted leading '(' opens a subshell (finding 1)
+    if cmd_clean.startswith("("):
+        return "BLOCKED: Command contains a subshell group"
 
-    # 2. Reject command chaining metacharacters unless explicitly allowed
-    if not allow_chaining and _CHAIN_METACHAR_RE.search(cmd_stripped):
-        return (
-            "BLOCKED: Command contains chaining metacharacters (;, &&, ||, |, `, $(...)). "
-            "Use separate run_command calls for each command, or pass allow_chaining=True."
-        )
+    # Backtick command substitution: shlex does NOT strip backticks, so they
+    # survive as literal characters and execute via /bin/sh.  Block here so
+    # that `echo \`rm -rf /tmp/x\`` is caught even when allow_chaining=True
+    # (finding 1b — backtick stays in one segment after operator split).
+    if "`" in cmd_clean:
+        return "BLOCKED: Command contains backtick command substitution"
 
-    # 3. Parse with shlex and check first token against deny set
     try:
-        tokens = shlex.split(cmd_stripped)
+        tokens = shlex.split(cmd_clean)
     except ValueError:
         # Malformed quoting — treat as suspicious
         return "BLOCKED: Command has malformed shell quoting"
@@ -110,43 +190,164 @@ def _check_blocked(cmd: str, allow_chaining: bool = False) -> str | None:
     if not tokens:
         return None
 
+    # Detect process/command substitution tokens that may survive operator
+    # splitting (e.g. the <(rm ...) token in `cat <(rm ...)`) (finding 1)
+    for token in tokens:
+        if token.startswith(("<(", ">(", "$(")):
+            return "BLOCKED: Command contains process or command substitution"
+
+    # Redirection to an absolute path or parent-directory traversal is blocked
+    # (finding 1a).  Relative redirects (`printf probe > file`) are allowed so
+    # the sandbox write-isolation test keeps passing.
+    #
+    # Two forms must be caught:
+    #   Space-separated : tokens[i] == '>'  and tokens[i+1] == '/etc/passwd'
+    #   No-space        : tokens[i] == '>/etc/passwd'  (single merged token)
+    for i, tok in enumerate(tokens):
+        # Space-separated form: standalone operator followed by separate target
+        if _REDIR_OP_RE.match(tok) and i + 1 < len(tokens):
+            target = tokens[i + 1]
+            if target.startswith("/") or ".." in target:
+                return "BLOCKED: Redirection to absolute path or parent traversal"
+        # No-space form: operator prefix merged with target in the same token
+        # e.g. '>/etc/passwd', '>>/abs/p', '2>/dev/null', '< /etc/shadow'
+        m = _REDIR_PREFIX_RE.match(tok)
+        if m and m.end() < len(tok):
+            target = tok[m.end():]
+            if target.startswith("/") or ".." in target:
+                return "BLOCKED: Redirection to absolute path or parent traversal"
+
     first_cmd = _basename(tokens[0])
     if first_cmd in _DENY_COMMANDS:
         return f"BLOCKED: '{first_cmd}' is a blocked command"
 
-    # 4. Wrapper commands can otherwise hide a blocked command as the next token.
-    if first_cmd in {"sudo", "doas", "command", "env", "nohup", "nice", "time"}:
+    # Dangerous find usage: -delete flag or -exec/-execdir with a blocked cmd
+    # (finding 5)
+    if first_cmd == "find":
+        if "-delete" in tokens:
+            return "BLOCKED: 'find -delete' is a blocked pattern"
+        for i, t in enumerate(tokens):
+            if t in {"-exec", "-execdir"} and i + 1 < len(tokens):
+                exec_name = _basename(tokens[i + 1])
+                if exec_name in _DENY_COMMANDS:
+                    return f"BLOCKED: 'find {t} {exec_name}' is a blocked pattern"
+
+    # xargs executes its first non-option argument as a command.
+    # Handles both `-I{}` (no-space) and `-I {}` (space-separated) replacement
+    # forms: skip the placeholder token that follows `-I` so that the actual
+    # command is correctly identified (finding 2 / finding 5).
+    if first_cmd == "xargs":
+        xargs_cmd: str | None = None
+        i = 1
+        while i < len(tokens):
+            t = tokens[i]
+            if t == "-I" and i + 1 < len(tokens):
+                # Space-separated: `-I PLACEHOLDER COMMAND …` — skip placeholder
+                i += 2
+                continue
+            if t == "--":
+                i += 1
+                continue
+            if t.startswith("-"):
+                i += 1
+                continue
+            if "=" in t and not t.startswith(("/", "\\")):
+                i += 1
+                continue
+            xargs_cmd = t
+            break
+        if xargs_cmd:
+            xargs_name = _basename(xargs_cmd)
+            if xargs_name in _DENY_COMMANDS:
+                return f"BLOCKED: 'xargs {xargs_name}' is a blocked command"
+
+    # Wrapper commands can hide a blocked command as the next token.
+    # busybox is included because it proxies any coreutil by name (finding 5).
+    if first_cmd in {"sudo", "doas", "command", "env", "nohup", "nice", "time", "busybox"}:
         wrapped = _first_non_option(tokens, 1)
         if wrapped:
             wrapped_name = _basename(wrapped)
             if wrapped_name in _DENY_COMMANDS:
                 return f"BLOCKED: '{wrapped_name}' is a blocked command"
-            wrapped_index = tokens.index(wrapped)
+            wrapped_index = next(i for i in range(1, len(tokens)) if tokens[i] == wrapped)
             if wrapped_name in {"sudo", "doas", "command", "env", "nohup", "nice", "time", "sh", "bash", "zsh", "fish"}:
-                nested_msg = _check_blocked(" ".join(tokens[wrapped_index:]), allow_chaining=allow_chaining)
+                nested_msg = _check_single_segment(" ".join(tokens[wrapped_index:]))
                 if nested_msg:
                     return f"BLOCKED: wrapper contains blocked command. {nested_msg}"
+            # busybox can proxy `find` — apply find-specific -delete/-exec checks
+            # even though `find` itself is not in _DENY_COMMANDS (finding 5).
+            if wrapped_name == "find":
+                subtokens = tokens[wrapped_index:]
+                if "-delete" in subtokens:
+                    return "BLOCKED: 'find -delete' is a blocked pattern (via wrapper)"
+                for i, t in enumerate(subtokens):
+                    if t in {"-exec", "-execdir"} and i + 1 < len(subtokens):
+                        exec_name = _basename(subtokens[i + 1])
+                        if exec_name in _DENY_COMMANDS:
+                            return f"BLOCKED: 'find {t} {exec_name}' is a blocked pattern (via wrapper)"
 
-    # 5. Shell wrappers (`bash -c`, `sh -c`, etc.) must recursively vet the script.
+    # Shell wrappers (`bash -c`, `sh -c`, etc.) must recursively vet the script.
     if first_cmd in {"sh", "bash", "zsh", "fish"}:
         try:
             c_index = tokens.index("-c")
         except ValueError:
             c_index = -1
         if c_index >= 0 and c_index + 1 < len(tokens):
-            nested_msg = _check_blocked(tokens[c_index + 1], allow_chaining=allow_chaining)
+            nested_msg = _check_blocked(tokens[c_index + 1], allow_chaining=False)
             if nested_msg:
                 return f"BLOCKED: shell wrapper contains blocked command. {nested_msg}"
 
     return None
 
 
+def _check_blocked(cmd: str, allow_chaining: bool = False) -> str | None:
+    """Check if a command should be blocked. Returns an error message or None."""
+    cmd_stripped = cmd.strip()
+
+    # 1. Check for dangerous regex patterns in raw command
+    for pat in _DENY_PATTERNS:
+        if pat.search(cmd_stripped):
+            return "BLOCKED: Command matches dangerous pattern"
+
+    # 2. Subshell-group fast path: a command that starts with '(' is a subshell
+    #    (finding 1 — catches `(rm -rf /)` before shlex parsing)
+    if cmd_stripped.startswith("("):
+        return "BLOCKED: Command starts with a subshell group"
+
+    # 3. Metacharacter handling
+    if _CHAIN_METACHAR_RE.search(cmd_stripped):
+        if not allow_chaining:
+            return (
+                "BLOCKED: Command contains chaining/injection metacharacters "
+                "(;, &&, ||, |, `, $(...), <(...), >(...) or similar). "
+                "Use separate run_command calls for each command, or pass allow_chaining=True."
+            )
+        # When chaining is allowed, split on operators and vet every individual
+        # segment so that `true && rm -rf /` cannot sneak through (finding 2).
+        # Note: splitting on raw operators cannot respect quoted operators (e.g.
+        # a semicolon inside a string literal); this is an accepted trade-off
+        # between security and a full POSIX-shell parse.
+        segments = _OPERATOR_SPLIT_RE.split(cmd_stripped)
+        for raw_seg in segments:
+            seg_msg = _check_single_segment(raw_seg)
+            if seg_msg:
+                return seg_msg
+        return None
+
+    # 4. No metacharacters detected: vet as a single command segment
+    return _check_single_segment(cmd_stripped)
+
+
 async def handle_run_command(args: dict) -> str:
     cmd = args["cmd"]
     cwd = str(args.get("cwd", str(PROJECT_ROOT)))
     timeout = int(args.get("timeout", SHELL_TIMEOUT))
-    allow_chaining = bool(args.get("allow_chaining", False))
-    sandbox_mode = _sandbox_enabled(args)
+    # allow_chaining and sandbox_mode are operator/server-config-only values —
+    # never read from model-supplied args (finding 2).  Any model-injected copy
+    # of these keys is silently ignored here; additionalProperties:false on the
+    # schema prevents them from being accepted in the first place.
+    allow_chaining = False
+    sandbox_mode = _sandbox_enabled()
 
     block_msg = _check_blocked(cmd, allow_chaining=allow_chaining)
     if block_msg:
@@ -180,7 +381,9 @@ async def handle_run_command(args: dict) -> str:
             env = _sandbox_env()
         else:
             exec_cwd = cwd
-            env = None
+            # Never inherit the full parent env — strip injection-vector vars
+            # even in non-sandbox mode (finding 2, part c).
+            env = _filtered_env()
 
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -229,7 +432,8 @@ async def handle_run_powershell(args: dict) -> str:
     """
     script = args["script"]
     timeout = int(args.get("timeout", SHELL_TIMEOUT))
-    sandbox_mode = _sandbox_enabled(args)
+    # sandbox_mode is operator/server-config-only — never from model args (finding 2).
+    sandbox_mode = _sandbox_enabled()
 
     block_msg = _check_blocked(script, allow_chaining=True)  # PS scripts naturally chain
     if block_msg:
@@ -262,7 +466,9 @@ async def handle_run_powershell(args: dict) -> str:
             env = _sandbox_env()
         else:
             exec_cwd = str(PROJECT_ROOT)
-            env = None
+            # Never inherit the full parent env — strip injection-vector vars
+            # even in non-sandbox mode (finding 2, part c).
+            env = _filtered_env()
 
         ps_args = [
             ps_exe,

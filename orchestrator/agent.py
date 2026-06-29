@@ -36,16 +36,13 @@ import io
 import json
 import logging
 import os
-import platform
 import random
 import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, Optional
 
-import yaml
 from dotenv import load_dotenv
 from mcp import ClientSession
 
@@ -75,33 +72,9 @@ _COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
 
 
 # ---------------------------------------------------------------------------
-# OS detection (used by system prompt and operational guidelines)
+# OS detection (extracted to orchestrator/agent_env.py)
 # ---------------------------------------------------------------------------
-
-def _detect_os() -> tuple[str, str, str]:
-    """Return (os_display_name, launch_example, path_style)."""
-    system = platform.system()
-    if system == "Darwin":
-        return (
-            "macOS",
-            "`open -a 'TextEdit'`",
-            "POSIX paths (e.g. /Users/...)",
-        )
-    elif system == "Linux":
-        return (
-            "Linux",
-            "`xdg-open` or `gedit`",
-            "POSIX paths (e.g. /home/...)",
-        )
-    else:
-        return (
-            "Windows",
-            "`start notepad.exe`",
-            "Windows paths (e.g. C:\\...)",
-        )
-
-
-_OS_NAME, _LAUNCH_EXAMPLE, _PATH_STYLE = _detect_os()
+from orchestrator.agent_env import _detect_os, _OS_NAME, _LAUNCH_EXAMPLE, _PATH_STYLE  # noqa: E402,F401
 
 # ---------------------------------------------------------------------------
 # Tool name normalization (extracted to orchestrator/tool_utils.py)
@@ -119,33 +92,9 @@ from orchestrator.ui_bridge import UIBridge  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Config loading
+# Config loading (extracted to orchestrator/agent_config.py)
 # ---------------------------------------------------------------------------
-
-_DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
-
-
-def load_config(path: Optional[str] = None) -> dict:
-    cfg_path = Path(path) if path else _DEFAULT_CONFIG_PATH
-    if not cfg_path.exists():
-        logger.warning(f"config.yaml not found at {cfg_path}, using defaults")
-        return {}
-    with open(cfg_path) as f:
-        return yaml.safe_load(f) or {}
-
-
-def _resolve_hitl_threshold(config: dict, env_val: Optional[str] = None) -> Optional[str]:
-    """Return the HITL risk threshold from config or env var.
-
-    Accepts "high", "medium", or "low".  Config key wins over env var.
-    Any other value (including None / empty string) disables the gate.
-    """
-    raw = config.get("hitl_risk_threshold") or env_val
-    if raw is None:
-        return None
-    normalized = str(raw).strip().lower()
-    return normalized if normalized in ("high", "medium", "low") else None
-
+from orchestrator.agent_config import _DEFAULT_CONFIG_PATH, load_config, _resolve_hitl_threshold, DEFAULT_PROVIDER  # noqa: E402,F401
 
 # ---------------------------------------------------------------------------
 # MCP client (extracted to orchestrator/mcp_client.py)
@@ -387,9 +336,6 @@ class KimAgent:
         if usage:
             try:
                 self._log("INFO", f"[USAGE] {json.dumps(usage, ensure_ascii=False, separators=(',', ':'))}")
-                _usage_typed: dict = {"type": "usage"}
-                _usage_typed.update(usage)
-                print(json.dumps(_usage_typed, ensure_ascii=False, separators=(",", ":")), flush=True)
             except Exception:
                 logger.debug("Failed to serialize usage payload", exc_info=True)
 
@@ -478,6 +424,15 @@ class KimAgent:
         Returns:
             {"success": bool, "summary": str, "screenshot": str (base64)}
         """
+        # Attach run_id / session_id to every log line for this run.
+        try:
+            from orchestrator.obs_logging import init_logging as _init_logging
+            _run_id = getattr(self._session_store, "session_id", "") or ""
+            _sess_id = str(getattr(self, "_resume_session_id", "") or "")
+            _init_logging(run_id=_run_id, session_id=_sess_id)
+        except Exception:
+            pass  # logging must never crash startup
+
         self._log("INFO", f"=== Starting task: {task!r} ===")
         print(json.dumps({"type": "status", "message": "Kim is working on it…"}, separators=(",", ":"), ensure_ascii=False), flush=True)
         # K3: start the shared stdin pump so mid-run steer lines are captured.
@@ -488,8 +443,8 @@ class KimAgent:
                 pump = get_stdin_pump()
                 pump.set_steer_callback(self.add_steer)
                 pump.start()
-            except Exception:
-                pass
+            except Exception as _pump_err:
+                logger.warning("stdin pump start failed: %s", _pump_err)
         self._screenshot_hashes = []
         self._recent_action_sigs = []
         # Reset plan/step dedupe so a fresh PLAN block at the start of this
@@ -538,16 +493,23 @@ class KimAgent:
         else:
             self.memory.clear()
 
-        await self._refresh_tools()
-        if not self._tools:
+        try:
+            await self._refresh_tools()
+            if not self._tools:
+                return self._complete_run(make_run_result(
+                    AgentTermination.PROVIDER_FAILED,
+                    "No MCP tools available",
+                    "",
+                ))
+            self._emit_context_snapshot()
+            system_prompt = self._build_system_prompt(task)
+        except Exception as _startup_err:
+            self._log("ERROR", f"Agent startup failed: {_startup_err}")
             return self._complete_run(make_run_result(
                 AgentTermination.PROVIDER_FAILED,
-                "No MCP tools available",
+                f"Agent startup failed: {_startup_err}",
                 "",
             ))
-
-        self._emit_context_snapshot()
-        system_prompt = self._build_system_prompt(task)
         # Inject compact summary (if present) at the top of the system prompt so
         # all API providers receive it without embedding a system-role message in
         # the messages list (which Anthropic's API does not permit).
@@ -556,32 +518,80 @@ class KimAgent:
             system_prompt = compact_ctx + "\n\n---\n\n" + system_prompt
         self._run_consecutive_continues: int = 0
         self._run_last_tool: Optional[str] = None
+        self._run_iteration: int = 0
 
         self._run_screenshot_b64: str = ""
+        self._suppress_screen_tools_first_turn: bool = False
 
         # Browser web-chat models (Gemini/Claude/ChatGPT web) can't reliably emit a
         # take_screenshot tool call, so a visual question like "what's on my screen?"
         # would be answered blind. Proactively capture the screen on the first turn
         # and attach it to the task message so the model actually sees the desktop.
-        first_content: Any = f"Task: {task}"
+        first_content: Any = f"Task: {task}"   # what is shown in the chat bubble
+        llm_first_content: Any = None          # what the model receives, when it differs
         if type(self.provider).__name__ == "BrowserProvider" and _looks_visual(task):
+            # Visual question on a browser web-chat model. Capture the screen and:
+            #   1. attach it as an IMAGE so the bridge can paste it into the chat with a
+            #      real Cmd+V (a trusted paste the editor accepts — the window must be
+            #      visible/focused for this), giving true "what's on screen" vision; and
+            #   2. ALSO enumerate the open windows as a TEXT fallback, so if the image
+            #      paste fails the model can still answer from the window list.
+            # The image goes in the user's visible bubble; the window-list + the "answer
+            # directly, don't call tools" instruction go ONLY into the model's copy (kept
+            # out of the bubble) and live in the USER message — a reused thread skips the
+            # system prompt on follow-up turns, so context there would be dropped.
+            shot_b64 = ""
             try:
                 shot_b64 = await self._take_screenshot()
-                if shot_b64:
-                    self._run_screenshot_b64 = shot_b64
-                    first_content = [
-                        {"type": "text", "text": f"Task: {task}"},
-                        {"type": "image", "data": shot_b64, "media_type": "image/png"},
-                    ]
-                    self._log("INFO", "Attached proactive screenshot for browser visual task")
             except Exception as e:
                 self._log("WARN", f"Proactive screenshot for browser provider failed: {e}")
+            windows_text = ""
+            try:
+                windows_text = (await self._execute_tool("get_windows", {}) or "").strip()
+            except Exception as e:
+                self._log("WARN", f"get_windows for visual context failed: {e}")
+
+            if shot_b64 or windows_text:
+                self._suppress_screen_tools_first_turn = True
+                img_block = None
+                if shot_b64:
+                    self._run_screenshot_b64 = shot_b64
+                    img_block = {"type": "image", "data": shot_b64, "media_type": "image/png"}
+                ctx = [f"Task: {task}"]
+                if shot_b64:
+                    ctx.append("\nA screenshot of my screen is attached — describe what you actually see in it.")
+                if windows_text:
+                    ctx.append("\n[Fallback context — the open windows are:]\n" + windows_text)
+                ctx.append(
+                    "\nAnswer directly. Do NOT call get_windows, take_screenshot, or any other "
+                    "tool — reply with TASK_COMPLETE: <your answer>."
+                )
+                llm_text = "\n".join(ctx)
+                if img_block:
+                    first_content = [{"type": "text", "text": f"Task: {task}"}, img_block]
+                    llm_first_content = [{"type": "text", "text": llm_text}, img_block]
+                else:
+                    llm_first_content = llm_text
+                self._log("INFO", f"Visual browser turn — image={'y' if shot_b64 else 'n'}, windows={'y' if windows_text else 'n'}")
 
         first_msg = {"role": "user", "content": first_content}
-        self.memory.add_user(first_content, has_screenshot=isinstance(first_content, list))
+        self.memory.add_user(
+            llm_first_content if llm_first_content is not None else first_content,
+            has_screenshot=isinstance(first_content, list),
+        )
         self._session_store.append_message(first_msg)
 
+        # Browser web-chat threads submit reliably only on a FRESH chat: the first
+        # message of a session always sends, but submitting a follow-up into a reused
+        # thread is flaky — Gemini's send button doesn't always register programmatic
+        # input (diagnosed: prompt stuck in the editor, send never fires). The browser
+        # provider is free (no API tokens), so starting every message on a fresh chat
+        # and re-sending context is the right trade: reliable > the payload saving.
+        if type(self.provider).__name__ == "BrowserProvider":
+            self._clear_chat_on_next_call = True
+
         for iteration in range(1, self.max_iterations + 1):
+            self._run_iteration = iteration
             # ── Cancellation check ──────────────────────────────────────
             if self._is_cancelled():
                 self._log("WARN", "Task cancelled by user")
@@ -601,18 +611,22 @@ class KimAgent:
             # K3: fold any mid-run steering into memory before this LLM call.
             self._drain_steers()
             request_messages = self.memory.get_messages()
-            request_estimate = estimate_request_tokens(
-                request_messages,
-                tools=self._tools,
-                system=system_prompt,
-            )
+
+            # A screenshot was attached to the first message — withhold the
+            # screen-reading tools on that turn so the model answers from the
+            # image instead of triggering a second round-trip (issue #4 hang).
+            call_tools = self._tools
+            if iteration == 1 and self._suppress_screen_tools_first_turn:
+                call_tools = [t for t in self._tools if t.get("name") not in _SCREEN_READ_TOOLS]
+                if len(call_tools) != len(self._tools):
+                    self._log("INFO", "Screenshot attached — withholding screen-read tools on first turn so the answer comes from the image")
 
             # ── LLM call with retry ─────────────────────────────────────
             try:
                 clear_chat = self._clear_chat_on_next_call and iteration == 1
                 response = await self._call_with_retry(
                     messages=request_messages,
-                    tools=self._tools,
+                    tools=call_tools,
                     system=system_prompt,
                     clear_chat=clear_chat,
                 )
@@ -631,8 +645,21 @@ class KimAgent:
                 return self._complete_run(make_run_result(AgentTermination.PROVIDER_FAILED, need_help, self._run_screenshot_b64))
 
             # ── Track token/context usage ────────────────────────────────
+            # Compute the request-size estimate lazily — only when the provider
+            # did not return exact input_tokens (avoids re-serializing ~50 tool
+            # schemas on every iteration when real usage is already available).
+            _usage = response.get("usage", {})
+            _has_exact_input = bool(
+                _usage.get("input") or _usage.get("input_tokens") or _usage.get("prompt_tokens")
+            ) and not bool(
+                _usage.get("estimated") or _usage.get("estimate") or _usage.get("is_estimate")
+            )
+            request_estimate = (
+                None if _has_exact_input
+                else estimate_request_tokens(request_messages, tools=call_tools, system=system_prompt)
+            )
             self._track_context_usage(
-                response.get("usage", {}),
+                _usage,
                 fallback_input_tokens=request_estimate,
                 fallback_source=type(self.provider).__name__,
             )
@@ -675,8 +702,9 @@ class KimAgent:
         tool_args = response.get("args", {})
         if raw_tool_name != tool_name:
             self._log("INFO", f"Normalized tool name '{raw_tool_name}' -> '{tool_name}'")
-        self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]})")
-        print(f"[TOOL] {tool_name}({json.dumps(tool_args)[:120]})", flush=True)
+        _arg_keys = list(tool_args.keys()) if isinstance(tool_args, dict) else []
+        self._log("TOOL", f"{tool_name}(keys={_arg_keys})")
+        print(f"[TOOL] {tool_name}(keys={_arg_keys})", flush=True)
 
         # Model tried to call task_complete as a tool — treat it as TASK_COMPLETE: text
         if tool_name in ("task_complete", "TASK_COMPLETE"):
@@ -696,9 +724,6 @@ class KimAgent:
                     {"role": "user", "content": "[Tool result: batch]\nERROR: 'calls' must be a list."})
                 return None
 
-            _BATCH_SAFE = {"read_file", "list_dir", "git_status", "git_diff",
-                           "git_log", "search_in_files", "find_files",
-                           "get_screen_info", "get_windows", "observe_ui"}
             batch_results = []
             aborted_after = -1
             ok = True
@@ -712,15 +737,9 @@ class KimAgent:
                 sub_tool = _normalize_tool_name(raw_sub_tool)
                 sub_args = call.get("args", {})
 
-                if sub_tool not in _BATCH_SAFE:
-                    batch_results.append(
-                        f"Call {idx} ({raw_sub_tool}): ERROR: Tool '{raw_sub_tool}' "
-                        f"is not safe for batching. Allowed: {', '.join(_BATCH_SAFE)}."
-                    )
-                    ok = False
-                    aborted_after = idx
-                    break
-
+                # Non-safe (mutating) sub-tools are run sequentially just like
+                # safe ones — the preview/HITL gate below provides the same
+                # user-confirmation opportunity as the single-tool code path.
                 if self._is_preview_mode() and self._ui_bridge:
                     confirmed = await self._ui_bridge.confirm_action(sub_tool, sub_args)
                     if not confirmed:
@@ -785,66 +804,13 @@ class KimAgent:
                 AgentTermination.NEED_HELP, summary, self._run_screenshot_b64,
             ))
 
-        # Only include a screenshot if the LLM explicitly called take_screenshot
-        if tool_name == "take_screenshot":
-            screenshot_b64 = result_text
-            if screenshot_b64.startswith("data:image/png;base64,"):
-                screenshot_b64 = screenshot_b64[len("data:image/png;base64,"):]
-            self._run_screenshot_b64 = screenshot_b64
-
-            # Stuck detection
-            if self._is_stuck(screenshot_b64) and iteration > 3:
-                self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
-                return self._complete_run(make_run_result(
-                    AgentTermination.STUCK,
-                    "STUCK: Screen not changing after repeated actions.",
-                    screenshot_b64,
-                ))
-
-            user_content = [
-                {"type": "text", "text": f"[Tool result: {tool_name}]\nScreenshot captured."},
-                {"type": "image", "data": screenshot_b64, "media_type": "image/png"},
-            ]
-            self.memory.add_user(user_content, has_screenshot=True)
-            self._session_store.append_message({"role": "user", "content": user_content})
-
-        elif tool_name == "take_annotated_screenshot":
-            # Parse the JSON result to extract annotated image + grid
-            try:
-                ann_data = json.loads(result_text)
-            except (json.JSONDecodeError, TypeError):
-                ann_data = {}
-
-            ann_image_b64 = ann_data.get("image", "")
-            if ann_image_b64.startswith("data:image/png;base64,"):
-                ann_image_b64 = ann_image_b64[len("data:image/png;base64,"):]
-            self._run_screenshot_b64 = ann_image_b64
-
-            # Build text context with the grid mapping + instructions
-            grid_map = ann_data.get("grid", {})
-            instructions = ann_data.get("instructions", "")
-            screen_w = ann_data.get("screen_width", "?")
-            screen_h = ann_data.get("screen_height", "?")
-            grid_text = (
-                f"[Tool result: {tool_name}]\n"
-                f"Annotated screenshot captured (screen: {screen_w}×{screen_h}).\n"
-                f"{instructions}\n\n"
-                f"Grid marker coordinates (label → [x, y] in real screen pixels):\n"
-                f"{json.dumps(grid_map, separators=(',', ':'))}"
-            )
-
-            if ann_image_b64:
-                user_content = [
-                    {"type": "text", "text": grid_text},
-                    {"type": "image", "data": ann_image_b64, "media_type": "image/png"},
-                ]
-                self.memory.add_user(user_content, has_screenshot=True)
-                self._session_store.append_message({"role": "user", "content": user_content})
-            else:
-                # Fallback: no image, just text
-                self.memory.add_user(grid_text)
-                self._session_store.append_message({"role": "user", "content": grid_text})
-
+        # Route screenshot tools through the shared helper (handles prefix-strip,
+        # _run_screenshot_b64 update, stuck check, and image-block storage).
+        # Non-screenshot tools store a plain text result.
+        if tool_name in ("take_screenshot", "take_annotated_screenshot"):
+            _stuck_result = self._store_screenshot_result(tool_name, result_text)
+            if _stuck_result is not None:
+                return _stuck_result
         else:
             user_content = f"[Tool result: {tool_name}]\n{result_text}"
             self.memory.add_user(user_content)
@@ -870,6 +836,30 @@ class KimAgent:
         # Strip "Thought for Xs" reasoning preamble that some models prepend.
         content = re.sub(r'^Thought for \d+s\s*\n?', '', content, flags=re.IGNORECASE).strip()
 
+        # Check for terminal markers BEFORE attempting JSON tool-call extraction.
+        # A model's completion/summary message may embed tool-JSON in its prose
+        # (e.g. "I removed it by calling {"tool": "delete_file", ...}") — if we
+        # run _extract_json_tool_call first, that JSON gets executed rather than
+        # the run completing.  Terminal markers always take priority.
+        _tc_early = re.search(r"\bTASK_COMPLETE:\s*(.+)\Z", content, re.IGNORECASE | re.DOTALL)
+        if _tc_early:
+            self.memory.add_assistant(content)
+            self._session_store.append_message({"role": "assistant", "content": content})
+            self._emit_plan_markers(content)
+            summary = _tc_early.group(1).strip()
+            self._log("DEBUG", f"TASK_COMPLETE: {summary}")
+            await self._generate_and_save_summary(task, summary)
+            return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, summary, self._run_screenshot_b64))
+
+        _nh_early = re.search(r"\bNEED_HELP:\s*(.+)\Z", content, re.IGNORECASE | re.DOTALL)
+        if _nh_early:
+            self.memory.add_assistant(content)
+            self._session_store.append_message({"role": "assistant", "content": content})
+            self._emit_plan_markers(content)
+            reason = _nh_early.group(1).strip()
+            self._log("DEBUG", f"NEED_HELP: {reason}")
+            return self._complete_run(make_run_result(AgentTermination.NEED_HELP, f"NEED_HELP: {reason}", self._run_screenshot_b64))
+
         # Some models (e.g. gpt-oss:20b) cannot use native tool_calls and
         # instead emit {"tool": "...", "args": {...}} as plain text.
         # Parse and execute it so it never pollutes chat history.
@@ -883,14 +873,44 @@ class KimAgent:
                 self._emit_plan_markers(thinking)
             tool_name = _normalize_tool_name(_json_call['tool'])
             tool_args = _json_call['args']
-            self._log("TOOL", f"{tool_name}({json.dumps(tool_args)[:120]}) [text-json]")
-            print(f"[TOOL] {tool_name}({json.dumps(tool_args)[:120]})", flush=True)
+            _tj_arg_keys = list(tool_args.keys()) if isinstance(tool_args, dict) else []
+            self._log("TOOL", f"{tool_name}(keys={_tj_arg_keys}) [text-json]")
+            print(f"[TOOL] {tool_name}(keys={_tj_arg_keys})", flush=True)
             self._run_consecutive_continues = 0
+            # Preview gate — same as native tool calls (#27)
+            if self._is_preview_mode() and self._ui_bridge:
+                self._log("INFO", f"[Preview/text-json] Waiting for confirmation: {tool_name}")
+                confirmed = await self._ui_bridge.confirm_action(tool_name, tool_args)
+                if not confirmed:
+                    self._log("WARN", f"Action denied by user: {tool_name}")
+                    self.memory.add_user(
+                        f"[User denied the action: {tool_name}]. "
+                        "Choose a different approach that does not require this action."
+                    )
+                    return None
             result_text = await self._execute_tool(tool_name, tool_args)
             self._run_last_tool = tool_name
-            user_content = f"[Tool result: {tool_name}]\n{result_text}"
-            self.memory.add_user(user_content)
-            self._session_store.append_message({"role": "user", "content": user_content})
+            # Route screenshot tools through the shared helper (prefix-strip,
+            # _run_screenshot_b64 update, stuck check, image-block storage).
+            if tool_name in ("take_screenshot", "take_annotated_screenshot"):
+                _stuck_result = self._store_screenshot_result(tool_name, result_text)
+                if _stuck_result is not None:
+                    return _stuck_result
+            else:
+                user_content = f"[Tool result: {tool_name}]\n{result_text}"
+                self.memory.add_user(user_content)
+                self._session_store.append_message({"role": "user", "content": user_content})
+            # Loop guard — same as native tool calls (#27)
+            if self._note_repeated_action(tool_name, tool_args, result_text):
+                nudge = (
+                    "[Loop guard] You have made the same tool call with identical "
+                    "arguments and received an identical result 3 times in a row. "
+                    "This approach is not working — change strategy: use a different "
+                    "tool or different arguments, or stop and ask via NEED_HELP."
+                )
+                self._log("WARN", "Repeated identical action 3x (text-json) — nudging model to change approach")
+                self.memory.add_user(nudge)
+                self._session_store.append_message({"role": "user", "content": nudge})
             return None
 
         self.memory.add_assistant(content)
@@ -902,14 +922,18 @@ class KimAgent:
         # parser picks it up via parseLogLine.
         self._emit_plan_markers(content)
 
-        _tc = re.search(r"\bTASK_COMPLETE:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
+        # DOTALL (not MULTILINE): the answer after TASK_COMPLETE: can span multiple
+        # lines (lists, code, paragraphs). MULTILINE's `(.+)$` stopped at the first
+        # line, truncating multi-line answers to their first line (e.g. a bullet list
+        # collapsed to "- Red"). Capture everything after the marker to the end.
+        _tc = re.search(r"\bTASK_COMPLETE:\s*(.+)\Z", content, re.IGNORECASE | re.DOTALL)
         if _tc:
             summary = _tc.group(1).strip()
             self._log("DEBUG", f"TASK_COMPLETE: {summary}")
             await self._generate_and_save_summary(task, summary)
             return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, summary, self._run_screenshot_b64))
 
-        _nh = re.search(r"\bNEED_HELP:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
+        _nh = re.search(r"\bNEED_HELP:\s*(.+)\Z", content, re.IGNORECASE | re.DOTALL)
         if _nh:
             reason = _nh.group(1).strip()
             self._log("DEBUG", f"NEED_HELP: {reason}")
@@ -947,11 +971,84 @@ class KimAgent:
         return None
 
     # ------------------------------------------------------------------
+    # Screenshot result helper (shared by native tool path and text-JSON path)
+    # ------------------------------------------------------------------
+
+    def _store_screenshot_result(self, tool_name: str, result_text: str) -> Optional[dict]:
+        """Store a take_screenshot or take_annotated_screenshot result to memory/session.
+
+        Handles data-URI prefix stripping, _run_screenshot_b64 update, stuck
+        detection, and image-block formatting.  Returns a run-result dict when
+        stuck is detected (caller should return it), or None to continue.
+        Called from both the native tool path and the text-JSON tool path so
+        both paths get identical screenshot handling.
+        """
+        iteration = getattr(self, "_run_iteration", 0)
+
+        if tool_name == "take_screenshot":
+            screenshot_b64 = result_text
+            if screenshot_b64.startswith("data:image/png;base64,"):
+                screenshot_b64 = screenshot_b64[len("data:image/png;base64,"):]
+            self._run_screenshot_b64 = screenshot_b64
+
+            # Stuck detection
+            if self._is_stuck(screenshot_b64) and iteration > 3:
+                self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
+                return self._complete_run(make_run_result(
+                    AgentTermination.STUCK,
+                    "STUCK: Screen not changing after repeated actions.",
+                    screenshot_b64,
+                ))
+
+            user_content = [
+                {"type": "text", "text": f"[Tool result: {tool_name}]\nScreenshot captured."},
+                {"type": "image", "data": screenshot_b64, "media_type": "image/png"},
+            ]
+            self.memory.add_user(user_content, has_screenshot=True)
+            self._session_store.append_message({"role": "user", "content": user_content})
+
+        else:  # take_annotated_screenshot
+            try:
+                ann_data = json.loads(result_text)
+            except (json.JSONDecodeError, TypeError):
+                ann_data = {}
+
+            ann_image_b64 = ann_data.get("image", "")
+            if ann_image_b64.startswith("data:image/png;base64,"):
+                ann_image_b64 = ann_image_b64[len("data:image/png;base64,"):]
+            self._run_screenshot_b64 = ann_image_b64
+
+            grid_map = ann_data.get("grid", {})
+            instructions = ann_data.get("instructions", "")
+            screen_w = ann_data.get("screen_width", "?")
+            screen_h = ann_data.get("screen_height", "?")
+            grid_text = (
+                f"[Tool result: {tool_name}]\n"
+                f"Annotated screenshot captured (screen: {screen_w}×{screen_h}).\n"
+                f"{instructions}\n\n"
+                f"Grid marker coordinates (label → [x, y] in real screen pixels):\n"
+                f"{json.dumps(grid_map, separators=(',', ':'))}"
+            )
+
+            if ann_image_b64:
+                user_content = [
+                    {"type": "text", "text": grid_text},
+                    {"type": "image", "data": ann_image_b64, "media_type": "image/png"},
+                ]
+                self.memory.add_user(user_content, has_screenshot=True)
+                self._session_store.append_message({"role": "user", "content": user_content})
+            else:
+                self.memory.add_user(grid_text)
+                self._session_store.append_message({"role": "user", "content": grid_text})
+
+        return None
+
+    # ------------------------------------------------------------------
     # MCP helpers
     # ------------------------------------------------------------------
 
     async def _refresh_tools(self) -> None:
-        result = await self.session.list_tools()
+        result = await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
         self._tools = [
             {
                 "name": t.name,
@@ -1004,8 +1101,8 @@ class KimAgent:
                 if label:
                     parts.append(f"→ {label}")
                 return " ".join(x for x in parts if x).strip()
-        except Exception:
-            pass
+        except Exception as _preview_err:
+            logger.debug("_build_approval_preview failed: %s", _preview_err)
         return ""
 
     async def _execute_tool(self, name: str, args: dict) -> str:
@@ -1098,9 +1195,15 @@ class KimAgent:
         output = ""
 
         try:
-            result = await self.session.call_tool(name=name, arguments=args)
+            result = await asyncio.wait_for(
+                self.session.call_tool(name=name, arguments=args),
+                timeout=120.0,
+            )
             parts = [c.text for c in result.content if hasattr(c, "text")]
             output = "\n".join(parts) if parts else "(no output)"
+        except asyncio.TimeoutError:
+            logger.error(f"MCP tool '{name}' timed out after 120s")
+            output = f"ERROR calling {name}: timed out after 120s"
         except Exception as e:
             logger.error(f"MCP tool '{name}' failed: {e}", exc_info=True)
             output = f"ERROR calling {name}: {e}"
@@ -1211,11 +1314,29 @@ class KimAgent:
                 kwargs = {}
                 if clear_chat and _provider_accepts_kwarg(self.provider.complete, "clear_chat"):
                     kwargs["clear_chat"] = True
-                response = await self.provider.complete(
-                    messages=messages,
-                    tools=tools,
-                    system=system,
-                    **kwargs,
+                # Use a provider-aware outer timeout so the cap is never shorter
+                # than the provider's own internal budget.
+                # - BrowserProvider: bridge path polls for up to _BRIDGE_TIMEOUT_S=720s;
+                #   CDP path waits up to RESPONSE_WAIT_S+GENERATION_WAIT_S≈1200s.
+                #   Use 1260s (1200+60s margin) so the internal timeouts always fire first.
+                # - OllamaProvider: httpx streaming client uses _timeout_s=600s.
+                #   Use 660s (600+60s margin).
+                # - All other providers (API-backed): keep the conservative 300s cap.
+                _provider_cls = type(self.provider).__name__
+                if _provider_cls == "BrowserProvider":
+                    _outer_timeout = 1260.0
+                elif _provider_cls == "OllamaProvider":
+                    _outer_timeout = 660.0
+                else:
+                    _outer_timeout = 300.0
+                response = await asyncio.wait_for(
+                    self.provider.complete(
+                        messages=messages,
+                        tools=tools,
+                        system=system,
+                        **kwargs,
+                    ),
+                    timeout=_outer_timeout,
                 )
                 try:
                     self._session_store.append_llm_event(
@@ -1232,7 +1353,14 @@ class KimAgent:
                 return response
             except Exception as e:
                 last_error = e
-                provider_error = classify_provider_error(e)
+                # On Python ≤3.10, asyncio.TimeoutError is NOT a subclass of the
+                # builtin TimeoutError and its str() is "" — classify_provider_error
+                # would fall through to code="unknown"/non-retryable.  Normalise here
+                # so the classifier always sees a named, retryable TimeoutError.
+                _exc_to_classify: Exception = e
+                if isinstance(e, asyncio.TimeoutError) and not isinstance(e, TimeoutError):
+                    _exc_to_classify = TimeoutError(f"LLM provider call timed out after {_outer_timeout}s")
+                provider_error = classify_provider_error(_exc_to_classify)
                 try:
                     self._session_store.append_llm_event(
                         "errored",
@@ -1264,7 +1392,9 @@ class KimAgent:
                     "attempt": attempt,
                     "max_retries": self._max_retries,
                 }, separators=(",", ":"), ensure_ascii=False), flush=True)
-                await asyncio.sleep(delay)
+                # Do NOT sleep on the final attempt — the raise immediately follows (#31)
+                if attempt < self._max_retries:
+                    await asyncio.sleep(delay)
 
         raise last_error  # type: ignore[misc]
 
@@ -1301,8 +1431,8 @@ class KimAgent:
                     )
                     if event:
                         print(json.dumps(event, separators=(",", ":"), ensure_ascii=False), flush=True)
-            except Exception:
-                pass
+            except Exception as _rf_err:
+                logger.debug("run_failed event emit failed: %s", _rf_err)
 
         return result
 
@@ -1703,20 +1833,10 @@ Rules:
             logger.warning(f"Failed to save session summary: {e}")
 
 
-_VISUAL_TASK_RE = re.compile(
-    r"\b(?:"
-    r"on (?:my|the) (?:screen|desktop)|what'?s on (?:my|the)|what (?:do|can) you see|"
-    r"describe (?:my|the|this) (?:screen|desktop|display)|see (?:my|the) (?:screen|desktop)|"
-    r"look at (?:my|the) (?:screen|desktop)|what'?s open|which (?:apps?|windows?)|"
-    r"my screen|the screen|screenshot|screen ?shot|what am i (?:looking at|seeing)"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def _looks_visual(task: str) -> bool:
-    """Heuristic: does this task ask about what's currently on the user's screen?"""
-    return bool(_VISUAL_TASK_RE.search(task or ""))
+# ---------------------------------------------------------------------------
+# Visual-task detection (extracted to orchestrator/visual_task.py)
+# ---------------------------------------------------------------------------
+from orchestrator.visual_task import _VISUAL_TASK_RE, _looks_visual, _SCREEN_READ_TOOLS  # noqa: E402,F401
 
 
 def _provider_accepts_kwarg(fn: Any, name: str) -> bool:
@@ -1742,81 +1862,10 @@ def _usage_int(usage: dict, *keys: str) -> Optional[int]:
     return None
 
 
-def _build_compact_prompt(messages: list[dict]) -> str:
-    transcript = []
-    for idx, msg in enumerate(messages, start=1):
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "image":
-                    parts.append("[image omitted]")
-                elif isinstance(item, dict):
-                    parts.append(str(item.get("text") or item.get("content") or item))
-                else:
-                    parts.append(str(item))
-            content_text = "\n".join(parts)
-        else:
-            content_text = str(content)
-        if len(content_text) > 3000:
-            content_text = content_text[:1400] + "\n…[middle trimmed for compact prompt]…\n" + content_text[-1400:]
-        transcript.append(f"[{idx}] {role}:\n{content_text}")
-
-    return (
-        "Compact this Kim Pro conversation into a durable handoff artifact. "
-        "Preserve concrete decisions, user preferences, file paths, commands, "
-        "provider/session details, errors, NEED_HELP outcomes, and open questions.\n\n"
-        "Return ONLY valid JSON with this shape:\n"
-        '{"summary":"...","decisions":["..."],"paths":["..."],'
-        '"open_questions":["..."],"need_help":["..."],"next_steps":["..."]}\n\n'
-        "Transcript:\n"
-        + "\n\n---\n\n".join(transcript)
-    )
-
-
-def _parse_compact_json(raw: str) -> dict[str, Any]:
-    if not raw:
-        return {"summary": "Conversation compacted, but the model returned an empty summary."}
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-    if match:
-        try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    return {"summary": cleaned[:8000]}
-
-
 # ---------------------------------------------------------------------------
-# Fallback direct screenshot
+# Compact prompt helpers (extracted to orchestrator/compact_prompt.py)
 # ---------------------------------------------------------------------------
-
-def _direct_screenshot(scale: float = 0.75) -> str:
-    import mss
-    from PIL import Image
-
-    with mss.mss() as sct:
-        shot = sct.grab(sct.monitors[1])
-        img = Image.frombytes("RGB", shot.size, shot.rgb)
-    if scale != 1.0:
-        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    img.close()
-    return base64.b64encode(buf.getvalue()).decode()
-
+from orchestrator.compact_prompt import _build_compact_prompt, _parse_compact_json  # noqa: E402,F401
 
 # ---------------------------------------------------------------------------
 # Convenience context manager
@@ -1836,7 +1885,7 @@ async def mcp_agent_context(
         async with mcp_agent_context(config, ui_bridge=bridge) as agent:
             result = await agent.run("open Notepad")
     """
-    name = provider_name or config.get("provider", "claude")
+    name = provider_name or config.get("provider", DEFAULT_PROVIDER)
     provider = create_provider(name, config)
 
     async with mcp_session_context(config) as session:
@@ -1860,39 +1909,5 @@ async def mcp_agent_context(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # --- TEMP DEBUG (remove after diagnosing browser-provider crash): tee all
-    # stderr — logging AND uncaught tracebacks — to a file so the real error can
-    # be read off disk. The app only surfaces a generic message to the UI. ---
-    try:
-        import sys as _sys
-
-        _dbg_fh = open("/tmp/kim-stderr-debug.log", "a", buffering=1)
-        _dbg_fh.write(f"\n===== new run @ {__import__('datetime').datetime.now()} argv={_sys.argv[1:]} =====\n")
-
-        class _Tee:
-            def __init__(self, *streams):
-                self._streams = streams
-
-            def write(self, data):
-                for s in self._streams:
-                    try:
-                        s.write(data)
-                        s.flush()
-                    except Exception:
-                        pass
-                return len(data)
-
-            def flush(self):
-                for s in self._streams:
-                    try:
-                        s.flush()
-                    except Exception:
-                        pass
-
-        _sys.stderr = _Tee(_sys.stderr, _dbg_fh)
-    except Exception:
-        pass
-    # --- end temp debug ---
-
     from orchestrator.cli import _build_arg_parser, _cli_main
     asyncio.run(_cli_main(_build_arg_parser().parse_args()))

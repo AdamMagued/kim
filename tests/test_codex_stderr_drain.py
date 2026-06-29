@@ -1,5 +1,5 @@
 """
-Tests for _drain_stderr_to() in mcp_server/tools/codex_bridge.py.
+Tests for _drain_stderr_to() in codex_engine/engine.py.
 
 Verifies that Codex subprocess stderr is surfaced in real time as [STATUS] lines
 rather than silently accumulated and only shown on non-zero exit.
@@ -11,7 +11,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from mcp_server.tools.codex_bridge import _drain_stderr_to
+from codex_engine.engine import _drain_stderr_to
 
 
 def _make_stderr_stream(*lines: str) -> asyncio.StreamReader:

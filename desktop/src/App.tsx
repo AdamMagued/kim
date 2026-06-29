@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -9,6 +9,7 @@ import { useSessions } from './hooks/useSessions';
 import { useAccount } from './hooks/useAccount';
 
 import { RevampSidebar, RevampSettings } from './components/kim-ui';
+import { sessionKey } from './components/kim-ui/RevampSidebar';
 import { ChatView } from './components/ChatView';
 import { UpdateModal } from './components/UpdateModal';
 import { OnboardingFlow } from './components/OnboardingFlow';
@@ -46,6 +47,8 @@ function loadSettings(): Settings {
 function saveSettings(s: Settings) {
   localStorage.setItem('kim-settings', JSON.stringify(s));
 }
+
+const GITHUB_RELEASES_API = 'https://api.github.com/repos/AdamMagued/kim/releases/latest';
 
 interface GithubRelease {
   tag_name: string;
@@ -102,10 +105,6 @@ function isNoDragTarget(target: EventTarget | null): boolean {
   ));
 }
 
-function sessionKey(session: SessionInfo): string {
-  return session.session_key ?? `${session.session_type}:${session.date}:${session.session_id}`;
-}
-
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -135,6 +134,17 @@ export default function App() {
   const [appVersion, setAppVersion] = useState('0.1.0');
   const [updateInfo, setUpdateInfo] = useState<GithubRelease | null>(null);
   const [showUpdate, setShowUpdate] = useState(false);
+  const [updateStage, setUpdateStage] = useState<'idle' | 'updating' | 'done' | 'error'>('idle');
+  const silentCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ref through which App calls ChatView's internal openConnectors without a
+  // global CustomEvent bus. ChatView writes its stable openConnectors callback
+  // here on mount; App reads it when the sidebar or header button is clicked.
+  const openConnectorsRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    return () => {
+      if (silentCheckTimerRef.current !== null) clearTimeout(silentCheckTimerRef.current);
+    };
+  }, []);
 
   // Globally suppress the WebView's native context menu. Right-click should
   // never show "Inspect Element", "Reload", "Back" etc. on our app. Components
@@ -202,18 +212,24 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!settings.schedule_timer.enabled) return;
+    if (!settings.schedule_timer.enabled) {
+      invoke('stop_schedule_timer').catch(() => {});
+      return;
+    }
     const intervalSeconds = settings.schedule_timer.interval_seconds || DEFAULT_SETTINGS.schedule_timer.interval_seconds;
     invoke('start_schedule_timer', { intervalSeconds })
       .catch((e) => {
         toast(`Could not start schedule timer: ${String(e)}`, 'error', 7000);
       });
+    return () => {
+      invoke('stop_schedule_timer').catch(() => {});
+    };
   }, [settings.schedule_timer.enabled, settings.schedule_timer.interval_seconds]);
 
   async function silentUpdateCheck(currentVersion: string) {
     try {
       const resp = await fetch(
-        'https://api.github.com/repos/AdamMagued/kim/releases/latest',
+        GITHUB_RELEASES_API,
         { headers: { Accept: 'application/vnd.github+json' } }
       );
       if (!resp.ok) return; // fail silently on startup
@@ -222,8 +238,9 @@ export default function App() {
       if (compareSemver(latest, currentVersion) > 0) {
         setUpdateInfo(data);
         // Delay slightly so the app has time to finish loading
-        setTimeout(() => {
+        silentCheckTimerRef.current = setTimeout(() => {
           toast(`Kim ${latest} is available — you're on ${currentVersion}. Click to update.`, 'info', 8000);
+          setUpdateStage('idle');
           setShowUpdate(true);
         }, 2000);
       }
@@ -242,12 +259,14 @@ export default function App() {
       else if (mod && e.key.toLowerCase() === 'b') { e.preventDefault(); setSidebarCollapsed(v => !v); }
       else if (e.key === 'Escape') {
         if (showSettings) setShowSettings(false);
-        else if (showUpdate) setShowUpdate(false);
+        // Only dismiss the UpdateModal via Escape when the update has not yet
+        // started — mirrors UpdateModal's own backdrop-click guard (line 55).
+        else if (showUpdate && updateStage === 'idle') setShowUpdate(false);
       }
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [showSettings, showUpdate]);
+  }, [showSettings, showUpdate, updateStage]);
 
   function handleSettingsChange(next: Settings) {
     setSettings(next);
@@ -289,6 +308,10 @@ export default function App() {
     setActiveSession(null);
     setNewChatMode(true);
     setChatSerial(s => s + 1);
+  }
+
+  function openConnectors() {
+    openConnectorsRef.current?.();
   }
 
   function handleRemoveProject(path: string) {
@@ -381,7 +404,7 @@ export default function App() {
     toast('Checking for updates…', 'info', 2000);
     try {
       const resp = await fetch(
-        'https://api.github.com/repos/AdamMagued/kim/releases/latest',
+        GITHUB_RELEASES_API,
         { headers: { Accept: 'application/vnd.github+json' } }
       );
       if (!resp.ok) {
@@ -394,6 +417,7 @@ export default function App() {
       const latest = data.tag_name.replace(/^v/, '');
       if (compareSemver(latest, appVersion) > 0) {
         setUpdateInfo(data);
+        setUpdateStage('idle');
         setShowUpdate(true);
       } else {
         toast(`You're on the latest version (v${appVersion}).`, 'success');
@@ -445,6 +469,7 @@ export default function App() {
           const next = order[(idx + 1) % order.length];
           handleSettingsChange({ ...settings, theme: next });
         }}
+        onOpenConnectors={openConnectors}
       />
 
       <main className="kim-main">
@@ -521,7 +546,7 @@ export default function App() {
           <button
             type="button"
             className="kim-topbar__connectors-btn kim-no-drag"
-            onClick={() => window.dispatchEvent(new CustomEvent('kim-open-connectors'))}
+            onClick={openConnectors}
             aria-label="Open connectors"
             title="Connectors"
           >
@@ -553,6 +578,7 @@ export default function App() {
           onSelectProject={handleSelectProject}
           recentSessions={activeTab === 'code' ? codexSessions : kimSessions}
           onSelectSession={handleSelectSession}
+          openConnectorsRef={openConnectorsRef}
         />
       </main>
 
@@ -575,6 +601,7 @@ export default function App() {
           latestVersion={updateInfo.tag_name.replace(/^v/, '')}
           releaseNotes={updateInfo.body ?? ''}
           onDismiss={() => setShowUpdate(false)}
+          onStageChange={setUpdateStage}
         />
       )}
 

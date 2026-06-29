@@ -218,7 +218,7 @@ async def handle_git_checkout(args: dict) -> str:
     # so we don't run them through validate_path, but a leading '..' or an
     # absolute path is never a valid branch name and almost always a file
     # restore that bypasses ALLOWED_PATHS.
-    if target.startswith("..") or target.startswith("/") or target.startswith("\\"):
+    if target.startswith("..") or target.startswith("/") or target.startswith("\\") or target.startswith("-"):
         return f"PERMISSION_ERROR: refusing git checkout target {target!r}"
     try:
         git_args = ["checkout"]

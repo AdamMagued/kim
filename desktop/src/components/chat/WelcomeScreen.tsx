@@ -252,7 +252,6 @@ export function WelcomeScreen({
           }}
         >
           <span>⌘N new chat</span>
-          <span>⌘K search</span>
           <span>⌘, settings</span>
         </div>
       </div>

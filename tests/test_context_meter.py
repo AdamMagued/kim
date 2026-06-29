@@ -5,6 +5,8 @@ from orchestrator.context_meter import (
     coerce_budget,
     estimate_request_tokens,
     estimate_text_tokens,
+    _tools_token_count,
+    _tools_token_cache,
 )
 
 
@@ -83,26 +85,32 @@ def test_budget_overflow_single_large_input():
 
 
 def test_budget_overflow_cumulative():
-    """Multiple small inputs that cumulatively exceed budget trigger critical."""
+    """Each add_input reflects the most-recent request window size (not a running sum).
+    The meter uses the last request size as the current-window estimate, so the final
+    call with 20 tokens reports 20 (ok), not an accumulated 100."""
     meter = ContextMeter(budget=100)
     meter.add_input(40, source="test", estimated=False)
     meter.add_input(40, source="test", estimated=False)
     snap = meter.add_input(20, source="test", estimated=False)
-    assert snap.cumulative_input == 100
-    assert snap.phase == "critical"  # 100/100 = 1.0 >= 0.95
+    assert snap.cumulative_input == 20
+    assert snap.phase == "ok"  # 20/100 = 0.20 < 0.80
 
 
 def test_budget_warn_to_critical_transition():
-    """Meter transitions from ok → warn → critical as tokens accumulate."""
+    """Each call sets the current-window size independently; phase is determined
+    by the most-recent request size relative to budget."""
     meter = ContextMeter(budget=1000)
     snap1 = meter.add_input(500, source="test", estimated=False)
-    assert snap1.phase == "ok"  # 50%
+    assert snap1.phase == "ok"   # 500/1000 = 50%
+    assert snap1.cumulative_input == 500
 
-    snap2 = meter.add_input(310, source="test", estimated=False)
-    assert snap2.phase == "warn"  # 81%
+    snap2 = meter.add_input(810, source="test", estimated=False)
+    assert snap2.phase == "warn"  # 810/1000 = 81%
+    assert snap2.cumulative_input == 810
 
-    snap3 = meter.add_input(200, source="test", estimated=False)
-    assert snap3.phase == "critical"  # 101%
+    snap3 = meter.add_input(1010, source="test", estimated=False)
+    assert snap3.phase == "critical"  # 1010/1000 = 101%
+    assert snap3.cumulative_input == 1010
 
 
 def test_reset_after_compact_resets_cumulative():
@@ -150,3 +158,84 @@ def test_estimate_text_tokens_empty_string():
 def test_estimate_text_tokens_short_text():
     """Short text should return at least 1 token."""
     assert estimate_text_tokens("hi") >= 1
+
+
+# ── Regression guards for the four specified behaviors ───────────────────────
+
+
+def test_record_run_uses_current_window_not_cumulative():
+    """cumulative_input is assigned (not summed), so a second call with 2000
+    tokens yields 2000, not 1000+2000=3000.  This prevents spurious WARN/CRITICAL
+    phases caused by quadratic growth when the full conversation is resent."""
+    meter = ContextMeter(budget=DEFAULT_CONTEXT_BUDGET_TOKENS)
+    meter.add_input(1000, source="test", estimated=False)
+    snap = meter.add_input(2000, source="test", estimated=False)
+    assert snap.cumulative_input == 2000, (
+        "cumulative_input must reflect the most-recent request window (assignment), "
+        f"got {snap.cumulative_input}"
+    )
+    assert meter.cumulative_input == 2000
+
+
+def test_tools_token_count_cached_by_identity():
+    """_tools_token_count returns the same value on repeated calls for the same
+    list object without re-serializing: the cache entry keyed on (id, len)
+    should be populated after the first call and reused on the second."""
+    _tools_token_cache.clear()
+    tools = [{"name": "read_file", "description": "reads a file"}]
+    first = _tools_token_count(tools)
+    # Cache must now hold exactly one entry for this list
+    assert len(_tools_token_cache) == 1
+    key = (id(tools), len(tools))
+    assert key in _tools_token_cache
+    second = _tools_token_count(tools)
+    assert first == second, "Second call must return same count as first (cache hit)"
+    # Cache should still hold exactly one entry (no duplicate keys created)
+    assert len(_tools_token_cache) == 1
+
+
+def test_tools_token_cache_invalidated_on_length_change():
+    """Appending an element to the tools list changes its length, which shifts
+    the cache key and triggers a recompute.  After recompute, the cache holds
+    at most one entry (old entry is evicted via clear())."""
+    _tools_token_cache.clear()
+    tools = [{"name": "read_file"}]
+    count_before = _tools_token_count(tools)
+    old_key = (id(tools), len(tools))
+
+    tools.append({"name": "write_file", "description": "writes a file with more tokens here"})
+    count_after = _tools_token_count(tools)
+
+    # Count must have changed because the schema is larger
+    assert count_after > count_before, (
+        "Appending a tool should increase the serialised token count"
+    )
+    # Old key must no longer be in cache (clear() was called on recompute)
+    assert old_key not in _tools_token_cache, "Stale cache entry must be evicted after length change"
+    # Cache holds exactly one entry (the new key)
+    new_key = (id(tools), len(tools))
+    assert new_key in _tools_token_cache
+    assert len(_tools_token_cache) == 1
+
+
+def test_estimate_request_tokens_includes_tools():
+    """estimate_request_tokens must add the tools token count on top of the
+    system+messages estimate.  Calling with vs. without tools on the same
+    system+messages should produce a strictly larger result."""
+    messages = [{"role": "user", "content": "hello"}]
+    system = "You are a helpful assistant."
+    tools = [{"name": "read_file", "description": "reads a file from disk"}]
+
+    without_tools = estimate_request_tokens(messages, system=system, tools=None)
+    with_tools = estimate_request_tokens(messages, system=system, tools=tools)
+
+    assert with_tools > without_tools, (
+        f"estimate_request_tokens with tools ({with_tools}) must exceed "
+        f"estimate without tools ({without_tools})"
+    )
+    # The difference must equal the cached tools count
+    tools_count = _tools_token_count(tools)
+    assert with_tools - without_tools == tools_count, (
+        "The gap between with-tools and without-tools estimates must equal "
+        f"_tools_token_count(tools)={tools_count}, got gap={with_tools - without_tools}"
+    )

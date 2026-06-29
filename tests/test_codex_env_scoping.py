@@ -2,7 +2,7 @@
 Regression test: run_codex_subtask() must pass environment variables via
 the subprocess `env=` dict parameter, NOT by mutating os.environ.
 
-If someone refactors codex_bridge.py and accidentally uses os.environ[k] = v
+If someone refactors codex_engine/engine.py and accidentally uses os.environ[k] = v
 instead of the local env dict, this test will break.
 """
 
@@ -12,7 +12,7 @@ import textwrap
 from pathlib import Path
 
 # Locate the source file
-_CODEX_BRIDGE = Path(__file__).resolve().parent.parent / "mcp_server" / "tools" / "codex_bridge.py"
+_CODEX_BRIDGE = Path(__file__).resolve().parent.parent / "codex_engine" / "engine.py"
 
 
 def _get_function_source(source_text: str, func_name: str) -> str:
@@ -29,7 +29,7 @@ class TestCodexEnvScoping:
     """Verify env-var isolation in codex_bridge.run_codex_subtask."""
 
     def test_source_file_exists(self):
-        assert _CODEX_BRIDGE.exists(), f"Expected codex_bridge.py at {_CODEX_BRIDGE}"
+        assert _CODEX_BRIDGE.exists(), f"Expected engine.py at {_CODEX_BRIDGE}"
 
     def test_env_dict_is_passed_to_subprocess(self):
         """The subprocess must receive env= as a keyword argument."""

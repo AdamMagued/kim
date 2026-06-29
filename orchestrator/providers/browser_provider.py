@@ -24,4 +24,4 @@ def __getattr__(name):
 
 # BrowserProvider is provided lazily by __getattr__ above (avoids importing
 # playwright at module load); flake8 can't see that, hence the F822 suppression.
-__all__ = ["BrowserProvider", "SITE_CONFIGS"]  # noqa: F822
+__all__ = ["BrowserProvider", "SITE_CONFIGS"]  # noqa: F822  # pyright: ignore[reportUnsupportedDunderAll]

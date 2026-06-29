@@ -23,6 +23,7 @@ import copy
 import json
 import logging
 import os
+import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -32,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 # Default base directory relative to the project root
 _DEFAULT_BASE_DIR = Path(__file__).resolve().parent.parent / "kim_sessions"
+
+# Rotate the active JSONL when it exceeds this size (finding 4: size cap)
+_MAX_SESSION_BYTES = 50 * 1024 * 1024  # 50 MB
 
 
 class SessionStore:
@@ -68,6 +72,8 @@ class SessionStore:
         self.summary_file = self.session_dir / f"{self.session_id}.summary.txt"
         self.context_file = self.session_dir / f"{self.session_id}.context.json"
         self._message_count = 0
+        # Lock that serialises all append writes within this process (finding 3)
+        self._lock: threading.Lock = threading.Lock()
 
         # Create directory on first use
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -80,6 +86,36 @@ class SessionStore:
     # Write API
     # ------------------------------------------------------------------
 
+    def _append_line(self, line: str) -> None:
+        """Write a single JSONL line with a process-level lock, flush, and fsync.
+
+        Uses a threading.Lock so two threads sharing the same SessionStore
+        instance cannot interleave writes (finding 3).  Also rotates the
+        session file when it exceeds _MAX_SESSION_BYTES so individual sessions
+        cannot grow without bound (finding 4).  Rolled files keep the session
+        date-dir so age-based pruning covers them automatically.
+        """
+        with self._lock:
+            # Rotate before writing if the current file is over the size cap
+            if (
+                self.session_file.exists()
+                and self.session_file.stat().st_size >= _MAX_SESSION_BYTES
+            ):
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                rolled = self.session_dir / f"{self.session_id}.roll.{stamp}.jsonl"
+                try:
+                    self.session_file.rename(rolled)
+                    logger.info(
+                        "Session file rotated: %s -> %s", self.session_file.name, rolled.name
+                    )
+                except OSError as exc:
+                    logger.warning("Could not rotate session file %s: %s", self.session_file, exc)
+
+            with open(self.session_file, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+
     def append_message(self, message: dict) -> None:
         """
         Append one message as a JSONL line.
@@ -89,10 +125,7 @@ class SessionStore:
         """
         cleaned = _strip_images_for_disk(message)
         line = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))
-
-        with open(self.session_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-
+        self._append_line(line)
         self._message_count += 1
 
     def flush(self) -> None:
@@ -118,8 +151,7 @@ class SessionStore:
             "cwd": cwd if cwd is not None else os.getcwd(),
         }
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-        with open(self.session_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        self._append_line(line)
         logger.info("Run started: task=%r", task[:60] if len(task) > 60 else task)
 
     def append_run_result(self, result: dict, cwd: Optional[str] = None) -> None:
@@ -143,8 +175,7 @@ class SessionStore:
             "cwd": cwd if cwd is not None else os.getcwd(),
         }
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-        with open(self.session_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        self._append_line(line)
         logger.info(
             "Run result appended to session: termination=%r success=%r",
             record["termination"],
@@ -192,8 +223,7 @@ class SessionStore:
         if risk_level:
             record["risk_level"] = risk_level
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-        with open(self.session_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        self._append_line(line)
         logger.info(
             "Tool trace appended: tool=%r phase=%r duration_ms=%r",
             tool_name,
@@ -240,8 +270,7 @@ class SessionStore:
         if error_code:
             record["error_code"] = error_code
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-        with open(self.session_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        self._append_line(line)
         logger.info(
             "LLM trace appended: provider=%r phase=%r attempt=%r duration_ms=%r",
             provider,
@@ -297,8 +326,7 @@ class SessionStore:
         if consecutive_continues is not None:
             record["consecutive_continues"] = int(consecutive_continues)
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-        with open(self.session_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        self._append_line(line)
         logger.info(
             "Checkpoint appended: iteration=%d phase=%r last_tool=%r",
             iteration,
@@ -307,8 +335,10 @@ class SessionStore:
         )
 
     def save_summary(self, summary: str) -> None:
-        """Write a human-readable summary alongside the JSONL file."""
-        self.summary_file.write_text(summary.strip() + "\n", encoding="utf-8")
+        """Write a human-readable summary alongside the JSONL file (atomic)."""
+        tmp = self.summary_file.with_suffix(self.summary_file.suffix + ".tmp")
+        tmp.write_text(summary.strip() + "\n", encoding="utf-8")
+        os.replace(tmp, self.summary_file)
         logger.info(f"Session summary saved: {self.summary_file}")
 
     def load_context_state(self) -> dict:
@@ -367,7 +397,12 @@ class SessionStore:
         session_id: str,
         base_dir: Optional[Path] = None,
     ) -> Optional[Path]:
-        """Return the JSONL path for a session ID if it exists."""
+        """Return the JSONL path for a session ID if it exists.
+
+        Also returns the expected live-file path when only rolled segments
+        exist (i.e. every append crossed the 50 MB cap and the live file has
+        been rotated away) so callers can still resolve the session directory.
+        """
         base = Path(base_dir) if base_dir else _DEFAULT_BASE_DIR
         if not base.exists():
             return None
@@ -377,6 +412,10 @@ class SessionStore:
                 continue
             candidate = date_dir / f"{session_id}.jsonl"
             if candidate.exists():
+                return candidate
+            # Session may consist entirely of rolled segments — return the
+            # expected live-file path so callers can locate the date directory.
+            if any(date_dir.glob(f"{session_id}.roll.*.jsonl")):
                 return candidate
         return None
 
@@ -398,16 +437,28 @@ class SessionStore:
         Load all messages from a session JSONL file.
 
         Searches all date directories for the given session_id.
+        Rolled segments (<id>.roll.<stamp>.jsonl, produced when the live file
+        exceeds the 50 MB cap) are concatenated in chronological stamp order
+        before the live file so the full transcript is recovered on resume.
         Returns the messages in order, ready to be loaded into
         ConversationMemory.
         """
         candidate = SessionStore.find_session_file(session_id, base_dir=base_dir)
-        if candidate:
-            return _read_jsonl(candidate)
+        if candidate is None:
+            if warn_if_missing:
+                logger.info(f"Session not found: {session_id}")
+            return []
 
-        if warn_if_missing:
-            logger.info(f"Session not found: {session_id}")
-        return []
+        session_dir = candidate.parent
+        # Collect rolled segments in chronological order (stamp sorts lexicographically)
+        roll_files = sorted(session_dir.glob(f"{session_id}.roll.*.jsonl"))
+        messages: list[dict] = []
+        for roll_file in roll_files:
+            messages.extend(_read_jsonl(roll_file))
+        # Append the live file if it exists (may not exist if every write was rolled)
+        if candidate.exists():
+            messages.extend(_read_jsonl(candidate))
+        return messages
 
     @staticmethod
     def load_trace_events(
@@ -463,6 +514,8 @@ class SessionStore:
             if not date_dir.is_dir():
                 continue
             for session_file in sorted(date_dir.glob("*.jsonl"), reverse=True):
+                if ".roll." in session_file.name:
+                    continue  # rolled segments are read via load_session, not enumerated separately
                 session_id = session_file.stem
                 for record in _read_jsonl(session_file):
                     if "role" in record:
@@ -661,12 +714,22 @@ class SessionStore:
             if not date_dir.is_dir():
                 continue
             for jsonl_file in sorted(date_dir.glob("*.jsonl"), reverse=True):
+                if ".roll." in jsonl_file.name:
+                    continue  # rolled segments are not standalone sessions
                 session_id = jsonl_file.stem
                 summary_file = date_dir / f"{session_id}.summary.txt"
                 context_file = date_dir / f"{session_id}.context.json"
                 try:
+                    msg_count = 0
                     with open(jsonl_file, encoding="utf-8") as f:
-                        msg_count = sum(1 for _ in f)
+                        for _line in f:
+                            _stripped = _line.strip()
+                            if _stripped:
+                                try:
+                                    if "role" in json.loads(_stripped):
+                                        msg_count += 1
+                                except json.JSONDecodeError:
+                                    pass
                 except Exception:
                     msg_count = 0
 
@@ -725,6 +788,13 @@ class SessionStore:
                                 candidate.unlink()
                             except OSError as e:
                                 logger.warning(f"Could not delete {candidate}: {e}")
+                    # Also remove compact artifacts (finding 1: save_compact_artifact
+                    # writes <id>.compact.<stamp>.json which were never pruned)
+                    for compact_file in date_dir.glob(f"{session_id}.compact.*.json"):
+                        try:
+                            compact_file.unlink()
+                        except OSError as e:
+                            logger.warning(f"Could not delete {compact_file}: {e}")
                     deleted += 1
                 elif dir_date <= strip_cutoff:
                     # Strip screenshot data in place
@@ -796,7 +866,8 @@ def _strip_images_for_disk(message: dict) -> dict:
     """
     content = message.get("content")
     if content is None:
-        return message
+        # Strip internal metadata keys even when there is no content (finding 5)
+        return {k: v for k, v in message.items() if not k.startswith("_")}
 
     # Simple string content — nothing to strip
     if isinstance(content, str):

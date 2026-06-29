@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useId } from 'react';
 import type { ToolUseBlock, ToolResultBlock } from '../types';
 
 function Chevron({ open }: { open: boolean }) {
@@ -173,6 +173,7 @@ interface ToolUseCardProps {
 
 export function ToolUseCard({ block, result }: ToolUseCardProps) {
   const [open, setOpen] = useState(false);
+  const panelId = useId();
   const input = block.input && typeof block.input === 'object' && !Array.isArray(block.input)
     ? block.input
     : {};
@@ -197,7 +198,7 @@ export function ToolUseCard({ block, result }: ToolUseCardProps) {
 
   return (
     <div className="kim-tool-card">
-      <button onClick={() => setOpen(o => !o)} className="kim-tool-card__header">
+      <button onClick={() => setOpen(o => !o)} className="kim-tool-card__header" aria-expanded={open} aria-controls={panelId}>
         <span className="kim-tool-card__icon" aria-hidden>
           <WrenchIcon />
         </span>
@@ -207,7 +208,7 @@ export function ToolUseCard({ block, result }: ToolUseCardProps) {
       </button>
 
       {open && (
-        <div className="kim-tool-card__body">
+        <div id={panelId} className="kim-tool-card__body">
           <div style={{ marginBottom: 10 }}>
             <div className="kim-tool-card__section-label">{isFileWrite ? `Code written to ${basename(path)}` : 'Input'}</div>
             <pre className={`kim-tool-card__pre${isFileWrite ? ' kim-tool-card__pre--code' : ''}`}>
@@ -235,6 +236,7 @@ interface ToolResultCardProps {
 
 export function ToolResultCard({ block }: ToolResultCardProps) {
   const [open, setOpen] = useState(false);
+  const panelId = useId();
   const rawBlock = block as ToolResultBlock & { output?: unknown; tool_name?: string };
   const rawContent = rawBlock.content ?? rawBlock.output ?? '';
   const content =
@@ -246,7 +248,7 @@ export function ToolResultCard({ block }: ToolResultCardProps) {
 
   return (
     <div className="kim-tool-card">
-      <button onClick={() => setOpen(o => !o)} className="kim-tool-card__header">
+      <button onClick={() => setOpen(o => !o)} className="kim-tool-card__header" aria-expanded={open} aria-controls={panelId}>
         <span className="kim-tool-card__icon kim-tool-card__icon--result" aria-hidden>
           <CheckIcon />
         </span>
@@ -260,7 +262,7 @@ export function ToolResultCard({ block }: ToolResultCardProps) {
         <Chevron open={open} />
       </button>
       {open && (
-        <div className="kim-tool-card__body">
+        <div id={panelId} className="kim-tool-card__body">
           {result.diffLines && result.diffLines.length > 0 && (
             <div style={{ marginBottom: 10 }}>
               <div className="kim-tool-card__section-label">Diff</div>
@@ -309,11 +311,12 @@ interface SignalCardProps {
 
 export function SignalCard({ kind, text, onAction, actionLabel }: SignalCardProps) {
   const [open, setOpen] = useState(false);
+  const panelId = useId();
   const isError = kind === 'error';
 
   return (
     <div className={`kim-tool-card ${isError ? 'kim-tool-card--error' : ''}`}>
-      <button onClick={() => setOpen(o => !o)} className="kim-tool-card__header">
+      <button onClick={() => setOpen(o => !o)} className="kim-tool-card__header" aria-expanded={open} aria-controls={panelId}>
         <span className={`kim-tool-card__icon ${isError ? 'kim-tool-card__icon--error' : 'kim-tool-card__icon--result'}`} aria-hidden>
           {isError ? '⚠' : <CheckIcon />}
         </span>
@@ -323,7 +326,7 @@ export function SignalCard({ kind, text, onAction, actionLabel }: SignalCardProp
         <Chevron open={open} />
       </button>
       {open && (
-        <div className="kim-tool-card__body">
+        <div id={panelId} className="kim-tool-card__body">
           <pre className="kim-tool-card__pre" style={{ whiteSpace: 'pre-wrap' }}>{text}</pre>
           {onAction && actionLabel && (
             <div style={{ marginTop: '8px' }}>

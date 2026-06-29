@@ -15,6 +15,7 @@ returns a clean OS_LIMITATION error message so the LLM can adapt.
 import asyncio
 import logging
 import re
+import urllib.parse
 import webbrowser
 
 from mcp_server.os_utils import CURRENT_OS, IS_WINDOWS, IS_MACOS, IS_LINUX, check_tool_available
@@ -45,7 +46,7 @@ def _applescript_quote(s: str) -> str:
 
 async def _get_windows_win() -> str:
     import pygetwindow as gw
-    windows = gw.getAllWindows()
+    windows = gw.getAllWindows()  # type: ignore[attr-defined]  # Windows-only pygetwindow API
     lines = []
     for w in windows:
         if w.title.strip():
@@ -58,7 +59,7 @@ async def _get_windows_win() -> str:
 
 async def _focus_window_win(title: str) -> str:
     import pygetwindow as gw
-    matches = gw.getWindowsWithTitle(title)
+    matches = gw.getWindowsWithTitle(title)  # type: ignore[attr-defined]  # Windows-only pygetwindow API
     if not matches:
         return f"ERROR: No window found with title containing '{title}'"
     win = matches[0]
@@ -70,7 +71,7 @@ async def _focus_window_win(title: str) -> str:
 
 async def _resize_window_win(title: str, x: int, y: int, width: int, height: int) -> str:
     import pygetwindow as gw
-    matches = gw.getWindowsWithTitle(title)
+    matches = gw.getWindowsWithTitle(title)  # type: ignore[attr-defined]  # Windows-only pygetwindow API
     if not matches:
         return f"ERROR: No window found with title containing '{title}'"
     win = matches[0]
@@ -202,7 +203,15 @@ async def _run_cmd(cmd: list[str]) -> tuple[int, str, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except (asyncio.TimeoutError, TimeoutError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        raise
     return (
         proc.returncode or 0,
         stdout.decode("utf-8", errors="replace").strip(),
@@ -384,6 +393,9 @@ async def handle_resize_window(args: dict) -> str:
 
 async def handle_open_url(args: dict) -> str:
     url = str(args["url"])
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return f"ERROR: URL scheme '{parsed.scheme}' is not allowed; only http and https are permitted"
     try:
         webbrowser.open(url)
         logger.info(f"open_url: {url}")

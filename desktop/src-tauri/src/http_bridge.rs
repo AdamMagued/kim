@@ -21,9 +21,16 @@ fn handle_webview_bridge_request(
         return;
     }
 
-    if !(method == Method::Get && (path == "/v1/health" || path == "/v1/status")) {
-        let auth = header_value(&request, "X-Kim-Token");
-        if auth.as_deref() != Some(token.as_str()) {
+    // /v1/health stays unauthenticated (Railway prober, uptime checks).
+    // /v1/status now requires the token to avoid unauthenticated local info disclosure (#12).
+    if !(method == Method::Get && path == "/v1/health") {
+        let auth = header_value(&request, "X-Kim-Token").unwrap_or_default();
+        // Use constant-time comparison to prevent timing side-channels (#19).
+        let token_bytes = token.as_bytes();
+        let auth_bytes = auth.as_bytes();
+        let tokens_match = token_bytes.len() == auth_bytes.len()
+            && token_bytes.iter().zip(auth_bytes.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+        if !tokens_match {
             respond_json(
                 request,
                 401,
@@ -533,10 +540,25 @@ fn handle_webview_bridge_request(
                 tier = tier_json,
             );
 
+            // An image (screenshot) is pasted into the chat with a REAL Cmd+V
+            // (native_paste) — a trusted paste the editor accepts. That keystroke
+            // only lands if the provider webview is visible, frontmost and key, so
+            // for image sends we show + focus it instead of hiding it offscreen. The
+            // screenshot was already captured before this send, so showing the window
+            // now does not interfere with screen-capture tools.
+            // Only PNG drives the native-paste path: write_first_png_to_clipboard stages
+            // only PNG, so a non-PNG image here would fire Cmd+V against a STALE clipboard
+            // (pasting whatever the user had copied). Non-PNG images use the file-input /
+            // synthetic-paste strategies instead. Screenshots are always PNG.
+            let has_image_attachment = attachments.iter().any(|a| a.mime_type == "image/png");
+
             // The window stays offscreen (1x1 at -10000,-10000) during
             // headless operation.  JS keeps running at 1x1, no need to
             // show it to the user.
-            if should_keep_browser_visible() {
+            if has_image_attachment {
+                show_browser_window_impl(&app_handle);
+                let _ = window.set_focus();
+            } else if should_keep_browser_visible() {
                 show_browser_window_impl(&app_handle);
             } else if is_browser_window_offscreen(&window) {
                 if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
@@ -582,7 +604,10 @@ fn handle_webview_bridge_request(
             // during inputEl.focus() / send-button click. Without this, Stage
             // Manager swaps groups and Kim's window comes forward, breaking
             // observe_ui on the actual target app.
-            let saved_frontmost = save_frontmost_app();
+            // For image sends, keep the provider webview frontmost & key so the
+            // native_paste Cmd+V lands in its focused editor — do NOT restore the
+            // user's previous frontmost app until the paste is done.
+            let saved_frontmost = if has_image_attachment { None } else { save_frontmost_app() };
 
             if let Err(e) = window.eval(&bridge_call) {
                 respond_json(
@@ -970,6 +995,10 @@ fn handle_webview_bridge_request(
                 session_id: Option<String>,
                 #[serde(default)]
                 provider: Option<String>,
+                /// Mirrors the CLI's --permission-mode / KIM_HITL_RISK_THRESHOLD (#15).
+                /// Accepted values: "auto", "confirm-sensitive", "confirm-all".
+                #[serde(default)]
+                permission_mode: Option<String>,
             }
 
             let parsed: TaskRequest = match serde_json::from_str(&body) {
@@ -985,12 +1014,23 @@ fn handle_webview_bridge_request(
                 return;
             }
 
-            // Reject if a task is already running
+            // Reject if a task is already running.
+            // The atomic BRIDGE_TASK_STARTING flag closes the TOCTOU window between
+            // the process_exists check and the spawn (#17).
+            let was_starting = BRIDGE_TASK_STARTING.swap(true, Ordering::AcqRel);
+            if was_starting {
+                respond_json(request, 409, serde_json::json!({
+                    "ok": false,
+                    "error": "A task is already starting. Try again in a moment.",
+                }));
+                return;
+            }
             {
                 let store = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None));
                 if let Ok(guard) = store.lock() {
                     if let Some(pid) = *guard {
                         if process_exists(pid) {
+                            BRIDGE_TASK_STARTING.store(false, Ordering::Release);
                             respond_json(request, 409, serde_json::json!({
                                 "ok": false,
                                 "error": "A task is already running. Cancel it first.",
@@ -1005,6 +1045,7 @@ fn handle_webview_bridge_request(
             let python = match find_python_interpreter(&kim_root) {
                 Ok(p) => p,
                 Err(e) => {
+                    BRIDGE_TASK_STARTING.store(false, Ordering::Release);
                     respond_json(request, 500, serde_json::json!({"ok": false, "error": e}));
                     return;
                 }
@@ -1027,9 +1068,31 @@ fn handle_webview_bridge_request(
 
             let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();
 
+            // NOTE (#16): this spawn block is a near-duplicate of subprocess.rs::send_task.
+            // Any env/flag changes here must be mirrored there. TODO: extract a shared
+            // helper once Tauri v2 async Command is stable across both contexts.
+            let run_id = {
+                let sess_safe: String = session_id
+                    .chars()
+                    .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+                    .collect();
+                format!(
+                    "{}-{}",
+                    sess_safe,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
+                )
+            };
             let mut cmd = std::process::Command::new(&python);
-            cmd.args(["-m", "orchestrator.agent"])
-                .arg("--task")
+            // When the resolved interpreter is the bundled sidecar it's a standalone
+            // executable, not a Python binary — invoke it directly (matches the canonical
+            // spawn in subprocess.rs). Otherwise `<python> -m orchestrator.agent`.
+            if !crate::subprocess::is_bundled_orchestrator(&python) {
+                cmd.args(["-m", "orchestrator.agent"]);
+            }
+            cmd.arg("--task")
                 .arg(&parsed.task)
                 .arg("--session-dir")
                 .arg(session_dir.to_string_lossy().to_string())
@@ -1038,10 +1101,20 @@ fn handle_webview_bridge_request(
                 .arg("--provider")
                 .arg(&provider)
                 .current_dir(&kim_root)
+                .env("KIM_RUN_ID", &run_id)  // matches subprocess.rs (#16)
                 .env("PROJECT_ROOT", kim_root.to_str().unwrap_or(""))
                 .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
+                .stdin(std::process::Stdio::piped())   // required for HITL approval (#15)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit());
+            // Own process group so a later /v1/cancel (kill -TERM -<pid>) reaps the whole
+            // process tree (MCP server, browser/Playwright helpers), not just the parent
+            // Python — mirrors subprocess.rs. Without this the children are orphaned.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
+            }
 
             if let Ok(guard) = KIM_PREFERRED_SITE.get_or_init(|| StdMutex::new(None)).lock() {
                 if let Some(site) = &*guard {
@@ -1053,6 +1126,21 @@ fn handle_webview_bridge_request(
                 cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
                     .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
                     .env("KIM_WEBVIEW_WINDOW_LABEL", "kim-browser-signin");
+            }
+
+            // Honour permission_mode from the /v1/task request (#15).
+            // Maps to KIM_HITL_RISK_THRESHOLD that the orchestrator already reads.
+            // Use the same vocabulary as subprocess.rs send_task so both code paths
+            // behave identically:
+            //   full_auto   → no threshold (no HITL gate)
+            //   ask_risky   → KIM_HITL_RISK_THRESHOLD=high  (risky tools need approval)
+            //   ask_always  → KIM_HITL_RISK_THRESHOLD=medium (all medium+ tools)
+            // Also set KIM_TAURI_MODE=1 so StdinApprovalBridge is auto-wired.
+            cmd.env("KIM_TAURI_MODE", "1");
+            match parsed.permission_mode.as_deref().unwrap_or("full_auto") {
+                "ask_risky" => { cmd.env("KIM_HITL_RISK_THRESHOLD", "high"); }
+                "ask_always" => { cmd.env("KIM_HITL_RISK_THRESHOLD", "medium"); }
+                _ => {} // full_auto or unknown: no threshold = no HITL gate
             }
 
             if provider == "browser" || provider.starts_with("browser:") {
@@ -1068,6 +1156,7 @@ fn handle_webview_bridge_request(
                 let google_env = match tauri::async_runtime::block_on(google_oauth::google_oauth_env_for_agent()) {
                     Ok(value) => value,
                     Err(err) => {
+                        BRIDGE_TASK_STARTING.store(false, Ordering::Release);
                         respond_json(request, 400, serde_json::json!({
                             "ok": false,
                             "error": format!(
@@ -1086,13 +1175,23 @@ fn handle_webview_bridge_request(
             match cmd.spawn() {
                 Ok(mut child) => {
                     let child_pid = child.id();
-                    // Store PID
+                    // Store PID and clear the "starting" guard (#17) atomically:
+                    // the PID is visible before we release the guard so future
+                    // callers see the running process rather than a brief window
+                    // where both the PID slot and the starting flag are clear.
                     if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
                         *guard = Some(child_pid);
                     }
+                    BRIDGE_TASK_STARTING.store(false, Ordering::Release);
                     // Store session ID
                     if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
                         *guard = Some(session_id.clone());
+                    }
+                    // Store stdin handle for HITL approval forwarding (#15).
+                    // /v1/task/approve writes {"type":"hitl_approve","approved":bool}
+                    // to this handle so the Python StdinApprovalBridge receives it.
+                    if let Ok(mut guard) = BRIDGE_TASK_STDIN.get_or_init(|| StdMutex::new(None)).lock() {
+                        *guard = child.stdin.take();
                     }
 
                     // Emit event so the desktop UI knows a task started
@@ -1130,6 +1229,11 @@ fn handle_webview_bridge_request(
                         if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
                             *guard = None;
                         }
+                        // Drop the stdin handle so further /v1/task/approve calls
+                        // get a "no task running" error rather than hanging.
+                        if let Ok(mut guard) = BRIDGE_TASK_STDIN.get_or_init(|| StdMutex::new(None)).lock() {
+                            *guard = None;
+                        }
                         if let Some(cancel_win) = app_for_wait.get_webview_window("cancel-widget") {
                             let _ = cancel_win.close();
                         }
@@ -1150,6 +1254,8 @@ fn handle_webview_bridge_request(
                     }));
                 }
                 Err(e) => {
+                    // Clear the starting guard on spawn failure (#17).
+                    BRIDGE_TASK_STARTING.store(false, Ordering::Release);
                     respond_json(request, 500, serde_json::json!({
                         "ok": false,
                         "error": format!("Failed to start agent: {}", e),
@@ -1215,6 +1321,49 @@ fn handle_webview_bridge_request(
                         "message": "No task is currently running.",
                     }));
                 }
+            }
+        }
+        // HITL approval forwarding (#15): kimctl sends the user's yes/no decision
+        // here; we write a JSON line to the orchestrator's stdin so the Python
+        // StdinApprovalBridge receives it and unblocks the agent loop.
+        (Method::Post, "/v1/task/approve") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                return;
+            }
+            #[derive(Deserialize)]
+            struct ApproveRequest {
+                approved: bool,
+            }
+            let parsed: ApproveRequest = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    return;
+                }
+            };
+            let payload = format!(
+                "{}\n",
+                serde_json::json!({"type": "hitl_approve", "approved": parsed.approved})
+            );
+            let guard = BRIDGE_TASK_STDIN.get_or_init(|| StdMutex::new(None));
+            match guard.lock() {
+                Ok(mut opt) => {
+                    if let Some(ref mut stdin) = *opt {
+                        use std::io::Write as _;
+                        match stdin.write_all(payload.as_bytes()) {
+                            Ok(_) => {
+                                let _ = stdin.flush();
+                                respond_json(request, 200, serde_json::json!({"ok": true}));
+                            }
+                            Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": format!("stdin write failed: {}", e)})),
+                        }
+                    } else {
+                        respond_json(request, 409, serde_json::json!({"ok": false, "error": "No task running or task has no piped stdin"}));
+                    }
+                }
+                Err(_) => respond_json(request, 500, serde_json::json!({"ok": false, "error": "Internal lock error"})),
             }
         }
         (Method::Post, "/v1/browser/show") => {
@@ -1477,192 +1626,6 @@ fn handle_bridge_result_request(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Codex file-bridge command watcher (Tasks 4/5/7 of the browser-parity work)
-// ---------------------------------------------------------------------------
-
-const CODEX_BRIDGE_DIR: &str = "/tmp/codex_bridge";
-
-/// Spawn a background thread that:
-///  - Polls `/tmp/codex_bridge/browser_cmd.json` every 500 ms and dispatches
-///    show/hide/switch_site actions to the Kim webview window.
-///  - Writes `/tmp/codex_bridge/bridge_status.json` every 5 s so Codex's
-///    `/browser status` command can report the current bridge state.
-pub(crate) fn start_bridge_file_watcher(app_handle: tauri::AppHandle) {
-    std::thread::spawn(move || {
-        let bridge_dir = std::path::Path::new(CODEX_BRIDGE_DIR);
-        let cmd_path = bridge_dir.join("browser_cmd.json");
-        let status_path = bridge_dir.join("bridge_status.json");
-
-        let mut last_cmd_mtime: Option<std::time::SystemTime> = None;
-        let mut last_status_write = std::time::Instant::now();
-
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            // ── Handle browser_cmd.json ─────────────────────────────────────
-            if let Ok(meta) = fs::metadata(&cmd_path) {
-                if let Ok(modified) = meta.modified() {
-                    let is_new = last_cmd_mtime.is_none_or(|prev| modified > prev);
-                    if is_new {
-                        last_cmd_mtime = Some(modified);
-                        if let Ok(text) = fs::read_to_string(&cmd_path) {
-                            let _ = fs::remove_file(&cmd_path); // consume once
-                            if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&text) {
-                                let action = cmd.get("action")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let app = app_handle.clone();
-                                match action.as_str() {
-                                    "show_window" => {
-                                        show_browser_window_impl(&app);
-                                    }
-                                    "hide_window" => {
-                                        if let Some(win) = app.get_webview_window("kim-browser-signin") {
-                                            hide_browser_window_offscreen(&win);
-                                        }
-                                    }
-                                    "switch_site" => {
-                                        let site = cmd.get("site")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("claude");
-                                        let url = site_to_url(site);
-                                        let provider = Some(format!("{} (via /model)", capitalize(site)));
-                                        let _ = open_browser_signin_window_impl(&url, provider, &app);
-                                    }
-                                    "screenshot_flash" => {
-                                        show_screenshot_flash_impl(&app);
-                                    }
-                                    _ => {
-                                        eprintln!("[Kim] Unknown browser cmd action: {action}");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // ── Write bridge_status.json every 5 s ─────────────────────────
-            if last_status_write.elapsed() >= std::time::Duration::from_secs(5) {
-                last_status_write = std::time::Instant::now();
-                let (window_open, current_url) = if let Some(win) =
-                    app_handle.get_webview_window("kim-browser-signin")
-                {
-                    let url = win.url().map(|u| u.to_string()).unwrap_or_default();
-                    (true, url)
-                } else {
-                    (false, String::new())
-                };
-                let current_site = url_to_site(&current_url);
-                let signed_in = !current_url.is_empty()
-                    && !current_url.contains("login")
-                    && !current_url.contains("signin")
-                    && !current_url.contains("sign-in")
-                    && !current_url.contains("auth");
-                let status = serde_json::json!({
-                    "window_open": window_open,
-                    "current_site": current_site,
-                    "current_url": current_url,
-                    "bridge_version": 8,
-                    "signed_in": signed_in,
-                });
-                let _ = fs::create_dir_all(bridge_dir);
-                if let Ok(text) = serde_json::to_string_pretty(&status) {
-                    let _ = fs::write(&status_path, text);
-                }
-            }
-        }
-    });
-}
-
-fn show_screenshot_flash_impl(app_handle: &tauri::AppHandle) {
-    use tauri::Manager;
-    if let Some(existing) = app_handle.get_webview_window("screenshot-flash") {
-        let _ = existing.close();
-    }
-    // Use monitor logical size instead of fullscreen(true) to avoid the
-    // macOS Spaces slide-in transition and the opaque backing-layer that
-    // fullscreen mode forces (which produces the black fill).
-    let (log_w, log_h, log_x, log_y) = app_handle
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .map(|m| {
-            let sf = m.scale_factor();
-            let sz = m.size();
-            let pos = m.position();
-            (
-                sz.width as f64 / sf,
-                sz.height as f64 / sf,
-                pos.x as f64 / sf,
-                pos.y as f64 / sf,
-            )
-        })
-        .unwrap_or((1920.0, 1080.0, 0.0, 0.0));
-
-    match tauri::WebviewWindowBuilder::new(
-        app_handle,
-        "screenshot-flash",
-        tauri::WebviewUrl::App("screenshot-flash.html".into()),
-    )
-    .title("")
-    .inner_size(log_w, log_h)
-    .position(log_x, log_y)
-    .transparent(true)
-    .decorations(false)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .visible_on_all_workspaces(true)
-    .resizable(false)
-    .build()
-    {
-        Ok(win) => {
-            let win: tauri::WebviewWindow = win;
-            let _ = win.set_ignore_cursor_events(true);
-            let win_for_close = win.clone();
-            let config = app_handle.state::<crate::config::AppConfig>();
-            let delay_ms = config.screenshot_flash_duration_ms;
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                let _ = win_for_close.close();
-            });
-        }
-        Err(e) => eprintln!("[Kim] screenshot flash window error: {e}"),
-    }
-}
-
-#[tauri::command]
-pub(crate) async fn show_screenshot_flash(app_handle: tauri::AppHandle) {
-    show_screenshot_flash_impl(&app_handle);
-}
-
-fn site_to_url(site: &str) -> String {
-    match site {
-        "chatgpt" => "https://chatgpt.com/".to_string(),
-        "gemini" => "https://gemini.google.com/app".to_string(),
-        "deepseek" => "https://chat.deepseek.com/".to_string(),
-        "grok" => "https://grok.com/".to_string(),
-        _ => "https://claude.ai/new".to_string(),
-    }
-}
-
-fn url_to_site(url: &str) -> &'static str {
-    if url.contains("chatgpt.com") || url.contains("chat.openai.com") {
-        "chatgpt"
-    } else if url.contains("gemini.google.com") {
-        "gemini"
-    } else if url.contains("deepseek.com") {
-        "deepseek"
-    } else if url.contains("grok.x.com") || url.contains("x.com/i/grok") {
-        "grok"
-    } else if url.contains("claude.ai") {
-        "claude"
-    } else {
-        "unknown"
-    }
-}
 
 pub(crate) fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
@@ -1728,11 +1691,11 @@ pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Resul
     }
 
     if token.is_empty() {
-        token = format!(
-            "kim-{}-{}",
-            std::process::id(),
-            WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
+        // Generate a cryptographically random fallback token (#18).
+        // The previous format "kim-{pid}-{counter}" was predictable and low-entropy.
+        use rand::Rng;
+        let random_bytes: [u8; 32] = rand::thread_rng().gen();
+        token = random_bytes.iter().map(|b| format!("{:02x}", b)).collect();
         eprintln!("[Kim] WARNING: KIM_API_KEY not found in env or .env. Falling back to random bridge token.");
     }
 
@@ -1775,4 +1738,147 @@ pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Resul
     });
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for the /v1/task argv builder logic
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    /// Mirror the argv-building logic that lives inside the `/v1/task` HTTP handler
+    /// (http_bridge.rs lines ~1087-1098).  The handler calls
+    /// `crate::subprocess::is_bundled_orchestrator` to decide whether to prepend
+    /// `-m orchestrator.agent`, then appends `--task` and `--session-dir`.
+    ///
+    /// Keeping the mirror here (rather than calling the handler directly) lets us
+    /// exercise the decision branch in isolation without needing a Tauri AppHandle.
+    fn build_task_argv(interpreter: &str, task: &str, session_dir: &str) -> Vec<String> {
+        let mut args: Vec<String> = vec![];
+        if !crate::subprocess::is_bundled_orchestrator(interpreter) {
+            args.push("-m".to_string());
+            args.push("orchestrator.agent".to_string());
+        }
+        args.push("--task".to_string());
+        args.push(task.to_string());
+        args.push("--session-dir".to_string());
+        args.push(session_dir.to_string());
+        args
+    }
+
+    /// Regression: a bundled sidecar interpreter must NOT receive `-m orchestrator.agent`
+    /// because it is a standalone executable, not a Python binary.
+    /// Previously, every kimctl /v1/task spawn passed the flag unconditionally and
+    /// caused an immediate "No module named orchestrator" failure.
+    #[test]
+    fn bundled_omits_module_flag() {
+        let bundled_paths = [
+            "kim-orchestrator",
+            "kim-orchestrator-aarch64-apple-darwin",
+            "/Applications/Kim.app/Contents/MacOS/kim-orchestrator-aarch64-apple-darwin",
+            "/usr/local/lib/kim/kim-orchestrator-x86_64-unknown-linux-gnu",
+        ];
+
+        for interpreter in bundled_paths {
+            let argv = build_task_argv(interpreter, "do something", "/tmp/sessions");
+            assert!(
+                !argv.contains(&"-m".to_string()),
+                "bundled interpreter {:?} must NOT receive '-m' flag, got: {:?}",
+                interpreter,
+                argv,
+            );
+            assert!(
+                !argv.contains(&"orchestrator.agent".to_string()),
+                "bundled interpreter {:?} must NOT receive 'orchestrator.agent', got: {:?}",
+                interpreter,
+                argv,
+            );
+        }
+    }
+
+    /// Regression: a plain Python interpreter MUST receive `-m orchestrator.agent`
+    /// so that the orchestrator package is located on PYTHONPATH.
+    /// Without this flag every kimctl task silently failed to import the module.
+    #[test]
+    fn python_includes_module_flag() {
+        let python_paths = [
+            "python3",
+            "python",
+            "/usr/bin/python3",
+            "/home/user/.kim/venv/bin/python",
+            "/path/venv/bin/python3.11",
+        ];
+
+        for interpreter in python_paths {
+            let argv = build_task_argv(interpreter, "do something", "/tmp/sessions");
+            let m_pos = argv.iter().position(|a| a == "-m");
+            let module_pos = argv.iter().position(|a| a == "orchestrator.agent");
+
+            assert!(
+                m_pos.is_some(),
+                "python interpreter {:?} must receive '-m' flag, got: {:?}",
+                interpreter,
+                argv,
+            );
+            assert!(
+                module_pos.is_some(),
+                "python interpreter {:?} must receive 'orchestrator.agent', got: {:?}",
+                interpreter,
+                argv,
+            );
+            // The two flags must be adjacent: `-m orchestrator.agent`
+            assert_eq!(
+                m_pos.unwrap() + 1,
+                module_pos.unwrap(),
+                "'-m' must immediately precede 'orchestrator.agent' for {:?}",
+                interpreter,
+            );
+        }
+    }
+
+    /// Regression: regardless of interpreter type, the built argv must carry
+    /// `--task <task>` and `--session-dir <dir>` so the orchestrator receives
+    /// the user's request and stores its state in the right location.
+    #[test]
+    fn task_and_session_args_present() {
+        let cases = [
+            // (interpreter, expected_has_module_flag)
+            ("kim-orchestrator-aarch64-apple-darwin", false),
+            ("/usr/bin/python3", true),
+        ];
+        let task_value = "write a hello world script";
+        let session_dir_value = "/home/user/.kim/sessions";
+
+        for (interpreter, _) in cases {
+            let argv = build_task_argv(interpreter, task_value, session_dir_value);
+
+            let task_pos = argv.iter().position(|a| a == "--task");
+            assert!(
+                task_pos.is_some(),
+                "interpreter {:?}: '--task' missing from argv {:?}",
+                interpreter,
+                argv,
+            );
+            assert_eq!(
+                argv.get(task_pos.unwrap() + 1).map(String::as_str),
+                Some(task_value),
+                "interpreter {:?}: value after '--task' must be the task string",
+                interpreter,
+            );
+
+            let sdir_pos = argv.iter().position(|a| a == "--session-dir");
+            assert!(
+                sdir_pos.is_some(),
+                "interpreter {:?}: '--session-dir' missing from argv {:?}",
+                interpreter,
+                argv,
+            );
+            assert_eq!(
+                argv.get(sdir_pos.unwrap() + 1).map(String::as_str),
+                Some(session_dir_value),
+                "interpreter {:?}: value after '--session-dir' must be the session dir",
+                interpreter,
+            );
+        }
+    }
 }

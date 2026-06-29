@@ -1,5 +1,6 @@
 use crate::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tauri::State;
@@ -261,11 +262,23 @@ fn executable_from_env(key: &str, kind: CodeBackendKind) -> Option<CodeBackend> 
 }
 
 fn executable_on_path(name: &str, kind: CodeBackendKind) -> Option<CodeBackend> {
-    let out = std::process::Command::new("which").arg(name).output().ok()?;
+    // Use the platform-appropriate PATH search command (#20).
+    #[cfg(target_os = "windows")]
+    let search_cmd = ("where", name);
+    #[cfg(not(target_os = "windows"))]
+    let search_cmd = ("which", name);
+
+    let out = std::process::Command::new(search_cmd.0).arg(search_cmd.1).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // `where` on Windows returns one match per line; take the first.
+    let s = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if s.is_empty() {
         None
     } else {
@@ -343,9 +356,20 @@ pub(crate) async fn send_task(
     use tokio::process::Command;
 
     // Refuse to start a second task if one is already running or spawning.
+    // This is a fast early-reject; the authoritative gate is the reserve block below.
     {
         let guard = state.lock().await;
-        if guard.pid.is_some() || guard.starting {
+        let bridge_pid_running = BRIDGE_TASK_PID
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(process_exists)
+            .unwrap_or(false);
+        if guard.pid.is_some() || guard.starting
+            || BRIDGE_TASK_STARTING.load(Ordering::Acquire)
+            || bridge_pid_running
+        {
             return Err("A task is already running. Stop it before starting a new one.".to_string());
         }
     }
@@ -453,10 +477,21 @@ pub(crate) async fn send_task(
                 // Tell run_codex_subtask exactly which codex binary to spawn,
                 // so it doesn't have to repeat the search dance.
                 .env("CODEX_BIN", code_bin.to_string_lossy().to_string())
+                // Signal Tauri mode so codex_bridge_service emits a HITL
+                // approval request before spawning Codex (#2). Stdin pipe is
+                // required for the Python side to receive the approval decision.
+                .env("KIM_TAURI_MODE", "1")
+                .stdin(Stdio::piped())
                 // Forward webview-bridge creds so BrowserProvider can drive
                 // the in-app sign-in window in headless mode if configured.
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            // Map permission_mode → KIM_HITL_RISK_THRESHOLD (same vocab as send_task).
+            match permission_mode.as_deref().unwrap_or("full_auto") {
+                "ask_risky" => { c.env("KIM_HITL_RISK_THRESHOLD", "high"); }
+                "ask_always" => { c.env("KIM_HITL_RISK_THRESHOLD", "medium"); }
+                _ => {} // full_auto: no gate
+            }
             c
         } else {
             // ── Direct API mode ──────────────────────────────────────────
@@ -467,9 +502,13 @@ pub(crate) async fn send_task(
                 // so Codex bypasses its own ChatGPT account auth entirely and
                 // routes through the local Ollama daemon instead.
                 c.arg("exec")
-                    .arg("--json")
-                    .arg("--dangerously-bypass-approvals-and-sandbox")
-                    .arg("-C").arg(target_root.to_string_lossy().to_string())
+                    .arg("--json");
+                // Gate the sandbox-bypass flag behind an explicit opt-in env var (#1).
+                // Default: sandboxed + approvals enabled.
+                if std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1") {
+                    c.arg("--dangerously-bypass-approvals-and-sandbox");
+                }
+                c.arg("-C").arg(target_root.to_string_lossy().to_string())
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
@@ -696,10 +735,30 @@ pub(crate) async fn send_task(
 
     // Reserve the runner slot immediately before spawning. Command setup can be
     // slow, and two frontend invocations can otherwise both pass the initial
-    // pid check and spawn separate agents.
+    // pid check and spawn separate agents. BRIDGE_TASK_STARTING is the shared
+    // gate with /v1/task — both paths claim it atomically, so only one can win.
+    // After claiming, we also check BRIDGE_TASK_PID because /v1/task clears
+    // BRIDGE_TASK_STARTING once its PID is stored, meaning a running /v1/task
+    // has BRIDGE_TASK_STARTING=false but BRIDGE_TASK_PID=Some(pid).
     {
         let mut guard = state.lock().await;
         if guard.pid.is_some() || guard.starting {
+            return Err("A task is already running. Stop it before starting a new one.".to_string());
+        }
+        // swap returns the *previous* value; if it was already true, /v1/task owns it — bail.
+        if BRIDGE_TASK_STARTING.swap(true, Ordering::AcqRel) {
+            return Err("A task is already running. Stop it before starting a new one.".to_string());
+        }
+        // /v1/task may have cleared BRIDGE_TASK_STARTING but still be running (PID set).
+        let bridge_running = BRIDGE_TASK_PID
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(process_exists)
+            .unwrap_or(false);
+        if bridge_running {
+            BRIDGE_TASK_STARTING.store(false, Ordering::Release);
             return Err("A task is already running. Stop it before starting a new one.".to_string());
         }
         guard.starting = true;
@@ -710,6 +769,8 @@ pub(crate) async fn send_task(
         Err(e) => {
             let mut guard = state.lock().await;
             guard.starting = false;
+            // Release the shared spawn gate so /v1/task can proceed after our failure.
+            BRIDGE_TASK_STARTING.store(false, Ordering::Release);
             return Err(format!("Failed to start Kim: {}", e));
         }
     };
@@ -725,11 +786,20 @@ pub(crate) async fn send_task(
     if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
         *guard = child_pid;
     }
+    // PID is now set — release the BRIDGE_TASK_STARTING gate so the /v1/task guard
+    // sees a running PID rather than the "starting" flag going forward.
+    BRIDGE_TASK_STARTING.store(false, Ordering::Release);
     // K7: reflect the running task in the tray status line.
     crate::speed_access::set_tray_status(&app_handle, Some(task.as_str()));
 
-    // Store stdin handle for HITL approval round-trip (only for Kim orchestrator, not Codex).
-    if !is_codex {
+    // Store stdin handle for HITL approval round-trip.
+    // Always stored for the Kim orchestrator path (!is_codex).
+    // Also stored for the Codex browser-bridge path (is_codex && is_browser_provider):
+    // codex_bridge_service emits hitl_approval_request on stdout before spawning Codex
+    // and reads the approval from stdin, so the round-trip requires a live handle here.
+    // Direct Codex CLI runs (is_codex && !is_browser_provider) use Stdio::null on stdin
+    // and never emit HITL requests, so they are intentionally excluded.
+    if !is_codex || is_browser_provider {
         *hitl_stdin().lock().await = child.stdin.take();
     }
 
@@ -1251,6 +1321,86 @@ mod tests {
         assert!(!is_bundled_orchestrator("/usr/bin/python3"));
         assert!(!is_bundled_orchestrator("python"));
         assert!(!is_bundled_orchestrator("/path/venv/bin/python"));
+    }
+
+    // ── Regression: bundled_detection_by_basename ──────────────────────────────
+    // is_bundled_orchestrator must return true for every expected basename variant
+    // of the sidecar and false for the python interpreter names that can appear
+    // on PATH (python3 is the default system interpreter on macOS/Linux).
+    #[test]
+    fn bundled_detection_by_basename() {
+        // Bare sidecar name (development copy placed next to executable).
+        assert!(is_bundled_orchestrator("kim-orchestrator"));
+        // The Tauri bundle convention appends the platform triple.
+        assert!(is_bundled_orchestrator("kim-orchestrator-aarch64-apple-darwin"));
+        assert!(is_bundled_orchestrator("kim-orchestrator-x86_64-unknown-linux-gnu"));
+        assert!(is_bundled_orchestrator("kim-orchestrator-x86_64-pc-windows-msvc"));
+        // Any string that embeds the sidecar name is treated as bundled —
+        // this is intentional per the `contains` implementation.
+        assert!(is_bundled_orchestrator("prefix-kim-orchestrator-suffix"));
+
+        // Python interpreter names must never be treated as bundled.
+        assert!(!is_bundled_orchestrator("python3"));
+        assert!(!is_bundled_orchestrator("python"));
+        assert!(!is_bundled_orchestrator("py"));
+        // Unrelated orchestration tools must not match.
+        assert!(!is_bundled_orchestrator("orchestrator"));
+        assert!(!is_bundled_orchestrator("kim-agent"));
+    }
+
+    // ── Regression: bundled_detection_with_path_and_suffix ─────────────────────
+    // Detection must work when the sidecar is referenced via an absolute path and
+    // when the binary carries a .exe extension (Windows sidecar convention).
+    #[test]
+    fn bundled_detection_with_path_and_suffix() {
+        // Absolute path inside a macOS .app bundle.
+        assert!(is_bundled_orchestrator(
+            "/Applications/Kim.app/Contents/MacOS/kim-orchestrator"
+        ));
+        // Absolute path with Tauri platform-triple suffix (macOS arm64).
+        assert!(is_bundled_orchestrator(
+            "/Applications/Kim.app/Contents/MacOS/kim-orchestrator-aarch64-apple-darwin"
+        ));
+        // Absolute path on Linux.
+        assert!(is_bundled_orchestrator(
+            "/usr/local/lib/kim/kim-orchestrator-x86_64-unknown-linux-gnu"
+        ));
+        // Windows path — bare name with .exe extension.
+        assert!(is_bundled_orchestrator(
+            r"C:\Program Files\Kim\kim-orchestrator.exe"
+        ));
+        // Windows path — platform-triple + .exe extension.
+        assert!(is_bundled_orchestrator(
+            r"C:\Program Files\Kim\kim-orchestrator-x86_64-pc-windows-msvc.exe"
+        ));
+        // The .exe suffix alone (without "kim-orchestrator") must NOT match.
+        assert!(!is_bundled_orchestrator("python.exe"));
+        assert!(!is_bundled_orchestrator(r"C:\Python312\python.exe"));
+    }
+
+    // ── Regression: python_paths_not_bundled ───────────────────────────────────
+    // Any Python interpreter path returned by find_python_interpreter() in the
+    // non-sidecar code paths must NOT be classified as the bundled orchestrator.
+    #[test]
+    fn python_paths_not_bundled() {
+        // Project-local venv paths (both Unix and Windows layouts).
+        assert!(!is_bundled_orchestrator("/workspace/project/venv/bin/python"));
+        assert!(!is_bundled_orchestrator("/workspace/project/.venv/bin/python"));
+        assert!(!is_bundled_orchestrator(
+            r"C:\workspace\project\venv\Scripts\python.exe"
+        ));
+        assert!(!is_bundled_orchestrator(
+            r"C:\workspace\project\.venv\Scripts\python.exe"
+        ));
+        // Kim install-script home venv paths.
+        assert!(!is_bundled_orchestrator("/home/user/.kim_root/venv/bin/python"));
+        assert!(!is_bundled_orchestrator("/home/user/.kim/venv/bin/python"));
+        // Bare names as returned by system PATH fallback.
+        assert!(!is_bundled_orchestrator("python"));
+        assert!(!is_bundled_orchestrator("python3"));
+        // System-installed interpreters.
+        assert!(!is_bundled_orchestrator("/usr/bin/python3"));
+        assert!(!is_bundled_orchestrator("/usr/local/bin/python3"));
     }
 
     #[test]

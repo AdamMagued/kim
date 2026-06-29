@@ -372,8 +372,11 @@
     return map[m] || (m.includes('/') ? m.split('/')[1].split('+')[0] : 'bin');
   };
 
-  const injectAttachments = async (cfg, inputEl, attachments) => {
-    if (!attachments || !attachments.length) return 0;
+  // Returns { count, strategy, thumb } — count>0 ONLY when a real attachment chip
+  // actually appeared in the page. Each strategy is verified so a programmatic
+  // upload that the web UI silently ignores is not falsely reported as success.
+  const injectAttachments = async (cfg, inputEl, attachments, requestNativePaste) => {
+    if (!attachments || !attachments.length) return { count: 0, strategy: 'none', thumb: false };
     const files = [];
     for (let i = 0; i < attachments.length; i++) {
       try {
@@ -387,21 +390,68 @@
         files.push(new File([blob], name, { type: mime }));
       } catch (_) {}
     }
-    if (!files.length) return 0;
+    if (!files.length) return { count: 0, strategy: 'none', thumb: false };
 
-    // Find file input
+    // A real attachment chip / thumbnail appearing is the only proof the upload took.
+    const THUMB_SEL = 'img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view, '
+      + '[data-test-id*="image"], [aria-label*="Remove file"], [aria-label*="Remove attachment"]';
+    const baseThumbs = document.querySelectorAll(THUMB_SEL).length;
+    const thumbAppeared = async (ms) => {
+      let waited = 0;
+      while (waited < ms) {
+        await new Promise(r => setTimeout(r, 150));
+        waited += 150;
+        if (document.querySelectorAll(THUMB_SEL).length > baseThumbs) return true;
+      }
+      return false;
+    };
+
+    const imageFile = files.find(f => String(f.type || '').startsWith('image/'));
+
+    // Strategy 1 (preferred for the in-app webview): ask Rust to fire a REAL Cmd+V.
+    // WKWebView blocks execCommand('paste') and rejects synthetic ClipboardEvent, but a
+    // genuine keystroke is trusted and accepted. Do this FIRST — before touching the
+    // file input / upload button, which can steal focus or open a picker and make the
+    // keystroke miss the editor. The PNG is already on the clipboard and (for image
+    // sends) the webview is visible + frontmost + key.
+    // Only PNG: Rust stages only PNG to the system clipboard, so firing Cmd+V for a
+    // non-PNG image would paste whatever was already on the clipboard (stale/wrong).
+    if (imageFile && imageFile.type === 'image/png' && inputEl && typeof requestNativePaste === 'function') {
+      try { inputEl.focus(); } catch (_) {}
+      await new Promise(r => setTimeout(r, 150));
+      try { inputEl.focus(); } catch (_) {}            // re-assert focus right before the paste
+      const preThumbs = document.querySelectorAll(THUMB_SEL).length;
+      try { requestNativePaste(); } catch (_) {}
+      // The keystroke only fires ~400-500ms after this (IPC round-trip + Rust settle
+      // sleep), so wait PAST that before looking — otherwise we catch a pre-paste
+      // transient and declare success before the image is actually pasted (the race we
+      // diagnosed: thumb reported at +151ms while Cmd+V fired at +413ms).
+      await new Promise(r => setTimeout(r, 800));
+      let pasted = false;
+      for (let i = 0; i < 25; i++) {                   // poll up to ~5s more
+        if (document.querySelectorAll(THUMB_SEL).length > preThumbs) { pasted = true; break; }
+        await new Promise(r => setTimeout(r, 200));
+      }
+      if (pasted) {
+        // Let Gemini UPLOAD the image to its backend before we inject text and send —
+        // otherwise the message goes out without the picture attached.
+        await new Promise(r => setTimeout(r, 2000));
+        await dismissPopups();
+        return { count: 1, strategy: 'native_paste', thumb: true };
+      }
+      // native paste didn't visibly land — fall through to the legacy strategies.
+    }
+
+    // Strategy 2: hidden file input (other UIs). Verify a chip appears before trusting it.
     let fileInput = null;
     for (const sel of cfg.file_input_selectors || []) {
-      try {
-        const el = document.querySelector(sel);
-        if (el && el instanceof HTMLInputElement && el.type === 'file') { fileInput = el; break; }
-      } catch (_) {}
+      try { const el = document.querySelector(sel); if (el && el instanceof HTMLInputElement && el.type === 'file') { fileInput = el; break; } } catch (_) {}
     }
     if (!fileInput) {
       for (const sel of cfg.upload_button_selectors || []) {
         try {
           const btn = document.querySelector(sel);
-          if (btn) { btn.click(); await new Promise(r => setTimeout(r, 100)); }
+          if (btn) { btn.click(); await new Promise(r => setTimeout(r, 120)); }
           for (const fsel of cfg.file_input_selectors || []) {
             const fi = document.querySelector(fsel);
             if (fi && fi instanceof HTMLInputElement && fi.type === 'file') { fileInput = fi; break; }
@@ -411,70 +461,33 @@
       }
     }
     if (fileInput) {
-      const dt = new DataTransfer();
-      for (const f of files) dt.items.add(f);
-      try { fileInput.files = dt.files; } catch (_) {
-        try { Object.defineProperty(fileInput, 'files', { value: dt.files, configurable: true }); } catch (_) {}
-      }
-      fileInput.dispatchEvent(new Event('input', { bubbles: true }));
-      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-      await new Promise(r => setTimeout(r, 250));
-      return files.length;
+      try {
+        const dt = new DataTransfer();
+        for (const f of files) dt.items.add(f);
+        try { fileInput.files = dt.files; } catch (_) { try { Object.defineProperty(fileInput, 'files', { value: dt.files, configurable: true }); } catch (_) {} }
+        fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+        if (await thumbAppeared(2500)) { await dismissPopups(); return { count: files.length, strategy: 'file_input', thumb: true }; }
+      } catch (_) {}
     }
 
-    // Fallback: image paste. Two strategies in order:
-    //
-    // 1. document.execCommand('paste') — reads from the REAL system clipboard that
-    //    the Rust bridge pre-populated via osascript before evaluating this script.
-    //    This triggers a TRUSTED paste event (isTrusted: true) that Gemini's editor
-    //    accepts.  Synthetic ClipboardEvent is always isTrusted: false and is silently
-    //    rejected by Gemini's React/Lit frontend.
-    //
-    // 2. ClipboardEvent fallback — kept for sites (Claude, ChatGPT) that do honour
-    //    synthetic paste events.
-    //
-    // Returns 1 only when a thumbnail appears, 0 when all methods fail.
-    const imageFile = files.find(f => String(f.type || '').startsWith('image/'));
+    // Strategy 3/4: execCommand / synthetic paste (other webviews that honour them).
     if (imageFile && inputEl) {
-      try {
-        inputEl.focus();
-        await new Promise(r => setTimeout(r, 100));
+      try { inputEl.focus(); await new Promise(r => setTimeout(r, 120)); } catch (_) {}
+      let execPasted = false;
+      try { execPasted = document.execCommand('paste'); } catch (_) {}
+      if (await thumbAppeared(3000)) { await dismissPopups(); return { count: 1, strategy: 'execCommand_paste', thumb: true, execPasted }; }
 
-        // Strategy 1: synthetic ClipboardEvent (isTrusted: false — may be ignored by some editors)
+      try {
         const dt = new DataTransfer();
         dt.items.add(imageFile);
-        const pasteEvent = new ClipboardEvent('paste', {
-          bubbles: true,
-          cancelable: true,
-          clipboardData: dt,
-        });
-        inputEl.dispatchEvent(pasteEvent);
-        console.log('[KimBridge] ClipboardEvent paste dispatched:', imageFile.name);
+        inputEl.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
+      } catch (_) {}
+      if (await thumbAppeared(2500)) { await dismissPopups(); return { count: 1, strategy: 'synthetic_paste', thumb: true }; }
 
-        let waited = 0;
-        let thumbnailFound = false;
-        while (waited < 1000) {
-          await new Promise(r => setTimeout(r, 100));
-          waited += 100;
-          if (document.querySelector('img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view')) {
-            thumbnailFound = true;
-            break;
-          }
-        }
-        if (thumbnailFound) {
-          await dismissPopups();
-          console.log('[KimBridge] ClipboardEvent paste succeeded');
-          return 1;
-        }
-
-        // All methods failed — return 0 so send() can append a fallback note
-        console.warn('[KimBridge] All paste strategies failed after 2.5s — returning 0');
-        return 0;
-      } catch (e) {
-        console.warn('[KimBridge] injectAttachments error:', e);
-      }
+      return { count: 0, strategy: 'all_failed', thumb: false, execPasted };
     }
-    return 0;
+    return { count: 0, strategy: 'no_image', thumb: false };
   };
 
   // ── Main send function ───────────────────────────────────────────────
@@ -688,7 +701,18 @@
       }
       inputEl.focus();
 
-      const uploadedCount = await injectAttachments(cfg, inputEl, attachments);
+      const attachResult = await injectAttachments(cfg, inputEl, attachments,
+        () => ipcEmit({ ok: true, event: 'native_paste', req_id: reqId, site: siteKey }));
+      const uploadedCount = (attachResult && attachResult.count) || 0;
+      // Instrument which upload strategy ran + whether a chip actually appeared + the
+      // live bridge version, so success/failure is diagnosable from bridge_debug.log.
+      // (Unknown 'attach_diag' event is logged by Rust then ignored — harmless.)
+      if (attachments && attachments.length) {
+        try {
+          ipcEmit({ ok: true, event: 'attach_diag', req_id: reqId, site: siteKey,
+            error: 'ATTACH _v=' + (window.__kimBridge && window.__kimBridge._v) + ' ' + JSON.stringify(attachResult) });
+        } catch (_) {}
+      }
 
       // 3. Inject text — verify with rAF loop instead of hardcoded sleep.
       // When attachments were expected but couldn't be injected (uploadedCount === 0),
@@ -740,27 +764,44 @@
         throw new Error('Prompt changed after injection. Refusing to send a partial prompt.');
       }
 
-      // 4b. Submit via send button (preferred) or synthetic Enter (fallback).
-      inputEl.focus();
-      let sendClicked = false;
-      for (let attempt = 0; attempt < 15; attempt++) {
-        const sendBtn = findElement(cfg.send_selectors || [], { visible: true, enabled: true });
-        if (sendBtn) {
-          sendBtn.click();
-          sendClicked = true;
-          break;
+      // 4b/4c. Submit and verify by the one reliable signal: the editor clearing.
+      //   IMPORTANT: do NOT use the stop button as a "sent" signal. On a reused
+      //   thread it reads as visible even when idle (confirmed via diag.stop=true
+      //   while nothing was generating) — that false positive is exactly what made
+      //   the old code skip its retry and hang the full 120s (issue #4). A successful
+      //   submit clears the contenteditable; if our prompt is still sitting there the
+      //   send never registered (send button disabled / synthetic Enter ignored), so
+      //   re-attempt until it clears. Turn-1 (working path) clears immediately.
+      const minPromptLen = Math.min(8, normalizeText(effectivePrompt).length);
+      const inputCleared = () => {
+        try { return readInputText(inputEl).length < minPromptLen && !promptMatchesInput(inputEl, effectivePrompt); }
+        catch (_) { return false; }
+      };
+      const attemptSubmit = () => {
+        inputEl.focus();
+        // Prefer an enabled Send button; fall back to any visible one (the disabled
+        // flag often lags right after programmatic injection); then an Enter keypress.
+        const btn = findElement(cfg.send_selectors || [], { visible: true, enabled: true })
+                 || findElement(cfg.send_selectors || [], { visible: true });
+        if (btn) { try { btn.click(); return 'button'; } catch (_) {} }
+        for (const type of ['keydown', 'keypress', 'keyup']) {
+          inputEl.dispatchEvent(new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
         }
-        await new Promise(r => setTimeout(r, 100));
-      }
-      if (!sendClicked) {
-        // Fallback: synthetic Enter
-        inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-        inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-        inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-      }
-      console.log('[KimBridge] Message submitted via', sendClicked ? 'send button' : 'synthetic Enter');
+        return 'enter';
+      };
 
-      // 4c. Record THIS request's hash AFTER submit so the NEXT request can wait for it
+      let submitVia = attemptSubmit();
+      let sendConfirmed = inputCleared();
+      for (let v = 0; v < 6 && !sendConfirmed; v++) {
+        await new Promise(r => setTimeout(r, 350));
+        if (isSuperseded()) { ipcEmit({ ok: false, event: 'error', req_id: reqId, error: 'Request superseded by newer send', site: siteKey }); return; }
+        if (inputCleared()) { sendConfirmed = true; break; }
+        console.warn('[KimBridge] input not cleared after submit — re-attempting (try ' + (v + 1) + ')');
+        submitVia = attemptSubmit();
+      }
+      console.log('[KimBridge] Message submitted via', submitVia, '— confirmed=' + sendConfirmed);
+
+      // 4d. Record THIS request's hash AFTER submit so the NEXT request can wait for it
       if (completionHash) {
         window.__kimBridge._lastHash = completionHash;
       }
@@ -847,6 +888,8 @@
         const nodes = getResponseNodes(cfg, siteKey);
         const nn = findNewNode();
         const txt = nn ? extractAnswerText(nn) : (getLatestResponseText(cfg, siteKey) || '');
+        let inputLen = -1;
+        try { inputLen = readInputText(inputEl).length; } catch (_) {}
         return {
           loops,
           baseCount: baselineResponseCount,
@@ -858,6 +901,7 @@
           stop: isAnyStopVisible(cfg),
           sawNew: sawNewResponse,
           idle: idleCount,
+          inputLen, // >0 after send ⇒ message never left the input (send failed)
           head: txt.slice(0, 60),
         };
       };
@@ -874,6 +918,24 @@
         }
         reportProgress(latestText);
         if (loops % 17 === 0) console.log('[KimBridge] poll diag', JSON.stringify(diag()));
+
+        // Fail fast rather than burn the full 120s hard deadline on dead air. Keyed
+        // off real signals only (NOT the stop button, which false-positives on reused
+        // threads). Only trips when NOTHING has appeared yet (sawNewResponse stays
+        // false) — a genuine generation flips sawNewResponse within a second or two of
+        // streaming, so this never aborts a real (even slow) response.
+        if (!sawNewResponse) {
+          let inputStuck = false;
+          try { inputStuck = readInputText(inputEl).length >= minPromptLen; } catch (_) {}
+          if (inputStuck && loops >= 33) {
+            // ~10s: our prompt is still sitting in the editor → the send never registered.
+            throw new Error(`Send did not register — prompt still in the input after ${loops} polls; diag=${JSON.stringify(diag())}`);
+          }
+          if (loops >= 200) {
+            // ~60s: input cleared (message left) but no reply node ever appeared.
+            throw new Error(`No response turn detected — nothing generated after ${loops} polls; diag=${JSON.stringify(diag())}`);
+          }
+        }
 
         if (completionHash && latestText.includes(completionHash)) {
           responseText = latestText.replace(completionHash, '').trim();
@@ -963,7 +1025,7 @@
 
   // ── Public API ─────────────────────────────────────────────────────────
   window.__kimBridge = {
-    _v: 12,
+    _v: 18,
     _lastHash: null, // Tracks the completion hash of the most recent request
     _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
     send,

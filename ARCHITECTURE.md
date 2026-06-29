@@ -46,28 +46,31 @@ The intelligence and action engine of the platform is written in Python and oper
 │  - claude.py                 │                              │
 │  - openai_provider.py        │  Local MCP Server (server.py)│
 │  - gemini.py / deepseek.py   │  - tool_registry.py          │
-│  - browser/provider.py       │  - 31 OS Control Tools       │
+│  - browser/provider.py       │  - 50 OS Control Tools       │
 └──────────────────────────────┴──────────────────────────────┘
 ```
 
 - **KimAgent Loop (`agent.py`)**: An asynchronous iteration loop that takes task inputs, manages history compaction, prunes screenshots, requests choices from LLM Providers, and executes actions.
-- **Local MCP Server (`server.py`)**: Communicates with the orchestrator over a secure stdio transport. Exposes **31 OS-control tools** grouped across files, shell command exec, mouse/keyboard inputs, window focal states, screen vision, browser interactions, search/grep, and git tools.
+- **Local MCP Server (`server.py`)**: Communicates with the orchestrator over a secure stdio transport. Exposes **50 OS-control tools** grouped across files, shell command exec, mouse/keyboard inputs, window focal states, screen vision, browser interactions, search/grep, and git tools.
 
 ---
 
 ## 3. Communication Protocols & IPC
 
-Tauri communicates with the spawned agent subprocess using high-fidelity Inter-Process Communication (IPC) channels.
+The system has four distinct IPC surfaces between layers.
 
-### The 5 Tauri events (Rust Backend → React UI)
+### Surface A — Tauri events (Rust Backend → React UI)
+Five events emitted by the Rust backend over the Tauri event bus:
 1. `kim-agent-output` (string): Live stdout text stream from the agent.
 2. `kim-agent-error` (string): Subprocess stderr output logs.
 3. `kim-agent-done` (boolean): Signal confirming runloop completion.
 4. `kim-agent-cancelled` (boolean): Signal that a running task was aborted.
 5. `kim-agent-code-session` (SessionInfo): Session data emitted when a code workspace initializes.
 
-### Stdout Text Protocol (Python → Rust Backend)
-The agent loop formats outputs printed to stdout, which `lib.rs` captures line-by-line and forwards:
+Canonical event shapes are defined in `desktop/src/types/events.schema.json`; TypeScript types are generated from it via `scripts/gen-events.js` into `desktop/src/types/events.gen.ts` (codegen is live and checked by CI drift check). Events are also parsed from the raw stdout text protocol below.
+
+### Surface B — Stdout Text Protocol (Python → Rust Backend)
+The agent loop formats outputs printed to stdout, which `subprocess.rs` captures line-by-line and forwards via the Tauri event bus:
 - `[STATUS] <message>`: Live status updates (e.g. "Taking a screenshot...", "Running command...").
 - `[PLAN]{json_array}`: Emits a structured JSON array representing planned workflow steps.
 - `[STEP N]:{json_object}`: Emits details of the current step $N$ (status, tool parameters, outcome).
@@ -75,6 +78,22 @@ The agent loop formats outputs printed to stdout, which `lib.rs` captures line-b
 - `[CONTEXT]{json_object}`: Cumulative context usage (input token meter status and compaction metrics).
 - `[UI] SCREENSHOT_FLASH`: Triggers a full-window screen-capture camera flash transition in the UI.
 - `[UI] SHOW`: Restores/shows the main Tauri window.
+
+### Surface C — HTTP Bridge (`http_bridge.rs`, `/v1/*` endpoints)
+`desktop/src-tauri/src/http_bridge.rs` runs a `tiny_http` server on a fixed local port (authenticated by `X-Kim-Token`). Key endpoints:
+- `POST /v1/task` — spawns a new agent subprocess (used by the Code tab / `codex_bridge_service`).
+- `POST /v1/send` and `GET /v1/result/{reqId}` — split send/receive for browser-provider LLM calls (bridge.js → Python → bridge.js round-trip).
+- `POST /v1/complete` — legacy single-call variant of send/receive.
+- `POST /v1/callback` — signals to the waiting condvar that the WebView bridge has initialized.
+- `GET /v1/status`, `/v1/health`, `/v1/ping` — status/health probes.
+- `/v1/browser/*` — current URL, metadata, commit-URL, and restore for in-app WebView state.
+- `POST /v1/cancel`, `/v1/hide`, `/v1/show`, `/v1/open` — task lifecycle and window controls.
+
+### Surface D — WebView Automation Bridge (`browser_bridge.rs` + `bridge.js`)
+`desktop/src-tauri/src/browser_bridge.rs` manages a persistent in-app WebView window (`kim-browser-automate`) and injects `bridge.js` (extracted from `lib.rs` and loaded via `include_str!("bridge.js")`). The injected script intercepts outgoing fetch/XHR calls inside the target site (Claude, ChatGPT, Gemini) and re-routes them through the `/v1/send` HTTP bridge so the Python `BrowserProvider` can intercept LLM responses without a Playwright subprocess.
+
+### Surface E — Phone Relay (`relay.rs`)
+`desktop/src-tauri/src/relay.rs` manages the optional phone-to-PC relay integration. Tauri commands (`read_relay_config`, `write_relay_url`, `relay_pair_init`, `relay_pair_status`) wire the relay URL and RELAY_PC_API_KEY configuration stored in `config.yaml`.
 
 ---
 
@@ -84,18 +103,18 @@ The Code workspace uses a highly coordinated multi-layered proxy pipeline to exe
 
 ```
 Tauri React UI (Code Tab)
-  → Tauri Backend (lib.rs)
-    → subprocess (python -m orchestrator.run_codex_bridge)
-      → mcp_server/tools/codex_bridge.py (setup proxy + launch CLI)
+  → Tauri Backend (subprocess.rs / http_bridge.rs /v1/task)
+    → subprocess (python -m orchestrator.codex_bridge_service)
+      → codex_bridge_service.py (setup proxy + launch CLI, with atexit/SIGTERM cleanup)
         → _CodexProxy (aiohttp proxy server on ephemeral port)
           → Codex CLI (codex exec --json)
             → BrowserProvider.complete() (scrapes browser using CDP)
 ```
 
 The 5 distinct execution layers:
-1. **React Code Tab**: Submits tasks using Tauri RPC.
-2. **Tauri Subprocess Launch**: Spawns `run_codex_bridge.py`.
-3. **MCP Tool Bridge**: Starts an in-memory `_CodexProxy`.
+1. **React Code Tab**: Submits tasks using Tauri RPC; Tauri may use `/v1/task` (HTTP bridge) to spawn the subprocess.
+2. **Tauri Subprocess Launch**: Spawns `orchestrator.codex_bridge_service` (the consolidated bridge module; replaced the legacy `run_codex_bridge.py` entrypoint). It imports the bridge engine from the top-level `codex_engine/engine.py` package — a normal sibling import with no `sys.path` manipulation (resolution comes from `PYTHONPATH=kim_root`).
+3. **`codex_bridge_service.py`**: Starts an in-process `_CodexProxy`; registers `atexit`/`SIGTERM` handlers for cleanup; uses a `tempfile.TemporaryDirectory` context for scratch files.
 4. **_CodexProxy (aiohttp)**: Intercepts OpenAI-format API endpoints and maps them to local execution structures.
 5. **Codex CLI & BrowserProvider**: Connects to the browser provider using Chromium Developer Tools Protocol (CDP) to drive prompts in the live browser.
 
@@ -139,6 +158,6 @@ The system resolves parameters at runtime from four key layers:
    - Google account multi-login profiles linked within `KimAccount` store `{ email, authuser_index }` pairings.
    - The active identity's `authuser_index` propagates down to the browser bridge (`authuser` key) via the `/v1/send` endpoint, driving WebView loads to URLs matching `?authuser=N`.
 
-5. **kimTools Gateway security isolation**:
-   - `kimTools` is a separate local API gateway/proxy operating on port 8046.
-   - Hardcoded OAuth credentials have been completely removed from source. It relies exclusively on env vars (`GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET`), falling back to a 503 error when missing.
+5. **HTTP bridge security**:
+   - The `/v1/*` HTTP bridge (`http_bridge.rs`) is authenticated via a per-session `X-Kim-Token` header checked using constant-time comparison to prevent timing attacks. `/v1/health` is the only unauthenticated endpoint.
+   - Hardcoded OAuth credentials have been removed from source. Google OAuth relies exclusively on env vars (`GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET`) via `google_oauth.rs`, falling back to a 503 error when missing.

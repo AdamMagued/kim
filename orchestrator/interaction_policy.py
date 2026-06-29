@@ -178,7 +178,7 @@ class InteractionPolicy:
 
         if name == "web_observe":
             self.web_observe_attempted = True
-            self.web_observe_failed = result_text.startswith("ERROR:")
+            self.web_observe_failed = failed
             self.web_state_dirty = False
             if self.web_observe_failed:
                 self.known_web_element_ids.clear()

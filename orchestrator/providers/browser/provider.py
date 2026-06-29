@@ -144,8 +144,8 @@ class BrowserProvider(BaseProvider):
         if self._gemini_authuser is None:
             self._gemini_authuser = self._load_active_gemini_authuser_from_account()
 
-        self._managed_pw = None
-        self._managed_browser = None
+        # _managed_pw / _managed_browser removed: they were set but never read
+        # and never explicitly closed, causing resource leaks (#43).
 
         # ── Persistent session directory ────────────────────────────────
         project_root = Path(
@@ -204,7 +204,10 @@ class BrowserProvider(BaseProvider):
         )
 
     def reset_session(self) -> None:
-        pass
+        """Clear per-session state so a fresh task gets a clean system prompt and tab."""
+        self._sent_system_prompt = False
+        self._last_chat_page_url = None
+        self._last_chat_site = None
 
     def _estimate_prompt_usage(self, prompt: str, attachments: list[dict]) -> dict:
         image_count = sum(
@@ -305,6 +308,10 @@ class BrowserProvider(BaseProvider):
         sent_sys = self._sent_system_prompt
         if restore_status == "stored_thread" and len(messages) > 1:
             sent_sys = True
+        # A cleared/fresh chat has no prior context — the system prompt (and the
+        # completion-hash protocol it establishes) MUST be re-sent in full.
+        if clear_chat:
+            sent_sys = False
 
         prompt, attachments, completion_hash, new_sent = format_prompt(
             messages,
@@ -338,6 +345,13 @@ class BrowserProvider(BaseProvider):
             return self._attach_usage(result, estimated_usage)
 
         try:
+            # Playwright is imported lazily (module top only imports it under
+            # TYPE_CHECKING so selecting a browser provider doesn't hard-crash when
+            # playwright isn't installed). Import the runtime symbol here, where the
+            # CDP path actually needs it; a missing install degrades to the NEED_HELP
+            # below instead of a NameError.
+            from playwright.async_api import async_playwright
+
             async with async_playwright() as pw:
                 browser = await self._connect(pw)
                 page, site = await self._find_chat_page(browser)
@@ -385,12 +399,18 @@ class BrowserProvider(BaseProvider):
 
                 logger.info(f"[STATUS] Sending message to {site}…")
                 raw_response = await self._send_and_wait(page, cfg, prompt, site, completion_hash)
+                # Pass known_tools so the parser can reject prompt-injected fake tool
+                # calls whose names aren't in the schema the agent actually has (#38).
+                known = {t["name"] for t in (tools or [])} if tools else None
                 return self._attach_usage(
-                    parse_response(raw_response, completion_hash),
+                    parse_response(raw_response, completion_hash, known_tools=known),
                     estimated_usage,
                 )
-        except Exception as e:
-            logger.error(f"BrowserProvider.complete failed: {e}", exc_info=True)
+        except (ConnectionError, OSError, RuntimeError) as e:
+            # Only genuine browser-connection / IO failures are mapped to NEED_HELP;
+            # all other exceptions (KeyError, TypeError, programming bugs) propagate
+            # to the caller's retry / classify_provider_error path (#37).
+            logger.error(f"BrowserProvider.complete browser connection failed: {e}", exc_info=True)
             return self._attach_usage(
                 {"type": "text", "content": f"NEED_HELP: Browser connection failed — {e}"},
                 estimated_usage,
@@ -412,8 +432,8 @@ class BrowserProvider(BaseProvider):
         self._sent_system_prompt = new_sent
         return prompt, attachments, completion_hash
 
-    def _parse_response(self, text, completion_hash):
-        return parse_response(text, completion_hash)
+    def _parse_response(self, text, completion_hash, known_tools=None):
+        return parse_response(text, completion_hash, known_tools=known_tools)
 
     def _strip_transport_markers(self, text, completion_hash):
         return strip_transport_markers(text, completion_hash)
@@ -438,20 +458,25 @@ class BrowserProvider(BaseProvider):
             logger.info("CDP unavailable — auto-launching headless Chromium")
             return await self._auto_launch(pw)
 
+        # Derive the port from the configured CDP URL so the help text matches
+        # what the provider actually tries to connect to (#3).
+        import urllib.parse as _urlparse
+        _cdp_port = _urlparse.urlparse(self._cdp_url).port or 9222
+
         sys_name = platform.system()
         if sys_name == "Darwin":
             launch_cmd = (
                 '/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome '
-                f'--remote-debugging-port=9222 --user-data-dir="{self._user_data_dir}"'
+                f'--remote-debugging-port={_cdp_port} --user-data-dir="{self._user_data_dir}"'
             )
         elif sys_name == "Linux":
             launch_cmd = (
-                f'google-chrome --remote-debugging-port=9222 '
+                f'google-chrome --remote-debugging-port={_cdp_port} '
                 f'--user-data-dir="{self._user_data_dir}"'
             )
         else:
             launch_cmd = (
-                f'chrome.exe --remote-debugging-port=9222 '
+                f'chrome.exe --remote-debugging-port={_cdp_port} '
                 f'--user-data-dir="{self._user_data_dir}"'
             )
         raise ConnectionError(
@@ -508,22 +533,10 @@ class BrowserProvider(BaseProvider):
                 )
             await context.new_page()
 
-        self._managed_context = context
         logger.info(
             f"Headless Chromium ready — {len(context.pages)} page(s) loaded"
         )
         return context  # type: ignore[return-value]
-
-    async def _list_pages(self, browser) -> list[str]:
-        pages: list[str] = []
-        if hasattr(browser, 'contexts'):
-            for ctx in browser.contexts:
-                for page in ctx.pages:
-                    pages.append(page.url)
-        elif hasattr(browser, 'pages'):
-            for page in browser.pages:
-                pages.append(page.url)
-        return pages
 
     async def _find_chat_page(self, browser) -> tuple[Optional[Page], Optional[str]]:
         ordered = [

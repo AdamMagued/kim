@@ -291,6 +291,8 @@ export const HIDDEN_SUBSTRINGS = [
   'stdin',
   // Backend routing/startup diagnostics that shouldn't render as thoughts
   'Routing to Codex',
+  // Internal run lifecycle status — not a user-facing reasoning step
+  'run ended:',
   // Native UI tool-result noise
   'No interactive controls', "title='", 'title="',
 ];
@@ -366,7 +368,17 @@ export function friendlyError(raw: string): string {
     .replace(/\[(ERROR|WARN|INFO|DEBUG|TOOL|CRITICAL)\]\s*/g, '')
     .replace(/orchestrator\.\w+:\s*/g, '')
     .trim();
-  return cleaned.length > 0 && cleaned.length < 200 ? cleaned : 'Something went wrong. Check your settings and try again.';
+  // Reject strings that contain internal file paths, Python tracebacks, or stack
+  // fragments — these must never be surfaced verbatim in the UI.
+  const hasSensitiveDetail =
+    /[/\\][a-zA-Z0-9_.~-]+[/\\]/.test(cleaned) ||  // absolute/relative file path
+    /\bTraceback\b/i.test(cleaned) ||
+    /File\s+"[^"]*"/.test(cleaned) ||
+    /\.py(?::\s*\d+)?/.test(cleaned) ||
+    /^\s*at\s+\S+\s+\(/.test(cleaned);              // JS stack frame
+  return cleaned.length > 0 && cleaned.length < 200 && !hasSensitiveDetail
+    ? cleaned
+    : 'Something went wrong. Check your settings and try again.';
 }
 
 /** Friendly names + icons for known tool calls */
@@ -477,10 +489,26 @@ export function parseLogLine(raw: string, id: number): ActivityItem | null {
     if (text) return { id, kind: 'status', icon: '›', text };
   }
 
-  const toolMatch = stripped.match(/\[TOOL\]\s+(?:[\w.]+:\s+)?(\w+)\((.{0,200})\)/);
-  if (toolMatch) {
-    const toolName = toolMatch[1];
-    const argsRaw = toolMatch[2] ?? '{}';
+  // Use balanced-paren extraction so args longer than 200 chars are not truncated.
+  const toolPrefixMatch = stripped.match(/\[TOOL\]\s+(?:[\w.]+:\s+)?(\w+)\(/);
+  if (toolPrefixMatch) {
+    const toolName = toolPrefixMatch[1];
+    const openIdx = (toolPrefixMatch.index ?? 0) + toolPrefixMatch[0].length - 1;
+    let depth = 0;
+    let closeIdx = -1;
+    let inString = false;
+    let escape = false;
+    for (let ci = openIdx; ci < stripped.length; ci++) {
+      const ch = stripped[ci];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\' && inString) { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (!inString) {
+        if (ch === '(') depth++;
+        else if (ch === ')') { depth--; if (depth === 0) { closeIdx = ci; break; } }
+      }
+    }
+    const argsRaw = closeIdx > openIdx ? stripped.slice(openIdx + 1, closeIdx) : '{}';
     let args: Record<string, unknown> = {};
     try { args = JSON.parse(argsRaw); } catch {
       const m = argsRaw.match(/"(\w+)":\s*"([^"]+)"/);
@@ -894,23 +922,30 @@ export function projectLabel(path?: string): string {
 
 // USD cost per 1M tokens { input, output }. Zero for free/local providers.
 // Rates are approximate; see provider docs for exact pricing.
+// Last refreshed: 2025-Q2. Update when provider pricing changes.
 const PRICE_PER_1M: Record<string, { input: number; output: number }> = {
-  claude:   { input: 3.00,  output: 15.00  }, // claude-sonnet-4.x default
-  openai:   { input: 5.00,  output: 15.00  }, // gpt-4o
-  gemini:   { input: 1.25,  output: 5.00   }, // gemini-1.5-pro
-  deepseek: { input: 0.27,  output: 1.10   }, // deepseek-chat
+  claude:   { input: 3.00,  output: 15.00  }, // claude-sonnet-4.x (Anthropic)
+  openai:   { input: 2.50,  output: 10.00  }, // gpt-4o (OpenAI)
+  gemini:   { input: 1.25,  output: 5.00   }, // gemini-1.5-pro (Google)
+  deepseek: { input: 0.27,  output: 1.10   }, // deepseek-chat V3 (cache-miss)
   ollama:   { input: 0,     output: 0      }, // local
-  browser:  { input: 0,     output: 0      }, // local
+  browser:  { input: 0,     output: 0      }, // local browser session
 };
 
-export function estimateCostUsd(provider: string, inputTokens: number, outputTokens: number): number {
+/**
+ * Returns the estimated USD cost for the given token counts, or `null` when the
+ * provider is not in the known price table.  Returning null (instead of falling
+ * back to an arbitrary rate) prevents fabricated cost figures appearing in the UI
+ * for providers we have no pricing data for.
+ */
+export function estimateCostUsd(provider: string, inputTokens: number, outputTokens: number): number | null {
   // B5: browser providers stream as `browser:claude` / `browser:chatgpt` etc.
-  // Those are free local sessions — normalize to the `browser` (zero-cost) key
-  // so they don't fall through to the default claude rate and show a fake cost.
+  // Those are free local sessions — normalize to the `browser` (zero-cost) key.
   const normalized = provider.trim().toLowerCase().startsWith('browser')
     ? 'browser'
-    : provider;
-  const rates = PRICE_PER_1M[normalized] ?? PRICE_PER_1M['claude'];
+    : provider.trim().toLowerCase();
+  const rates = PRICE_PER_1M[normalized];
+  if (!rates) return null; // Unknown provider — don't fabricate a cost
   return (inputTokens * rates.input + outputTokens * rates.output) / 1_000_000;
 }
 

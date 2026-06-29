@@ -1,18 +1,17 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
-use tiny_http::{Header, Request, Response, StatusCode};
 use tokio::sync::Mutex;
 
 mod google_oauth;
 pub mod account;
+pub mod secrets;
 pub mod codex_projects;
 pub mod data_io;
 pub mod feedback;
@@ -27,13 +26,25 @@ pub mod voice_config;
 pub mod config;
 pub(crate) mod http_bridge;
 pub mod browser_bridge;
+mod screenshot_flash;
+mod codex_bridge;
 pub mod provider_auth;
 pub(crate) use browser_bridge::*;
+mod paths;
+pub(crate) use paths::*;
+mod session_store;
+pub(crate) use session_store::*;
+mod provider_url;
+pub(crate) use provider_url::*;
+mod http_util;
+pub(crate) use http_util::*;
 
 // Re-export commonly used types/helpers from submodules so remaining lib.rs
 // code (session listing, run history, codex file-bridge) can use them unqualified.
 use codex_projects::{mirror_latest_claw_session_to_codex, newest_codex_session};
-use http_bridge::{capitalize, start_webview_bridge_server, start_bridge_file_watcher, show_screenshot_flash};
+use http_bridge::{capitalize, start_webview_bridge_server};
+use codex_bridge::start_bridge_file_watcher;
+use screenshot_flash::show_screenshot_flash;
 use ollama::ollama_tags;
 
 // ---------------------------------------------------------------------------
@@ -137,11 +148,21 @@ static IPC_LISTENER_REGISTERED: OnceLock<()> = OnceLock::new();
 static WEBVIEW_BRIDGE_CFG: OnceLock<WebviewBridgeConfig> = OnceLock::new();
 static WEBVIEW_BRIDGE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WEBVIEW_BRIDGE_REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Atomic "task is starting" guard to close the TOCTOU window between the
+/// already-running check and the spawn (#17).  Set to true before spawning,
+/// cleared after the PID is stored or on spawn failure.
+static BRIDGE_TASK_STARTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static WEBVIEW_BRIDGE_RESULTS: OnceLock<StdMutex<HashMap<String, BridgeCompleteResponse>>> = OnceLock::new();
 static WEBVIEW_BRIDGE_PROGRESS: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
 /// Condvar notified whenever a result is inserted into WEBVIEW_BRIDGE_RESULTS.
 /// Collectors wait on this instead of polling every 150ms.
 static WEBVIEW_BRIDGE_NOTIFY: OnceLock<(StdMutex<()>, Condvar)> = OnceLock::new();
+/// Condvar signalled by the /v1/callback handler once the bridge.js initialization
+/// script has reported readiness (flag set to true).  The nav-wait in
+/// `clear_provider_webview_chat` uses this condvar so it can wake early rather
+/// than always sleeping for the full 3 500 ms (#10).
+static WEBVIEW_NAV_READY: OnceLock<(StdMutex<bool>, Condvar)> = OnceLock::new();
 /// Tracks whether the browser window was hidden before a specific /v1/send request, so /v1/result knows to hide it after.
 static WEBVIEW_WAS_HIDDEN: OnceLock<StdMutex<std::collections::HashSet<String>>> = OnceLock::new();
 /// Debug/testing mode: keep the provider webview visible while sending.
@@ -151,10 +172,15 @@ static WEBVIEW_KEEP_VISIBLE: OnceLock<StdMutex<bool>> = OnceLock::new();
 static BRIDGE_TASK_PID: OnceLock<StdMutex<Option<u32>>> = OnceLock::new();
 /// Session ID of the currently-running agent task (set by /v1/task or send_task).
 static BRIDGE_TASK_SESSION: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
+/// Stdin handle for the /v1/task agent process; written by /v1/task/approve for HITL (#15).
+static BRIDGE_TASK_STDIN: OnceLock<StdMutex<Option<std::process::ChildStdin>>> = OnceLock::new();
 /// The site selected via /v1/provider, to be passed to the next agent spawn.
 static KIM_PREFERRED_SITE: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
 /// Last Gemini authuser index intentionally loaded in the in-app browser.
 static WEBVIEW_LAST_GEMINI_AUTHUSER: OnceLock<StdMutex<Option<u32>>> = OnceLock::new();
+/// Child handle for the CDP Chrome process spawned by launch_chrome_for_cdp (#8).
+/// Stored so it can be killed on app shutdown rather than leaking as a zombie.
+static CDP_CHROME_CHILD: OnceLock<StdMutex<Option<std::process::Child>>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -236,90 +262,6 @@ pub struct KimMessage {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Ancestors of the current executable, used to locate an installed Kim
-/// project root (`kim/` containing orchestrator/). This lets the packaged
-/// desktop app find its sibling Python project without any hardcoded user
-/// directories.
-fn exe_ancestor_kim_root() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    for ancestor in exe.ancestors() {
-        // Heuristic: an ancestor that contains `orchestrator/agent.py` is
-        // a valid Kim root. Works for both `kim/desktop/…/desktop` dev and
-        // packaged-app layouts where the binary lives beside the project.
-        if ancestor.join("orchestrator").join("agent.py").exists() {
-            return Some(ancestor.to_path_buf());
-        }
-    }
-    None
-}
-
-pub(crate) fn default_project_root() -> PathBuf {
-    // 0a. Compile-time baked path — the only reliable option when the app runs
-    //     from inside a .app bundle where no ancestor contains orchestrator/.
-    //     Set by build.rs from CARGO_MANIFEST_DIR at build time.
-    if let Some(baked) = option_env!("KIM_COMPILE_TIME_ROOT") {
-        let p = PathBuf::from(baked);
-        if p.exists() && p.join("orchestrator").join("agent.py").exists() {
-            return p;
-        }
-    }
-
-    // 0b. ~/.kim_root — written by install.sh so even a moved/renamed project
-    //     can be found at runtime without a rebuild.
-    if let Some(home) = dirs::home_dir() {
-        let root_file = home.join(".kim_root");
-        if let Ok(contents) = std::fs::read_to_string(&root_file) {
-            let p = PathBuf::from(contents.trim());
-            if p.exists() && p.join("orchestrator").join("agent.py").exists() {
-                return p;
-            }
-        }
-    }
-
-    // 1. Environment override wins (explicit user intent).
-    if let Ok(env_root) = std::env::var("KIM_PROJECT_ROOT") {
-        let p = PathBuf::from(env_root);
-        if p.exists() {
-            return p;
-        }
-    }
-    // 2. Walk up from the executable.
-    if let Some(root) = exe_ancestor_kim_root() {
-        return root;
-    }
-    // 3. ~/.kim (standard per-user install).
-    if let Some(home) = dirs::home_dir() {
-        let user = home.join(".kim");
-        if user.exists() {
-            return user;
-        }
-        // Return the default location even if not yet created
-        return user;
-    }
-    PathBuf::from(".")
-}
-
-pub(crate) fn default_sessions_dir() -> PathBuf {
-    // Environment override.
-    if let Ok(env_dir) = std::env::var("KIM_SESSIONS_DIR") {
-        let p = PathBuf::from(env_dir);
-        if p.exists() {
-            return p;
-        }
-    }
-    // Project-root/kim_sessions if the project root was detected.
-    let root = default_project_root();
-    let root_sessions = root.join("kim_sessions");
-    if root_sessions.exists() {
-        return root_sessions;
-    }
-    // ~/.kim/sessions fallback.
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".kim").join("sessions");
-    }
-    PathBuf::from("kim_sessions")
-}
-
 fn command_exists(cmd: &str) -> bool {
     std::process::Command::new(cmd)
         .arg("--version")
@@ -329,706 +271,6 @@ fn command_exists(cmd: &str) -> bool {
         .is_ok()
 }
 
-
-/// Validate that a user-supplied `session_id` is a safe file-stem:
-/// no path separators, no `..`, printable ASCII-ish. Prevents a caller
-/// from escaping the per-date directory via `../../etc/passwd` etc.
-pub(crate) fn validate_session_id(session_id: &str) -> Result<(), String> {
-    if session_id.is_empty() {
-        return Err("session_id is empty".to_string());
-    }
-    if session_id.len() > 128 {
-        return Err("session_id is too long".to_string());
-    }
-    if session_id.contains('/')
-        || session_id.contains('\\')
-        || session_id.contains("..")
-        || session_id.contains('\0')
-    {
-        return Err("session_id contains illegal characters".to_string());
-    }
-    // Only allow [A-Za-z0-9._-].
-    if !session_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-    {
-        return Err("session_id contains illegal characters".to_string());
-    }
-    Ok(())
-}
-
-
-pub(crate) fn browser_session_meta_filename(session_id: &str) -> String {
-    format!("{}.browser.json", session_id)
-}
-
-fn read_browser_session_meta_from_dir(date_dir: &Path, session_id: &str) -> Option<BrowserSessionMeta> {
-    let path = date_dir.join(browser_session_meta_filename(session_id));
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<BrowserSessionMeta>(&raw).ok()
-}
-
-fn write_browser_session_meta_to_dir(
-    date_dir: &Path,
-    session_id: &str,
-    meta: &BrowserSessionMeta,
-) -> Result<(), String> {
-    fs::create_dir_all(date_dir).map_err(|e| e.to_string())?;
-    let path = date_dir.join(browser_session_meta_filename(session_id));
-    let tmp_path = date_dir.join(format!("{}.browser.json.tmp", session_id));
-    let text = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
-
-    // Atomic write: write to a same-directory temp file, then rename over the
-    // target. This prevents partially-written .browser.json files when the UI
-    // and kimctl/bridge both commit URL metadata around the same time. The last
-    // successful writer wins; callers always merge against the current file
-    // before writing.
-    fs::write(&tmp_path, text).map_err(|e| e.to_string())?;
-    match fs::rename(&tmp_path, &path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            #[cfg(target_os = "windows")]
-            {
-                // Windows rename does not overwrite existing files. Fall back to
-                // remove+rename; this is not perfectly atomic, but still avoids
-                // exposing a partially-written JSON file.
-                if path.exists() {
-                    fs::remove_file(&path).map_err(|remove_err| remove_err.to_string())?;
-                }
-                fs::rename(&tmp_path, &path).map_err(|rename_err| rename_err.to_string())
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = fs::remove_file(&tmp_path);
-                Err(e.to_string())
-            }
-        }
-    }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
-}
-
-fn session_base_dir(session_type: &str, kim_dir: Option<String>, codex_dir: Option<String>) -> PathBuf {
-    if session_type == "codex" {
-        codex_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir)
-    } else {
-        kim_dir.map(PathBuf::from).unwrap_or_else(default_sessions_dir)
-    }
-}
-
-fn resolve_session_date_dir(
-    base: &Path,
-    session_id: &str,
-    session_date: Option<&str>,
-) -> Result<PathBuf, String> {
-    validate_session_id(session_id)?;
-
-    if let Some(date) = session_date.map(str::trim).filter(|d| !d.is_empty()) {
-        let dir = base.join(date);
-        if dir.join(format!("{}.jsonl", session_id)).exists()
-            || dir.join(browser_session_meta_filename(session_id)).exists()
-            || dir.exists()
-        {
-            return Ok(dir);
-        }
-    }
-
-    if base.exists() {
-        let mut date_dirs: Vec<PathBuf> = fs::read_dir(base)
-            .map_err(|e| e.to_string())?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        date_dirs.sort_by_key(|p| std::cmp::Reverse(p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()));
-        for dir in date_dirs {
-            if dir.join(format!("{}.jsonl", session_id)).exists()
-                || dir.join(browser_session_meta_filename(session_id)).exists()
-            {
-                return Ok(dir);
-            }
-        }
-    }
-
-    // New chat fallback: create today's date bucket. This keeps metadata next to
-    // the session file once the first run creates it.
-    let today = chrono_like_today();
-    Ok(base.join(today))
-}
-
-pub(crate) fn chrono_like_today() -> String {
-    // Avoid adding a new dependency. Good enough for naming a fallback date dir;
-    // most existing call sites pass the real session date.
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = secs / 86_400;
-    // Civil date conversion from days since Unix epoch.
-    let z = days as i64 + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if m <= 2 { 1 } else { 0 };
-    format!("{:04}-{:02}-{:02}", year, m, d)
-}
-
-fn host_matches_site(host: &str, site: &str) -> bool {
-    let host = host.trim().trim_start_matches("www.").to_ascii_lowercase();
-    match normalize_site(site).as_str() {
-        "claude" => host == "claude.ai" || host.ends_with(".claude.ai"),
-        "chatgpt" => host == "chatgpt.com" || host == "chat.openai.com" || host.ends_with(".chatgpt.com"),
-        "gemini" => host == "gemini.google.com",
-        "deepseek" => host == "chat.deepseek.com" || host.ends_with(".deepseek.com"),
-        "grok" => host == "grok.com" || host == "grok.x.com" || host == "x.com",
-        _ => false,
-    }
-}
-
-fn browser_url_site(url: &str) -> Option<String> {
-    let parsed = tauri::Url::parse(url).ok()?;
-    let host = parsed.host_str()?.to_ascii_lowercase();
-    for site in ["claude", "chatgpt", "gemini", "deepseek", "grok"] {
-        if host_matches_site(&host, site) {
-            return Some(site.to_string());
-        }
-    }
-    None
-}
-
-fn browser_url_is_bad_for_commit(url: &str, site: &str) -> bool {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    let Ok(parsed) = tauri::Url::parse(trimmed) else { return true; };
-    if !matches!(parsed.scheme(), "https" | "http") {
-        return true;
-    }
-    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
-    if !host_matches_site(&host, site) {
-        return true;
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.contains("accounts.google.com")
-        || lower.contains("/login")
-        || lower.contains("signin")
-        || lower.contains("sign-in")
-        || lower.contains("servicelogin")
-        || lower.contains("signoutoptions")
-        || lower.contains("/auth")
-        || lower.contains("oauth")
-    {
-        return true;
-    }
-
-    let normalized = lower.trim_end_matches('/');
-    let site_norm = normalize_site(site);
-    match site_norm.as_str() {
-        "claude" => normalized == "https://claude.ai" || normalized == "https://claude.ai/new",
-        "chatgpt" => normalized == "https://chatgpt.com" || normalized == "https://chat.openai.com",
-        "gemini" => normalized == "https://gemini.google.com" || normalized == "https://gemini.google.com/app",
-        "deepseek" => normalized == "https://chat.deepseek.com",
-        "grok" => normalized == "https://grok.com" || normalized == "https://grok.x.com",
-        _ => true,
-    }
-}
-
-fn browser_url_allowed_for_restore(url: &str, site: &str) -> bool {
-    // Restore is deliberately stricter than "same host": do not navigate to
-    // arbitrary URLs, login/auth pages, or provider home/new-chat pages stored
-    // by mistake. Fallback home navigation is controlled separately.
-    !browser_url_is_bad_for_commit(url, site)
-}
-
-fn query_param(raw_url: &str, wanted: &str) -> Option<String> {
-    let url = tauri::Url::parse(&format!("http://localhost{}", raw_url)).ok()?;
-    for (key, value) in url.query_pairs() {
-        if key == wanted {
-            let owned = value.into_owned();
-            if !owned.trim().is_empty() {
-                return Some(owned);
-            }
-        }
-    }
-    None
-}
-
-fn browser_restore_status_for_session(
-    session_dir: &Path,
-    session_id: Option<&str>,
-    provider_arg: &str,
-) -> String {
-    let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
-        return "new_or_unknown".to_string();
-    };
-    if validate_session_id(session_id).is_err() {
-        return "new_or_unknown".to_string();
-    }
-
-    let site = if provider_arg.starts_with("browser:") {
-        normalize_site(provider_arg.trim_start_matches("browser:"))
-    } else if provider_arg == "browser" {
-        // The UI stores browser_last_site in the sidecar before send. If the
-        // provider is the generic "browser", read that hint below.
-        "".to_string()
-    } else {
-        return "not_browser".to_string();
-    };
-
-    let date_dir = match resolve_session_date_dir(session_dir, session_id, None) {
-        Ok(v) => v,
-        Err(_) => return "new_or_unknown".to_string(),
-    };
-    let meta = read_browser_session_meta_from_dir(&date_dir, session_id).unwrap_or_default();
-    let resolved_site = if site.is_empty() {
-        meta.browser_last_site.clone().unwrap_or_else(|| "claude".to_string())
-    } else {
-        site
-    };
-
-    match meta.browser_threads.get(&resolved_site) {
-        Some(url) if browser_url_allowed_for_restore(url, &resolved_site) => "stored_thread".to_string(),
-        Some(_) => "stored_url_rejected".to_string(),
-        None => "no_stored_url".to_string(),
-    }
-}
-
-pub(crate) fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<SessionInfo>, String> {
-    if !base.exists() {
-        return Ok(vec![]);
-    }
-
-    let mut sessions = vec![];
-
-    let mut date_dirs: Vec<_> = fs::read_dir(base)
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-    date_dirs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
-
-    for date_entry in date_dirs {
-        let date_dir = date_entry.path();
-        let date_str = date_entry.file_name().to_string_lossy().to_string();
-
-        let mut jsonl_files: Vec<_> = fs::read_dir(&date_dir)
-            .map_err(|e| e.to_string())?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let name = e.file_name();
-                let s = name.to_string_lossy();
-                s.ends_with(".jsonl") && !s.contains(".summary")
-            })
-            .collect();
-        jsonl_files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
-
-        for file_entry in jsonl_files {
-            let session_file = file_entry.path();
-            let session_id = session_file
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            let summary_file = date_dir.join(format!("{}.summary.txt", session_id));
-            let has_summary = summary_file.exists();
-            let summary = if has_summary {
-                fs::read_to_string(&summary_file)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            } else {
-                None
-            };
-
-            let message_count = count_lines(&session_file).unwrap_or(0);
-            let mut title = infer_session_title(&session_file, summary.as_ref(), &session_id);
-            // K4: merge the user meta sidecar (title override + pin).
-            let (meta_title, pinned) = crate::session_commands::read_session_meta(&date_dir, &session_id);
-            if let Some(t) = meta_title {
-                if !t.trim().is_empty() {
-                    title = t;
-                }
-            }
-
-            let browser_meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
-            let BrowserSessionMeta {
-                browser_threads,
-                browser_last_site,
-                browser_threads_updated_at_ms,
-                last_llm_provider,
-            } = browser_meta;
-            sessions.push(SessionInfo {
-                session_key: format!("{}:{}:{}", session_type, date_str, session_id),
-                session_id,
-                title,
-                date: date_str.clone(),
-                message_count,
-                has_summary,
-                summary,
-                session_type: session_type.to_string(),
-                pinned,
-                browser_threads: if browser_threads.is_empty() { None } else { Some(browser_threads) },
-                browser_last_site,
-                browser_threads_updated_at_ms,
-                last_llm_provider,
-            });
-        }
-    }
-
-    Ok(sessions)
-}
-
-pub(crate) fn count_lines(path: &Path) -> std::io::Result<usize> {
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    Ok(reader
-        .lines()
-        .filter(|l| {
-            l.as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        })
-        .count())
-}
-
-pub(crate) fn parse_jsonl(path: &Path) -> Result<Vec<KimMessage>, String> {
-    let file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let reader = BufReader::new(file);
-    let mut messages = vec![];
-
-    for (i, line) in reader.lines().enumerate() {
-        let line = line.map_err(|e| e.to_string())?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<KimMessage>(trimmed) {
-            Ok(msg) => messages.push(msg),
-            Err(e) => {
-                let parsed = serde_json::from_str::<serde_json::Value>(trimmed).ok();
-                // Typed trace records (run_started, tool_call, llm_turn, run_checkpoint,
-                // run_result) are valid JSON with a "type" key but no "role". Skip them
-                // silently — they are not chat messages and are not malformed.
-                let is_trace_record = parsed.as_ref().and_then(|v| v.get("type")).is_some()
-                    && parsed.as_ref().and_then(|v| v.get("role")).is_none();
-                if is_trace_record {
-                    continue;
-                }
-                match parsed.and_then(codex_jsonl_line_to_kim_message) {
-                    Some(msg) => messages.push(msg),
-                    None => eprintln!("Skipping malformed JSONL line {}: {}", i + 1, e),
-                }
-            }
-        }
-    }
-
-    Ok(messages)
-}
-
-fn codex_jsonl_line_to_kim_message(value: serde_json::Value) -> Option<KimMessage> {
-    if value.get("type").and_then(|v| v.as_str()) != Some("message") {
-        return None;
-    }
-
-    let message = value.get("message")?;
-    let role = message.get("role")?.as_str()?.to_string();
-    let content = message
-        .get("blocks")
-        .cloned()
-        .map(normalize_codex_blocks)
-        .or_else(|| message.get("content").cloned())
-        .unwrap_or_else(|| serde_json::Value::String(String::new()));
-
-    Some(KimMessage {
-        role,
-        content,
-        tool_calls: None,
-        tool_call_id: None,
-        name: None,
-    })
-}
-
-fn normalize_codex_blocks(blocks: serde_json::Value) -> serde_json::Value {
-    let serde_json::Value::Array(items) = blocks else {
-        return blocks;
-    };
-
-    serde_json::Value::Array(
-        items
-            .into_iter()
-            .map(|mut block| {
-                if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                    if let Some(raw_input) = block.get("input").and_then(|v| v.as_str()) {
-                        let parsed = serde_json::from_str::<serde_json::Value>(raw_input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": raw_input }));
-                        if let Some(obj) = block.as_object_mut() {
-                            obj.insert("input".to_string(), parsed);
-                        }
-                    }
-                }
-                block
-            })
-            .collect(),
-    )
-}
-
-fn normalize_title_text(raw: &str) -> Option<String> {
-    let mut text = raw.replace('\n', " ");
-    text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut cleaned = text.trim().to_string();
-
-    for prefix in ["Task:", "task:", "TASK:"] {
-        if cleaned.starts_with(prefix) {
-            cleaned = cleaned[prefix.len()..].trim().to_string();
-            break;
-        }
-    }
-
-    if cleaned.is_empty() {
-        return None;
-    }
-
-    let max_chars = 56usize;
-    let char_count = cleaned.chars().count();
-    if char_count > max_chars {
-        let mut shortened: String = cleaned.chars().take(max_chars - 1).collect();
-        shortened = shortened.trim_end().to_string();
-        return Some(format!("{}…", shortened));
-    }
-
-    Some(cleaned)
-}
-
-fn extract_title_from_content(content: &serde_json::Value) -> Option<String> {
-    match content {
-        serde_json::Value::String(s) => normalize_title_text(s),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                if item_type == "text" {
-                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        if let Some(title) = normalize_title_text(text) {
-                            return Some(title);
-                        }
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-pub(crate) fn infer_session_title(session_file: &Path, summary: Option<&String>, session_id: &str) -> String {
-    if let Ok(file) = fs::File::open(session_file) {
-        let reader = BufReader::new(file);
-        for line in reader.lines().map_while(Result::ok).take(80) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let value: serde_json::Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let role = value.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            if role == "user" {
-                if let Some(content) = value.get("content") {
-                    if let Some(title) = extract_title_from_content(content) {
-                        return title;
-                    }
-                }
-            } else if value.get("type").and_then(|v| v.as_str()) == Some("message") {
-                let message = value.get("message").unwrap_or(&serde_json::Value::Null);
-                let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                if role == "user" {
-                    if let Some(content) = message.get("blocks").or_else(|| message.get("content")) {
-                        if let Some(title) = extract_title_from_content(content) {
-                            return title;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(s) = summary {
-        if let Some(title) = normalize_title_text(s) {
-            return title;
-        }
-    }
-
-    let short_id: String = session_id.chars().take(8).collect();
-    format!("Session {}", short_id)
-}
-
-fn header_value(request: &Request, name: &str) -> Option<String> {
-    request
-        .headers()
-        .iter()
-    .find(|h| h.field.to_string().eq_ignore_ascii_case(name))
-        .map(|h| h.value.as_str().to_string())
-}
-
-fn json_response(status: u16, body: serde_json::Value) -> Response<std::io::Cursor<Vec<u8>>> {
-    let mut resp = Response::from_string(body.to_string()).with_status_code(StatusCode(status));
-    if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
-        resp.add_header(h);
-    }
-    if let Ok(h) = Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]) {
-        resp.add_header(h);
-    }
-    if let Ok(h) = Header::from_bytes(
-        &b"Access-Control-Allow-Headers"[..],
-        &b"Content-Type, X-Kim-Token"[..],
-    ) {
-        resp.add_header(h);
-    }
-    if let Ok(h) = Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]) {
-        resp.add_header(h);
-    }
-    resp
-}
-
-fn respond_json(request: Request, status: u16, body: serde_json::Value) {
-    let _ = request.respond(json_response(status, body));
-}
-
-fn agent_debug_log(hypothesis_id: &str, message: &str, data: serde_json::Value) {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let line = serde_json::json!({
-        "sessionId": "16b33e",
-        "hypothesisId": hypothesis_id,
-        "location": "desktop/src-tauri/src/lib.rs",
-        "message": message,
-        "data": data,
-        "timestamp": ts,
-    });
-    let log_path = default_sessions_dir().join("bridge_debug.log");
-    let _ = std::fs::create_dir_all(default_sessions_dir());
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", line);
-    }
-}
-
-fn normalize_site(site: &str) -> String {
-    match site.trim().to_lowercase().as_str() {
-        "claude" | "claude.ai" => "claude".to_string(),
-        "chatgpt" | "openai" | "gpt" => "chatgpt".to_string(),
-        "gemini" | "google" => "gemini".to_string(),
-        "deepseek" => "deepseek".to_string(),
-        "grok" => "grok".to_string(),
-        other if !other.is_empty() => other.to_string(),
-        _ => "claude".to_string(),
-    }
-}
-
-fn last_llm_provider_allowed(p: &str) -> bool {
-    if p.is_empty() || p.len() > 64 {
-        return false;
-    }
-    matches!(
-        p,
-        "browser"
-            | "browser:claude"
-            | "browser:chatgpt"
-            | "browser:gemini"
-            | "browser:grok"
-            | "browser:deepseek"
-            | "browser:custom"
-            | "claude"
-            | "openai"
-            | "gemini"
-            | "deepseek"
-            | "ollama"
-    )
-}
-
-fn apply_browser_meta_writes(
-    meta: &mut BrowserSessionMeta,
-    browser_last_site: Option<String>,
-    site: Option<String>,
-    url: Option<String>,
-    last_llm_provider: Option<String>,
-) -> Result<(), String> {
-    if let Some(last) = browser_last_site
-        .as_deref()
-        .map(normalize_site)
-        .filter(|s| !s.is_empty())
-    {
-        meta.browser_last_site = Some(last);
-    }
-
-    if let (Some(site_raw), Some(url_raw)) = (site.as_deref(), url.as_deref()) {
-        let site_norm = normalize_site(site_raw);
-        if browser_url_is_bad_for_commit(url_raw, &site_norm) {
-            return Err(format!(
-                "Refusing to store non-conversation/login URL for {}: {}",
-                site_norm, url_raw
-            ));
-        }
-        meta.browser_threads
-            .insert(site_norm.clone(), url_raw.trim().to_string());
-        meta.browser_last_site = Some(site_norm);
-    }
-
-    if let Some(p) = last_llm_provider {
-        let t = p.trim();
-        if last_llm_provider_allowed(t) {
-            meta.last_llm_provider = Some(t.to_string());
-        }
-    }
-
-    meta.browser_threads_updated_at_ms = Some(now_ms());
-    Ok(())
-}
-
-fn default_site_url(site: &str) -> &'static str {
-    match normalize_site(site).as_str() {
-        "chatgpt" => "https://chatgpt.com",
-        "gemini" => "https://gemini.google.com/app",
-        "deepseek" => "https://chat.deepseek.com",
-        "grok" => "https://grok.com",
-        _ => "https://claude.ai/new",
-    }
-}
-
-fn gemini_site_url(authuser: Option<u32>) -> String {
-    match authuser {
-        Some(index) => format!("https://gemini.google.com/app?authuser={index}"),
-        None => "https://gemini.google.com/app".to_string(),
-    }
-}
-
-fn fresh_site_url(site: &str, authuser: Option<u32>) -> String {
-    if normalize_site(site) == "gemini" {
-        gemini_site_url(authuser)
-    } else {
-        default_site_url(site).to_string()
-    }
-}
 
 fn clear_provider_webview_chat(
     window: &tauri::WebviewWindow,
@@ -1041,9 +283,17 @@ fn clear_provider_webview_chat(
         .eval(format!("window.location.href = {};", js_url))
         .map_err(|e| e.to_string())?;
 
-    // Give the provider SPA and the initialization_script-backed Kim bridge time
+    // Wait for the provider SPA and the initialization_script-backed Kim bridge
     // to install before the next eval calls window.__kimBridge.send(...).
-    std::thread::sleep(Duration::from_millis(3500));
+    // Uses a condvar so a future signal from the bridge readiness callback can
+    // wake this thread early; falls back to 3 500 ms max timeout (#10).
+    {
+        let (lock, cvar) = WEBVIEW_NAV_READY.get_or_init(|| (StdMutex::new(false), Condvar::new()));
+        if let Ok(mut ready) = lock.lock() {
+            *ready = false; // reset for this navigation
+            let _result = cvar.wait_timeout_while(ready, Duration::from_millis(3500), |r| !*r);
+        }
+    }
 
     if normalize_site(site) == "gemini" {
         if let Ok(mut guard) = WEBVIEW_LAST_GEMINI_AUTHUSER
@@ -1148,7 +398,13 @@ fn prepare_gemini_webview(window: &tauri::WebviewWindow, authuser: Option<u32>, 
         let target_url = gemini_site_url(authuser);
         if let Ok(js_url) = serde_json::to_string(&target_url) {
             let _ = window.eval(format!("window.location.href = {};", js_url));
-            std::thread::sleep(Duration::from_millis(3500));
+            // Same condvar-based wait as clear_provider_webview_chat (#10):
+            // wakes early on bridge readiness, falls back to 3 500 ms.
+            let (lock, cvar) = WEBVIEW_NAV_READY.get_or_init(|| (StdMutex::new(false), Condvar::new()));
+            if let Ok(mut ready) = lock.lock() {
+                *ready = false;
+                let _result = cvar.wait_timeout_while(ready, Duration::from_millis(3500), |r| !*r);
+            }
         }
         if let Ok(mut guard) = WEBVIEW_LAST_GEMINI_AUTHUSER
             .get_or_init(|| StdMutex::new(None))
@@ -1245,15 +501,46 @@ fn write_first_png_to_clipboard(attachments: &[BridgeAttachment]) -> bool {
         }
     };
 
-    let temp_path = format!("/tmp/kim_clip_{}.png", std::process::id());
-    if let Err(e) = std::fs::write(&temp_path, &bytes) {
-        eprintln!("[Kim] clipboard: write temp failed: {}", e);
-        return false;
+    // Use a random hex suffix for the temp file name rather than a guessable PID
+    // so a malicious process can't race and swap in a symlink (#23/#4).
+    // We use std::fs::OpenOptions with O_CREAT|O_EXCL mode 0600 (via permissions)
+    // instead of the `tempfile` dev-dependency which isn't available in production code.
+    let rand_hex: String = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        (std::time::SystemTime::now(), std::process::id()).hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let temp_path = format!("{}/kim_clip_{}.png", std::env::temp_dir().display(), rand_hex);
+    // Set permissions to 0600 immediately after creation.
+    {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true); // O_CREAT | O_EXCL
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&temp_path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(&bytes) {
+                    eprintln!("[Kim] clipboard: temp write failed: {}", e);
+                    let _ = std::fs::remove_file(&temp_path);
+                    return false;
+                }
+            }
+            Err(e) => {
+                eprintln!("[Kim] clipboard: temp open failed: {}", e);
+                return false;
+            }
+        }
     }
 
-    // «class PNGf» is the four-char AppleScript type for PNG data.
+    // class PNGf is the four-char AppleScript type for PNG data.
     let script = format!(
-        "set the clipboard to (read (POSIX file \"{}\") as «class PNGf»)",
+        "set the clipboard to (read (POSIX file \"{}\") as \u{00AB}class PNGf\u{00BB})",
         temp_path
     );
     let ok = std::process::Command::new("osascript")
@@ -1280,32 +567,15 @@ fn write_first_png_to_clipboard(_attachments: &[BridgeAttachment]) -> bool {
 /// clipboard. The temporary file is removed immediately after pbcopy reads it.
 #[cfg(target_os = "macos")]
 fn write_text_prompt_to_clipboard(prompt: &str) -> bool {
-    let stamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let temp_path = format!("/tmp/kim_prompt_{}_{}.txt", std::process::id(), stamp);
-    if let Err(e) = std::fs::write(&temp_path, prompt.as_bytes()) {
-        eprintln!("[Kim] clipboard: prompt temp write failed: {}", e);
-        return false;
-    }
-
-    let bytes = match std::fs::read(&temp_path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            let _ = std::fs::remove_file(&temp_path);
-            eprintln!("[Kim] clipboard: prompt temp read failed: {}", e);
-            return false;
-        }
-    };
-
+    // Pipe prompt bytes directly to pbcopy stdin — no temp file needed (#5).
+    // The old approach wrote to a world-readable /tmp file that could expose
+    // the full prompt (which may contain secrets/PII).
     let mut child = match std::process::Command::new("pbcopy")
         .stdin(std::process::Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
         Err(e) => {
-            let _ = std::fs::remove_file(&temp_path);
             eprintln!("[Kim] clipboard: pbcopy spawn failed: {}", e);
             return false;
         }
@@ -1316,11 +586,10 @@ fn write_text_prompt_to_clipboard(prompt: &str) -> bool {
         .take()
         .map(|mut stdin| {
             use std::io::Write;
-            stdin.write_all(&bytes).is_ok()
+            stdin.write_all(prompt.as_bytes()).is_ok()
         })
         .unwrap_or(false);
     let ok = wrote && child.wait().map(|s| s.success()).unwrap_or(false);
-    let _ = std::fs::remove_file(&temp_path);
 
     if !ok {
         eprintln!("[Kim] clipboard: pbcopy failed (non-fatal)");
@@ -1671,7 +940,15 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
     use std::net::TcpStream;
     use std::process::Command as StdCommand;
 
-    let port_open = TcpStream::connect("127.0.0.1:9222").is_ok();
+    // Honour KIM_REAL_BROWSER_CDP_PORT so the Rust launcher matches the Python
+    // side (web.py already reads this variable).  Default: 9222.
+    let cdp_port: u16 = std::env::var("KIM_REAL_BROWSER_CDP_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|&p| p != 0)
+        .unwrap_or(9222);
+
+    let port_open = TcpStream::connect(format!("127.0.0.1:{cdp_port}")).is_ok();
     if port_open {
         return Ok(false); // already running, no wait needed
     }
@@ -1700,22 +977,39 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
 
     for chrome in candidates {
         let user_data_arg = format!("--user-data-dir={}", user_data_str);
+        let cdp_port_arg = format!("--remote-debugging-port={cdp_port}");
         let result = StdCommand::new(chrome)
             .args([
                 user_data_arg.as_str(),
-                "--remote-debugging-port=9222",
+                cdp_port_arg.as_str(),
                 "--no-first-run",
                 "--no-default-browser-check",
-                "--disable-popup-blocking",
+                // --disable-popup-blocking removed: weakens browser security (#3).
             ])
             .spawn();
-        if result.is_ok() {
+        if let Ok(child) = result {
+            // Store the child handle so it can be killed on app exit (#8).
+            // Without this, Chrome processes accumulate as zombies.
+            if let Ok(mut guard) = CDP_CHROME_CHILD.get_or_init(|| StdMutex::new(None)).lock() {
+                *guard = Some(child);
+            }
             // Caller is responsible for the post-launch wait so it can use
             // tokio::time::sleep instead of std::thread::sleep.
             return Ok(true); // freshly spawned — caller must wait for port
         }
     }
     Err("Chrome/Chromium not found. Install Google Chrome to use the browser provider.".to_string())
+}
+
+/// Kill the CDP Chrome child on app shutdown (#8).
+pub(crate) fn kill_cdp_chrome() {
+    if let Some(guard) = CDP_CHROME_CHILD.get() {
+        if let Ok(mut child_opt) = guard.lock() {
+            if let Some(mut child) = child_opt.take() {
+                let _ = child.kill();
+            }
+        }
+    }
 }
 
 /// Read a single value from `<kim_root>/.env` (best-effort, no dependency).
@@ -1882,14 +1176,6 @@ pub(crate) use subprocess::{find_python_interpreter, send_task, cancel_task, hit
 // Voice config (config.yaml — voice:/enabled, voice:/engine, voice:/voice_id)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn config_yaml_path(project_root: Option<String>) -> PathBuf {
-    project_root
-        .map(PathBuf::from)
-        .unwrap_or_else(default_project_root)
-        .join("config.yaml")
-}
-
-
 // ---------------------------------------------------------------------------
 // Phone relay (config.yaml `relay:` block + RELAY_PC_API_KEY env var)
 // ---------------------------------------------------------------------------
@@ -2025,6 +1311,9 @@ pub fn run() {
             account::clear_account,
             account::reset_onboarding,
             account::delete_all_sessions,
+            secrets::store_github_token,
+            secrets::get_github_token,
+            secrets::delete_github_token,
             ollama::ollama_get_status,
             ollama::ollama_test_model,
             ollama::ollama_signin,
@@ -2052,20 +1341,33 @@ pub fn run() {
             schedule_commands::stop_schedule_timer,
             schedule_commands::get_schedule_timer_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            // Kill the CDP Chrome child process on every exit path (#8) so we don't
+            // leave a zombie browser consuming memory and holding the debug port.
+            if let tauri::RunEvent::Exit = event {
+                kill_cdp_chrome();
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Helper: write lines to a temp file, return path.
+    // Helper: write lines to a temp file using O_EXCL-safe NamedTempFile (#23).
+    // subsec_nanos() was guessable and racy — tempfile guarantees uniqueness + 0600 mode.
     fn write_temp_jsonl(lines: &[&str]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("kim_test_{}.jsonl", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos()));
-        std::fs::write(&path, lines.join("\n")).unwrap();
+        use std::io::Write as _;
+        let mut f = tempfile::Builder::new()
+            .prefix("kim_test_")
+            .suffix(".jsonl")
+            .tempfile()
+            .expect("tempfile creation failed");
+        f.write_all(lines.join("\n").as_bytes()).unwrap();
+        // Persist so the test can open it by path; caller is responsible for cleanup.
+        let (_, path) = f.keep().expect("tempfile persist failed");
         path
     }
 
@@ -2102,22 +1404,66 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn test_build_bridge_complete_script_no_poisoning() {
-        let script = build_bridge_complete_script(
-            "gemini",
-            "hello __KIM_SITE__",
-            "req_123",
-            &[],
-            "http://local",
-            "token__KIM_REQID__",
-            None,
-            None
-        ).unwrap();
+    // #22: build_bridge_complete_script was deleted; the persistent bridge.js
+    // initialization_script handles all injection now. The old test that called this
+    // deleted function has been removed to keep `cargo test` green.
 
-        assert!(script.contains("const __kimSite = \"gemini\";"));
-        assert!(script.contains("const __kimPrompt = \"hello __KIM_SITE__\";"));
-        assert!(script.contains("const __kimReqId = \"req_123\";"));
-        assert!(script.contains("const __kimCallbackToken = \"token__KIM_REQID__\";"));
+    // -----------------------------------------------------------------------
+    // normalize_site regression guards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_site_deepseek_browser() {
+        // Code-tab promotion: "deepseek-browser" must map to "deepseek".
+        assert_eq!(normalize_site("deepseek-browser"), "deepseek");
+    }
+
+    #[test]
+    fn normalize_site_default() {
+        // Empty string falls back to "claude".
+        assert_eq!(normalize_site(""), "claude");
+        // Aliases: openai and gpt both map to chatgpt.
+        assert_eq!(normalize_site("openai"), "chatgpt");
+        assert_eq!(normalize_site("gpt"), "chatgpt");
+        // Alias: google maps to gemini.
+        assert_eq!(normalize_site("google"), "gemini");
+        // Canonical names pass through unchanged.
+        assert_eq!(normalize_site("claude"), "claude");
+        assert_eq!(normalize_site("chatgpt"), "chatgpt");
+        assert_eq!(normalize_site("gemini"), "gemini");
+        assert_eq!(normalize_site("deepseek"), "deepseek");
+        assert_eq!(normalize_site("grok"), "grok");
+    }
+
+    // -----------------------------------------------------------------------
+    // host_matches_site regression guards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn host_matches_site_grok_excludes_xcom() {
+        // x.com is Twitter's root domain — must NOT match grok (#9).
+        assert!(!host_matches_site("x.com", "grok"), "x.com must not match grok");
+        // www. prefix should be stripped, still not match.
+        assert!(!host_matches_site("www.x.com", "grok"), "www.x.com must not match grok");
+        // Canonical Grok hosts must match.
+        assert!(host_matches_site("grok.com", "grok"), "grok.com must match grok");
+        assert!(host_matches_site("grok.x.com", "grok"), "grok.x.com must match grok");
+    }
+
+    #[test]
+    fn host_matches_site_others() {
+        // ChatGPT canonical hosts.
+        assert!(host_matches_site("chatgpt.com", "chatgpt"));
+        assert!(host_matches_site("chat.openai.com", "chatgpt"));
+        // Gemini canonical host.
+        assert!(host_matches_site("gemini.google.com", "gemini"));
+        // DeepSeek canonical host.
+        assert!(host_matches_site("chat.deepseek.com", "deepseek"));
+        // Claude canonical host.
+        assert!(host_matches_site("claude.ai", "claude"));
+        // Aliases resolve correctly through host_matches_site (openai alias).
+        assert!(host_matches_site("chatgpt.com", "openai"));
+        // www. prefix stripping works for claude.
+        assert!(host_matches_site("www.claude.ai", "claude"));
     }
 }

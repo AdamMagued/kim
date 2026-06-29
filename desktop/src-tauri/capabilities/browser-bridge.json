@@ -8,13 +8,11 @@
       "https://claude.ai/*",
       "https://chatgpt.com/*",
       "https://gemini.google.com/*",
-      "https://accounts.google.com/*",
       "https://grok.com/*",
       "https://chat.deepseek.com/*"
     ]
   },
   "permissions": [
-    "core:default",
     "core:event:allow-emit"
   ]
 }

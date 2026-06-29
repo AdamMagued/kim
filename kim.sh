@@ -5,9 +5,9 @@
 export WEBKIT_DISABLE_DMABUF_RENDERER=1
 export WEBKIT_DISABLE_COMPOSITING_MODE=1
 
-# Auto-detect DISPLAY if not set
+# Auto-detect DISPLAY if not set; honour a pre-existing value (#65).
 if [ -z "$DISPLAY" ]; then
-  export DISPLAY=:1
+  export DISPLAY="${KIM_DISPLAY_FALLBACK:-:1}"
 fi
 
 # Source .env if present (for LLM API keys)

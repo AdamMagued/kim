@@ -7,8 +7,13 @@ param(
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Override KIM_RELEASE_REPO env var to point at a different fork (#66).
 if ([string]::IsNullOrWhiteSpace($Repo)) {
-    $Repo = "AdamMagued/kim"
+    if (-not [string]::IsNullOrWhiteSpace($env:KIM_RELEASE_REPO)) {
+        $Repo = $env:KIM_RELEASE_REPO
+    } else {
+        $Repo = "AdamMagued/kim"
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
@@ -52,6 +57,30 @@ try {
         Invoke-WebRequest -Uri $url -OutFile $archivePath -Headers $headers -UseBasicParsing
     } catch {
         throw "Could not download $asset. Publish a Windows release asset with this exact name first, or set GITHUB_TOKEN for a private release."
+    }
+
+    # Checksum verification (#58): download SHA256SUMS and verify before install.
+    $skipChecksum = $env:KIM_SKIP_CHECKSUM -eq "1"
+    if (-not $skipChecksum) {
+        $shaUrl = $url -replace '\.(zip|tar\.gz)$', '.sha256'
+        $shaPath = Join-Path $tempRoot "SHA256SUMS"
+        try {
+            Invoke-WebRequest -Uri $shaUrl -OutFile $shaPath -Headers $headers -UseBasicParsing -ErrorAction Stop
+            $shaContent = Get-Content $shaPath -Raw
+            $expectedLine = $shaContent -split "`n" | Where-Object { $_ -match [regex]::Escape($asset) } | Select-Object -First 1
+            if ($expectedLine) {
+                $expectedHash = ($expectedLine -split '\s+')[0].Trim().ToLower()
+                $actualHash = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
+                if ($actualHash -ne $expectedHash) {
+                    throw "Checksum mismatch for $asset (expected $expectedHash, got $actualHash). Aborting."
+                }
+                Write-Host "Checksum verified: $expectedHash"
+            } else {
+                Write-Warning "No checksum entry found for $asset in SHA256SUMS; skipping verification"
+            }
+        } catch [System.Net.WebException] {
+            Write-Warning "SHA256SUMS not available for this release; skipping verification"
+        }
     }
 
     Expand-Archive -Path $archivePath -DestinationPath $extractDir -Force

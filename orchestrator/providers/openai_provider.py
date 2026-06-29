@@ -81,6 +81,7 @@ class OpenAIProvider(BaseProvider):
             if oai_tools:
                 kwargs["tools"] = oai_tools
                 kwargs["tool_choice"] = "auto"
+            kwargs["timeout"] = 180.0
 
             response = await self._client.chat.completions.create(**kwargs)
         except openai.RateLimitError:
@@ -89,6 +90,10 @@ class OpenAIProvider(BaseProvider):
             raise  # 401 — bad key; non-retryable
         except openai.PermissionDeniedError:
             raise  # 403 — non-retryable
+        except openai.APITimeoutError as e:
+            # Re-raise as builtin TimeoutError so classify_provider_error marks it
+            # retryable regardless of Python version (isinstance check works on all).
+            raise TimeoutError(str(e) or "OpenAI API timed out") from e
         except openai.APIError as e:
             logger.error(f"OpenAI API error: {e}")
             raise
@@ -169,9 +174,8 @@ class OpenAIProvider(BaseProvider):
 
             if len(msg.tool_calls) > 1:
                 # Surface multi-tool requests as a `batch` call so the agent
-                # can sequence them through its existing batch dispatcher.
-                # Previously this returned a text error, which the agent
-                # interpreted as a stuck-loop turn and bailed with NEED_HELP.
+                # can sequence them (including mutating tools, which go through
+                # the normal preview/HITL gate in the batch dispatcher).
                 return {
                     "type": "tool_call",
                     "tool": "batch",

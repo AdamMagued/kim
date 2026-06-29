@@ -1,5 +1,5 @@
 """
-Process lifecycle contract tests for mcp_server/tools/codex_bridge.py.
+Process lifecycle contract tests for codex_engine/engine.py.
 
 Verifies that run_codex_subtask() kills the Codex subprocess in its finally
 block so that an unexpected exit path (BrokenPipeError, CancelledError, any
@@ -22,7 +22,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 _CODEX_BRIDGE = (
-    Path(__file__).resolve().parent.parent / "mcp_server" / "tools" / "codex_bridge.py"
+    Path(__file__).resolve().parent.parent / "codex_engine" / "engine.py"
 )
 
 

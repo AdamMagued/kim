@@ -10,7 +10,7 @@ POST  /prompt            phone → submit task           auth: phone_key
 GET   /prompt/next       PC   → dequeue next task       auth: pc_key
 POST  /result            PC   → upload result           auth: pc_key
 GET   /result/{task_id}  phone → poll result            auth: phone_key
-WS    /ws                phone → real-time result push  auth: token query param
+WS    /ws                phone → real-time result push  auth: X-API-Key header
 GET   /status            anyone → health check          public
 
 Run locally:
@@ -26,6 +26,8 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -34,6 +36,7 @@ from fastapi import (
     Depends,
     FastAPI,
     HTTPException,
+    Request,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -133,14 +136,53 @@ allowed_origins = [o.strip() for o in allowed_origins_str.split(",")] if allowed
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["X-API-Key", "Content-Type"],
 )
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+# ── Pair-complete rate limiting ────────────────────────────────────────────────
+# /pair/complete is unauthenticated by design (possession of the code is the
+# proof), so we guard the ~30-bit pair_code against online guessing with two
+# independent caps: a per-IP sliding-window limit and a per-code attempt cap.
+
+_PAIR_RATE_LIMIT_IP = int(os.environ.get("PAIR_RATE_LIMIT_IP", "10"))
+_PAIR_RATE_WINDOW_S = int(os.environ.get("PAIR_RATE_LIMIT_WINDOW_S", "60"))
+_PAIR_RATE_LIMIT_CODE = int(os.environ.get("PAIR_RATE_LIMIT_CODE", "5"))
+
+# {ip: [monotonic timestamps of recent attempts]}
+_pair_ip_attempts: dict[str, list[float]] = defaultdict(list)
+# {normalised_pair_code: attempt_count}
+_pair_code_attempts: dict[str, int] = defaultdict(int)
+
+
+def _check_pair_rate_limit(client_ip: str, pair_code: str) -> None:
+    """Raise HTTP 429 if the IP or code has exceeded its attempt cap."""
+    now = time.monotonic()
+    window_start = now - _PAIR_RATE_WINDOW_S
+
+    # Expire old IP timestamps and check the sliding window.
+    recent = [t for t in _pair_ip_attempts[client_ip] if t > window_start]
+    _pair_ip_attempts[client_ip] = recent
+    if len(recent) >= _PAIR_RATE_LIMIT_IP:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many pairing attempts from this IP. Retry after {_PAIR_RATE_WINDOW_S}s.",
+        )
+    _pair_ip_attempts[client_ip].append(now)
+
+    # Per-code cap (independent of IP to prevent code enumeration).
+    code_key = pair_code.strip().upper()
+    if _pair_code_attempts[code_key] >= _PAIR_RATE_LIMIT_CODE:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many attempts for this pairing code. Request a new code.",
+        )
+    _pair_code_attempts[code_key] += 1
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -300,19 +342,28 @@ async def pair_init() -> PairInitResponse:
     response_model=PairCompleteResponse,
     summary="Phone: redeem a pair_code in exchange for a long-lived device_token",
 )
-async def pair_complete(body: PairCompleteRequest) -> PairCompleteResponse:
+async def pair_complete(request: Request, body: PairCompleteRequest) -> PairCompleteResponse:
     """
     Phone exchanges the short-lived `pair_code` (shown on the PC) for a
     permanent `device_token`. The token is used as `X-API-Key` in every
     subsequent request. No prior credential is required — possession of the
     code is the proof, and the code is invalidated atomically on success.
+
+    Rate-limited per IP (PAIR_RATE_LIMIT_IP attempts per PAIR_RATE_LIMIT_WINDOW_S
+    seconds) and per code (PAIR_RATE_LIMIT_CODE attempts total) to prevent
+    online guessing of the ~30-bit pair_code space.
     """
+    client_ip = request.client.host if request.client else "unknown"
+    _check_pair_rate_limit(client_ip, body.pair_code)
+
     result = await db.complete_pairing(body.pair_code, body.device_name)
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Pairing code is invalid, expired, or already used.",
         )
+    # Clear per-code counter on success so the slot doesn't stay poisoned.
+    _pair_code_attempts.pop(body.pair_code.strip().upper(), None)
     return PairCompleteResponse(**result)
 
 
@@ -336,6 +387,42 @@ async def pair_status(pair_code: str) -> PairStatusResponse:
             detail=f"Pairing code {pair_code!r} not found",
         )
     return PairStatusResponse(**info)
+
+
+# ── Admin device management ────────────────────────────────────────────────────
+
+@app.get(
+    "/admin/devices",
+    summary="Admin: list all paired devices",
+    dependencies=[Depends(require_pc_key)],
+)
+async def admin_list_devices() -> list[dict]:
+    """
+    Return all registered devices (id, device_name, paired_at, last_seen).
+    Requires the PC API key. Use this to audit active sessions and identify
+    tokens to revoke.
+    """
+    return await db.list_devices()
+
+
+@app.delete(
+    "/admin/devices/{device_id}",
+    summary="Admin: revoke a paired device",
+    dependencies=[Depends(require_pc_key)],
+)
+async def admin_revoke_device(device_id: str) -> dict:
+    """
+    Permanently delete a device record. Its device_token immediately stops
+    working. Requires the PC API key. Use this after a device is lost or a
+    token is suspected to be compromised.
+    """
+    ok = await db.revoke_device(device_id)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Device {device_id!r} not found",
+        )
+    return {"ok": True, "revoked": device_id}
 
 
 @app.websocket("/ws")
