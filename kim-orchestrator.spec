@@ -1,7 +1,7 @@
 # kim-orchestrator.spec — PyInstaller build specification
 #
-# Bundles orchestrator/ + mcp_server/ into a single executable sidecar
-# for the Tauri desktop app.
+# Bundles orchestrator/ + mcp_server/ + codex_engine/ into a single executable
+# sidecar for the Tauri desktop app.
 #
 # Usage (from repo root):
 #   pip install pyinstaller
@@ -44,6 +44,10 @@ a = Analysis(
         (str(REPO_ROOT / 'mcp_server'), 'mcp_server'),
         # Include orchestrator package so relative imports work inside the frozen app
         (str(REPO_ROOT / 'orchestrator'), 'orchestrator'),
+        # Codex bridge engine: top-level package imported by the spawned
+        # orchestrator.codex_bridge_service. Bundled so the frozen app can run
+        # browser-backed Codex tasks (previously shipped inside mcp_server/tools/).
+        (str(REPO_ROOT / 'codex_engine'), 'codex_engine'),
         # Default config file so the agent can find its defaults when no config.yaml
         # exists in the installation directory.
         (str(REPO_ROOT / 'config.yaml.example'), '.'),

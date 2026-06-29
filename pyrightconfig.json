@@ -1,7 +1,8 @@
 {
   "include": [
     "orchestrator/providers",
-    "mcp_server"
+    "mcp_server",
+    "codex_engine"
   ],
   "pythonVersion": "3.12",
   "typeCheckingMode": "basic",

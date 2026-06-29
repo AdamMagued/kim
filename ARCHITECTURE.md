@@ -113,7 +113,7 @@ Tauri React UI (Code Tab)
 
 The 5 distinct execution layers:
 1. **React Code Tab**: Submits tasks using Tauri RPC; Tauri may use `/v1/task` (HTTP bridge) to spawn the subprocess.
-2. **Tauri Subprocess Launch**: Spawns `orchestrator.codex_bridge_service` (the consolidated bridge module; replaced the legacy `run_codex_bridge.py` entrypoint — note: `mcp_server/tools/codex_bridge.py` still exists and is imported by `codex_bridge_service.py`, pending final verification before deletion).
+2. **Tauri Subprocess Launch**: Spawns `orchestrator.codex_bridge_service` (the consolidated bridge module; replaced the legacy `run_codex_bridge.py` entrypoint). It imports the bridge engine from the top-level `codex_engine/engine.py` package — a normal sibling import with no `sys.path` manipulation (resolution comes from `PYTHONPATH=kim_root`).
 3. **`codex_bridge_service.py`**: Starts an in-process `_CodexProxy`; registers `atexit`/`SIGTERM` handlers for cleanup; uses a `tempfile.TemporaryDirectory` context for scratch files.
 4. **_CodexProxy (aiohttp)**: Intercepts OpenAI-format API endpoints and maps them to local execution structures.
 5. **Codex CLI & BrowserProvider**: Connects to the browser provider using Chromium Developer Tools Protocol (CDP) to drive prompts in the live browser.

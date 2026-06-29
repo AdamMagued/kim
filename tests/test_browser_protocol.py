@@ -1,7 +1,7 @@
 import os
 import unittest
 
-from mcp_server.tools.codex_bridge import (
+from codex_engine.engine import (
     _codex_browser_system_prompt,
     _provider_response_to_chat_completions,
     _provider_response_to_responses_api,

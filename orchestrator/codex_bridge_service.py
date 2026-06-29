@@ -2,7 +2,7 @@
 Codex bridge service — lifecycle-managed launcher for browser-backed Codex runs.
 
 Merges ``orchestrator/run_codex_bridge.py`` and the subprocess-launch logic from
-``mcp_server/tools/codex_bridge.py`` into a single module with:
+``codex_engine/engine.py`` into a single module with:
 
 - ``atexit`` handler: kills the Codex process on any exit path
 - ``signal.SIGTERM`` handler: same cleanup (Tauri sends SIGTERM on cancel)
@@ -31,18 +31,19 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-# Make ``import orchestrator.*`` and ``import mcp_server.*`` resolve from repo root.
-_HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent
-if str(_REPO) not in sys.path:
-    sys.path.insert(0, str(_REPO))
-
-from mcp_server.tools.codex_bridge import (  # noqa: E402
+from codex_engine.engine import (
     CODEX_BINARY,
     _CodexProxy,
     _write_codex_config,
 )
-from orchestrator.providers.base import create_provider  # noqa: E402
+from orchestrator.providers.base import create_provider
+
+# Repo root — used to locate the default ``config.yaml`` when ``--config`` is
+# omitted (see ``_load_config`` below). Import resolution for ``codex_engine.*``,
+# ``orchestrator.*`` and ``mcp_server.*`` comes from ``PYTHONPATH=kim_root`` set by
+# the Tauri launcher (``subprocess.rs``), so no ``sys.path`` manipulation is needed.
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parent
 
 # Named constant for the placeholder API key used in local proxy auth (#53).
 # The proxy validates a per-run cryptographically random bearer token; this

@@ -1,10 +1,11 @@
 """
-Codex Bridge — relay module.
+Codex engine — the Codex bridge runtime.
 
-NOTE: The Tauri subprocess spawn now uses orchestrator/codex_bridge_service.py
-(Phase 7). This module remains the canonical home for _CodexProxy and
-run_codex_subtask, which are imported by codex_bridge_service. It will be
-deleted once the new service has been verified end-to-end in production.
+This top-level package is the canonical home for the Codex bridge "engine":
+``_CodexProxy``, ``run_codex_subtask``, and the subprocess/config helpers. It is
+consumed by the orchestrator-side launcher ``orchestrator/codex_bridge_service.py``,
+which imports it as a normal sibling package (``from codex_engine.engine import …``).
+It is not an MCP tool — it is not registered in ``mcp_server/tool_registry.py``.
 
 Spawns an OpenAI Codex CLI subprocess and routes its LLM calls through
 Kim's BrowserProvider via a local HTTP proxy server.
@@ -30,7 +31,7 @@ Auto-compaction (claw-style two-pass):
     (second pass — adapted from claw's summary_compression.rs).
 
 Usage:
-    from mcp_server.tools.codex_bridge import run_codex_subtask
+    from codex_engine.engine import run_codex_subtask
 
     result = await run_codex_subtask(
         task="write fibonacci.py and test it",

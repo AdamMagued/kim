@@ -78,7 +78,7 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 - `tool_risk.py` — Risk tier definitions mirroring `mcp_server/tool_tiers.py`
 - `stuck_detection.py` — Detects agent runloop stuck conditions and triggers recovery
 - `interaction_policy.py` — Policy logic for human-in-the-loop interaction gates
-- `codex_bridge_service.py` — Consolidated Codex bridge launcher (replaced legacy `run_codex_bridge.py` entrypoint; imports `mcp_server/tools/codex_bridge.py` which still exists pending final verification); manages `_CodexProxy` lifecycle with `atexit`/SIGTERM cleanup
+- `codex_bridge_service.py` — Consolidated Codex bridge launcher (replaced legacy `run_codex_bridge.py` entrypoint; imports the engine from the top-level `codex_engine/engine.py` package); manages `_CodexProxy` lifecycle with `atexit`/SIGTERM cleanup
 - `scheduled_runner.py` — Background runner for scheduled/cron agent tasks
 - `cron_store.py` — Persistent cron schedule storage
 - `obs_logging.py` — Observability / structured logging helpers
@@ -110,6 +110,12 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 
 ---
 
+## codex_engine (Codex bridge runtime)
+
+- `engine.py` — Codex bridge "engine": `_CodexProxy` (aiohttp), `run_codex_subtask`, the Codex subprocess launcher, and the `~/.codex/config.toml` writer. Consumed by `orchestrator/codex_bridge_service.py` as a sibling package. Not an MCP tool (not registered in `mcp_server/tool_registry.py`).
+
+---
+
 ## mcp_server (Model Context Protocol server — 50 tools)
 
 - `server.py` — Stdio transport MCP server router; processes incoming tool calls
@@ -129,7 +135,6 @@ Kim is a local AI agent platform for Windows, macOS, and Linux that connects clo
 - `tools/web.py` — Browser navigation, page inspection, DOM click, form fillers, and screenshots actions
 - `tools/web_element_scoring.py` — Numeric prioritizer scoring elements for target queries
 - `tools/web_observe_js.py` — Client JS observer recording interactive elements
-- `tools/codex_bridge.py` — Local proxy wrapper linking tools to Codex executor calls
 - `tools/git.py` — Sandboxed Git status, diffs, commits, branches, and logs execution
 - `tools/code.py` — Local runtime builders for Python and NodeJS snippets with linter hooks
 - `tools/search.py` — Quick local file searchers (ripgrep / file finder)

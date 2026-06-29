@@ -1,5 +1,5 @@
 """
-Regression tests for mcp_server/tools/codex_bridge.py — cmd-builder behaviors.
+Regression tests for codex_engine/engine.py — cmd-builder behaviors.
 
 Three contracts guarded here:
 
@@ -27,7 +27,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 _CODEX_BRIDGE = (
-    Path(__file__).resolve().parent.parent / "mcp_server" / "tools" / "codex_bridge.py"
+    Path(__file__).resolve().parent.parent / "codex_engine" / "engine.py"
 )
 
 
@@ -213,7 +213,7 @@ class TestCmdBuilderRuntime(unittest.IsolatedAsyncioTestCase):
         was passed to asyncio.create_subprocess_exec.
         """
         # Import inside test so module-level stubs are in place first
-        from mcp_server.tools.codex_bridge import run_codex_subtask
+        from codex_engine.engine import run_codex_subtask
 
         captured: list[list[str]] = []
 
@@ -244,7 +244,7 @@ class TestCmdBuilderRuntime(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec),
-            patch("mcp_server.tools.codex_bridge._CodexProxy", return_value=fake_proxy),
+            patch("codex_engine.engine._CodexProxy", return_value=fake_proxy),
             patch("shutil.rmtree"),
             patch("os.environ", base_env),
         ):
