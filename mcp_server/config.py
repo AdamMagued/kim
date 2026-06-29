@@ -66,8 +66,14 @@ LOG_LEVEL: str = _cfg.get("logging", {}).get("level", "INFO")
 BROWSER_HEADLESS: bool = bool(
     _cfg.get("browser_provider", {}).get("browser_headless", False)
 )
+# Canonical fallback for `use_real_browser` when the key is absent from
+# config.yaml. False keeps Kim on its dedicated managed Chromium instead of
+# silently attaching to the user's real Chrome over CDP — a privacy change a
+# missing key should never trigger. Mirrors the shipped `config.yaml`
+# (`use_real_browser: false`); see tests/test_config_parity.py.
+DEFAULT_USE_REAL_BROWSER: bool = False
 USE_REAL_BROWSER: bool = bool(
-    _cfg.get("use_real_browser", True)
+    _cfg.get("use_real_browser", DEFAULT_USE_REAL_BROWSER)
 )
 VOICE_ENABLED: bool = bool(_cfg.get("voice_enabled", False))
 

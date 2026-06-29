@@ -16,6 +16,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from orchestrator.agent_config import DEFAULT_PROVIDER
+
 
 def resolve_log_dir() -> Path:
     """D3: pick the first writable log directory.
@@ -97,7 +99,7 @@ async def _cli_main(args: argparse.Namespace) -> None:
         logging.getLogger(__name__).debug(f"Could not set up structured logs: {_log_err}")
 
     task = args.task or input("Task: ").strip()
-    print(f"Running: {task!r}  provider={config.get('provider', 'claude')}", file=sys.stderr)
+    print(f"Running: {task!r}  provider={config.get('provider', DEFAULT_PROVIDER)}", file=sys.stderr)
 
     async with mcp_agent_context(
         config,

@@ -94,7 +94,7 @@ from orchestrator.ui_bridge import UIBridge  # noqa: E402
 # ---------------------------------------------------------------------------
 # Config loading (extracted to orchestrator/agent_config.py)
 # ---------------------------------------------------------------------------
-from orchestrator.agent_config import _DEFAULT_CONFIG_PATH, load_config, _resolve_hitl_threshold  # noqa: E402,F401
+from orchestrator.agent_config import _DEFAULT_CONFIG_PATH, load_config, _resolve_hitl_threshold, DEFAULT_PROVIDER  # noqa: E402,F401
 
 # ---------------------------------------------------------------------------
 # MCP client (extracted to orchestrator/mcp_client.py)
@@ -1885,7 +1885,7 @@ async def mcp_agent_context(
         async with mcp_agent_context(config, ui_bridge=bridge) as agent:
             result = await agent.run("open Notepad")
     """
-    name = provider_name or config.get("provider", "claude")
+    name = provider_name or config.get("provider", DEFAULT_PROVIDER)
     provider = create_provider(name, config)
 
     async with mcp_session_context(config) as session:

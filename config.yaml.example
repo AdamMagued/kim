@@ -29,7 +29,7 @@ openai_api_key_env: OPENAI_API_KEY
 openai_base_url: ''
 preview_mode: false
 project_root: .
-provider: browser
+provider: ollama
 relay:
   pc_api_key: ''
   poll_interval: 2

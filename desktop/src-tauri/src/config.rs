@@ -11,6 +11,9 @@ fn default_schedules_enabled() -> bool { true }
 
 fn default_model_map() -> HashMap<String, String> {
     let mut map = HashMap::new();
+    // Keep these in sync with `config.yaml`'s `model:` block so the config-absent
+    // fallback matches the shipped file (see tests/test_config_parity.py).
+    map.insert("claude".to_string(), "claude-opus-4-6".to_string());
     map.insert("openai".to_string(), "gpt-4o".to_string());
     map.insert("deepseek".to_string(), "deepseek-chat".to_string());
     map.insert("gemini".to_string(), "gemini-2.0-flash".to_string());
