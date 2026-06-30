@@ -1,65 +1,47 @@
 use crate::*;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tauri::State;
-use tokio::sync::Mutex as TokioMutex;
-
-// ── HITL stdin channel (Rust → Python approval relay) ────────────────────────
-//
-// The running agent's stdin handle is stored here after spawn so that
-// `hitl_respond_approval` can write the user's approve/deny decision to it.
-// Each new task replaces the stored handle (old handle dropped = pipe closed).
-fn hitl_stdin() -> &'static TokioMutex<Option<tokio::process::ChildStdin>> {
-    static HITL_STDIN: OnceLock<TokioMutex<Option<tokio::process::ChildStdin>>> = OnceLock::new();
-    HITL_STDIN.get_or_init(|| TokioMutex::new(None))
-}
 
 /// Write the user's HITL approval decision to the running agent's stdin.
 /// Python's StdinApprovalBridge reads this line to unblock confirm_action().
 #[tauri::command]
 pub(crate) async fn hitl_respond_approval(approved: bool) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-    let mut guard = hitl_stdin().lock().await;
-    if let Some(ref mut stdin) = *guard {
-        let msg = if approved {
-            "{\"type\":\"hitl_approve\",\"approved\":true}\n"
-        } else {
-            "{\"type\":\"hitl_approve\",\"approved\":false}\n"
-        };
-        stdin.write_all(msg.as_bytes()).await.map_err(|e| e.to_string())?;
-        stdin.flush().await.map_err(|e| e.to_string())
+    let msg = if approved {
+        "{\"type\":\"hitl_approve\",\"approved\":true}\n"
     } else {
-        Err("No agent stdin available for HITL response".to_string())
-    }
+        "{\"type\":\"hitl_approve\",\"approved\":false}\n"
+    };
+    let mut rt = crate::task_runtime::task_runtime().lock().await;
+    rt.write_stdin_line(msg).await
 }
 
 /// K3: write a mid-run steering message to the running agent's stdin. Python's
 /// stdin pump folds it into memory as a user message before the next LLM call.
 #[tauri::command]
 pub(crate) async fn steer_task(text: String) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
     let payload = serde_json::json!({ "type": "user_steer", "text": text }).to_string();
-    let mut guard = hitl_stdin().lock().await;
-    if let Some(ref mut stdin) = *guard {
-        stdin
-            .write_all(format!("{payload}\n").as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        stdin.flush().await.map_err(|e| e.to_string())
-    } else {
-        Err("No agent stdin available for steering".to_string())
-    }
+    let msg = format!("{payload}\n");
+    let mut rt = crate::task_runtime::task_runtime().lock().await;
+    rt.write_stdin_line(&msg).await
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum KimEvent {
-    Status { message: String },
-    Plan { steps: Vec<serde_json::Value> },
-    Step { n: usize, data: serde_json::Value },
-    Done { n: usize },
+    Status {
+        message: String,
+    },
+    Plan {
+        steps: Vec<serde_json::Value>,
+    },
+    Step {
+        n: usize,
+        data: serde_json::Value,
+    },
+    Done {
+        n: usize,
+    },
     Context {
         cumulative_input: u64,
         budget: u64,
@@ -70,13 +52,31 @@ enum KimEvent {
         source: String,
         estimate: bool,
     },
-    Stats { input: u64, output: u64, total: u64 },
+    Stats {
+        input: u64,
+        output: u64,
+        total: u64,
+    },
     UiScreenshotFlash,
     UiShow,
-    RunDone { termination: String, success: bool },
-    RunFailed { reason: String, recoverable: bool, suggestion: String },
-    ProviderError { code: String, retryable: bool },
-    RateLimited { delay: f64, attempt: u32, max_retries: u32 },
+    RunDone {
+        termination: String,
+        success: bool,
+    },
+    RunFailed {
+        reason: String,
+        recoverable: bool,
+        suggestion: String,
+    },
+    ProviderError {
+        code: String,
+        retryable: bool,
+    },
+    RateLimited {
+        delay: f64,
+        attempt: u32,
+        max_retries: u32,
+    },
     HitlApprovalRequest {
         tool: String,
         risk: String,
@@ -85,7 +85,10 @@ enum KimEvent {
         #[serde(default)]
         preview: String,
     },
-    HitlApprovalResult { tool: String, approved: bool },
+    HitlApprovalResult {
+        tool: String,
+        approved: bool,
+    },
 }
 
 /// Resolve a Python interpreter or bundled orchestrator sidecar.
@@ -112,8 +115,14 @@ pub(crate) fn find_python_interpreter(project_root: &Path) -> Result<String, Str
     // ── 2. Install-script venv in ~/.kim_root or ~/.kim ───────────────────────
     if let Some(home) = dirs_home() {
         let install_candidates = [
-            home.join(".kim_root").join("venv").join("bin").join("python"),
-            home.join(".kim_root").join(".venv").join("bin").join("python"),
+            home.join(".kim_root")
+                .join("venv")
+                .join("bin")
+                .join("python"),
+            home.join(".kim_root")
+                .join(".venv")
+                .join("bin")
+                .join("python"),
             home.join(".kim").join("venv").join("bin").join("python"),
             home.join(".kim").join(".venv").join("bin").join("python"),
         ];
@@ -129,7 +138,10 @@ pub(crate) fn find_python_interpreter(project_root: &Path) -> Result<String, Str
         project_root.join("venv").join("bin").join("python"),
         project_root.join(".venv").join("bin").join("python"),
         project_root.join("venv").join("Scripts").join("python.exe"),
-        project_root.join(".venv").join("Scripts").join("python.exe"),
+        project_root
+            .join(".venv")
+            .join("Scripts")
+            .join("python.exe"),
     ];
     for candidate in candidates {
         if candidate.exists() {
@@ -268,7 +280,10 @@ fn executable_on_path(name: &str, kind: CodeBackendKind) -> Option<CodeBackend> 
     #[cfg(not(target_os = "windows"))]
     let search_cmd = ("which", name);
 
-    let out = std::process::Command::new(search_cmd.0).arg(search_cmd.1).output().ok()?;
+    let out = std::process::Command::new(search_cmd.0)
+        .arg(search_cmd.1)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -282,7 +297,10 @@ fn executable_on_path(name: &str, kind: CodeBackendKind) -> Option<CodeBackend> 
     if s.is_empty() {
         None
     } else {
-        Some(CodeBackend { kind, binary: PathBuf::from(s) })
+        Some(CodeBackend {
+            kind,
+            binary: PathBuf::from(s),
+        })
     }
 }
 
@@ -314,7 +332,10 @@ fn find_code_backend(kim_root: &Path) -> Option<CodeBackend> {
     if let Ok(p) = std::env::var("CODEX_BIN") {
         let path = PathBuf::from(p);
         if path.is_file() {
-            let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
             let kind = if filename == "claw" {
                 CodeBackendKind::Claw
             } else {
@@ -349,28 +370,19 @@ pub(crate) async fn send_task(
     // Maps to KIM_HITL_RISK_THRESHOLD: full_auto=off, ask_risky=high, ask_always=medium
     permission_mode: Option<String>,
     app_handle: tauri::AppHandle,
-    state: State<'_, TaskState>,
+    _state: State<'_, TaskState>,
 ) -> Result<String, String> {
     use std::process::Stdio;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
 
     // Refuse to start a second task if one is already running or spawning.
-    // This is a fast early-reject; the authoritative gate is the reserve block below.
     {
-        let guard = state.lock().await;
-        let bridge_pid_running = BRIDGE_TASK_PID
-            .get_or_init(|| StdMutex::new(None))
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .map(process_exists)
-            .unwrap_or(false);
-        if guard.pid.is_some() || guard.starting
-            || BRIDGE_TASK_STARTING.load(Ordering::Acquire)
-            || bridge_pid_running
-        {
-            return Err("A task is already running. Stop it before starting a new one.".to_string());
+        let rt = crate::task_runtime::task_runtime().lock().await;
+        if rt.is_occupied() {
+            return Err(
+                "A task is already running. Stop it before starting a new one.".to_string(),
+            );
         }
     }
     let app_config = app_handle.state::<config::AppConfig>();
@@ -393,8 +405,7 @@ pub(crate) async fn send_task(
     // i.e. distinct from the Kim repo itself. The Chat tab passes the Kim
     // repo as project_root (so MCP tools know the workspace), but those
     // sessions must still land in kim_sessions/, not .codex/sessions/.
-    let is_codex = target_root.canonicalize().ok()
-        != kim_root.canonicalize().ok();
+    let is_codex = target_root.canonicalize().ok() != kim_root.canonicalize().ok();
 
     let session_dir = if is_codex {
         target_root.join(".codex").join("sessions")
@@ -461,7 +472,10 @@ pub(crate) async fn send_task(
             let python = find_python_interpreter(&kim_root)?;
             let _ = app_handle.emit(
                 "kim-agent-output",
-                format!("[STATUS] Routing to Codex via Kim's browser provider ({})", provider_arg),
+                format!(
+                    "[STATUS] Routing to Codex via Kim's browser provider ({})",
+                    provider_arg
+                ),
             );
             let _ = app_handle.emit(
                 "kim-agent-output",
@@ -469,9 +483,12 @@ pub(crate) async fn send_task(
             );
             let mut c = Command::new(&python);
             c.args(["-m", "orchestrator.codex_bridge_service"])
-                .arg("--task").arg(&task)
-                .arg("--cwd").arg(target_root.to_string_lossy().to_string())
-                .arg("--provider").arg(&provider_arg)
+                .arg("--task")
+                .arg(&task)
+                .arg("--cwd")
+                .arg(target_root.to_string_lossy().to_string())
+                .arg("--provider")
+                .arg(&provider_arg)
                 .current_dir(&kim_root)
                 .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
                 // Tell run_codex_subtask exactly which codex binary to spawn,
@@ -488,8 +505,12 @@ pub(crate) async fn send_task(
                 .stderr(Stdio::piped());
             // Map permission_mode → KIM_HITL_RISK_THRESHOLD (same vocab as send_task).
             match permission_mode.as_deref().unwrap_or("full_auto") {
-                "ask_risky" => { c.env("KIM_HITL_RISK_THRESHOLD", "high"); }
-                "ask_always" => { c.env("KIM_HITL_RISK_THRESHOLD", "medium"); }
+                "ask_risky" => {
+                    c.env("KIM_HITL_RISK_THRESHOLD", "high");
+                }
+                "ask_always" => {
+                    c.env("KIM_HITL_RISK_THRESHOLD", "medium");
+                }
                 _ => {} // full_auto: no gate
             }
             c
@@ -501,14 +522,14 @@ pub(crate) async fn send_task(
                 // When the provider is Ollama, use --oss --local-provider ollama
                 // so Codex bypasses its own ChatGPT account auth entirely and
                 // routes through the local Ollama daemon instead.
-                c.arg("exec")
-                    .arg("--json");
+                c.arg("exec").arg("--json");
                 // Gate the sandbox-bypass flag behind an explicit opt-in env var (#1).
                 // Default: sandboxed + approvals enabled.
                 if std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1") {
                     c.arg("--dangerously-bypass-approvals-and-sandbox");
                 }
-                c.arg("-C").arg(target_root.to_string_lossy().to_string())
+                c.arg("-C")
+                    .arg(target_root.to_string_lossy().to_string())
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
@@ -519,10 +540,13 @@ pub(crate) async fn send_task(
                         ollama_local_model.as_deref(),
                         ollama_cloud_model.as_deref(),
                         &app_config,
-                    ).await?;
+                    )
+                    .await?;
                     c.arg("--oss")
-                        .arg("--local-provider").arg("ollama")
-                        .arg("--model").arg(&model);
+                        .arg("--local-provider")
+                        .arg("ollama")
+                        .arg("--model")
+                        .arg(&model);
                     format!("Ollama via local daemon ({model})")
                 } else {
                     configure_codex_direct_provider(
@@ -534,7 +558,8 @@ pub(crate) async fn send_task(
                         ollama_local_model.as_deref(),
                         ollama_cloud_model.as_deref(),
                         &app_config,
-                    ).await?
+                    )
+                    .await?
                 };
                 let _ = app_handle.emit(
                     "kim-agent-output",
@@ -547,7 +572,8 @@ pub(crate) async fn send_task(
                 c.arg(&task);
             } else {
                 // Claw compatibility binary: uses old --output-format json interface.
-                c.arg("--output-format").arg("json")
+                c.arg("--output-format")
+                    .arg("json")
                     .current_dir(&target_root)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
@@ -560,7 +586,8 @@ pub(crate) async fn send_task(
                     ollama_local_model.as_deref(),
                     ollama_cloud_model.as_deref(),
                     &app_config,
-                ).await?;
+                )
+                .await?;
                 let _ = app_handle.emit(
                     "kim-agent-output",
                     format!(
@@ -581,7 +608,13 @@ pub(crate) async fn send_task(
         let sess = resume_session_id.as_deref().unwrap_or("run");
         let sess_safe: String = sess
             .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let run_id = format!(
             "{}-{}",
@@ -620,8 +653,12 @@ pub(crate) async fn send_task(
             .stderr(Stdio::piped());
         // Map permission_mode → KIM_HITL_RISK_THRESHOLD env var.
         match permission_mode.as_deref().unwrap_or("full_auto") {
-            "ask_risky" => { c.env("KIM_HITL_RISK_THRESHOLD", "high"); }
-            "ask_always" => { c.env("KIM_HITL_RISK_THRESHOLD", "medium"); }
+            "ask_risky" => {
+                c.env("KIM_HITL_RISK_THRESHOLD", "high");
+            }
+            "ask_always" => {
+                c.env("KIM_HITL_RISK_THRESHOLD", "medium");
+            }
             _ => {} // full_auto: no threshold = no HITL gate
         }
         c
@@ -666,7 +703,8 @@ pub(crate) async fn send_task(
     if is_browser_provider {
         if bridge_cfg.is_none() {
             let root_for_chrome = kim_root.clone();
-            match tokio::task::spawn_blocking(move || launch_chrome_for_cdp(&root_for_chrome)).await {
+            match tokio::task::spawn_blocking(move || launch_chrome_for_cdp(&root_for_chrome)).await
+            {
                 Ok(Ok(true)) => {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
@@ -701,16 +739,32 @@ pub(crate) async fn send_task(
     }
 
     if !is_codex && provider_arg.trim().eq_ignore_ascii_case("ollama") {
-        if let Some(base_url) = ollama_base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(base_url) = ollama_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             cmd.env("KIM_OLLAMA_BASE_URL", base_url);
         }
-        if let Some(mode) = ollama_mode.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(mode) = ollama_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             cmd.env("KIM_OLLAMA_MODE", mode);
         }
-        if let Some(model) = ollama_local_model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(model) = ollama_local_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             cmd.env("KIM_OLLAMA_LOCAL_MODEL", model);
         }
-        if let Some(model) = ollama_cloud_model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(model) = ollama_cloud_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             cmd.env("KIM_OLLAMA_CLOUD_MODEL", model);
         }
         if let Some(limit) = ollama_context_limit_override.filter(|n| *n > 0) {
@@ -733,62 +787,39 @@ pub(crate) async fn send_task(
         cmd.process_group(0);
     }
 
-    // Reserve the runner slot immediately before spawning. Command setup can be
-    // slow, and two frontend invocations can otherwise both pass the initial
-    // pid check and spawn separate agents. BRIDGE_TASK_STARTING is the shared
-    // gate with /v1/task — both paths claim it atomically, so only one can win.
-    // After claiming, we also check BRIDGE_TASK_PID because /v1/task clears
-    // BRIDGE_TASK_STARTING once its PID is stored, meaning a running /v1/task
-    // has BRIDGE_TASK_STARTING=false but BRIDGE_TASK_PID=Some(pid).
+    // Reserve the runner slot immediately before spawning.
     {
-        let mut guard = state.lock().await;
-        if guard.pid.is_some() || guard.starting {
-            return Err("A task is already running. Stop it before starting a new one.".to_string());
-        }
-        // swap returns the *previous* value; if it was already true, /v1/task owns it — bail.
-        if BRIDGE_TASK_STARTING.swap(true, Ordering::AcqRel) {
-            return Err("A task is already running. Stop it before starting a new one.".to_string());
-        }
-        // /v1/task may have cleared BRIDGE_TASK_STARTING but still be running (PID set).
-        let bridge_running = BRIDGE_TASK_PID
-            .get_or_init(|| StdMutex::new(None))
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .map(process_exists)
-            .unwrap_or(false);
-        if bridge_running {
-            BRIDGE_TASK_STARTING.store(false, Ordering::Release);
-            return Err("A task is already running. Stop it before starting a new one.".to_string());
-        }
-        guard.starting = true;
+        let mut rt = crate::task_runtime::task_runtime().lock().await;
+        rt.reserve().map_err(|_| {
+            "A task is already running. Stop it before starting a new one.".to_string()
+        })?;
     }
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            let mut guard = state.lock().await;
-            guard.starting = false;
-            // Release the shared spawn gate so /v1/task can proceed after our failure.
-            BRIDGE_TASK_STARTING.store(false, Ordering::Release);
+            let mut rt = crate::task_runtime::task_runtime().lock().await;
+            rt.release();
             return Err(format!("Failed to start Kim: {}", e));
         }
     };
 
     // Record the PID so cancel_task can signal it.
-    let child_pid = child.id();
+    let Some(child_pid) = child.id() else {
+        let mut rt = crate::task_runtime::task_runtime().lock().await;
+        rt.release();
+        return Err("Failed to read child PID after spawn.".to_string());
+    };
     {
-        let mut guard = state.lock().await;
-        guard.pid = child_pid;
-        guard.starting = false;
+        let mut rt = crate::task_runtime::task_runtime().lock().await;
+        rt.store_pid(
+            child_pid,
+            resume_session_id
+                .clone()
+                .unwrap_or_else(|| "gui".to_string()),
+            crate::task_runtime::SpawnSource::Gui,
+        );
     }
-    // Also sync to the bridge-accessible static so kimctl cancel works.
-    if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
-        *guard = child_pid;
-    }
-    // PID is now set — release the BRIDGE_TASK_STARTING gate so the /v1/task guard
-    // sees a running PID rather than the "starting" flag going forward.
-    BRIDGE_TASK_STARTING.store(false, Ordering::Release);
     // K7: reflect the running task in the tray status line.
     crate::speed_access::set_tray_status(&app_handle, Some(task.as_str()));
 
@@ -800,7 +831,7 @@ pub(crate) async fn send_task(
     // Direct Codex CLI runs (is_codex && !is_browser_provider) use Stdio::null on stdin
     // and never emit HITL requests, so they are intentionally excluded.
     if !is_codex || is_browser_provider {
-        *hitl_stdin().lock().await = child.stdin.take();
+        crate::task_runtime::task_runtime().lock().await.gui_stdin = child.stdin.take();
     }
 
     let ipc_typed = app_config.ipc_protocol == "typed";
@@ -814,63 +845,112 @@ pub(crate) async fn send_task(
                     if let Ok(event) = serde_json::from_str::<KimEvent>(&line) {
                         match &event {
                             KimEvent::Status { message } => {
-                                let _ = app.emit("kim:status", serde_json::json!({"message": message}));
+                                let _ =
+                                    app.emit("kim:status", serde_json::json!({"message": message}));
                             }
                             KimEvent::Plan { steps } => {
                                 let _ = app.emit("kim:plan", serde_json::json!({"steps": steps}));
                             }
                             KimEvent::Step { n, data } => {
-                                let _ = app.emit("kim:step", serde_json::json!({"n": n, "data": data}));
+                                let _ =
+                                    app.emit("kim:step", serde_json::json!({"n": n, "data": data}));
                             }
                             KimEvent::Done { n } => {
                                 let _ = app.emit("kim:done", serde_json::json!({"n": n}));
                             }
-                            KimEvent::Context { cumulative_input, budget, phase, percent, last_input, last_output, source, estimate } => {
-                                let _ = app.emit("kim:context", serde_json::json!({
-                                    "cumulative_input": cumulative_input,
-                                    "budget": budget,
-                                    "phase": phase,
-                                    "percent": percent,
-                                    "last_input": last_input,
-                                    "last_output": last_output,
-                                    "source": source,
-                                    "estimate": estimate,
-                                }));
+                            KimEvent::Context {
+                                cumulative_input,
+                                budget,
+                                phase,
+                                percent,
+                                last_input,
+                                last_output,
+                                source,
+                                estimate,
+                            } => {
+                                let _ = app.emit(
+                                    "kim:context",
+                                    serde_json::json!({
+                                        "cumulative_input": cumulative_input,
+                                        "budget": budget,
+                                        "phase": phase,
+                                        "percent": percent,
+                                        "last_input": last_input,
+                                        "last_output": last_output,
+                                        "source": source,
+                                        "estimate": estimate,
+                                    }),
+                                );
                             }
-                            KimEvent::Stats { input, output, total } => {
+                            KimEvent::Stats {
+                                input,
+                                output,
+                                total,
+                            } => {
                                 let _ = app.emit("kim:stats", serde_json::json!({"input": input, "output": output, "total": total}));
                             }
                             KimEvent::UiScreenshotFlash => {
-                                let _ = app.emit("kim:ui", serde_json::json!({"action": "screenshot_flash"}));
+                                let _ = app.emit(
+                                    "kim:ui",
+                                    serde_json::json!({"action": "screenshot_flash"}),
+                                );
                             }
                             KimEvent::UiShow => {
                                 let _ = app.emit("kim:ui", serde_json::json!({"action": "show"}));
                             }
-                            KimEvent::RunDone { termination, success } => {
+                            KimEvent::RunDone {
+                                termination,
+                                success,
+                            } => {
                                 let _ = app.emit("kim:run-done", serde_json::json!({"termination": termination, "success": success}));
                             }
-                            KimEvent::RunFailed { reason, recoverable, suggestion } => {
-                                let _ = app.emit("kim:run-failed", serde_json::json!({
-                                    "reason": reason,
-                                    "recoverable": recoverable,
-                                    "suggestion": suggestion,
-                                }));
+                            KimEvent::RunFailed {
+                                reason,
+                                recoverable,
+                                suggestion,
+                            } => {
+                                let _ = app.emit(
+                                    "kim:run-failed",
+                                    serde_json::json!({
+                                        "reason": reason,
+                                        "recoverable": recoverable,
+                                        "suggestion": suggestion,
+                                    }),
+                                );
                             }
                             KimEvent::ProviderError { code, retryable } => {
-                                let _ = app.emit("kim:provider-error", serde_json::json!({"code": code, "retryable": retryable}));
+                                let _ = app.emit(
+                                    "kim:provider-error",
+                                    serde_json::json!({"code": code, "retryable": retryable}),
+                                );
                             }
-                            KimEvent::RateLimited { delay, attempt, max_retries } => {
-                                let _ = app.emit("kim:rate-limited", serde_json::json!({
-                                    "delay": delay,
-                                    "attempt": attempt,
-                                    "max_retries": max_retries,
-                                }));
+                            KimEvent::RateLimited {
+                                delay,
+                                attempt,
+                                max_retries,
+                            } => {
+                                let _ = app.emit(
+                                    "kim:rate-limited",
+                                    serde_json::json!({
+                                        "delay": delay,
+                                        "attempt": attempt,
+                                        "max_retries": max_retries,
+                                    }),
+                                );
                             }
-                            KimEvent::HitlApprovalRequest { tool, risk, reason, preview } => {
+                            KimEvent::HitlApprovalRequest {
+                                tool,
+                                risk,
+                                reason,
+                                preview,
+                            } => {
                                 let _ = app.emit("kim:hitl-approval-request", serde_json::json!({"tool": tool, "risk": risk, "reason": reason, "preview": preview}));
                             }
                             KimEvent::HitlApprovalResult { tool, approved } => {
-                                let _ = app.emit("kim:hitl-approval-result", serde_json::json!({"tool": tool, "approved": approved}));
+                                let _ = app.emit(
+                                    "kim:hitl-approval-result",
+                                    serde_json::json!({"tool": tool, "approved": approved}),
+                                );
                             }
                         }
                     } else {
@@ -915,21 +995,11 @@ pub(crate) async fn send_task(
 
     // Clear the recorded PID regardless of exit reason (normal, error, cancelled).
     {
-        let mut guard = state.lock().await;
-        guard.pid = None;
-        guard.starting = false;
-    }
-    // Clear bridge-accessible PID too.
-    if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
-        *guard = None;
+        let mut rt = crate::task_runtime::task_runtime().lock().await;
+        rt.clear();
     }
     // K7: tray back to idle.
     crate::speed_access::set_tray_status(&app_handle, None);
-    // Drop the HITL stdin handle so the pipe is closed.
-    *hitl_stdin().lock().await = None;
-    if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
-        *guard = None;
-    }
 
     let _ = set_task_active_mode(app_handle.clone(), false).await;
     if let Some(flash_win) = app_handle.get_webview_window("screenshot-flash") {
@@ -953,44 +1023,26 @@ pub(crate) async fn send_task(
     // Always return Ok — the frontend learns about failure via the kim-agent-done
     // event (payload = false). Returning Err here causes a second error path in the
     // JS catch block, leading to duplicate error messages and UI state conflicts.
-    Ok(if status.success() { "Task completed".to_string() } else { "Task ended".to_string() })
+    Ok(if status.success() {
+        "Task completed".to_string()
+    } else {
+        "Task ended".to_string()
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Cancel a running task — SIGTERM, then SIGKILL after 2s if still alive.
 // ---------------------------------------------------------------------------
 
-/// Clear the task PID from BOTH tracking stores so subsequent cancel/status
-/// calls don't see a stale PID regardless of how the task was started.
-async fn clear_task_pid(state: &TaskState) {
-    let mut guard = state.lock().await;
-    guard.pid = None;
-    guard.starting = false;
-    if let Ok(mut bridge_guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
-        *bridge_guard = None;
-    }
-}
-
 #[tauri::command]
 pub(crate) async fn cancel_task(
     app_handle: tauri::AppHandle,
-    state: State<'_, TaskState>,
+    _state: State<'_, TaskState>,
 ) -> Result<String, String> {
     let (pid, starting) = {
-        let guard = state.lock().await;
-        (guard.pid, guard.starting)
+        let rt = crate::task_runtime::task_runtime().lock().await;
+        (rt.pid, rt.starting)
     };
-
-    // Fall back to the bridge-registered PID. Tasks started via kimctl /v1/task
-    // register in BRIDGE_TASK_PID, not TaskState — so the GUI Stop button needs
-    // to check both stores or it silently no-ops while the task keeps running.
-    let pid = pid.or_else(|| {
-        BRIDGE_TASK_PID
-            .get_or_init(|| StdMutex::new(None))
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-    });
 
     let Some(pid) = pid else {
         if starting {
@@ -1000,8 +1052,7 @@ pub(crate) async fn cancel_task(
     };
 
     // Step 1 — graceful signal.
-    send_signal(pid, false)
-        .map_err(|e| format!("Failed to send stop signal: {}", e))?;
+    send_signal(pid, false).map_err(|e| format!("Failed to send stop signal: {}", e))?;
 
     // Restore the UI immediately. If the agent is cancelled while a screenshot
     // tool is blocking, Python may never reach its finally block that normally
@@ -1014,22 +1065,20 @@ pub(crate) async fn cancel_task(
     // Step 2 — wait up to 2 seconds for the process to exit; if it's still
     // alive, force kill. We poll by re-sending signal 0 (existence check).
     let app = app_handle.clone();
-    // Clone the inner Arc so the spawned task has its own handle —
-    // dereference State<'_, TaskState> to TaskState (= Arc<Mutex<…>>),
-    // then Arc::clone just bumps the refcount.
-    let state_clone: TaskState = Arc::clone(&*state);
     tokio::spawn(async move {
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if !process_exists(pid) {
-                clear_task_pid(&state_clone).await;
+                let mut rt = crate::task_runtime::task_runtime().lock().await;
+                rt.clear();
                 let _ = app.emit("kim-agent-cancelled", true);
                 return;
             }
         }
         // Still alive after 2s → SIGKILL / taskkill /F.
         let _ = send_signal(pid, true);
-        clear_task_pid(&state_clone).await;
+        let mut rt = crate::task_runtime::task_runtime().lock().await;
+        rt.clear();
         let _ = app.emit("kim-agent-cancelled", true);
     });
 
@@ -1046,9 +1095,7 @@ pub(crate) fn send_signal(pid: u32, force: bool) -> std::io::Result<()> {
     // If group kill fails (e.g. the process is not a group leader), fall back
     // to killing only the parent process.
     let neg_pid = format!("-{}", pid);
-    let status = Command::new("kill")
-        .args([sig, &neg_pid])
-        .status();
+    let status = Command::new("kill").args([sig, &neg_pid]).status();
     match status {
         Ok(s) if s.success() => Ok(()),
         _ => {
@@ -1057,9 +1104,10 @@ pub(crate) fn send_signal(pid: u32, force: bool) -> std::io::Result<()> {
                 .args([sig, &pid.to_string()])
                 .status()?;
             if !status.success() {
-                return Err(std::io::Error::other(
-                    format!("kill {} {} failed with {}", sig, pid, status),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "kill {} {} failed with {}",
+                    sig, pid, status
+                )));
             }
             Ok(())
         }
@@ -1122,7 +1170,10 @@ mod tests {
         let json = r#"{"type":"run_done","termination":"task_complete","success":true}"#;
         let event: KimEvent = serde_json::from_str(json).expect("run_done should deserialize");
         match event {
-            KimEvent::RunDone { termination, success } => {
+            KimEvent::RunDone {
+                termination,
+                success,
+            } => {
                 assert_eq!(termination, "task_complete");
                 assert!(success);
             }
@@ -1133,9 +1184,13 @@ mod tests {
     #[test]
     fn test_parse_run_done_failed_variant() {
         let json = r#"{"type":"run_done","termination":"max_iterations","success":false}"#;
-        let event: KimEvent = serde_json::from_str(json).expect("run_done failed should deserialize");
+        let event: KimEvent =
+            serde_json::from_str(json).expect("run_done failed should deserialize");
         match event {
-            KimEvent::RunDone { termination, success } => {
+            KimEvent::RunDone {
+                termination,
+                success,
+            } => {
                 assert_eq!(termination, "max_iterations");
                 assert!(!success);
             }
@@ -1146,7 +1201,8 @@ mod tests {
     #[test]
     fn test_parse_provider_error_event() {
         let json = r#"{"type":"provider_error","code":"rate_limit","retryable":false}"#;
-        let event: KimEvent = serde_json::from_str(json).expect("provider_error should deserialize");
+        let event: KimEvent =
+            serde_json::from_str(json).expect("provider_error should deserialize");
         match event {
             KimEvent::ProviderError { code, retryable } => {
                 assert_eq!(code, "rate_limit");
@@ -1159,7 +1215,8 @@ mod tests {
     #[test]
     fn test_parse_provider_error_retryable_variant() {
         let json = r#"{"type":"provider_error","code":"server_error","retryable":true}"#;
-        let event: KimEvent = serde_json::from_str(json).expect("provider_error retryable should deserialize");
+        let event: KimEvent =
+            serde_json::from_str(json).expect("provider_error retryable should deserialize");
         match event {
             KimEvent::ProviderError { code, retryable } => {
                 assert_eq!(code, "server_error");
@@ -1172,11 +1229,19 @@ mod tests {
     #[test]
     fn test_parse_run_done_all_terminations() {
         let terminations = [
-            "task_complete", "cancelled", "max_iterations",
-            "stuck", "provider_failed", "need_help", "conversational_loop",
+            "task_complete",
+            "cancelled",
+            "max_iterations",
+            "stuck",
+            "provider_failed",
+            "need_help",
+            "conversational_loop",
         ];
         for term in &terminations {
-            let json = format!(r#"{{"type":"run_done","termination":"{}","success":false}}"#, term);
+            let json = format!(
+                r#"{{"type":"run_done","termination":"{}","success":false}}"#,
+                term
+            );
             let event: KimEvent = serde_json::from_str(&json)
                 .unwrap_or_else(|e| panic!("run_done with termination={} failed: {}", term, e));
             match event {
@@ -1189,9 +1254,15 @@ mod tests {
     #[test]
     fn test_parse_hitl_approval_request_event() {
         let json = r#"{"type":"hitl_approval_request","tool":"run_command","risk":"high","reason":"arbitrary_code_execution"}"#;
-        let event: KimEvent = serde_json::from_str(json).expect("hitl_approval_request should deserialize");
+        let event: KimEvent =
+            serde_json::from_str(json).expect("hitl_approval_request should deserialize");
         match event {
-            KimEvent::HitlApprovalRequest { tool, risk, reason, preview } => {
+            KimEvent::HitlApprovalRequest {
+                tool,
+                risk,
+                reason,
+                preview,
+            } => {
                 assert_eq!(tool, "run_command");
                 assert_eq!(risk, "high");
                 assert_eq!(reason, "arbitrary_code_execution");
@@ -1204,7 +1275,8 @@ mod tests {
     #[test]
     fn test_parse_hitl_approval_result_approved_event() {
         let json = r#"{"type":"hitl_approval_result","tool":"run_command","approved":true}"#;
-        let event: KimEvent = serde_json::from_str(json).expect("hitl_approval_result should deserialize");
+        let event: KimEvent =
+            serde_json::from_str(json).expect("hitl_approval_result should deserialize");
         match event {
             KimEvent::HitlApprovalResult { tool, approved } => {
                 assert_eq!(tool, "run_command");
@@ -1217,7 +1289,8 @@ mod tests {
     #[test]
     fn test_parse_hitl_approval_result_denied_event() {
         let json = r#"{"type":"hitl_approval_result","tool":"delete_file","approved":false}"#;
-        let event: KimEvent = serde_json::from_str(json).expect("hitl_approval_result denied should deserialize");
+        let event: KimEvent =
+            serde_json::from_str(json).expect("hitl_approval_result denied should deserialize");
         match event {
             KimEvent::HitlApprovalResult { tool, approved } => {
                 assert_eq!(tool, "delete_file");
@@ -1242,11 +1315,7 @@ mod tests {
         let result = find_python_interpreter(root);
         assert!(result.is_ok(), "Expected Ok, got {:?}", result);
         let found = result.unwrap();
-        assert!(
-            found.contains("venv"),
-            "Expected venv path, got: {}",
-            found
-        );
+        assert!(found.contains("venv"), "Expected venv path, got: {}", found);
     }
 
     #[test]
@@ -1313,8 +1382,12 @@ mod tests {
 
     #[test]
     fn test_is_bundled_orchestrator_positive() {
-        assert!(is_bundled_orchestrator("/path/to/kim-orchestrator-aarch64-apple-darwin"));
-        assert!(is_bundled_orchestrator("/Applications/Kim.app/Contents/MacOS/kim-orchestrator"));
+        assert!(is_bundled_orchestrator(
+            "/path/to/kim-orchestrator-aarch64-apple-darwin"
+        ));
+        assert!(is_bundled_orchestrator(
+            "/Applications/Kim.app/Contents/MacOS/kim-orchestrator"
+        ));
         assert!(is_bundled_orchestrator("kim-orchestrator"));
     }
 
@@ -1334,9 +1407,15 @@ mod tests {
         // Bare sidecar name (development copy placed next to executable).
         assert!(is_bundled_orchestrator("kim-orchestrator"));
         // The Tauri bundle convention appends the platform triple.
-        assert!(is_bundled_orchestrator("kim-orchestrator-aarch64-apple-darwin"));
-        assert!(is_bundled_orchestrator("kim-orchestrator-x86_64-unknown-linux-gnu"));
-        assert!(is_bundled_orchestrator("kim-orchestrator-x86_64-pc-windows-msvc"));
+        assert!(is_bundled_orchestrator(
+            "kim-orchestrator-aarch64-apple-darwin"
+        ));
+        assert!(is_bundled_orchestrator(
+            "kim-orchestrator-x86_64-unknown-linux-gnu"
+        ));
+        assert!(is_bundled_orchestrator(
+            "kim-orchestrator-x86_64-pc-windows-msvc"
+        ));
         // Any string that embeds the sidecar name is treated as bundled —
         // this is intentional per the `contains` implementation.
         assert!(is_bundled_orchestrator("prefix-kim-orchestrator-suffix"));
@@ -1386,8 +1465,12 @@ mod tests {
     #[test]
     fn python_paths_not_bundled() {
         // Project-local venv paths (both Unix and Windows layouts).
-        assert!(!is_bundled_orchestrator("/workspace/project/venv/bin/python"));
-        assert!(!is_bundled_orchestrator("/workspace/project/.venv/bin/python"));
+        assert!(!is_bundled_orchestrator(
+            "/workspace/project/venv/bin/python"
+        ));
+        assert!(!is_bundled_orchestrator(
+            "/workspace/project/.venv/bin/python"
+        ));
         assert!(!is_bundled_orchestrator(
             r"C:\workspace\project\venv\Scripts\python.exe"
         ));
@@ -1395,7 +1478,9 @@ mod tests {
             r"C:\workspace\project\.venv\Scripts\python.exe"
         ));
         // Kim install-script home venv paths.
-        assert!(!is_bundled_orchestrator("/home/user/.kim_root/venv/bin/python"));
+        assert!(!is_bundled_orchestrator(
+            "/home/user/.kim_root/venv/bin/python"
+        ));
         assert!(!is_bundled_orchestrator("/home/user/.kim/venv/bin/python"));
         // Bare names as returned by system PATH fallback.
         assert!(!is_bundled_orchestrator("python"));
@@ -1424,4 +1509,3 @@ mod tests {
         assert!(home.is_some(), "dirs_home() returned None — HOME not set?");
     }
 }
-

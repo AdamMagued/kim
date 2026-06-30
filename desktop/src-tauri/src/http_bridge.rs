@@ -1,7 +1,7 @@
 use crate::*;
-use tiny_http::{Method, Request, Server};
-use tauri::Manager;
 use std::time::Duration;
+use tauri::Manager;
+use tiny_http::{Method, Request, Server};
 
 fn handle_webview_bridge_request(
     mut request: Request,
@@ -9,12 +9,7 @@ fn handle_webview_bridge_request(
     token: String,
 ) {
     let method = request.method().clone();
-    let path = request
-        .url()
-        .split('?')
-        .next()
-        .unwrap_or("/")
-        .to_string();
+    let path = request.url().split('?').next().unwrap_or("/").to_string();
 
     if method == Method::Options {
         respond_json(request, 204, serde_json::json!({"ok": true}));
@@ -29,7 +24,11 @@ fn handle_webview_bridge_request(
         let token_bytes = token.as_bytes();
         let auth_bytes = auth.as_bytes();
         let tokens_match = token_bytes.len() == auth_bytes.len()
-            && token_bytes.iter().zip(auth_bytes.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+            && token_bytes
+                .iter()
+                .zip(auth_bytes.iter())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
         if !tokens_match {
             respond_json(
                 request,
@@ -88,7 +87,11 @@ fn handle_webview_bridge_request(
             };
 
             match open_browser_signin_window_impl(&parsed.url, parsed.provider_name, &app_handle) {
-                Ok(msg) => respond_json(request, 200, serde_json::json!({"ok": true, "message": msg})),
+                Ok(msg) => respond_json(
+                    request,
+                    200,
+                    serde_json::json!({"ok": true, "message": msg}),
+                ),
                 Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": e})),
             }
         }
@@ -179,33 +182,45 @@ fn handle_webview_bridge_request(
 
             if !req_id.is_empty() && !payload_str.is_empty() {
                 match base64::engine::general_purpose::STANDARD.decode(&payload_str) {
-                    Ok(decoded) => {
-                        match String::from_utf8(decoded) {
-                            Ok(json_str) => {
-                                if let Ok(ipc_event) = serde_json::from_str::<BridgeIpcEvent>(&json_str) {
-                                    handle_bridge_ipc_event(ipc_event, &app_handle);
-                                } else {
-                                    match serde_json::from_str::<BridgeCompleteResponse>(&json_str) {
-                                        Ok(payload) => {
-                                            let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
-                                            if let Ok(mut guard) = store.lock() {
-                                                guard.insert(req_id, payload);
-                                            }
-                                            notify_bridge_result();
+                    Ok(decoded) => match String::from_utf8(decoded) {
+                        Ok(json_str) => {
+                            if let Ok(ipc_event) = serde_json::from_str::<BridgeIpcEvent>(&json_str)
+                            {
+                                handle_bridge_ipc_event(ipc_event, &app_handle);
+                            } else {
+                                match serde_json::from_str::<BridgeCompleteResponse>(&json_str) {
+                                    Ok(payload) => {
+                                        let store = WEBVIEW_BRIDGE_RESULTS
+                                            .get_or_init(|| StdMutex::new(HashMap::new()));
+                                        if let Ok(mut guard) = store.lock() {
+                                            guard.insert(req_id, payload);
                                         }
-                                        Err(e) => {
-                                            agent_debug_log("H2", "ping json parse failed", serde_json::json!({ "error": e.to_string(), "json_str": json_str }));
-                                        }
+                                        notify_bridge_result();
+                                    }
+                                    Err(e) => {
+                                        agent_debug_log(
+                                            "H2",
+                                            "ping json parse failed",
+                                            serde_json::json!({ "error": e.to_string(), "json_str": json_str }),
+                                        );
                                     }
                                 }
                             }
-                            Err(e) => {
-                                agent_debug_log("H2", "ping utf8 parse failed", serde_json::json!({ "error": e.to_string() }));
-                            }
                         }
-                    }
+                        Err(e) => {
+                            agent_debug_log(
+                                "H2",
+                                "ping utf8 parse failed",
+                                serde_json::json!({ "error": e.to_string() }),
+                            );
+                        }
+                    },
                     Err(e) => {
-                        agent_debug_log("H2", "ping base64 parse failed", serde_json::json!({ "error": e.to_string(), "payload_str": payload_str }));
+                        agent_debug_log(
+                            "H2",
+                            "ping base64 parse failed",
+                            serde_json::json!({ "error": e.to_string(), "payload_str": payload_str }),
+                        );
                     }
                 }
             }
@@ -244,7 +259,11 @@ fn handle_webview_bridge_request(
             }
 
             let site = normalize_site(parsed.site.as_deref().unwrap_or("claude"));
-            let gemini_authuser = if site == "gemini" { parsed.authuser } else { None };
+            let gemini_authuser = if site == "gemini" {
+                parsed.authuser
+            } else {
+                None
+            };
             let bridge_lock = WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(()));
             let _guard = match bridge_lock.try_lock() {
                 Ok(g) => g,
@@ -278,7 +297,8 @@ fn handle_webview_bridge_request(
                 } else {
                     default_site_url(&site).to_string()
                 };
-                let open_result = open_browser_signin_window_impl(&open_url, Some(site.clone()), &app_handle);
+                let open_result =
+                    open_browser_signin_window_impl(&open_url, Some(site.clone()), &app_handle);
                 if let Err(e) = open_result {
                     respond_json(
                         request,
@@ -304,9 +324,13 @@ fn handle_webview_bridge_request(
             }
 
             if parsed.clear_chat {
-                agent_debug_log("H1", "clear_chat requested for /v1/complete", serde_json::json!({
-                    "site": site.clone(),
-                }));
+                agent_debug_log(
+                    "H1",
+                    "clear_chat requested for /v1/complete",
+                    serde_json::json!({
+                        "site": site.clone(),
+                    }),
+                );
                 if let Err(e) = clear_provider_webview_chat(&window, &site, gemini_authuser) {
                     respond_json(
                         request,
@@ -385,7 +409,11 @@ fn handle_webview_bridge_request(
                         );
                     }
                 }
-                Err(e) => respond_json(request, 504, serde_json::json!({"ok": false, "error": e, "site": site})),
+                Err(e) => respond_json(
+                    request,
+                    504,
+                    serde_json::json!({"ok": false, "error": e, "site": site}),
+                ),
             }
         }
         // ── Split send/receive: /v1/send ────────────────────────────────
@@ -424,11 +452,18 @@ fn handle_webview_bridge_request(
             }
 
             let site = normalize_site(parsed.site.as_deref().unwrap_or("claude"));
-            let gemini_authuser = if site == "gemini" { parsed.authuser } else { None };
+            let gemini_authuser = if site == "gemini" {
+                parsed.authuser
+            } else {
+                None
+            };
 
             // Acquire lock early to prevent overlapping sends from clobbering
             // clipboard, window state, or req_id stores (#33, #34)
-            let _bridge_guard = match WEBVIEW_BRIDGE_LOCK.get_or_init(|| StdMutex::new(())).try_lock() {
+            let _bridge_guard = match WEBVIEW_BRIDGE_LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .try_lock()
+            {
                 Ok(g) => g,
                 Err(std::sync::TryLockError::WouldBlock) => {
                     respond_json(
@@ -457,7 +492,8 @@ fn handle_webview_bridge_request(
                 } else {
                     default_site_url(&site).to_string()
                 };
-                let open_result = open_browser_signin_window_impl(&open_url, Some(site.clone()), &app_handle);
+                let open_result =
+                    open_browser_signin_window_impl(&open_url, Some(site.clone()), &app_handle);
                 if let Err(e) = open_result {
                     respond_json(
                         request,
@@ -483,9 +519,13 @@ fn handle_webview_bridge_request(
             }
 
             if parsed.clear_chat {
-                agent_debug_log("H1", "clear_chat requested for /v1/send", serde_json::json!({
-                    "site": site.clone(),
-                }));
+                agent_debug_log(
+                    "H1",
+                    "clear_chat requested for /v1/send",
+                    serde_json::json!({
+                        "site": site.clone(),
+                    }),
+                );
                 if let Err(e) = clear_provider_webview_chat(&window, &site, gemini_authuser) {
                     respond_json(
                         request,
@@ -517,12 +557,16 @@ fn handle_webview_bridge_request(
             }
 
             let attachments = &parsed.attachments;
-            let prompt_json = serde_json::to_string(&parsed.prompt).unwrap_or_else(|_| "\"\"".to_string());
+            let prompt_json =
+                serde_json::to_string(&parsed.prompt).unwrap_or_else(|_| "\"\"".to_string());
             let req_id_json = serde_json::to_string(&req_id).unwrap_or_else(|_| "\"\"".to_string());
             let site_json = serde_json::to_string(&site).unwrap_or_else(|_| "\"\"".to_string());
-            let attachments_json = serde_json::to_string(&attachments).unwrap_or_else(|_| "\"[]\"".to_string());
-            let hash_json = serde_json::to_string(&parsed.completion_hash).unwrap_or_else(|_| "null".to_string());
-            let tier_json = serde_json::to_string(&parsed.model_tier).unwrap_or_else(|_| "null".to_string());
+            let attachments_json =
+                serde_json::to_string(&attachments).unwrap_or_else(|_| "\"[]\"".to_string());
+            let hash_json = serde_json::to_string(&parsed.completion_hash)
+                .unwrap_or_else(|_| "null".to_string());
+            let tier_json =
+                serde_json::to_string(&parsed.model_tier).unwrap_or_else(|_| "null".to_string());
 
             let bridge_call = format!(
                 r#"(() => {{
@@ -561,24 +605,34 @@ fn handle_webview_bridge_request(
             } else if should_keep_browser_visible() {
                 show_browser_window_impl(&app_handle);
             } else if is_browser_window_offscreen(&window) {
-                if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
+                if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN
+                    .get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+                    .lock()
+                {
                     guard.insert(req_id.clone());
                 }
             } else {
                 // Keep the provider webview off-screen during normal sends so it
                 // does not cover the user's target app before screenshot tools run.
                 hide_browser_window_offscreen(&window);
-                if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
+                if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN
+                    .get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+                    .lock()
+                {
                     guard.insert(req_id.clone());
                 }
             }
 
-            agent_debug_log("H1", "send via persistent bridge", serde_json::json!({
-                "reqId": req_id,
-                "site": site.clone(),
-                "promptLen": parsed.prompt.len(),
-                "attachments": attachments.len(),
-            }));
+            agent_debug_log(
+                "H1",
+                "send via persistent bridge",
+                serde_json::json!({
+                    "reqId": req_id,
+                    "site": site.clone(),
+                    "promptLen": parsed.prompt.len(),
+                    "attachments": attachments.len(),
+                }),
+            );
 
             // Best-effort: pre-populate the macOS system clipboard with the first PNG
             // attachment so the bridge JS can use document.execCommand('paste') to
@@ -587,14 +641,22 @@ fn handle_webview_bridge_request(
             // JS bridge calls injectAttachments → execCommand('paste').
             if !attachments.is_empty() {
                 let _clip_ok = write_first_png_to_clipboard(attachments);
-                agent_debug_log("H1", "clipboard write", serde_json::json!({ "ok": _clip_ok }));
+                agent_debug_log(
+                    "H1",
+                    "clipboard write",
+                    serde_json::json!({ "ok": _clip_ok }),
+                );
             } else {
                 // For text-only sends, stage the full prompt through a temp file
                 // and copy it to the system clipboard before the browser bridge
                 // runs. The injected JS pastes once, verifies the full text, and
                 // refuses to send if the provider editor only accepted part of it.
                 let _clip_ok = write_text_prompt_to_clipboard(&parsed.prompt);
-                agent_debug_log("H1", "prompt clipboard write", serde_json::json!({ "ok": _clip_ok, "promptLen": parsed.prompt.len() }));
+                agent_debug_log(
+                    "H1",
+                    "prompt clipboard write",
+                    serde_json::json!({ "ok": _clip_ok, "promptLen": parsed.prompt.len() }),
+                );
             }
 
             // Lock already acquired at the top of /v1/send handler (#33)
@@ -607,7 +669,11 @@ fn handle_webview_bridge_request(
             // For image sends, keep the provider webview frontmost & key so the
             // native_paste Cmd+V lands in its focused editor — do NOT restore the
             // user's previous frontmost app until the paste is done.
-            let saved_frontmost = if has_image_attachment { None } else { save_frontmost_app() };
+            let saved_frontmost = if has_image_attachment {
+                None
+            } else {
+                save_frontmost_app()
+            };
 
             if let Err(e) = window.eval(&bridge_call) {
                 respond_json(
@@ -641,9 +707,8 @@ fn handle_webview_bridge_request(
             let timeout = Duration::from_secs(5);
 
             let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
-            let (notify_lock, condvar) = WEBVIEW_BRIDGE_NOTIFY.get_or_init(|| {
-                (StdMutex::new(()), Condvar::new())
-            });
+            let (notify_lock, condvar) =
+                WEBVIEW_BRIDGE_NOTIFY.get_or_init(|| (StdMutex::new(()), Condvar::new()));
 
             if let Ok(mut guard) = notify_lock.lock() {
                 while start.elapsed() < timeout {
@@ -681,61 +746,70 @@ fn handle_webview_bridge_request(
         // kimctl routes
         // ---------------------------------------------------------------
         (Method::Get, "/v1/status") => {
-            let has_running_task = {
-                let store = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None));
-                if let Ok(guard) = store.lock() {
-                    guard.map(process_exists).unwrap_or(false)
-                } else {
-                    false
+            let (has_running_task, active_session_id) = tauri::async_runtime::block_on(async {
+                let mut rt = crate::task_runtime::task_runtime().lock().await;
+                match rt.pid {
+                    Some(pid) if process_exists(pid) => (true, rt.session_id.clone()),
+                    Some(_) => {
+                        rt.clear();
+                        (false, None)
+                    }
+                    None => (false, None),
                 }
-            };
-            let active_session_id = {
-                let store = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None));
-                if let Ok(guard) = store.lock() {
-                    guard.clone()
-                } else {
-                    None
-                }
-            };
+            });
             let browser_visible = app_handle
                 .get_webview_window("kim-browser-signin")
                 .map(|w| w.is_visible().unwrap_or(false))
                 .unwrap_or(false);
-            respond_json(request, 200, serde_json::json!({
-                "ok": true,
-                "has_running_task": has_running_task,
-                "active_session_id": active_session_id,
-                "browser_visible": browser_visible,
-            }));
+            respond_json(
+                request,
+                200,
+                serde_json::json!({
+                    "ok": true,
+                    "has_running_task": has_running_task,
+                    "active_session_id": active_session_id,
+                    "browser_visible": browser_visible,
+                }),
+            );
         }
         (Method::Get, "/v1/browser/current-url") => {
             let current_url = app_handle
                 .get_webview_window("kim-browser-signin")
                 .map(|w| webview_current_href(&w))
                 .filter(|u| !u.trim().is_empty());
-            respond_json(request, 200, serde_json::json!({
-                "ok": true,
-                "url": current_url,
-            }));
+            respond_json(
+                request,
+                200,
+                serde_json::json!({
+                    "ok": true,
+                    "url": current_url,
+                }),
+            );
         }
         (Method::Get, "/v1/browser/meta") => {
             let raw_url = request.url().to_string();
             let Some(session_id) = query_param(&raw_url, "session_id") else {
-                respond_json(request, 400, serde_json::json!({"ok": false, "error": "session_id is required."}));
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": "session_id is required."}),
+                );
                 return;
             };
             if let Err(e) = validate_session_id(&session_id) {
                 respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
                 return;
             }
-            let session_type = query_param(&raw_url, "session_type").unwrap_or_else(|| "kim".to_string());
+            let session_type =
+                query_param(&raw_url, "session_type").unwrap_or_else(|| "kim".to_string());
             let session_date = query_param(&raw_url, "session_date");
             let kim_dir = query_param(&raw_url, "kim_dir");
             let codex_dir = query_param(&raw_url, "codex_dir");
             let base = session_base_dir(&session_type, kim_dir, codex_dir);
             match resolve_session_date_dir(&base, &session_id, session_date.as_deref()) {
                 Ok(date_dir) => {
-                    let meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
+                    let meta = read_browser_session_meta_from_dir(&date_dir, &session_id)
+                        .unwrap_or_default();
                     respond_json(request, 200, serde_json::json!({"ok": true, "meta": meta}));
                 }
                 Err(e) => respond_json(request, 400, serde_json::json!({"ok": false, "error": e})),
@@ -744,7 +818,11 @@ fn handle_webview_bridge_request(
         (Method::Post, "/v1/browser/meta") => {
             let mut body = String::new();
             if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
+                );
                 return;
             }
 
@@ -772,7 +850,11 @@ fn handle_webview_bridge_request(
             let parsed: BrowserMetaWriteRequest = match serde_json::from_str(&body) {
                 Ok(v) => v,
                 Err(e) => {
-                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
+                    );
                     return;
                 }
             };
@@ -783,14 +865,19 @@ fn handle_webview_bridge_request(
 
             let stype = parsed.session_type.unwrap_or_else(|| "kim".to_string());
             let base = session_base_dir(&stype, parsed.kim_dir, parsed.codex_dir);
-            let date_dir = match resolve_session_date_dir(&base, &parsed.session_id, parsed.session_date.as_deref()) {
+            let date_dir = match resolve_session_date_dir(
+                &base,
+                &parsed.session_id,
+                parsed.session_date.as_deref(),
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
                     return;
                 }
             };
-            let mut meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id).unwrap_or_default();
+            let mut meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id)
+                .unwrap_or_default();
 
             if let Err(e) = apply_browser_meta_writes(
                 &mut meta,
@@ -811,7 +898,11 @@ fn handle_webview_bridge_request(
         (Method::Post, "/v1/browser/commit-url") => {
             let mut body = String::new();
             if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
+                );
                 return;
             }
 
@@ -833,7 +924,11 @@ fn handle_webview_bridge_request(
             let parsed: BrowserCommitRequest = match serde_json::from_str(&body) {
                 Ok(v) => v,
                 Err(e) => {
-                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
+                    );
                     return;
                 }
             };
@@ -843,11 +938,16 @@ fn handle_webview_bridge_request(
             }
 
             let Some(win) = app_handle.get_webview_window("kim-browser-signin") else {
-                respond_json(request, 200, serde_json::json!({"ok": true, "committed": false, "reason": "no_browser_window"}));
+                respond_json(
+                    request,
+                    200,
+                    serde_json::json!({"ok": true, "committed": false, "reason": "no_browser_window"}),
+                );
                 return;
             };
             let current_url = webview_current_href(&win);
-            let site = parsed.preferred_site
+            let site = parsed
+                .preferred_site
                 .as_deref()
                 .map(normalize_site)
                 .filter(|s| !s.is_empty())
@@ -856,21 +956,30 @@ fn handle_webview_bridge_request(
 
             let stype = parsed.session_type.unwrap_or_else(|| "kim".to_string());
             let base = session_base_dir(&stype, parsed.kim_dir, parsed.codex_dir);
-            let date_dir = match resolve_session_date_dir(&base, &parsed.session_id, parsed.session_date.as_deref()) {
+            let date_dir = match resolve_session_date_dir(
+                &base,
+                &parsed.session_id,
+                parsed.session_date.as_deref(),
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
                     return;
                 }
             };
-            let mut meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id).unwrap_or_default();
+            let mut meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id)
+                .unwrap_or_default();
 
             if browser_url_is_bad_for_commit(&current_url, &site) {
                 // Preserve any useful previous URL; only update the last-site hint.
                 meta.browser_last_site = Some(site);
                 meta.browser_threads_updated_at_ms = Some(now_ms());
                 let _ = write_browser_session_meta_to_dir(&date_dir, &parsed.session_id, &meta);
-                respond_json(request, 200, serde_json::json!({"ok": true, "committed": false, "reason": "ignored_bad_url", "meta": meta}));
+                respond_json(
+                    request,
+                    200,
+                    serde_json::json!({"ok": true, "committed": false, "reason": "ignored_bad_url", "meta": meta}),
+                );
                 return;
             }
 
@@ -878,14 +987,22 @@ fn handle_webview_bridge_request(
             meta.browser_last_site = Some(site);
             meta.browser_threads_updated_at_ms = Some(now_ms());
             match write_browser_session_meta_to_dir(&date_dir, &parsed.session_id, &meta) {
-                Ok(()) => respond_json(request, 200, serde_json::json!({"ok": true, "committed": true, "meta": meta})),
+                Ok(()) => respond_json(
+                    request,
+                    200,
+                    serde_json::json!({"ok": true, "committed": true, "meta": meta}),
+                ),
                 Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": e})),
             }
         }
         (Method::Post, "/v1/browser/restore") => {
             let mut body = String::new();
             if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
+                );
                 return;
             }
 
@@ -907,7 +1024,11 @@ fn handle_webview_bridge_request(
             let parsed: BrowserRestoreRequest = match serde_json::from_str(&body) {
                 Ok(v) => v,
                 Err(e) => {
-                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
+                    );
                     return;
                 }
             };
@@ -916,24 +1037,34 @@ fn handle_webview_bridge_request(
                 return;
             }
             if is_bridge_task_running() {
-                respond_json(request, 409, serde_json::json!({
-                    "ok": false,
-                    "error": "Cannot restore provider browser while Kim is running a task.",
-                }));
+                respond_json(
+                    request,
+                    409,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "Cannot restore provider browser while Kim is running a task.",
+                    }),
+                );
                 return;
             }
 
             let stype = parsed.session_type.unwrap_or_else(|| "kim".to_string());
             let base = session_base_dir(&stype, parsed.kim_dir, parsed.codex_dir);
-            let date_dir = match resolve_session_date_dir(&base, &parsed.session_id, parsed.session_date.as_deref()) {
+            let date_dir = match resolve_session_date_dir(
+                &base,
+                &parsed.session_id,
+                parsed.session_date.as_deref(),
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
                     return;
                 }
             };
-            let meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id).unwrap_or_default();
-            let site = parsed.preferred_site
+            let meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id)
+                .unwrap_or_default();
+            let site = parsed
+                .preferred_site
                 .as_deref()
                 .map(normalize_site)
                 .filter(|s| !s.is_empty())
@@ -958,7 +1089,12 @@ fn handle_webview_bridge_request(
 
             let provider_name = Some(format!("{} (session)", capitalize(&site)));
             // Match the Tauri-command path: chat-select restores happen invisibly.
-            match open_browser_signin_window_with_visibility(&target, provider_name, false, &app_handle) {
+            match open_browser_signin_window_with_visibility(
+                &target,
+                provider_name,
+                false,
+                &app_handle,
+            ) {
                 Ok(_) => {
                     let message = if restored {
                         "Restored the saved browser conversation for this session."
@@ -967,24 +1103,36 @@ fn handle_webview_bridge_request(
                     } else {
                         "No saved browser conversation for this provider; opened the provider start page."
                     };
-                    respond_json(request, 200, serde_json::json!({
-                        "ok": true,
-                        "result": BrowserRestoreResult {
-                            restored,
-                            site,
-                            url: target,
-                            reason,
-                            message: Some(message.to_string()),
-                        },
-                    }));
+                    respond_json(
+                        request,
+                        200,
+                        serde_json::json!({
+                            "ok": true,
+                            "result": BrowserRestoreResult {
+                                restored,
+                                site,
+                                url: target,
+                                reason,
+                                message: Some(message.to_string()),
+                            },
+                        }),
+                    );
                 }
-                Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": format!("{}", e)})),
+                Err(e) => respond_json(
+                    request,
+                    500,
+                    serde_json::json!({"ok": false, "error": format!("{}", e)}),
+                ),
             }
         }
         (Method::Post, "/v1/task") => {
             let mut body = String::new();
             if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
+                );
                 return;
             }
 
@@ -1004,54 +1152,62 @@ fn handle_webview_bridge_request(
             let parsed: TaskRequest = match serde_json::from_str(&body) {
                 Ok(v) => v,
                 Err(e) => {
-                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
+                    );
                     return;
                 }
             };
 
             if parsed.task.trim().is_empty() {
-                respond_json(request, 400, serde_json::json!({"ok": false, "error": "Task cannot be empty."}));
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": "Task cannot be empty."}),
+                );
                 return;
             }
 
-            // Reject if a task is already running.
-            // The atomic BRIDGE_TASK_STARTING flag closes the TOCTOU window between
-            // the process_exists check and the spawn (#17).
-            let was_starting = BRIDGE_TASK_STARTING.swap(true, Ordering::AcqRel);
-            if was_starting {
-                respond_json(request, 409, serde_json::json!({
-                    "ok": false,
-                    "error": "A task is already starting. Try again in a moment.",
-                }));
-                return;
-            }
-            {
-                let store = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None));
-                if let Ok(guard) = store.lock() {
-                    if let Some(pid) = *guard {
-                        if process_exists(pid) {
-                            BRIDGE_TASK_STARTING.store(false, Ordering::Release);
-                            respond_json(request, 409, serde_json::json!({
-                                "ok": false,
-                                "error": "A task is already running. Cancel it first.",
-                            }));
-                            return;
-                        }
+            // Reject if a task is already running or starting.
+            let reserve_result = tauri::async_runtime::block_on(async {
+                let mut rt = crate::task_runtime::task_runtime().lock().await;
+                if let Some(pid) = rt.pid {
+                    if process_exists(pid) {
+                        return Err("A task is already running. Cancel it first.".to_string());
                     }
+                    rt.clear();
                 }
+                rt.reserve()
+                    .map_err(|_| "A task is already starting. Try again in a moment.".to_string())
+            });
+            if let Err(error) = reserve_result {
+                respond_json(
+                    request,
+                    409,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": error,
+                    }),
+                );
+                return;
             }
 
             let kim_root = default_project_root();
             let python = match find_python_interpreter(&kim_root) {
                 Ok(p) => p,
                 Err(e) => {
-                    BRIDGE_TASK_STARTING.store(false, Ordering::Release);
+                    tauri::async_runtime::block_on(async {
+                        crate::task_runtime::task_runtime().lock().await.release();
+                    });
                     respond_json(request, 500, serde_json::json!({"ok": false, "error": e}));
                     return;
                 }
             };
 
-            let session_id = parsed.session_id
+            let session_id = parsed
+                .session_id
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| {
                     let ts = std::time::SystemTime::now()
@@ -1059,10 +1215,15 @@ fn handle_webview_bridge_request(
                         .unwrap_or_default()
                         .as_millis() as u64;
                     let counter = WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    format!("{:04x}{:04x}", (ts & 0xFFFF) as u16, (counter & 0xFFFF) as u16)
+                    format!(
+                        "{:04x}{:04x}",
+                        (ts & 0xFFFF) as u16,
+                        (counter & 0xFFFF) as u16
+                    )
                 });
             let session_dir = kim_root.join("kim_sessions");
-            let provider = parsed.provider
+            let provider = parsed
+                .provider
                 .filter(|s| !s.trim().is_empty() && s != "desktop")
                 .unwrap_or_else(|| "browser".to_string());
 
@@ -1074,7 +1235,13 @@ fn handle_webview_bridge_request(
             let run_id = {
                 let sess_safe: String = session_id
                     .chars()
-                    .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+                    .map(|ch| {
+                        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                            ch
+                        } else {
+                            '_'
+                        }
+                    })
                     .collect();
                 format!(
                     "{}-{}",
@@ -1101,10 +1268,10 @@ fn handle_webview_bridge_request(
                 .arg("--provider")
                 .arg(&provider)
                 .current_dir(&kim_root)
-                .env("KIM_RUN_ID", &run_id)  // matches subprocess.rs (#16)
+                .env("KIM_RUN_ID", &run_id) // matches subprocess.rs (#16)
                 .env("PROJECT_ROOT", kim_root.to_str().unwrap_or(""))
                 .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
-                .stdin(std::process::Stdio::piped())   // required for HITL approval (#15)
+                .stdin(std::process::Stdio::piped()) // required for HITL approval (#15)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit());
             // Own process group so a later /v1/cancel (kill -TERM -<pid>) reaps the whole
@@ -1116,7 +1283,10 @@ fn handle_webview_bridge_request(
                 cmd.process_group(0);
             }
 
-            if let Ok(guard) = KIM_PREFERRED_SITE.get_or_init(|| StdMutex::new(None)).lock() {
+            if let Ok(guard) = KIM_PREFERRED_SITE
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+            {
                 if let Some(site) = &*guard {
                     cmd.env("KIM_PREFERRED_SITE", site);
                 }
@@ -1138,32 +1308,41 @@ fn handle_webview_bridge_request(
             // Also set KIM_TAURI_MODE=1 so StdinApprovalBridge is auto-wired.
             cmd.env("KIM_TAURI_MODE", "1");
             match parsed.permission_mode.as_deref().unwrap_or("full_auto") {
-                "ask_risky" => { cmd.env("KIM_HITL_RISK_THRESHOLD", "high"); }
-                "ask_always" => { cmd.env("KIM_HITL_RISK_THRESHOLD", "medium"); }
+                "ask_risky" => {
+                    cmd.env("KIM_HITL_RISK_THRESHOLD", "high");
+                }
+                "ask_always" => {
+                    cmd.env("KIM_HITL_RISK_THRESHOLD", "medium");
+                }
                 _ => {} // full_auto or unknown: no threshold = no HITL gate
             }
 
             if provider == "browser" || provider.starts_with("browser:") {
-                let restore_status = browser_restore_status_for_session(
-                    &session_dir,
-                    Some(&session_id),
-                    &provider,
-                );
+                let restore_status =
+                    browser_restore_status_for_session(&session_dir, Some(&session_id), &provider);
                 cmd.env("KIM_BROWSER_RESTORE_STATUS", restore_status);
             }
 
             if provider.trim().eq_ignore_ascii_case("gemini") {
-                let google_env = match tauri::async_runtime::block_on(google_oauth::google_oauth_env_for_agent()) {
+                let google_env = match tauri::async_runtime::block_on(
+                    google_oauth::google_oauth_env_for_agent(),
+                ) {
                     Ok(value) => value,
                     Err(err) => {
-                        BRIDGE_TASK_STARTING.store(false, Ordering::Release);
-                        respond_json(request, 400, serde_json::json!({
-                            "ok": false,
-                            "error": format!(
-                                "Google for Kim is not connected. Open Settings → Account → Google for Kim (API), then Continue with Google. {}",
-                                err
-                            ),
-                        }));
+                        tauri::async_runtime::block_on(async {
+                            crate::task_runtime::task_runtime().lock().await.release();
+                        });
+                        respond_json(
+                            request,
+                            400,
+                            serde_json::json!({
+                                "ok": false,
+                                "error": format!(
+                                    "Google for Kim is not connected. Open Settings → Account → Google for Kim (API), then Continue with Google. {}",
+                                    err
+                                ),
+                            }),
+                        );
                         return;
                     }
                 };
@@ -1175,30 +1354,24 @@ fn handle_webview_bridge_request(
             match cmd.spawn() {
                 Ok(mut child) => {
                     let child_pid = child.id();
-                    // Store PID and clear the "starting" guard (#17) atomically:
-                    // the PID is visible before we release the guard so future
-                    // callers see the running process rather than a brief window
-                    // where both the PID slot and the starting flag are clear.
-                    if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
-                        *guard = Some(child_pid);
-                    }
-                    BRIDGE_TASK_STARTING.store(false, Ordering::Release);
-                    // Store session ID
-                    if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
-                        *guard = Some(session_id.clone());
-                    }
-                    // Store stdin handle for HITL approval forwarding (#15).
-                    // /v1/task/approve writes {"type":"hitl_approve","approved":bool}
-                    // to this handle so the Python StdinApprovalBridge receives it.
-                    if let Ok(mut guard) = BRIDGE_TASK_STDIN.get_or_init(|| StdMutex::new(None)).lock() {
-                        *guard = child.stdin.take();
-                    }
+                    tauri::async_runtime::block_on(async {
+                        let mut rt = crate::task_runtime::task_runtime().lock().await;
+                        rt.store_pid(
+                            child_pid,
+                            session_id.clone(),
+                            crate::task_runtime::SpawnSource::Bridge,
+                        );
+                        rt.bridge_stdin = child.stdin.take();
+                    });
 
                     // Emit event so the desktop UI knows a task started
-                    let _ = app_handle.emit("kim-agent-started", serde_json::json!({
-                        "session_id": session_id,
-                        "source": "kimctl",
-                    }));
+                    let _ = app_handle.emit(
+                        "kim-agent-started",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "source": "kimctl",
+                        }),
+                    );
 
                     // Background thread: read stdout to capture SCREENSHOT_FLASH and emit to UI
                     let reader_handle = if let Some(stdout) = child.stdout.take() {
@@ -1217,27 +1390,20 @@ fn handle_webview_bridge_request(
                     // Background thread: wait for child to exit, then clear PID
                     let app_for_wait = app_handle.clone();
                     std::thread::spawn(move || {
-                    let mut child = child;
+                        let mut child = child;
                         let status = child.wait();
                         let success = status.as_ref().map(|s| s.success()).unwrap_or(false);
                         if let Some(handle) = reader_handle {
                             let _ = handle.join();
                         }
-                        if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
-                            *guard = None;
-                        }
-                        if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
-                            *guard = None;
-                        }
-                        // Drop the stdin handle so further /v1/task/approve calls
-                        // get a "no task running" error rather than hanging.
-                        if let Ok(mut guard) = BRIDGE_TASK_STDIN.get_or_init(|| StdMutex::new(None)).lock() {
-                            *guard = None;
-                        }
+                        tauri::async_runtime::block_on(async {
+                            crate::task_runtime::task_runtime().lock().await.clear();
+                        });
                         if let Some(cancel_win) = app_for_wait.get_webview_window("cancel-widget") {
                             let _ = cancel_win.close();
                         }
-                        if let Some(flash_win) = app_for_wait.get_webview_window("screenshot-flash") {
+                        if let Some(flash_win) = app_for_wait.get_webview_window("screenshot-flash")
+                        {
                             let _ = flash_win.close();
                         }
                         if let Some(main_win) = app_for_wait.get_webview_window("main") {
@@ -1247,44 +1413,52 @@ fn handle_webview_bridge_request(
                         let _ = app_for_wait.emit("kim-agent-done", success);
                     });
 
-                    respond_json(request, 200, serde_json::json!({
-                        "ok": true,
-                        "session_id": session_id,
-                        "sessions_dir": session_dir.to_string_lossy(),
-                    }));
+                    respond_json(
+                        request,
+                        200,
+                        serde_json::json!({
+                            "ok": true,
+                            "session_id": session_id,
+                            "sessions_dir": session_dir.to_string_lossy(),
+                        }),
+                    );
                 }
                 Err(e) => {
-                    // Clear the starting guard on spawn failure (#17).
-                    BRIDGE_TASK_STARTING.store(false, Ordering::Release);
-                    respond_json(request, 500, serde_json::json!({
-                        "ok": false,
-                        "error": format!("Failed to start agent: {}", e),
-                    }));
+                    tauri::async_runtime::block_on(async {
+                        crate::task_runtime::task_runtime().lock().await.release();
+                    });
+                    respond_json(
+                        request,
+                        500,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("Failed to start agent: {}", e),
+                        }),
+                    );
                 }
             }
         }
         (Method::Post, "/v1/cancel") => {
-            let pid = {
-                let store = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None));
-                if let Ok(guard) = store.lock() {
-                    *guard
-                } else {
-                    None
-                }
-            };
+            let pid = tauri::async_runtime::block_on(async {
+                let rt = crate::task_runtime::task_runtime().lock().await;
+                rt.pid
+            });
 
             match pid {
                 Some(pid) if process_exists(pid) => {
                     match send_signal(pid, false) {
                         Ok(()) => {
-                            if let Some(cancel_win) = app_handle.get_webview_window("cancel-widget") {
+                            if let Some(cancel_win) = app_handle.get_webview_window("cancel-widget")
+                            {
                                 let _ = cancel_win.close();
                             }
                             if let Some(main_win) = app_handle.get_webview_window("main") {
                                 let _ = main_win.show();
                                 let _ = main_win.set_focus();
                             }
-                            if let Some(flash_win) = app_handle.get_webview_window("screenshot-flash") {
+                            if let Some(flash_win) =
+                                app_handle.get_webview_window("screenshot-flash")
+                            {
                                 let _ = flash_win.close();
                             }
                             // Background cleanup: wait 2s then force-kill if alive
@@ -1298,28 +1472,40 @@ fn handle_webview_bridge_request(
                                 if process_exists(pid) {
                                     let _ = send_signal(pid, true);
                                 }
-                                if let Ok(mut guard) = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None)).lock() {
-                                    *guard = None;
-                                }
-                                if let Ok(mut guard) = BRIDGE_TASK_SESSION.get_or_init(|| StdMutex::new(None)).lock() {
-                                    *guard = None;
-                                }
+                                tauri::async_runtime::block_on(async {
+                                    crate::task_runtime::task_runtime().lock().await.clear();
+                                });
                             });
-                            respond_json(request, 200, serde_json::json!({"ok": true, "message": "Cancelling task."}));
+                            respond_json(
+                                request,
+                                200,
+                                serde_json::json!({"ok": true, "message": "Cancelling task."}),
+                            );
                         }
                         Err(e) => {
-                            respond_json(request, 500, serde_json::json!({
-                                "ok": false,
-                                "error": format!("Failed to send stop signal: {}", e),
-                            }));
+                            respond_json(
+                                request,
+                                500,
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error": format!("Failed to send stop signal: {}", e),
+                                }),
+                            );
                         }
                     }
                 }
                 _ => {
-                    respond_json(request, 200, serde_json::json!({
-                        "ok": true,
-                        "message": "No task is currently running.",
-                    }));
+                    tauri::async_runtime::block_on(async {
+                        crate::task_runtime::task_runtime().lock().await.clear();
+                    });
+                    respond_json(
+                        request,
+                        200,
+                        serde_json::json!({
+                            "ok": true,
+                            "message": "No task is currently running.",
+                        }),
+                    );
                 }
             }
         }
@@ -1329,7 +1515,11 @@ fn handle_webview_bridge_request(
         (Method::Post, "/v1/task/approve") => {
             let mut body = String::new();
             if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
+                );
                 return;
             }
             #[derive(Deserialize)]
@@ -1339,7 +1529,11 @@ fn handle_webview_bridge_request(
             let parsed: ApproveRequest = match serde_json::from_str(&body) {
                 Ok(v) => v,
                 Err(e) => {
-                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
+                    );
                     return;
                 }
             };
@@ -1347,31 +1541,28 @@ fn handle_webview_bridge_request(
                 "{}\n",
                 serde_json::json!({"type": "hitl_approve", "approved": parsed.approved})
             );
-            let guard = BRIDGE_TASK_STDIN.get_or_init(|| StdMutex::new(None));
-            match guard.lock() {
-                Ok(mut opt) => {
-                    if let Some(ref mut stdin) = *opt {
-                        use std::io::Write as _;
-                        match stdin.write_all(payload.as_bytes()) {
-                            Ok(_) => {
-                                let _ = stdin.flush();
-                                respond_json(request, 200, serde_json::json!({"ok": true}));
-                            }
-                            Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": format!("stdin write failed: {}", e)})),
-                        }
-                    } else {
-                        respond_json(request, 409, serde_json::json!({"ok": false, "error": "No task running or task has no piped stdin"}));
-                    }
-                }
-                Err(_) => respond_json(request, 500, serde_json::json!({"ok": false, "error": "Internal lock error"})),
+            let result = tauri::async_runtime::block_on(async {
+                let mut rt = crate::task_runtime::task_runtime().lock().await;
+                rt.write_stdin_line(&payload).await
+            });
+            match result {
+                Ok(()) => respond_json(request, 200, serde_json::json!({"ok": true})),
+                Err(e) => respond_json(request, 409, serde_json::json!({"ok": false, "error": e})),
             }
         }
         (Method::Post, "/v1/browser/show") => {
-            if app_handle.get_webview_window("kim-browser-signin").is_some() {
+            if app_handle
+                .get_webview_window("kim-browser-signin")
+                .is_some()
+            {
                 show_browser_window_impl(&app_handle);
                 respond_json(request, 200, serde_json::json!({"ok": true}));
             } else {
-                respond_json(request, 200, serde_json::json!({"ok": false, "message": "No browser window exists yet."}));
+                respond_json(
+                    request,
+                    200,
+                    serde_json::json!({"ok": false, "message": "No browser window exists yet."}),
+                );
             }
         }
         (Method::Post, "/v1/browser/hide") => {
@@ -1383,7 +1574,11 @@ fn handle_webview_bridge_request(
         (Method::Post, "/v1/browser/click") => {
             let mut body = String::new();
             if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
+                );
                 return;
             }
 
@@ -1395,30 +1590,47 @@ fn handle_webview_bridge_request(
             let parsed: ClickRequest = match serde_json::from_str(&body) {
                 Ok(v) => v,
                 Err(e) => {
-                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
+                    );
                     return;
                 }
             };
 
             if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
-                let selector_json = serde_json::to_string(&parsed.selector).unwrap_or_else(|_| "\"\"".to_string());
+                let selector_json =
+                    serde_json::to_string(&parsed.selector).unwrap_or_else(|_| "\"\"".to_string());
                 let js = format!(
                     "(() => {{ const el = document.querySelector({}); if (el) {{ el.click(); return true; }} return false; }})()",
                     selector_json
                 );
                 match win.eval(&js) {
                     Ok(()) => {
-                        respond_json(request, 200, serde_json::json!({"ok": true, "clicked": true}));
+                        respond_json(
+                            request,
+                            200,
+                            serde_json::json!({"ok": true, "clicked": true}),
+                        );
                     }
                     Err(e) => {
-                        respond_json(request, 500, serde_json::json!({
-                            "ok": false,
-                            "error": format!("eval failed: {}", e),
-                        }));
+                        respond_json(
+                            request,
+                            500,
+                            serde_json::json!({
+                                "ok": false,
+                                "error": format!("eval failed: {}", e),
+                            }),
+                        );
                     }
                 }
             } else {
-                respond_json(request, 200, serde_json::json!({"ok": false, "clicked": false, "error": "No browser window."}));
+                respond_json(
+                    request,
+                    200,
+                    serde_json::json!({"ok": false, "clicked": false, "error": "No browser window."}),
+                );
             }
         }
         (Method::Post, "/v1/browser/new-chat") => {
@@ -1470,19 +1682,31 @@ fn handle_webview_bridge_request(
                 })()"#;
                 match win.eval(js) {
                     Ok(()) => respond_json(request, 200, serde_json::json!({"ok": true})),
-                    Err(e) => respond_json(request, 500, serde_json::json!({
-                        "ok": false,
-                        "error": format!("eval failed: {}", e),
-                    })),
+                    Err(e) => respond_json(
+                        request,
+                        500,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("eval failed: {}", e),
+                        }),
+                    ),
                 }
             } else {
-                respond_json(request, 200, serde_json::json!({"ok": false, "error": "No browser window."}));
+                respond_json(
+                    request,
+                    200,
+                    serde_json::json!({"ok": false, "error": "No browser window."}),
+                );
             }
         }
         (Method::Post, "/v1/provider") => {
             let mut body = String::new();
             if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}));
+                respond_json(
+                    request,
+                    400,
+                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
+                );
                 return;
             }
 
@@ -1494,13 +1718,20 @@ fn handle_webview_bridge_request(
             let parsed: ProviderRequest = match serde_json::from_str(&body) {
                 Ok(v) => v,
                 Err(e) => {
-                    respond_json(request, 400, serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}));
+                    respond_json(
+                        request,
+                        400,
+                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
+                    );
                     return;
                 }
             };
 
             let site = normalize_site(&parsed.site);
-            if let Ok(mut guard) = KIM_PREFERRED_SITE.get_or_init(|| StdMutex::new(None)).lock() {
+            if let Ok(mut guard) = KIM_PREFERRED_SITE
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+            {
                 *guard = Some(site.clone());
             }
             let url = default_site_url(&site);
@@ -1539,10 +1770,18 @@ fn handle_webview_bridge_request(
                 match open_browser_signin_window_impl(url, Some(site.clone()), &app_handle) {
                     Ok(_) => {
                         show_browser_window_impl(&app_handle);
-                        respond_json(request, 200, serde_json::json!({"ok": true, "site": site.clone(), "opened": true}));
+                        respond_json(
+                            request,
+                            200,
+                            serde_json::json!({"ok": true, "site": site.clone(), "opened": true}),
+                        );
                     }
                     Err(e) => {
-                        respond_json(request, 500, serde_json::json!({"ok": false, "error": format!("{}", e)}));
+                        respond_json(
+                            request,
+                            500,
+                            serde_json::json!({"ok": false, "error": format!("{}", e)}),
+                        );
                     }
                 }
             }
@@ -1557,8 +1796,6 @@ fn handle_webview_bridge_request(
     }
 }
 
-
-
 fn handle_bridge_result_request(
     request: Request,
     path: &str,
@@ -1567,32 +1804,43 @@ fn handle_bridge_result_request(
 ) {
     let req_id = path.trim_start_matches("/v1/result/").to_string();
     if req_id.is_empty() {
-        respond_json(request, 400, serde_json::json!({"ok": false, "error": "Missing req_id"}));
+        respond_json(
+            request,
+            400,
+            serde_json::json!({"ok": false, "error": "Missing req_id"}),
+        );
         return;
     }
 
     let window = if let Some(w) = app_handle.get_webview_window("kim-browser-signin") {
         w
     } else {
-        respond_json(request, 500, serde_json::json!({"ok": false, "error": "Browser window closed."}));
+        respond_json(
+            request,
+            500,
+            serde_json::json!({"ok": false, "error": "Browser window closed."}),
+        );
         return;
     };
 
-    agent_debug_log("H1", "result collector start (persistent bridge)", serde_json::json!({
-        "reqId": req_id,
-    }));
+    agent_debug_log(
+        "H1",
+        "result collector start (persistent bridge)",
+        serde_json::json!({
+            "reqId": req_id,
+        }),
+    );
 
     let app_config = app_handle.state::<crate::config::AppConfig>();
     let timeout_secs = app_config.bridge_timeout_secs;
 
-    let result = collect_bridge_payload(
-        &window,
-        &req_id,
-        Duration::from_secs(timeout_secs),
-    );
+    let result = collect_bridge_payload(&window, &req_id, Duration::from_secs(timeout_secs));
 
     let mut should_hide = false;
-    if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
+    if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN
+        .get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+        .lock()
+    {
         should_hide = guard.remove(&req_id);
     }
     if should_hide {
@@ -1602,30 +1850,41 @@ fn handle_bridge_result_request(
     match result {
         Ok(payload) => {
             if payload.ok {
-                respond_json(request, 200, serde_json::json!({
-                    "ok": true,
-                    "response": payload.response,
-                    "site": payload.site.unwrap_or_else(|| "unknown".to_string()),
-                    "req_id": req_id,
-                }));
+                respond_json(
+                    request,
+                    200,
+                    serde_json::json!({
+                        "ok": true,
+                        "response": payload.response,
+                        "site": payload.site.unwrap_or_else(|| "unknown".to_string()),
+                        "req_id": req_id,
+                    }),
+                );
             } else {
-                respond_json(request, 500, serde_json::json!({
-                    "ok": false,
-                    "error": payload.error.unwrap_or_else(|| "Unknown bridge error".to_string()),
-                    "req_id": req_id,
-                }));
+                respond_json(
+                    request,
+                    500,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": payload.error.unwrap_or_else(|| "Unknown bridge error".to_string()),
+                        "req_id": req_id,
+                    }),
+                );
             }
         }
         Err(e) => {
-            respond_json(request, 504, serde_json::json!({
-                "ok": false,
-                "error": e,
-                "req_id": req_id,
-            }));
+            respond_json(
+                request,
+                504,
+                serde_json::json!({
+                    "ok": false,
+                    "error": e,
+                    "req_id": req_id,
+                }),
+            );
         }
     }
 }
-
 
 pub(crate) fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
@@ -1677,9 +1936,16 @@ pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Resul
         if let Ok(content) = std::fs::read_to_string(env_path) {
             for line in content.lines() {
                 if line.starts_with("KIM_API_KEY=") || line.starts_with("RELAY_API_KEY=") {
-                    token = line.split_once('=').map(|x| x.1).unwrap_or("").trim().to_string();
-                    if (token.starts_with('"') && token.ends_with('"') && token.len() >= 2) || (token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2) {
-                        token = token[1..token.len()-1].to_string();
+                    token = line
+                        .split_once('=')
+                        .map(|x| x.1)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if (token.starts_with('"') && token.ends_with('"') && token.len() >= 2)
+                        || (token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2)
+                    {
+                        token = token[1..token.len() - 1].to_string();
                     }
                     if !token.is_empty() {
                         break;
@@ -1724,8 +1990,7 @@ pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Resul
     std::thread::spawn(move || {
         eprintln!(
             "[Kim] In-app browser bridge listening at {} (mode=sentinel_v1, timeout={}s)",
-            base_url,
-            timeout_secs,
+            base_url, timeout_secs,
         );
         for request in server.incoming_requests() {
             let app = app_handle.clone();

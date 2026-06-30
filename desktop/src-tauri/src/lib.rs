@@ -1,34 +1,34 @@
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
-use base64::Engine as _;
-use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
-mod google_oauth;
 pub mod account;
-pub mod secrets;
+pub mod browser_bridge;
+mod codex_bridge;
 pub mod codex_projects;
+pub mod config;
 pub mod data_io;
 pub mod feedback;
+mod google_oauth;
+pub(crate) mod http_bridge;
 pub mod ollama;
+pub mod provider_auth;
 pub mod relay;
 pub mod run_history;
 pub mod schedule_commands;
 mod scheduler;
-mod speed_access;
-pub mod session_commands;
-pub mod voice_config;
-pub mod config;
-pub(crate) mod http_bridge;
-pub mod browser_bridge;
 mod screenshot_flash;
-mod codex_bridge;
-pub mod provider_auth;
+pub mod secrets;
+pub mod session_commands;
+mod speed_access;
+pub mod voice_config;
 pub(crate) use browser_bridge::*;
 mod paths;
 pub(crate) use paths::*;
@@ -38,14 +38,15 @@ mod provider_url;
 pub(crate) use provider_url::*;
 mod http_util;
 pub(crate) use http_util::*;
+pub(crate) mod task_runtime;
 
 // Re-export commonly used types/helpers from submodules so remaining lib.rs
 // code (session listing, run history, codex file-bridge) can use them unqualified.
+use codex_bridge::start_bridge_file_watcher;
 use codex_projects::{mirror_latest_claw_session_to_codex, newest_codex_session};
 use http_bridge::{capitalize, start_webview_bridge_server};
-use codex_bridge::start_bridge_file_watcher;
-use screenshot_flash::show_screenshot_flash;
 use ollama::ollama_tags;
+use screenshot_flash::show_screenshot_flash;
 
 // ---------------------------------------------------------------------------
 // Shared state — currently running agent child (for cancellation)
@@ -127,7 +128,7 @@ struct BridgeCallbackRequest {
 /// IPC event payload sent from the persistent JS bridge via Tauri emit.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct BridgeIpcEvent {
-    event: String,     // "sent" | "done" | "error" | "progress"
+    event: String, // "sent" | "done" | "error" | "progress"
     req_id: String,
     #[serde(default)]
     response: Option<String>,
@@ -148,12 +149,8 @@ static IPC_LISTENER_REGISTERED: OnceLock<()> = OnceLock::new();
 static WEBVIEW_BRIDGE_CFG: OnceLock<WebviewBridgeConfig> = OnceLock::new();
 static WEBVIEW_BRIDGE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WEBVIEW_BRIDGE_REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
-/// Atomic "task is starting" guard to close the TOCTOU window between the
-/// already-running check and the spawn (#17).  Set to true before spawning,
-/// cleared after the PID is stored or on spawn failure.
-static BRIDGE_TASK_STARTING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static WEBVIEW_BRIDGE_RESULTS: OnceLock<StdMutex<HashMap<String, BridgeCompleteResponse>>> = OnceLock::new();
+static WEBVIEW_BRIDGE_RESULTS: OnceLock<StdMutex<HashMap<String, BridgeCompleteResponse>>> =
+    OnceLock::new();
 static WEBVIEW_BRIDGE_PROGRESS: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
 /// Condvar notified whenever a result is inserted into WEBVIEW_BRIDGE_RESULTS.
 /// Collectors wait on this instead of polling every 150ms.
@@ -167,13 +164,6 @@ static WEBVIEW_NAV_READY: OnceLock<(StdMutex<bool>, Condvar)> = OnceLock::new();
 static WEBVIEW_WAS_HIDDEN: OnceLock<StdMutex<std::collections::HashSet<String>>> = OnceLock::new();
 /// Debug/testing mode: keep the provider webview visible while sending.
 static WEBVIEW_KEEP_VISIBLE: OnceLock<StdMutex<bool>> = OnceLock::new();
-/// PID of the currently-running agent subprocess, accessible from both the
-/// sync bridge thread (/v1/task, /v1/cancel) and the async Tauri commands.
-static BRIDGE_TASK_PID: OnceLock<StdMutex<Option<u32>>> = OnceLock::new();
-/// Session ID of the currently-running agent task (set by /v1/task or send_task).
-static BRIDGE_TASK_SESSION: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
-/// Stdin handle for the /v1/task agent process; written by /v1/task/approve for HITL (#15).
-static BRIDGE_TASK_STDIN: OnceLock<StdMutex<Option<std::process::ChildStdin>>> = OnceLock::new();
 /// The site selected via /v1/provider, to be passed to the next agent spawn.
 static KIM_PREFERRED_SITE: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
 /// Last Gemini authuser index intentionally loaded in the in-app browser.
@@ -223,7 +213,6 @@ pub struct CompletedCodexSession {
     pub project_path: String,
 }
 
-
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct BrowserSessionMeta {
     #[serde(default)]
@@ -271,7 +260,6 @@ fn command_exists(cmd: &str) -> bool {
         .is_ok()
 }
 
-
 fn clear_provider_webview_chat(
     window: &tauri::WebviewWindow,
     site: &str,
@@ -308,17 +296,17 @@ fn clear_provider_webview_chat(
 }
 
 fn is_bridge_task_running() -> bool {
-    let store = BRIDGE_TASK_PID.get_or_init(|| StdMutex::new(None));
-    let Ok(mut guard) = store.lock() else { return false };
-    match *guard {
-        Some(pid) if process_exists(pid) => true,
-        Some(_) => {
-            // Process exited but PID was never cleared — clean it up
-            *guard = None;
-            false
+    tauri::async_runtime::block_on(async {
+        let mut rt = crate::task_runtime::task_runtime().lock().await;
+        match rt.pid {
+            Some(pid) if process_exists(pid) => true,
+            Some(_) => {
+                rt.clear();
+                false
+            }
+            None => false,
         }
-        None => false,
-    }
+    })
 }
 
 fn should_keep_browser_visible() -> bool {
@@ -400,7 +388,8 @@ fn prepare_gemini_webview(window: &tauri::WebviewWindow, authuser: Option<u32>, 
             let _ = window.eval(format!("window.location.href = {};", js_url));
             // Same condvar-based wait as clear_provider_webview_chat (#10):
             // wakes early on bridge readiness, falls back to 3 500 ms.
-            let (lock, cvar) = WEBVIEW_NAV_READY.get_or_init(|| (StdMutex::new(false), Condvar::new()));
+            let (lock, cvar) =
+                WEBVIEW_NAV_READY.get_or_init(|| (StdMutex::new(false), Condvar::new()));
             if let Ok(mut ready) = lock.lock() {
                 *ready = false;
                 let _result = cvar.wait_timeout_while(ready, Duration::from_millis(3500), |r| !*r);
@@ -473,7 +462,9 @@ fn schedule_frontmost_restore(bundle_id: String) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn save_frontmost_app() -> Option<String> { None }
+fn save_frontmost_app() -> Option<String> {
+    None
+}
 
 #[cfg(not(target_os = "macos"))]
 fn schedule_frontmost_restore(_bundle_id: String) {}
@@ -512,7 +503,11 @@ fn write_first_png_to_clipboard(attachments: &[BridgeAttachment]) -> bool {
         (std::time::SystemTime::now(), std::process::id()).hash(&mut h);
         format!("{:016x}", h.finish())
     };
-    let temp_path = format!("{}/kim_clip_{}.png", std::env::temp_dir().display(), rand_hex);
+    let temp_path = format!(
+        "{}/kim_clip_{}.png",
+        std::env::temp_dir().display(),
+        rand_hex
+    );
     // Set permissions to 0600 immediately after creation.
     {
         use std::io::Write;
@@ -647,8 +642,12 @@ fn hide_browser_window_offscreen(win: &tauri::WebviewWindow) {
 /// `hide_browser_window_offscreen`.  `is_visible()` always returns true
 /// because we never call `win.hide()`, so we check position/size instead.
 fn is_browser_window_offscreen(win: &tauri::WebviewWindow) -> bool {
-    let pos = win.outer_position().unwrap_or(tauri::PhysicalPosition::new(0, 0));
-    let size = win.outer_size().unwrap_or(tauri::PhysicalSize::new(100, 100));
+    let pos = win
+        .outer_position()
+        .unwrap_or(tauri::PhysicalPosition::new(0, 0));
+    let size = win
+        .outer_size()
+        .unwrap_or(tauri::PhysicalSize::new(100, 100));
     pos.x <= -9000 || pos.y <= -9000 || (size.width <= 1 && size.height <= 1)
 }
 
@@ -677,17 +676,19 @@ fn show_browser_window_impl(app_handle: &tauri::AppHandle) {
 
 #[tauri::command]
 async fn show_browser_window(app_handle: tauri::AppHandle) -> Result<(), String> {
-    if app_handle.get_webview_window("kim-browser-signin").is_some() {
+    if app_handle
+        .get_webview_window("kim-browser-signin")
+        .is_some()
+    {
         show_browser_window_impl(&app_handle);
         Ok(())
     } else {
         Err("No Kim browser window is open yet. Open a browser provider first.".to_string())
-
     }
 }
 
 pub(crate) mod window_manager;
-pub(crate) use window_manager::{show_main_window, set_task_active_mode};
+pub(crate) use window_manager::{set_task_active_mode, show_main_window};
 pub(crate) mod updater;
 
 #[tauri::command]
@@ -724,13 +725,7 @@ async fn session_browser_meta_write(
     let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
     let mut meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
 
-    apply_browser_meta_writes(
-        &mut meta,
-        browser_last_site,
-        site,
-        url,
-        last_llm_provider,
-    )?;
+    apply_browser_meta_writes(&mut meta, browser_last_site, site, url, last_llm_provider)?;
     write_browser_session_meta_to_dir(&date_dir, &session_id, &meta)?;
     Ok(meta)
 }
@@ -747,7 +742,14 @@ async fn session_browser_url_commit(
 ) -> Result<BrowserSessionMeta, String> {
     validate_session_id(&session_id)?;
     let Some(win) = app_handle.get_webview_window("kim-browser-signin") else {
-        return session_browser_meta_read(session_id, session_date, session_type, kim_dir, codex_dir).await;
+        return session_browser_meta_read(
+            session_id,
+            session_date,
+            session_type,
+            kim_dir,
+            codex_dir,
+        )
+        .await;
     };
     let current_url = webview_current_href(&win);
     let site = preferred_site
@@ -763,7 +765,8 @@ async fn session_browser_url_commit(
         let stype = session_type.clone().unwrap_or_else(|| "kim".to_string());
         let base = session_base_dir(&stype, kim_dir, codex_dir);
         let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
-        let mut meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
+        let mut meta =
+            read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
         if meta.browser_last_site.as_deref() != Some(site.as_str()) {
             meta.browser_last_site = Some(site);
             meta.browser_threads_updated_at_ms = Some(now_ms());
@@ -782,7 +785,8 @@ async fn session_browser_url_commit(
         None,
         kim_dir,
         codex_dir,
-    ).await
+    )
+    .await
 }
 
 #[tauri::command]
@@ -837,9 +841,15 @@ async fn restore_browser_for_session(
     let message = if restored {
         Some("Restored the saved browser conversation for this session.".to_string())
     } else if meta.browser_threads.contains_key(&site) {
-        Some("Saved browser URL was no longer safe/valid, so Kim opened a fresh provider page.".to_string())
+        Some(
+            "Saved browser URL was no longer safe/valid, so Kim opened a fresh provider page."
+                .to_string(),
+        )
     } else {
-        Some("No saved browser conversation for this provider; opened the provider start page.".to_string())
+        Some(
+            "No saved browser conversation for this provider; opened the provider start page."
+                .to_string(),
+        )
     };
 
     Ok(BrowserRestoreResult {
@@ -891,7 +901,10 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
     ];
     #[cfg(target_os = "linux")]
     let candidates: &[&str] = &[
-        "google-chrome", "google-chrome-stable", "chromium-browser", "chromium",
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium-browser",
+        "chromium",
     ];
     #[cfg(target_os = "windows")]
     let candidates: &[&str] = &[
@@ -952,7 +965,9 @@ fn read_env_file_var(kim_root: &Path, key: &str) -> Option<String> {
     let prefix = format!("{}=", key);
     for raw in content.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         if let Some(rest) = line.strip_prefix(&prefix) {
             let mut v = rest.trim().to_string();
             if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
@@ -960,7 +975,9 @@ fn read_env_file_var(kim_root: &Path, key: &str) -> Option<String> {
             {
                 v = v[1..v.len() - 1].to_string();
             }
-            if !v.is_empty() { return Some(v); }
+            if !v.is_empty() {
+                return Some(v);
+            }
         }
     }
     None
@@ -1001,13 +1018,24 @@ pub(crate) async fn selected_ollama_codex_model(
             .filter(|s| !s.is_empty())
             .unwrap_or("http://localhost:11434");
         if let Ok(models) = ollama_tags(base).await {
-            if let Some(first) = models.first().map(|m| m.name.trim()).filter(|m| !m.is_empty()) {
+            if let Some(first) = models
+                .first()
+                .map(|m| m.name.trim())
+                .filter(|m| !m.is_empty())
+            {
                 return Ok(first.to_string());
             }
         }
-        return Err("Pick or pull an Ollama local model before running Codex with Ollama Local.".to_string());
+        return Err(
+            "Pick or pull an Ollama local model before running Codex with Ollama Local."
+                .to_string(),
+        );
     }
-    let fallback = config.default_model.get("ollama").map(|s| s.as_str()).unwrap_or("gpt-oss:120b-cloud");
+    let fallback = config
+        .default_model
+        .get("ollama")
+        .map(|s| s.as_str())
+        .unwrap_or("gpt-oss:120b-cloud");
     Ok(cloud_model
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -1035,35 +1063,50 @@ pub(crate) async fn configure_codex_direct_provider(
                 ollama_local_model,
                 ollama_cloud_model,
                 config,
-            ).await?;
-            cmd.arg("--model").arg(&model)
+            )
+            .await?;
+            cmd.arg("--model")
+                .arg(&model)
                 .env("OPENAI_BASE_URL", ollama_openai_base_url(ollama_base_url))
                 // Required by OpenAI-compatible clients; ignored by Ollama.
                 .env("OPENAI_API_KEY", "ollama");
             Ok(format!("Ollama via local daemon ({model})"))
         }
         "openai" => {
-            let key = read_env_file_var(kim_root, "OPENAI_API_KEY")
-                .ok_or_else(|| "Codex with OpenAI needs OPENAI_API_KEY in the environment or Kim's .env.".to_string())?;
-            let fallback = config.default_model.get("openai").map(|s| s.as_str()).unwrap_or("openai/gpt-4o");
+            let key = read_env_file_var(kim_root, "OPENAI_API_KEY").ok_or_else(|| {
+                "Codex with OpenAI needs OPENAI_API_KEY in the environment or Kim's .env."
+                    .to_string()
+            })?;
+            let fallback = config
+                .default_model
+                .get("openai")
+                .map(|s| s.as_str())
+                .unwrap_or("openai/gpt-4o");
             let model = read_first_env_file_var(kim_root, &["CODEX_OPENAI_MODEL", "OPENAI_MODEL"])
                 .unwrap_or_else(|| fallback.to_string());
-            cmd.arg("--model").arg(&model)
-                .env("OPENAI_API_KEY", key);
+            cmd.arg("--model").arg(&model).env("OPENAI_API_KEY", key);
             if let Some(base) = read_env_file_var(kim_root, "OPENAI_BASE_URL") {
                 cmd.env("OPENAI_BASE_URL", base);
             }
             Ok(format!("OpenAI-compatible API ({model})"))
         }
         "deepseek" => {
-            let key = read_env_file_var(kim_root, "DEEPSEEK_API_KEY")
-                .ok_or_else(|| "Codex with DeepSeek needs DEEPSEEK_API_KEY in the environment or Kim's .env.".to_string())?;
-            let fallback = config.default_model.get("deepseek").map(|s| s.as_str()).unwrap_or("deepseek-chat");
-            let model = read_first_env_file_var(kim_root, &["CODEX_DEEPSEEK_MODEL", "DEEPSEEK_MODEL"])
-                .unwrap_or_else(|| fallback.to_string());
+            let key = read_env_file_var(kim_root, "DEEPSEEK_API_KEY").ok_or_else(|| {
+                "Codex with DeepSeek needs DEEPSEEK_API_KEY in the environment or Kim's .env."
+                    .to_string()
+            })?;
+            let fallback = config
+                .default_model
+                .get("deepseek")
+                .map(|s| s.as_str())
+                .unwrap_or("deepseek-chat");
+            let model =
+                read_first_env_file_var(kim_root, &["CODEX_DEEPSEEK_MODEL", "DEEPSEEK_MODEL"])
+                    .unwrap_or_else(|| fallback.to_string());
             let base = read_env_file_var(kim_root, "DEEPSEEK_BASE_URL")
                 .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
-            cmd.arg("--model").arg(&model)
+            cmd.arg("--model")
+                .arg(&model)
                 .env("OPENAI_API_KEY", key)
                 .env("OPENAI_BASE_URL", base);
             Ok(format!("DeepSeek API ({model})"))
@@ -1071,12 +1114,18 @@ pub(crate) async fn configure_codex_direct_provider(
         "gemini" => {
             let key = read_env_file_var(kim_root, "GOOGLE_API_KEY")
                 .ok_or_else(|| "Codex with Gemini direct API needs GOOGLE_API_KEY in the environment or Kim's .env. Kim's Google OAuth token is only wired into the Chat provider path.".to_string())?;
-            let fallback = config.default_model.get("gemini").map(|s| s.as_str()).unwrap_or("gemini-2.0-flash");
+            let fallback = config
+                .default_model
+                .get("gemini")
+                .map(|s| s.as_str())
+                .unwrap_or("gemini-2.0-flash");
             let model = read_first_env_file_var(kim_root, &["CODEX_GEMINI_MODEL", "GEMINI_MODEL"])
                 .unwrap_or_else(|| fallback.to_string());
-            let base = read_env_file_var(kim_root, "GEMINI_OPENAI_BASE_URL")
-                .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta/openai".to_string());
-            cmd.arg("--model").arg(&model)
+            let base = read_env_file_var(kim_root, "GEMINI_OPENAI_BASE_URL").unwrap_or_else(|| {
+                "https://generativelanguage.googleapis.com/v1beta/openai".to_string()
+            });
+            cmd.arg("--model")
+                .arg(&model)
                 .env("OPENAI_API_KEY", key)
                 .env("OPENAI_BASE_URL", base);
             Ok(format!("Gemini OpenAI-compatible API ({model})"))
@@ -1085,7 +1134,13 @@ pub(crate) async fn configure_codex_direct_provider(
             let key = read_first_env_file_var(kim_root, &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"])
                 .ok_or_else(|| "Codex needs an Anthropic API key for Claude direct mode. Add ANTHROPIC_API_KEY to Kim's .env, or switch the provider dropdown to Ollama/Browser.".to_string())?;
             cmd.env("ANTHROPIC_API_KEY", key);
-            for key in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CODEX_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
+            for key in [
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CODEX_MODEL",
+                "CLAUDE_MODEL",
+                "ANTHROPIC_MODEL",
+            ] {
                 if let Some(value) = read_env_file_var(kim_root, key) {
                     cmd.env(key, value);
                 }
@@ -1096,7 +1151,10 @@ pub(crate) async fn configure_codex_direct_provider(
 }
 
 pub(crate) mod subprocess;
-pub(crate) use subprocess::{find_python_interpreter, send_task, cancel_task, hitl_respond_approval, steer_task, process_exists, send_signal};
+pub(crate) use subprocess::{
+    cancel_task, find_python_interpreter, hitl_respond_approval, process_exists, send_signal,
+    send_task, steer_task,
+};
 
 // ---------------------------------------------------------------------------
 // Voice config (config.yaml — voice:/enabled, voice:/engine, voice:/voice_id)
@@ -1292,7 +1350,11 @@ mod tests {
         ]);
         let msgs = parse_jsonl(&path).unwrap();
         // Only the two role-bearing chat lines should be parsed.
-        assert_eq!(msgs.len(), 2, "trace records must be skipped, not treated as errors");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "trace records must be skipped, not treated as errors"
+        );
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
         let _ = std::fs::remove_file(path);
@@ -1350,12 +1412,24 @@ mod tests {
     #[test]
     fn host_matches_site_grok_excludes_xcom() {
         // x.com is Twitter's root domain — must NOT match grok (#9).
-        assert!(!host_matches_site("x.com", "grok"), "x.com must not match grok");
+        assert!(
+            !host_matches_site("x.com", "grok"),
+            "x.com must not match grok"
+        );
         // www. prefix should be stripped, still not match.
-        assert!(!host_matches_site("www.x.com", "grok"), "www.x.com must not match grok");
+        assert!(
+            !host_matches_site("www.x.com", "grok"),
+            "www.x.com must not match grok"
+        );
         // Canonical Grok hosts must match.
-        assert!(host_matches_site("grok.com", "grok"), "grok.com must match grok");
-        assert!(host_matches_site("grok.x.com", "grok"), "grok.x.com must match grok");
+        assert!(
+            host_matches_site("grok.com", "grok"),
+            "grok.com must match grok"
+        );
+        assert!(
+            host_matches_site("grok.x.com", "grok"),
+            "grok.x.com must match grok"
+        );
     }
 
     #[test]
