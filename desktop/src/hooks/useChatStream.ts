@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import type { ActivityItem, PendingTask, HitlApprovalStatus } from '../components/chat/types';
+import type { ActivityItem, PendingTask, HitlApprovalStatus, LivePlanParsed } from '../components/chat/types';
 import type { SessionInfo, Settings } from '../types';
 import { parseAgentLine, buildThinkingTrace } from '../components/chat/parsers';
 import { parsePlanFromActivity, browserSiteFromProvider } from '../components/chat/utils';
@@ -83,6 +83,8 @@ export function useChatStream({
   const [rateLimitedState, setRateLimitedState] = useState<{ delay: number; attempt: number; max_retries: number } | null>(null);
   // K1: checkpoint run id emitted by Rust at spawn — used by the revert action.
   const [lastRunId, setLastRunId] = useState<string | null>(null);
+  const [typedStatus, setTypedStatus] = useState('');
+  const [typedLivePlan, setTypedLivePlan] = useState<LivePlanParsed | null>(null);
   // Fix 4: promote to state so consumers re-render when cancel status changes
   const [isCancelled, setIsCancelled] = useState(false);
 
@@ -210,6 +212,8 @@ export function useChatStream({
     }
     activityRef.current = [];
     setActivity([]);
+    setTypedStatus('');
+    setTypedLivePlan(null);
   }, []);
 
   // Clean activity timer on unmount
@@ -350,12 +354,46 @@ export function useChatStream({
     let unlistenTypedRateLimited: (() => void) | undefined;
     let unlistenTypedHitlRequest: (() => void) | undefined;
     let unlistenTypedHitlResult: (() => void) | undefined;
+    let unlistenTypedStatus: (() => void) | undefined;
+    let unlistenTypedPlan: (() => void) | undefined;
+    let unlistenTypedStep: (() => void) | undefined;
+    let unlistenTypedDone: (() => void) | undefined;
     let unlistenRunId: (() => void) | undefined;
 
-    // Typed IPC listeners (kim:* events). Post-V-1, activity/plan/step state is
-    // derived from the legacy kim-agent-output stream via parsePlanFromActivity,
-    // so kim:status/plan/step/done carried no extra state — those four no-op
-    // listeners were removed (B10). The typed listeners below DO own state.
+    // Typed IPC listeners (kim:* events). The live plan/status UI now prefers
+    // these typed events first; the legacy stdout parser remains only as a
+    // compatibility fallback for older non-typed streams.
+    listen<{ message: string }>('kim:status', e => {
+      setTypedStatus(e.payload.message);
+    }).then(fn => { if (!cancelled) unlistenTypedStatus = fn; else fn(); });
+
+    listen<{ steps: unknown[] }>('kim:plan', e => {
+      const steps = e.payload.steps.filter((step): step is string => typeof step === 'string').slice(0, 12);
+      if (steps.length < 2) return;
+      setTypedLivePlan({ steps, activeStep: 0, doneSteps: [], structured: true });
+    }).then(fn => { if (!cancelled) unlistenTypedPlan = fn; else fn(); });
+
+    listen<{ n: number; data: Record<string, unknown> }>('kim:step', e => {
+      setTypedLivePlan(prev => {
+        if (!prev) return prev;
+        const activeStep = Math.max(0, Math.min(e.payload.n, prev.steps.length));
+        if (activeStep === prev.activeStep) return prev;
+        return { ...prev, activeStep };
+      });
+    }).then(fn => { if (!cancelled) unlistenTypedStep = fn; else fn(); });
+
+    listen<{ n: number }>('kim:done', e => {
+      setTypedLivePlan(prev => {
+        if (!prev) return prev;
+        const doneSteps = prev.doneSteps.includes(e.payload.n)
+          ? prev.doneSteps
+          : [...prev.doneSteps, e.payload.n].sort((a, b) => a - b);
+        const activeStep = Math.max(prev.activeStep, e.payload.n);
+        if (activeStep === prev.activeStep && doneSteps.length === prev.doneSteps.length) return prev;
+        return { ...prev, activeStep, doneSteps };
+      });
+    }).then(fn => { if (!cancelled) unlistenTypedDone = fn; else fn(); });
+
     listen<{
       cumulative_input: number;
       budget: number;
@@ -569,6 +607,10 @@ export function useChatStream({
       unlistenTypedRateLimited?.();
       unlistenTypedHitlRequest?.();
       unlistenTypedHitlResult?.();
+      unlistenTypedStatus?.();
+      unlistenTypedPlan?.();
+      unlistenTypedStep?.();
+      unlistenTypedDone?.();
       unlistenRunId?.();
     };
     // commitCurrentBrowserUrl intentionally omitted — accessed via ref so this effect
@@ -576,11 +618,11 @@ export function useChatStream({
   }, [appendRaw, flushActivityNow, clearActivityNow, setMessageReloadNonce]);
 
   // Derived state to satisfy Prompt 8 explicit signature
-  const traceItems = buildThinkingTrace(activity, parsePlanFromActivity(activity));
-  const livePlan = parsePlanFromActivity(activity);
+  const livePlan = typedLivePlan ?? parsePlanFromActivity(activity);
+  const traceItems = buildThinkingTrace(activity, livePlan);
   const planSteps = livePlan?.steps ?? [];
   const activityEntries = activity;
-  const lastStatus = activity.filter(a => a.kind === 'status').slice(-1)[0]?.text ?? '';
+  const lastStatus = typedStatus || (activity.filter(a => a.kind === 'status').slice(-1)[0]?.text ?? '');
   const contextUsage = contextState?.percent ?? 0;
   const isDone = !isRunning;
   // isCancelled is now proper state (Fix 4) — declared above with useState
