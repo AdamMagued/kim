@@ -88,11 +88,17 @@ impl AgentGoogleOAuthEnv {
         } else {
             "oauth"
         };
-        
+
         let mut env = vec![
             ("KIM_GEMINI_AUTH_MODE".to_string(), auth_mode.to_string()),
-            ("KIM_GOOGLE_ACCESS_TOKEN".to_string(), self.access_token.clone()),
-            ("KIM_GOOGLE_ACCESS_TOKEN_EXPIRES_AT".to_string(), self.expires_at.to_string()),
+            (
+                "KIM_GOOGLE_ACCESS_TOKEN".to_string(),
+                self.access_token.clone(),
+            ),
+            (
+                "KIM_GOOGLE_ACCESS_TOKEN_EXPIRES_AT".to_string(),
+                self.expires_at.to_string(),
+            ),
         ];
         if let Some(project_id) = &self.project_id {
             env.push(("KIM_GOOGLE_USER_PROJECT_ID".to_string(), project_id.clone()));
@@ -113,7 +119,9 @@ fn oauth_client_id() -> Result<String, String> {
         .map(str::to_string)
         .or_else(|| std::env::var("KIM_GOOGLE_OAUTH_CLIENT_ID").ok())
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| "KIM_GOOGLE_OAUTH_CLIENT_ID is not configured for this Kim build.".to_string())
+        .ok_or_else(|| {
+            "KIM_GOOGLE_OAUTH_CLIENT_ID is not configured for this Kim build.".to_string()
+        })
 }
 
 fn quota_project() -> Option<String> {
@@ -128,16 +136,19 @@ fn oauth_scopes() -> Vec<String> {
     std::env::var("KIM_GOOGLE_OAUTH_SCOPES")
         .ok()
         .map(|raw| raw.split_whitespace().map(str::to_string).collect())
-        .unwrap_or_else(|| vec![
-            "openid".to_string(),
-            "email".to_string(),
-            "profile".to_string(),
-            GEMINI_SCOPE.to_string(),
-        ])
+        .unwrap_or_else(|| {
+            vec![
+                "openid".to_string(),
+                "email".to_string(),
+                "profile".to_string(),
+                GEMINI_SCOPE.to_string(),
+            ]
+        })
 }
 
 fn keyring_entry() -> Result<Entry, String> {
-    Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(|e| format!("Could not open OS secure storage: {e}"))
+    Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .map_err(|e| format!("Could not open OS secure storage: {e}"))
 }
 
 fn read_secret() -> Result<Option<GoogleOAuthSecret>, String> {
@@ -147,21 +158,27 @@ fn read_secret() -> Result<Option<GoogleOAuthSecret>, String> {
             .map(Some)
             .map_err(|e| format!("Stored Google token metadata is invalid: {e}")),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("Could not read Google token from OS secure storage: {e}")),
+        Err(e) => Err(format!(
+            "Could not read Google token from OS secure storage: {e}"
+        )),
     }
 }
 
 fn write_secret(secret: &GoogleOAuthSecret) -> Result<(), String> {
     let entry = keyring_entry()?;
     let raw = serde_json::to_string(secret).map_err(|e| e.to_string())?;
-    entry.set_password(&raw).map_err(|e| format!("Could not save Google token to OS secure storage: {e}"))
+    entry
+        .set_password(&raw)
+        .map_err(|e| format!("Could not save Google token to OS secure storage: {e}"))
 }
 
 fn delete_secret() -> Result<(), String> {
     let entry = keyring_entry()?;
     match entry.delete_password() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("Could not remove Google token from OS secure storage: {e}")),
+        Err(e) => Err(format!(
+            "Could not remove Google token from OS secure storage: {e}"
+        )),
     }
 }
 
@@ -198,7 +215,10 @@ fn system_open_url(url: &str) -> Result<(), String> {
         .ok_or_else(|| "Could not open Google sign-in in your browser.".to_string())
 }
 
-fn wait_for_loopback_callback(listener: TcpListener, expected_state: String) -> Result<String, String> {
+fn wait_for_loopback_callback(
+    listener: TcpListener,
+    expected_state: String,
+) -> Result<String, String> {
     // Set a 5-minute timeout so abandoning consent doesn't block the thread forever.
     const TIMEOUT: Duration = Duration::from_secs(300);
     listener
@@ -226,7 +246,9 @@ fn wait_for_loopback_callback(listener: TcpListener, expected_state: String) -> 
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| format!("OAuth callback stream setup failed: {e}"))?;
     let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf).map_err(|e| format!("OAuth callback read failed: {e}"))?;
+    let n = stream
+        .read(&mut buf)
+        .map_err(|e| format!("OAuth callback read failed: {e}"))?;
     let request = String::from_utf8_lossy(&buf[..n]);
     let first_line = request.lines().next().unwrap_or_default();
     let path = first_line
@@ -256,7 +278,11 @@ fn wait_for_loopback_callback(listener: TcpListener, expected_state: String) -> 
         .ok_or_else(|| "Google sign-in did not return an authorization code.".to_string())
 }
 
-async fn exchange_code_for_token(code: &str, redirect_uri: &str, verifier: &str) -> Result<TokenResponse, String> {
+async fn exchange_code_for_token(
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<TokenResponse, String> {
     let client_id = oauth_client_id()?;
     let form = vec![
         ("client_id", client_id),
@@ -351,13 +377,15 @@ pub async fn google_oauth_start() -> Result<GoogleOAuthStatus, String> {
     let verifier = random_string(96);
     let challenge = code_challenge(&verifier);
     let state = random_string(48);
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("Could not start OAuth callback server: {e}"))?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("Could not start OAuth callback server: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let scopes = oauth_scopes();
 
     let mut auth_url = Url::parse(GOOGLE_AUTH_URL).map_err(|e| e.to_string())?;
-    auth_url.query_pairs_mut()
+    auth_url
+        .query_pairs_mut()
         .append_pair("client_id", &client_id)
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("response_type", "code")
@@ -369,9 +397,10 @@ pub async fn google_oauth_start() -> Result<GoogleOAuthStatus, String> {
         .append_pair("prompt", "consent");
 
     system_open_url(auth_url.as_str())?;
-    let code = tauri::async_runtime::spawn_blocking(move || wait_for_loopback_callback(listener, state))
-        .await
-        .map_err(|e| format!("OAuth callback task failed: {e}"))??;
+    let code =
+        tauri::async_runtime::spawn_blocking(move || wait_for_loopback_callback(listener, state))
+            .await
+            .map_err(|e| format!("OAuth callback task failed: {e}"))??;
     let token = exchange_code_for_token(&code, &redirect_uri, &verifier).await?;
     let refresh_token = token.refresh_token.clone().or_else(|| read_secret().ok().flatten().map(|s| s.refresh_token))
         .ok_or_else(|| "Google did not return a refresh token. Disconnect/reconnect and approve offline access.".to_string())?;
@@ -385,7 +414,12 @@ pub async fn google_oauth_start() -> Result<GoogleOAuthStatus, String> {
         refresh_token,
         email: email.clone(),
         project_id: quota_project(),
-        scopes: token.scope.unwrap_or_else(|| scopes.join(" ")).split_whitespace().map(str::to_string).collect(),
+        scopes: token
+            .scope
+            .unwrap_or_else(|| scopes.join(" "))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
         connected_at: now_epoch(),
     };
     write_secret(&secret)?;
@@ -409,7 +443,9 @@ pub async fn google_oauth_disconnect() -> Result<(), String> {
 pub async fn google_oauth_test() -> Result<GoogleOAuthStatus, String> {
     let secret = read_secret()?.ok_or_else(|| "Google for Kim is not connected.".to_string())?;
     let env = google_oauth_env_for_agent().await?;
-    let mut req = Client::new().get(GEMINI_MODELS_URL).bearer_auth(&env.access_token);
+    let mut req = Client::new()
+        .get(GEMINI_MODELS_URL)
+        .bearer_auth(&env.access_token);
     if let Some(project) = &env.project_id {
         req = req.header("x-goog-user-project", project);
     }
@@ -428,4 +464,3 @@ pub async fn google_oauth_test() -> Result<GoogleOAuthStatus, String> {
         error: None,
     })
 }
-

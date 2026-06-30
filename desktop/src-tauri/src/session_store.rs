@@ -1,11 +1,11 @@
 // session_store.rs — on-disk session store helpers.
 // Extracted from lib.rs (file-split restructure) — behavior unchanged.
 
+use crate::*;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use crate::*;
 
 /// Validate that a user-supplied `session_id` is a safe file-stem:
 /// no path separators, no `..`, printable ASCII-ish. Prevents a caller
@@ -38,7 +38,10 @@ pub(crate) fn browser_session_meta_filename(session_id: &str) -> String {
     format!("{}.browser.json", session_id)
 }
 
-pub(crate) fn read_browser_session_meta_from_dir(date_dir: &Path, session_id: &str) -> Option<BrowserSessionMeta> {
+pub(crate) fn read_browser_session_meta_from_dir(
+    date_dir: &Path,
+    session_id: &str,
+) -> Option<BrowserSessionMeta> {
     let path = date_dir.join(browser_session_meta_filename(session_id));
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str::<BrowserSessionMeta>(&raw).ok()
@@ -90,7 +93,11 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn session_base_dir(session_type: &str, kim_dir: Option<String>, codex_dir: Option<String>) -> PathBuf {
+pub(crate) fn session_base_dir(
+    session_type: &str,
+    kim_dir: Option<String>,
+    codex_dir: Option<String>,
+) -> PathBuf {
     let raw = if session_type == "codex" {
         codex_dir.map(PathBuf::from)
     } else {
@@ -145,7 +152,13 @@ pub(crate) fn resolve_session_date_dir(
             .map(|e| e.path())
             .filter(|p| p.is_dir())
             .collect();
-        date_dirs.sort_by_key(|p| std::cmp::Reverse(p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()));
+        date_dirs.sort_by_key(|p| {
+            std::cmp::Reverse(
+                p.file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            )
+        });
         for dir in date_dirs {
             if dir.join(format!("{}.jsonl", session_id)).exists()
                 || dir.join(browser_session_meta_filename(session_id)).exists()
@@ -161,7 +174,10 @@ pub(crate) fn resolve_session_date_dir(
     Ok(base.join(today))
 }
 
-pub(crate) fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<Vec<SessionInfo>, String> {
+pub(crate) fn read_sessions_from_dir(
+    base: &Path,
+    session_type: &str,
+) -> Result<Vec<SessionInfo>, String> {
     if !base.exists() {
         return Ok(vec![]);
     }
@@ -212,14 +228,16 @@ pub(crate) fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<
             let message_count = count_lines(&session_file).unwrap_or(0);
             let mut title = infer_session_title(&session_file, summary.as_ref(), &session_id);
             // K4: merge the user meta sidecar (title override + pin).
-            let (meta_title, pinned) = crate::session_commands::read_session_meta(&date_dir, &session_id);
+            let (meta_title, pinned) =
+                crate::session_commands::read_session_meta(&date_dir, &session_id);
             if let Some(t) = meta_title {
                 if !t.trim().is_empty() {
                     title = t;
                 }
             }
 
-            let browser_meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
+            let browser_meta =
+                read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
             let BrowserSessionMeta {
                 browser_threads,
                 browser_last_site,
@@ -236,7 +254,11 @@ pub(crate) fn read_sessions_from_dir(base: &Path, session_type: &str) -> Result<
                 summary,
                 session_type: session_type.to_string(),
                 pinned,
-                browser_threads: if browser_threads.is_empty() { None } else { Some(browser_threads) },
+                browser_threads: if browser_threads.is_empty() {
+                    None
+                } else {
+                    Some(browser_threads)
+                },
                 browser_last_site,
                 browser_threads_updated_at_ms,
                 last_llm_provider,
@@ -252,11 +274,7 @@ pub(crate) fn count_lines(path: &Path) -> std::io::Result<usize> {
     let reader = BufReader::new(file);
     Ok(reader
         .lines()
-        .filter(|l| {
-            l.as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        })
+        .filter(|l| l.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false))
         .count())
 }
 
@@ -388,7 +406,11 @@ pub(crate) fn extract_title_from_content(content: &serde_json::Value) -> Option<
     }
 }
 
-pub(crate) fn infer_session_title(session_file: &Path, summary: Option<&String>, session_id: &str) -> String {
+pub(crate) fn infer_session_title(
+    session_file: &Path,
+    summary: Option<&String>,
+    session_id: &str,
+) -> String {
     if let Ok(file) = fs::File::open(session_file) {
         let reader = BufReader::new(file);
         for line in reader.lines().map_while(Result::ok).take(80) {
@@ -412,7 +434,8 @@ pub(crate) fn infer_session_title(session_file: &Path, summary: Option<&String>,
                 let message = value.get("message").unwrap_or(&serde_json::Value::Null);
                 let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
                 if role == "user" {
-                    if let Some(content) = message.get("blocks").or_else(|| message.get("content")) {
+                    if let Some(content) = message.get("blocks").or_else(|| message.get("content"))
+                    {
                         if let Some(title) = extract_title_from_content(content) {
                             return title;
                         }

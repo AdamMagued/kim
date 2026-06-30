@@ -4,10 +4,10 @@
 //! Public Tauri commands: `read_relay_config`, `write_relay_url`,
 //! `relay_pair_init`, `relay_pair_status`.
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
-use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RelayConfig {
@@ -120,7 +120,10 @@ pub(crate) fn read_pc_api_key(project_root: Option<String>) -> String {
         for line in contents.lines() {
             let line = line.trim();
             if let Some(rest) = line.strip_prefix("RELAY_PC_API_KEY=") {
-                return rest.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                return rest
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string();
             }
         }
     }
@@ -139,7 +142,10 @@ pub async fn read_relay_config(project_root: Option<String>) -> Result<RelayConf
         String::new()
     };
     let pc_key_configured = !read_pc_api_key(project_root).is_empty();
-    Ok(RelayConfig { url, pc_key_configured })
+    Ok(RelayConfig {
+        url,
+        pc_key_configured,
+    })
 }
 
 #[tauri::command]
@@ -232,16 +238,19 @@ pub async fn relay_pair_init(project_root: Option<String>) -> Result<RelayPairIn
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("Relay /pair/init returned {}: {}", status.as_u16(), text));
+        return Err(format!(
+            "Relay /pair/init returned {}: {}",
+            status.as_u16(),
+            text
+        ));
     }
     #[derive(Deserialize)]
     struct Body {
         pair_code: String,
         expires_at: String,
     }
-    let body: Body = serde_json::from_str(&text).map_err(|e| format!(
-        "Relay returned unparseable JSON: {} (raw: {})", e, text
-    ))?;
+    let body: Body = serde_json::from_str(&text)
+        .map_err(|e| format!("Relay returned unparseable JSON: {} (raw: {})", e, text))?;
     Ok(RelayPairInit {
         pair_code: body.pair_code,
         expires_at: body.expires_at,
@@ -292,7 +301,11 @@ pub async fn relay_pair_status(
         });
     }
     if !status.is_success() {
-        return Err(format!("Relay /pair/status returned {}: {}", status.as_u16(), text));
+        return Err(format!(
+            "Relay /pair/status returned {}: {}",
+            status.as_u16(),
+            text
+        ));
     }
     let parsed: RelayPairStatus = serde_json::from_str(&text)
         .map_err(|e| format!("Relay returned unparseable JSON: {} (raw: {})", e, text))?;
@@ -358,7 +371,9 @@ mod tests {
 
         // It must come BEFORE max_iterations, not after.
         let url_pos = result.find("  url:").expect("url line should be present");
-        let max_pos = result.find("max_iterations:").expect("max_iterations should be preserved");
+        let max_pos = result
+            .find("max_iterations:")
+            .expect("max_iterations should be preserved");
         assert!(
             url_pos < max_pos,
             "url was inserted after max_iterations instead of inside the relay block:\n{result}"
@@ -369,8 +384,7 @@ mod tests {
     #[test]
     fn upsert_replaces_url_in_relay_block_before_trailing_top_level_scalar() {
         let yaml = "relay:\n  url: https://old.example.com\nmax_iterations: 30\n";
-        let result =
-            upsert_block_scalar(yaml, "relay", "url", "https://new.example.com");
+        let result = upsert_block_scalar(yaml, "relay", "url", "https://new.example.com");
 
         assert!(
             result.contains("  url: https://new.example.com"),
@@ -383,11 +397,17 @@ mod tests {
 
         let url_pos = result.find("  url:").unwrap();
         let max_pos = result.find("max_iterations:").unwrap();
-        assert!(url_pos < max_pos, "url ended up after max_iterations:\n{result}");
+        assert!(
+            url_pos < max_pos,
+            "url ended up after max_iterations:\n{result}"
+        );
 
         // url must not appear before the relay: marker either.
         let relay_pos = result.find("relay:").unwrap();
-        assert!(url_pos > relay_pos, "url appeared before relay: marker:\n{result}");
+        assert!(
+            url_pos > relay_pos,
+            "url appeared before relay: marker:\n{result}"
+        );
     }
 
     /// The url line must not be emitted at the top level (zero indentation).

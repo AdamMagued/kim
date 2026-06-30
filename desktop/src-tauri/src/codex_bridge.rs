@@ -1,10 +1,10 @@
 // codex_bridge.rs — Codex file-bridge command watcher.
 // Extracted from http_bridge.rs — behavior unchanged.
 
-use crate::*;
-use tauri::Manager;
 use crate::http_bridge::capitalize;
 use crate::screenshot_flash::show_screenshot_flash_impl;
+use crate::*;
+use tauri::Manager;
 
 /// Return the per-user, 0700 bridge directory (#14).
 /// Uses `$HOME/.kim/codex_bridge` instead of the world-readable `/tmp/codex_bridge`
@@ -53,7 +53,8 @@ pub(crate) fn start_bridge_file_watcher(app_handle: tauri::AppHandle) {
                         if let Ok(text) = fs::read_to_string(&cmd_path) {
                             let _ = fs::remove_file(&cmd_path); // consume once
                             if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&text) {
-                                let action = cmd.get("action")
+                                let action = cmd
+                                    .get("action")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
@@ -63,17 +64,22 @@ pub(crate) fn start_bridge_file_watcher(app_handle: tauri::AppHandle) {
                                         show_browser_window_impl(&app);
                                     }
                                     "hide_window" => {
-                                        if let Some(win) = app.get_webview_window("kim-browser-signin") {
+                                        if let Some(win) =
+                                            app.get_webview_window("kim-browser-signin")
+                                        {
                                             hide_browser_window_offscreen(&win);
                                         }
                                     }
                                     "switch_site" => {
-                                        let site = cmd.get("site")
+                                        let site = cmd
+                                            .get("site")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("claude");
                                         let url = site_to_url(site);
-                                        let provider = Some(format!("{} (via /model)", capitalize(site)));
-                                        let _ = open_browser_signin_window_impl(&url, provider, &app);
+                                        let provider =
+                                            Some(format!("{} (via /model)", capitalize(site)));
+                                        let _ =
+                                            open_browser_signin_window_impl(&url, provider, &app);
                                     }
                                     "screenshot_flash" => {
                                         show_screenshot_flash_impl(&app);
@@ -91,14 +97,13 @@ pub(crate) fn start_bridge_file_watcher(app_handle: tauri::AppHandle) {
             // ── Write bridge_status.json every 5 s ─────────────────────────
             if last_status_write.elapsed() >= std::time::Duration::from_secs(5) {
                 last_status_write = std::time::Instant::now();
-                let (window_open, current_url) = if let Some(win) =
-                    app_handle.get_webview_window("kim-browser-signin")
-                {
-                    let url = win.url().map(|u| u.to_string()).unwrap_or_default();
-                    (true, url)
-                } else {
-                    (false, String::new())
-                };
+                let (window_open, current_url) =
+                    if let Some(win) = app_handle.get_webview_window("kim-browser-signin") {
+                        let url = win.url().map(|u| u.to_string()).unwrap_or_default();
+                        (true, url)
+                    } else {
+                        (false, String::new())
+                    };
                 let current_site = url_to_site(&current_url);
                 let signed_in = !current_url.is_empty()
                     && !current_url.contains("login")
@@ -138,7 +143,8 @@ fn url_to_site(url: &str) -> &'static str {
         "gemini"
     } else if url.contains("deepseek.com") {
         "deepseek"
-    } else if url.contains("grok.com") || url.contains("grok.x.com") || url.contains("x.com/i/grok") {
+    } else if url.contains("grok.com") || url.contains("grok.x.com") || url.contains("x.com/i/grok")
+    {
         "grok"
     } else if url.contains("claude.ai") {
         "claude"

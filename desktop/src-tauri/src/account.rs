@@ -4,10 +4,10 @@
 //! Public Tauri commands: `load_account`, `save_account`, `clear_account`,
 //! `reset_onboarding`, `delete_all_sessions`.
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
-use serde::{Deserialize, Serialize};
 
 /// Guards `save_account` against concurrent full-overwrites.
 ///
@@ -196,7 +196,11 @@ pub async fn delete_all_sessions() -> Result<(), String> {
         }
         if path.is_dir() {
             fs::remove_dir_all(path).map_err(|e| e.to_string())?;
-        } else if path.extension().and_then(|e| e.to_str()).is_some_and(|ext| matches!(ext, "jsonl" | "json" | "md" | "zip")) {
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| matches!(ext, "jsonl" | "json" | "md" | "zip"))
+        {
             fs::remove_file(path).map_err(|e| e.to_string())?;
         }
     }
@@ -252,7 +256,10 @@ mod account_tests {
 
         let raw = fs::read_to_string(&path).expect("file must exist after write");
         // Verify it is valid pretty JSON (indented).
-        assert!(raw.contains('\n'), "expected pretty-printed JSON with newlines");
+        assert!(
+            raw.contains('\n'),
+            "expected pretty-printed JSON with newlines"
+        );
 
         let restored: KimAccount =
             serde_json::from_str(&raw).expect("must deserialize without error");

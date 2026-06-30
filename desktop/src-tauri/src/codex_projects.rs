@@ -3,11 +3,11 @@
 //! Extracted from lib.rs (Phase 8 restructure).
 //! Public Tauri commands: `list_codex_projects`, `open_in_finder`.
 
+use crate::data_io::unix_secs_to_utc_iso;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use serde::{Deserialize, Serialize};
-use crate::data_io::unix_secs_to_utc_iso;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CodexSession {
@@ -131,7 +131,9 @@ pub async fn open_in_finder(path: String) -> Result<(), String> {
 
 fn read_project_sessions(dir: &Path) -> Vec<CodexSession> {
     let mut sessions = Vec::new();
-    let Ok(date_entries) = fs::read_dir(dir) else { return sessions };
+    let Ok(date_entries) = fs::read_dir(dir) else {
+        return sessions;
+    };
 
     let mut date_dirs: Vec<_> = date_entries
         .filter_map(|e| e.ok())
@@ -142,7 +144,9 @@ fn read_project_sessions(dir: &Path) -> Vec<CodexSession> {
     for date_entry in date_dirs {
         let date = date_entry.file_name().to_string_lossy().to_string();
         let date_path = date_entry.path();
-        let Ok(file_entries) = fs::read_dir(&date_path) else { continue };
+        let Ok(file_entries) = fs::read_dir(&date_path) else {
+            continue;
+        };
 
         let mut files: Vec<_> = file_entries
             .filter_map(|e| e.ok())
@@ -158,7 +162,8 @@ fn read_project_sessions(dir: &Path) -> Vec<CodexSession> {
             if sessions.len() >= 50 {
                 return sessions;
             }
-            let session_id = fe.path()
+            let session_id = fe
+                .path()
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -203,10 +208,14 @@ fn newest_claw_session_file(project_path: &Path) -> Option<(PathBuf, SystemTime)
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_dir() {
-            let Ok(files) = fs::read_dir(&path) else { continue };
+            let Ok(files) = fs::read_dir(&path) else {
+                continue;
+            };
             for file_entry in files.filter_map(|e| e.ok()) {
                 let file_path = file_entry.path();
-                let Some(name) = file_path.file_name().and_then(|n| n.to_str()) else { continue };
+                let Some(name) = file_path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
                 if !name.ends_with(".jsonl") || name.contains(".summary") {
                     continue;
                 }
@@ -223,7 +232,9 @@ fn newest_claw_session_file(project_path: &Path) -> Option<(PathBuf, SystemTime)
                 }
             }
         } else {
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
             if !name.ends_with(".jsonl") || name.contains(".summary") {
                 continue;
             }
@@ -285,7 +296,9 @@ pub(crate) fn newest_codex_session(project_path: &Path) -> Option<crate::Complet
             continue;
         }
         let date = date_entry.file_name().to_string_lossy().to_string();
-        let Ok(file_entries) = fs::read_dir(&date_path) else { continue };
+        let Ok(file_entries) = fs::read_dir(&date_path) else {
+            continue;
+        };
         for file_entry in file_entries.filter_map(|e| e.ok()) {
             let path = file_entry.path();
             let name = file_entry.file_name().to_string_lossy().to_string();
@@ -312,7 +325,9 @@ pub(crate) fn newest_codex_session(project_path: &Path) -> Option<crate::Complet
     }
 
     let (_, path, date, session_id) = newest?;
-    let summary_path = sessions_dir.join(&date).join(format!("{}.summary.txt", session_id));
+    let summary_path = sessions_dir
+        .join(&date)
+        .join(format!("{}.summary.txt", session_id));
     let summary = if summary_path.exists() {
         fs::read_to_string(summary_path)
             .ok()

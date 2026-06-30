@@ -3,14 +3,14 @@
 //! Extracted from lib.rs (Phase 8 restructure).
 //! Public Tauri commands: `read_voice_config`, `write_voice_config`.
 
-use std::fs;
 use serde::{Deserialize, Serialize};
+use std::fs;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct VoiceConfig {
     pub enabled: bool,
-    pub engine: String,    // "kokoro" | "maya1" | "http" | "hume"
-    pub voice_id: String,  // kokoro voice_id OR hume voice_name OR http voice
+    pub engine: String,   // "kokoro" | "maya1" | "http" | "hume"
+    pub voice_id: String, // kokoro voice_id OR hume voice_name OR http voice
 }
 
 /// Extract a scalar value from a single line inside a top-level `voice:` block.
@@ -61,7 +61,11 @@ pub async fn read_voice_config(project_root: Option<String>) -> Result<VoiceConf
         .unwrap_or("af_heart")
         .to_string();
 
-    Ok(VoiceConfig { enabled, engine, voice_id })
+    Ok(VoiceConfig {
+        enabled,
+        engine,
+        voice_id,
+    })
 }
 
 /// Replace one `  key: value` line inside the `voice:` block, or insert it
@@ -134,7 +138,11 @@ pub async fn write_voice_config(
         String::from("voice:\n")
     };
 
-    let mut updated = upsert_voice_scalar(&original, "enabled", if config.enabled { "true" } else { "false" });
+    let mut updated = upsert_voice_scalar(
+        &original,
+        "enabled",
+        if config.enabled { "true" } else { "false" },
+    );
     updated = upsert_voice_scalar(&updated, "engine", &config.engine);
     updated = upsert_voice_scalar(&updated, "voice_id", &config.voice_id);
 

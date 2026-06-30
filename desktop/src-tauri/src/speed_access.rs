@@ -64,10 +64,19 @@ pub(crate) fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let status = MenuItem::with_id(app, "status", "Kim — idle", false, None::<&str>)?;
     let quick = MenuItem::with_id(app, "quick_ask", "Quick ask", true, None::<&str>)?;
     let cancel = MenuItem::with_id(app, "cancel_run", "Cancel current run", true, None::<&str>)?;
-    let privacy = MenuItem::with_id(app, "privacy_pause", "Toggle privacy pause", true, None::<&str>)?;
+    let privacy = MenuItem::with_id(
+        app,
+        "privacy_pause",
+        "Toggle privacy pause",
+        true,
+        None::<&str>,
+    )?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = PredefinedMenuItem::quit(app, Some("Quit Kim"))?;
-    let menu = Menu::with_items(app, &[&status, &sep, &quick, &cancel, &privacy, &sep, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&status, &sep, &quick, &cancel, &privacy, &sep, &quit],
+    )?;
 
     TrayIconBuilder::with_id("kim-tray")
         .tooltip("Kim")

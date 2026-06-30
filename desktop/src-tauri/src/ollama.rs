@@ -4,8 +4,8 @@
 //! Public Tauri commands: `ollama_get_status`, `ollama_test_model`,
 //! `ollama_signin`, `ollama_pull_model`.
 
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tauri::Emitter;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -122,7 +122,10 @@ fn find_ollama_binary() -> Option<String> {
     #[cfg(not(windows))]
     let probe = ("which", vec!["ollama"]);
 
-    let out = std::process::Command::new(probe.0).args(probe.1).output().ok()?;
+    let out = std::process::Command::new(probe.0)
+        .args(probe.1)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -260,7 +263,10 @@ pub(crate) async fn ollama_tags(base_url: &str) -> Result<Vec<OllamaModelInfo>, 
             modified_at: m.modified_at,
             family: m.details.as_ref().and_then(|d| d.family.clone()),
             parameter_size: m.details.as_ref().and_then(|d| d.parameter_size.clone()),
-            quantization_level: m.details.as_ref().and_then(|d| d.quantization_level.clone()),
+            quantization_level: m
+                .details
+                .as_ref()
+                .and_then(|d| d.quantization_level.clone()),
             cloud: false,
             installed: true,
         })
@@ -296,7 +302,10 @@ async fn ollama_chat_probe(base_url: &str, model: &str) -> Result<(), String> {
 
 fn friendly_ollama_cloud_message(detail: &str) -> String {
     let lowered = detail.to_lowercase();
-    if lowered.contains("sign in") || lowered.contains("unauthorized") || lowered.contains("forbidden") {
+    if lowered.contains("sign in")
+        || lowered.contains("unauthorized")
+        || lowered.contains("forbidden")
+    {
         "Sign in to Ollama to use cloud models".to_string()
     } else if lowered.contains("not found") || lowered.contains("pull") {
         "Cloud model unavailable; use a local model or install the cloud model".to_string()
@@ -393,10 +402,8 @@ pub async fn ollama_get_status(
     };
 
     let local_models = ollama_tags(&base_url).await.unwrap_or_default();
-    let local_names: std::collections::HashSet<String> = local_models
-        .iter()
-        .map(|m| m.name.to_lowercase())
-        .collect();
+    let local_names: std::collections::HashSet<String> =
+        local_models.iter().map(|m| m.name.to_lowercase()).collect();
     let mut cloud_models: Vec<OllamaModelInfo> = known_ollama_cloud_models()
         .into_iter()
         .map(|name| OllamaModelInfo {
@@ -425,13 +432,16 @@ pub async fn ollama_get_status(
         }
     }
 
-    let selected = selected_model.clone().filter(|m| !m.trim().is_empty()).or_else(|| {
-        if selected_mode == "cloud" {
-            Some(ollama_fallback.clone())
-        } else {
-            local_models.first().map(|m| m.name.clone())
-        }
-    });
+    let selected = selected_model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| {
+            if selected_mode == "cloud" {
+                Some(ollama_fallback.clone())
+            } else {
+                local_models.first().map(|m| m.name.clone())
+            }
+        });
     let selected_available = selected
         .as_ref()
         .map(|m| {
@@ -453,7 +463,10 @@ pub async fn ollama_get_status(
             Err(detail) => (false, Some(friendly_ollama_cloud_message(&detail))),
         }
     } else {
-        (false, Some("Local models work without any Ollama account.".to_string()))
+        (
+            false,
+            Some("Local models work without any Ollama account.".to_string()),
+        )
     };
 
     let (context_limit, context_limit_source) = if let Some(model) = selected.as_ref() {
@@ -473,7 +486,11 @@ pub async fn ollama_get_status(
     };
 
     let state = if selected_mode == "cloud" {
-        if cloud_connected { "connected" } else { "running_not_signed_in" }
+        if cloud_connected {
+            "connected"
+        } else {
+            "running_not_signed_in"
+        }
     } else if !local_models.is_empty() {
         "connected"
     } else {
@@ -512,10 +529,7 @@ pub async fn ollama_get_status(
 }
 
 #[tauri::command]
-pub async fn ollama_test_model(
-    base_url: Option<String>,
-    model: String,
-) -> Result<bool, String> {
+pub async fn ollama_test_model(base_url: Option<String>, model: String) -> Result<bool, String> {
     let base_url = base_url.unwrap_or_else(|| "http://localhost:11434".to_string());
     ollama_chat_probe(&base_url, &model).await.map(|_| true)
 }
@@ -546,12 +560,19 @@ end tell"#;
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let candidates = [
-            ("x-terminal-emulator", vec!["-e", "sh", "-lc", "ollama signin"]),
+            (
+                "x-terminal-emulator",
+                vec!["-e", "sh", "-lc", "ollama signin"],
+            ),
             ("gnome-terminal", vec!["--", "sh", "-lc", "ollama signin"]),
             ("konsole", vec!["-e", "sh", "-lc", "ollama signin"]),
         ];
         for (cmd, args) in candidates {
-            if std::process::Command::new(cmd).args(args.clone()).spawn().is_ok() {
+            if std::process::Command::new(cmd)
+                .args(args.clone())
+                .spawn()
+                .is_ok()
+            {
                 return Ok(());
             }
         }
@@ -560,10 +581,7 @@ end tell"#;
 }
 
 #[tauri::command]
-pub async fn ollama_pull_model(
-    model: String,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+pub async fn ollama_pull_model(model: String, app_handle: tauri::AppHandle) -> Result<(), String> {
     let model_name = model.trim().to_string();
     if model_name.is_empty() {
         return Err("Model name is required".to_string());
@@ -586,7 +604,13 @@ pub async fn ollama_pull_model(
                     tokio::spawn(async move {
                         let mut lines = tokio::io::BufReader::new(stdout).lines();
                         while let Ok(Some(line)) = lines.next_line().await {
-                            let _ = app.emit("ollama-pull-progress", OllamaPullProgress { model: model.clone(), line });
+                            let _ = app.emit(
+                                "ollama-pull-progress",
+                                OllamaPullProgress {
+                                    model: model.clone(),
+                                    line,
+                                },
+                            );
                         }
                     });
                 }
@@ -596,41 +620,59 @@ pub async fn ollama_pull_model(
                     tokio::spawn(async move {
                         let mut lines = tokio::io::BufReader::new(stderr).lines();
                         while let Ok(Some(line)) = lines.next_line().await {
-                            let _ = app.emit("ollama-pull-progress", OllamaPullProgress { model: model.clone(), line });
+                            let _ = app.emit(
+                                "ollama-pull-progress",
+                                OllamaPullProgress {
+                                    model: model.clone(),
+                                    line,
+                                },
+                            );
                         }
                     });
                 }
                 let finished = child.wait().await.map_err(|e| e.to_string());
                 match finished {
                     Ok(status) if status.success() => {
-                        let _ = app_handle.emit("ollama-pull-finished", OllamaPullFinished {
-                            model: model_name,
-                            success: true,
-                            error: None,
-                        });
+                        let _ = app_handle.emit(
+                            "ollama-pull-finished",
+                            OllamaPullFinished {
+                                model: model_name,
+                                success: true,
+                                error: None,
+                            },
+                        );
                     }
                     Ok(status) => {
-                        let _ = app_handle.emit("ollama-pull-finished", OllamaPullFinished {
-                            model: model_name,
-                            success: false,
-                            error: Some(format!("`ollama pull` exited with {}", status)),
-                        });
+                        let _ = app_handle.emit(
+                            "ollama-pull-finished",
+                            OllamaPullFinished {
+                                model: model_name,
+                                success: false,
+                                error: Some(format!("`ollama pull` exited with {}", status)),
+                            },
+                        );
                     }
                     Err(err) => {
-                        let _ = app_handle.emit("ollama-pull-finished", OllamaPullFinished {
-                            model: model_name,
-                            success: false,
-                            error: Some(err),
-                        });
+                        let _ = app_handle.emit(
+                            "ollama-pull-finished",
+                            OllamaPullFinished {
+                                model: model_name,
+                                success: false,
+                                error: Some(err),
+                            },
+                        );
                     }
                 }
             }
             Err(err) => {
-                let _ = app_handle.emit("ollama-pull-finished", OllamaPullFinished {
-                    model: model_name,
-                    success: false,
-                    error: Some(err.to_string()),
-                });
+                let _ = app_handle.emit(
+                    "ollama-pull-finished",
+                    OllamaPullFinished {
+                        model: model_name,
+                        success: false,
+                        error: Some(err.to_string()),
+                    },
+                );
             }
         }
     });

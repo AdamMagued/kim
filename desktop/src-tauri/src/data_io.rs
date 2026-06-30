@@ -4,10 +4,10 @@
 //! Public Tauri commands: `verify_github_pat`, `export_data`, `import_data`,
 //! `backup_to_gist`, `restore_from_gist`.
 
+use crate::account::{account_dir, account_path, KimAccount};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
-use crate::account::{KimAccount, account_dir, account_path};
 
 // ---------------------------------------------------------------------------
 // Shared time helpers — used by other lib.rs sections via `crate::data_io::`
@@ -32,22 +32,43 @@ pub(crate) fn unix_secs_to_utc_iso(secs: u64) -> String {
     // Gregorian calendar algorithm (Julian Day Number method)
     let mut year = 1970u64;
     loop {
-        let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+        let leap =
+            (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
         let days_in_year = if leap { 366 } else { 365 };
-        if days < days_in_year { break; }
+        if days < days_in_year {
+            break;
+        }
         days -= days_in_year;
         year += 1;
     }
     let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
-    let month_days: [u64; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days: [u64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 1u64;
     for &md in &month_days {
-        if days < md { break; }
+        if days < md {
+            break;
+        }
         days -= md;
         month += 1;
     }
     let day = days + 1;
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month, day, h, m, s)
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, h, m, s
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +95,10 @@ pub async fn verify_github_pat(token: String) -> Result<GitHubUser, String> {
         .map_err(|e| format!("Network error: {}", e))?;
 
     if !resp.status().is_success() {
-        return Err(format!("GitHub returned {}. Check that your token has 'read:user' scope.", resp.status()));
+        return Err(format!(
+            "GitHub returned {}. Check that your token has 'read:user' scope.",
+            resp.status()
+        ));
     }
 
     let user: GitHubUser = resp.json().await.map_err(|e| e.to_string())?;
@@ -102,7 +126,10 @@ pub async fn export_data(
         "zip" => export_as_zip(&base, &out),
         "json" => export_as_json(&base, &out),
         "markdown" => export_as_markdown(&base, &out),
-        _ => Err(format!("Unknown format: {}. Use 'zip', 'json', or 'markdown'.", format)),
+        _ => Err(format!(
+            "Unknown format: {}. Use 'zip', 'json', or 'markdown'.",
+            format
+        )),
     }
 }
 
@@ -130,7 +157,10 @@ pub(crate) fn sanitized_account_json(gist_id_hint: Option<&str>) -> String {
     if let Some(obj) = value.as_object_mut() {
         obj.remove("github_token");
         if let Some(gist_id) = gist_id_hint.map(str::trim).filter(|s| !s.is_empty()) {
-            obj.insert("gist_id".to_string(), serde_json::Value::String(gist_id.to_string()));
+            obj.insert(
+                "gist_id".to_string(),
+                serde_json::Value::String(gist_id.to_string()),
+            );
         }
     }
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
@@ -142,7 +172,8 @@ fn export_as_zip(sessions_base: &Path, out: &Path) -> Result<String, String> {
 
     let file = std::fs::File::create(out).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
-    let opts: FileOptions<'_, ()> = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let opts: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     let mut count = 0usize;
     collect_jsonl_files(sessions_base, &mut |rel, data| {
@@ -159,7 +190,11 @@ fn export_as_zip(sessions_base: &Path, out: &Path) -> Result<String, String> {
     }
 
     zip.finish().map_err(|e| e.to_string())?;
-    Ok(format!("Exported {} session files to {}", count, out.display()))
+    Ok(format!(
+        "Exported {} session files to {}",
+        count,
+        out.display()
+    ))
 }
 
 fn export_as_json(sessions_base: &Path, out: &Path) -> Result<String, String> {
@@ -181,7 +216,11 @@ fn export_as_json(sessions_base: &Path, out: &Path) -> Result<String, String> {
     });
     let raw = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
     fs::write(out, raw).map_err(|e| e.to_string())?;
-    Ok(format!("Exported {} sessions to {}", sessions.len(), out.display()))
+    Ok(format!(
+        "Exported {} sessions to {}",
+        sessions.len(),
+        out.display()
+    ))
 }
 
 fn export_as_markdown(sessions_base: &Path, out: &Path) -> Result<String, String> {
@@ -207,7 +246,11 @@ fn export_as_markdown(sessions_base: &Path, out: &Path) -> Result<String, String
     });
 
     fs::write(out, &md).map_err(|e| e.to_string())?;
-    Ok(format!("Exported {} sessions as Markdown to {}", count, out.display()))
+    Ok(format!(
+        "Exported {} sessions as Markdown to {}",
+        count,
+        out.display()
+    ))
 }
 
 pub(crate) fn collect_jsonl_files<F>(base: &Path, cb: &mut F)
@@ -217,10 +260,17 @@ where
     if !base.exists() {
         return;
     }
-    let Ok(date_dirs) = fs::read_dir(base) else { return };
-    for de in date_dirs.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()) {
+    let Ok(date_dirs) = fs::read_dir(base) else {
+        return;
+    };
+    for de in date_dirs
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+    {
         let date = de.file_name().to_string_lossy().to_string();
-        let Ok(files) = fs::read_dir(de.path()) else { continue };
+        let Ok(files) = fs::read_dir(de.path()) else {
+            continue;
+        };
         for fe in files.filter_map(|e| e.ok()) {
             let name = fe.file_name().to_string_lossy().to_string();
             if name.ends_with(".jsonl") {
@@ -310,7 +360,9 @@ fn import_from_zip(src: &Path, base: &Path) -> Result<String, String> {
 
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            if let (Ok(canon_dest_parent), Ok(canon_base)) = (parent.canonicalize(), base.canonicalize()) {
+            if let (Ok(canon_dest_parent), Ok(canon_base)) =
+                (parent.canonicalize(), base.canonicalize())
+            {
                 let full = canon_dest_parent.join(dest.file_name().unwrap_or_default());
                 if !full.starts_with(&canon_base) {
                     continue;
@@ -332,11 +384,15 @@ fn import_from_json(src: &Path, base: &Path) -> Result<String, String> {
     let raw = fs::read_to_string(src).map_err(|e| e.to_string())?;
     let payload: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
 
-    let sessions = payload["sessions"].as_array().ok_or("Invalid export format: missing 'sessions' array.")?;
+    let sessions = payload["sessions"]
+        .as_array()
+        .ok_or("Invalid export format: missing 'sessions' array.")?;
     let mut count = 0usize;
 
     for session in sessions {
-        let rel = session["session"].as_str().unwrap_or("unknown/session.jsonl");
+        let rel = session["session"]
+            .as_str()
+            .unwrap_or("unknown/session.jsonl");
 
         // Guard against path traversal attacks
         if rel.contains("..") || rel.starts_with('/') || rel.starts_with('\\') {
@@ -350,7 +406,9 @@ fn import_from_json(src: &Path, base: &Path) -> Result<String, String> {
 
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            if let (Ok(canon_dest_parent), Ok(canon_base)) = (parent.canonicalize(), base.canonicalize()) {
+            if let (Ok(canon_dest_parent), Ok(canon_base)) =
+                (parent.canonicalize(), base.canonicalize())
+            {
                 let full = canon_dest_parent.join(dest.file_name().unwrap_or_default());
                 if !full.starts_with(&canon_base) {
                     return Err(format!("path traversal attempt: {:?}", rel));
@@ -448,10 +506,7 @@ pub async fn backup_to_gist(
 }
 
 #[tauri::command]
-pub async fn restore_from_gist(
-    token: String,
-    gist_id: String,
-) -> Result<KimAccount, String> {
+pub async fn restore_from_gist(token: String, gist_id: String) -> Result<KimAccount, String> {
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("https://api.github.com/gists/{}", gist_id))
@@ -463,7 +518,10 @@ pub async fn restore_from_gist(
         .map_err(|e| format!("Network error: {}", e))?;
 
     if !resp.status().is_success() {
-        return Err(format!("GitHub returned {}. Check the Gist ID.", resp.status()));
+        return Err(format!(
+            "GitHub returned {}. Check the Gist ID.",
+            resp.status()
+        ));
     }
 
     let gist: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
@@ -553,7 +611,11 @@ mod zip_import_tests {
         );
 
         let result = import_from_zip(&zip_path, &base);
-        assert!(result.is_ok(), "import_from_zip must not error on traversal entries: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "import_from_zip must not error on traversal entries: {:?}",
+            result
+        );
 
         // Nothing should have been written outside base.
         assert!(
@@ -587,7 +649,11 @@ mod zip_import_tests {
         make_zip(&zip_path, &[("2026-06-28/session-abc.jsonl", content)]);
 
         let result = import_from_zip(&zip_path, &base);
-        assert!(result.is_ok(), "import_from_zip failed on safe entry: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "import_from_zip failed on safe entry: {:?}",
+            result
+        );
 
         let dest = base.join("2026-06-28").join("session-abc.jsonl");
         assert!(
@@ -627,7 +693,11 @@ mod zip_import_tests {
         );
 
         let result = import_from_zip(&zip_path, &base);
-        assert!(result.is_ok(), "import_from_zip must not error on traversal entry: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "import_from_zip must not error on traversal entry: {:?}",
+            result
+        );
 
         assert!(
             !evil_dir.exists(),

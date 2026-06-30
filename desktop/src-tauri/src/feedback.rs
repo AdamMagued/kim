@@ -3,12 +3,12 @@
 //! Extracted from lib.rs (Phase 8 restructure).
 //! Public Tauri commands: `send_feedback`, `save_attachment`.
 
+use base64::Engine as _;
+use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use base64::Engine as _;
-use serde::Deserialize;
 
 /// Monotonic counter so two saves within the same millisecond still get
 /// distinct subdir names. (D4)
@@ -85,7 +85,7 @@ pub async fn save_attachment(filename: String, data_base64: String) -> Result<St
 
 #[derive(Deserialize)]
 pub struct FeedbackPayload {
-    pub category: String,    // "bug" | "feature" | "general" | "praise" | "other"
+    pub category: String, // "bug" | "feature" | "general" | "praise" | "other"
     pub message: String,
     pub contact: Option<String>,
 }
@@ -97,20 +97,23 @@ pub async fn send_feedback(payload: FeedbackPayload) -> Result<(), String> {
     }
 
     let category_label = match payload.category.as_str() {
-        "bug"     => "🐛 Bug Report",
+        "bug" => "🐛 Bug Report",
         "feature" => "✨ Feature Request",
-        "praise"  => "🙏 Praise",
+        "praise" => "🙏 Praise",
         "general" => "💬 General Feedback",
-        _         => "📝 Feedback",
+        _ => "📝 Feedback",
     };
 
-    let contact_field = payload.contact
+    let contact_field = payload
+        .contact
         .filter(|s| !s.trim().is_empty())
-        .map(|email| serde_json::json!({
-            "name": "Contact",
-            "value": email,
-            "inline": true,
-        }));
+        .map(|email| {
+            serde_json::json!({
+                "name": "Contact",
+                "value": email,
+                "inline": true,
+            })
+        });
 
     let mut fields = vec![
         serde_json::json!({
@@ -129,10 +132,10 @@ pub async fn send_feedback(payload: FeedbackPayload) -> Result<(), String> {
     }
 
     let color = match payload.category.as_str() {
-        "bug"     => 0xef4444u32,
+        "bug" => 0xef4444u32,
         "feature" => 0x6366f1,
-        "praise"  => 0x22c55e,
-        _         => 0x64748b,
+        "praise" => 0x22c55e,
+        _ => 0x64748b,
     };
 
     let body = serde_json::json!({

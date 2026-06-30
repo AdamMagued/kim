@@ -76,7 +76,10 @@ mod tests {
     fn overlap_guard_blocks_second_acquire_until_release() {
         release_tick(); // ensure a clean slate
         assert!(try_acquire_tick(), "first acquire should succeed");
-        assert!(!try_acquire_tick(), "second acquire must be blocked while held");
+        assert!(
+            !try_acquire_tick(),
+            "second acquire must be blocked while held"
+        );
         release_tick();
         assert!(try_acquire_tick(), "acquire should succeed after release");
         release_tick();

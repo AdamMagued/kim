@@ -1,13 +1,23 @@
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use serde::Deserialize;
 
-fn default_bridge_timeout_secs() -> u64 { 720 }
-fn default_screenshot_flash_duration_ms() -> u64 { 3300 }
-fn default_max_iterations() -> u32 { 25 }
-fn default_ipc_protocol() -> String { "typed".to_string() }
-fn default_schedules_enabled() -> bool { true }
+fn default_bridge_timeout_secs() -> u64 {
+    720
+}
+fn default_screenshot_flash_duration_ms() -> u64 {
+    3300
+}
+fn default_max_iterations() -> u32 {
+    25
+}
+fn default_ipc_protocol() -> String {
+    "typed".to_string()
+}
+fn default_schedules_enabled() -> bool {
+    true
+}
 
 fn default_model_map() -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -64,12 +74,18 @@ pub fn load_config(path: &Path) -> AppConfig {
         Ok(content) => match serde_yaml::from_str::<AppConfig>(&content) {
             Ok(config) => config,
             Err(e) => {
-                eprintln!("[Kim] Warning: Failed to parse config.yaml: {}. Using defaults.", e);
+                eprintln!(
+                    "[Kim] Warning: Failed to parse config.yaml: {}. Using defaults.",
+                    e
+                );
                 AppConfig::default()
             }
-        }
+        },
         Err(e) => {
-            eprintln!("[Kim] Warning: Failed to read config.yaml: {}. Using defaults.", e);
+            eprintln!(
+                "[Kim] Warning: Failed to read config.yaml: {}. Using defaults.",
+                e
+            );
             AppConfig::default()
         }
     }
@@ -94,9 +110,18 @@ ipc_protocol: typed
 "#;
         let config: AppConfig = serde_yaml::from_str(yaml_str).unwrap();
         assert_eq!(config.default_model.get("openai").unwrap(), "gpt-4o-custom");
-        assert_eq!(config.default_model.get("deepseek").unwrap(), "deepseek-chat-custom");
-        assert_eq!(config.default_model.get("gemini").unwrap(), "gemini-2.0-flash-custom");
-        assert_eq!(config.default_model.get("ollama").unwrap(), "gpt-oss-custom");
+        assert_eq!(
+            config.default_model.get("deepseek").unwrap(),
+            "deepseek-chat-custom"
+        );
+        assert_eq!(
+            config.default_model.get("gemini").unwrap(),
+            "gemini-2.0-flash-custom"
+        );
+        assert_eq!(
+            config.default_model.get("ollama").unwrap(),
+            "gpt-oss-custom"
+        );
         assert_eq!(config.max_iterations, 30);
         assert_eq!(config.bridge_timeout_secs, 500);
         assert_eq!(config.screenshot_flash_duration_ms, 2000);
@@ -148,4 +173,3 @@ ipc_protocol: typed
         assert_eq!(config.bridge_timeout_secs, 720);
     }
 }
-

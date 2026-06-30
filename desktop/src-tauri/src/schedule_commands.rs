@@ -16,8 +16,8 @@ use crate::{default_project_root, subprocess::find_python_interpreter};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Shared subprocess helper
@@ -141,9 +141,7 @@ pub(crate) fn build_list_args(python: &str, enabled_only: bool) -> Vec<String> {
 /// Return the JSON array of all scheduled tasks.
 /// Pass `enabled_only: true` to filter to enabled tasks only.
 #[tauri::command]
-pub(crate) async fn list_scheduled_tasks(
-    enabled_only: bool,
-) -> Result<String, String> {
+pub(crate) async fn list_scheduled_tasks(enabled_only: bool) -> Result<String, String> {
     let kim_root = default_project_root();
     let python = find_python_interpreter(&kim_root)?;
     let args = build_list_args(&python, enabled_only);
@@ -320,9 +318,7 @@ pub(crate) fn build_due_args(python: &str, as_of: Option<&str>) -> Vec<String> {
 /// Return the JSON array of due scheduled tasks by calling
 /// `python -m kimctl schedule due --json [--as-of <ISO>]`.
 #[tauri::command]
-pub(crate) async fn list_due_scheduled_tasks(
-    as_of: Option<String>,
-) -> Result<String, String> {
+pub(crate) async fn list_due_scheduled_tasks(as_of: Option<String>) -> Result<String, String> {
     let kim_root = default_project_root();
     let python = find_python_interpreter(&kim_root)?;
     let args = build_due_args(&python, as_of.as_deref());
@@ -420,14 +416,13 @@ pub(crate) async fn start_schedule_timer(
                     continue;
                 }
 
-                let tick_result =
-                    tokio::task::spawn_blocking({
-                        let kim_root = kim_root.clone();
-                        move || run_due_once(&kim_root, false)
-                    })
-                    .await
-                    .map_err(|e| format!("Executor error: {e}"))
-                    .and_then(|r| r);
+                let tick_result = tokio::task::spawn_blocking({
+                    let kim_root = kim_root.clone();
+                    move || run_due_once(&kim_root, false)
+                })
+                .await
+                .map_err(|e| format!("Executor error: {e}"))
+                .and_then(|r| r);
 
                 let tick_event = {
                     let mut guard = loop_state.lock().await;
@@ -497,22 +492,25 @@ mod tests {
     #[test]
     fn test_add_scheduled_task_is_async_fn() {
         fn assert_is_async<F: std::future::Future>(_: F) {}
+        assert_is_async(add_scheduled_task("t".into(), "@daily".into(), None, false));
         assert_is_async(add_scheduled_task(
-            "t".into(), "@daily".into(), None, false,
-        ));
-        assert_is_async(add_scheduled_task(
-            "t".into(), "@daily".into(), Some("ollama".into()), true,
+            "t".into(),
+            "@daily".into(),
+            Some("ollama".into()),
+            true,
         ));
     }
 
     #[test]
     fn test_update_scheduled_task_is_async_fn() {
         fn assert_is_async<F: std::future::Future>(_: F) {}
+        assert_is_async(update_scheduled_task("id1".into(), None, None, None, None));
         assert_is_async(update_scheduled_task(
-            "id1".into(), None, None, None, None,
-        ));
-        assert_is_async(update_scheduled_task(
-            "id1".into(), Some("new task".into()), None, None, Some(true),
+            "id1".into(),
+            Some("new task".into()),
+            None,
+            None,
+            Some(true),
         ));
     }
 
@@ -526,7 +524,9 @@ mod tests {
     fn test_list_due_scheduled_tasks_is_async_fn() {
         fn assert_is_async<F: std::future::Future>(_: F) {}
         assert_is_async(list_due_scheduled_tasks(None));
-        assert_is_async(list_due_scheduled_tasks(Some("2026-06-05T12:00:00+00:00".into())));
+        assert_is_async(list_due_scheduled_tasks(Some(
+            "2026-06-05T12:00:00+00:00".into(),
+        )));
     }
 
     #[test]
@@ -666,7 +666,12 @@ mod tests {
     #[test]
     fn test_build_update_args_task_and_expr() {
         let args = build_update_args(
-            "python3", "id1", Some("new text"), Some("@weekly"), None, None,
+            "python3",
+            "id1",
+            Some("new text"),
+            Some("@weekly"),
+            None,
+            None,
         );
         let t_idx = args.iter().position(|a| a == "--task").unwrap();
         assert_eq!(args[t_idx + 1], "new text");
@@ -754,7 +759,8 @@ mod tests {
             assert!(
                 ch.is_ascii(),
                 "non-ASCII char {:?} at byte offset {}",
-                ch, i
+                ch,
+                i
             );
         }
     }

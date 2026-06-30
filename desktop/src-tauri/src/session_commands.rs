@@ -4,10 +4,10 @@
 //! Public Tauri commands include `list_sessions`, `delete_session`,
 //! `summarize_session`, `load_session_messages`, and `get_app_version`.
 
+use serde_json;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use serde_json;
 
 #[tauri::command]
 pub async fn list_sessions(
@@ -49,7 +49,9 @@ pub async fn summarize_session(
 
     let mut jsonl_path: Option<PathBuf> = None;
     for base in &dirs_to_search {
-        if !base.exists() { continue; }
+        if !base.exists() {
+            continue;
+        }
         if let Ok(entries) = fs::read_dir(base) {
             let mut date_dirs: Vec<_> = entries
                 .filter_map(|e| e.ok())
@@ -64,7 +66,9 @@ pub async fn summarize_session(
                 }
             }
         }
-        if jsonl_path.is_some() { break; }
+        if jsonl_path.is_some() {
+            break;
+        }
     }
 
     let path = jsonl_path.ok_or_else(|| format!("Session file not found: {}", session_id))?;
@@ -78,7 +82,9 @@ pub async fn summarize_session(
 
     for line in reader.lines().map_while(Result::ok) {
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
         let value: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(_) => continue,
@@ -88,7 +94,11 @@ pub async fn summarize_session(
             (r.to_string(), value.get("content").cloned())
         } else if value.get("type").and_then(|v| v.as_str()) == Some("message") {
             let msg = value.get("message").unwrap_or(&serde_json::Value::Null);
-            let r = msg.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let r = msg
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let c = msg.get("blocks").or_else(|| msg.get("content")).cloned();
             (r, c)
         } else {
@@ -98,11 +108,20 @@ pub async fn summarize_session(
         let text = match &content {
             Some(serde_json::Value::String(s)) => Some(s.clone()),
             Some(serde_json::Value::Array(items)) => {
-                let texts: Vec<String> = items.iter()
+                let texts: Vec<String> = items
+                    .iter()
                     .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
-                    .filter_map(|b| b.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .filter_map(|b| {
+                        b.get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
                     .collect();
-                if texts.is_empty() { None } else { Some(texts.join("\n")) }
+                if texts.is_empty() {
+                    None
+                } else {
+                    Some(texts.join("\n"))
+                }
             }
             _ => None,
         };
@@ -110,15 +129,17 @@ pub async fn summarize_session(
         if role == "user" {
             if let Some(ref t) = text {
                 let clean = t.trim();
-                if !clean.starts_with("[Tool result:") && !clean.is_empty() && first_user_text.is_none() {
-                    first_user_text = Some(clean.strip_prefix("Task: ").unwrap_or(clean).to_string());
+                if !clean.starts_with("[Tool result:")
+                    && !clean.is_empty()
+                    && first_user_text.is_none()
+                {
+                    first_user_text =
+                        Some(clean.strip_prefix("Task: ").unwrap_or(clean).to_string());
                 }
             }
         } else if role == "assistant" {
             if let Some(ref t) = text {
-                let clean = t.trim()
-                    .trim_start_matches("TASK_COMPLETE:")
-                    .trim();
+                let clean = t.trim().trim_start_matches("TASK_COMPLETE:").trim();
                 if !clean.is_empty() {
                     last_assistant_text = Some(clean.to_string());
                 }
@@ -131,13 +152,18 @@ pub async fn summarize_session(
                             let mut path_str = None;
                             if let Some(input_val) = block.get("input") {
                                 if let Some(s) = input_val.as_str() {
-                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                                        path_str = parsed.get("path").or_else(|| parsed.get("file_path"))
+                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+                                    {
+                                        path_str = parsed
+                                            .get("path")
+                                            .or_else(|| parsed.get("file_path"))
                                             .and_then(|v| v.as_str())
                                             .map(|s| s.to_string());
                                     }
                                 } else if let Some(obj) = input_val.as_object() {
-                                    path_str = obj.get("path").or_else(|| obj.get("file_path"))
+                                    path_str = obj
+                                        .get("path")
+                                        .or_else(|| obj.get("file_path"))
                                         .and_then(|v| v.as_str())
                                         .map(|s| s.to_string());
                                 }
@@ -215,13 +241,11 @@ pub async fn load_session_messages(
             let date_dir = base.join(date);
             let candidate = date_dir.join(format!("{}.jsonl", session_id));
             if candidate.exists() {
-                let (canon_candidate, canon_dir) = match (
-                    candidate.canonicalize(),
-                    date_dir.canonicalize(),
-                ) {
-                    (Ok(c), Ok(d)) => (c, d),
-                    _ => continue,
-                };
+                let (canon_candidate, canon_dir) =
+                    match (candidate.canonicalize(), date_dir.canonicalize()) {
+                        (Ok(c), Ok(d)) => (c, d),
+                        _ => continue,
+                    };
                 if !canon_candidate.starts_with(&canon_dir) {
                     return Err("Resolved session path escapes its date directory".to_string());
                 }
@@ -242,13 +266,11 @@ pub async fn load_session_messages(
             if !candidate.exists() {
                 continue;
             }
-            let (canon_candidate, canon_dir) = match (
-                candidate.canonicalize(),
-                date_dir.canonicalize(),
-            ) {
-                (Ok(c), Ok(d)) => (c, d),
-                _ => continue,
-            };
+            let (canon_candidate, canon_dir) =
+                match (candidate.canonicalize(), date_dir.canonicalize()) {
+                    (Ok(c), Ok(d)) => (c, d),
+                    _ => continue,
+                };
             if !canon_candidate.starts_with(&canon_dir) {
                 return Err("Resolved session path escapes its date directory".to_string());
             }
@@ -344,7 +366,10 @@ pub(crate) fn read_session_meta(date_dir: &Path, session_id: &str) -> (Option<St
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return (None, false);
     };
-    let title = v.get("title").and_then(|x| x.as_str()).map(|s| s.to_string());
+    let title = v
+        .get("title")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
     let pinned = v.get("pinned").and_then(|x| x.as_bool()).unwrap_or(false);
     (title, pinned)
 }
@@ -382,10 +407,8 @@ pub(crate) fn delete_session_files(date_dir: &Path, session_id: &str) -> usize {
         for entry in entries.filter_map(|e| e.ok()) {
             let fname = entry.file_name();
             let fname_str = fname.to_string_lossy();
-            let is_compact = fname_str.starts_with(&compact_prefix)
-                && fname_str.ends_with(".json");
-            let is_roll = fname_str.starts_with(&roll_prefix)
-                && fname_str.ends_with(".jsonl");
+            let is_compact = fname_str.starts_with(&compact_prefix) && fname_str.ends_with(".json");
+            let is_roll = fname_str.starts_with(&roll_prefix) && fname_str.ends_with(".jsonl");
             if (is_compact || is_roll) && fs::remove_file(entry.path()).is_ok() {
                 n += 1;
             }
@@ -417,7 +440,10 @@ mod k4_tests {
     fn tmp() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "kim-k4-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&p).unwrap();
         p
@@ -496,9 +522,18 @@ mod k4_tests {
         let n = delete_session_files(&date_dir, id);
         // 1 fixed (.jsonl) + 1 compact + 2 roll = 4 total.
         assert_eq!(n, 4, "expected 4 files removed, got {n}");
-        assert!(!date_dir.join(&compact).exists(), "compact sidecar should be gone");
-        assert!(!date_dir.join(&roll1).exists(), "roll sidecar 1 should be gone");
-        assert!(!date_dir.join(&roll2).exists(), "roll sidecar 2 should be gone");
+        assert!(
+            !date_dir.join(&compact).exists(),
+            "compact sidecar should be gone"
+        );
+        assert!(
+            !date_dir.join(&roll1).exists(),
+            "roll sidecar 1 should be gone"
+        );
+        assert!(
+            !date_dir.join(&roll2).exists(),
+            "roll sidecar 2 should be gone"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -532,7 +567,10 @@ mod k4_tests {
         let n = delete_session_files(&date_dir, target);
         assert_eq!(n, 2, "expected 2 target files removed, got {n}");
 
-        assert!(other_jsonl.exists(), "other session jsonl must be untouched");
+        assert!(
+            other_jsonl.exists(),
+            "other session jsonl must be untouched"
+        );
         assert!(other_meta.exists(), "other session meta must be untouched");
         assert!(other_roll.exists(), "other session roll must be untouched");
         assert!(unrelated.exists(), "unrelated file must be untouched");

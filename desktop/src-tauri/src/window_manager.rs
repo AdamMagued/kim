@@ -10,7 +10,10 @@ pub(crate) async fn show_main_window(app_handle: tauri::AppHandle) -> Result<(),
 }
 
 #[tauri::command]
-pub(crate) async fn set_task_active_mode(app_handle: tauri::AppHandle, active: bool) -> Result<(), String> {
+pub(crate) async fn set_task_active_mode(
+    app_handle: tauri::AppHandle,
+    active: bool,
+) -> Result<(), String> {
     let cancel_label = "cancel-widget";
     if active {
         // Hide main window
@@ -46,7 +49,9 @@ pub(crate) async fn set_task_active_mode(app_handle: tauri::AppHandle, active: b
                 let height = 50.0 * scale_factor;
                 let x = (size.width as f64 - width) / 2.0;
                 let y = size.height as f64 - height - (80.0 * scale_factor); // 80px from bottom
-                let _ = cancel_win.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x as i32, y as i32)));
+                let _ = cancel_win.set_position(tauri::Position::Physical(
+                    tauri::PhysicalPosition::new(x as i32, y as i32),
+                ));
             }
         }
     } else {

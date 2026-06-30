@@ -2,9 +2,9 @@
 //! sign-in window, payload collection, and one-shot bridge completion.
 //! Extracted from lib.rs (file-split restructure) — behavior unchanged.
 
+use base64::Engine as _;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use base64::Engine as _;
 use tauri::{Emitter, Listener, Manager};
 
 use crate::*;
@@ -35,8 +35,7 @@ pub(crate) fn open_browser_signin_window_with_visibility(
         return Err("URL cannot be empty.".to_string());
     }
 
-    let parsed = tauri::Url::parse(trimmed)
-        .map_err(|e| format!("Invalid URL: {}", e))?;
+    let parsed = tauri::Url::parse(trimmed).map_err(|e| format!("Invalid URL: {}", e))?;
     match parsed.scheme() {
         "https" | "http" => {}
         _ => return Err("Only http:// or https:// URLs are allowed.".to_string()),
@@ -77,18 +76,15 @@ pub(crate) fn open_browser_signin_window_with_visibility(
         .map(|name| format!("Kim Browser - {}", name))
         .unwrap_or_else(|| "Kim Browser".to_string());
 
-    let window = tauri::WebviewWindowBuilder::new(
-        app_handle,
-        label,
-        tauri::WebviewUrl::External(parsed),
-    )
-    .title(title)
-    .inner_size(1280.0, 860.0)
-    .resizable(true)
-    .visible(initially_visible)
-    .initialization_script(PERSISTENT_BRIDGE_JS)
-    .build()
-    .map_err(|e| format!("Failed to open Kim browser window: {}", e))?;
+    let window =
+        tauri::WebviewWindowBuilder::new(app_handle, label, tauri::WebviewUrl::External(parsed))
+            .title(title)
+            .inner_size(1280.0, 860.0)
+            .resizable(true)
+            .visible(initially_visible)
+            .initialization_script(PERSISTENT_BRIDGE_JS)
+            .build()
+            .map_err(|e| format!("Failed to open Kim browser window: {}", e))?;
 
     // If we built it invisible, immediately move it offscreen so that later
     // calls to `is_browser_window_offscreen` recognise it as hidden and so the
@@ -186,12 +182,20 @@ pub(crate) fn clean_bridge_progress_text(text: &str) -> Option<String> {
         return None;
     }
 
-    if cleaned.chars().filter(|ch| *ch == '{' || *ch == '}' || *ch == '\\').count() > 8 {
+    if cleaned
+        .chars()
+        .filter(|ch| *ch == '{' || *ch == '}' || *ch == '\\')
+        .count()
+        > 8
+    {
         return None;
     }
 
     if cleaned.len() > 280 {
-        let cut = (0..=277).rev().find(|&i| cleaned.is_char_boundary(i)).unwrap_or(0);
+        let cut = (0..=277)
+            .rev()
+            .find(|&i| cleaned.is_char_boundary(i))
+            .unwrap_or(0);
         cleaned.truncate(cut);
         cleaned.push_str("...");
     }
@@ -206,7 +210,11 @@ pub(crate) fn emit_bridge_progress(app_handle: &tauri::AppHandle, req_id: &str, 
 
     let progress_store = WEBVIEW_BRIDGE_PROGRESS.get_or_init(|| StdMutex::new(HashMap::new()));
     if let Ok(mut guard) = progress_store.lock() {
-        if guard.get(req_id).map(|last| last == &cleaned).unwrap_or(false) {
+        if guard
+            .get(req_id)
+            .map(|last| last == &cleaned)
+            .unwrap_or(false)
+        {
             return;
         }
         guard.insert(req_id.to_string(), cleaned.clone());
@@ -238,12 +246,15 @@ pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &ta
             let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
             if let Ok(mut guard) = store.lock() {
                 let sent_key = format!("{}_sent", ipc_event.req_id);
-                guard.insert(sent_key, BridgeCompleteResponse {
-                    ok: true,
-                    response: None,
-                    error: None,
-                    site: ipc_event.site,
-                });
+                guard.insert(
+                    sent_key,
+                    BridgeCompleteResponse {
+                        ok: true,
+                        response: None,
+                        error: None,
+                        site: ipc_event.site,
+                    },
+                );
             }
             // Wake up anyone waiting for the "sent" signal.
             notify_bridge_result();
@@ -257,12 +268,15 @@ pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &ta
             }
             let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
             if let Ok(mut guard) = store.lock() {
-                guard.insert(ipc_event.req_id.clone(), BridgeCompleteResponse {
-                    ok: true,
-                    response: ipc_event.response,
-                    error: None,
-                    site: ipc_event.site,
-                });
+                guard.insert(
+                    ipc_event.req_id.clone(),
+                    BridgeCompleteResponse {
+                        ok: true,
+                        response: ipc_event.response,
+                        error: None,
+                        site: ipc_event.site,
+                    },
+                );
             }
             notify_bridge_result();
         }
@@ -280,12 +294,15 @@ pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &ta
             }
             let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
             if let Ok(mut guard) = store.lock() {
-                guard.insert(ipc_event.req_id.clone(), BridgeCompleteResponse {
-                    ok: false,
-                    response: None,
-                    error: ipc_event.error,
-                    site: ipc_event.site,
-                });
+                guard.insert(
+                    ipc_event.req_id.clone(),
+                    BridgeCompleteResponse {
+                        ok: false,
+                        response: None,
+                        error: ipc_event.error,
+                        site: ipc_event.site,
+                    },
+                );
             }
             notify_bridge_result();
         }
@@ -308,10 +325,14 @@ pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &ta
                         .status()
                         .map(|s| s.success())
                         .unwrap_or(false);
-                    agent_debug_log("H1", "native_paste fired Cmd+V", serde_json::json!({
-                        "reqId": req_id,
-                        "ok": status,
-                    }));
+                    agent_debug_log(
+                        "H1",
+                        "native_paste fired Cmd+V",
+                        serde_json::json!({
+                            "reqId": req_id,
+                            "ok": status,
+                        }),
+                    );
                 });
             }
         }
@@ -323,17 +344,13 @@ pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &ta
 
 /// Wake up any thread waiting on WEBVIEW_BRIDGE_NOTIFY.
 pub(crate) fn notify_bridge_result() {
-    let (_, condvar) = WEBVIEW_BRIDGE_NOTIFY.get_or_init(|| {
-        (StdMutex::new(()), Condvar::new())
-    });
+    let (_, condvar) = WEBVIEW_BRIDGE_NOTIFY.get_or_init(|| (StdMutex::new(()), Condvar::new()));
     condvar.notify_all();
 }
-
 
 // build_bridge_complete_script deleted (#22): the persistent bridge (bridge.js) is
 // always loaded via initialization_script so the ~1000-line legacy inline-script
 // fallback was dead code.
-
 
 /// Condvar-based bridge payload collector.
 ///
@@ -348,9 +365,7 @@ pub(crate) fn collect_bridge_payload(
 ) -> Result<BridgeCompleteResponse, String> {
     let started = Instant::now();
     let result_store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
-    let (lock, condvar) = WEBVIEW_BRIDGE_NOTIFY.get_or_init(|| {
-        (StdMutex::new(()), Condvar::new())
-    });
+    let (lock, condvar) = WEBVIEW_BRIDGE_NOTIFY.get_or_init(|| (StdMutex::new(()), Condvar::new()));
 
     // For legacy fallback: if IPC isn't delivering, fall back to title polling
     let req_id_json = serde_json::to_string(req_id)
@@ -371,10 +386,16 @@ pub(crate) fn collect_bridge_payload(
                         serde_json::json!({ "reqId": req_id, "loops": ipc_wait_loops }),
                     );
                     // Also clean up progress and hidden-state entries
-                    if let Ok(mut pg) = WEBVIEW_BRIDGE_PROGRESS.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+                    if let Ok(mut pg) = WEBVIEW_BRIDGE_PROGRESS
+                        .get_or_init(|| StdMutex::new(HashMap::new()))
+                        .lock()
+                    {
                         pg.remove(req_id);
                     }
-                    if let Ok(mut hg) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
+                    if let Ok(mut hg) = WEBVIEW_WAS_HIDDEN
+                        .get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+                        .lock()
+                    {
                         hg.remove(req_id);
                     }
                     return Ok(payload);
@@ -396,10 +417,16 @@ pub(crate) fn collect_bridge_payload(
                 guard.remove(req_id);
                 guard.remove(&format!("{}_sent", req_id));
             }
-            if let Ok(mut pg) = WEBVIEW_BRIDGE_PROGRESS.get_or_init(|| StdMutex::new(HashMap::new())).lock() {
+            if let Ok(mut pg) = WEBVIEW_BRIDGE_PROGRESS
+                .get_or_init(|| StdMutex::new(HashMap::new()))
+                .lock()
+            {
                 pg.remove(req_id);
             }
-            if let Ok(mut hg) = WEBVIEW_WAS_HIDDEN.get_or_init(|| StdMutex::new(std::collections::HashSet::new())).lock() {
+            if let Ok(mut hg) = WEBVIEW_WAS_HIDDEN
+                .get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+                .lock()
+            {
                 hg.remove(req_id);
             }
             agent_debug_log(
@@ -616,11 +643,7 @@ pub(crate) fn run_bridge_completion_once(
         }),
     );
 
-    let result = collect_bridge_payload(
-        window,
-        &req_id,
-        Duration::from_secs(timeout_secs),
-    );
+    let result = collect_bridge_payload(window, &req_id, Duration::from_secs(timeout_secs));
 
     agent_debug_log(
         "H1",
@@ -647,11 +670,9 @@ pub(crate) fn run_bridge_completion_once(
     result
 }
 
-
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
-
 
 #[tauri::command]
 pub(crate) async fn open_browser_signin_window(
@@ -661,4 +682,3 @@ pub(crate) async fn open_browser_signin_window(
 ) -> Result<String, String> {
     open_browser_signin_window_impl(&url, provider_name, &app_handle)
 }
-

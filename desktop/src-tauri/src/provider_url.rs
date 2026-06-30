@@ -1,8 +1,8 @@
 // provider_url.rs — provider/site identity, URL classification, and meta-write helpers.
 // Extracted from lib.rs (file-split restructure) — behavior unchanged.
 
-use std::path::Path;
 use crate::*;
+use std::path::Path;
 
 pub(crate) fn normalize_site(site: &str) -> String {
     match site.trim().to_lowercase().as_str() {
@@ -20,7 +20,9 @@ pub(crate) fn host_matches_site(host: &str, site: &str) -> bool {
     let host = host.trim().trim_start_matches("www.").to_ascii_lowercase();
     match normalize_site(site).as_str() {
         "claude" => host == "claude.ai" || host.ends_with(".claude.ai"),
-        "chatgpt" => host == "chatgpt.com" || host == "chat.openai.com" || host.ends_with(".chatgpt.com"),
+        "chatgpt" => {
+            host == "chatgpt.com" || host == "chat.openai.com" || host.ends_with(".chatgpt.com")
+        }
         "gemini" => host == "gemini.google.com",
         "deepseek" => host == "chat.deepseek.com" || host.ends_with(".deepseek.com"),
         // x.com is Twitter's root domain, not Grok (#9).
@@ -45,7 +47,9 @@ pub(crate) fn browser_url_is_bad_for_commit(url: &str, site: &str) -> bool {
     if trimmed.is_empty() {
         return true;
     }
-    let Ok(parsed) = tauri::Url::parse(trimmed) else { return true; };
+    let Ok(parsed) = tauri::Url::parse(trimmed) else {
+        return true;
+    };
     if !matches!(parsed.scheme(), "https" | "http") {
         return true;
     }
@@ -72,7 +76,10 @@ pub(crate) fn browser_url_is_bad_for_commit(url: &str, site: &str) -> bool {
     match site_norm.as_str() {
         "claude" => normalized == "https://claude.ai" || normalized == "https://claude.ai/new",
         "chatgpt" => normalized == "https://chatgpt.com" || normalized == "https://chat.openai.com",
-        "gemini" => normalized == "https://gemini.google.com" || normalized == "https://gemini.google.com/app",
+        "gemini" => {
+            normalized == "https://gemini.google.com"
+                || normalized == "https://gemini.google.com/app"
+        }
         "deepseek" => normalized == "https://chat.deepseek.com",
         "grok" => normalized == "https://grok.com" || normalized == "https://grok.x.com",
         _ => true,
@@ -199,13 +206,17 @@ pub(crate) fn browser_restore_status_for_session(
     };
     let meta = read_browser_session_meta_from_dir(&date_dir, session_id).unwrap_or_default();
     let resolved_site = if site.is_empty() {
-        meta.browser_last_site.clone().unwrap_or_else(|| "claude".to_string())
+        meta.browser_last_site
+            .clone()
+            .unwrap_or_else(|| "claude".to_string())
     } else {
         site
     };
 
     match meta.browser_threads.get(&resolved_site) {
-        Some(url) if browser_url_allowed_for_restore(url, &resolved_site) => "stored_thread".to_string(),
+        Some(url) if browser_url_allowed_for_restore(url, &resolved_site) => {
+            "stored_thread".to_string()
+        }
         Some(_) => "stored_url_rejected".to_string(),
         None => "no_stored_url".to_string(),
     }

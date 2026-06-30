@@ -142,7 +142,10 @@ pub(crate) fn build_auth_probe_js(site: &str, req_id: &str, base_url: &str, toke
     )
 }
 
-pub(crate) fn parse_auth_response(site: &str, result: &BridgeCompleteResponse) -> ProviderAuthStatus {
+pub(crate) fn parse_auth_response(
+    site: &str,
+    result: &BridgeCompleteResponse,
+) -> ProviderAuthStatus {
     if !result.ok {
         return ProviderAuthStatus {
             provider: site.to_string(),
@@ -161,7 +164,10 @@ pub(crate) fn parse_auth_response(site: &str, result: &BridgeCompleteResponse) -
                 .and_then(|x| x.as_str())
                 .unwrap_or(site)
                 .to_string(),
-            signed_in: v.get("signed_in").and_then(|x| x.as_bool()).unwrap_or(false),
+            signed_in: v
+                .get("signed_in")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
             email: v.get("email").and_then(|x| x.as_str()).map(String::from),
             name: v.get("name").and_then(|x| x.as_str()).map(String::from),
             avatar: v.get("avatar").and_then(|x| x.as_str()).map(String::from),
@@ -184,8 +190,8 @@ pub(crate) async fn provider_check_auth(
     app_handle: tauri::AppHandle,
 ) -> Result<ProviderAuthStatus, String> {
     let site = normalize_site(&provider);
-    let origin = provider_origin(&site)
-        .ok_or_else(|| format!("Unsupported provider: {}", provider))?;
+    let origin =
+        provider_origin(&site).ok_or_else(|| format!("Unsupported provider: {}", provider))?;
 
     let cfg = WEBVIEW_BRIDGE_CFG
         .get()
@@ -256,7 +262,12 @@ pub(crate) async fn provider_check_auth(
 pub(crate) fn post_signin_url_patterns(site: &str) -> Vec<&'static str> {
     match site {
         "chatgpt" | "openai" => vec!["chatgpt.com/c/", "chatgpt.com/?", "chatgpt.com/g/"],
-        "claude" | "anthropic" => vec!["claude.ai/chat", "claude.ai/new", "claude.ai/chats", "claude.ai/projects"],
+        "claude" | "anthropic" => vec![
+            "claude.ai/chat",
+            "claude.ai/new",
+            "claude.ai/chats",
+            "claude.ai/projects",
+        ],
         "gemini" | "google" => vec!["gemini.google.com/app"],
         "deepseek" => vec!["chat.deepseek.com/a", "chat.deepseek.com/?"],
         "grok" => vec!["grok.com/chat", "grok.com/?"],
@@ -320,12 +331,7 @@ pub(crate) async fn provider_signin(
     let login_url = provider_login_url(&site)
         .ok_or_else(|| format!("No login URL configured for provider: {}", provider))?;
 
-    open_browser_signin_window_with_visibility(
-        &login_url,
-        Some(site.clone()),
-        true,
-        &app_handle,
-    )?;
+    open_browser_signin_window_with_visibility(&login_url, Some(site.clone()), true, &app_handle)?;
     // Force-show even if the window already existed and was hidden.
     show_browser_window_impl(&app_handle);
 
@@ -339,8 +345,8 @@ pub(crate) async fn provider_signout(
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
     let site = normalize_site(&provider);
-    let origin = provider_origin(&site)
-        .ok_or_else(|| format!("Unsupported provider: {}", provider))?;
+    let origin =
+        provider_origin(&site).ok_or_else(|| format!("Unsupported provider: {}", provider))?;
 
     // Each provider has its own logout flow; navigating the webview to the
     // logout endpoint causes the page to clear its auth cookies in-place.
@@ -366,4 +372,3 @@ pub(crate) async fn provider_signout(
 // ---------------------------------------------------------------------------
 // Chrome auto-launch for browser provider CDP
 // ---------------------------------------------------------------------------
-

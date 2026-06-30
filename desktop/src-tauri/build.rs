@@ -16,10 +16,7 @@ fn main() {
 
     if let Some(root) = project_root {
         if root.join("orchestrator").join("agent.py").exists() {
-            println!(
-                "cargo:rustc-env=KIM_COMPILE_TIME_ROOT={}",
-                root.display()
-            );
+            println!("cargo:rustc-env=KIM_COMPILE_TIME_ROOT={}", root.display());
         }
     }
 
