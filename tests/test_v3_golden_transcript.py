@@ -140,6 +140,10 @@ _TYPED_JSON_REQUIRED_KEYS: dict[str, list[str]] = {
     "rate_limited": ["delay", "attempt", "max_retries"],
     "hitl_approval_request": ["tool", "risk", "reason"],
     "hitl_approval_result": ["tool", "approved"],
+    "tool": ["name", "args"],
+    "answer": ["text"],
+    "diff": ["path", "added", "removed"],
+    "activity": ["kind", "text"],
 }
 
 _LEGACY_TEXT_PREFIXES = ("[TOOL] ", "[SUCCESS]", "[FAILED]")
@@ -191,22 +195,26 @@ class TestGoldenTranscriptCapture:
         )
 
     def test_golden_transcript_contains_tool_call(self):
-        """Legacy [TOOL] line must be present for take_screenshot."""
+        """Schema-generated tool event must be present for take_screenshot."""
         lines = _capture_run()
-        tool_lines = [ln for ln in lines if ln.startswith("[TOOL] ")]
+        tool_lines = [
+            json.loads(line)
+            for line in lines
+            if line.startswith("{") and json.loads(line).get("type") == "tool"
+        ]
         assert len(tool_lines) == 1
-        assert "take_screenshot" in tool_lines[0]
+        assert tool_lines[0]["name"] == "take_screenshot"
 
     def test_golden_transcript_contains_ui_events(self):
         """Screenshot flash and show events must bracket the tool call."""
         lines = _capture_run()
-        tool_idx = next(i for i, ln in enumerate(lines) if ln.startswith("[TOOL] "))
-        # screenshot_flash must appear AFTER [TOOL] (pre-execution signal)
+        tool_idx = next(i for i, line in enumerate(lines) if '"type":"tool"' in line)
+        # screenshot_flash must appear after the typed tool event (pre-execution signal)
         flash_indices = [i for i, ln in enumerate(lines) if '"type":"ui_screenshot_flash"' in ln]
         show_indices = [i for i, ln in enumerate(lines) if '"type":"ui_show"' in ln]
         assert flash_indices, "Expected ui_screenshot_flash event"
         assert show_indices, "Expected ui_show event"
-        # flash comes after [TOOL] line, show comes after flash
+        # flash comes after the tool event, show comes after flash
         assert any(idx > tool_idx for idx in flash_indices), "flash_idx should be > tool_idx"
         assert show_indices[0] > flash_indices[0], "ui_show should come after ui_screenshot_flash"
 

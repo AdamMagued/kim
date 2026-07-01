@@ -75,6 +75,7 @@ class _SpySessionStore:
         self.session_file = base_dir / f"{session_id}.jsonl"
         self.checkpoints: List[Dict[str, Any]] = []
         self.messages: List[dict] = []
+        self.context_state: Dict[str, Any] = {}
         self._checkpoint_raise = False
 
     def append_checkpoint(
@@ -112,10 +113,10 @@ class _SpySessionStore:
         pass
 
     def load_context_state(self) -> Optional[dict]:
-        return None
+        return dict(self.context_state)
 
     def save_context_state(self, state: dict) -> None:
-        pass
+        self.context_state = dict(state)
 
 
 def _make_task_complete_response(summary: str = "done") -> dict:
@@ -188,7 +189,7 @@ def _build_agent(spy_store: _SpySessionStore, provider_responses: list):
     agent._complete_run = lambda result: result
     agent._emit_context_snapshot = lambda: None
     agent._build_system_prompt = lambda task: "system"
-    agent._persist_context_state_extra = lambda **kw: None
+    agent._persist_context_state_extra = lambda *a, **kw: None
 
     agent.memory = ConversationMemory(
         max_messages=config["memory_max_messages"],
@@ -281,3 +282,56 @@ def test_checkpoint_consecutive_continues_included():
 
     # consecutive_continues starts at 0; checkpoint must record it.
     assert spy.checkpoints[0]["consecutive_continues"] == 0
+
+
+def test_track_context_usage_persists_real_snapshot_metadata():
+    with tempfile.TemporaryDirectory() as tmp:
+        spy = _SpySessionStore(Path(tmp))
+        agent = _build_agent(spy, [])
+
+        from orchestrator.agent import KimAgent
+        from orchestrator.context_meter import ContextMeter
+
+        agent._context_meter = ContextMeter(budget=1_000)
+        agent._persist_context_state_extra = KimAgent._persist_context_state_extra.__get__(agent, KimAgent)
+        agent._track_context_usage = KimAgent._track_context_usage.__get__(agent, KimAgent)
+        agent._print_context_json = lambda snapshot: None
+
+        agent._track_context_usage(
+            {"input": 120, "output": 33, "source": "browser_prompt", "estimated": True}
+        )
+
+        assert spy.context_state["last_input"] == 120
+        assert spy.context_state["last_output"] == 33
+        assert spy.context_state["source"] == "browser_prompt"
+        assert spy.context_state["estimated"] is True
+
+        agent._persist_context_state_extra({"needs_fresh_chat": False})
+
+        assert spy.context_state["last_input"] == 120
+        assert spy.context_state["last_output"] == 33
+        assert spy.context_state["source"] == "browser_prompt"
+        assert spy.context_state["needs_fresh_chat"] is False
+
+
+def test_resume_log_counts_only_real_conversation_messages():
+    with tempfile.TemporaryDirectory() as tmp:
+        spy = _SpySessionStore(Path(tmp))
+        agent = _build_agent(spy, [_make_task_complete_response()])
+        logs: list[str] = []
+        agent._log = lambda _level, msg: logs.append(msg)
+        agent._resume_session_id = "resume-1"
+
+        saved = [
+            {"type": "run_started", "task": "hello"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"type": "run_result", "termination": "task_complete"},
+        ]
+
+        with patch("orchestrator.agent.estimate_request_tokens", return_value=100), \
+             patch("orchestrator.agent.SessionStore.session_exists", return_value=True), \
+             patch("orchestrator.agent.SessionStore.load_session", return_value=saved):
+            _run(agent.run("continue"))
+
+    assert any("Resuming session resume-1 (2 messages)" in msg for msg in logs)

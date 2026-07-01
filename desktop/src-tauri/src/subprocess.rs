@@ -3,6 +3,158 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::State;
 
+fn forward_agent_stdout_line(
+    app: &tauri::AppHandle,
+    ipc_typed: bool,
+    is_codex: bool,
+    line: &str,
+) {
+    if ipc_typed {
+        if let Ok(event) = serde_json::from_str::<KimEvent>(line) {
+            match &event {
+                KimEvent::Status { message } => {
+                    let _ = app.emit("kim:status", serde_json::json!({"message": message}));
+                }
+                KimEvent::Plan { steps } => {
+                    let _ = app.emit("kim:plan", serde_json::json!({"steps": steps}));
+                }
+                KimEvent::Step { n, data } => {
+                    let _ = app.emit("kim:step", serde_json::json!({"n": n, "data": data}));
+                }
+                KimEvent::Done { n } => {
+                    let _ = app.emit("kim:done", serde_json::json!({"n": n}));
+                }
+                KimEvent::Context {
+                    cumulative_input,
+                    budget,
+                    phase,
+                    percent,
+                    last_input,
+                    last_output,
+                    source,
+                    estimate,
+                } => {
+                    let _ = app.emit(
+                        "kim:context",
+                        serde_json::json!({
+                            "cumulative_input": cumulative_input,
+                            "budget": budget,
+                            "phase": phase,
+                            "percent": percent,
+                            "last_input": last_input,
+                            "last_output": last_output,
+                            "source": source,
+                            "estimate": estimate,
+                        }),
+                    );
+                }
+                KimEvent::Stats {
+                    input,
+                    output,
+                    total,
+                } => {
+                    let _ = app.emit(
+                        "kim:stats",
+                        serde_json::json!({"input": input, "output": output, "total": total}),
+                    );
+                }
+                KimEvent::UiScreenshotFlash => {
+                    let _ = app.emit("kim:ui", serde_json::json!({"action": "screenshot_flash"}));
+                }
+                KimEvent::UiShow => {
+                    let _ = app.emit("kim:ui", serde_json::json!({"action": "show"}));
+                }
+                KimEvent::RunDone {
+                    termination,
+                    success,
+                } => {
+                    let _ = app.emit(
+                        "kim:run-done",
+                        serde_json::json!({"termination": termination, "success": success}),
+                    );
+                }
+                KimEvent::RunFailed {
+                    reason,
+                    recoverable,
+                    suggestion,
+                } => {
+                    let _ = app.emit(
+                        "kim:run-failed",
+                        serde_json::json!({
+                            "reason": reason,
+                            "recoverable": recoverable,
+                            "suggestion": suggestion,
+                        }),
+                    );
+                }
+                KimEvent::ProviderError { code, retryable } => {
+                    let _ = app.emit(
+                        "kim:provider-error",
+                        serde_json::json!({"code": code, "retryable": retryable}),
+                    );
+                }
+                KimEvent::RateLimited {
+                    delay,
+                    attempt,
+                    max_retries,
+                } => {
+                    let _ = app.emit(
+                        "kim:rate-limited",
+                        serde_json::json!({
+                            "delay": delay,
+                            "attempt": attempt,
+                            "max_retries": max_retries,
+                        }),
+                    );
+                }
+                KimEvent::HitlApprovalRequest {
+                    tool,
+                    risk,
+                    reason,
+                    preview,
+                } => {
+                    let _ = app.emit(
+                        "kim:hitl-approval-request",
+                        serde_json::json!({"tool": tool, "risk": risk, "reason": reason, "preview": preview}),
+                    );
+                }
+                KimEvent::HitlApprovalResult { tool, approved } => {
+                    let _ = app.emit(
+                        "kim:hitl-approval-result",
+                        serde_json::json!({"tool": tool, "approved": approved}),
+                    );
+                }
+                KimEvent::Tool { name, args } => {
+                    let _ = app.emit("kim:tool", serde_json::json!({"name": name, "args": args}));
+                }
+                KimEvent::Answer { text } => {
+                    let _ = app.emit("kim:answer", serde_json::json!({"text": text}));
+                }
+                KimEvent::Diff {
+                    path,
+                    added,
+                    removed,
+                } => {
+                    let _ = app.emit(
+                        "kim:diff",
+                        serde_json::json!({"path": path, "added": added, "removed": removed}),
+                    );
+                }
+                KimEvent::Activity { kind, text } => {
+                    let _ = app.emit(
+                        "kim:activity",
+                        serde_json::json!({"kind": kind, "text": text}),
+                    );
+                }
+            }
+        } else if is_codex {
+            let _ = app.emit("kim-agent-output", line);
+        }
+    } else {
+        let _ = app.emit("kim-agent-output", line);
+    }
+}
+
 /// Write the user's HITL approval decision to the running agent's stdin.
 /// Python's StdinApprovalBridge reads this line to unblock confirm_action().
 #[tauri::command]
@@ -26,70 +178,7 @@ pub(crate) async fn steer_task(text: String) -> Result<(), String> {
     rt.write_stdin_line(&msg).await
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum KimEvent {
-    Status {
-        message: String,
-    },
-    Plan {
-        steps: Vec<serde_json::Value>,
-    },
-    Step {
-        n: usize,
-        data: serde_json::Value,
-    },
-    Done {
-        n: usize,
-    },
-    Context {
-        cumulative_input: u64,
-        budget: u64,
-        phase: String,
-        percent: u32,
-        last_input: u64,
-        last_output: u64,
-        source: String,
-        estimate: bool,
-    },
-    Stats {
-        input: u64,
-        output: u64,
-        total: u64,
-    },
-    UiScreenshotFlash,
-    UiShow,
-    RunDone {
-        termination: String,
-        success: bool,
-    },
-    RunFailed {
-        reason: String,
-        recoverable: bool,
-        suggestion: String,
-    },
-    ProviderError {
-        code: String,
-        retryable: bool,
-    },
-    RateLimited {
-        delay: f64,
-        attempt: u32,
-        max_retries: u32,
-    },
-    HitlApprovalRequest {
-        tool: String,
-        risk: String,
-        reason: String,
-        // K6: optional preview (command / unified diff / URL+label).
-        #[serde(default)]
-        preview: String,
-    },
-    HitlApprovalResult {
-        tool: String,
-        approved: bool,
-    },
-}
+include!("events.gen.rs");
 
 /// Resolve a Python interpreter or bundled orchestrator sidecar.
 ///
@@ -841,130 +930,7 @@ pub(crate) async fn send_task(
         Some(tokio::spawn(async move {
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if ipc_typed {
-                    if let Ok(event) = serde_json::from_str::<KimEvent>(&line) {
-                        match &event {
-                            KimEvent::Status { message } => {
-                                let _ =
-                                    app.emit("kim:status", serde_json::json!({"message": message}));
-                            }
-                            KimEvent::Plan { steps } => {
-                                let _ = app.emit("kim:plan", serde_json::json!({"steps": steps}));
-                            }
-                            KimEvent::Step { n, data } => {
-                                let _ =
-                                    app.emit("kim:step", serde_json::json!({"n": n, "data": data}));
-                            }
-                            KimEvent::Done { n } => {
-                                let _ = app.emit("kim:done", serde_json::json!({"n": n}));
-                            }
-                            KimEvent::Context {
-                                cumulative_input,
-                                budget,
-                                phase,
-                                percent,
-                                last_input,
-                                last_output,
-                                source,
-                                estimate,
-                            } => {
-                                let _ = app.emit(
-                                    "kim:context",
-                                    serde_json::json!({
-                                        "cumulative_input": cumulative_input,
-                                        "budget": budget,
-                                        "phase": phase,
-                                        "percent": percent,
-                                        "last_input": last_input,
-                                        "last_output": last_output,
-                                        "source": source,
-                                        "estimate": estimate,
-                                    }),
-                                );
-                            }
-                            KimEvent::Stats {
-                                input,
-                                output,
-                                total,
-                            } => {
-                                let _ = app.emit("kim:stats", serde_json::json!({"input": input, "output": output, "total": total}));
-                            }
-                            KimEvent::UiScreenshotFlash => {
-                                let _ = app.emit(
-                                    "kim:ui",
-                                    serde_json::json!({"action": "screenshot_flash"}),
-                                );
-                            }
-                            KimEvent::UiShow => {
-                                let _ = app.emit("kim:ui", serde_json::json!({"action": "show"}));
-                            }
-                            KimEvent::RunDone {
-                                termination,
-                                success,
-                            } => {
-                                let _ = app.emit("kim:run-done", serde_json::json!({"termination": termination, "success": success}));
-                            }
-                            KimEvent::RunFailed {
-                                reason,
-                                recoverable,
-                                suggestion,
-                            } => {
-                                let _ = app.emit(
-                                    "kim:run-failed",
-                                    serde_json::json!({
-                                        "reason": reason,
-                                        "recoverable": recoverable,
-                                        "suggestion": suggestion,
-                                    }),
-                                );
-                            }
-                            KimEvent::ProviderError { code, retryable } => {
-                                let _ = app.emit(
-                                    "kim:provider-error",
-                                    serde_json::json!({"code": code, "retryable": retryable}),
-                                );
-                            }
-                            KimEvent::RateLimited {
-                                delay,
-                                attempt,
-                                max_retries,
-                            } => {
-                                let _ = app.emit(
-                                    "kim:rate-limited",
-                                    serde_json::json!({
-                                        "delay": delay,
-                                        "attempt": attempt,
-                                        "max_retries": max_retries,
-                                    }),
-                                );
-                            }
-                            KimEvent::HitlApprovalRequest {
-                                tool,
-                                risk,
-                                reason,
-                                preview,
-                            } => {
-                                let _ = app.emit("kim:hitl-approval-request", serde_json::json!({"tool": tool, "risk": risk, "reason": reason, "preview": preview}));
-                            }
-                            KimEvent::HitlApprovalResult { tool, approved } => {
-                                let _ = app.emit(
-                                    "kim:hitl-approval-result",
-                                    serde_json::json!({"tool": tool, "approved": approved}),
-                                );
-                            }
-                        }
-                    } else {
-                        // Not a typed KimEvent — forward on legacy channel for [TOOL] / [SUCCESS]
-                        // text lines that still come from the Kim-agent path (those do not JSON-parse
-                        // as KimEvent and carry real activity-feed content).
-                        let _ = app.emit("kim-agent-output", &line);
-                    }
-                } else {
-                    // Codex CLI subprocess path — all lines forwarded on the legacy channel.
-                    // Codex exec speaks item.completed JSONL + [STATUS] / [ANSWER] text protocol;
-                    // that output format is not under our control and cannot be schema-firsted.
-                    let _ = app.emit("kim-agent-output", &line);
-                }
+                forward_agent_stdout_line(&app, ipc_typed, is_codex, &line);
             }
         }))
     } else {
@@ -1297,6 +1263,20 @@ mod tests {
                 assert!(!approved);
             }
             _ => panic!("Expected HitlApprovalResult, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_generated_activity_events() {
+        let cases = [
+            r#"{"type":"tool","name":"read_file","args":{}}"#,
+            r#"{"type":"answer","text":"done"}"#,
+            r#"{"type":"diff","path":"main.rs","added":2,"removed":1}"#,
+            r#"{"type":"activity","kind":"error","text":"failed"}"#,
+        ];
+        for json in cases {
+            serde_json::from_str::<KimEvent>(json)
+                .unwrap_or_else(|error| panic!("generated event failed to decode: {error}"));
         }
     }
 

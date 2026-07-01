@@ -1,6 +1,6 @@
-// events.gen.ts — DO NOT HAND-EDIT
+// events.gen.ts -- DO NOT HAND-EDIT
 // Generated from desktop/src/types/events.schema.json via `npm run gen:events`.
-// To add/change an event: edit events.schema.json, then re-run the script.
+// To add or change an event, edit the schema and rerun the generator.
 
 /** All typed IPC event names emitted by the Kim agent. */
 export const KimEventNames = {
@@ -17,9 +17,77 @@ export const KimEventNames = {
   RATE_LIMITED: 'kim:rate-limited' as const,
   HITL_APPROVAL_REQUEST: 'kim:hitl-approval-request' as const,
   HITL_APPROVAL_RESULT: 'kim:hitl-approval-result' as const,
+  TOOL: 'kim:tool' as const,
+  ANSWER: 'kim:answer' as const,
+  DIFF: 'kim:diff' as const,
+  ACTIVITY: 'kim:activity' as const,
 } as const;
 
 export type KimEventName = (typeof KimEventNames)[keyof typeof KimEventNames];
+
+/** Legacy markers retained for the uncontrolled Codex compatibility stream. */
+export const LegacyLogTags = {
+  "[STATUS]": {
+    "tag": "[STATUS]",
+    "event": "kim:status"
+  },
+  "[PLAN]": {
+    "tag": "[PLAN]",
+    "event": "kim:plan"
+  },
+  "[STEP]": {
+    "tag": "[STEP]",
+    "event": "kim:step"
+  },
+  "[DONE]": {
+    "tag": "[DONE]",
+    "event": "kim:done"
+  },
+  "[CONTEXT]": {
+    "tag": "[CONTEXT]",
+    "event": "kim:context"
+  },
+  "[STATS]": {
+    "tag": "[STATS]",
+    "event": "kim:stats"
+  },
+  "[TOOL]": {
+    "tag": "[TOOL]",
+    "event": "kim:tool"
+  },
+  "[ANSWER]": {
+    "tag": "[ANSWER]",
+    "event": "kim:answer"
+  },
+  "[DIFF]": {
+    "tag": "[DIFF]",
+    "event": "kim:diff"
+  },
+  "[SUCCESS]": {
+    "tag": "[SUCCESS]",
+    "event": "kim:activity",
+    "kind": "success"
+  },
+  "[FAILED]": {
+    "tag": "[FAILED]",
+    "event": "kim:activity",
+    "kind": "error"
+  },
+  "[ERROR]": {
+    "tag": "[ERROR]",
+    "event": "kim:activity",
+    "kind": "error"
+  },
+  "TASK_COMPLETE:": {
+    "tag": "TASK_COMPLETE:",
+    "event": "kim:answer"
+  },
+  "NEED_HELP:": {
+    "tag": "NEED_HELP:",
+    "event": "kim:activity",
+    "kind": "error"
+  }
+} as const;
 
 /** A human-readable status message from the agent loop (activity feed item). */
 export interface KimStatusPayload {
@@ -138,6 +206,39 @@ export interface KimHitlApprovalResultPayload {
   /** True if the user approved the tool call. */
   approved: boolean;
 }
+
+/** A tool invocation shown in the live activity feed. */
+export interface KimToolPayload {
+  /** Canonical MCP tool name. */
+  name: string;
+  /** Tool arguments used to build the activity label. */
+  args: Record<string, unknown>;
+}
+
+/** A final assistant answer to append to the conversation. */
+export interface KimAnswerPayload {
+  /** Answer text without a legacy marker prefix. */
+  text: string;
+}
+
+/** Line-count summary for a file changed by a tool. */
+export interface KimDiffPayload {
+  /** Display-safe file basename. */
+  path: string;
+  /** Lines added. */
+  added: number;
+  /** Lines removed. */
+  removed: number;
+}
+
+/** A structured status, success, or error activity item. */
+export interface KimActivityPayload {
+  /** Activity severity and presentation kind. */
+  kind: 'status' | 'success' | 'error';
+  /** Human-readable activity text. */
+  text: string;
+}
+
 /** Discriminated union of all typed IPC events. */
 export type KimEvent =
   | { event: typeof KimEventNames.STATUS; payload: KimStatusPayload }
@@ -152,4 +253,45 @@ export type KimEvent =
   | { event: typeof KimEventNames.PROVIDER_ERROR; payload: KimProviderErrorPayload }
   | { event: typeof KimEventNames.RATE_LIMITED; payload: KimRateLimitedPayload }
   | { event: typeof KimEventNames.HITL_APPROVAL_REQUEST; payload: KimHitlApprovalRequestPayload }
-  | { event: typeof KimEventNames.HITL_APPROVAL_RESULT; payload: KimHitlApprovalResultPayload };
+  | { event: typeof KimEventNames.HITL_APPROVAL_RESULT; payload: KimHitlApprovalResultPayload }
+  | { event: typeof KimEventNames.TOOL; payload: KimToolPayload }
+  | { event: typeof KimEventNames.ANSWER; payload: KimAnswerPayload }
+  | { event: typeof KimEventNames.DIFF; payload: KimDiffPayload }
+  | { event: typeof KimEventNames.ACTIVITY; payload: KimActivityPayload };
+
+const KimWireEventMap = {
+  "status": { event: KimEventNames.STATUS },
+  "plan": { event: KimEventNames.PLAN },
+  "step": { event: KimEventNames.STEP },
+  "done": { event: KimEventNames.DONE },
+  "context": { event: KimEventNames.CONTEXT },
+  "stats": { event: KimEventNames.STATS },
+  "ui_screenshot_flash": { event: KimEventNames.UI, fixedPayload: {"action":"screenshot_flash"} },
+  "ui_show": { event: KimEventNames.UI, fixedPayload: {"action":"show"} },
+  "run_done": { event: KimEventNames.RUN_DONE },
+  "run_failed": { event: KimEventNames.RUN_FAILED },
+  "provider_error": { event: KimEventNames.PROVIDER_ERROR },
+  "rate_limited": { event: KimEventNames.RATE_LIMITED },
+  "hitl_approval_request": { event: KimEventNames.HITL_APPROVAL_REQUEST },
+  "hitl_approval_result": { event: KimEventNames.HITL_APPROVAL_RESULT },
+  "tool": { event: KimEventNames.TOOL },
+  "answer": { event: KimEventNames.ANSWER },
+  "diff": { event: KimEventNames.DIFF },
+  "activity": { event: KimEventNames.ACTIVITY },
+} as const;
+
+/** Decode one Python stdout JSON event using the schema-generated wire map. */
+export function decodeKimEventLine(raw: string): KimEvent | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const record = parsed as Record<string, unknown>;
+    if (typeof record.type !== 'string' || !(record.type in KimWireEventMap)) return null;
+    const mapping = KimWireEventMap[record.type as keyof typeof KimWireEventMap];
+    const { type: _type, ...payload } = record;
+    const fixedPayload = 'fixedPayload' in mapping ? mapping.fixedPayload : {};
+    return { event: mapping.event, payload: { ...payload, ...fixedPayload } } as KimEvent;
+  } catch {
+    return null;
+  }
+}

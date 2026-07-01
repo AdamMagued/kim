@@ -106,6 +106,15 @@ class ConversationMemory:
     def __len__(self) -> int:
         return len(self._messages)
 
+    @staticmethod
+    def count_conversation_messages(messages: list[dict]) -> int:
+        """Count real user/assistant turns in persisted session records."""
+        return sum(
+            1
+            for msg in messages
+            if msg.get("role") in {"user", "assistant"}
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

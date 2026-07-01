@@ -30,9 +30,7 @@ Programmatic usage:
 """
 
 import asyncio
-import base64
 import inspect
-import io
 import json
 import logging
 import os
@@ -63,6 +61,22 @@ from orchestrator.tool_errors import classify_tool_output
 from orchestrator.tool_risk import classify_tool_risk, coerce_hitl_bool
 from orchestrator.agent_states import AgentTermination, make_run_result, run_failure_event
 from orchestrator import stuck_detection as _stuck
+from orchestrator.events_gen import (
+    emit_context,
+    emit_diff,
+    emit_done,
+    emit_hitl_approval_request,
+    emit_hitl_approval_result,
+    emit_plan,
+    emit_provider_error,
+    emit_rate_limited,
+    emit_run_failed,
+    emit_stats,
+    emit_status,
+    emit_step,
+    emit_tool,
+    emit_ui,
+)
 
 load_dotenv()
 
@@ -196,6 +210,10 @@ class KimAgent:
         getattr(logger, _level, logger.info)(message)
         if self._ui_bridge:
             self._ui_bridge.log(level, message)
+        if message.startswith("[STATUS] "):
+            status = message[len("[STATUS] "):].strip()
+            if status and not status.startswith(("[PLAN]", "[STEP]", "[DONE]")):
+                emit_status(status)
 
     # In-memory plan state so we can dedupe across turns (the model may repeat
     # the PLAN block or the same STEP marker; we only want to emit each once).
@@ -252,7 +270,7 @@ class KimAgent:
                     self._last_step_signature = ""  # reset step dedupe on new plan
                     self._last_done_signature = ""
                     self._log("INFO", f"[STATUS] [PLAN]{sig}")
-                    print(json.dumps({"type": "plan", "steps": plan_payload["steps"]}, separators=(",", ":"), ensure_ascii=False), flush=True)
+                    emit_plan(plan_payload["steps"])
 
         # ── STEP markers ────────────────────────────────────────────────
         # Match the LAST step marker in this turn (the most recent one wins —
@@ -273,7 +291,7 @@ class KimAgent:
                 self._last_step_signature = sig
                 self._current_step_index = int(m.group(1))
                 self._log("INFO", f"[STATUS] [STEP]{sig}")
-                print(json.dumps({"type": "step", "n": step_payload["index"], "data": step_payload}, separators=(",", ":"), ensure_ascii=False), flush=True)
+                emit_step(step_payload["index"], step_payload)
 
         # ── DONE markers ────────────────────────────────────────────────
         done_matches = list(
@@ -290,7 +308,7 @@ class KimAgent:
             if sig != self._last_done_signature:
                 self._last_done_signature = sig
                 self._log("INFO", f"[STATUS] [DONE]{sig}")
-                print(json.dumps({"type": "done", "n": done_payload["index"]}, separators=(",", ":"), ensure_ascii=False), flush=True)
+                emit_done(done_payload["index"])
 
     def _is_preview_mode(self) -> bool:
         if self._ui_bridge is not None:
@@ -331,7 +349,7 @@ class KimAgent:
                 f" output_tokens={output_tokens}"
                 f" total_tokens={total}",
             )
-            print(json.dumps({"type": "stats", "input": input_tokens, "output": output_tokens, "total": total}, separators=(",", ":"), ensure_ascii=False), flush=True)
+            emit_stats(input_tokens, output_tokens, total)
 
         if usage:
             try:
@@ -347,7 +365,10 @@ class KimAgent:
         )
         if snapshot is None:
             return
-        self._persist_context_state_extra({"needs_fresh_chat": self._clear_chat_on_next_call})
+        self._persist_context_state_extra(
+            {"needs_fresh_chat": self._clear_chat_on_next_call},
+            snapshot=snapshot,
+        )
         self._log("INFO", snapshot.to_log_line())
         self._print_context_json(snapshot)
 
@@ -358,24 +379,35 @@ class KimAgent:
 
     def _print_context_json(self, snapshot: ContextSnapshot) -> None:
         """Emit a typed JSON context line to stdout for the Rust typed-IPC parser."""
-        print(json.dumps(
-            {
-                "type": "context",
-                "cumulative_input": snapshot.cumulative_input,
-                "budget": snapshot.budget,
-                "phase": snapshot.phase,
-                "percent": int(round(snapshot.ratio * 100)),
-                "last_input": snapshot.last_input,
-                "last_output": snapshot.last_output,
-                "source": snapshot.source,
-                "estimate": snapshot.estimated,
-            },
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ), flush=True)
+        emit_context(
+            snapshot.cumulative_input,
+            snapshot.budget,
+            snapshot.phase,
+            int(round(snapshot.ratio * 100)),
+            snapshot.last_input,
+            snapshot.last_output,
+            snapshot.source,
+            snapshot.estimated,
+        )
 
-    def _persist_context_state_extra(self, extra: Optional[Dict[str, Any]] = None) -> None:
-        state = self._context_meter.to_metadata()
+    def _persist_context_state_extra(
+        self,
+        extra: Optional[Dict[str, Any]] = None,
+        *,
+        snapshot: Optional[ContextSnapshot] = None,
+    ) -> None:
+        state: Dict[str, Any] = {}
+        if snapshot is not None:
+            state = self._context_meter.to_metadata(snapshot)
+        else:
+            try:
+                loaded = self._session_store.load_context_state()
+                if isinstance(loaded, dict):
+                    state = dict(loaded)
+            except Exception:
+                state = {}
+            if not state:
+                state = self._context_meter.to_metadata()
         if extra:
             state.update(extra)
         try:
@@ -406,14 +438,7 @@ class KimAgent:
         for text in pending:
             self.memory.add_user(f"[User steering mid-run]: {text}")
             try:
-                print(
-                    json.dumps(
-                        {"type": "status", "message": f"steering noted: {text[:60]}"},
-                        separators=(",", ":"),
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
+                emit_status(f"steering noted: {text[:60]}")
             except Exception:
                 pass
 
@@ -434,7 +459,7 @@ class KimAgent:
             pass  # logging must never crash startup
 
         self._log("INFO", f"=== Starting task: {task!r} ===")
-        print(json.dumps({"type": "status", "message": "Kim is working on it…"}, separators=(",", ":"), ensure_ascii=False), flush=True)
+        emit_status("Kim is working on it…")
         # K3: start the shared stdin pump so mid-run steer lines are captured.
         import os as _os_run
         if _os_run.environ.get("KIM_TAURI_MODE") == "1":
@@ -482,7 +507,11 @@ class KimAgent:
                     warn_if_missing=False,
                 )
                 if saved:
-                    self._log("INFO", f"Resuming session {self._resume_session_id} ({len(saved)} messages)")
+                    resumed_count = ConversationMemory.count_conversation_messages(saved)
+                    self._log(
+                        "INFO",
+                        f"Resuming session {self._resume_session_id} ({resumed_count} messages)",
+                    )
                     self.memory.load_from_messages(saved)
                 else:
                     self._log("WARN", f"Session {self._resume_session_id} exists but had no readable messages")
@@ -642,7 +671,7 @@ class KimAgent:
                 # Typed JSON line — parsed by KimEvent::ProviderError in Rust and
                 # forwarded as kim:provider-error to the frontend.  retryable=False
                 # because this path is only reached after all retry attempts are exhausted.
-                print(json.dumps({"type": "provider_error", "code": provider_error.code, "retryable": False}, separators=(",", ":"), ensure_ascii=False), flush=True)
+                emit_provider_error(provider_error.code, False)
                 self._log("ERROR", f"Provider error (all retries exhausted): {e}")
                 self._last_provider_error_code = provider_error.code
                 need_help = f"NEED_HELP: LLM provider call failed after retries: {e}"
@@ -710,7 +739,8 @@ class KimAgent:
             self._log("INFO", f"Normalized tool name '{raw_tool_name}' -> '{tool_name}'")
         _arg_keys = list(tool_args.keys()) if isinstance(tool_args, dict) else []
         self._log("TOOL", f"{tool_name}(keys={_arg_keys})")
-        print(f"[TOOL] {tool_name}(keys={_arg_keys})", flush=True)
+        # Keep the live feed metadata-only; tool args can contain user secrets.
+        emit_tool(tool_name, {})
 
         # Model tried to call task_complete as a tool — treat it as TASK_COMPLETE: text
         if tool_name in ("task_complete", "TASK_COMPLETE"):
@@ -881,7 +911,7 @@ class KimAgent:
             tool_args = _json_call['args']
             _tj_arg_keys = list(tool_args.keys()) if isinstance(tool_args, dict) else []
             self._log("TOOL", f"{tool_name}(keys={_tj_arg_keys}) [text-json]")
-            print(f"[TOOL] {tool_name}(keys={_tj_arg_keys})", flush=True)
+            emit_tool(tool_name, {})
             self._run_consecutive_continues = 0
             # Preview gate — same as native tool calls (#27)
             if self._is_preview_mode() and self._ui_bridge:
@@ -1130,19 +1160,14 @@ class KimAgent:
             _hitl_risk = classify_tool_risk(name, args or {})
             _ord = {"high": 2, "medium": 1, "low": 0}
             if _ord.get(_hitl_risk["level"], 0) >= _ord.get(self._hitl_risk_threshold, 99):
-                print(json.dumps({
-                    "type": "hitl_approval_request",
-                    "tool": name,
-                    "risk": _hitl_risk["level"],
-                    "reason": _hitl_risk["reason"],
-                    "preview": self._build_approval_preview(name, args or {}),
-                }, separators=(",", ":"), ensure_ascii=False), flush=True)
+                emit_hitl_approval_request(
+                    name,
+                    _hitl_risk["level"],
+                    _hitl_risk["reason"],
+                    self._build_approval_preview(name, args or {}),
+                )
                 _hitl_interactively_approved = await self._ui_bridge.confirm_action(name, args or {})
-                print(json.dumps({
-                    "type": "hitl_approval_result",
-                    "tool": name,
-                    "approved": _hitl_interactively_approved,
-                }, separators=(",", ":"), ensure_ascii=False), flush=True)
+                emit_hitl_approval_result(name, _hitl_interactively_approved)
                 if not _hitl_interactively_approved:
                     return (
                         f"HITL_DENIED: User denied '{name}' ({_hitl_risk['reason']}). "
@@ -1187,7 +1212,7 @@ class KimAgent:
         if _is_screenshot:
             # SCREENSHOT_FLASH tells ChatView to trigger the aura animation AND
             # hide only the main window (not the flash overlay window).
-            print(json.dumps({"type": "ui_screenshot_flash"}, separators=(",", ":"), ensure_ascii=False), flush=True)
+            emit_ui("screenshot_flash")
             if self._ui_bridge:
                 try:
                     await self._ui_bridge.hide_for_screenshot()
@@ -1215,7 +1240,7 @@ class KimAgent:
             output = f"ERROR calling {name}: {e}"
         finally:
             if _is_screenshot:
-                print(json.dumps({"type": "ui_show"}, separators=(",", ":"), ensure_ascii=False), flush=True)
+                emit_ui("show")
                 if self._ui_bridge:
                     try:
                         await self._ui_bridge.show_after_screenshot()
@@ -1249,6 +1274,7 @@ class KimAgent:
                 import os as _os
                 basename = _os.path.basename(_file_path)
                 self._log("INFO", f"[DIFF] path={basename} +{added} -{removed} duration_ms={duration_ms}")
+                emit_diff(basename, added, removed)
             except (OSError, IOError):
                 pass
 
@@ -1392,12 +1418,7 @@ class KimAgent:
                     f"{type(e).__name__}: {e} ({provider_error.code}) — retrying in {delay:.1f}s",
                 )
                 # Emit typed event so the frontend can show "Rate-limited, retrying in Xs..."
-                print(json.dumps({
-                    "type": "rate_limited",
-                    "delay": round(delay, 1),
-                    "attempt": attempt,
-                    "max_retries": self._max_retries,
-                }, separators=(",", ":"), ensure_ascii=False), flush=True)
+                emit_rate_limited(round(delay, 1), attempt, self._max_retries)
                 # Do NOT sleep on the final attempt — the raise immediately follows (#31)
                 if attempt < self._max_retries:
                     await asyncio.sleep(delay)
@@ -1436,7 +1457,11 @@ class KimAgent:
                         provider_error_code=provider_code,
                     )
                     if event:
-                        print(json.dumps(event, separators=(",", ":"), ensure_ascii=False), flush=True)
+                        emit_run_failed(
+                            event["reason"],
+                            event["recoverable"],
+                            event["suggestion"],
+                        )
             except Exception as _rf_err:
                 logger.debug("run_failed event emit failed: %s", _rf_err)
 
@@ -1771,7 +1796,7 @@ Rules:
         compacted_at = datetime.now(timezone.utc).isoformat()
         snapshot = self._context_meter.reset_after_compact(compacted_at=compacted_at)
         self._clear_chat_on_next_call = True
-        self._persist_context_state_extra({"needs_fresh_chat": True})
+        self._persist_context_state_extra({"needs_fresh_chat": True}, snapshot=snapshot)
         self._log("INFO", snapshot.to_log_line())
         self._print_context_json(snapshot)
 
@@ -1881,6 +1906,7 @@ from orchestrator.compact_prompt import _build_compact_prompt, _parse_compact_js
 # ---------------------------------------------------------------------------
 # Convenience context manager
 # ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def mcp_agent_context(

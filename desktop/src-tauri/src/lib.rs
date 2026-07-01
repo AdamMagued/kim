@@ -295,18 +295,24 @@ fn clear_provider_webview_chat(
     Ok(())
 }
 
-fn is_bridge_task_running() -> bool {
-    tauri::async_runtime::block_on(async {
-        let mut rt = crate::task_runtime::task_runtime().lock().await;
-        match rt.pid {
-            Some(pid) if process_exists(pid) => true,
-            Some(_) => {
-                rt.clear();
-                false
-            }
-            None => false,
+async fn is_bridge_task_running_async() -> bool {
+    let mut rt = crate::task_runtime::task_runtime().lock().await;
+    match rt.pid {
+        Some(pid) if process_exists(pid) => true,
+        Some(_) => {
+            rt.clear();
+            false
         }
-    })
+        None => false,
+    }
+}
+
+fn is_bridge_task_running() -> bool {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| tauri::async_runtime::block_on(is_bridge_task_running_async()))
+    } else {
+        tauri::async_runtime::block_on(is_bridge_task_running_async())
+    }
 }
 
 fn should_keep_browser_visible() -> bool {
@@ -800,7 +806,7 @@ async fn restore_browser_for_session(
     app_handle: tauri::AppHandle,
 ) -> Result<BrowserRestoreResult, String> {
     validate_session_id(&session_id)?;
-    if is_bridge_task_running() {
+    if is_bridge_task_running_async().await {
         return Err("Cannot restore provider browser while Kim is running a task.".to_string());
     }
 

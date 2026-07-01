@@ -80,7 +80,7 @@ def _exclusive_lock(lock_path: Path, timeout: float = _LOCK_TIMEOUT):
                 fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.close(fd)
                 break
-            except FileExistsError:
+            except (FileExistsError, PermissionError):
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         f"cron_store: could not acquire lock {lock_path} within {timeout}s"

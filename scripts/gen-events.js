@@ -1,81 +1,224 @@
 #!/usr/bin/env node
-/**
- * Generates desktop/src/types/events.gen.ts from desktop/src/types/events.schema.json.
- * Run via: npm run gen:events  (from desktop/)  or  node scripts/gen-events.js (from repo root)
- *
- * CI drift check: node scripts/gen-events.js && git diff --exit-code desktop/src/types/events.gen.ts
- */
+/** Generate TypeScript, Rust, and Python IPC bindings from events.schema.json. */
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(__dirname, '..');
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(scriptDir, '..');
 const schemaPath = resolve(repoRoot, 'desktop/src/types/events.schema.json');
-const outPath = resolve(repoRoot, 'desktop/src/types/events.gen.ts');
+const tsOutPath = resolve(repoRoot, 'desktop/src/types/events.gen.ts');
+const rustOutPath = resolve(repoRoot, 'desktop/src-tauri/src/events.gen.rs');
+const pythonOutPath = resolve(repoRoot, 'orchestrator/events_gen.py');
 
 const schema = JSON.parse(readFileSync(schemaPath, 'utf8'));
 const events = schema.events;
-
-// ── helpers ────────────────────────────────────────────────────────────────
+const legacyTags = schema.legacyTags ?? [];
 
 function toConstKey(event) {
-  // "kim:run-done" → "RUN_DONE"
   return event.replace(/^kim:/, '').replace(/-/g, '_').toUpperCase();
 }
 
-function renderType(fieldType) {
-  // The schema's "type" field is a verbatim TypeScript type string — pass it through.
-  return fieldType;
+function wireType(event) {
+  return event.wireType ?? event.event.replace(/^kim:/, '').replace(/-/g, '_');
 }
 
-function renderInterface(ev) {
-  const lines = [`export interface ${ev.typeName}Payload {`];
-  for (const [key, def] of Object.entries(ev.payload)) {
+function renderInterface(event) {
+  const lines = [`export interface ${event.typeName}Payload {`];
+  for (const [key, def] of Object.entries(event.payload)) {
     if (def.description) lines.push(`  /** ${def.description} */`);
-    lines.push(`  ${key}: ${renderType(def.type)};`);
+    lines.push(`  ${key}${def.optional ? '?' : ''}: ${def.type};`);
   }
   lines.push('}');
   return lines.join('\n');
 }
 
-// ── generate ───────────────────────────────────────────────────────────────
-
-const header = `\
-// events.gen.ts — DO NOT HAND-EDIT
+const tsHeader = `// events.gen.ts -- DO NOT HAND-EDIT
 // Generated from desktop/src/types/events.schema.json via \`npm run gen:events\`.
-// To add/change an event: edit events.schema.json, then re-run the script.
+// To add or change an event, edit the schema and rerun the generator.
 `;
-
-const eventNames = events.map(ev =>
-  `  ${toConstKey(ev.event)}: '${ev.event}' as const,`
+const tsNames = events.map(event =>
+  `  ${toConstKey(event.event)}: '${event.event}' as const,`
 ).join('\n');
-
-const constBlock = `\
+const tsInterfaces = events.map(event => {
+  const comment = event.description ? `/** ${event.description} */\n` : '';
+  return comment + renderInterface(event);
+}).join('\n\n');
+const tsUnion = events.map(event =>
+  `  | { event: typeof KimEventNames.${toConstKey(event.event)}; payload: ${event.typeName}Payload }`
+).join('\n');
+const tsWireEntries = events.flatMap(event => {
+  if (event.wireVariants) {
+    return event.wireVariants.map(variant =>
+      `  ${JSON.stringify(variant.type)}: { event: KimEventNames.${toConstKey(event.event)}, fixedPayload: ${JSON.stringify(variant.payload)} },`
+    );
+  }
+  return [`  ${JSON.stringify(wireType(event))}: { event: KimEventNames.${toConstKey(event.event)} },`];
+}).join('\n');
+const tsOut = `${tsHeader}
 /** All typed IPC event names emitted by the Kim agent. */
 export const KimEventNames = {
-${eventNames}
+${tsNames}
 } as const;
 
 export type KimEventName = (typeof KimEventNames)[keyof typeof KimEventNames];
-`;
 
-const interfaces = events.map(ev => {
-  const comment = ev.description ? `/** ${ev.description} */\n` : '';
-  return comment + renderInterface(ev);
-}).join('\n\n');
+/** Legacy markers retained for the uncontrolled Codex compatibility stream. */
+export const LegacyLogTags = ${JSON.stringify(Object.fromEntries(legacyTags.map(item => [item.tag, item])), null, 2)} as const;
 
-const unionEntries = events.map(ev =>
-  `  | { event: typeof KimEventNames.${toConstKey(ev.event)}; payload: ${ev.typeName}Payload }`
-).join('\n');
+${tsInterfaces}
 
-const unionBlock = `\
 /** Discriminated union of all typed IPC events. */
 export type KimEvent =
-${unionEntries};
+${tsUnion};
+
+const KimWireEventMap = {
+${tsWireEntries}
+} as const;
+
+/** Decode one Python stdout JSON event using the schema-generated wire map. */
+export function decodeKimEventLine(raw: string): KimEvent | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const record = parsed as Record<string, unknown>;
+    if (typeof record.type !== 'string' || !(record.type in KimWireEventMap)) return null;
+    const mapping = KimWireEventMap[record.type as keyof typeof KimWireEventMap];
+    const { type: _type, ...payload } = record;
+    const fixedPayload = 'fixedPayload' in mapping ? mapping.fixedPayload : {};
+    return { event: mapping.event, payload: { ...payload, ...fixedPayload } } as KimEvent;
+  } catch {
+    return null;
+  }
+}
 `;
 
-const out = [header, constBlock, interfaces, unionBlock].join('\n');
-writeFileSync(outPath, out, 'utf8');
-console.log(`✓ Generated ${outPath}`);
+function snakeToPascal(value) {
+  return value.split('_').map(part => part.charAt(0).toUpperCase() + part.slice(1)).join('');
+}
+
+function rustType(def) {
+  if (def.rustType) return def.rustType;
+  if (def.type === 'string' || def.type.startsWith("'")) return 'String';
+  if (def.type === 'boolean') return 'bool';
+  if (def.type === 'number') return 'f64';
+  if (def.type === 'unknown[]') return 'Vec<serde_json::Value>';
+  return 'serde_json::Value';
+}
+
+function rustVariant(name, payload, fixed = false) {
+  const variant = snakeToPascal(name);
+  if (fixed || Object.keys(payload).length === 0) return `    ${variant},`;
+  const fields = Object.entries(payload).map(([key, def]) => {
+    const attrs = def.default ? '        #[serde(default)]\n' : '';
+    return `${attrs}        ${key}: ${rustType(def)},`;
+  }).join('\n');
+  return `    ${variant} {\n${fields}\n    },`;
+}
+
+const rustVariants = events.flatMap(event => {
+  if (event.wireVariants) {
+    return event.wireVariants.map(variant => rustVariant(variant.type, {}, true));
+  }
+  return [rustVariant(wireType(event), event.payload)];
+}).join('\n');
+const rustOut = `// events.gen.rs -- DO NOT HAND-EDIT
+// Generated from desktop/src/types/events.schema.json via npm run gen:events.
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum KimEvent {
+${rustVariants}
+}
+`;
+
+function pyName(event) {
+  return event.replace(/^kim:/, '').replace(/-/g, '_');
+}
+
+function pyParam([key, def]) {
+  const annotation = def.type === 'string' || def.type.startsWith("'") ? 'str'
+    : def.type === 'boolean' ? 'bool'
+    : def.type === 'number' ? 'float'
+    : def.type === 'unknown[]' ? 'list[object]'
+    : 'dict[str, object]';
+  return `${key}: ${annotation}${def.optional ? " = ''" : ''}`;
+}
+
+function renderPyEmitter(event) {
+  const name = pyName(event.event);
+  const params = Object.entries(event.payload).map(pyParam).join(', ');
+  if (event.wireVariants) {
+    const choices = event.wireVariants.map(variant => {
+      const value = Object.values(variant.payload)[0];
+      return `        ${JSON.stringify(value)}: ${JSON.stringify(variant.type)},`;
+    }).join('\n');
+    return `def emit_${name}(${params}) -> None:\n    wire_type = {\n${choices}\n    }[action]\n    emit_event(wire_type)`;
+  }
+  const fields = Object.keys(event.payload).map(key => `${key}=${key}`).join(', ');
+  return `def emit_${name}(${params}) -> None:\n    emit_event(${JSON.stringify(wireType(event))}${fields ? `, ${fields}` : ''})`;
+}
+
+const pyConstants = events.map(event => `${toConstKey(event.event)} = ${JSON.stringify(event.event)}`).join('\n');
+const pyLegacy = legacyTags.map(item => `    ${JSON.stringify(item.tag)}: ${JSON.stringify(item)},`).join('\n');
+const pyEmitters = events.map(renderPyEmitter).join('\n\n\n');
+const pythonOut = `# flake8: noqa
+# events_gen.py -- DO NOT HAND-EDIT
+# Generated from desktop/src/types/events.schema.json via npm run gen:events.
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from typing import Any
+
+${pyConstants}
+
+LEGACY_LOG_TAGS = {
+${pyLegacy}
+}
+
+
+def emit_event(event_type: str, **payload: Any) -> None:
+    line = json.dumps({"type": event_type, **payload}, separators=(",", ":"), ensure_ascii=False)
+    data = (line + "\\n").encode("utf-8", errors="replace")
+
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        try:
+            buffer.write(data)
+            buffer.flush()
+            return
+        except OSError:
+            pass
+
+    try:
+        os.write(sys.stdout.fileno(), data)
+        return
+    except (AttributeError, OSError, ValueError):
+        pass
+
+    try:
+        sys.stdout.write(line + "\\n")
+        sys.stdout.flush()
+        return
+    except Exception:
+        pass
+
+    fallback = getattr(sys.__stdout__, "buffer", None)
+    if fallback is not None:
+        fallback.write(data)
+        fallback.flush()
+
+
+${pyEmitters}
+`;
+
+writeFileSync(tsOutPath, tsOut, 'utf8');
+writeFileSync(rustOutPath, rustOut, 'utf8');
+writeFileSync(pythonOutPath, pythonOut, 'utf8');
+console.log(`Generated ${tsOutPath}`);
+console.log(`Generated ${rustOutPath}`);
+console.log(`Generated ${pythonOutPath}`);

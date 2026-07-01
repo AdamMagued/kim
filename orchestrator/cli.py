@@ -10,13 +10,13 @@ Usage:
 """
 
 import argparse
-import json
 import logging
 import sys
 import tempfile
 from pathlib import Path
 
 from orchestrator.agent_config import DEFAULT_PROVIDER
+from orchestrator.events_gen import emit_answer, emit_run_done
 
 
 def resolve_log_dir() -> Path:
@@ -113,8 +113,13 @@ async def _cli_main(args: argparse.Namespace) -> None:
     # Typed JSON line: parsed by KimEvent::RunDone in Rust subprocess.rs and
     # forwarded as kim:run-done to the frontend.  Emitted before the human-readable
     # [STATUS] line so Rust sees it while the process is still running.
-    run_done = {"type": "run_done", "termination": termination, "success": bool(result["success"])}
-    print(json.dumps(run_done, separators=(",", ":"), ensure_ascii=False), flush=True)
+    emit_run_done(termination, bool(result["success"]))
+    if result["success"]:
+        answer = str(result.get("summary", "")).strip()
+        if answer.upper().startswith("TASK_COMPLETE:"):
+            answer = answer[len("TASK_COMPLETE:"):].strip()
+        if answer:
+            emit_answer(answer)
     # Human-readable line for legacy kim-agent-output path and activity feed.
     print(f"[STATUS] run ended: {termination}", flush=True)
     print(f"\n[{status}] {result['summary']}")

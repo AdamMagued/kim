@@ -4,7 +4,27 @@ import { invoke } from '@tauri-apps/api/core';
 import type { ActivityItem, PendingTask, HitlApprovalStatus, LivePlanParsed } from '../components/chat/types';
 import type { SessionInfo, Settings } from '../types';
 import { parseAgentLine, buildThinkingTrace } from '../components/chat/parsers';
-import { parsePlanFromActivity, browserSiteFromProvider } from '../components/chat/utils';
+import { browserSiteFromProvider, friendlyError, TOOL_MAP } from '../components/chat/utils';
+import {
+  KimEventNames,
+  type KimActivityPayload,
+  type KimAnswerPayload,
+  type KimContextPayload,
+  type KimDiffPayload,
+  type KimDonePayload,
+  type KimHitlApprovalRequestPayload,
+  type KimHitlApprovalResultPayload,
+  type KimPlanPayload,
+  type KimProviderErrorPayload,
+  type KimRateLimitedPayload,
+  type KimRunDonePayload,
+  type KimRunFailedPayload,
+  type KimStatsPayload,
+  type KimStatusPayload,
+  type KimStepPayload,
+  type KimToolPayload,
+  type KimUiPayload,
+} from '../types/events.gen';
 
 const MAX_ACTIVITY_ITEMS = 300;
 
@@ -334,6 +354,26 @@ export function useChatStream({
     }
   }, [isDuplicate, isDuplicateActivityItem, enqueueActivityUpdate]);
 
+  const appendTypedActivity = useCallback((kind: ActivityItem['kind'], text: string) => {
+    const cleanText = text.trim();
+    if (!cleanText) return;
+    const item: ActivityItem = {
+      id: ++activityCounterRef.current,
+      kind,
+      icon: kind === 'error' ? '⚠' : kind === 'success' ? '✓' : '›',
+      text: cleanText,
+    };
+    if (isDuplicateActivityItem(item)) return;
+    enqueueActivityUpdate(prev => {
+      if (kind === 'success') return prev;
+      if (kind === 'status' && prev.length > 0 && prev[prev.length - 1].kind === 'status') {
+        return [...prev.slice(0, -1), item];
+      }
+      const next = [...prev, item];
+      return next.length > MAX_ACTIVITY_ITEMS ? next.slice(-MAX_ACTIVITY_ITEMS) : next;
+    });
+  }, [enqueueActivityUpdate, isDuplicateActivityItem]);
+
   // ── Event Listener Wiring ─────────────────────────────────────────────────
   useEffect(() => {
     // Fix 2: track whether this effect instance has been cleaned up so that
@@ -358,22 +398,26 @@ export function useChatStream({
     let unlistenTypedPlan: (() => void) | undefined;
     let unlistenTypedStep: (() => void) | undefined;
     let unlistenTypedDone: (() => void) | undefined;
+    let unlistenTypedTool: (() => void) | undefined;
+    let unlistenTypedAnswer: (() => void) | undefined;
+    let unlistenTypedDiff: (() => void) | undefined;
+    let unlistenTypedActivity: (() => void) | undefined;
     let unlistenRunId: (() => void) | undefined;
 
-    // Typed IPC listeners (kim:* events). The live plan/status UI now prefers
-    // these typed events first; the legacy stdout parser remains only as a
-    // compatibility fallback for older non-typed streams.
-    listen<{ message: string }>('kim:status', e => {
+    // Typed IPC listeners own Kim's UI state. The raw listener below remains
+    // exclusively for the external Codex JSONL/text compatibility stream.
+    listen<KimStatusPayload>(KimEventNames.STATUS, e => {
       setTypedStatus(e.payload.message);
+      appendTypedActivity('status', e.payload.message);
     }).then(fn => { if (!cancelled) unlistenTypedStatus = fn; else fn(); });
 
-    listen<{ steps: unknown[] }>('kim:plan', e => {
+    listen<KimPlanPayload>(KimEventNames.PLAN, e => {
       const steps = e.payload.steps.filter((step): step is string => typeof step === 'string').slice(0, 12);
       if (steps.length < 2) return;
       setTypedLivePlan({ steps, activeStep: 0, doneSteps: [], structured: true });
     }).then(fn => { if (!cancelled) unlistenTypedPlan = fn; else fn(); });
 
-    listen<{ n: number; data: Record<string, unknown> }>('kim:step', e => {
+    listen<KimStepPayload>(KimEventNames.STEP, e => {
       setTypedLivePlan(prev => {
         if (!prev) return prev;
         const activeStep = Math.max(0, Math.min(e.payload.n, prev.steps.length));
@@ -382,7 +426,7 @@ export function useChatStream({
       });
     }).then(fn => { if (!cancelled) unlistenTypedStep = fn; else fn(); });
 
-    listen<{ n: number }>('kim:done', e => {
+    listen<KimDonePayload>(KimEventNames.DONE, e => {
       setTypedLivePlan(prev => {
         if (!prev) return prev;
         const doneSteps = prev.doneSteps.includes(e.payload.n)
@@ -394,16 +438,7 @@ export function useChatStream({
       });
     }).then(fn => { if (!cancelled) unlistenTypedDone = fn; else fn(); });
 
-    listen<{
-      cumulative_input: number;
-      budget: number;
-      phase: string;
-      percent: number;
-      last_input: number;
-      last_output: number;
-      source: string;
-      estimate: boolean;
-    }>('kim:context', e => {
+    listen<KimContextPayload>(KimEventNames.CONTEXT, e => {
       setContextState({
         cumulative_input: e.payload.cumulative_input,
         budget: e.payload.budget,
@@ -416,7 +451,7 @@ export function useChatStream({
       });
     }).then(fn => { if (!cancelled) unlistenTypedContext = fn; else fn(); });
 
-    listen<{ input: number; output: number; total: number }>('kim:stats', e => {
+    listen<KimStatsPayload>(KimEventNames.STATS, e => {
       setTokenStats({ input: e.payload.input, output: e.payload.output, total: e.payload.total });
     }).then(fn => { if (!cancelled) unlistenTypedStats = fn; else fn(); });
 
@@ -424,7 +459,7 @@ export function useChatStream({
     // terminationReasonRef gives the kim-agent-done handler richer context;
     // exposing it to the UI (e.g. a termination-specific banner) is the
     // remaining Tier 2b gap documented in HARNESS_ROADMAP.md.
-    listen<{ termination: string; success: boolean }>('kim:run-done', e => {
+    listen<KimRunDonePayload>(KimEventNames.RUN_DONE, e => {
       terminationReasonRef.current = e.payload.termination;
     }).then(fn => { if (!cancelled) unlistenTypedRunDone = fn; else fn(); });
 
@@ -432,13 +467,13 @@ export function useChatStream({
     // Not surfaced via setTaskError here because the taskError string is rendered
     // raw by StreamRenderer when !== 'agent-error'; a dedicated banner slot is
     // needed before a structured code can be shown to the user.
-    listen<{ code: string; retryable: boolean }>('kim:provider-error', e => {
+    listen<KimProviderErrorPayload>(KimEventNames.PROVIDER_ERROR, e => {
       lastProviderErrorCodeRef.current = e.payload.code;
     }).then(fn => { if (!cancelled) unlistenTypedProviderError = fn; else fn(); });
 
     // HITL approval visibility. This is display-only for now; the approval
     // decision path still lives in the agent/UIBridge layer.
-    listen<{ tool: string; risk: string; reason: string; preview?: string }>('kim:hitl-approval-request', e => {
+    listen<KimHitlApprovalRequestPayload>(KimEventNames.HITL_APPROVAL_REQUEST, e => {
       setHitlApprovalStatus({
         tool: e.payload.tool,
         risk: e.payload.risk,
@@ -448,7 +483,7 @@ export function useChatStream({
       });
     }).then(fn => { if (!cancelled) unlistenTypedHitlRequest = fn; else fn(); });
 
-    listen<{ tool: string; approved: boolean }>('kim:hitl-approval-result', e => {
+    listen<KimHitlApprovalResultPayload>(KimEventNames.HITL_APPROVAL_RESULT, e => {
       setHitlApprovalStatus(prev => ({
         tool: e.payload.tool,
         risk: prev?.tool === e.payload.tool ? prev.risk : 'high',
@@ -463,11 +498,11 @@ export function useChatStream({
     listen<string>('kim-run-id', e => { setLastRunId(e.payload); }) // K1
       .then(fn => { if (!cancelled) unlistenRunId = fn; else fn(); });
 
-    listen<{ reason: string; recoverable: boolean; suggestion: string }>('kim:run-failed', e => {
+    listen<KimRunFailedPayload>(KimEventNames.RUN_FAILED, e => {
       setRunFailure(e.payload);
     }).then(fn => { if (!cancelled) unlistenTypedRunFailed = fn; else fn(); });
 
-    listen<{ delay: number; attempt: number; max_retries: number }>('kim:rate-limited', e => {
+    listen<KimRateLimitedPayload>(KimEventNames.RATE_LIMITED, e => {
       setRateLimitedState(e.payload);
       // B9: cancel any prior auto-clear timer before scheduling a new one.
       clearRateLimitTimer();
@@ -477,7 +512,7 @@ export function useChatStream({
       }, (e.payload.delay + 1) * 1000);
     }).then(fn => { if (!cancelled) unlistenTypedRateLimited = fn; else fn(); });
 
-    listen<{ action: 'screenshot_flash' | 'show' }>('kim:ui', e => {
+    listen<KimUiPayload>(KimEventNames.UI, e => {
       if (e.payload.action === 'screenshot_flash' && isRunningRef.current) {
         invoke('show_screenshot_flash').catch(() => {});
         invoke('set_task_active_mode', { active: true }).catch(() => {});
@@ -485,6 +520,60 @@ export function useChatStream({
         invoke('show_main_window').catch(() => {});
       }
     }).then(fn => { if (!cancelled) unlistenTypedUi = fn; else fn(); });
+
+    listen<KimToolPayload>(KimEventNames.TOOL, e => {
+      const id = ++activityCounterRef.current;
+      const def = TOOL_MAP[e.payload.name];
+      const item: ActivityItem = {
+        id,
+        kind: 'tool',
+        icon: def?.icon ?? '›',
+        text: def ? def.label(e.payload.args) : `Using tool: \`${e.payload.name}\``,
+      };
+      if (isDuplicateActivityItem(item)) return;
+      enqueueActivityUpdate(prev => {
+        const next = [...prev, item];
+        return next.length > MAX_ACTIVITY_ITEMS ? next.slice(-MAX_ACTIVITY_ITEMS) : next;
+      });
+    }).then(fn => { if (!cancelled) unlistenTypedTool = fn; else fn(); });
+
+    listen<KimAnswerPayload>(KimEventNames.ANSWER, e => {
+      const text = e.payload.text.trim();
+      if (!text) return;
+      answerReceivedThisRunRef.current = true;
+      setLiveHistory(prev => {
+        const last = prev[prev.length - 1];
+        if (last?.role === 'assistant' && last.content.trim() === text) return prev;
+        return [...prev, { role: 'assistant', content: text }];
+      });
+    }).then(fn => { if (!cancelled) unlistenTypedAnswer = fn; else fn(); });
+
+    listen<KimDiffPayload>(KimEventNames.DIFF, e => {
+      enqueueActivityUpdate(prev => {
+        if (prev.length === 0) return prev;
+        const last = prev[prev.length - 1];
+        if (last.kind !== 'tool' || !/(Editing|Writing|Creating)/.test(last.text)) return prev;
+        return [
+          ...prev.slice(0, -1),
+          { ...last, text: `${last.text} +${e.payload.added} -${e.payload.removed}` },
+        ];
+      });
+    }).then(fn => { if (!cancelled) unlistenTypedDiff = fn; else fn(); });
+
+    listen<KimActivityPayload>(KimEventNames.ACTIVITY, e => {
+      if (e.payload.kind === 'error') {
+        const message = friendlyError(e.payload.text);
+        setTaskError(message);
+        needHelpFlagRef.current = true;
+        if (lastRunTaskRef.current) setLastFailedTask(lastRunTaskRef.current);
+        appendTypedActivity('error', message);
+      } else if (e.payload.kind === 'success') {
+        appendTypedActivity('success', e.payload.text);
+      } else {
+        setTypedStatus(e.payload.text);
+        appendTypedActivity('status', e.payload.text);
+      }
+    }).then(fn => { if (!cancelled) unlistenTypedActivity = fn; else fn(); });
 
     listen<string>('kim-agent-output', event => {
       appendRaw(event.payload);
@@ -611,14 +700,18 @@ export function useChatStream({
       unlistenTypedPlan?.();
       unlistenTypedStep?.();
       unlistenTypedDone?.();
+      unlistenTypedTool?.();
+      unlistenTypedAnswer?.();
+      unlistenTypedDiff?.();
+      unlistenTypedActivity?.();
       unlistenRunId?.();
     };
     // commitCurrentBrowserUrl intentionally omitted — accessed via ref so this effect
     // registers listeners once and doesn't re-run (and leak handlers) on session switch.
-  }, [appendRaw, flushActivityNow, clearActivityNow, setMessageReloadNonce]);
+  }, [appendRaw, appendTypedActivity, enqueueActivityUpdate, flushActivityNow, clearActivityNow, isDuplicateActivityItem, setMessageReloadNonce]);
 
   // Derived state to satisfy Prompt 8 explicit signature
-  const livePlan = typedLivePlan ?? parsePlanFromActivity(activity);
+  const livePlan = typedLivePlan;
   const traceItems = buildThinkingTrace(activity, livePlan);
   const planSteps = livePlan?.steps ?? [];
   const activityEntries = activity;

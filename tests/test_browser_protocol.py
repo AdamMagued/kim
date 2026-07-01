@@ -121,6 +121,15 @@ class BrowserProtocolTests(unittest.TestCase):
             else:
                 os.environ["KIM_BROWSER_RESTORE_STATUS"] = previous
 
+    def test_browser_usage_estimates_non_zero_output_tokens(self):
+        provider = _browser_provider_or_skip(self)
+        result = provider._attach_usage(
+            {"type": "text", "content": "Hello from Gemini."},
+            {"input": 12, "estimated": True, "source": "browser_prompt"},
+        )
+        self.assertGreater(result["usage"]["output"], 0)
+        self.assertEqual(result["usage"]["source"], "browser_prompt")
+
 
 if __name__ == "__main__":
     unittest.main()

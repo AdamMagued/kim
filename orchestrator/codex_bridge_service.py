@@ -31,6 +31,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from orchestrator.events_gen import emit_hitl_approval_request, emit_status
+
 from codex_engine.engine import (
     CODEX_BINARY,
     _CodexProxy,
@@ -127,10 +129,7 @@ def _parse_args() -> argparse.Namespace:
 
 def _status(message: str) -> None:
     """Print a typed status line to stdout for the Rust IPC parser."""
-    print(
-        json.dumps({"type": "status", "message": message}, separators=(",", ":"), ensure_ascii=False),
-        flush=True,
-    )
+    emit_status(message)
 
 
 async def _request_hitl_approval(task: str) -> bool:
@@ -144,14 +143,12 @@ async def _request_hitl_approval(task: str) -> bool:
     """
     import asyncio
 
-    event = {
-        "type": "hitl_approval_request",
-        "tool": "codex_bridge",
-        "risk": "high",
-        "reason": "Codex can execute arbitrary shell commands in your project directory.",
-        "preview": task[:200],
-    }
-    print(json.dumps(event, separators=(",", ":"), ensure_ascii=False), flush=True)
+    emit_hitl_approval_request(
+        "codex_bridge",
+        "high",
+        "Codex can execute arbitrary shell commands in your project directory.",
+        task[:200],
+    )
 
     loop = asyncio.get_running_loop()
     try:

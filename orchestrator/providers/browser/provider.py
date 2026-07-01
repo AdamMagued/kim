@@ -216,7 +216,6 @@ class BrowserProvider(BaseProvider):
         )
         return {
             "input": estimate_text_tokens(prompt) + image_count * IMAGE_TOKEN_ESTIMATE,
-            "output": 0,
             "estimated": True,
             "source": "browser_prompt",
         }
@@ -227,8 +226,26 @@ class BrowserProvider(BaseProvider):
             return result
         if "usage" not in result:
             result = dict(result)
-            result["usage"] = usage
+            merged_usage = dict(usage)
+            merged_usage["output"] = BrowserProvider._estimate_output_usage(result)
+            result["usage"] = merged_usage
         return result
+
+    @staticmethod
+    def _estimate_output_usage(result: dict) -> int:
+        if not isinstance(result, dict):
+            return 0
+        text_parts: list[str] = []
+        content = result.get("content")
+        if isinstance(content, str) and content.strip():
+            text_parts.append(content)
+        extra = result.get("tool") if result.get("type") == "tool_call" else None
+        if isinstance(extra, str) and extra.strip():
+            text_parts.append(extra)
+        if isinstance(result.get("args"), dict) and result["args"]:
+            text_parts.append(json.dumps(result["args"], ensure_ascii=False, sort_keys=True))
+        joined = "\n".join(part for part in text_parts if part).strip()
+        return estimate_text_tokens(joined) if joined else 0
 
     # ==================================================================
     # Main entry point

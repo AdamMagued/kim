@@ -51,10 +51,10 @@ class CliTerminationStaticTests(unittest.TestCase):
         )
 
     def test_run_done_json_transport_present_in_source(self):
-        """cli.py must emit a structured run_done JSON line for typed IPC."""
-        self.assertIn('"run_done"', self.source)
-        self.assertIn('"success"', self.source)
-        self.assertIn("json.dumps", self.source)
+        """cli.py must use the schema-generated run_done emitter."""
+        self.assertIn("from orchestrator.events_gen import", self.source)
+        self.assertIn("emit_run_done", self.source)
+        self.assertIn('emit_run_done(termination, bool(result["success"]))', self.source)
 
     def test_termination_key_accessed_via_get_with_fallback(self):
         """result.get('termination', 'unknown') must be used so old result dicts
@@ -112,9 +112,9 @@ class CliTerminationStaticTests(unittest.TestCase):
 
     def test_run_done_json_precedes_status_line_in_source(self):
         """Structured run_done JSON should be emitted before the legacy status line."""
-        json_pos = self.source.find('"run_done"')
+        json_pos = self.source.find("emit_run_done(termination")
         status_pos = self.source.find("[STATUS] run ended:")
-        self.assertGreater(json_pos, -1, "run_done JSON not found in cli.py")
+        self.assertGreater(json_pos, -1, "generated run_done emitter not found in cli.py")
         self.assertGreater(status_pos, -1, "[STATUS] run ended not found in cli.py")
         self.assertLess(json_pos, status_pos)
 

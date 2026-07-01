@@ -46,7 +46,15 @@
   };
 
   // ── Helpers ──────────────────────────────────────────────────────────
-  const normalizeText = (v) => String(v || '').replace(/\u00a0/g, ' ').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/[—–]/g, '--').replace(/…/g, '...').trim();
+  const normalizeText = (v) => String(v || '')
+    .replace(/[\u200b-\u200d\u2060\ufeff]/g, '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[—–]/g, '--')
+    .replace(/…/g, '...')
+    .trim();
+  const canonicalText = (v) => normalizeText(v).replace(/\s+/g, ' ').trim();
 
   const isVisible = (el) => {
     if (!el) return false;
@@ -145,6 +153,17 @@
     if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
       return normalizeText(inputEl.value || '');
     }
+    try {
+      const rich = inputEl.closest && inputEl.closest('rich-textarea');
+      if (rich) {
+        const mirror = rich.querySelector('textarea, input')
+          || (rich.shadowRoot && rich.shadowRoot.querySelector('textarea, input'));
+        if (mirror && (mirror instanceof HTMLTextAreaElement || mirror instanceof HTMLInputElement)) {
+          const mirrored = normalizeText(mirror.value || '');
+          if (mirrored) return mirrored;
+        }
+      }
+    } catch (_) {}
     return normalizeText(inputEl.innerText || inputEl.textContent || '');
   };
 
@@ -152,14 +171,16 @@
     const expectedRaw = String(promptText || '');
     const actual = readInputText(inputEl);
     const expected = normalizeText(expectedRaw);
+    const actualCanonical = canonicalText(actual);
+    const expectedCanonical = canonicalText(expected);
     if (!expected) return true;
-    if (actual === expected) return true;
+    if (actual === expected || actualCanonical === expectedCanonical) return true;
     if (expected.length < 500) return false;
-    if (actual.length < Math.floor(expected.length * 0.98)) return false;
+    if (actualCanonical.length < Math.floor(expectedCanonical.length * 0.9)) return false;
     
     const fuzzyMatch = (a, b) => a.replace(/\W+/g, '') === b.replace(/\W+/g, '');
-    return fuzzyMatch(actual.slice(0, 220), expected.slice(0, 220))
-      && fuzzyMatch(actual.slice(-220), expected.slice(-220));
+    return fuzzyMatch(actualCanonical.slice(0, 220), expectedCanonical.slice(0, 220))
+      && fuzzyMatch(actualCanonical.slice(-220), expectedCanonical.slice(-220));
   };
 
   // ── IPC emit (Tauri native) ──────────────────────────────────────────

@@ -38,7 +38,7 @@ jobs:
       - name: Events schema drift check
         run: |
           npm run gen:events
-          git diff --exit-code src/types/events.gen.ts || (echo "ERROR: events.gen.ts is out of sync with events.schema.json. Run 'npm run gen:events' and commit the result." && exit 1)
+          git diff --exit-code src/types/events.gen.ts src-tauri/src/events.gen.rs ../orchestrator/events_gen.py || (echo "ERROR: generated IPC bindings are out of sync with events.schema.json. Run 'npm run gen:events' and commit all generated outputs." && exit 1)
 
       - name: Vitest unit tests
         run: npm run test

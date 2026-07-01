@@ -2,6 +2,7 @@ import type { ActivityItem, LivePlanParsed } from './types';
 import type { TraceItem, WorkedForTraceItem, WorkedForToolKind } from '../kim-ui';
 import { parseAnswerLine, friendlyError, parseLogLine, speakAsKimNarration } from './utils';
 import { parseCodexItemCompleted } from './codexEvents';
+import { decodeKimEventLine } from '../../types/events.gen';
 
 // ── Trace helpers (activity → ThinkingWithPlan format) ─────────────────────
 
@@ -124,6 +125,9 @@ export function parseAgentLine(line: string, id: number): ParsedAgentLine {
   // Surface structured one-shot coding-agent JSON
   const stdoutLine = line.startsWith('[err]') ? line.slice(5).trimStart() : line;
   if (stdoutLine.startsWith('{')) {
+    // Kim-owned JSON is decoded from the schema and consumed by dedicated
+    // kim:* listeners. It must never appear as a raw chat/activity item.
+    if (decodeKimEventLine(stdoutLine)) return { type: 'none' };
     try {
       const parsed = JSON.parse(stdoutLine) as {
         error?: string;

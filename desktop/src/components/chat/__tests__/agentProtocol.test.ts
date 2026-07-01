@@ -6,9 +6,9 @@
  * tests/test_v3_golden_transcript.py).
  *
  * Rules this test guards:
- * 1. Typed JSON events (status, context, stats, ui_*) arrive on
- *    kim-agent-output but MUST be silenced (type:'none') — the real
- *    payloads come via the typed kim:* Tauri events.
+ * 1. Typed JSON events must be silenced (type:'none') if they ever reach
+ *    kim-agent-output through the Codex compatibility stream — the real
+ *    payloads come via typed kim:* Tauri events.
  * 2. Legacy [TOOL] lines produce an activity_item with kind:'tool'.
  * 3. The Codex JSONL branch (item.completed) still works and produces
  *    the appropriate codex_* types.
@@ -79,6 +79,15 @@ describe('Golden transcript: typed JSON events are silenced', () => {
 
   it('run_failed event is silenced', () => {
     const line = '{"type":"run_failed","reason":"max_iterations","recoverable":true,"suggestion":"Try a simpler task."}';
+    expect(parseAgentLine(line, 1).type).toBe('none');
+  });
+
+  it.each([
+    '{"type":"tool","name":"read_file","args":{}}',
+    '{"type":"answer","text":"done"}',
+    '{"type":"diff","path":"main.ts","added":2,"removed":1}',
+    '{"type":"activity","kind":"error","text":"failed"}',
+  ])('schema-generated activity event is silenced on the raw stream: %s', line => {
     expect(parseAgentLine(line, 1).type).toBe('none');
   });
 });

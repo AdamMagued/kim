@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Kim Agent IPC Events",
-  "description": "All typed events emitted from Python orchestrator → Rust subprocess.rs → Tauri → React. Edit this file and run 'npm run gen:events' to regenerate events.gen.ts.",
+  "description": "All typed events emitted from Python orchestrator → Rust subprocess.rs → Tauri → React. Edit this file and run 'npm run gen:events' to regenerate the TypeScript, Rust, and Python bindings.",
   "events": [
     {
       "event": "kim:status",
@@ -27,7 +27,7 @@
       "typeName": "KimStep",
       "description": "Agent advanced to a new plan step.",
       "payload": {
-        "n": { "type": "number", "description": "1-based step index." },
+        "n": { "type": "number", "rustType": "usize", "description": "1-based step index." },
         "data": { "type": "Record<string, unknown>", "description": "Step metadata." }
       }
     },
@@ -36,7 +36,7 @@
       "typeName": "KimDone",
       "description": "Agent completed a plan step.",
       "payload": {
-        "n": { "type": "number", "description": "1-based step index that finished." }
+        "n": { "type": "number", "rustType": "usize", "description": "1-based step index that finished." }
       }
     },
     {
@@ -44,12 +44,12 @@
       "typeName": "KimContext",
       "description": "Context window usage snapshot.",
       "payload": {
-        "cumulative_input": { "type": "number", "description": "Total input tokens consumed so far." },
-        "budget": { "type": "number", "description": "Configured context token budget." },
+        "cumulative_input": { "type": "number", "rustType": "u64", "description": "Total input tokens consumed so far." },
+        "budget": { "type": "number", "rustType": "u64", "description": "Configured context token budget." },
         "phase": { "type": "string", "description": "Budget phase label (ok / warn / critical / full)." },
-        "percent": { "type": "number", "description": "Percentage of budget consumed (0–100)." },
-        "last_input": { "type": "number", "description": "Input tokens in the last provider call." },
-        "last_output": { "type": "number", "description": "Output tokens in the last provider call." },
+        "percent": { "type": "number", "rustType": "u32", "description": "Percentage of budget consumed (0–100)." },
+        "last_input": { "type": "number", "rustType": "u64", "description": "Input tokens in the last provider call." },
+        "last_output": { "type": "number", "rustType": "u64", "description": "Output tokens in the last provider call." },
         "source": { "type": "string", "description": "Provider identifier that produced this snapshot." },
         "estimate": { "type": "boolean", "description": "True when token count is estimated rather than exact." }
       }
@@ -59,15 +59,19 @@
       "typeName": "KimStats",
       "description": "Cumulative token usage for this run.",
       "payload": {
-        "input": { "type": "number", "description": "Cumulative input tokens." },
-        "output": { "type": "number", "description": "Cumulative output tokens." },
-        "total": { "type": "number", "description": "input + output." }
+        "input": { "type": "number", "rustType": "u64", "description": "Cumulative input tokens." },
+        "output": { "type": "number", "rustType": "u64", "description": "Cumulative output tokens." },
+        "total": { "type": "number", "rustType": "u64", "description": "input + output." }
       }
     },
     {
       "event": "kim:ui",
       "typeName": "KimUi",
       "description": "Window/UI control signal from the agent.",
+      "wireVariants": [
+        { "type": "ui_screenshot_flash", "payload": { "action": "screenshot_flash" } },
+        { "type": "ui_show", "payload": { "action": "show" } }
+      ],
       "payload": {
         "action": {
           "type": "'screenshot_flash' | 'show'",
@@ -115,8 +119,8 @@
       "description": "Provider rate-limited; agent will retry after a delay.",
       "payload": {
         "delay": { "type": "number", "description": "Seconds until next retry." },
-        "attempt": { "type": "number", "description": "Current retry attempt number (1-based)." },
-        "max_retries": { "type": "number", "description": "Maximum retries configured." }
+        "attempt": { "type": "number", "rustType": "u32", "description": "Current retry attempt number (1-based)." },
+        "max_retries": { "type": "number", "rustType": "u32", "description": "Maximum retries configured." }
       }
     },
     {
@@ -130,7 +134,7 @@
           "description": "Risk level: high | medium. Determines UI prominence."
         },
         "reason": { "type": "string", "description": "Machine-readable reason key (e.g. 'arbitrary_code_execution')." },
-        "preview": { "type": "string", "description": "K6: human-readable preview — command string, unified diff (<=40 lines), or URL + element label. May be empty." }
+        "preview": { "type": "string", "default": true, "description": "K6: human-readable preview — command string, unified diff (<=40 lines), or URL + element label. May be empty." }
       }
     },
     {
@@ -141,6 +145,58 @@
         "tool": { "type": "string", "description": "MCP tool name that was approved or denied." },
         "approved": { "type": "boolean", "description": "True if the user approved the tool call." }
       }
+    },
+    {
+      "event": "kim:tool",
+      "typeName": "KimTool",
+      "description": "A tool invocation shown in the live activity feed.",
+      "payload": {
+        "name": { "type": "string", "description": "Canonical MCP tool name." },
+        "args": { "type": "Record<string, unknown>", "rustType": "serde_json::Value", "description": "Tool arguments used to build the activity label." }
+      }
+    },
+    {
+      "event": "kim:answer",
+      "typeName": "KimAnswer",
+      "description": "A final assistant answer to append to the conversation.",
+      "payload": {
+        "text": { "type": "string", "description": "Answer text without a legacy marker prefix." }
+      }
+    },
+    {
+      "event": "kim:diff",
+      "typeName": "KimDiff",
+      "description": "Line-count summary for a file changed by a tool.",
+      "payload": {
+        "path": { "type": "string", "description": "Display-safe file basename." },
+        "added": { "type": "number", "rustType": "usize", "description": "Lines added." },
+        "removed": { "type": "number", "rustType": "usize", "description": "Lines removed." }
+      }
+    },
+    {
+      "event": "kim:activity",
+      "typeName": "KimActivity",
+      "description": "A structured status, success, or error activity item.",
+      "payload": {
+        "kind": { "type": "'status' | 'success' | 'error'", "description": "Activity severity and presentation kind." },
+        "text": { "type": "string", "description": "Human-readable activity text." }
+      }
     }
+  ],
+  "legacyTags": [
+    { "tag": "[STATUS]", "event": "kim:status" },
+    { "tag": "[PLAN]", "event": "kim:plan" },
+    { "tag": "[STEP]", "event": "kim:step" },
+    { "tag": "[DONE]", "event": "kim:done" },
+    { "tag": "[CONTEXT]", "event": "kim:context" },
+    { "tag": "[STATS]", "event": "kim:stats" },
+    { "tag": "[TOOL]", "event": "kim:tool" },
+    { "tag": "[ANSWER]", "event": "kim:answer" },
+    { "tag": "[DIFF]", "event": "kim:diff" },
+    { "tag": "[SUCCESS]", "event": "kim:activity", "kind": "success" },
+    { "tag": "[FAILED]", "event": "kim:activity", "kind": "error" },
+    { "tag": "[ERROR]", "event": "kim:activity", "kind": "error" },
+    { "tag": "TASK_COMPLETE:", "event": "kim:answer" },
+    { "tag": "NEED_HELP:", "event": "kim:activity", "kind": "error" }
   ]
 }

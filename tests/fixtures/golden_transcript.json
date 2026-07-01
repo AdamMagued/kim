@@ -3,7 +3,7 @@
     "{\"type\":\"status\",\"message\":\"Kim is working on it\u2026\"}",
     "{\"type\":\"context\",\"cumulative_input\":0,\"budget\":100000,\"phase\":\"ok\",\"percent\":0,\"last_input\":0,\"last_output\":0,\"source\":\"session\",\"estimate\":false}",
     "{\"type\":\"context\",\"cumulative_input\":2458,\"budget\":100000,\"phase\":\"ok\",\"percent\":2,\"last_input\":2458,\"last_output\":0,\"source\":\"FakeProvider\",\"estimate\":true}",
-    "[TOOL] take_screenshot({})",
+    "{\"type\":\"tool\",\"name\":\"take_screenshot\",\"args\":{}}",
     "{\"type\":\"ui_screenshot_flash\"}",
     "{\"type\":\"ui_show\"}",
     "{\"type\":\"context\",\"cumulative_input\":6457,\"budget\":100000,\"phase\":\"ok\",\"percent\":6,\"last_input\":3999,\"last_output\":0,\"source\":\"FakeProvider\",\"estimate\":true}"
@@ -12,7 +12,7 @@
     "status",
     "context",
     "context",
-    "legacy_tool",
+    "tool",
     "ui_screenshot_flash",
     "ui_show",
     "context"

@@ -109,11 +109,20 @@ def classify_provider_error(error: Exception) -> ProviderError:
     # "auth" and "oauth" need word boundaries to avoid false positives such as
     # 'author', 'authority', or 'authenticated' (which is a success state).
     _AUTH_WORD_RE = _re_provider_error.compile(r"\b(auth|oauth)\b")
-    if isinstance(error, PermissionError) or any(marker in lowered for marker in auth_markers) or _AUTH_WORD_RE.search(lowered):
+    if (
+        isinstance(error, PermissionError)
+        or any(marker in lowered for marker in auth_markers)
+        or _AUTH_WORD_RE.search(lowered)
+    ):
         return ProviderError("auth", message, retryable=False)
 
     # Use a digit-bounded pattern for 400 to avoid matching strings like "error 4001".
-    if isinstance(error, ValueError) or "invalid request" in lowered or "bad request" in lowered or _re_provider_error.search(r"(?<!\d)400(?!\d)", lowered):
+    if (
+        isinstance(error, ValueError)
+        or "invalid request" in lowered
+        or "bad request" in lowered
+        or _re_provider_error.search(r"(?<!\d)400(?!\d)", lowered)
+    ):
         return ProviderError("invalid_request", message, retryable=False)
 
     if "rate" in lowered and "limit" in lowered:
