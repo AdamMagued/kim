@@ -12,10 +12,17 @@ import json
 import logging
 import os
 import platform
+import re
 import uuid
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+_STATUS_RECAP_RE = re.compile(
+    r"^kim is (?:(?:still )?thinking|working(?: on it)?)"
+    r"(?:[.….]?(?:\s*\(\d+s\))?)?$",
+    re.IGNORECASE,
+)
 
 _DATA_URI_PREFIX = "data:"
 _DATA_URI_BASE64_MARKER = ";base64,"
@@ -148,6 +155,8 @@ def build_history_recap(
                 content = content[:max_item_chars] + "…"
             lines.append(f"User: {content}")
         elif role == "assistant":
+            if "\n" not in content and _STATUS_RECAP_RE.match(content):
+                continue
             stripped = content.lstrip()
             if stripped.startswith("{") and '"tool"' in stripped:
                 try:

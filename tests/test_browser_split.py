@@ -204,6 +204,17 @@ class TestBuildHistoryRecap(unittest.TestCase):
         ]
         assert self.recap(msgs) == ""
 
+    def test_internal_status_narration_skipped(self):
+        msgs = [
+            {"role": "assistant", "content": "Kim is thinking…"},
+            {"role": "assistant", "content": "Kim is working on it…"},
+            {"role": "user", "content": "Task: open calc"},
+        ]
+        result = self.recap(msgs)
+        assert "Kim is thinking" not in result
+        assert "Kim is working" not in result
+        assert "User: open calc" in result
+
     def test_truncation(self):
         msgs = [{"role": "user", "content": "x" * 5000}]
         result = self.recap(msgs, max_recap=100)
