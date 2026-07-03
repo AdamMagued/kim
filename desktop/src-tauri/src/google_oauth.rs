@@ -402,8 +402,21 @@ pub async fn google_oauth_start() -> Result<GoogleOAuthStatus, String> {
             .await
             .map_err(|e| format!("OAuth callback task failed: {e}"))??;
     let token = exchange_code_for_token(&code, &redirect_uri, &verifier).await?;
-    let refresh_token = token.refresh_token.clone().or_else(|| read_secret().ok().flatten().map(|s| s.refresh_token))
-        .ok_or_else(|| "Google did not return a refresh token. Disconnect/reconnect and approve offline access.".to_string())?;
+    // #42: `prompt=consent` (above) makes Google return a refresh token on every
+    // authorization, so the None branch is rare. When Google does omit it (e.g.
+    // an already-granted re-consent), reuse the previously stored refresh token
+    // rather than failing; only error when there is genuinely nothing to keep,
+    // with an actionable next step.
+    let refresh_token = token
+        .refresh_token
+        .clone()
+        .or_else(|| read_secret().ok().flatten().map(|s| s.refresh_token))
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| {
+            "Google did not return a refresh token. In Settings → Account → Google for Kim, \
+             Disconnect and reconnect, and approve offline access when prompted."
+                .to_string()
+        })?;
     let userinfo = fetch_userinfo(&token.access_token).await?;
     let email = userinfo.email;
     if email.trim().is_empty() {

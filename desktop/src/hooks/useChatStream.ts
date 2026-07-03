@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { ActivityItem, PendingTask, HitlApprovalStatus, LivePlanParsed } from '../components/chat/types';
 import type { SessionInfo, Settings } from '../types';
 import { parseAgentLine, buildThinkingTrace } from '../components/chat/parsers';
-import { browserSiteFromProvider, friendlyError, TOOL_MAP } from '../components/chat/utils';
+import { browserSiteFromProvider, friendlyError, parsePlanFromActivity, TOOL_MAP } from '../components/chat/utils';
 import {
   KimEventNames,
   type KimActivityPayload,
@@ -710,8 +710,12 @@ export function useChatStream({
     // registers listeners once and doesn't re-run (and leak handlers) on session switch.
   }, [appendRaw, appendTypedActivity, enqueueActivityUpdate, flushActivityNow, clearActivityNow, isDuplicateActivityItem, setMessageReloadNonce]);
 
-  // Derived state to satisfy Prompt 8 explicit signature
-  const livePlan = typedLivePlan;
+  // Derived state to satisfy Prompt 8 explicit signature.
+  // #34: prefer the typed kim:plan-driven plan, but fall back to parsing the
+  // legacy activity stream so runs whose plan arrives only as text (codex and
+  // kimctl-bridge streams that don't emit typed kim:plan) still render a live
+  // plan checklist instead of nothing.
+  const livePlan = typedLivePlan ?? parsePlanFromActivity(activity);
   const traceItems = buildThinkingTrace(activity, livePlan);
   const planSteps = livePlan?.steps ?? [];
   const activityEntries = activity;

@@ -527,7 +527,7 @@ async fn openai_models(config: &KimConfig) -> Vec<String> {
         .map(|a| {
             a.iter()
                 .filter_map(|m| m["id"].as_str())
-                .filter(|id| id.starts_with("gpt") || id.starts_with('o'))
+                .filter(|id| is_openai_chat_model(id))
                 .map(ToString::to_string)
                 .collect()
         })
@@ -537,6 +537,37 @@ async fn openai_models(config: &KimConfig) -> Vec<String> {
     }
     ids.sort();
     ids
+}
+
+/// A45: keep only chat-capable OpenAI model ids in the `/model` picker.
+/// The raw `/v1/models` list also contains embeddings, audio/realtime, image,
+/// moderation, and instruct (completions) models whose ids start with `gpt`/`o`
+/// but can't be used for chat — selecting one just fails at request time.
+fn is_openai_chat_model(id: &str) -> bool {
+    if !(id.starts_with("gpt") || id.starts_with('o')) {
+        return false;
+    }
+    const NON_CHAT_MARKERS: &[&str] = &[
+        "instruct",
+        "embedding",
+        "audio",
+        "realtime",
+        "transcribe",
+        "tts",
+        "whisper",
+        "image",
+        "moderation",
+        "dall-e",
+        "search",
+        "-tts",
+    ];
+    let lowered = id.to_ascii_lowercase();
+    !NON_CHAT_MARKERS.iter().any(|m| lowered.contains(m))
+}
+
+#[cfg(test)]
+pub(crate) fn is_openai_chat_model_for_test(id: &str) -> bool {
+    is_openai_chat_model(id)
 }
 
 async fn ollama_models() -> Vec<String> {
@@ -561,6 +592,14 @@ async fn ollama_models() -> Vec<String> {
     models
 }
 
+/// Suggested Ollama cloud models shown in the picker (#32).
+///
+/// These are display suggestions only — the daemon is authoritative, and the
+/// selected model is validated at request time (a wrong name fails there, not
+/// here). The list was trimmed to real `-cloud` tags; the previously-listed
+/// `deepseek-coder-v4:cloud` and `mistral-large:latest-cloud` were fabricated
+/// (non-existent / malformed tags) and are removed. Keep in sync with the
+/// desktop copy in `desktop/src-tauri/src/ollama.rs`.
 fn known_ollama_cloud_models() -> &'static [&'static str] {
     &[
         "gpt-oss:20b-cloud",
@@ -571,8 +610,6 @@ fn known_ollama_cloud_models() -> &'static [&'static str] {
         "qwen2.5-coder:32b-cloud",
         "deepseek-r1:671b-cloud",
         "deepseek-v3:685b-cloud",
-        "deepseek-coder-v4:cloud",
-        "mistral-large:latest-cloud",
         "gemma3:27b-cloud",
     ]
 }

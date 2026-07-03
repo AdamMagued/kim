@@ -18,9 +18,17 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Internal status/thinking narration that must never be replayed into the next
+# browser prompt recap (#39). Covers every phrasing the frontend's
+# speakAsKimNarration and the orchestrator's emit_status produce:
+#   "Kim is thinking…", "Kim is still thinking… (3s)", "Kim is working",
+#   "Kim is working on it…", "Kim is still working on it".
+# Only applied to single-line assistant content (see build_history_recap), so a
+# real one-line answer that happens to start "Kim is …" is still preserved
+# unless it exactly matches this status shape.
 _STATUS_RECAP_RE = re.compile(
-    r"^kim is (?:(?:still )?thinking|working(?: on it)?)"
-    r"(?:[.….]?(?:\s*\(\d+s\))?)?$",
+    r"^kim is (?:still )?(?:thinking|working)(?: on it)?"
+    r"[.…]*(?:\s*\(\d+s\))?$",
     re.IGNORECASE,
 )
 

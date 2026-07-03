@@ -81,6 +81,23 @@ fn parse_typed(v: &serde_json::Value) -> AgentLine {
                 AgentLine::Activity(msg)
             }
         }
+        // #33: the orchestrator now emits tool use as a typed `{"type":"tool",
+        // "name":...}` event instead of the legacy `[TOOL] name(...)` text line,
+        // so the plain-text branch below never matches. Map it here so the CLI
+        // still shows "running <tool>" activity.
+        "tool" => {
+            let name = v
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                AgentLine::Ignore
+            } else {
+                AgentLine::Tool { name }
+            }
+        }
         "run_done" => AgentLine::Done(v.get("success").and_then(|x| x.as_bool()).unwrap_or(false)),
         "provider_error" => AgentLine::ProviderError(
             v.get("code")
@@ -192,7 +209,12 @@ pub async fn stream_agentic_request(
     .current_dir(root)
     .env("PYTHONPATH", root)
     // Terminal HITL: the agent gates risky tools; we answer on stdin.
+    // KIM_TAURI_MODE=1 is required too (#28): the orchestrator only wires
+    // StdinApprovalBridge (and starts the stdin pump that routes our
+    // hitl_approve replies) when BOTH env vars are set. Without it the
+    // approval gate was silently skipped and high-risk tools ran unprompted.
     .env("KIM_HITL_RISK_THRESHOLD", "high")
+    .env("KIM_TAURI_MODE", "1")
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::null())
@@ -330,6 +352,22 @@ mod tests {
         assert_eq!(
             parse_agent_line("[FAILED] nope"),
             AgentLine::Answer("nope".into())
+        );
+    }
+
+    #[test]
+    fn parses_typed_tool_event() {
+        // #33: the orchestrator emits typed tool events, not [TOOL] text.
+        assert_eq!(
+            parse_agent_line(r#"{"type":"tool","name":"read_file","args":{}}"#),
+            AgentLine::Tool {
+                name: "read_file".into()
+            }
+        );
+        // Empty/missing name is ignored rather than shown as a blank tool.
+        assert_eq!(
+            parse_agent_line(r#"{"type":"tool","name":""}"#),
+            AgentLine::Ignore
         );
     }
 

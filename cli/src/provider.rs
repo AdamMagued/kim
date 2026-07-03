@@ -288,6 +288,20 @@ async fn stream_via_bridge(
             return;
         }
     };
+    // #36: the desktop /v1/task endpoint does not thread attachments to the
+    // agent, so images referenced here used to be base64-encoded, sent, and
+    // silently dropped. Fail loudly with a path forward instead of pretending
+    // the image was delivered.
+    if !attachments.is_empty() {
+        let names: Vec<&str> = attachments.iter().map(|a| a.name.as_str()).collect();
+        let _ = tx.send(AppEvent::Err(format!(
+            "Image attachments ({}) aren't supported over the Kim desktop bridge yet. \
+             Use a direct vision provider for images — e.g. `/provider ollama` (a vision \
+             model) or `/provider claude` — or drop the image and send text only.",
+            names.join(", ")
+        )));
+        return;
+    }
     let client = reqwest::Client::new();
     let mut request = client
         .post(format!(
@@ -298,11 +312,6 @@ async fn stream_via_bridge(
             "task": prompt,
             "provider": config.provider,
             "model": config.model,
-            "attachments": attachments.iter().map(|a| json!({
-                "name": a.name,
-                "mime_type": a.mime_type,
-                "data_base64": a.data_base64,
-            })).collect::<Vec<_>>(),
         }));
     if let Some(token) = bridge_token() {
         request = request.header("X-Kim-Token", token);
@@ -916,6 +925,9 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
     // Holds the exclusive temp dir for the codex CODEX_HOME so it outlives the
     // if-else block and stays alive until child.wait() completes (#23).
     let mut _codex_temp_dir: Option<tempfile::TempDir> = None;
+    // Holds the responses-proxy (local provider only) for the whole run; drop at
+    // function exit kills it and removes its script (#35).
+    let mut _proxy_handle: Option<ProxyHandle> = None;
 
     let mut child = if is_browser {
         // Browser provider: launch the Kim codex bridge service.
@@ -967,10 +979,14 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
     } else {
         // Local provider: start a Responses-API→Chat-Completions proxy so codex
         // can talk to ollama (which only speaks Chat Completions).
-        let proxy_port = match start_responses_proxy(config, &tx).await {
+        // Keep the handle alive for the whole codex run; it kills the proxy and
+        // deletes its temp script on drop at function exit (#35).
+        let proxy = match start_responses_proxy(config, &tx).await {
             Some(p) => p,
             None => return,
         };
+        let proxy_port = proxy.port;
+        _proxy_handle = Some(proxy);
         // Use an exclusive randomized temp dir so concurrent runs don't clobber
         // each other and the path is not pre-creatable by a local attacker (#23).
         let kim_codex_dir = match tempfile::Builder::new().prefix("kim_codex_").tempdir() {
@@ -1191,15 +1207,47 @@ Responses-API proxy for Codex + Ollama
 
 const RESPONSES_PROXY_PY: &str = include_str!("responses_proxy.py");
 
-async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent>) -> Option<u16> {
+/// Owns a running responses-proxy child plus its on-disk script (#35).
+/// Dropping it kills the proxy (`kill_on_drop`) and removes the temp script —
+/// so the caller MUST hold it for the lifetime of the codex run and let it drop
+/// afterwards. The previous code detached `child.wait()` into a background task,
+/// which leaked the proxy (it ran forever, port bound) after every `/code` turn.
+struct ProxyHandle {
+    port: u16,
+    _child: tokio::process::Child,
+    _script: tempfile::NamedTempFile,
+}
+
+async fn start_responses_proxy(
+    config: &KimConfig,
+    tx: &UnboundedSender<AppEvent>,
+) -> Option<ProxyHandle> {
+    use std::io::Write as _;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
 
-    let tmp_path = std::env::temp_dir().join("kim_responses_proxy.py");
-    if let Err(e) = std::fs::write(&tmp_path, RESPONSES_PROXY_PY) {
+    // Randomized, exclusive temp file (O_CREAT|O_EXCL, 0600 on unix) instead of
+    // a fixed `kim_responses_proxy.py` a local attacker could pre-create or
+    // symlink (#35). Held by ProxyHandle so it is removed when the proxy dies.
+    let mut script = match tempfile::Builder::new()
+        .prefix("kim_responses_proxy_")
+        .suffix(".py")
+        .tempfile()
+    {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = tx.send(AppEvent::Err(format!("Failed to create proxy script: {e}")));
+            return None;
+        }
+    };
+    if let Err(e) = script
+        .write_all(RESPONSES_PROXY_PY.as_bytes())
+        .and_then(|()| script.flush())
+    {
         let _ = tx.send(AppEvent::Err(format!("Failed to write proxy script: {e}")));
         return None;
     }
+    let tmp_path = script.path().to_path_buf();
 
     // Resolve a Python interpreter the same way agentic.rs does: venv first,
     // then system python3/python — avoids hardcoding "python3" which is absent
@@ -1249,10 +1297,11 @@ async fn start_responses_proxy(config: &KimConfig, tx: &UnboundedSender<AppEvent
         }
     };
 
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
-    Some(port)
+    Some(ProxyHandle {
+        port,
+        _child: child,
+        _script: script,
+    })
 }
 
 /// Build the argv list passed to `codex exec`. Extracted for testability (#1).
@@ -1740,6 +1789,67 @@ mod tests {
             AppEvent::TextChunk(t) | AppEvent::ThoughtChunk(t) => !t.contains("assistantfinal"),
             _ => true,
         }));
+    }
+
+    // #43: stream a long prefix + the marker one char at a time. No emitted
+    // chunk may ever contain a partial marker prefix ("assistantfina", etc.),
+    // and the full answer must arrive intact. This exercises the worst case the
+    // audit worried about (a boundary landing mid-marker after >14 chars of
+    // preceding text). If this passes, the 14-char tail hold-back is sufficient.
+    #[test]
+    fn assistantfinal_never_leaks_partial_marker_when_streamed_char_by_char() {
+        const MARKER: &str = "assistantfinal";
+        let prefix = "some long reasoning that exceeds the tail holdback window ";
+        let suffix = "The final answer.";
+        let full = format!("{prefix}{MARKER}{suffix}");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parser = ThinkParser::new();
+        for ch in full.chars() {
+            let mut buf = [0u8; 4];
+            parser.feed(ch.encode_utf8(&mut buf), &tx);
+        }
+        parser.flush(&tx);
+
+        let events = drain(&mut rx);
+        // #43's actual claim: no individual emitted chunk may contain the marker
+        // or any prefix of it of length >= 4 (short overlaps like "as" are
+        // unavoidable and harmless). This is the property that would break if the
+        // 14-char tail hold-back were too small.
+        let mut visible = String::new();
+        for e in &events {
+            if let AppEvent::TextChunk(t) | AppEvent::ThoughtChunk(t) = e {
+                assert!(!t.contains(MARKER), "full marker leaked in a chunk: {t:?}");
+                for n in (4..MARKER.len()).rev() {
+                    let partial = &MARKER[..n];
+                    assert!(
+                        !t.contains(partial),
+                        "partial marker {partial:?} leaked in chunk {t:?}"
+                    );
+                }
+                visible.push_str(t);
+            }
+        }
+        // Nothing lost or duplicated: the marker is stripped and the surrounding
+        // text is delivered exactly once, in order. (Role classification of the
+        // pre-marker text is timing-dependent when streamed and is not asserted.)
+        assert_eq!(visible, format!("{prefix}{suffix}"));
+    }
+
+    // #45: the OpenAI model picker must drop non-chat model ids.
+    #[test]
+    fn openai_chat_model_filter_excludes_non_chat_ids() {
+        use crate::commands::is_openai_chat_model_for_test as keep;
+        assert!(keep("gpt-4o"));
+        assert!(keep("gpt-4o-mini"));
+        assert!(keep("o3"));
+        assert!(keep("o1-mini"));
+        assert!(!keep("gpt-3.5-turbo-instruct"));
+        assert!(!keep("gpt-4o-audio-preview"));
+        assert!(!keep("gpt-4o-realtime-preview"));
+        assert!(!keep("gpt-image-1"));
+        assert!(!keep("omni-moderation-latest"));
+        assert!(!keep("text-embedding-3-large")); // not gpt/o prefixed anyway
     }
 
     #[test]

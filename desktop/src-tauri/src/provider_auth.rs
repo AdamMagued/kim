@@ -350,6 +350,13 @@ pub(crate) async fn provider_signout(
 
     // Each provider has its own logout flow; navigating the webview to the
     // logout endpoint causes the page to clear its auth cookies in-place.
+    //
+    // #41: the Gemini logout hits Google's global `/Logout`, which clears ALL
+    // Google sessions — but only inside the `kim-browser-signin` WKWebView's own
+    // cookie jar (isolated from the user's Safari/Chrome). Gemini is currently
+    // Kim's only Google-backed browser provider, so there is no other Google
+    // provider to collaterally sign out. If a second Google provider is ever
+    // added, scope this to a per-account sign-out instead of the global URL.
     let logout_url = match site.as_str() {
         "chatgpt" | "openai" => format!("{}/auth/logout", origin),
         "claude" | "anthropic" => format!("{}/login?logout=true", origin),

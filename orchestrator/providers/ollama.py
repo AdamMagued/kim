@@ -70,19 +70,55 @@ def _parse_context_column(raw: str) -> int | None:
         return None
 
 
+def _ps_context_column_span(header_line: str) -> tuple[int, int] | None:
+    """Char span [start, end) of the CONTEXT column in an `ollama ps` header.
+
+    The real header is ``NAME  ID  SIZE  PROCESSOR  CONTEXT  UNTIL`` — CONTEXT is
+    NOT the last column; UNTIL ("4 minutes from now") is. Taking the last
+    whitespace token therefore grabbed "now", so this path always returned None
+    (issue #30). `ollama ps` is column-aligned (Go tabwriter), so the CONTEXT
+    header and its values start at the same character offset; slice by that.
+    Returns None for older `ollama` builds whose `ps` has no CONTEXT column.
+    """
+    cols: list[tuple[int, str]] = []
+    idx = 0
+    for token in header_line.split():
+        start = header_line.find(token, idx)
+        if start < 0:
+            continue
+        idx = start + len(token)
+        cols.append((start, token))
+    for i, (start, name) in enumerate(cols):
+        if name.upper() == "CONTEXT":
+            end = cols[i + 1][0] if i + 1 < len(cols) else len(header_line) + 1_000_000
+            return start, end
+    return None
+
+
 def _parse_ollama_ps_context(output: str, model: str) -> int | None:
     wanted = model.strip().lower()
+    span: tuple[int, int] | None = None
     for line in output.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.lower().startswith("name "):
+        if not stripped:
             continue
         lowered = stripped.lower()
+        if lowered.startswith("name ") or lowered == "name":
+            span = _ps_context_column_span(line)
+            continue
         if not lowered.startswith(wanted):
             continue
-        cols = stripped.split()
-        if len(cols) < 2:
+        if span is None:
+            # No CONTEXT column in this `ollama ps` (old build) — no reliable
+            # way to read it positionally; let callers fall back to /api/show.
+            return None
+        start, end = span
+        if start >= len(line):
             continue
-        return _parse_context_column(cols[-1])
+        segment = line[start:end].strip()
+        value = _parse_context_column(segment)
+        if value is not None:
+            return value
     return None
 
 
@@ -128,6 +164,11 @@ class OllamaProvider(BaseProvider):
         tools: list[dict],
         system: str,
     ) -> dict[str, Any]:
+        # Check the daemon is up FIRST (#31). _fetch_tags() calls
+        # raise_for_status(), so probing it before the liveness check surfaced a
+        # raw httpx.ConnectError instead of the friendly "Ollama is installed
+        # but not running" message when the daemon was stopped.
+        await self._ensure_daemon_running()
         # Fetch tags once for local mode; both _resolve_selected_model and
         # _validate_model need the tag list and would otherwise each make a
         # separate HTTP round-trip.
@@ -135,7 +176,6 @@ class OllamaProvider(BaseProvider):
         if self._mode == "local":
             cached_tags = await self._fetch_tags()
         model = await self._resolve_selected_model(tags=cached_tags)
-        await self._ensure_daemon_running()
         await self._validate_model(model, tags=cached_tags)
 
         # Proactively strip images for models we know don't support vision.
@@ -294,7 +334,20 @@ class OllamaProvider(BaseProvider):
         # matching tool-result message, so strict servers can pair them. The
         # pending pair is (tool_name, call_id) for the most recent unanswered call.
         call_seq = 0
-        pending_call: tuple[str, str] | None = None
+        # FIFO of unanswered (tool_name, call_id) pairs. A list (not a single
+        # slot) so interleaved/parallel tool calls each keep their own id: a
+        # result matches the oldest pending call of the same name (#40).
+        pending_calls: list[tuple[str, str]] = []
+
+        def _match_pending(result_text: str) -> tuple[str, str] | None:
+            name = _tool_result_name(result_text)
+            if name is None:
+                return None
+            for i, (nm, _cid) in enumerate(pending_calls):
+                if nm == name:
+                    return pending_calls.pop(i)
+            return None
+
         if system.strip():
             out.append({"role": "system", "content": system})
         for msg in messages:
@@ -305,7 +358,7 @@ class OllamaProvider(BaseProvider):
                 if native_tool_call:
                     call_seq += 1
                     tc = native_tool_call["tool_calls"][0]
-                    pending_call = (tc["function"]["name"], tc["id"])
+                    pending_calls.append((tc["function"]["name"], tc["id"]))
                     out.append(native_tool_call)
                     continue
             if isinstance(content, list):
@@ -331,17 +384,17 @@ class OllamaProvider(BaseProvider):
                 if images:
                     converted["images"] = images
                 else:
-                    tool_result = _tool_result_message(role, converted["content"], pending=pending_call)
+                    matched = _match_pending(converted["content"])
+                    tool_result = _tool_result_message(role, converted["content"], pending=matched)
                     if tool_result:
-                        pending_call = None
                         out.append(tool_result)
                         continue
                 out.append(converted)
             else:
                 text = str(content or "")
-                tool_result = _tool_result_message(role, text, pending=pending_call)
+                matched = _match_pending(text)
+                tool_result = _tool_result_message(role, text, pending=matched)
                 if tool_result:
-                    pending_call = None
                     out.append(tool_result)
                     continue
                 out.append({"role": role, "content": text})
@@ -416,10 +469,10 @@ class OllamaProvider(BaseProvider):
                         pieces.append(chunk)
                     tc_deltas = msg.get("tool_calls")
                     if isinstance(tc_deltas, list):
-                        for delta in tc_deltas:
+                        for position, delta in enumerate(tc_deltas):
                             if not isinstance(delta, dict):
                                 continue
-                            idx = delta.get("index", 0)
+                            idx = _resolve_tool_call_index(delta, position)
                             while len(tool_calls) <= idx:
                                 tool_calls.append({})
                             _accumulate_tool_call_delta(tool_calls[idx], delta)
@@ -524,6 +577,27 @@ class OllamaProvider(BaseProvider):
         )
 
 
+def _resolve_tool_call_index(delta: dict, position: int) -> int:
+    """Pick the accumulator slot for a streamed tool-call delta (#38).
+
+    Ollama's native /api/chat usually omits an index and can return several
+    complete tool calls in a single message's ``tool_calls`` array. The old code
+    read ``delta.get("index", 0)`` and so collapsed every call in that array into
+    slot 0 — losing all but one. Prefer an explicit index when present (top-level
+    or nested under ``function``, for OpenAI-style servers), otherwise fall back
+    to the delta's position in the array. Using the position preserves
+    cross-chunk fragment accumulation (each chunk carries one entry at position
+    0) while separating multiple whole calls that arrive together.
+    """
+    for candidate in (
+        delta.get("index"),
+        delta["function"].get("index") if isinstance(delta.get("function"), dict) else None,
+    ):
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+            return candidate
+    return position
+
+
 def _accumulate_tool_call_delta(acc: dict, delta: dict) -> None:
     """Merge a streaming tool-call delta into an accumulator entry.
 
@@ -596,6 +670,22 @@ def _assistant_tool_call_message(raw_content: str, call_id: str | None = None) -
     }
 
 
+_TOOL_RESULT_RE = re.compile(r"^\s*\[Tool result:\s*([A-Za-z0-9_.:-]+)\]\s*\n?([\s\S]*)$")
+
+
+def _tool_result_name(text: str) -> str | None:
+    """Tool name if `text` is a ``[Tool result: <name>]`` payload, else None.
+
+    Used to pair a result with the correct pending assistant tool call before
+    building the tool message (#40).
+    """
+    match = _TOOL_RESULT_RE.match(text or "")
+    if not match:
+        return None
+    name = match.group(1).strip()
+    return name or None
+
+
 def _tool_result_message(
     role: str,
     text: str,
@@ -603,7 +693,7 @@ def _tool_result_message(
 ) -> dict[str, Any] | None:
     if role != "user":
         return None
-    match = re.match(r"^\s*\[Tool result:\s*([A-Za-z0-9_.:-]+)\]\s*\n?([\s\S]*)$", text)
+    match = _TOOL_RESULT_RE.match(text)
     if not match:
         return None
     name = match.group(1).strip()

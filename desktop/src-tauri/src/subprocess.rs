@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::State;
 
-fn forward_agent_stdout_line(
+pub(crate) fn forward_agent_stdout_line(
     app: &tauri::AppHandle,
     ipc_typed: bool,
     is_codex: bool,
@@ -879,6 +879,14 @@ pub(crate) async fn send_task(
     // Reserve the runner slot immediately before spawning.
     {
         let mut rt = crate::task_runtime::task_runtime().lock().await;
+        // #25: recover from a stale dead pid (e.g. a missed clear after a
+        // wait() error) instead of blocking every future task until restart.
+        // Mirrors the /v1/task bridge path.
+        if let Some(pid) = rt.pid {
+            if !process_exists(pid) {
+                rt.clear();
+            }
+        }
         rt.reserve().map_err(|_| {
             "A task is already running. Stop it before starting a new one.".to_string()
         })?;
@@ -950,7 +958,10 @@ pub(crate) async fn send_task(
         None
     };
 
-    let status = child.wait().await.map_err(|e| e.to_string())?;
+    // #25: don't `?` on wait() before cleanup — a propagated error here used
+    // to skip the clear below, leaving a stale pid that blocked every future
+    // task with "A task is already running" until app restart.
+    let wait_result = child.wait().await;
 
     if let Some(handle) = stdout_handle {
         let _ = handle.await;
@@ -960,9 +971,11 @@ pub(crate) async fn send_task(
     }
 
     // Clear the recorded PID regardless of exit reason (normal, error, cancelled).
+    // Guarded by pid (#24): if a cancel poller already cleared us and a new
+    // task has since stored its own pid, this late clear must be a no-op.
     {
         let mut rt = crate::task_runtime::task_runtime().lock().await;
-        rt.clear();
+        rt.clear_if_pid(child_pid);
     }
     // K7: tray back to idle.
     crate::speed_access::set_tray_status(&app_handle, None);
@@ -971,6 +984,8 @@ pub(crate) async fn send_task(
     if let Some(flash_win) = app_handle.get_webview_window("screenshot-flash") {
         let _ = flash_win.close();
     }
+
+    let status = wait_result.map_err(|e| e.to_string())?;
 
     if is_codex {
         if code_backend
@@ -1035,8 +1050,9 @@ pub(crate) async fn cancel_task(
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if !process_exists(pid) {
+                // #24: pid-guarded — a new task may already occupy the slot.
                 let mut rt = crate::task_runtime::task_runtime().lock().await;
-                rt.clear();
+                rt.clear_if_pid(pid);
                 let _ = app.emit("kim-agent-cancelled", true);
                 return;
             }
@@ -1044,7 +1060,7 @@ pub(crate) async fn cancel_task(
         // Still alive after 2s → SIGKILL / taskkill /F.
         let _ = send_signal(pid, true);
         let mut rt = crate::task_runtime::task_runtime().lock().await;
-        rt.clear();
+        rt.clear_if_pid(pid); // #24: pid-guarded
         let _ = app.emit("kim-agent-cancelled", true);
     });
 

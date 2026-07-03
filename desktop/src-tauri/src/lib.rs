@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 pub mod account;
 pub mod browser_bridge;
 mod codex_bridge;
+mod env_path;
 pub mod codex_projects;
 pub mod config;
 pub mod data_io;
@@ -564,13 +565,19 @@ fn write_first_png_to_clipboard(_attachments: &[BridgeAttachment]) -> bool {
     false
 }
 
-/// Stage a text prompt through a temporary file and copy it to the macOS
-/// clipboard. The temporary file is removed immediately after pbcopy reads it.
+/// Read the current macOS clipboard as text (empty string if it holds no text).
 #[cfg(target_os = "macos")]
-fn write_text_prompt_to_clipboard(prompt: &str) -> bool {
-    // Pipe prompt bytes directly to pbcopy stdin — no temp file needed (#5).
-    // The old approach wrote to a world-readable /tmp file that could expose
-    // the full prompt (which may contain secrets/PII).
+fn read_clipboard_text() -> Option<String> {
+    std::process::Command::new("pbpaste")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Copy `text` to the macOS clipboard via pbcopy. Returns true on success.
+#[cfg(target_os = "macos")]
+fn pbcopy_text(text: &str) -> bool {
     let mut child = match std::process::Command::new("pbcopy")
         .stdin(std::process::Stdio::piped())
         .spawn()
@@ -581,20 +588,42 @@ fn write_text_prompt_to_clipboard(prompt: &str) -> bool {
             return false;
         }
     };
-
     let wrote = child
         .stdin
         .take()
         .map(|mut stdin| {
             use std::io::Write;
-            stdin.write_all(prompt.as_bytes()).is_ok()
+            stdin.write_all(text.as_bytes()).is_ok()
         })
         .unwrap_or(false);
-    let ok = wrote && child.wait().map(|s| s.success()).unwrap_or(false);
+    wrote && child.wait().map(|s| s.success()).unwrap_or(false)
+}
 
+/// Stage a text prompt on the macOS clipboard so the browser bridge can paste it
+/// into the provider editor.
+///
+/// #44: the prompt (which may contain secrets/PII) used to be left on the system
+/// clipboard indefinitely. We now snapshot the prior clipboard, and after the
+/// paste has landed restore it — but only if the clipboard still holds *our*
+/// injected prompt, so we never clobber something the user copied in the
+/// meantime.
+#[cfg(target_os = "macos")]
+fn write_text_prompt_to_clipboard(prompt: &str) -> bool {
+    let prior = read_clipboard_text();
+    let ok = pbcopy_text(prompt);
     if !ok {
         eprintln!("[Kim] clipboard: pbcopy failed (non-fatal)");
+        return false;
     }
+
+    let prompt_owned = prompt.to_string();
+    std::thread::spawn(move || {
+        // Well after the bridge's paste (~100–500ms). Restore-if-unchanged.
+        std::thread::sleep(Duration::from_secs(8));
+        if read_clipboard_text().as_deref() == Some(prompt_owned.as_str()) {
+            let _ = pbcopy_text(prior.as_deref().unwrap_or(""));
+        }
+    });
     ok
 }
 
@@ -1193,6 +1222,9 @@ pub(crate) use subprocess::{
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // #23: repair the minimal launchd PATH before anything shells out —
+    // packaged GUI launches otherwise can't find ollama/git/etc.
+    env_path::fix_gui_path();
     let task_state: TaskState = Arc::new(Mutex::new(RunningTask::default()));
     let schedule_timer_state = schedule_commands::new_schedule_timer_state();
     let config_path = config_yaml_path(None);

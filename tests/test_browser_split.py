@@ -215,6 +215,37 @@ class TestBuildHistoryRecap(unittest.TestCase):
         assert "Kim is working" not in result
         assert "User: open calc" in result
 
+    def test_internal_status_narration_all_phrasings_skipped(self):
+        # #39: the recap filter must cover every narration phrasing the frontend
+        # (speakAsKimNarration) and orchestrator (emit_status) can produce.
+        narration = [
+            "Kim is thinking",
+            "Kim is thinking…",
+            "Kim is thinking...",
+            "Kim is still thinking… (3s)",
+            "Kim is working",
+            "Kim is working on it…",
+            "Kim is still working on it",
+            "KIM IS THINKING…",
+        ]
+        for text in narration:
+            msgs = [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": "Task: real task"},
+            ]
+            result = self.recap(msgs)
+            assert "Kim:" not in result, f"narration leaked into recap: {text!r} -> {result!r}"
+            assert "User: real task" in result
+
+    def test_real_answer_starting_with_kim_is_preserved(self):
+        # A genuine one-line answer that merely starts "Kim is …" but isn't the
+        # status shape must NOT be dropped.
+        msgs = [
+            {"role": "assistant", "content": "Kim is a local AI agent platform."},
+        ]
+        result = self.recap(msgs)
+        assert "Kim: Kim is a local AI agent platform." in result
+
     def test_truncation(self):
         msgs = [{"role": "user", "content": "x" * 5000}]
         result = self.recap(msgs, max_recap=100)

@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 from orchestrator.agent_config import DEFAULT_PROVIDER
-from orchestrator.events_gen import emit_answer, emit_run_done
+from orchestrator.events_gen import emit_activity, emit_answer, emit_run_done
 
 
 def resolve_log_dir() -> Path:
@@ -120,6 +120,17 @@ async def _cli_main(args: argparse.Namespace) -> None:
             answer = answer[len("TASK_COMPLETE:"):].strip()
         if answer:
             emit_answer(answer)
+    elif termination != "cancelled":
+        # #26/#27: in typed IPC mode Rust drops the legacy `[FAILED] <summary>`
+        # text line, so failed runs (including NEED_HELP questions) lost their
+        # detail — the UI only saw the bare termination code via kim:run-failed.
+        # Emit the summary as a typed activity event: the frontend's kim:activity
+        # error handler surfaces the real text and preserves it instead of
+        # overwriting with a generic banner. User cancels are excluded — they
+        # are not errors and already flow through kim-agent-cancelled.
+        failure_detail = str(result.get("summary", "")).strip()
+        if failure_detail:
+            emit_activity("error", failure_detail)
     # Human-readable line for legacy kim-agent-output path and activity feed.
     print(f"[STATUS] run ended: {termination}", flush=True)
     print(f"\n[{status}] {result['summary']}")

@@ -105,6 +105,20 @@ impl TaskRuntime {
         self.bridge_stdin = None;
     }
 
+    /// Clear only if the stored pid still matches `pid` (#24).
+    ///
+    /// Late cleanup paths (cancel pollers, spawn-side waiters) race new
+    /// spawns: task A's deferred `clear()` must not wipe task B's freshly
+    /// stored pid/session/stdin. Returns true if it actually cleared.
+    pub fn clear_if_pid(&mut self, pid: u32) -> bool {
+        if self.pid == Some(pid) {
+            self.clear();
+            true
+        } else {
+            false
+        }
+    }
+
     /// True if the slot is occupied (either starting or a pid is held).
     pub fn is_occupied(&self) -> bool {
         self.pid.is_some() || self.starting
@@ -215,5 +229,33 @@ mod tests {
         let mut rt = TaskRuntime::default();
         rt.store_pid(1, "s".to_string(), SpawnSource::Gui);
         assert!(rt.is_occupied());
+    }
+
+    // #24: a stale clear (from a cancelled predecessor task) must not wipe a
+    // successor task's state.
+    #[test]
+    fn clear_if_pid_clears_on_matching_pid() {
+        let mut rt = TaskRuntime::default();
+        rt.store_pid(100, "a".to_string(), SpawnSource::Gui);
+        assert!(rt.clear_if_pid(100));
+        assert!(!rt.is_occupied());
+        assert!(rt.session_id.is_none());
+    }
+
+    #[test]
+    fn clear_if_pid_is_noop_on_different_pid() {
+        let mut rt = TaskRuntime::default();
+        rt.store_pid(200, "b".to_string(), SpawnSource::Bridge);
+        assert!(!rt.clear_if_pid(100));
+        assert_eq!(rt.pid, Some(200));
+        assert_eq!(rt.session_id.as_deref(), Some("b"));
+        assert_eq!(rt.source, Some(SpawnSource::Bridge));
+    }
+
+    #[test]
+    fn clear_if_pid_is_noop_when_idle() {
+        let mut rt = TaskRuntime::default();
+        assert!(!rt.clear_if_pid(100));
+        assert!(!rt.is_occupied());
     }
 }

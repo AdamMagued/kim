@@ -94,6 +94,13 @@ struct OllamaShowResponse {
     modelfile: Option<String>,
 }
 
+/// Suggested Ollama cloud models shown in the picker (#32).
+///
+/// Display suggestions only — the daemon is authoritative and the selected
+/// model is validated at request time (a wrong name fails there, not here).
+/// Trimmed to real `-cloud` tags: the fabricated `deepseek-coder-v4:cloud` and
+/// `mistral-large:latest-cloud` (non-existent / malformed tags) were removed.
+/// Keep in sync with the CLI copy in `cli/src/commands.rs`.
 fn known_ollama_cloud_models() -> Vec<String> {
     vec![
         // OpenAI open-source models (Ollama cloud routing)
@@ -108,9 +115,6 @@ fn known_ollama_cloud_models() -> Vec<String> {
         // DeepSeek
         "deepseek-r1:671b-cloud".to_string(),
         "deepseek-v3:685b-cloud".to_string(),
-        "deepseek-coder-v4:cloud".to_string(),
-        // Mistral
-        "mistral-large:latest-cloud".to_string(),
         // Gemma (Google)
         "gemma3:27b-cloud".to_string(),
     ]
@@ -300,18 +304,53 @@ async fn ollama_chat_probe(base_url: &str, model: &str) -> Result<(), String> {
     })
 }
 
-fn friendly_ollama_cloud_message(detail: &str) -> String {
-    let lowered = detail.to_lowercase();
-    if lowered.contains("sign in")
-        || lowered.contains("unauthorized")
-        || lowered.contains("forbidden")
-    {
-        "Sign in to Ollama to use cloud models".to_string()
-    } else if lowered.contains("not found") || lowered.contains("pull") {
-        "Cloud model unavailable; use a local model or install the cloud model".to_string()
-    } else {
-        "Cloud model unavailable; use a local model or sign in".to_string()
+/// Classify `ollama whoami` output into a sign-in verdict (#22).
+///
+/// Ok(true)  — signed in (command succeeded and printed an account).
+/// Ok(false) — definitively not signed in.
+/// Err(_)    — indeterminate (old CLI without `whoami`, timeout, other error);
+///             callers should fall back to the previous liveness-only behavior
+///             rather than hard-blocking cloud tasks.
+fn classify_whoami_output(success: bool, stdout: &str, stderr: &str) -> Result<bool, String> {
+    if success {
+        return Ok(!stdout.trim().is_empty());
     }
+    let combined = format!("{} {}", stdout, stderr).to_lowercase();
+    if combined.contains("not signed in")
+        || combined.contains("sign in")
+        || combined.contains("signin")
+        || combined.contains("unauthorized")
+        || combined.contains("401")
+    {
+        return Ok(false);
+    }
+    if combined.contains("unknown command") || combined.contains("unknown flag") {
+        return Err("ollama CLI does not support `whoami`".to_string());
+    }
+    Err(if combined.trim().is_empty() {
+        "whoami failed".to_string()
+    } else {
+        combined
+    })
+}
+
+/// Real ollama.com sign-in probe: `ollama whoami` (#22).
+/// The previous check hit `/api/version`, which is a daemon-liveness endpoint
+/// that never requires an account — it reported "connected" even when the
+/// user had never run `ollama signin`.
+async fn ollama_cloud_signed_in(binary: &str) -> Result<bool, String> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(binary).arg("whoami").output(),
+    )
+    .await
+    .map_err(|_| "whoami timed out".to_string())?
+    .map_err(|e| e.to_string())?;
+    classify_whoami_output(
+        out.status.success(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    )
 }
 
 #[tauri::command]
@@ -453,14 +492,20 @@ pub async fn ollama_get_status(
         })
         .unwrap_or(false);
 
-    // For status polling in cloud mode, use a lightweight liveness check
-    // (version endpoint) instead of sending a real generation request on
-    // every poll, which would incur token cost/latency on metered cloud.
+    // Cloud mode: check the real ollama.com sign-in state via `ollama whoami`
+    // (#22). Free and local — no generation request, no token cost. If the
+    // installed CLI predates `whoami` (or the probe errors), fall back to the
+    // old daemon-liveness semantics instead of hard-blocking cloud tasks.
     // Explicit model validation is available via `ollama_test_model`.
     let (cloud_connected, cloud_message) = if selected_mode == "cloud" {
-        match ollama_version(&base_url).await {
-            Ok(_) => (true, Some("Connected to Ollama".to_string())),
-            Err(detail) => (false, Some(friendly_ollama_cloud_message(&detail))),
+        let binary = installed_path.as_deref().unwrap_or("ollama");
+        match ollama_cloud_signed_in(binary).await {
+            Ok(true) => (true, Some("Connected to Ollama".to_string())),
+            Ok(false) => (
+                false,
+                Some("Sign in to Ollama to use cloud models".to_string()),
+            ),
+            Err(_) => (true, Some("Connected to Ollama".to_string())),
         }
     } else {
         (
@@ -677,4 +722,43 @@ pub async fn ollama_pull_model(model: String, app_handle: tauri::AppHandle) -> R
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_whoami_output;
+
+    #[test]
+    fn whoami_success_with_account_is_signed_in() {
+        assert_eq!(classify_whoami_output(true, "alice@example.com\n", ""), Ok(true));
+    }
+
+    #[test]
+    fn whoami_success_with_empty_output_is_not_signed_in() {
+        assert_eq!(classify_whoami_output(true, "  \n", ""), Ok(false));
+    }
+
+    #[test]
+    fn whoami_not_signed_in_error_is_definitive_false() {
+        assert_eq!(
+            classify_whoami_output(false, "", "Error: you are not signed in"),
+            Ok(false)
+        );
+        assert_eq!(
+            classify_whoami_output(false, "", "Error: unauthorized"),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn whoami_unknown_command_is_indeterminate() {
+        // Old ollama CLI without `whoami` — must NOT report signed-out,
+        // callers fall back to liveness-only semantics.
+        assert!(classify_whoami_output(false, "", "Error: unknown command \"whoami\"").is_err());
+    }
+
+    #[test]
+    fn whoami_other_failure_is_indeterminate() {
+        assert!(classify_whoami_output(false, "", "some transient failure").is_err());
+    }
 }

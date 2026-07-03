@@ -124,6 +124,12 @@ class Handler(BaseHTTPRequestHandler):
 
         model = req.get("model", "llama3.2")
         messages = input_to_messages(req.get("input", []))
+        # #29: Codex sends its entire system prompt in the top-level
+        # Responses-API `instructions` field, not inside `input`. Dropping it
+        # ran Codex against ollama with no system instructions at all.
+        instructions = req.get("instructions")
+        if isinstance(instructions, str) and instructions.strip():
+            messages.insert(0, {"role": "system", "content": clean_image_data(instructions)})
         tools = tools_to_chat(req.get("tools", []))
         stream = req.get("stream", False)
         _log(f"POST model={model!r} stream={stream} path={self.path!r} msgs={len(messages)}")

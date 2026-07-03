@@ -118,6 +118,16 @@ class CliTerminationStaticTests(unittest.TestCase):
         self.assertGreater(status_pos, -1, "[STATUS] run ended not found in cli.py")
         self.assertLess(json_pos, status_pos)
 
+    def test_failure_summary_emitted_as_typed_activity(self):
+        """#26/#27: failed (non-cancelled) runs must emit a typed activity error
+        carrying the summary. Typed IPC mode drops the legacy `[FAILED] <summary>`
+        text line, so without this the UI only ever sees the bare termination code
+        and NEED_HELP questions render with no content."""
+        self.assertIn("emit_activity", self.source)
+        self.assertIn('emit_activity("error", failure_detail)', self.source)
+        # User cancels are not errors and must not produce an error activity.
+        self.assertIn('termination != "cancelled"', self.source)
+
 
 class CliTerminationFormatTests(unittest.TestCase):
     """Pure-logic tests for the termination output format string."""

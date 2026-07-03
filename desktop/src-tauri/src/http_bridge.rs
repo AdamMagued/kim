@@ -1143,8 +1143,14 @@ fn handle_webview_bridge_request(
                 session_id: Option<String>,
                 #[serde(default)]
                 provider: Option<String>,
-                /// Mirrors the CLI's --permission-mode / KIM_HITL_RISK_THRESHOLD (#15).
-                /// Accepted values: "auto", "confirm-sensitive", "confirm-all".
+                /// HITL permission gate → KIM_HITL_RISK_THRESHOLD (#15/#37).
+                /// Canonical values match the GUI/subprocess.rs vocabulary:
+                ///   "full_auto"  → no gate
+                ///   "ask_risky"  → high-risk tools need approval
+                ///   "ask_always" → medium+ tools need approval
+                /// Legacy aliases also accepted: "auto"=full_auto,
+                /// "confirm-sensitive"=ask_risky, "confirm-all"=ask_always.
+                /// Anything unrecognized defaults to full_auto.
                 #[serde(default)]
                 permission_mode: Option<String>,
             }
@@ -1307,14 +1313,18 @@ fn handle_webview_bridge_request(
             //   ask_always  → KIM_HITL_RISK_THRESHOLD=medium (all medium+ tools)
             // Also set KIM_TAURI_MODE=1 so StdinApprovalBridge is auto-wired.
             cmd.env("KIM_TAURI_MODE", "1");
+            // #37: accept both the canonical vocabulary and the legacy aliases
+            // that this endpoint's docs historically advertised, so an
+            // integrator using either gets the HITL gate they asked for instead
+            // of a silent full-auto.
             match parsed.permission_mode.as_deref().unwrap_or("full_auto") {
-                "ask_risky" => {
+                "ask_risky" | "confirm-sensitive" => {
                     cmd.env("KIM_HITL_RISK_THRESHOLD", "high");
                 }
-                "ask_always" => {
+                "ask_always" | "confirm-all" => {
                     cmd.env("KIM_HITL_RISK_THRESHOLD", "medium");
                 }
-                _ => {} // full_auto or unknown: no threshold = no HITL gate
+                _ => {} // full_auto / auto / unknown: no threshold = no HITL gate
             }
 
             if provider == "browser" || provider.starts_with("browser:") {
@@ -1373,14 +1383,27 @@ fn handle_webview_bridge_request(
                         }),
                     );
 
-                    // Background thread: read stdout to capture SCREENSHOT_FLASH and emit to UI
+                    // Background thread: read stdout and forward events to the UI.
+                    // #33: route through the same translator the GUI path uses so
+                    // typed kim:* events (plan/step/tool/answer/…) reach the
+                    // frontend's typed listeners. Previously this emitted every
+                    // line raw on kim-agent-output, and the frontend's
+                    // decodeKimEventLine silently discarded typed JSON — so a
+                    // kimctl-launched task showed almost nothing in the desktop UI.
+                    let ipc_typed =
+                        app_handle.state::<crate::config::AppConfig>().ipc_protocol == "typed";
                     let reader_handle = if let Some(stdout) = child.stdout.take() {
                         let reader = std::io::BufReader::new(stdout);
                         use std::io::BufRead;
                         let app_handle_out = app_handle.clone();
                         Some(std::thread::spawn(move || {
                             for l in reader.lines().map_while(Result::ok) {
-                                let _ = app_handle_out.emit("kim-agent-output", l);
+                                crate::subprocess::forward_agent_stdout_line(
+                                    &app_handle_out,
+                                    ipc_typed,
+                                    false,
+                                    &l,
+                                );
                             }
                         }))
                     } else {
@@ -1396,8 +1419,14 @@ fn handle_webview_bridge_request(
                         if let Some(handle) = reader_handle {
                             let _ = handle.join();
                         }
+                        // #24: pid-guarded — if a cancel poller already cleared
+                        // us and a new task stored its own pid meanwhile, this
+                        // late clear must be a no-op.
                         tauri::async_runtime::block_on(async {
-                            crate::task_runtime::task_runtime().lock().await.clear();
+                            crate::task_runtime::task_runtime()
+                                .lock()
+                                .await
+                                .clear_if_pid(child_pid);
                         });
                         if let Some(cancel_win) = app_for_wait.get_webview_window("cancel-widget") {
                             let _ = cancel_win.close();
@@ -1472,8 +1501,12 @@ fn handle_webview_bridge_request(
                                 if process_exists(pid) {
                                     let _ = send_signal(pid, true);
                                 }
+                                // #24: pid-guarded — never wipe a successor task.
                                 tauri::async_runtime::block_on(async {
-                                    crate::task_runtime::task_runtime().lock().await.clear();
+                                    crate::task_runtime::task_runtime()
+                                        .lock()
+                                        .await
+                                        .clear_if_pid(pid);
                                 });
                             });
                             respond_json(
@@ -1495,8 +1528,16 @@ fn handle_webview_bridge_request(
                     }
                 }
                 _ => {
+                    // #24: only reap a stale DEAD pid here. The old
+                    // unconditional clear() also wiped the `starting` flag,
+                    // letting a second task reserve while one was mid-spawn.
                     tauri::async_runtime::block_on(async {
-                        crate::task_runtime::task_runtime().lock().await.clear();
+                        let mut rt = crate::task_runtime::task_runtime().lock().await;
+                        if let Some(stale) = rt.pid {
+                            if !process_exists(stale) {
+                                rt.clear();
+                            }
+                        }
                     });
                     respond_json(
                         request,
