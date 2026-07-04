@@ -57,7 +57,7 @@ _DENY_PATTERNS = [
 # existing callers depend on redirection working (e.g. `printf x > file`).
 # Process substitution '<(...)' / '>(' is caught by the '<\(' / '>\(' patterns.
 # \n and \r are included: POSIX shells treat newline like ';' as a separator.
-_CHAIN_METACHAR_RE = re.compile(r"[;|&`\n\r]|\$\(|<\(|>\(")
+_CHAIN_METACHAR_RE = re.compile(r"[;|`\n\r]|(?<!>)&(?!>)|\$\(|<\(|>\(")
 
 # Operator-level split used to isolate individual segments when chaining is
 # allowed.  '&&' and '||' must appear before the single-char alternatives so
@@ -93,6 +93,9 @@ _DANGEROUS_ENV_VARS = frozenset({
     # Node.js / Ruby / Perl module paths
     "NODE_PATH", "RUBYLIB", "PERL5LIB", "PERLLIB",
 })
+
+_ENV_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
+_SAFE_ABSOLUTE_REDIRECTS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
 
 
 def _filtered_env() -> dict[str, str]:
@@ -190,6 +193,18 @@ def _check_single_segment(cmd: str) -> str | None:
     if not tokens:
         return None
 
+    # Removing dangerous variables from the inherited environment is not
+    # sufficient: a shell command can set them inline (directly or through
+    # wrappers such as ``env`` / ``sudo env``).  Reject those assignments
+    # wherever they occur in the command token stream.
+    for token in tokens:
+        assignment = _ENV_ASSIGNMENT_RE.match(token)
+        if assignment and assignment.group(1) in _DANGEROUS_ENV_VARS:
+            return (
+                "BLOCKED: Inline assignment to dangerous environment variable "
+                f"'{assignment.group(1)}'"
+            )
+
     # Detect process/command substitution tokens that may survive operator
     # splitting (e.g. the <(rm ...) token in `cat <(rm ...)`) (finding 1)
     for token in tokens:
@@ -207,14 +222,20 @@ def _check_single_segment(cmd: str) -> str | None:
         # Space-separated form: standalone operator followed by separate target
         if _REDIR_OP_RE.match(tok) and i + 1 < len(tokens):
             target = tokens[i + 1]
-            if target.startswith("/") or ".." in target:
+            if (
+                target.startswith("/")
+                and target not in _SAFE_ABSOLUTE_REDIRECTS
+            ) or ".." in target:
                 return "BLOCKED: Redirection to absolute path or parent traversal"
         # No-space form: operator prefix merged with target in the same token
         # e.g. '>/etc/passwd', '>>/abs/p', '2>/dev/null', '< /etc/shadow'
         m = _REDIR_PREFIX_RE.match(tok)
         if m and m.end() < len(tok):
             target = tok[m.end():]
-            if target.startswith("/") or ".." in target:
+            if (
+                target.startswith("/")
+                and target not in _SAFE_ABSOLUTE_REDIRECTS
+            ) or ".." in target:
                 return "BLOCKED: Redirection to absolute path or parent traversal"
 
     first_cmd = _basename(tokens[0])

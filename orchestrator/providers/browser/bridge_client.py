@@ -26,6 +26,7 @@ async def complete_via_webview_bridge(
     prompt: str,
     attachments: list[dict],
     completion_hash: str,
+    known_tools: Optional[set[str]] = None,
     clear_chat: bool = False,
     site_configs: Optional[dict] = None,
 ) -> dict:
@@ -98,7 +99,7 @@ async def complete_via_webview_bridge(
         if send_resp.status_code == 404:
             logger.info("Bridge /v1/send returned 404, falling back to /v1/complete")
             return await _complete_via_webview_bridge_legacy(
-                bridge_url, prompt, headers, payload, completion_hash
+                bridge_url, prompt, headers, payload, completion_hash, known_tools
             )
 
         try:
@@ -213,7 +214,9 @@ async def complete_via_webview_bridge(
             "content": "NEED_HELP: In-app browser bridge returned an empty response.",
         }
 
-    return parse_response(raw_response.strip(), completion_hash)
+    return parse_response(
+        raw_response.strip(), completion_hash, known_tools=known_tools
+    )
 
 
 async def _complete_via_webview_bridge_legacy(
@@ -222,6 +225,7 @@ async def _complete_via_webview_bridge_legacy(
     headers: dict,
     payload: dict,
     completion_hash: str,
+    known_tools: Optional[set[str]] = None,
 ) -> dict:
     """Monolithic /v1/complete fallback for older Rust binaries."""
     try:
@@ -286,4 +290,6 @@ async def _complete_via_webview_bridge_legacy(
             "content": "NEED_HELP: In-app browser bridge returned an empty response.",
         }
 
-    return parse_response(raw_response.strip(), completion_hash)
+    return parse_response(
+        raw_response.strip(), completion_hash, known_tools=known_tools
+    )

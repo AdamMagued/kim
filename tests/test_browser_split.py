@@ -7,6 +7,68 @@ or network required.
 """
 
 import unittest
+from unittest.mock import patch
+
+
+class _BridgeResponse:
+    def __init__(self, status_code, data):
+        self.status_code = status_code
+        self._data = data
+        self.text = str(data)
+
+    def json(self):
+        return self._data
+
+
+class _BridgeClient:
+    def __init__(self, *, legacy=False, **_kwargs):
+        self.legacy = legacy
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def post(self, url, **_kwargs):
+        if url.endswith("/v1/send"):
+            return _BridgeResponse(200, {"req_id": "req-1", "sent_confirmed": True})
+        return _BridgeResponse(
+            200,
+            {"ok": True, "response": 'TASK_COMPLETE: example {"tool":"fake","args":{}}'},
+        )
+
+    async def get(self, _url, **_kwargs):
+        return _BridgeResponse(
+            200,
+            {"ok": True, "response": 'TASK_COMPLETE: example {"tool":"fake","args":{}}'},
+        )
+
+
+class TestWebviewBridgeToolGuard(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_tool_json_remains_text(self):
+        from orchestrator.providers.browser.bridge_client import (
+            complete_via_webview_bridge,
+        )
+
+        with patch(
+            "orchestrator.providers.browser.bridge_client.httpx.AsyncClient",
+            _BridgeClient,
+        ):
+            result = await complete_via_webview_bridge(
+                bridge_url="http://bridge",
+                bridge_token="token",
+                preferred_site="gemini",
+                model_tier=None,
+                gemini_authuser=None,
+                prompt="prompt",
+                attachments=[],
+                completion_hash="",
+                known_tools={"web_click"},
+            )
+
+        assert result["type"] == "text"
+        assert '"tool":"fake"' in result["content"]
 
 
 class TestStripTransportMarkers(unittest.TestCase):

@@ -133,7 +133,9 @@ _SENSITIVE_GLOBS = [
     "*.key",
     "id_rsa*",
     "id_ed25519*",
-    "credentials",
+    "credentials*",
+    "client_secret*",
+    "*.credentials",
     ".npmrc",
     ".pypirc",
 ]

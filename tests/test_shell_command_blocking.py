@@ -351,6 +351,41 @@ def test_filtered_env_strips_all_injection_vars(monkeypatch):
         assert k not in env, f"{k} should be stripped by _filtered_env() but was present"
 
 
+@pytest.mark.parametrize("cmd", [
+    "LD_PRELOAD=/tmp/x.so ls",
+    "env LD_PRELOAD=/tmp/x.so ls",
+    "sudo env LD_PRELOAD=/tmp/x.so ls",
+    "DYLD_INSERT_LIBRARIES=/tmp/x.dylib id",
+    "PYTHONPATH=/tmp/modules python script.py",
+])
+def test_inline_dangerous_env_assignments_are_blocked(cmd):
+    result = _check_blocked(cmd)
+    assert result is not None and "dangerous environment variable" in result
+
+
+def test_benign_inline_env_assignment_is_allowed():
+    assert _check_blocked("FOO=bar command") is None
+
+
+@pytest.mark.parametrize("target", [
+    "/dev/null",
+    "/dev/stdout",
+    "/dev/stderr",
+])
+def test_safe_device_redirections_are_allowed(target):
+    assert _check_blocked(f"cmd >{target}") is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "cmd 2>&1",
+    "cmd >&output.log",
+    "cmd &>/dev/null",
+    "cmd >/dev/null 2>&1",
+])
+def test_fd_duplication_redirections_are_allowed(cmd):
+    assert _check_blocked(cmd) is None
+
+
 # ── 4. Deny set and wrapper commands (finding 3 / finding 5) ─────────────────
 
 

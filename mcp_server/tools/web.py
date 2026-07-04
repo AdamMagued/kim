@@ -1505,15 +1505,15 @@ async def handle_web_screenshot(args: dict) -> str:
 
 
 async def handle_web_wait_for(args: dict) -> str:
-    target = str(args.get("text") or args.get("selector") or "").strip()
+    text = str(args.get("text") or "").strip()
+    selector = str(args.get("selector") or "").strip()
+    target = text or selector
     timeout = int(args.get("timeout_ms", 10000))
     if not target:
         return "ERROR: 'text' or 'selector' is required"
     page = await _page()
     try:
-        if target.startswith("/") or target.startswith(("css=", "xpath=")) or any(
-            ch in target for ch in "#.[>:"
-        ):
+        if selector or target.startswith(("css=", "xpath=", "/")):
             await page.locator(target).first.wait_for(timeout=timeout, state="visible")
             return f"Selector matched: {target}"
         await page.get_by_text(target, exact=False).first.wait_for(

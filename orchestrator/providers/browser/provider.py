@@ -356,6 +356,7 @@ class BrowserProvider(BaseProvider):
                 prompt=prompt,
                 attachments=attachments,
                 completion_hash=completion_hash,
+                known_tools={t["name"] for t in (tools or []) if "name" in t},
                 clear_chat=clear_chat,
                 site_configs=getattr(self, "_site_configs", None),
             )

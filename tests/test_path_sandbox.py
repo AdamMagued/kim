@@ -74,6 +74,16 @@ class SensitiveFileGlobTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             validate_path("aws/credentials")
 
+    def test_credential_file_variants_denied(self):
+        for path in (
+            "credentials.json",
+            "credentials.yml",
+            "client_secret_example.json",
+            "service.credentials",
+        ):
+            with self.subTest(path=path), self.assertRaises(PermissionError):
+                validate_path(path)
+
     def test_npmrc_denied(self):
         with self.assertRaises(PermissionError):
             validate_path(".npmrc")
