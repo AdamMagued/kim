@@ -1203,12 +1203,25 @@ class BrowserProvider(BaseProvider):
 
             if any_stop_visible:
                 idle_count = 0
-            elif idle_count > 8 and loop.time() > min_generation_time:
-                if completion_hash and completion_hash not in current_text:
-                    logger.warning("Generation complete (stop button hidden) but completion hash missing!")
-                else:
-                    logger.debug("Generation complete (stop button hidden & text settled)")
-                return
+            else:
+                # The completion sentinel is the definitive "done" signal. When we
+                # asked for one and it's still absent, the model is very likely
+                # mid-generation — returning here scrapes a truncated answer (the
+                # exact bug where a reply was cut off mid-sentence). So stay patient
+                # while the hash is pending and only fall back to the text-settled
+                # heuristic after a much longer idle.
+                hash_pending = bool(completion_hash) and completion_hash not in current_text
+                idle_needed = 20 if hash_pending else 8  # ~15s vs ~6s of stable text
+                if idle_count > idle_needed and loop.time() > min_generation_time:
+                    if hash_pending:
+                        logger.warning(
+                            "Completion hash still missing after ~%ds of settled text "
+                            "— scraping anyway (response may be truncated)",
+                            int(idle_count * 0.75),
+                        )
+                    else:
+                        logger.debug("Generation complete (stop button hidden & text settled)")
+                    return
             now = loop.time()
             if now - last_status >= 3:
                 elapsed = int(now - (deadline - GENERATION_WAIT_S))

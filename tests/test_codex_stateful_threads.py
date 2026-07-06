@@ -129,7 +129,7 @@ class TestThreadStateSidecar(unittest.TestCase):
 
 class TestNoteRelayResult(unittest.TestCase):
     def test_fresh_chat_resets_then_counts_this_turn(self):
-        proxy, _ = _proxy(thread_state={"turns": 9, "est_tokens": 50_000})
+        proxy, _ = _proxy(thread_state={"turns": 9, "est_tokens": 50_000}, stateful=True)
         proxy._note_relay_result(
             is_first_relay=True,
             cleared_chat=True,
@@ -140,6 +140,25 @@ class TestNoteRelayResult(unittest.TestCase):
         self.assertEqual(st["turns"], 1)            # reset to 0, then +1
         self.assertEqual(st["est_tokens"], 140)     # reset to 0, then +usage
         self.assertTrue(st["sent_instructions"])    # first relay armed the thread
+
+    def test_sent_instructions_only_persisted_in_stateful_mode(self):
+        # Legacy (stateful off) clears the chat every task, so it must NOT
+        # persist sent_instructions — otherwise the first stateful task later
+        # would wrongly skip the system prompt (send a delta into a chat that
+        # never received it).
+        off, _ = _proxy(thread_state={}, stateful=False)
+        off._note_relay_result(
+            is_first_relay=True, cleared_chat=True, consumed_handoff=None,
+            response={"usage": {}},
+        )
+        self.assertFalse(off._thread_state.get("sent_instructions"))
+
+        on, _ = _proxy(thread_state={}, stateful=True)
+        on._note_relay_result(
+            is_first_relay=True, cleared_chat=True, consumed_handoff=None,
+            response={"usage": {}},
+        )
+        self.assertTrue(on._thread_state.get("sent_instructions"))
 
     def test_continuation_accumulates(self):
         proxy, _ = _proxy(thread_state={"turns": 2, "est_tokens": 500, "sent_instructions": True})

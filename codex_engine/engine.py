@@ -729,7 +729,10 @@ class _CodexProxy:
             state["est_tokens"] = 0
         if consumed_handoff:
             state["handoff"] = None
-        if is_first_relay:
+        if is_first_relay and self._stateful:
+            # Only mark the thread as holding the system prompt in stateful mode.
+            # Legacy mode clears the chat every task, so persisting this would
+            # wrongly make the first stateful task skip the system prompt.
             state["sent_instructions"] = True
         usage = response.get("usage", {}) if isinstance(response, dict) else {}
         if not isinstance(usage, dict):
