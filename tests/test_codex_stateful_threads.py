@@ -1040,7 +1040,9 @@ class TestContractNudge(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, retry_reply)
         self.assertEqual(len(provider.calls), 1)
         sent = provider.calls[0]["messages"][0]["content"]
-        self.assertIn("FORMAT ERROR", sent)
+        # Accommodation framing: the nudge asks for the format as the reader's
+        # constraint, not as an adversarial "FORMAT ERROR" correction.
+        self.assertIn("JSON", sent)
         self.assertIn("tool_calls", sent)
         # Same thread — the nudge must never wipe the chat.
         self.assertFalse(provider.calls[0]["kwargs"]["clear_chat"])
