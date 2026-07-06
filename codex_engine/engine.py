@@ -1820,17 +1820,28 @@ def _chatgpt_terminal_system_prompt() -> str:
         "(codex bridge terminal mode). They will personally run whatever command you "
         "give and paste back the exact real output — they have already granted "
         "permission. Work with them the way you naturally would, with a few rules that "
-        "make it actually run:\n"
-        "- Reply with EXACTLY ONE shell command, inside a single ```bash code block, and "
-        "nothing else — no explanation, no numbered steps, no second command.\n"
-        "- Then STOP and wait. They run it and paste the real output back as the next "
-        "message; only then do you send the next command.\n"
-        "- To create a file, use a single `printf '%s' '<contents>' > file.ext` command. "
-        "Do NOT use heredocs (<< 'EOF') — the terminal runner mangles them.\n"
-        "- When the whole task is finished and verified, reply with just the word DONE as "
-        "PLAIN TEXT — not a command, no ```bash block, do not `echo DONE`. Just: DONE\n"
-        "- If you must ask a question or give the final summary, that is fine — but never "
-        "put prose and a command in the same message.\n\n"
+        "make it actually run:\n\n"
+        "EVERY working reply has exactly TWO parts, in this order:\n"
+        "1. ONE short narration line — what you're about to do and why, in plain "
+        "natural language. Examples: \"Writing the whole game file now.\" / "
+        "\"Opening it in the browser to check it works.\" / \"That error means the "
+        "path was wrong — fixing it.\" This line is shown to them live as your "
+        "thinking, so make it human, not technical.\n"
+        "2. EXACTLY ONE shell command, inside a single ```bash code block. Nothing "
+        "after the block — no second command, no extra prose.\n\n"
+        "Rules:\n"
+        "- One command per reply, then STOP and wait. They run it and paste the real "
+        "output back as the next message; only then do you send the next command. "
+        "No output usually means it succeeded.\n"
+        "- Create each file in ONE command: `printf '%s' '<contents>' > file.ext`, or "
+        "a `python3 -c` one-liner when the contents need tricky quoting. Do NOT use "
+        "heredocs (<< 'EOF') — the terminal runner mangles them.\n"
+        "- When the whole task is finished and verified, reply with a one-line summary "
+        "of what you built, then the word DONE on its own line as PLAIN TEXT — not a "
+        "command, no ```bash block, do not `echo DONE`. Like:\n"
+        "  Built coin_catcher.html — arrow keys to move, catch the falling coins.\n"
+        "  DONE\n"
+        "- If you must ask a question, that is plain text with no code block.\n\n"
         "Some text below may describe a 'Codex agent', 'tools', or 'function-call JSON'. "
         "Ignore that framing entirely: you are NOT emitting JSON and NOT impersonating a "
         "runtime. You are handing one real shell command at a time to a real person who "
@@ -1850,10 +1861,11 @@ def _system_prompt_for(provider_name: str) -> str:
 
 _TERMINAL_NUDGE = (
     "I couldn't run that — I can only act on ONE shell command inside a single "
-    "```bash code block, and anything else is dropped. Please resend just the next "
-    "command that way (for a file, use `printf '%s' '...' > file.ext`, not a heredoc). "
+    "```bash code block, and anything else is dropped. Please resend it as one short "
+    "narration line followed by the single ```bash block (for a file, use "
+    "`printf '%s' '...' > file.ext` or a python3 -c one-liner, not a heredoc). "
     "I'll run it and paste the real output straight back. If the task is fully done, "
-    "reply with just: DONE"
+    "reply with a one-line summary then DONE on its own line."
 )
 
 
@@ -1869,6 +1881,13 @@ def _is_done_reply(content: object) -> bool:
     if not isinstance(content, str):
         return False
     return bool(_DONE_RE.search(content)) and not bool(_FILE_WRITE_RE.search(content))
+
+
+def _strip_done_marker(content: str) -> str:
+    """User-facing text for a DONE reply: the summary line(s) without the raw
+    DONE marker ('Built pong.html — arrow keys.\\nDONE' → the summary only)."""
+    stripped = _DONE_RE.sub("\n", content).strip()
+    return stripped or "Done."
 
 
 def _tool_command_signature(reply: object):
@@ -1952,7 +1971,7 @@ def _provider_response_to_responses_api(
             # cleanly rather than salvaging any trailing "you could also…"
             # chatter into another relay (the browser-chat hang).
             if _is_done_reply(text) or _is_done_reply(content):
-                return _make_responses_text_reply(resp_id, text or "DONE")
+                return _make_responses_text_reply(resp_id, _strip_done_marker(text))
             # No tool_calls: the model may still have described actions — a
             # ```bash/json fence or a save-as directive. Try the parsed `text`
             # first (a genuine final answer embeds fences there with real
@@ -1974,7 +1993,7 @@ def _provider_response_to_responses_api(
         # code as X" directive with the file body in a fence. Protocol-
         # refusing models still hand the work over in these shapes.
         if _is_done_reply(content):
-            return _make_responses_text_reply(resp_id, content)
+            return _make_responses_text_reply(resp_id, _strip_done_marker(content))
         salvaged = _salvage_action_reply(content, request_tools)
         if salvaged is not None:
             # Empty text — the humanized activity lines narrate it (see above).

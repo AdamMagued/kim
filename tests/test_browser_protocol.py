@@ -33,7 +33,10 @@ class BrowserProtocolTests(unittest.TestCase):
             {"type": "text", "content": '{"text":"done","tool_calls":[]}'},
             relay_num=1,
         )
-        self.assertEqual(parsed["output"][0]["content"][0]["text"], "done")
+        # A bare "done" is normalized to a clean "Done." for display — what
+        # matters is it ends the turn as a text answer, not another relay.
+        self.assertEqual(parsed["output"][0]["content"][0]["text"], "Done.")
+        self.assertEqual(parsed["output"][0]["type"], "message")
 
     def test_tool_calls_are_mapped_to_responses_api(self):
         parsed = _provider_response_to_responses_api(
@@ -97,6 +100,13 @@ class BrowserProtocolTests(unittest.TestCase):
         self.assertIn("```bash", prompt)
         self.assertIn("DONE", prompt)
         self.assertIn("printf", prompt)  # heredoc-avoidance guidance
+
+    def test_terminal_prompt_requires_narration_line(self):
+        # The narration line is the visible "thinking" in the Kim chat —
+        # _surface_relay_reasoning shows the prose before the first fence.
+        prompt = _chatgpt_terminal_system_prompt()
+        self.assertIn("narration line", prompt)
+        self.assertIn("codex bridge terminal", prompt)  # load-bearing phrase
 
     def test_terminal_prompt_selects_codex_layout_not_chat_layout(self):
         # Same load-bearing coupling as the JSON prompt: the terminal prompt

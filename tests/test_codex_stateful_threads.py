@@ -1155,6 +1155,41 @@ class TestRepeatedCommandLoopGuard(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("reply with just DONE", sent)
 
 
+class TestDoneMarkerStripped(unittest.TestCase):
+    """A 'summary + DONE' finish shows the summary in Kim chat, not the raw
+    DONE marker; a bare DONE shows a clean 'Done.'"""
+
+    def test_summary_plus_done_shows_summary_only(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        content = "Built coin_catcher.html — arrow keys to move, catch coins.\nDONE"
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": content}, relay_num=2, request_tools=_CODEX_TOOLS
+        )
+        text = reply["output"][0]["content"][0]["text"]
+        self.assertIn("coin_catcher.html", text)
+        self.assertNotRegex(text, r"(?:^|\n)\s*DONE\s*$")
+
+    def test_bare_done_shows_done_dot(self):
+        from codex_engine.engine import _strip_done_marker
+
+        self.assertEqual(_strip_done_marker("DONE"), "Done.")
+        self.assertEqual(_strip_done_marker("Done."), "Done.")
+
+    def test_narration_plus_command_still_executes(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        # New prompt shape: narration line THEN one bash block — must salvage
+        # the command, never be mistaken for a final answer.
+        content = "Writing the whole game file now.\n```bash\nprintf '%s' 'x' > game.html\n```"
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": content}, relay_num=1, request_tools=_CODEX_TOOLS
+        )
+        calls = [o for o in reply["output"] if o["type"] == "function_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("game.html", calls[0]["arguments"])
+
+
 class TestDoneSkipsNudge(unittest.IsolatedAsyncioTestCase):
     """Real run 2026-07-06: the model replied a clean DONE and the bridge
     answered with the 'I couldn't run that' nudge — making it say DONE twice
