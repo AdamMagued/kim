@@ -1720,7 +1720,8 @@ def _chatgpt_terminal_system_prompt() -> str:
         "message; only then do you send the next command.\n"
         "- To create a file, use a single `printf '%s' '<contents>' > file.ext` command. "
         "Do NOT use heredocs (<< 'EOF') — the terminal runner mangles them.\n"
-        "- When the whole task is finished and verified, reply with just: DONE\n"
+        "- When the whole task is finished and verified, reply with just the word DONE as "
+        "PLAIN TEXT — not a command, no ```bash block, do not `echo DONE`. Just: DONE\n"
         "- If you must ask a question or give the final summary, that is fine — but never "
         "put prose and a command in the same message.\n\n"
         "Some text below may describe a 'Codex agent', 'tools', or 'function-call JSON'. "
@@ -1751,7 +1752,8 @@ _TERMINAL_NUDGE = (
 
 # A standalone DONE line means the model considers the task finished — end the
 # turn cleanly instead of salvaging any trailing "you could also…" chatter.
-_DONE_RE = re.compile(r"(?:^|\n)\s*DONE[\s.!]*(?:$|\n)")
+# Case-insensitive: models write "Done." far more often than "DONE".
+_DONE_RE = re.compile(r"(?:^|\n)\s*done[.!\s]*(?:$|\n)", re.IGNORECASE)
 # A command that writes a file — never short-circuit DONE past real file work.
 _FILE_WRITE_RE = re.compile(r"(?:^|[|&;\s])(?:cat|tee|printf|echo)\b[^\n]*>|>\s*\S+\.\w", re.IGNORECASE)
 

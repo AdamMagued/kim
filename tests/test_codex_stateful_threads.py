@@ -966,6 +966,16 @@ class TestDoneReply(unittest.TestCase):
         self.assertTrue(_is_done_reply("DONE"))
         self.assertTrue(_is_done_reply("open pong.html\nDONE"))
 
+    def test_done_detection_is_case_insensitive(self):
+        from codex_engine.engine import _is_done_reply
+
+        # The real miss: the model wrote "Done." (title case) and the turn
+        # didn't end, firing a needless nudge. Both forms must end the turn.
+        self.assertTrue(_is_done_reply("Done."))
+        self.assertTrue(_is_done_reply("Done"))
+        # ...but not when a real command follows/precedes on the same idea.
+        self.assertFalse(_is_done_reply("Done, but first run this:"))
+
 
 class TestChatgptTerminalNudge(unittest.IsolatedAsyncioTestCase):
     async def test_chatgpt_gets_terminal_nudge_not_json_nudge(self):
