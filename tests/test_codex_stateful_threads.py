@@ -930,6 +930,64 @@ class TestFileDirectiveSalvage(unittest.TestCase):
         self.assertIn(body, cmd)
 
 
+class TestHumanizeCommand(unittest.TestCase):
+    def test_file_creation_and_open(self):
+        from codex_engine.engine import _humanize_command
+
+        self.assertEqual(
+            _humanize_command("printf '%s' '<html>' > game.html"), "Creating game.html"
+        )
+        self.assertEqual(_humanize_command("open game.html"), "Opening game.html")
+        self.assertEqual(_humanize_command("mkdir -p src"), "Creating folder src")
+
+    def test_compound_command_reads_as_steps(self):
+        from codex_engine.engine import _humanize_command
+
+        self.assertEqual(
+            _humanize_command("printf '%s' 'x' > game.html && open game.html"),
+            "Creating game.html then Opening game.html",
+        )
+
+    def test_dep_install_and_run(self):
+        from codex_engine.engine import _humanize_command
+
+        self.assertEqual(_humanize_command("npm install"), "Installing dependencies")
+        self.assertEqual(_humanize_command("node server.js"), "Running server.js")
+
+    def test_unknown_command_is_truncated(self):
+        from codex_engine.engine import _humanize_command
+
+        self.assertTrue(_humanize_command("grep -R foo .").startswith("Running: grep"))
+
+    def test_announce_dedupes_and_prefixes_status(self):
+        import contextlib
+        import io
+
+        from codex_engine.engine import _announce_commands
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _announce_commands([
+                {"name": "exec_command", "input": {"cmd": "open x.html"}},
+                {"name": "exec_command", "input": {"cmd": "open x.html"}},  # dup
+            ])
+        lines = [line for line in buf.getvalue().splitlines() if line]
+        self.assertEqual(lines, ["[STATUS] Opening x.html…"])
+
+    def test_salvage_reply_carries_no_message_text(self):
+        # The full reply (prose + HTML) must NOT ride along as the tool reply's
+        # message text — that is what dumped "Kim: <whole file>" to the user.
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        content = "Run this in your terminal:\n```bash\nopen game.html\n```"
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": content}, relay_num=1, request_tools=_CODEX_TOOLS
+        )
+        messages = [o for o in reply["output"] if o["type"] == "message"]
+        self.assertEqual(messages, [])  # no message item, only the function call
+        self.assertTrue([o for o in reply["output"] if o["type"] == "function_call"])
+
+
 class TestToolCommandSignature(unittest.TestCase):
     def test_signature_extracts_function_calls(self):
         from codex_engine.engine import (

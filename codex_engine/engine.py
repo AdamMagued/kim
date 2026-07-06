@@ -745,7 +745,11 @@ class _CodexProxy:
             cmds = None
         self._last_tool_commands = cmds
         self._last_proxy_response = responses_reply
-        _surface_relay_reasoning(response, relay_num)
+        # Only narrate prose reasoning for a text answer — on a command turn the
+        # humanized activity lines already describe the work, and the model's
+        # "Run this in your terminal:" preamble is just noise.
+        if cmds is None:
+            _surface_relay_reasoning(response, relay_num)
 
         return _sse_or_json(stream, responses_reply)
 
@@ -1314,34 +1318,82 @@ def _reply_has_salvageable_actions(content: object) -> bool:
     )
 
 
+def _humanize_single(cmd: str) -> str:
+    """One shell command → a short, human activity line ('Creating game.html')."""
+    cmd = cmd.strip()
+    low = cmd.lower()
+    m = re.search(r">\s*([^\s;&|>]+\.\w+)", cmd)
+    if m and re.match(r"(printf|cat|tee|echo)\b", low):
+        return f"Creating {m.group(1)}"
+    m = re.match(r"open\s+(?:-\w+\s+)*([^\s;&|]+)", cmd)
+    if m:
+        return f"Opening {m.group(1)}"
+    m = re.match(r"mkdir\s+(?:-p\s+)?([^\s;&|]+)", cmd)
+    if m:
+        return f"Creating folder {m.group(1)}"
+    if re.match(r"(npm\s+(i|install)|yarn(\s+install)?|pnpm\s+install)\b", low):
+        return "Installing dependencies"
+    m = re.match(r"(?:npm run|node|python3?|npx)\s+([^\s;&|]+)", cmd)
+    if m:
+        return f"Running {m.group(1)}"
+    short = cmd if len(cmd) <= 50 else cmd[:50] + "…"
+    return f"Running: {short}"
+
+
+def _humanize_command(cmd: str) -> str:
+    """Full command (possibly `a && b`) → readable line ('Creating x then Opening x')."""
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return "Running command"
+    parts = [p for p in re.split(r"\s*&&\s*", cmd) if p.strip()]
+    if len(parts) > 1:
+        return " then ".join(_humanize_single(p) for p in parts)
+    return _humanize_single(cmd)
+
+
+def _announce_commands(tool_calls: list) -> None:
+    """Emit a clean per-command activity line instead of dumping raw commands."""
+    seen = []
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        cmd = (tc.get("input") or {}).get("cmd", "")
+        if isinstance(cmd, str) and cmd.strip():
+            line = _humanize_command(cmd)
+            if line not in seen:
+                seen.append(line)
+                print(f"[STATUS] {line}…", flush=True)
+
+
 def _salvage_action_reply(content: object, request_tools: object) -> Optional[list]:
     """Convert a non-tool-call reply's described actions into real tool calls.
 
-    Two shapes, in priority order:
-      1. ```bash/sh fences — explicit commands, executed verbatim.
-      2. A "save this code as X" directive + fenced file body — Kim writes
-         the file (heredoc) and opens it if the reply says to.
-    Returns normalized tool calls, or None when the reply describes nothing
-    executable.
+    Shapes, in priority order: a ```json tool-call fence, ```bash/sh command
+    fences, or a "save this code as X" directive + fenced file body. Returns
+    normalized tool calls (announcing them as clean activity lines), or None
+    when the reply describes nothing executable.
     """
+    calls = None
     json_calls = _extract_json_tool_fences(content)
     if json_calls:
-        print("[STATUS] Executing the tool call from Kim's reply…", flush=True)
-        return _normalize_tool_calls(json_calls, request_tools)
-    blocks = _extract_shell_blocks(content)
-    if blocks:
-        print("[STATUS] Executing the shell commands from Kim's reply…", flush=True)
-        return _normalize_tool_calls(
-            [{"name": "exec", "input": {"cmd": block}} for block in blocks],
-            request_tools,
-        )
-    directive = _extract_file_directive(content)
-    if directive is not None:
-        name, body, wants_open = directive
-        print(f"[STATUS] Saving {name} from Kim's reply…", flush=True)
-        return _normalize_tool_calls(
-            _file_directive_tool_calls(name, body, wants_open), request_tools
-        )
+        calls = _normalize_tool_calls(json_calls, request_tools)
+    if not calls:
+        blocks = _extract_shell_blocks(content)
+        if blocks:
+            calls = _normalize_tool_calls(
+                [{"name": "exec", "input": {"cmd": block}} for block in blocks],
+                request_tools,
+            )
+    if not calls:
+        directive = _extract_file_directive(content)
+        if directive is not None:
+            name, body, wants_open = directive
+            calls = _normalize_tool_calls(
+                _file_directive_tool_calls(name, body, wants_open), request_tools
+            )
+    if calls:
+        _announce_commands(calls)
+        return calls
     return None
 
 
@@ -1849,7 +1901,10 @@ def _provider_response_to_responses_api(
             if salvaged is None:
                 salvaged = _salvage_action_reply(content, request_tools)
             if salvaged is not None:
-                return _make_responses_tool_reply(resp_id, text, salvaged)
+                # Empty message text: the humanized activity lines from
+                # _announce_commands narrate the work — passing the full reply
+                # (prose + file body) would dump it to the user as "Kim: …".
+                return _make_responses_tool_reply(resp_id, "", salvaged)
             return _make_responses_text_reply(resp_id, text or content)
 
         # Prose reply — a DONE signal ends the turn; otherwise execute any
@@ -1860,7 +1915,8 @@ def _provider_response_to_responses_api(
             return _make_responses_text_reply(resp_id, content)
         salvaged = _salvage_action_reply(content, request_tools)
         if salvaged is not None:
-            return _make_responses_tool_reply(resp_id, content, salvaged)
+            # Empty text — the humanized activity lines narrate it (see above).
+            return _make_responses_tool_reply(resp_id, "", salvaged)
 
         return _make_responses_text_reply(resp_id, content)
 
