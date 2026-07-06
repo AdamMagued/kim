@@ -119,3 +119,41 @@ describe('useTaskRunner queue drain (B1)', () => {
     expect(result.current.queuedTasks).toHaveLength(0);
   });
 });
+
+describe('useTaskRunner — dead-setting wiring', () => {
+  beforeEach(() => {
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValue(undefined);
+  });
+
+  it('D-C1: does NOT queue when allow_message_queue is off', () => {
+    const stream = makeStream(true); // run in progress
+    const props = baseProps(stream);
+    (props.settings as unknown as { allow_message_queue: boolean }).allow_message_queue = false;
+    const { result } = renderHook(p => useTaskRunner(p), { initialProps: props });
+
+    act(() => {
+      result.current.handleSubmit('should not queue');
+    });
+    // Message is neither queued nor sent — the user is told to wait/steer.
+    expect(result.current.queuedTasks).toHaveLength(0);
+    expect(invokeMock).not.toHaveBeenCalledWith('send_task', expect.anything());
+  });
+
+  it('D-C3: forwards context_budget_tokens to send_task', async () => {
+    const stream = makeStream(false);
+    const props = baseProps(stream);
+    (props.settings as unknown as { context_budget_tokens: number }).context_budget_tokens = 123_456;
+    const { result } = renderHook(p => useTaskRunner(p), { initialProps: props });
+
+    act(() => {
+      result.current.handleSubmit('go');
+    });
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith(
+        'send_task',
+        expect.objectContaining({ contextBudgetTokens: 123_456 })
+      );
+    });
+  });
+});

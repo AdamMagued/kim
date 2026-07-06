@@ -803,8 +803,17 @@ export function useChatStream({
         if (lastRunTaskRef.current) {
           setLastFailedTask(lastRunTaskRef.current);
         }
-      } else if (event.payload && !hadNeedHelp) {
-        setLastFailedTask(null);
+      } else if (event.payload) {
+        // B2/C15: a transient mid-run error (recoverable stderr line, retried
+        // provider hiccup) used to leave a PERMANENT red Retry banner over a
+        // successful answer because hadNeedHelp skipped this cleanup. When the
+        // run succeeds and an answer actually arrived, the error was recovered
+        // — clear it. Only a needs-help run WITHOUT an answer keeps its banner
+        // (that banner is the agent's actual question to the user).
+        if (!hadNeedHelp || answerReceivedThisRunRef.current) {
+          setLastFailedTask(null);
+          setTaskError(null);
+        }
       }
       currentTaskRef.current = null;
     }).then(fn => { if (!cancelled) unlistenDone = fn; else fn(); });
@@ -953,8 +962,13 @@ export function useChatStream({
     // HITL approval round-trip. `decision` carries the K1 vocabulary
     // (accept | acceptForSession | decline); when omitted, it is derived
     // from `approved` so existing call sites keep working.
-    hitlRespond: (approved: boolean, decision?: 'accept' | 'acceptForSession' | 'decline') =>
-      invoke('hitl_respond_approval', {
+    hitlRespond: (approved: boolean, decision?: 'accept' | 'acceptForSession' | 'decline') => {
+      // A3/B10: disable the card as soon as a decision is clicked. On paths
+      // that never echo hitl-approval-result (codex bridge gate), the card
+      // stayed live and a SECOND click buffered a stdin decision line that the
+      // NEXT gate consumed — silently authorizing an unseen action.
+      setHitlApprovalStatus(prev => (prev ? { ...prev, decisionSent: true } : prev));
+      return invoke('hitl_respond_approval', {
         approved,
         decision: decision ?? (approved ? 'accept' : 'decline'),
         // T1: echo the pending request's id so Python only applies a decision
@@ -963,7 +977,10 @@ export function useChatStream({
       }).catch(() => {
         // M4: clicking Approve/Deny used to silently no-op when the invoke
         // rejected (dead run, IPC error) — card stayed pending, agent blocked.
+        // Re-enable the buttons: the decision never reached the agent.
+        setHitlApprovalStatus(prev => (prev ? { ...prev, decisionSent: false } : prev));
         toast('Could not send your approval decision — the run may have ended.', 'error', 4000);
-      }),
+      });
+    },
   };
 }

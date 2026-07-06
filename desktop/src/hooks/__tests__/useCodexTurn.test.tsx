@@ -98,6 +98,55 @@ describe('useCodexTurn — native approvals', () => {
   });
 });
 
+describe('useCodexTurn — user input (C4)', () => {
+  it('kim:user-input-request populates the question state', async () => {
+    const { result } = await renderTurn();
+    emit('kim:user-input-request', {
+      id: 'req-1', kind: 'questions', item_id: 'it-1',
+      questions: [{ id: 'q1', header: 'DB', question: 'Which database?', options: [{ label: 'Postgres' }] }],
+      message: '',
+    });
+    expect(result.current.userInput).toMatchObject({
+      id: 'req-1', kind: 'questions', resolved: false,
+    });
+    expect(result.current.userInput?.questions[0]).toMatchObject({ id: 'q1', question: 'Which database?' });
+  });
+
+  it('respondUserInput invokes respond_user_input verbatim and marks resolved', async () => {
+    const { result } = await renderTurn();
+    emit('kim:user-input-request', {
+      id: 'req-9', kind: 'questions', item_id: '', questions: [], message: '',
+    });
+    act(() => result.current.respondUserInput({ q1: { answers: ['Postgres'] } }));
+    expect(invokeMock).toHaveBeenCalledWith('respond_user_input', {
+      id: 'req-9', answers: { q1: { answers: ['Postgres'] } },
+    });
+    expect(result.current.userInput?.resolved).toBe(true);
+    // A second answer cannot double-send.
+    act(() => result.current.respondUserInput({ q1: { answers: ['x'] } }));
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('an elicitation is dismissed locally without invoking the backend', async () => {
+    const { result } = await renderTurn();
+    emit('kim:user-input-request', {
+      id: 'e1', kind: 'elicitation', item_id: '', questions: [], message: 'form',
+    });
+    act(() => result.current.respondUserInput({}));
+    expect(invokeMock).not.toHaveBeenCalledWith('respond_user_input', expect.anything());
+    expect(result.current.userInput?.resolved).toBe(true);
+  });
+
+  it('a terminal turn phase clears an unanswered question', async () => {
+    const { result } = await renderTurn();
+    emit('kim:user-input-request', {
+      id: 'req-2', kind: 'questions', item_id: '', questions: [], message: '',
+    });
+    emit('kim:turn-lifecycle', { phase: 'completed', turn_id: 't1' });
+    expect(result.current.userInput).toBeNull();
+  });
+});
+
 describe('useCodexTurn — streams', () => {
   it('accumulates command output and caps it', async () => {
     const { result } = await renderTurn();
@@ -203,7 +252,7 @@ describe('CodexTurnPanel components', () => {
     );
     expect(screen.getByText(/npx playwright install/)).toBeTruthy();
     expect(screen.getByText(/network access/)).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Always allow this session' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Always allow for this task' }));
     expect(onDecision).toHaveBeenCalledWith('acceptForSession');
     fireEvent.click(screen.getByRole('button', { name: 'Deny' }));
     expect(onDecision).toHaveBeenCalledWith('decline');
@@ -234,6 +283,9 @@ describe('CodexTurnPanel components', () => {
           tokenUsage: null,
           turnPhase: 'started',
           respond: () => undefined,
+          userInput: null,
+          respondUserInput: () => undefined,
+          dismissUserInput: () => undefined,
         }}
       />
     );
@@ -248,6 +300,7 @@ describe('CodexTurnPanel components', () => {
         turn={{
           approval: null, plan: [], commandOutput: '', diff: '',
           tokenUsage: null, turnPhase: null, respond: () => undefined,
+          userInput: null, respondUserInput: () => undefined, dismissUserInput: () => undefined,
         }}
       />
     );

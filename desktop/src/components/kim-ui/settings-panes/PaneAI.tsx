@@ -97,6 +97,14 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
     setRawBudget(String(settings.context_budget_tokens ?? 200_000));
   }, [settings.context_budget_tokens]);
 
+  // D-C4: privacy-pause was fully implemented backend→MCP but invoked by ZERO
+  // frontend code — the sentinel could only be created by hand. Reflect the
+  // real backend state and let the user toggle it.
+  const [privacyPaused, setPrivacyPaused] = useState(false);
+  useEffect(() => {
+    invoke<boolean>('get_privacy_pause').then(setPrivacyPaused).catch(() => {});
+  }, []);
+
   // Sign-in refresh timers — tracked so they can be cancelled if the pane unmounts
   // before the delays fire (finding #2: setState-after-unmount).
   const signInTimersRef = useRef<ReturnType<typeof window.setTimeout>[]>([]);
@@ -614,15 +622,35 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
       <SectionLabel>behavior</SectionLabel>
       <Row
         title="Queue messages while Kim is working"
-        subtitle="Off: a new send interrupts the current task. On: sends queue and run in order."
+        subtitle="On: extra sends line up and run in order. Off: Kim asks you to wait or steer instead of queuing."
       >
         <Toggle on={settings.allow_message_queue} onClick={() => update('allow_message_queue', !settings.allow_message_queue)} ariaLabel="Queue messages while Kim is working" />
       </Row>
+      {/* D-C2: "Keep browser visible" had no backend setter (WEBVIEW_KEEP_VISIBLE
+          is never written from the frontend), so the toggle did nothing. Rather
+          than fake it, disable the control and say so honestly. */}
       <Row
         title="Keep browser visible while running"
-        subtitle="Testing only — leaves the provider window on-screen so you can watch what Kim does."
+        subtitle="Not available in this build — Kim always manages the provider window itself."
       >
-        <Toggle on={settings.keep_browser_visible} onClick={() => update('keep_browser_visible', !settings.keep_browser_visible)} ariaLabel="Keep browser visible while running" />
+        <Toggle on={false} onClick={() => {}} disabled ariaLabel="Keep browser visible while running (unavailable)" />
+      </Row>
+      <Row
+        title="Privacy pause"
+        subtitle="Blocks Kim from taking screenshots or controlling your mouse/keyboard until you turn it off."
+      >
+        <Toggle
+          on={privacyPaused}
+          onClick={() => {
+            const next = !privacyPaused;
+            setPrivacyPaused(next);
+            invoke('set_privacy_pause', { on: next }).catch(() => {
+              setPrivacyPaused(!next); // revert on failure
+              toast('Could not change privacy pause.', 'error', 3000);
+            });
+          }}
+          ariaLabel="Privacy pause"
+        />
       </Row>
 
       <SectionLabel>context budget</SectionLabel>

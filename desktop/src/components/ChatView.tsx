@@ -530,6 +530,7 @@ export function ChatView({
       setTaskInput={setTaskInput}
       resolveProvider={resolveProvider}
       tokenStats={stream.tokenStats}
+      contextState={stream.contextState}
     />
   );
 }

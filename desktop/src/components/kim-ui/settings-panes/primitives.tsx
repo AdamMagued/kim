@@ -76,15 +76,18 @@ function Row({
   );
 }
 
-function Toggle({ on, onClick, ariaLabel }: { on: boolean; onClick: () => void; ariaLabel?: string }) {
+function Toggle({ on, onClick, ariaLabel, disabled }: { on: boolean; onClick: () => void; ariaLabel?: string; disabled?: boolean }) {
   return (
     <button
       type="button"
       role="switch"
-      className={`kr-toggle${on ? ' kr-on' : ''}`}
-      onClick={onClick}
+      className={`kr-toggle${on ? ' kr-on' : ''}${disabled ? ' kr-toggle--disabled' : ''}`}
+      onClick={disabled ? undefined : onClick}
+      disabled={disabled}
       aria-checked={on}
+      aria-disabled={disabled}
       aria-label={ariaLabel}
+      style={disabled ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
     />
   );
 }

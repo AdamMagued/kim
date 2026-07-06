@@ -37,17 +37,19 @@ const PROVIDER_BRANDS = 'Gemini|Claude|ChatGPT|Grok|DeepSeek';
 export function speakAsKimNarration(t: string): string {
   if (!t) return t;
   const B = PROVIDER_BRANDS;
+  // Honesty limit (audit item 3): only rewrite Kim's OWN pipeline framing —
+  // "<brand> is thinking…" spinners and "sending to <brand>" routing lines.
+  // The old blanket rules ("<brand> said" → "Kim", possessives, and any bare
+  // brand mention → "Kim") rewrote model-authored content (reasoning/status
+  // text that legitimately mentions Claude/Gemini/etc., e.g. "Reading the
+  // Claude API docs") and were removed as a dishonest content rewrite.
   return t
     // "Gemini is/still thinking… (3s)" → "Kim is thinking…"
     .replace(new RegExp(`\\b(?:${B})\\s+(?:is\\s+)?(?:still\\s+)?thinking(?:…|\\.\\.\\.)?(?:\\s+\\(\\d+s\\))?`, 'gi'), 'Kim is thinking…')
-    // "sending to / routing through / via / from Gemini" → neutral
-    .replace(new RegExp(`\\b(?:sending to|routed through|routing through|powered by|via|using|through|from)\\s+(?:${B})\\b`, 'gi'), 'Kim is working')
-    // "Gemini said/says/responded/returned/replied/is/was" → "Kim"
-    .replace(new RegExp(`\\b(?:${B})\\s+(?:said|says|say|responded|responds|respond|returned|replied|replies|is|was)\\b`, 'gi'), 'Kim')
-    // possessive "Gemini's" → "Kim's"
-    .replace(new RegExp(`\\b(?:${B})'s\\b`, 'gi'), "Kim's")
-    // any remaining bare brand mention in narration → "Kim"
-    .replace(new RegExp(`\\b(?:${B})\\b`, 'g'), 'Kim')
+    // "sending to / routing through / powered by Gemini" → neutral. Narrow
+    // verb list on purpose: generic "via/using/from <brand>" often appears in
+    // real content ("install it via Gemini CLI") and must not be rewritten.
+    .replace(new RegExp(`\\b(?:sending to|routed through|routing through|powered by)\\s+(?:${B})\\b`, 'gi'), 'Kim is working')
     // collapse a doubled "Kim Kim" the replacements can create
     .replace(/\bKim\s+Kim\b/g, 'Kim')
     .trim();
@@ -368,17 +370,15 @@ export function friendlyError(raw: string): string {
     .replace(/\[(ERROR|WARN|INFO|DEBUG|TOOL|CRITICAL)\]\s*/g, '')
     .replace(/orchestrator\.\w+:\s*/g, '')
     .trim();
-  // Reject strings that contain internal file paths, Python tracebacks, or stack
-  // fragments — these must never be surfaced verbatim in the UI.
-  const hasSensitiveDetail =
-    /[/\\][a-zA-Z0-9_.~-]+[/\\]/.test(cleaned) ||  // absolute/relative file path
-    /\bTraceback\b/i.test(cleaned) ||
-    /File\s+"[^"]*"/.test(cleaned) ||
-    /\.py(?::\s*\d+)?/.test(cleaned) ||
-    /^\s*at\s+\S+\s+\(/.test(cleaned);              // JS stack frame
-  return cleaned.length > 0 && cleaned.length < 200 && !hasSensitiveDetail
-    ? cleaned
-    : 'Something went wrong. Check your settings and try again.';
+  // Audit item 3 (B3/B4/C20): surface the REAL error. The old gate deleted any
+  // message over 200 chars or containing a path/".py"/traceback fragment and
+  // replaced it with "Something went wrong. Check your settings and try
+  // again." — which destroyed NEED_HELP questions and real crash text
+  // (ModuleNotFoundError etc.) while pointing the user at settings that were
+  // fine. We now keep the cleaned text (length-capped) and only fall back to
+  // the generic message when nothing usable remains.
+  if (!cleaned) return 'Something went wrong. Check your settings and try again.';
+  return cleaned.length > 600 ? cleaned.slice(0, 600) + '…' : cleaned;
 }
 
 /** Friendly names + icons for known tool calls */
@@ -472,6 +472,16 @@ export function parseLogLine(raw: string, id: number): ActivityItem | null {
   if (needHelpMatch) {
     const reason = needHelpMatch[1].trim();
     return { id, kind: 'error', icon: '⚠', text: friendlyError(reason || 'Kim needs your help to continue.') };
+  }
+
+  // B4: a Python crash's FINAL line ("ModuleNotFoundError: No module named
+  // 'mcp'") is the one clue the user needs, but the noise filter hides every
+  // "XxxError:" line (it was added to suppress traceback bodies). Surface the
+  // terminal exception line BEFORE the noise filter — excluding the
+  // ExceptionGroup wrappers, whose message is boilerplate, not the cause.
+  const crashMatch = stripped.match(/^([A-Za-z_][\w.]*(?:Error|Exception))\s*:\s*(.+)$/);
+  if (crashMatch && !/(?:Base)?ExceptionGroup$/.test(crashMatch[1])) {
+    return { id, kind: 'error', icon: '⚠', text: `${crashMatch[1]}: ${crashMatch[2].trim()}` };
   }
 
   if (isNoiseLine(raw)) return null;
