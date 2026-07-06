@@ -11,7 +11,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from codex_engine.engine import _drain_stderr_to
+from codex_engine.engine import _drain_stderr_to, _is_benign_codex_stderr
 
 
 def _make_stderr_stream(*lines: str) -> asyncio.StreamReader:
@@ -114,6 +114,23 @@ class DrainStderrTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(flush_values, [True])
 
+    async def test_benign_stdin_notice_is_not_surfaced(self):
+        """codex prints "Reading additional input from stdin..." because our
+        stdin is /dev/null (not a TTY). It must be accumulated for debugging
+        but never shown to the user as a codex error/status line."""
+        stream = _make_stderr_stream(
+            "Reading additional input from stdin...",
+            "error: real failure",
+        )
+        accumulated: list[str] = []
+        collected: list[str] = []
+
+        with patch("builtins.print", side_effect=lambda *a, **kw: collected.append(a[0])):
+            await _drain_stderr_to(stream, accumulated)
+
+        self.assertEqual(collected, ["[STATUS] codex: error: real failure"])
+        self.assertEqual(len(accumulated), 2)
+
     async def test_empty_stream_produces_no_output(self):
         """An empty stderr stream must not print anything."""
         stream = _make_stderr_stream()
@@ -123,6 +140,18 @@ class DrainStderrTests(unittest.IsolatedAsyncioTestCase):
             await _drain_stderr_to(stream, [])
 
         self.assertEqual(collected, [])
+
+
+class BenignStderrTests(unittest.TestCase):
+    def test_stdin_reading_notice_is_benign(self):
+        self.assertTrue(_is_benign_codex_stderr("Reading additional input from stdin..."))
+        self.assertTrue(_is_benign_codex_stderr("  reading prompt from stdin  "))
+        self.assertTrue(_is_benign_codex_stderr(""))
+
+    def test_real_errors_are_not_benign(self):
+        self.assertFalse(_is_benign_codex_stderr("error: something went wrong"))
+        self.assertFalse(_is_benign_codex_stderr("ModuleNotFoundError: No module named codex"))
+        self.assertFalse(_is_benign_codex_stderr("stream disconnected before completion"))
 
 
 if __name__ == "__main__":

@@ -421,10 +421,20 @@ class BrowserProvider(BaseProvider):
                     }
 
                 if clear_chat:
-                    logger.info(f"Clearing chat context by reloading {page.url}...")
-                    await page.goto(page.url, wait_until="domcontentloaded")
+                    # Navigate to the site root, which starts a NEW conversation.
+                    # Reloading page.url does NOT clear context: once a chat has
+                    # begun, the tab URL is a conversation permalink (e.g.
+                    # chatgpt.com/c/<id>), so a reload lands back in the SAME
+                    # chat — and a "fresh" prompt (handoff + system prompt) gets
+                    # sent into the old conversation.
+                    fresh_url = self._fresh_chat_url(site) or page.url
+                    logger.info(
+                        f"Starting a fresh {site} chat at {fresh_url} (was {page.url})..."
+                    )
+                    await page.goto(fresh_url, wait_until="domcontentloaded")
                     await asyncio.sleep(2.0)
                     self._sent_system_prompt = False
+                    self._last_chat_page_url = page.url
 
                 cfg = self._site_configs[site]
 
@@ -553,6 +563,16 @@ class BrowserProvider(BaseProvider):
                 if found:
                     return found
         return None
+
+    def _fresh_chat_url(self, site: str) -> Optional[str]:
+        """URL that opens a NEW conversation on ``site`` (the site root).
+
+        Used by clear_chat: every supported site starts a fresh chat at its
+        root (chatgpt.com/, claude.ai/, gemini.google.com/ → /app, …), whereas
+        an in-progress conversation lives at a permalink that survives reloads.
+        """
+        pattern = str(self._site_configs.get(site, {}).get("url_pattern") or "").strip()
+        return f"https://{pattern}/" if pattern else None
 
     def _site_launch_url(self) -> Optional[str]:
         """Full URL to open on auto-launch so the user lands on the AI chat

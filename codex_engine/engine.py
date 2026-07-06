@@ -2071,6 +2071,20 @@ def _make_responses_tool_reply(resp_id: str, text: str, tool_calls: list) -> dic
 # ── Output parsing & surfacing ───────────────────────────────────────────────
 
 
+def _is_benign_codex_stderr(line: str) -> bool:
+    """True for informational codex CLI chatter that is not an error.
+
+    Codex is launched with stdin=/dev/null; because that is not a TTY, codex
+    prints "Reading additional input from stdin..." (and immediately gets EOF).
+    Surfacing that in the user-visible activity feed as a codex error is pure
+    noise on every run.
+    """
+    lowered = line.strip().lower()
+    if not lowered:
+        return True
+    return "stdin" in lowered and ("reading" in lowered or "input" in lowered)
+
+
 async def _drain_stderr_to(
     stderr_stream: asyncio.StreamReader,
     stderr_lines: list,
@@ -2081,7 +2095,9 @@ async def _drain_stderr_to(
     Lines are printed as ``[STATUS] codex: {line}`` (truncated to *max_line_chars*)
     so they appear in the user-visible activity feed rather than disappearing into a
     debug log.  Accumulated lines remain available for the non-zero-exit error message.
-    Empty lines are skipped to avoid cluttering the UI with blank status entries.
+    Empty lines are skipped to avoid cluttering the UI with blank status entries, and
+    benign informational chatter (see ``_is_benign_codex_stderr``) is accumulated but
+    not surfaced.
     """
     async for raw in stderr_stream:
         line = raw.decode("utf-8", errors="replace").rstrip()
@@ -2089,7 +2105,8 @@ async def _drain_stderr_to(
             continue
         stderr_lines.append(line)
         logger.debug("codex stderr: %s", line)
-        print(f"[STATUS] codex: {line[:max_line_chars]}", flush=True)
+        if not _is_benign_codex_stderr(line):
+            print(f"[STATUS] codex: {line[:max_line_chars]}", flush=True)
 
 
 def _surface_codex_output(stdout_text: str) -> None:

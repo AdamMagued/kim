@@ -38,6 +38,7 @@ from codex_engine.engine import (
     _CodexProxy,
     _codex_browser_system_prompt,
     _get_compact_threshold,
+    _is_benign_codex_stderr,
     _write_codex_config,
 )
 from codex_engine.thread_state import (
@@ -163,14 +164,22 @@ def _sandbox_fingerprint() -> str:
 
 
 def _cli_session_changed(thread_state: dict, current_session: str) -> bool:
-    """True when a stored thread belongs to a DIFFERENT CLI session than the
-    current one (user quit and reopened kim). No current session id, no stored
-    session id, or a matching id all mean "not a new session" — so legacy
-    sidecars and the desktop app (which sets no id) never falsely reset."""
+    """True when a stored thread is NOT owned by the current CLI session.
+
+    Each `kim` launch gets a fresh session id, and a new session is a new chat:
+    it must start with ZERO prior context. So any stored thread whose
+    ``cli_session`` differs from the current id — including a sidecar with no
+    ``cli_session`` at all (written by the desktop app or an older Kim) —
+    counts as changed and is reset without compaction or handoff. Resuming an
+    unowned thread is exactly the bug where a "fresh" chat resurrected an old
+    conversation's context.
+
+    The desktop app sets no ``KIM_CLI_SESSION_ID``; with no current session id
+    this always returns False, so desktop Code-tab continuity is unaffected.
+    """
     if not current_session:
         return False
-    stored = thread_state.get("cli_session")
-    return bool(stored) and stored != current_session
+    return (thread_state.get("cli_session") or "") != current_session
 
 
 def _thread_sandbox_changed(thread_state: dict, current: str) -> bool:
@@ -279,8 +288,26 @@ async def _compact_browser_thread(provider, cwd: str, provider_name: str) -> tup
     except Exception as exc:  # noqa: BLE001
         logger.warning("In-thread compact failed: %s", exc)
 
-    reset_thread_state(cwd, provider_name, handoff=handoff or None)
+    state = reset_thread_state(cwd, provider_name, handoff=handoff or None)
+    _stamp_thread_owner(cwd, provider_name, state)
     return bool(handoff), handoff
+
+
+def _stamp_thread_owner(cwd: str, provider_name: str, state: dict) -> dict:
+    """Record the owning CLI session + sandbox fingerprint on a sidecar.
+
+    A reset sidecar with NO owner would be treated as a foreign thread by
+    ``_cli_session_changed`` on the very next task, silently dropping a
+    handoff the user just armed with /compact in this same session. Stamping
+    ownership keeps same-session continuity while a NEW session (different or
+    missing id) still starts with zero context.
+    """
+    state["sandbox"] = _sandbox_fingerprint()
+    session = os.environ.get("KIM_CLI_SESSION_ID", "").strip()
+    if session:
+        state["cli_session"] = session
+    save_thread_state(cwd, provider_name, state)
+    return state
 
 
 async def _run_compact_task(args: argparse.Namespace, config: dict) -> int:
@@ -516,8 +543,12 @@ async def _run_async(args: argparse.Namespace) -> int:
                         line = raw.decode("utf-8", errors="replace").rstrip()
                         if line:
                             logger.debug("codex stderr: %s", line)
-                            # Surface codex subprocess errors to the Kim activity feed.
-                            _status(f"codex error: {line}")
+                            # Surface codex subprocess errors to the Kim activity
+                            # feed — but not benign chatter like the "Reading
+                            # additional input from stdin..." notice codex prints
+                            # because our stdin is /dev/null.
+                            if not _is_benign_codex_stderr(line):
+                                _status(f"codex error: {line}")
 
                 # Whole-run budget. Browser relays are slow (a single one may
                 # legitimately take minutes of typing + generation), and one

@@ -380,6 +380,31 @@ class TestFindChatPagePreferredSite(unittest.IsolatedAsyncioTestCase):
         self.assertIs(page, gemini)
 
 
+class TestFreshChatUrl(unittest.TestCase):
+    """clear_chat must open a genuinely NEW conversation.
+
+    Regression for the compaction-handoff bug: after a chat has begun, the tab
+    URL is a conversation permalink (chatgpt.com/c/<id>), so `page.goto(page.url)`
+    lands back in the SAME chat — and the "fresh chat" prompt (handoff + system
+    prompt + new task) was sent into the very conversation that had just
+    produced the compaction summary. The fresh-chat target must be the site
+    root, never the current page URL.
+    """
+
+    def test_chatgpt_fresh_url_is_site_root_not_permalink(self):
+        p = _provider(preferred_site="chatgpt")
+        self.assertEqual(p._fresh_chat_url("chatgpt"), "https://chatgpt.com/")
+
+    def test_gemini_and_claude_fresh_urls(self):
+        p = _provider()
+        self.assertEqual(p._fresh_chat_url("gemini"), "https://gemini.google.com/")
+        self.assertEqual(p._fresh_chat_url("claude"), "https://claude.ai/")
+
+    def test_unknown_site_returns_none(self):
+        p = _provider()
+        self.assertIsNone(p._fresh_chat_url("nope-not-a-site"))
+
+
 class TestMaybeResetSystemPrompt(unittest.TestCase):
     """A brand-new chat materializing its conversation id (chatgpt.com/ →
     /c/<id> after the first reply) is the SAME conversation — re-injecting the
