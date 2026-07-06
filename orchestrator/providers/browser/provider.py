@@ -1181,7 +1181,9 @@ class BrowserProvider(BaseProvider):
         await asyncio.sleep(0.2 if definitive else 1.5)
 
         logger.info(f"[STATUS] Reading {site}'s response…")
-        return await self._scrape_last_response(page, cfg["response_selectors"], min_index=new_element_index)
+        return await self._scrape_last_response(
+            page, cfg["response_selectors"], min_index=new_element_index, as_markdown=True
+        )
 
     async def _find_selector(
         self, page: Page, selectors: list[str]
@@ -1362,21 +1364,89 @@ class BrowserProvider(BaseProvider):
         return False
 
     async def _scrape_last_response(
-        self, page: Page, response_selectors: list[str], min_index: int = 0
+        self,
+        page: Page,
+        response_selectors: list[str],
+        min_index: int = 0,
+        as_markdown: bool = False,
     ) -> str:
         for sel in response_selectors:
             try:
                 elements = await page.locator(sel).all()
                 candidates = elements[min_index:] if min_index < len(elements) else []
                 for el in reversed(candidates):
-                    text = await el.inner_text()
+                    text = None
+                    if as_markdown:
+                        # inner_text() renders code blocks as plain <pre> boxes,
+                        # DROPPING the ```lang fences the codex-bridge salvage
+                        # depends on. Reconstruct them from the DOM (language
+                        # from the <code> class or the block header). Any
+                        # failure falls through to plain inner_text — never
+                        # worse than before.
+                        text = await self._scrape_markdown(el)
+                    if not text or not text.strip():
+                        text = await el.inner_text()
                     if not text or not text.strip():
                         text = await el.text_content()
                     if text and text.strip():
                         logger.debug(f"Scraped {len(text)} chars from {sel}")
+                        if os.environ.get("KIM_DEBUG_SCRAPE") == "1":
+                            has_fence = "```" in text
+                            print(
+                                f"[STATUS] [scrape] {len(text)} chars, "
+                                f"code-fence present: {has_fence}",
+                                flush=True,
+                            )
                         return text.strip()
             except Exception:
                 continue
         raise RuntimeError(
             "Could not scrape response from any known selector"
         )
+
+    # JS: rebuild markdown from a response element, restoring ```lang fences
+    # around <pre> code blocks (which inner_text would flatten). Iterates the
+    # top-level children (ChatGPT/Gemini/Claude render <pre> as siblings of
+    # <p>/<h*>, not nested inside them) so prose keeps its innerText spacing.
+    _MARKDOWN_SERIALIZER_JS = r"""
+    (el) => {
+      const kids = el.children;
+      if (!kids || kids.length === 0) return el.innerText || '';
+      const parts = [];
+      for (const child of kids) {
+        if (child.tagName === 'PRE') {
+          const code = child.querySelector('code');
+          let lang = '';
+          if (code && code.className) {
+            const m = code.className.match(/language-([\w+#.-]+)/);
+            if (m) lang = m[1];
+          }
+          if (!lang) {
+            const hdr = child.querySelector('div');
+            if (hdr) {
+              const first = (hdr.innerText || '').trim().split('\n')[0].trim().toLowerCase();
+              if (/^[a-z0-9+#.-]{1,15}$/.test(first)) lang = first;
+            }
+          }
+          const codeText = (code ? code.textContent : child.innerText) || '';
+          parts.push('```' + lang + '\n' + codeText.replace(/\n+$/, '') + '\n```');
+        } else {
+          parts.push(child.innerText || '');
+        }
+      }
+      const joined = parts.join('\n\n');
+      return joined.trim() ? joined : (el.innerText || '');
+    }
+    """
+
+    async def _scrape_markdown(self, el) -> Optional[str]:
+        """Return the element's text with ```lang code fences reconstructed.
+
+        Returns None on any failure so the caller falls back to inner_text.
+        """
+        try:
+            result = await el.evaluate(self._MARKDOWN_SERIALIZER_JS)
+            return result if isinstance(result, str) else None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[scrape] markdown reconstruction failed: {e}")
+            return None

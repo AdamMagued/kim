@@ -133,6 +133,82 @@ class TestNormalizeForMarker(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _scrape_last_response markdown reconstruction (as_markdown=True)
+# ---------------------------------------------------------------------------
+
+class _MdElement:
+    """Fake response element: evaluate() returns fenced markdown (or raises),
+    inner_text() returns the flattened form the DOM would actually yield."""
+
+    def __init__(self, *, markdown=None, flat="", raises=False):
+        self._markdown = markdown
+        self._flat = flat
+        self._raises = raises
+
+    async def evaluate(self, _script):
+        if self._raises:
+            raise RuntimeError("evaluate boom")
+        return self._markdown
+
+    async def inner_text(self):
+        return self._flat
+
+    async def text_content(self):
+        return self._flat
+
+
+class _MdScrapePage:
+    def __init__(self, element):
+        self._element = element
+
+    def locator(self, _sel):
+        el = self._element
+
+        class _Loc:
+            async def all(self):
+                return [el]
+
+        return _Loc()
+
+
+class TestScrapeMarkdown(unittest.IsolatedAsyncioTestCase):
+    async def test_markdown_path_restores_fences(self):
+        p = _provider()
+        # inner_text would drop the fence; evaluate reconstructs it.
+        el = _MdElement(
+            markdown="Run this:\n\n```bash\nopen pong.html\n```",
+            flat="Run this:\nopen pong.html",
+        )
+        page = _MdScrapePage(el)
+        text = await p._scrape_last_response(page, ["sel"], as_markdown=True)
+        self.assertIn("```bash", text)
+        self.assertIn("open pong.html", text)
+
+    async def test_falls_back_to_inner_text_when_evaluate_raises(self):
+        p = _provider()
+        el = _MdElement(raises=True, flat="plain scraped text, no fences")
+        page = _MdScrapePage(el)
+        text = await p._scrape_last_response(page, ["sel"], as_markdown=True)
+        self.assertEqual(text, "plain scraped text, no fences")
+
+    async def test_empty_markdown_falls_back_to_inner_text(self):
+        p = _provider()
+        el = _MdElement(markdown="   ", flat="fallback body")
+        page = _MdScrapePage(el)
+        text = await p._scrape_last_response(page, ["sel"], as_markdown=True)
+        self.assertEqual(text, "fallback body")
+
+    async def test_default_path_never_calls_evaluate(self):
+        p = _provider()
+        el = _MdElement(raises=True, flat="plain body")
+        page = _MdScrapePage(el)
+        # as_markdown defaults False → must not touch evaluate (used by the
+        # completion-polling path, which stays on plain inner_text).
+        text = await p._scrape_last_response(page, ["sel"])
+        self.assertEqual(text, "plain body")
+
+
+# ---------------------------------------------------------------------------
 # _wait_for_generation_complete
 # ---------------------------------------------------------------------------
 
