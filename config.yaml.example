@@ -25,6 +25,21 @@ codex_bridge:
   # are slow — a single one can take minutes — so keep this comfortably above
   # the per-relay browser waits (600s).
   task_timeout_s: 1800
+  # Codex transport: "exec" (legacy `codex exec --json` spawn, the default) or
+  # "app-server" (JSON-RPC `codex app-server`: native per-command approvals,
+  # workspace-write sandbox, true session resume via a persisted thread id).
+  transport: exec
+  # App-server path only — Codex-native sandbox + approval policy.
+  # sandbox_mode: read-only | workspace-write | danger-full-access
+  sandbox_mode: workspace-write
+  # approval_policy: untrusted | on-failure | on-request | never
+  approval_policy: on-request
+  # Seconds to wait for the user's decision on a native command/file-change
+  # approval before auto-declining it.
+  approval_timeout_s: 120
+  # Codex-side transcript token budget: when thread/tokenUsage/updated exceeds
+  # this, Kim fires a native thread/compact/start. 0 disables.
+  codex_compact_tokens: 300000
 logging:
   level: INFO
 max_iterations: 25
