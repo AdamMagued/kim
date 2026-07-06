@@ -63,6 +63,22 @@ class BrowserProtocolTests(unittest.TestCase):
             '{"tool":"x","args":{}}',
         )
 
+    def test_codex_prompt_selects_codex_layout_not_chat_layout(self):
+        """The prompt_builder detects the codex bridge by phrase-matching the
+        system prompt ("codex bridge json mode"). If that coupling breaks, the
+        chat-mode layout is used instead, which appends an empty
+        [AVAILABLE TOOLS] block + TASK_COMPLETE instructions — honesty-tuned
+        models then refuse: 'there are no tools available'."""
+        provider = _browser_provider_or_skip(self)
+        prompt, _attachments, _hash = provider._format_prompt(
+            messages=[{"role": "user", "content": "make pong"}],
+            tools=[],
+            system=_codex_browser_system_prompt(),
+        )
+        self.assertNotIn("[AVAILABLE TOOLS]", prompt)
+        self.assertNotIn("TASK_COMPLETE", prompt)
+        self.assertNotIn("NEED_HELP", prompt)
+
     def test_formatted_codex_prompt_has_only_dynamic_marker_instruction(self):
         provider = _browser_provider_or_skip(self)
         prompt, _attachments, completion_hash = provider._format_prompt(

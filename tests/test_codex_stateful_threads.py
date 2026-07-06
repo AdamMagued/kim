@@ -561,6 +561,65 @@ class TestThreadSandboxChanged(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Codex tool forwarding — codex sends tool definitions in body["tools"];
+# without rendering them the browser model sees no tool list and honesty-
+# tuned models refuse ("there are no tools available")
+# ---------------------------------------------------------------------------
+
+class TestRenderCodexTools(unittest.TestCase):
+    def test_responses_shape_renders_names_descriptions_and_schema(self):
+        from codex_engine.engine import _extract_prompt_from_responses_request
+
+        body = {
+            "instructions": "You are Codex.",
+            "input": [{"role": "user", "content": "make pong"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "shell",
+                    "description": "Runs a shell command.",
+                    "parameters": {"type": "object", "properties": {"command": {"type": "array"}}},
+                },
+                {"type": "web_search"},
+            ],
+        }
+        prompt = _extract_prompt_from_responses_request(body)
+        self.assertIn("[AVAILABLE CODEX TOOLS]", prompt)
+        self.assertIn("- shell: Runs a shell command.", prompt)
+        self.assertIn('"command"', prompt)  # schema forwarded
+        self.assertIn("- web_search", prompt)
+        # Section sits between the system prompt and the task.
+        self.assertLess(prompt.index("[SYSTEM PROMPT]"), prompt.index("[AVAILABLE CODEX TOOLS]"))
+        self.assertLess(prompt.index("[AVAILABLE CODEX TOOLS]"), prompt.index("make pong"))
+
+    def test_chat_completions_nested_shape_is_supported(self):
+        from codex_engine.engine import _render_codex_tools
+
+        section = _render_codex_tools([
+            {
+                "type": "function",
+                "function": {
+                    "name": "apply_patch",
+                    "description": "Applies a diff.",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ])
+        self.assertIn("- apply_patch: Applies a diff.", section)
+
+    def test_missing_or_empty_tools_render_nothing(self):
+        from codex_engine.engine import _extract_prompt_from_responses_request, _render_codex_tools
+
+        self.assertEqual(_render_codex_tools(None), "")
+        self.assertEqual(_render_codex_tools([]), "")
+        self.assertEqual(_render_codex_tools(["junk", 42]), "")
+        prompt = _extract_prompt_from_responses_request(
+            {"instructions": "x", "input": [{"role": "user", "content": "hi"}]}
+        )
+        self.assertNotIn("[AVAILABLE CODEX TOOLS]", prompt)
+
+
+# ---------------------------------------------------------------------------
 # Contract nudge — a prose reply ("I'll create the files…") must get ONE
 # format re-ask instead of being handed to codex as a final answer
 # ---------------------------------------------------------------------------

@@ -1149,6 +1149,41 @@ def _extract_delta_prompt(items: list) -> str:
     return "\n\n".join(parts)
 
 
+def _render_codex_tools(tools: object) -> str:
+    """Render Codex's request `tools` array as a prompt section.
+
+    Codex passes its tool definitions (shell, apply_patch, update_plan, …) as
+    structured JSON in the request body — NOT inside `instructions`. Without
+    this section the browser model is told to emit tool_calls while seeing no
+    tool list, and honesty-tuned models refuse outright ("there are no tools
+    available").
+    """
+    if not isinstance(tools, list):
+        return ""
+    rendered = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        # Responses API is flat; chat completions nests under "function".
+        fn_raw = tool.get("function")
+        fn = fn_raw if isinstance(fn_raw, dict) else {}
+        name = tool.get("name") or fn.get("name")
+        if name:
+            entry = f"- {name}"
+            desc = str(tool.get("description") or fn.get("description") or "").strip()
+            if desc:
+                entry += f": {desc}"
+            params = tool.get("parameters") or fn.get("parameters")
+            if params:
+                entry += f"\n  input schema: {json.dumps(params, ensure_ascii=False)}"
+            rendered.append(entry)
+        elif tool.get("type"):
+            rendered.append(f"- {tool['type']}")
+    if not rendered:
+        return ""
+    return "[AVAILABLE CODEX TOOLS]\n" + "\n".join(rendered) + "\n"
+
+
 def _extract_prompt_from_responses_request(body: dict) -> str:
     """Extract a human-readable prompt from a Codex Responses API request."""
     parts = []
@@ -1156,6 +1191,10 @@ def _extract_prompt_from_responses_request(body: dict) -> str:
     instructions = body.get("instructions")
     if instructions:
         parts.append(f"[SYSTEM PROMPT]\n{instructions}\n")
+
+    tools_section = _render_codex_tools(body.get("tools"))
+    if tools_section:
+        parts.append(tools_section)
 
     input_items = body.get("input")
     if isinstance(input_items, str):
@@ -1184,6 +1223,9 @@ def _extract_prompt_from_responses_request(body: dict) -> str:
 def _extract_prompt_from_chat_request(body: dict) -> str:
     """Convert a chat completions request body into a single prompt string."""
     parts = []
+    tools_section = _render_codex_tools(body.get("tools"))
+    if tools_section:
+        parts.append(tools_section)
     for msg in body.get("messages", []):
         if not isinstance(msg, dict):
             continue
@@ -1304,20 +1346,25 @@ _CONTRACT_NUDGE = (
     '  {"text": "brief reasoning", "tool_calls": [{"name": "TOOL_NAME", "input": {...}}]}\n'
     "Reminder: you are NOT executing anything and are not being asked to claim you can. "
     "The local Codex runtime on the user's machine executes every tool_call you emit — "
-    "with the user's permission — and returns the real output to you. The tools in the "
-    "[SYSTEM PROMPT] are genuinely available through that runtime, so emitting tool_calls "
-    "is truthful and is the ONLY way the requested work can happen. If you said you would "
-    "create files or run commands, do NOT describe those actions — emit them as tool_calls "
-    "using the exact tool names from the [SYSTEM PROMPT]. "
+    "with the user's permission — and returns the real output to you. The tools listed in "
+    "[AVAILABLE CODEX TOOLS] are genuinely available through that runtime, so emitting "
+    "tool_calls is truthful and is the ONLY way the requested work can happen. If you said "
+    "you would create files or run commands, do NOT describe those actions — emit them as "
+    "tool_calls using those exact tool names. "
     'If it truly was your final answer, resend it as {"text": "<your answer>"}.'
 )
 
 
 def _codex_browser_system_prompt() -> str:
+    # NOTE: the phrase "codex bridge json mode" is load-bearing — the browser
+    # prompt_builder detects it to select the codex prompt layout instead of
+    # the chat-mode one (which would append conflicting instructions and an
+    # empty [AVAILABLE TOOLS] block). Guarded by test_browser_protocol.py.
     return (
-        "You are Kim, the reasoning engine for Codex — a coding agent runtime installed "
-        "on the user's own computer. The conversation below contains a [SYSTEM PROMPT] "
-        "section from Codex that defines the available tools — use those exact tool names.\n\n"
+        "You are Kim, the reasoning engine for Codex (codex bridge json mode) — a coding "
+        "agent runtime installed on the user's own computer. The conversation below "
+        "contains a [SYSTEM PROMPT] section from Codex, and an [AVAILABLE CODEX TOOLS] "
+        "section listing the tools the runtime exposes — use those exact tool names.\n\n"
         "How this works: YOU never execute anything. You only decide the next step and "
         "emit it as JSON. The local Codex runtime on the user's machine — which has the "
         "user's permission and real filesystem/shell access — executes each tool_call you "
@@ -1332,7 +1379,8 @@ def _codex_browser_system_prompt() -> str:
         '  Tool call:    {"text": "brief reasoning", "tool_calls": [{"name": "TOOL_NAME", "input": {...}}]}\n'
         '  Final answer: {"text": "your answer"}\n\n'
         "Rules:\n"
-        "- Use ONLY the tool names defined in the [SYSTEM PROMPT] from Codex.\n"
+        "- Use ONLY the tool names listed in [AVAILABLE CODEX TOOLS] (or defined in the "
+        "[SYSTEM PROMPT] from Codex).\n"
         "- For a tool turn: include tool_calls with at least one entry.\n"
         "- For a final answer: omit tool_calls entirely.\n"
         "- File content always goes in a tool call — never embed it in the text field.\n"
