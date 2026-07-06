@@ -333,11 +333,22 @@ def _scan_path_tokens(tokens: list[str], cwd: str | None) -> str | None:
             or candidate.startswith("~")
             or ".." in expanded.parts
         )
+        target = expanded if expanded.is_absolute() else base_dir / expanded
         if not is_pathy:
-            continue
+            # A plain relative token (``.env``, ``id_rsa``, ``sub/dir/.env``) is
+            # path-checked only when it actually names an existing file in the
+            # working dir. That catches ``cat .env`` / ``head id_rsa`` (F2 —
+            # reachable when shell.sandbox_mode is off and cwd is the project
+            # root) without false-denying grep/sed patterns that merely look
+            # like a filename. validate_path stays the single deny authority —
+            # no glob logic is duplicated or weakened here.
+            try:
+                if not target.is_file():
+                    continue
+            except OSError:
+                continue
         if str(expanded) in _SAFE_DEV_PATHS:
             continue
-        target = expanded if expanded.is_absolute() else base_dir / expanded
         try:
             validate_path(str(target))
         except PermissionError as e:
