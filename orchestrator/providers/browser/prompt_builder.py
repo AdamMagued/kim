@@ -336,6 +336,7 @@ def format_prompt(
             "you are answering codex" in system_lower
             or "you are codex" in system_lower
             or "codex bridge json" in system_lower
+            or "codex bridge terminal" in system_lower
             or "codex, a coding agent" in system_lower
             or "available codex tools" in system_lower
         )

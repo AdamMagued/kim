@@ -912,6 +912,86 @@ class TestFileDirectiveSalvage(unittest.TestCase):
         self.assertIn(body, cmd)
 
 
+class TestDoneReply(unittest.TestCase):
+    """A DONE signal ends the turn cleanly instead of salvaging trailing
+    'you could also…' chatter into another relay (the browser-chat hang)."""
+
+    def test_bare_done_is_a_final_text_answer(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": "DONE"}, relay_num=1, request_tools=_CODEX_TOOLS
+        )
+        self.assertEqual(reply["output"][0]["type"], "message")
+
+    def test_done_suppresses_trailing_chatter_command(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        # After finishing, the model wraps up with a stray idempotent command.
+        # DONE means stop — that block must NOT become another tool call.
+        content = "All set.\n```bash\nopen pong.html\n```\nDONE"
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": content}, relay_num=1, request_tools=_CODEX_TOOLS
+        )
+        self.assertFalse([o for o in reply["output"] if o["type"] == "function_call"])
+
+    def test_done_does_not_swallow_a_real_file_write(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        # If the model (misbehaving) says DONE but still includes a file-write,
+        # run it — never drop real file creation.
+        content = "```bash\nprintf '%s' '<html>' > pong.html\n```\nDONE"
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": content}, relay_num=1, request_tools=_CODEX_TOOLS
+        )
+        calls = [o for o in reply["output"] if o["type"] == "function_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("pong.html", calls[0]["arguments"])
+
+    def test_done_inside_json_contract_ends_turn(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": json.dumps({"text": "DONE"})},
+            relay_num=1,
+            request_tools=_CODEX_TOOLS,
+        )
+        self.assertEqual(reply["output"][0]["type"], "message")
+
+    def test_word_done_in_prose_is_not_a_done_signal(self):
+        from codex_engine.engine import _is_done_reply
+
+        # "done" mid-sentence must not end the turn.
+        self.assertFalse(_is_done_reply("I have done the first part, next:"))
+        self.assertTrue(_is_done_reply("DONE"))
+        self.assertTrue(_is_done_reply("open pong.html\nDONE"))
+
+
+class TestChatgptTerminalNudge(unittest.IsolatedAsyncioTestCase):
+    async def test_chatgpt_gets_terminal_nudge_not_json_nudge(self):
+        from codex_engine.engine import _CodexProxy, _TERMINAL_NUDGE
+
+        provider = _RecordingProvider([{"type": "text", "content": "still just chatting"}])
+        proxy = _CodexProxy(
+            provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
+        )
+        original = {"type": "text", "content": "Here's how you'd do it, in theory."}
+        await proxy._nudge_contract_retry(original, relay_num=1)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(provider.calls[0]["messages"][0]["content"], _TERMINAL_NUDGE)
+
+    async def test_gemini_still_gets_json_nudge(self):
+        from codex_engine.engine import _CodexProxy, _CONTRACT_NUDGE
+
+        provider = _RecordingProvider([{"type": "text", "content": "prose only"}])
+        proxy = _CodexProxy(
+            provider, provider_name="browser:gemini", thread_state={}, stateful=False
+        )
+        original = {"type": "text", "content": "I'll explain the approach."}
+        await proxy._nudge_contract_retry(original, relay_num=1)
+        self.assertEqual(provider.calls[0]["messages"][0]["content"], _CONTRACT_NUDGE)
+
+
 class TestShellFenceNudgeInteraction(unittest.IsolatedAsyncioTestCase):
     async def test_prose_with_fences_skips_the_nudge(self):
         proxy, provider = _proxy()

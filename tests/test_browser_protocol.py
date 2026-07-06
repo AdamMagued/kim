@@ -2,9 +2,11 @@ import os
 import unittest
 
 from codex_engine.engine import (
+    _chatgpt_terminal_system_prompt,
     _codex_browser_system_prompt,
     _provider_response_to_chat_completions,
     _provider_response_to_responses_api,
+    _system_prompt_for,
 )
 
 
@@ -78,6 +80,35 @@ class BrowserProtocolTests(unittest.TestCase):
         self.assertNotIn("[AVAILABLE TOOLS]", prompt)
         self.assertNotIn("TASK_COMPLETE", prompt)
         self.assertNotIn("NEED_HELP", prompt)
+
+    def test_system_prompt_selector_routes_chatgpt_to_terminal_mode(self):
+        # ChatGPT → terminal-helper prompt; everyone else → JSON prompt.
+        self.assertEqual(
+            _system_prompt_for("browser:chatgpt"), _chatgpt_terminal_system_prompt()
+        )
+        self.assertEqual(
+            _system_prompt_for("browser:gemini"), _codex_browser_system_prompt()
+        )
+        self.assertEqual(_system_prompt_for(""), _codex_browser_system_prompt())
+
+    def test_terminal_prompt_asks_for_one_bash_command_and_done(self):
+        prompt = _chatgpt_terminal_system_prompt()
+        self.assertIn("ONE shell command", prompt)
+        self.assertIn("```bash", prompt)
+        self.assertIn("DONE", prompt)
+        self.assertIn("printf", prompt)  # heredoc-avoidance guidance
+
+    def test_terminal_prompt_selects_codex_layout_not_chat_layout(self):
+        # Same load-bearing coupling as the JSON prompt: the terminal prompt
+        # must also pick the codex layout, not the chat-mode one.
+        provider = _browser_provider_or_skip(self)
+        prompt, _attachments, _hash = provider._format_prompt(
+            messages=[{"role": "user", "content": "make pong"}],
+            tools=[],
+            system=_chatgpt_terminal_system_prompt(),
+        )
+        self.assertNotIn("[AVAILABLE TOOLS]", prompt)
+        self.assertNotIn("TASK_COMPLETE", prompt)
 
     def test_formatted_codex_prompt_has_only_dynamic_marker_instruction(self):
         provider = _browser_provider_or_skip(self)

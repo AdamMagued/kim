@@ -17,7 +17,13 @@ MOD_KEY = "Meta" if platform.system() == "Darwin" else "Control"
 # port without extra config (#3).  Override via KIM_REAL_BROWSER_CDP_PORT.
 _CDP_PORT = int(os.environ.get("KIM_REAL_BROWSER_CDP_PORT", "9222"))
 CDP_URL = f"http://localhost:{_CDP_PORT}"
-RESPONSE_WAIT_S = 600
+# How long to wait for a NEW response bubble to even START appearing after a
+# submit. A model that has nothing new to say (e.g. codex sent a redundant
+# follow-up relay) never produces one — a long wait here is the "frozen, had
+# to Ctrl-C" hang. Kept short so a dead relay returns the prompt fast; the
+# separate GENERATION_WAIT_S still allows a long, slow full answer once it
+# has begun. Override via KIM_BROWSER_RESPONSE_WAIT_S.
+RESPONSE_WAIT_S = int(os.environ.get("KIM_BROWSER_RESPONSE_WAIT_S", "60"))
 GENERATION_WAIT_S = 600
 _VERIFY_MIN_CHARS = 20
 _INJECT_MAX_RETRIES = 3
