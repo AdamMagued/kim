@@ -23,6 +23,7 @@ export const KimEventNames = {
   ACTIVITY: 'kim:activity' as const,
   COMMAND_APPROVAL_REQUEST: 'kim:command-approval-request' as const,
   FILE_CHANGE_APPROVAL_REQUEST: 'kim:file-change-approval-request' as const,
+  USER_INPUT_REQUEST: 'kim:user-input-request' as const,
   COMMAND_OUTPUT: 'kim:command-output' as const,
   ASSISTANT_DELTA: 'kim:assistant-delta' as const,
   REASONING_DELTA: 'kim:reasoning-delta' as const,
@@ -301,6 +302,20 @@ export interface KimFileChangeApprovalRequestPayload {
   reason: string;
 }
 
+/** Codex app-server: codex is asking the USER a question (item/tool/requestUserInput) or an MCP server raised an elicitation. Render the questions and answer via the respond_user_input Tauri command, which writes a {"type":"user_input","id":…,"answers":…} stdin line back to the bridge. */
+export interface KimUserInputRequestPayload {
+  /** Request id — echo it back in the user_input stdin line (respond_user_input's id argument). */
+  id: string;
+  /** 'questions' (codex requestUserInput) or 'elicitation' (MCP elicitation; informational — Kim auto-declines these today). */
+  kind: string;
+  /** Codex thread item id the questions belong to; may be empty (always empty for elicitation). */
+  item_id: string;
+  /** Question objects as sent by codex: [{id, header, question, options?: [{label, description?}], isOther?, isSecret?}]. Empty for elicitation. */
+  questions: unknown[];
+  /** Elicitation message text; empty for kind='questions'. */
+  message: string;
+}
+
 /** Codex app-server: live output chunk from a running command. */
 export interface KimCommandOutputPayload {
   /** Command-execution item id this chunk belongs to. */
@@ -384,6 +399,7 @@ export type KimEvent =
   | { event: typeof KimEventNames.ACTIVITY; payload: KimActivityPayload }
   | { event: typeof KimEventNames.COMMAND_APPROVAL_REQUEST; payload: KimCommandApprovalRequestPayload }
   | { event: typeof KimEventNames.FILE_CHANGE_APPROVAL_REQUEST; payload: KimFileChangeApprovalRequestPayload }
+  | { event: typeof KimEventNames.USER_INPUT_REQUEST; payload: KimUserInputRequestPayload }
   | { event: typeof KimEventNames.COMMAND_OUTPUT; payload: KimCommandOutputPayload }
   | { event: typeof KimEventNames.ASSISTANT_DELTA; payload: KimAssistantDeltaPayload }
   | { event: typeof KimEventNames.REASONING_DELTA; payload: KimReasoningDeltaPayload }
@@ -414,6 +430,7 @@ const KimWireEventMap = {
   "activity": { event: KimEventNames.ACTIVITY },
   "command_approval_request": { event: KimEventNames.COMMAND_APPROVAL_REQUEST },
   "file_change_approval_request": { event: KimEventNames.FILE_CHANGE_APPROVAL_REQUEST },
+  "user_input_request": { event: KimEventNames.USER_INPUT_REQUEST },
   "command_output": { event: KimEventNames.COMMAND_OUTPUT },
   "assistant_delta": { event: KimEventNames.ASSISTANT_DELTA },
   "reasoning_delta": { event: KimEventNames.REASONING_DELTA },

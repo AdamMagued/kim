@@ -28,6 +28,7 @@ DIFF = "kim:diff"
 ACTIVITY = "kim:activity"
 COMMAND_APPROVAL_REQUEST = "kim:command-approval-request"
 FILE_CHANGE_APPROVAL_REQUEST = "kim:file-change-approval-request"
+USER_INPUT_REQUEST = "kim:user-input-request"
 COMMAND_OUTPUT = "kim:command-output"
 ASSISTANT_DELTA = "kim:assistant-delta"
 REASONING_DELTA = "kim:reasoning-delta"
@@ -183,6 +184,10 @@ def emit_command_approval_request(id: str, command: str, cwd: str, reason: str, 
 
 def emit_file_change_approval_request(id: str, files: list[object], reason: str) -> None:
     emit_event("file_change_approval_request", id=id, files=files, reason=reason)
+
+
+def emit_user_input_request(id: str, kind: str, item_id: str, questions: list[object], message: str) -> None:
+    emit_event("user_input_request", id=id, kind=kind, item_id=item_id, questions=questions, message=message)
 
 
 def emit_command_output(item_id: str, chunk: str) -> None:

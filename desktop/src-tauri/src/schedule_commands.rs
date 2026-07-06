@@ -75,6 +75,14 @@ pub(crate) struct ScheduleTimerInner {
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl ScheduleTimerInner {
+    /// True while the opt-in timer loop is alive. The built-in 60s scheduler
+    /// skips its tick when this is set so due tasks are not double-fired.
+    pub(crate) fn is_running(&self) -> bool {
+        self.handle.is_some()
+    }
+}
+
 pub(crate) type ScheduleTimerState = Arc<Mutex<ScheduleTimerInner>>;
 
 pub(crate) fn new_schedule_timer_state() -> ScheduleTimerState {
@@ -117,6 +125,27 @@ fn status_from_inner(inner: &ScheduleTimerInner) -> ScheduleTimerStatus {
         last_result: inner.last_result.clone(),
         last_error: inner.last_error.clone(),
     }
+}
+
+/// D19: whether the BUILT-IN 60s scheduler loop will fire due tasks.
+/// True when schedules are enabled in config and the user has not paused
+/// scheduling via Stop. Folded into `ScheduleTimerStatus.running` so the
+/// pane's Stopped/Running label reflects reality instead of only the opt-in
+/// timer (the "Stopped is a lie" bug: the label said Stopped while the
+/// built-in loop kept firing every 60s).
+fn builtin_scheduler_active(app_handle: &AppHandle) -> bool {
+    use tauri::Manager as _;
+    let enabled = app_handle
+        .try_state::<crate::config::AppConfig>()
+        .map(|c| c.schedules_enabled)
+        .unwrap_or(true);
+    enabled && !crate::scheduler::is_scheduler_paused()
+}
+
+/// Compose the user-facing status: "running" means SOMETHING will fire due
+/// tasks -- either the opt-in timer loop or the built-in 60s loop.
+pub(crate) fn compose_running(timer_running: bool, builtin_active: bool) -> bool {
+    timer_running || builtin_active
 }
 
 // ---------------------------------------------------------------------------
@@ -345,10 +374,17 @@ pub(crate) async fn start_schedule_timer(
     let interval = clamp_timer_interval(interval_seconds.unwrap_or(MIN_TIMER_INTERVAL_SECONDS));
     let timer_state = Arc::clone(&*state);
 
+    // D19: Start also un-pauses the built-in 60s loop (Stop paused it). While
+    // the opt-in timer runs, the built-in loop skips its ticks, so tasks are
+    // never double-fired.
+    crate::scheduler::set_scheduler_paused(false);
+
     {
         let mut inner = timer_state.lock().await;
         if inner.handle.is_some() {
-            return Ok(status_from_inner(&inner));
+            let mut status = status_from_inner(&inner);
+            status.running = compose_running(status.running, builtin_scheduler_active(&app_handle));
+            return Ok(status);
         }
 
         inner.interval_seconds = interval;
@@ -417,11 +453,22 @@ pub(crate) async fn start_schedule_timer(
     }
 }
 
-/// Stop the opt-in periodic schedule runner if it is active.
+/// Stop ALL scheduled execution the pane's Stop button is responsible for.
+///
+/// D19 ("Stopped is a lie"): the pane previously only aborted the opt-in timer
+/// loop here, while the built-in 60s scheduler kept firing due tasks and
+/// injecting their output into the open chat. Stop now ALSO pauses the built-in
+/// loop (`set_scheduler_paused(true)`), so pressing Stop genuinely halts every
+/// scheduled run until the next Start. `start_schedule_timer` clears the pause.
+/// The returned status is `running: false` (opt-in handle aborted + built-in
+/// paused), so the label is honest.
 #[tauri::command]
 pub(crate) async fn stop_schedule_timer(
     state: State<'_, ScheduleTimerState>,
 ) -> Result<ScheduleTimerStatus, String> {
+    // Pause the built-in loop first so no tick can slip through between the
+    // abort below and the flag being observed.
+    crate::scheduler::set_scheduler_paused(true);
     let mut inner = state.lock().await;
     if let Some(handle) = inner.handle.take() {
         handle.abort();
@@ -429,13 +476,21 @@ pub(crate) async fn stop_schedule_timer(
     Ok(status_from_inner(&inner))
 }
 
-/// Return the current opt-in schedule timer status.
+/// Return the current schedule-runner status.
+///
+/// D19: `running` is composed -- true when EITHER the opt-in timer loop is alive
+/// OR the built-in 60s scheduler is still armed (config-enabled and not paused
+/// via Stop). This makes the pane's Stopped/Running label reflect whether ANY
+/// scheduled execution can fire, not just the opt-in timer.
 #[tauri::command]
 pub(crate) async fn get_schedule_timer_status(
+    app_handle: AppHandle,
     state: State<'_, ScheduleTimerState>,
 ) -> Result<ScheduleTimerStatus, String> {
     let inner = state.lock().await;
-    Ok(status_from_inner(&inner))
+    let mut status = status_from_inner(&inner);
+    status.running = compose_running(status.running, builtin_scheduler_active(&app_handle));
+    Ok(status)
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +514,27 @@ mod tests {
         assert_eq!(clamp_timer_interval(59), 60);
         assert_eq!(clamp_timer_interval(60), 60);
         assert_eq!(clamp_timer_interval(300), 300);
+    }
+
+    #[test]
+    fn test_compose_running_is_logical_or() {
+        // D19: the pane is "running" when EITHER runner can fire due tasks.
+        assert!(!compose_running(false, false), "nothing armed -> stopped");
+        assert!(
+            compose_running(true, false),
+            "opt-in timer alone -> running"
+        );
+        assert!(
+            compose_running(false, true),
+            "built-in loop alone -> running"
+        );
+        assert!(compose_running(true, true), "both armed -> running");
+    }
+
+    #[test]
+    fn test_is_running_tracks_handle_presence() {
+        let idle = ScheduleTimerInner::default();
+        assert!(!idle.is_running(), "no handle -> not running");
     }
 
     #[test]

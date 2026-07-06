@@ -10,6 +10,25 @@ use tauri::{Emitter, Manager};
 
 static SCHEDULER_TICK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// D19: user-facing pause switch for the BUILT-IN 60s loop.
+///
+/// Before this flag existed, SchedulePane's Stop button only aborted the
+/// separate opt-in timer (`stop_schedule_timer`) while this loop kept firing
+/// due tasks every 60s and injecting their output into the open chat — the
+/// pane said "Stopped" but scheduled execution never stopped.
+/// `stop_schedule_timer` now sets this flag and `start_schedule_timer`
+/// clears it, so Stop genuinely halts ALL scheduled execution. In-memory
+/// only: an app restart returns to the `schedules_enabled` config default.
+static SCHEDULER_PAUSED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_scheduler_paused(paused: bool) {
+    SCHEDULER_PAUSED.store(paused, Ordering::Release);
+}
+
+pub(crate) fn is_scheduler_paused() -> bool {
+    SCHEDULER_PAUSED.load(Ordering::Acquire)
+}
+
 /// Try to claim the tick slot. Returns true if claimed (caller must release),
 /// false if a tick is already in flight and this one should be skipped.
 pub(crate) fn try_acquire_tick() -> bool {
@@ -46,6 +65,17 @@ async fn scheduler_tick(app_handle: &tauri::AppHandle) {
         .unwrap_or(true);
     if !enabled {
         return;
+    }
+    // (a2) D19: the user pressed Stop in the schedule pane — honor it.
+    if is_scheduler_paused() {
+        return;
+    }
+    // (a3) When the opt-in schedule timer is running it already fires due
+    // tasks on its own cadence; ticking here too would double-run them.
+    if let Some(timer) = app_handle.try_state::<crate::schedule_commands::ScheduleTimerState>() {
+        if timer.lock().await.is_running() {
+            return;
+        }
     }
     // (b) never stomp an interactive run — skip this tick if one is active.
     // H-PROC-1: the guard must read TaskRuntime, the store both spawn paths
@@ -103,5 +133,16 @@ mod tests {
         release_tick();
         assert!(try_acquire_tick(), "acquire should succeed after release");
         release_tick();
+    }
+
+    #[test]
+    fn scheduler_pause_flag_round_trips() {
+        // D19: Stop sets this so scheduler_tick early-returns; Start clears it.
+        let original = is_scheduler_paused();
+        set_scheduler_paused(true);
+        assert!(is_scheduler_paused(), "Stop must pause the built-in loop");
+        set_scheduler_paused(false);
+        assert!(!is_scheduler_paused(), "Start must un-pause it");
+        set_scheduler_paused(original); // leave the global as we found it
     }
 }

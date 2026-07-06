@@ -257,6 +257,7 @@ pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &ta
                         response: None,
                         error: None,
                         site: ipc_event.site,
+                        attachments_uploaded: None,
                     },
                 );
             }
@@ -279,6 +280,9 @@ pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &ta
                         response: ipc_event.response,
                         error: None,
                         site: ipc_event.site,
+                        // Forward the bridge's verified upload count so
+                        // /v1/result can hand it to Python's honesty gating.
+                        attachments_uploaded: ipc_event.attachments_uploaded,
                     },
                 );
             }
@@ -305,6 +309,7 @@ pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &ta
                         response: None,
                         error: ipc_event.error,
                         site: ipc_event.site,
+                        attachments_uploaded: None,
                     },
                 );
             }
@@ -726,6 +731,7 @@ mod title_pull_tests {
             response: Some(response.to_string()),
             error: None,
             site: Some("claude".to_string()),
+            attachments_uploaded: None,
         }
     }
 

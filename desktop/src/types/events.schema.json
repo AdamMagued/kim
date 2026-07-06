@@ -208,6 +208,18 @@
       }
     },
     {
+      "event": "kim:user-input-request",
+      "typeName": "KimUserInputRequest",
+      "description": "Codex app-server: codex is asking the USER a question (item/tool/requestUserInput) or an MCP server raised an elicitation. Render the questions and answer via the respond_user_input Tauri command, which writes a {\"type\":\"user_input\",\"id\":…,\"answers\":…} stdin line back to the bridge.",
+      "payload": {
+        "id": { "type": "string", "description": "Request id — echo it back in the user_input stdin line (respond_user_input's id argument)." },
+        "kind": { "type": "string", "description": "'questions' (codex requestUserInput) or 'elicitation' (MCP elicitation; informational — Kim auto-declines these today)." },
+        "item_id": { "type": "string", "default": true, "description": "Codex thread item id the questions belong to; may be empty (always empty for elicitation)." },
+        "questions": { "type": "unknown[]", "default": true, "description": "Question objects as sent by codex: [{id, header, question, options?: [{label, description?}], isOther?, isSecret?}]. Empty for elicitation." },
+        "message": { "type": "string", "default": true, "description": "Elicitation message text; empty for kind='questions'." }
+      }
+    },
+    {
       "event": "kim:command-output",
       "typeName": "KimCommandOutput",
       "description": "Codex app-server: live output chunk from a running command.",

@@ -179,6 +179,28 @@ pub(crate) fn forward_agent_stdout_line(
                         serde_json::json!({"id": id, "files": files, "reason": reason}),
                     );
                 }
+                KimEvent::UserInputRequest {
+                    id,
+                    kind,
+                    item_id,
+                    questions,
+                    message,
+                } => {
+                    // C4: codex asked the USER a question (item/tool/requestUserInput
+                    // or an MCP elicitation). Forward it so the frontend can render
+                    // the card; the answer comes back via the respond_user_input
+                    // command, which writes a user_input stdin line to the bridge.
+                    let _ = app.emit(
+                        "kim:user-input-request",
+                        serde_json::json!({
+                            "id": id,
+                            "kind": kind,
+                            "item_id": item_id,
+                            "questions": questions,
+                            "message": message,
+                        }),
+                    );
+                }
                 KimEvent::CommandOutput { item_id, chunk } => {
                     let _ = app.emit(
                         "kim:command-output",

@@ -265,6 +265,7 @@ pub(super) fn complete(mut request: Request, app_handle: tauri::AppHandle, token
                     .to_string(),
             ),
             site: Some(site.clone()),
+            attachments_uploaded: None,
         });
     }
 

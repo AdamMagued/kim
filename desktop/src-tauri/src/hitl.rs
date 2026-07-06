@@ -98,6 +98,34 @@ pub(crate) async fn respond_approval_decision(id: String, decision: String) -> R
     crate::task_runtime::write_stdin_line(&msg).await
 }
 
+/// Build the `user_input` stdin line answering a codex
+/// `item/tool/requestUserInput` question (C4). `answers` is forwarded as-is;
+/// Python's `parse_user_input_line` normalizes bare strings / string lists /
+/// `{answers: [...]}` objects into the ToolRequestUserInputResponse shape and
+/// rejects non-object payloads, so no vocabulary whitelist applies here.
+pub(crate) fn build_user_input_line(id: &str, answers: &serde_json::Value) -> String {
+    serde_json::json!({
+        "type": "user_input",
+        "id": id,
+        "answers": answers,
+    })
+    .to_string()
+}
+
+/// Answer a codex user-input request (`kim:user-input-request` event).
+/// Writes a `user_input` line to the running bridge's stdin; the codex
+/// app-server transport blocks its `_collect_user_input` wait on it.
+/// `answers` maps question id → answer (string, string list, or
+/// `{answers: [...]}` object — see `parse_user_input_line`).
+#[tauri::command]
+pub(crate) async fn respond_user_input(
+    id: String,
+    answers: serde_json::Value,
+) -> Result<(), String> {
+    let msg = format!("{}\n", build_user_input_line(&id, &answers));
+    crate::task_runtime::write_stdin_line(&msg).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +194,30 @@ mod tests {
         let line = build_approval_decision_line("7", "yolo");
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["decision"], "decline");
+    }
+
+    // C4: respond_user_input's stdin line must match parse_user_input_line's
+    // expected shape: {"type":"user_input","id":…,"answers":…}. answers is
+    // forwarded verbatim (object, list, or bare string all valid).
+    #[test]
+    fn test_user_input_line_shape() {
+        let answers = serde_json::json!({"q1": "yes", "q2": ["a", "b"]});
+        let line = build_user_input_line("req-9", &answers);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "user_input");
+        assert_eq!(v["id"], "req-9");
+        assert_eq!(v["answers"], answers);
+    }
+
+    #[test]
+    fn test_user_input_line_forwards_scalar_and_list_verbatim() {
+        // A bare string answer is passed through untouched (Python normalizes).
+        let line = build_user_input_line("1", &serde_json::json!("just text"));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["answers"], "just text");
+
+        let line = build_user_input_line("2", &serde_json::json!(["x", "y"]));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["answers"], serde_json::json!(["x", "y"]));
     }
 }

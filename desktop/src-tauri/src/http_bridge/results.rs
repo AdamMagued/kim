@@ -128,16 +128,22 @@ pub(super) fn handle_bridge_result_request(
     match result {
         Ok(payload) => {
             if payload.ok {
-                respond_json(
-                    request,
-                    200,
-                    serde_json::json!({
-                        "ok": true,
-                        "response": payload.response,
-                        "site": payload.site.unwrap_or_else(|| "unknown".to_string()),
-                        "req_id": req_id,
-                    }),
-                );
+                // Forward the bridge's verified upload count (bridge.js done
+                // payload → BridgeIpcEvent → BridgeCompleteResponse) so the
+                // Python side's screenshot-honesty gating actually receives
+                // it. Omitted (not null) when the bridge did not report one,
+                // matching the "older bridge" behavior bridge_client.py
+                // expects.
+                let mut body = serde_json::json!({
+                    "ok": true,
+                    "response": payload.response,
+                    "site": payload.site.unwrap_or_else(|| "unknown".to_string()),
+                    "req_id": req_id,
+                });
+                if let Some(uploaded) = payload.attachments_uploaded {
+                    body["attachments_uploaded"] = serde_json::json!(uploaded);
+                }
+                respond_json(request, 200, body);
             } else {
                 respond_json(
                     request,

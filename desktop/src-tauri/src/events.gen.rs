@@ -100,6 +100,16 @@ pub(crate) enum KimEvent {
         #[serde(default)]
         reason: String,
     },
+    UserInputRequest {
+        id: String,
+        kind: String,
+        #[serde(default)]
+        item_id: String,
+        #[serde(default)]
+        questions: Vec<serde_json::Value>,
+        #[serde(default)]
+        message: String,
+    },
     CommandOutput {
         item_id: String,
         chunk: String,

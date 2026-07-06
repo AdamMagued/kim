@@ -109,6 +109,12 @@ struct BridgeCompleteResponse {
     response: Option<String>,
     error: Option<String>,
     site: Option<String>,
+    /// How many attachments bridge.js verified as actually uploaded (chip
+    /// appeared in the composer). Forwarded to Python via /v1/result so
+    /// screenshot-honesty gating can tell "image delivered" from "image
+    /// silently dropped". `None` on payloads from older bridge scripts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attachments_uploaded: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -134,6 +140,10 @@ struct BridgeIpcEvent {
     level: Option<String>,
     #[serde(default)]
     msg: Option<String>,
+    /// Verified upload count from the bridge's `done` payload (see
+    /// `BridgeCompleteResponse::attachments_uploaded`).
+    #[serde(default)]
+    attachments_uploaded: Option<u64>,
 }
 
 static IPC_LISTENER_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -1047,6 +1057,7 @@ fn ollama_openai_base_url(base_url: Option<&str>) -> String {
 pub(crate) mod hitl;
 pub(crate) use hitl::hitl_respond_approval;
 pub(crate) use hitl::respond_approval_decision;
+pub(crate) use hitl::respond_user_input;
 pub(crate) mod subprocess;
 pub(crate) use subprocess::{
     cancel_task, find_python_interpreter, process_exists, send_task, steer_task,
@@ -1148,6 +1159,7 @@ pub fn run() {
             cancel_task,
             hitl_respond_approval,
             respond_approval_decision,
+            respond_user_input,
             steer_task,
             google_oauth::google_oauth_status,
             google_oauth::google_oauth_start,
