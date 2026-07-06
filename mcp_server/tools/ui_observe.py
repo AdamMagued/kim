@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
 from mcp_server.os_utils import CURRENT_OS, IS_MACOS, minimal_subprocess_env
+from mcp_server.privacy import is_privacy_paused, PRIVACY_ERROR
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +37,16 @@ class UIElement:
         return (self.x + max(1, self.width) // 2, self.y + max(1, self.height) // 2)
 
 
+# SINGLE-RUN INVARIANT (3.6): this cache is module-global, so it assumes ONE
+# MCP server process per agent run (which is how Kim spawns servers today).
+# If a server is ever shared across concurrent runs/sessions, element ids from
+# one run could be clicked by another — key this by session token before ever
+# sharing a server process. _LAST_OBSERVE_TS guards against the related
+# staleness hazard: click_ui refuses coordinates from an observation old
+# enough that the screen has likely changed.
 _LAST_ELEMENTS: dict[str, UIElement] = {}
+_LAST_OBSERVE_TS: float = 0.0
+_MAX_OBSERVATION_AGE_S = 120.0
 
 # Cached AX-trust result. None until probed; True/False once known. macOS TCC
 # is process-lifetime sticky — if we have access once, we have it for the rest
@@ -133,10 +144,11 @@ def _parse_elements(raw: str) -> tuple[str, str, list[UIElement]]:
 
 
 def _format_observation(app: str, window: str, elements: list[UIElement], limit: int) -> str:
-    global _LAST_ELEMENTS
+    global _LAST_ELEMENTS, _LAST_OBSERVE_TS
     # Rebuilt below from the SAME sorted/limited set that gets printed, so
     # every displayed element id is actually clickable (M1).
     _LAST_ELEMENTS = {}
+    _LAST_OBSERVE_TS = time.monotonic()
 
     lines = [
         "STRUCTURED_UI_OBSERVATION",
@@ -389,6 +401,10 @@ async def handle_observe_ui(args: dict) -> str:
 
 async def handle_click_ui(args: dict) -> str:
     """Click a UI element returned by the most recent observe_ui call."""
+    # 2.3: click_ui fires real input — it must honour the privacy pause like
+    # every other input tool (click, type_text, hotkey, ...).
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import pyautogui
 
     element_id = str(args.get("element_id") or "").strip()
@@ -397,6 +413,15 @@ async def handle_click_ui(args: dict) -> str:
     el = _LAST_ELEMENTS.get(element_id)
     if not el:
         return f"ERROR: Unknown element_id {element_id!r}. Call observe_ui again and use one of its IDs."
+    # 2.3: refuse stale coordinates — the screen has likely changed since a
+    # minutes-old observation, and clicking old coords can hit the wrong thing.
+    age = time.monotonic() - _LAST_OBSERVE_TS
+    if age > _MAX_OBSERVATION_AGE_S:
+        return (
+            f"ERROR: The last observe_ui result is {int(age)}s old (limit "
+            f"{int(_MAX_OBSERVATION_AGE_S)}s) and its coordinates may be stale. "
+            "Call observe_ui again, then click_ui with a fresh element_id."
+        )
     x, y = el.center
     button = str(args.get("button") or "left")
     clicks = int(args.get("clicks", 1))

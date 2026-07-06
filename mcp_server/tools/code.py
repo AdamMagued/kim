@@ -30,13 +30,17 @@ import tempfile
 import os
 
 from mcp_server.config import PROJECT_ROOT, CODE_TIMEOUT, SHELL_TIMEOUT, validate_path
-from mcp_server.os_utils import IS_MACOS, IS_LINUX
+from mcp_server.os_utils import IS_MACOS, IS_LINUX, IS_WINDOWS
 
 logger = logging.getLogger(__name__)
 
 # ── Minimal sandbox environment ───────────────────────────────────────────────
 
-_SANDBOX_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# /usr/local/bin is included so system-wide installs (e.g. node on macOS/Linux)
+# stay reachable; /snap/bin on Linux for snap-installed interpreters (1.3).
+_SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if IS_LINUX and os.path.isdir("/snap/bin"):
+    _SANDBOX_PATH += ":/snap/bin"
 
 
 def _minimal_env(extra: dict | None = None) -> dict[str, str]:
@@ -45,8 +49,30 @@ def _minimal_env(extra: dict | None = None) -> dict[str, str]:
     All code-execution subprocesses use this instead of inheriting os.environ
     so that OPENAI_API_KEY, ANTHROPIC_API_KEY, and similar secrets are never
     visible to executed code (finding 1).
+
+    On Windows the env must carry SystemRoot/ComSpec/Path (1.1): CPython
+    cannot even initialise without SystemRoot, and a POSIX-style PATH makes
+    every child binary unfindable. Mirrors shell.py's _sandbox_env.
     """
-    env: dict[str, str] = {
+    if IS_WINDOWS:
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        env: dict[str, str] = {
+            "Path": rf"{system_root}\System32;{system_root}",
+            "SystemRoot": system_root,
+            "TEMP": tempfile.gettempdir(),
+            "TMP": tempfile.gettempdir(),
+            "USERPROFILE": str(PROJECT_ROOT),
+        }
+        comspec = os.environ.get("ComSpec")
+        if comspec:
+            env["ComSpec"] = comspec
+        pathext = os.environ.get("PATHEXT")
+        if pathext:
+            env["PATHEXT"] = pathext
+        if extra:
+            env.update(extra)
+        return env
+    env = {
         "PATH": _SANDBOX_PATH,
         "HOME": str(PROJECT_ROOT),
         "TMPDIR": tempfile.gettempdir(),

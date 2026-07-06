@@ -117,28 +117,39 @@ async def _run_osascript(script: str) -> tuple[int, str, str]:
     )
 
 
+# AppleScript: list all application windows with names, positions, sizes.
+# Per-window visibility is queried via the AXMinimized attribute (2.4) instead
+# of hardcoding visible=true for every window: a minimized window must not be
+# reported as visible, or the LLM believes content is on screen when it isn't.
+_MAC_LIST_WINDOWS_SCRIPT = '''
+    set output to ""
+    tell application "System Events"
+        set allProcs to (every process whose visible is true)
+        repeat with proc in allProcs
+            set procName to name of proc
+            try
+                set wins to every window of proc
+                repeat with w in wins
+                    set winName to name of w
+                    set {posX, posY} to position of w
+                    set {sizeW, sizeH} to size of w
+                    set visFlag to "true"
+                    try
+                        if (value of attribute "AXMinimized" of w) is true then
+                            set visFlag to "false"
+                        end if
+                    end try
+                    set output to output & "title=" & quoted form of (procName & " - " & winName) & "  pos=(" & posX & "," & posY & ")  size=(" & sizeW & "x" & sizeH & ")  visible=" & visFlag & linefeed
+                end repeat
+            end try
+        end repeat
+    end tell
+    return output
+'''
+
+
 async def _get_windows_mac() -> str:
-    # AppleScript: list all application windows with names, positions, sizes
-    script = '''
-        set output to ""
-        tell application "System Events"
-            set allProcs to (every process whose visible is true)
-            repeat with proc in allProcs
-                set procName to name of proc
-                try
-                    set wins to every window of proc
-                    repeat with w in wins
-                        set winName to name of w
-                        set {posX, posY} to position of w
-                        set {sizeW, sizeH} to size of w
-                        set output to output & "title=" & quoted form of (procName & " - " & winName) & "  pos=(" & posX & "," & posY & ")  size=(" & sizeW & "x" & sizeH & ")  visible=true" & linefeed
-                    end repeat
-                end try
-            end repeat
-        end tell
-        return output
-    '''
-    exit_code, out, err = await _run_osascript(script)
+    exit_code, out, err = await _run_osascript(_MAC_LIST_WINDOWS_SCRIPT)
     if exit_code != 0:
         return f"ERROR: osascript failed: {err}"
     return out if out.strip() else "No windows found"
@@ -248,8 +259,11 @@ async def _get_windows_linux() -> str:
         parts = line.split(None, 7)
         if len(parts) >= 8:
             wid, desktop, x, y, w, h, host, title = parts
+            # 2.4: wmctrl -l cannot distinguish minimized/hidden windows, so
+            # do NOT fabricate visible=true — report the honest unknown.
             lines.append(
-                f"title={title!r:50s}  pos=({x},{y})  size=({w}x{h})  visible=true"
+                f"title={title!r:50s}  pos=({x},{y})  size=({w}x{h})  "
+                f"desktop={desktop}  visible=unknown"
             )
     return "\n".join(lines) if lines else "No windows found"
 
@@ -400,13 +414,49 @@ async def handle_resize_window(args: dict) -> str:
         return f"ERROR: {e}"
 
 
+async def _open_url_linux(url: str) -> str:
+    """Open a URL on Linux via xdg-open with a real exit-code check (1.5).
+
+    webbrowser.open() on Linux can silently fail (returns True even when the
+    spawned handler dies, e.g. headless or stripped env), so shell out to
+    xdg-open directly and surface a non-zero exit.
+    """
+    if not check_tool_available("xdg-open"):
+        # Fall back to webbrowser, but check its return value.
+        if webbrowser.open(url):
+            return f"Opened URL in default browser: {url}"
+        return (
+            "ERROR: Could not open URL: 'xdg-open' is not installed and no "
+            "usable browser was found (headless session?)."
+        )
+    try:
+        exit_code, out, err = await _run_cmd(["xdg-open", url])
+    except (asyncio.TimeoutError, TimeoutError):
+        # Some handlers keep xdg-open in the foreground; a timeout here means
+        # the handler was launched and is still running — not a failure.
+        return f"Opened URL (handler still running after 10s): {url}"
+    if exit_code != 0:
+        return (
+            f"ERROR: xdg-open exited with code {exit_code} for {url}: "
+            f"{err or out or 'no browser/handler available (headless session?)'}"
+        )
+    return f"Opened URL in default browser: {url}"
+
+
 async def handle_open_url(args: dict) -> str:
     url = str(args["url"])
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return f"ERROR: URL scheme '{parsed.scheme}' is not allowed; only http and https are permitted"
     try:
-        webbrowser.open(url)
+        if IS_LINUX:
+            result = await _open_url_linux(url)
+            logger.info(f"open_url [{CURRENT_OS}]: {result}")
+            return result
+        # webbrowser.open returns False when no browser could be launched —
+        # report that instead of claiming success (1.5).
+        if not webbrowser.open(url):
+            return f"ERROR: No usable browser found to open {url}"
         logger.info(f"open_url: {url}")
         return f"Opened URL in default browser: {url}"
     except Exception as e:

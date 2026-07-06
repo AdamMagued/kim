@@ -181,6 +181,18 @@ _RE_WIN_EXE = re.compile(
 )
 
 
+def _resolve_linux_app(app_name: str) -> str:
+    """Resolve a bare Linux app/tool name to an absolute path when possible.
+
+    Translated launches run under a restricted sandbox PATH that historically
+    missed /usr/local/bin and /snap/bin (1.3), so a bare 'google-chrome' or
+    'gedit' could be unfindable even when installed. Resolving against the
+    server's full PATH here makes the launch immune to the child's PATH.
+    """
+    resolved = shutil.which(app_name)
+    return resolved or app_name
+
+
 def _translate_start_command(app: str) -> str | None:
     """Translate a 'start <app>' Windows command to the current OS."""
     app_lower = app.strip().lower().rstrip('"').rstrip("'")
@@ -195,8 +207,8 @@ def _translate_start_command(app: str) -> str | None:
     if IS_LINUX:
         linux_app = _APP_MAP_LINUX.get(app_lower)
         if linux_app:
-            return linux_app
-        return f"xdg-open {shlex.quote(app.strip())}"
+            return shlex.quote(_resolve_linux_app(linux_app))
+        return f"{_resolve_linux_app('xdg-open')} {shlex.quote(app.strip())}"
 
     return None  # Windows — no translation needed
 
@@ -214,7 +226,8 @@ def _translate_exe_invocation(exe: str, rest: str) -> str | None:
     if IS_LINUX:
         linux_app = _APP_MAP_LINUX.get(exe_lower)
         if linux_app:
-            return f"{linux_app}{rest}"
+            # Absolute path so the launch survives a restricted child PATH (1.3)
+            return f"{shlex.quote(_resolve_linux_app(linux_app))}{rest}"
         return None
 
     return None
