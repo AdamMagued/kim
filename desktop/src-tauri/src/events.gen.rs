@@ -58,6 +58,8 @@ pub(crate) enum KimEvent {
         reason: String,
         #[serde(default)]
         preview: String,
+        #[serde(default)]
+        id: String,
     },
     HitlApprovalResult {
         tool: String,

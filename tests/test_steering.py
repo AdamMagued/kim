@@ -46,6 +46,18 @@ def test_pump_dispatch_routes_steer_and_approval():
     # No running loop set → dispatch routes synchronously.
     pump._dispatch({"type": "user_steer", "text": "go left"})
     assert seen == ["go left"]
-    pump._dispatch({"type": "hitl_approve", "approved": True})
-    got = asyncio.run(pump.next_approval(timeout=1.0))
+
+    # T1: decisions queued BEFORE a request starts waiting are stale and
+    # dropped, so the approval is dispatched while next_approval is waiting
+    # (the real flow: prompt first, decision second).
+    async def scenario():
+        answer = asyncio.get_running_loop().call_later(
+            0.01, pump._dispatch, {"type": "hitl_approve", "approved": True}
+        )
+        try:
+            return await pump.next_approval(timeout=1.0)
+        finally:
+            answer.cancel()
+
+    got = asyncio.run(scenario())
     assert got["approved"] is True

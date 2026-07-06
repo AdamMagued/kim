@@ -34,6 +34,11 @@ _STATUS_RECAP_RE = re.compile(
 
 _DATA_URI_PREFIX = "data:"
 _DATA_URI_BASE64_MARKER = ";base64,"
+# M1: a real data-URI mime type ("image/png", "application/pdf") — one token,
+# no whitespace. Without this check, a stray "data:" substring in prose (e.g.
+# "metadata: 2026") pairs with a LATER real ";base64," and swallows all the
+# prompt text in between as a bogus "mime type".
+_DATA_URI_MIME_RE = re.compile(r"[a-z0-9.+-]+/[a-z0-9.+-]+\Z")
 
 
 def ext_for_mime(mime_type: str) -> str:
@@ -113,7 +118,7 @@ def strip_data_uris(text: str, attachments_out: list[dict]) -> str:
             end += 1
 
         payload = text[payload_start:end]
-        if payload and "/" in mime_type:
+        if payload and _DATA_URI_MIME_RE.fullmatch(mime_type):
             out_parts.append(text[i:start])
             append_attachment(attachments_out, mime_type, payload)
             if mime_type.startswith("image/"):
@@ -412,6 +417,9 @@ def format_prompt(
         if marker_end != -1:
             head_end = min(marker_end + len(anchor), max_inject_chars // 2)
         tail_len = max(0, max_inject_chars - head_end - len(notice))
-        prompt = prompt[:head_end] + notice + prompt[-tail_len:]
+        # L2: prompt[-0:] is the WHOLE prompt — guard the zero-tail case
+        # (only reachable with a very small max_inject_chars).
+        tail = prompt[-tail_len:] if tail_len else ""
+        prompt = prompt[:head_end] + notice + tail
 
     return prompt, attachments, completion_hash, new_sent_system_prompt

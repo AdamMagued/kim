@@ -344,6 +344,18 @@ class BrowserProvider(BaseProvider):
             return None
         return self._parse_authuser_env(str(selected.get("authuser_index", "")))
 
+    def _commit_sent_system_prompt(self, result: object, new_sent: bool) -> None:
+        """H5: record that the system prompt reached the site only AFTER a
+        delivered send. A NEED_HELP text result (bridge failure, lost tab,
+        auth wall) means nothing was answered — committing early would make
+        the retry rebuild the prompt without the system prompt and the
+        completion-hash protocol it establishes."""
+        if isinstance(result, dict):
+            content = str(result.get("content", ""))
+            if result.get("type") == "text" and content.startswith("NEED_HELP"):
+                return
+        self._sent_system_prompt = new_sent
+
     async def complete(  # type: ignore[override]
         self,
         messages: list[dict],
@@ -374,7 +386,10 @@ class BrowserProvider(BaseProvider):
             use_webview_bridge=self._use_webview_bridge,
             handoff_summary=handoff,
         )
-        self._sent_system_prompt = new_sent
+        # H5: do NOT commit _sent_system_prompt yet — if the send below fails
+        # (bridge error, injection-verify failure, timeout), the retry must
+        # rebuild the prompt WITH the system prompt + completion-hash protocol.
+        # _commit_sent_system_prompt() records it only after a delivered send.
 
         estimated_usage = self._estimate_prompt_usage(prompt, attachments)
         logger.debug(
@@ -396,6 +411,7 @@ class BrowserProvider(BaseProvider):
                 clear_chat=clear_chat,
                 site_configs=getattr(self, "_site_configs", None),
             )
+            self._commit_sent_system_prompt(result, new_sent)
             return self._attach_usage(result, estimated_usage)
 
         # Injected browser-I/O seam (K3): call-site driver wins over the
@@ -408,9 +424,11 @@ class BrowserProvider(BaseProvider):
                 if page is None or site is None:
                     return lost_chat_response()
                 # cast: PageLike stands in for the concrete Page (string form: Page is TYPE_CHECKING-only).
-                return await self._run_chat_flow(
+                result = await self._run_chat_flow(
                     cast("Page", page), site, prompt, attachments, tools, completion_hash, clear_chat, estimated_usage
                 )
+                self._commit_sent_system_prompt(result, new_sent)
+                return result
 
             # Playwright is imported lazily (module top only imports it under
             # TYPE_CHECKING so selecting a browser provider doesn't hard-crash when
@@ -434,9 +452,17 @@ class BrowserProvider(BaseProvider):
                 if page is None or site is None:
                     return lost_chat_response()
 
-                return await self._run_chat_flow(
+                result = await self._run_chat_flow(
                     page, site, prompt, attachments, tools, completion_hash, clear_chat, estimated_usage
                 )
+                self._commit_sent_system_prompt(result, new_sent)
+                return result
+        except TimeoutError:
+            # H6: TimeoutError is an OSError subclass, but a slow generation /
+            # response wait is transient — re-raise so the agent's retry path
+            # (classify_provider_error → "timeout", retryable) handles it
+            # instead of ending the run with a terminal NEED_HELP.
+            raise
         except (ConnectionError, OSError, RuntimeError) as e:
             # Only genuine browser-connection / IO failures are mapped to NEED_HELP;
             # all other exceptions (KeyError, TypeError, programming bugs) propagate

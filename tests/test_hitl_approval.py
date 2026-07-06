@@ -189,9 +189,10 @@ class ApprovalResolverTests(unittest.TestCase):
             "preview": "echo hi", "args": {"cmd": "echo hi"},
         }))
         self.assertEqual(decision, "accept")
-        agent._ui_bridge.decide_action.assert_called_once_with(
-            "run_command", {"cmd": "echo hi"}
-        )
+        args, kwargs = agent._ui_bridge.decide_action.call_args
+        self.assertEqual(args, ("run_command", {"cmd": "echo hi"}))
+        # T1: the resolver forwards the unique decision id it emitted.
+        self.assertTrue(kwargs.get("request_id"))
 
     def test_decline_is_propagated(self):
         agent = _make_agent(hitl_threshold="high")

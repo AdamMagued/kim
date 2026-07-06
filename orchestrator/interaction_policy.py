@@ -193,9 +193,35 @@ class InteractionPolicy:
         if name == "observe_ui":
             self.ui_observe_attempted = True
             self.ui_state_dirty = False
+            if failed:
+                # M5: a failed observation must not bump the generation or
+                # scrape "ids" out of the error text — mirroring web_observe,
+                # reset so click_ui is blocked with the accurate
+                # "requires a prior observe_ui snapshot" remedy.
+                self.known_ui_element_ids.clear()
+                self.ui_generation = 0
+                return
             ids = set(re.findall(r"\b(e\d+)\s*:", result_text))
             self.known_ui_element_ids = ids
             self.ui_generation += 1
+            return
+
+        if name == "web_resolve":
+            # M3: web_resolve resolves from the FULL element map (including
+            # currently-invisible elements), so the id it returns may not be in
+            # the visible-elements set web_observe registered. Register it here
+            # or the follow-up web_click gets hard-blocked as unknown/stale and
+            # the model loops between resolve and click.
+            if failed:
+                return
+            try:
+                data = json.loads(result_text)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return
+            if isinstance(data, dict):
+                element_id = str(data.get("element_id") or "").strip()
+                if element_id:
+                    self.known_web_element_ids.add(element_id)
             return
 
         if name == "web_fill_form":

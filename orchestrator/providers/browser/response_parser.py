@@ -26,8 +26,13 @@ def strip_transport_markers(text: str, completion_hash: str) -> str:
 
     # Remove everything after the current-turn completion hash.  The hash is
     # unique per-request so this anchors us to exactly this turn's response.
+    # Anchor on the LAST occurrence (L6): a scraped DOM that echoes the user
+    # prompt contains the hash inside the "always append" instruction, and
+    # splitting on the FIRST occurrence would discard the real answer that
+    # follows it. The model appends its own marker at the end, so the last
+    # occurrence is the transport marker.
     if completion_hash and completion_hash in text:
-        text = text.split(completion_hash, 1)[0]
+        text = text.rsplit(completion_hash, 1)[0]
 
     # Within the current-turn fragment (before the completion_hash sentinel),
     # there may still be older END_OF_RESPONSE markers from a reused chat tab.
@@ -79,10 +84,16 @@ def try_parse_tool_json(s: str, known_tools: Optional[set] = None) -> Optional[d
         if known_tools is not None and tool_name not in known_tools:
             logger.debug("Ignoring JSON tool call for unknown tool %r (prompt-injection guard)", tool_name)
             return None
+        # L3: {"tool": "x", "args": null} (or a string/list) must not leak a
+        # non-dict into tool dispatch — downstream .get() calls would crash.
+        args = data.get("args", data.get("arguments", {}))
+        if not isinstance(args, dict):
+            logger.debug("Coercing non-dict tool args %r to {} for tool %r", args, tool_name)
+            args = {}
         return {
             "type": "tool_call",
             "tool": tool_name,
-            "args": data.get("args", data.get("arguments", {})),
+            "args": args,
         }
     return None
 

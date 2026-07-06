@@ -229,6 +229,8 @@ export interface KimHitlApprovalRequestPayload {
   reason: string;
   /** K6: human-readable preview — command string, unified diff (<=40 lines), or URL + element label. May be empty. */
   preview: string;
+  /** T1 decision id — unique per approval request. Echo it back in the hitl_approve stdin line; a decision whose id does not match the currently pending request is discarded. May be empty on legacy emitters. */
+  id?: string;
 }
 
 /** Human approval decision sent back to the agent. */

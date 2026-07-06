@@ -179,6 +179,23 @@ def _pid_exists(pid: int) -> bool:
 # PID registry for orphan reaping
 # ---------------------------------------------------------------------------
 
+def _boot_ref() -> int:
+    """A cheap, portable per-boot identity.
+
+    ``time.time() - time.monotonic()`` is the wall-clock instant the
+    system-wide monotonic clock was zeroed — stable across processes within a
+    boot session and shifted by the downtime across a reboot. Used to detect
+    PID reuse across reboots (M6): a registry entry whose boot ref does not
+    match the current one predates this boot, so its PID may now belong to an
+    innocent process and must never be SIGKILLed.
+    """
+    return round(time.time() - time.monotonic())
+
+
+# Allow small NTP/monotonic drift when comparing boot refs (seconds).
+_BOOT_REF_TOLERANCE = 5
+
+
 def _pid_registry_path(kim_root: Path) -> Path:
     return kim_root / "logs" / "scheduled_runs" / ".running_pids.json"
 
@@ -259,10 +276,18 @@ def _reap_stale_agents(
                 return
 
             now_ts = time.time()
+            current_boot = _boot_ref()
             surviving = []
             for entry in entries:
                 pid = entry.get("pid")
                 if pid is None:
+                    continue
+                # M6: an entry from a previous boot cannot be trusted — the OS
+                # may have reused its PID for an unrelated process. Drop it
+                # without killing. Entries predating this fix (no boot_ref)
+                # are also treated as unverifiable and never killed.
+                entry_boot = entry.get("boot_ref")
+                if entry_boot is None or abs(int(entry_boot) - current_boot) > _BOOT_REF_TOLERANCE:
                     continue
                 started = entry.get("started_at", now_ts)
                 elapsed = now_ts - started
@@ -302,7 +327,12 @@ def _register_agent_pid(kim_root: Path, task_id: str, pid: int) -> None:
                 )
             except (OSError, ValueError):
                 existing = []
-            existing.append({"task_id": task_id, "pid": int(pid), "started_at": time.time()})
+            existing.append({
+                "task_id": task_id,
+                "pid": int(pid),
+                "started_at": time.time(),
+                "boot_ref": _boot_ref(),  # M6: guards against reboot PID reuse
+            })
             try:
                 _write_pid_registry_atomic(reg_path, existing)
             except (OSError, TypeError, ValueError):
@@ -515,6 +545,13 @@ def run_next_due_task(
             try:
                 recorded = store.record_run(task.id, ran_at=as_of)
             except TimeoutError as exc:
+                # M7: the agent is already spawned (launched=True). Register its
+                # PID before this early return so the reaper can still enforce
+                # the wall-clock timeout — otherwise the child runs unreaped and
+                # (next_run_at not advanced) the same task is due again next
+                # tick → a duplicate agent.
+                if proc is not None:
+                    _register_agent_pid(kim_root, task.id, int(proc.pid))
                 result.error = f"record_run failed: {exc}"
                 return result
             result.recorded = recorded is not None

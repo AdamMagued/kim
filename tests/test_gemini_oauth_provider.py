@@ -114,5 +114,7 @@ def test_parse_rest_response_preserves_usage_and_tool_calls(monkeypatch):
         "type": "tool_call",
         "tool": "bash",
         "args": {"cmd": "ls"},
+        # H2: narration accompanying a tool call is preserved (empty here).
+        "content": "",
         "usage": {"input": 10, "output": 4, "cache_read_tokens": 0},
     }

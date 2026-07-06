@@ -301,7 +301,7 @@ class TestResolver:
         bridge = MagicMock()
         bridge.preview_mode = False
 
-        async def decide(tool, args):
+        async def decide(tool, args, request_id=None):
             return "acceptForSession"
 
         bridge.decide_action = decide
