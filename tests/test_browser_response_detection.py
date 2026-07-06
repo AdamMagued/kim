@@ -74,6 +74,25 @@ class _FakeLocator:
         return self._element
 
 
+class _FakeStopLocator:
+    """Stop-button locator whose visibility follows a per-poll script."""
+
+    def __init__(self, visibility):
+        self._vis = list(visibility)
+        self._i = 0
+
+    async def count(self):
+        return 1
+
+    def nth(self, _i):
+        return self
+
+    async def is_visible(self):
+        visible = self._vis[min(self._i, len(self._vis) - 1)]
+        self._i += 1
+        return visible
+
+
 # ---------------------------------------------------------------------------
 # _normalize_for_marker
 # ---------------------------------------------------------------------------
@@ -160,6 +179,52 @@ class TestWaitForGenerationComplete(unittest.IsolatedAsyncioTestCase):
             p, ["the answer"] * 200, completion_hash=None
         )
         self.assertFalse(result)
+
+    async def test_stop_transition_is_definitive_without_sentinel(self):
+        # The stop control appeared during generation and then cleared — the
+        # site itself signals completion. Must exit fast even though (a) the
+        # sentinel never arrived (would otherwise cost the 20-idle penalty)
+        # and (b) min_generation_s has not elapsed (mocked sleep keeps
+        # loop.time() well under the 5s floor — only the transition path can
+        # return this quickly).
+        p = _provider()
+        stop = _FakeStopLocator([True, True, False, False, False, False])
+        page = MagicMock()
+        page.locator = MagicMock(return_value=stop)
+        scrape = AsyncMock(
+            side_effect=["hel", "hello there!"] + ["hello there!"] * 50
+        )
+        with patch.object(p, "_scrape_last_response", scrape), \
+             patch.object(bp, "GENERATION_WAIT_S", 3.0), \
+             patch.object(bp.asyncio, "sleep", AsyncMock()):
+            result = await p._wait_for_generation_complete(
+                page,
+                stop_selectors=["button.stop"],
+                response_selectors=["sel"],
+                completion_hash="[END_OF_RESPONSE_never_echoed]",
+            )
+        self.assertTrue(result)
+        self.assertLess(scrape.await_count, 10)
+
+    async def test_stop_never_seen_does_not_use_transition_exit(self):
+        # If the stop control was never observed, the transition shortcut must
+        # not fire — completion falls back to the sentinel/idle heuristics.
+        p = _provider()
+        stop = _FakeStopLocator([False])
+        page = MagicMock()
+        page.locator = MagicMock(return_value=stop)
+        scrape = AsyncMock(side_effect=["the answer"] * 300)
+        with patch.object(p, "_scrape_last_response", scrape), \
+             patch.object(bp, "GENERATION_WAIT_S", 2.0), \
+             patch.object(bp.asyncio, "sleep", AsyncMock()):
+            result = await p._wait_for_generation_complete(
+                page,
+                stop_selectors=["button.stop"],
+                response_selectors=["sel"],
+                completion_hash=None,
+                min_generation_s=0.0,
+            )
+        self.assertFalse(result)  # idle-heuristic exit, not the transition
 
 
 # ---------------------------------------------------------------------------

@@ -1260,6 +1260,12 @@ class BrowserProvider(BaseProvider):
         norm_hash = _normalize_for_marker(completion_hash) if completion_hash else ""
         last_text_len = 0
         idle_count = 0
+        # Stop-control transition tracking: the site's own UI is the most
+        # reliable completion signal — the stop/streaming button appears while
+        # generating and clears when done, no model cooperation required
+        # (unlike the sentinel, which models often omit on short answers).
+        saw_stop = False
+        stop_cleared_polls = 0
 
         while loop.time() < deadline:
             current_text = ""
@@ -1306,8 +1312,22 @@ class BrowserProvider(BaseProvider):
                     pass
 
             if any_stop_visible:
+                saw_stop = True
+                stop_cleared_polls = 0
                 idle_count = 0
             else:
+                # Stop-control transition: it appeared during generation and
+                # has now cleared — the site itself says generation finished.
+                # Two clear polls with stable non-empty text confirm it; this
+                # deliberately bypasses min_generation_time and the sentinel
+                # wait (fast answers often omit the sentinel entirely).
+                if saw_stop and current_text:
+                    stop_cleared_polls += 1
+                    if stop_cleared_polls >= 2 and idle_count >= 1:
+                        logger.debug(
+                            "Generation complete (stop control appeared then cleared)"
+                        )
+                        return True
                 # The completion sentinel is the definitive "done" signal. When we
                 # asked for one and it's still absent, the model is very likely
                 # mid-generation — returning here scrapes a truncated answer (the

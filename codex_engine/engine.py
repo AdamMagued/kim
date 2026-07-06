@@ -992,15 +992,87 @@ def _sse_or_json(stream: bool, payload: dict):
 
 
 def _make_sse_response(responses_reply: dict):
-    """Wrap a Responses API dict as a minimal SSE stream for Codex streaming requests."""
+    """Wrap a Responses API dict as an SSE stream for Codex streaming requests.
+
+    Codex builds its item stream from the granular ``response.output_item.*``
+    events — a bare ``response.completed`` carrying the output is silently
+    ignored (verified against codex-cli 0.134: without the item events the
+    agent message never surfaces, ``exec --json`` emits no ``item.completed``,
+    and ``-o`` writes an empty file). So every output item must be streamed as
+    added → (text/argument deltas) → done before the final completed event.
+    """
     from aiohttp import web
+
     in_progress = dict(responses_reply)
     in_progress["status"] = "in_progress"
-    lines = [
-        f"data: {json.dumps({'type': 'response.created', 'response': in_progress})}\n\n",
-        f"data: {json.dumps({'type': 'response.completed', 'response': responses_reply})}\n\n",
-        "data: [DONE]\n\n",
-    ]
+    events: list[dict] = [{"type": "response.created", "response": in_progress}]
+
+    for idx, item in enumerate(responses_reply.get("output") or []):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type", "")
+        item_id = str(item.get("id") or f"item_{idx}")
+        item = {**item, "id": item_id}
+
+        if item_type == "message":
+            text = "".join(
+                str(block.get("text") or "")
+                for block in (item.get("content") or [])
+                if isinstance(block, dict) and block.get("type") == "output_text"
+            )
+            events.append({
+                "type": "response.output_item.added",
+                "output_index": idx,
+                "item": {**item, "content": [], "status": "in_progress"},
+            })
+            events.append({
+                "type": "response.output_text.delta",
+                "item_id": item_id, "output_index": idx, "content_index": 0,
+                "delta": text,
+            })
+            events.append({
+                "type": "response.output_text.done",
+                "item_id": item_id, "output_index": idx, "content_index": 0,
+                "text": text,
+            })
+            events.append({
+                "type": "response.output_item.done",
+                "output_index": idx,
+                "item": {**item, "status": "completed"},
+            })
+        elif item_type == "function_call":
+            arguments = str(item.get("arguments") or "{}")
+            events.append({
+                "type": "response.output_item.added",
+                "output_index": idx,
+                "item": {**item, "arguments": "", "status": "in_progress"},
+            })
+            events.append({
+                "type": "response.function_call_arguments.delta",
+                "item_id": item_id, "output_index": idx,
+                "delta": arguments,
+            })
+            events.append({
+                "type": "response.function_call_arguments.done",
+                "item_id": item_id, "output_index": idx,
+                "arguments": arguments,
+            })
+            events.append({
+                "type": "response.output_item.done",
+                "output_index": idx,
+                "item": {**item, "status": "completed"},
+            })
+        else:
+            events.append({
+                "type": "response.output_item.added", "output_index": idx, "item": item,
+            })
+            events.append({
+                "type": "response.output_item.done", "output_index": idx, "item": item,
+            })
+
+    events.append({"type": "response.completed", "response": responses_reply})
+    lines = [f"data: {json.dumps(ev)}\n\n" for ev in events]
+    lines.append("data: [DONE]\n\n")
     return web.Response(
         body="".join(lines).encode(),
         content_type="text/event-stream",

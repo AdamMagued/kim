@@ -400,6 +400,91 @@ class TestContinueCachedAccounting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proxy._last_sent_count, 3)
 
 
+class TestSseGranularEvents(unittest.TestCase):
+    """Codex builds its item stream from granular response.output_item.*
+    events — a bare response.completed is silently ignored (verified against
+    codex-cli 0.134: the agent message never surfaced and -o wrote an empty
+    file). The SSE wrapper must stream every output item."""
+
+    @staticmethod
+    def _events(reply):
+        from codex_engine.engine import _make_sse_response
+
+        raw = _make_sse_response(reply).body
+        assert raw is not None
+        body = raw.decode()
+        events = []
+        for line in body.splitlines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                events.append(json.loads(line[len("data: "):]))
+        return events, body
+
+    def test_text_reply_streams_item_events(self):
+        from codex_engine.engine import _make_responses_text_reply
+
+        events, body = self._events(_make_responses_text_reply("r1", "hello!"))
+        types = [e["type"] for e in events]
+        self.assertEqual(types[0], "response.created")
+        self.assertEqual(types[-1], "response.completed")
+        self.assertIn("response.output_item.added", types)
+        self.assertIn("response.output_text.delta", types)
+        self.assertIn("response.output_text.done", types)
+        self.assertIn("response.output_item.done", types)
+        delta = next(e for e in events if e["type"] == "response.output_text.delta")
+        self.assertEqual(delta["delta"], "hello!")
+        done_item = next(
+            e for e in events if e["type"] == "response.output_item.done"
+        )["item"]
+        self.assertEqual(done_item["type"], "message")
+        self.assertTrue(done_item.get("id"))
+        self.assertTrue(body.rstrip().endswith("data: [DONE]"))
+
+    def test_tool_reply_streams_function_call_arguments(self):
+        from codex_engine.engine import _make_responses_tool_reply
+
+        reply = _make_responses_tool_reply(
+            "r2", "", [{"name": "shell", "input": {"command": ["echo", "hi"]}}]
+        )
+        events, _ = self._events(reply)
+        types = [e["type"] for e in events]
+        self.assertIn("response.function_call_arguments.delta", types)
+        self.assertIn("response.function_call_arguments.done", types)
+        args_done = next(
+            e for e in events if e["type"] == "response.function_call_arguments.done"
+        )
+        self.assertEqual(
+            json.loads(args_done["arguments"]), {"command": ["echo", "hi"]}
+        )
+        added = next(
+            e for e in events if e["type"] == "response.output_item.added"
+        )["item"]
+        self.assertEqual(added["type"], "function_call")
+        self.assertEqual(added["name"], "shell")
+        self.assertEqual(added["arguments"], "")  # streams via deltas
+
+    def test_ordering_added_before_deltas_before_done(self):
+        from codex_engine.engine import _make_responses_text_reply
+
+        events, _ = self._events(_make_responses_text_reply("r3", "x"))
+        types = [e["type"] for e in events]
+        self.assertLess(
+            types.index("response.output_item.added"),
+            types.index("response.output_text.delta"),
+        )
+        self.assertLess(
+            types.index("response.output_text.delta"),
+            types.index("response.output_text.done"),
+        )
+        self.assertLess(
+            types.index("response.output_text.done"),
+            types.index("response.output_item.done"),
+        )
+        self.assertLess(
+            types.index("response.output_item.done"),
+            types.index("response.completed"),
+        )
+
+
 class TestCompactControlTasks(unittest.TestCase):
     def test_compact_control_tasks_recognized(self):
         from orchestrator import codex_bridge_service as svc
