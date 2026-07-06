@@ -51,6 +51,7 @@ import re
 import secrets
 import shlex
 import shutil
+import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -749,11 +750,12 @@ class _CodexProxy:
             return response
         if _is_thread_send_failure(response):
             return response
-        if _extract_shell_blocks(content):
-            # The prose carries fenced shell commands — the converter executes
-            # those directly; nudging would waste a round trip (and protocol-
-            # refusing models answer the nudge with another refusal).
-            logger.info(f"[relay #{relay_num}] Prose reply has shell fences — executing them, no nudge")
+        if _extract_shell_blocks(content) or _extract_file_directive(content) is not None:
+            # The prose carries executable actions (shell fences or a save-as
+            # file directive) — the converter executes those directly; nudging
+            # would waste a round trip (and protocol-refusing models answer
+            # the nudge with another refusal).
+            logger.info(f"[relay #{relay_num}] Prose reply has salvageable actions — executing, no nudge")
             return response
         logger.info(f"[relay #{relay_num}] Reply ignored the JSON contract — sending one format nudge")
         print("[STATUS] Reply was prose instead of tool calls — asking for the actions…", flush=True)
@@ -774,6 +776,7 @@ class _CodexProxy:
             if (
                 not retry_parsed.get("tool_calls")
                 and not _extract_shell_blocks(retry_text)
+                and _extract_file_directive(retry_text) is None
                 and _SELF_HELP_RE.search(retry_text)
             ):
                 # Format-compliant dodge: a final answer telling the USER to
@@ -784,8 +787,8 @@ class _CodexProxy:
                     f"[relay #{relay_num}] Nudge answered with do-it-yourself instructions — thread burned"
                 )
             return retry
-        if _extract_shell_blocks(retry_content):
-            # Refused the JSON but handed over the commands — good enough.
+        if _extract_shell_blocks(retry_content) or _extract_file_directive(retry_content) is not None:
+            # Refused the JSON but handed over the work — good enough.
             return retry
         # The thread ignored the contract even after an explicit format
         # nudge — it has talked itself out of the protocol (each refusal in
@@ -1285,6 +1288,33 @@ def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
     return normalized
 
 
+def _salvage_action_reply(content: object, request_tools: object) -> Optional[list]:
+    """Convert a non-tool-call reply's described actions into real tool calls.
+
+    Two shapes, in priority order:
+      1. ```bash/sh fences — explicit commands, executed verbatim.
+      2. A "save this code as X" directive + fenced file body — Kim writes
+         the file (heredoc) and opens it if the reply says to.
+    Returns normalized tool calls, or None when the reply describes nothing
+    executable.
+    """
+    blocks = _extract_shell_blocks(content)
+    if blocks:
+        print("[STATUS] Executing the shell commands from Kim's reply…", flush=True)
+        return _normalize_tool_calls(
+            [{"name": "exec", "input": {"cmd": block}} for block in blocks],
+            request_tools,
+        )
+    directive = _extract_file_directive(content)
+    if directive is not None:
+        name, body, wants_open = directive
+        print(f"[STATUS] Saving {name} from Kim's reply…", flush=True)
+        return _normalize_tool_calls(
+            _file_directive_tool_calls(name, body, wants_open), request_tools
+        )
+    return None
+
+
 def _extract_prompt_from_responses_request(body: dict) -> str:
     """Extract a human-readable prompt from a Codex Responses API request."""
     parts = []
@@ -1483,6 +1513,72 @@ def _extract_shell_blocks(content: object) -> list:
     return [block.strip() for block in _SHELL_FENCE_RE.findall(content) if block.strip()]
 
 
+# "Save this code as X" replies: the model hands over a filename, the full
+# file content in a fence, and an open instruction — Kim synthesizes the
+# commands itself instead of begging the model to emit them.
+_FILE_DIRECTIVE_RES = [
+    re.compile(
+        r"save (?:it|this|that|the (?:code|file))?\s*as:?\s*[`\"']?"
+        r"([A-Za-z0-9][\w\-]*\.[A-Za-z0-9]{1,8})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"file (?:named|called):?\s*[`\"']?([A-Za-z0-9][\w\-]*\.[A-Za-z0-9]{1,8})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"create (?:a )?file:?\s*[`\"']?([A-Za-z0-9][\w\-]*\.[A-Za-z0-9]{1,8})",
+        re.IGNORECASE,
+    ),
+]
+_ANY_FENCE_RE = re.compile(r"```[\w+-]*[ \t]*\n(.*?)```", re.DOTALL)
+_WANTS_OPEN_RE = re.compile(
+    r"open (?:it|the file|in (?:your|a|the) browser)|double-?click|open it with",
+    re.IGNORECASE,
+)
+
+
+def _extract_file_directive(content: object):
+    """Return (filename, file_content, wants_open) for 'save this as X' replies.
+
+    Requires an explicit filename directive AND a fenced block (the largest
+    fence is the file body). Filenames are restricted to plain basenames —
+    no dotfiles, no path separators.
+    """
+    if not isinstance(content, str):
+        return None
+    name = None
+    for rx in _FILE_DIRECTIVE_RES:
+        match = rx.search(content)
+        if match:
+            name = match.group(1)
+            break
+    if not name or name.startswith(".") or "/" in name or "\\" in name or ".." in name:
+        return None
+    blocks = [b for b in _ANY_FENCE_RE.findall(content) if b.strip()]
+    if not blocks:
+        return None
+    body = max(blocks, key=len).strip()
+    return name, body, bool(_WANTS_OPEN_RE.search(content))
+
+
+def _file_directive_tool_calls(name: str, body: str, wants_open: bool) -> list:
+    """Synthesize the exec calls the model described but refused to emit."""
+    delim = "KIM_EOF_7f3a"
+    while delim in body:
+        delim += "x"
+    calls = [{"name": "exec", "input": {"cmd": f"cat > {shlex.quote(name)} << '{delim}'\n{body}\n{delim}"}}]
+    if wants_open:
+        if sys.platform == "darwin":
+            opener = "open"
+        elif sys.platform == "win32":
+            opener = "start"
+        else:
+            opener = "xdg-open"
+        calls.append({"name": "exec", "input": {"cmd": f"{opener} {shlex.quote(name)}"}})
+    return calls
+
+
 # A nudge answer that instructs the USER to perform the actions (save the
 # file, run the command) is a soft refusal — format-compliant, work undone.
 _SELF_HELP_RE = re.compile(
@@ -1572,27 +1668,18 @@ def _provider_response_to_responses_api(
             if tool_calls:
                 tool_calls = _normalize_tool_calls(tool_calls, request_tools)
                 return _make_responses_tool_reply(resp_id, text, tool_calls)
-            blocks = _extract_shell_blocks(text)
-            if blocks:
-                print("[STATUS] Executing the shell commands from Kim's reply…", flush=True)
-                tool_calls = _normalize_tool_calls(
-                    [{"name": "exec", "input": {"cmd": block}} for block in blocks],
-                    request_tools,
-                )
-                return _make_responses_tool_reply(resp_id, text, tool_calls)
+            salvaged = _salvage_action_reply(text, request_tools)
+            if salvaged is not None:
+                return _make_responses_tool_reply(resp_id, text, salvaged)
             return _make_responses_text_reply(resp_id, text or content)
 
         # Prose reply — before treating it as a final answer, execute any
-        # shell commands the model wrote in ```bash fences. Protocol-refusing
-        # models still hand over the exact commands this way.
-        blocks = _extract_shell_blocks(content)
-        if blocks:
-            print("[STATUS] Executing the shell commands from Kim's reply…", flush=True)
-            tool_calls = _normalize_tool_calls(
-                [{"name": "exec", "input": {"cmd": block}} for block in blocks],
-                request_tools,
-            )
-            return _make_responses_tool_reply(resp_id, content, tool_calls)
+        # actions the model described: ```bash fences, or a "save this code
+        # as X" directive with the file body in a fence. Protocol-refusing
+        # models still hand the work over in these shapes.
+        salvaged = _salvage_action_reply(content, request_tools)
+        if salvaged is not None:
+            return _make_responses_tool_reply(resp_id, content, salvaged)
 
         return _make_responses_text_reply(resp_id, content)
 

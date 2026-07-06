@@ -767,6 +767,90 @@ class TestShellFenceSalvage(unittest.TestCase):
         self.assertEqual(reply["output"][0]["type"], "message")
 
 
+class TestFileDirectiveSalvage(unittest.TestCase):
+    """'Save this code as X' replies: filename directive + fenced body →
+    Kim synthesizes the write+open commands the model refused to emit."""
+
+    # Shape of the live run: html fence (never executed as shell) + explicit
+    # filename + "double-click / open with Chrome" instruction.
+    _PROSE = (
+        "Here's a complete single-file Pong game.\n\n"
+        "1. Create a file called: `pong.html`\n"
+        "2. Paste the code below into it\n"
+        "3. Double-click the file or open it with Chrome\n\n"
+        "```html\n<!DOCTYPE html>\n<html lang=\"en\">\n<canvas id=\"game\"></canvas>\n"
+        "<script>const ctx = canvas.getContext(\"2d\");</script>\n</html>\n```\n\n"
+        "If you want, I can upgrade it with sound effects."
+    )
+
+    def test_directive_extracted_with_filename_body_and_open(self):
+        from codex_engine.engine import _extract_file_directive
+
+        name, body, wants_open = _extract_file_directive(self._PROSE)
+        self.assertEqual(name, "pong.html")
+        self.assertTrue(body.startswith("<!DOCTYPE html>"))
+        self.assertTrue(wants_open)
+
+    def test_save_as_phrasing_also_matches(self):
+        from codex_engine.engine import _extract_file_directive
+
+        prose = "Just save it as `index.html`:\n```html\n<b>hi</b>\n```"
+        name, body, wants_open = _extract_file_directive(prose)
+        self.assertEqual(name, "index.html")
+        self.assertFalse(wants_open)
+
+    def test_no_filename_or_no_fence_returns_none(self):
+        from codex_engine.engine import _extract_file_directive
+
+        self.assertIsNone(_extract_file_directive("```html\n<b>hi</b>\n```"))
+        self.assertIsNone(_extract_file_directive("Save it as `pong.html` — code coming later."))
+
+    def test_dotfiles_and_paths_are_rejected(self):
+        from codex_engine.engine import _extract_file_directive
+
+        for bad in (".env", "../x.sh", "a/b.sh"):
+            prose = f"Save it as `{bad}`:\n```\ndata\n```"
+            self.assertIsNone(_extract_file_directive(prose), bad)
+
+    def test_prose_reply_becomes_write_and_open_tool_calls(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": self._PROSE},
+            relay_num=1,
+            request_tools=_CODEX_TOOLS,
+        )
+        calls = [o for o in reply["output"] if o["type"] == "function_call"]
+        self.assertEqual([c["name"] for c in calls], ["exec_command", "exec_command"])
+        self.assertIn("cat > pong.html", calls[0]["arguments"])
+        self.assertIn("<!DOCTYPE html>", calls[0]["arguments"])
+        self.assertIn("pong.html", calls[1]["arguments"])  # the open command
+
+    def test_bash_fence_takes_priority_over_directive(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        prose = (
+            "Save it as `pong.html`. Or just run:\n"
+            "```bash\ncat > pong.html <<'EOF'\n<b>hi</b>\nEOF\n```"
+        )
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": prose},
+            relay_num=1,
+            request_tools=_CODEX_TOOLS,
+        )
+        calls = [o for o in reply["output"] if o["type"] == "function_call"]
+        self.assertEqual(len(calls), 1)  # the explicit command only, no double-write
+
+    def test_heredoc_delimiter_collision_is_avoided(self):
+        from codex_engine.engine import _file_directive_tool_calls
+
+        body = "line1\nKIM_EOF_7f3a\nline2"
+        calls = _file_directive_tool_calls("x.txt", body, wants_open=False)
+        cmd = calls[0]["input"]["cmd"]
+        self.assertIn("KIM_EOF_7f3ax", cmd)
+        self.assertIn(body, cmd)
+
+
 class TestShellFenceNudgeInteraction(unittest.IsolatedAsyncioTestCase):
     async def test_prose_with_fences_skips_the_nudge(self):
         proxy, provider = _proxy()
@@ -774,6 +858,16 @@ class TestShellFenceNudgeInteraction(unittest.IsolatedAsyncioTestCase):
         result = await proxy._nudge_contract_retry(original, relay_num=1)
         self.assertIs(result, original)
         self.assertEqual(provider.calls, [])  # no round trip wasted
+
+    async def test_prose_with_file_directive_skips_the_nudge(self):
+        proxy, provider = _proxy()
+        original = {"type": "text", "content": (
+            "Create a file called `pong.html` and double-click it:\n"
+            "```html\n<b>pong</b>\n```"
+        )}
+        result = await proxy._nudge_contract_retry(original, relay_num=1)
+        self.assertIs(result, original)
+        self.assertEqual(provider.calls, [])
 
     async def test_refusal_retry_with_fences_is_used_and_not_burned(self):
         retry = {"type": "text", "content": (
