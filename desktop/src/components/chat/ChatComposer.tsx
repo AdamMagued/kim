@@ -5,6 +5,37 @@ import type { Settings } from '../../types';
 import { toast } from '../Toast';
 import { ProviderPicker } from '../ProviderPicker';
 
+/**
+ * Slash-command registry (audit B1/6.1). The `/compact` control task was only
+ * ever a hidden magic string — there was no menu, no autocomplete, so typing
+ * "/com" offered nothing and the feature was undiscoverable. This registry
+ * drives a real menu in the composer. Commands with `submitValue` fire
+ * immediately on select; the value is what actually gets sent (useTaskRunner
+ * recognizes the compact control tokens in chat + code mode).
+ */
+export interface SlashCommand {
+  name: string;
+  hint: string;
+  /** Value sent to onSubmit when picked. */
+  submitValue: string;
+}
+
+export const SLASH_COMMANDS: SlashCommand[] = [
+  {
+    name: '/compact',
+    hint: 'Summarize the conversation so far to free up context',
+    submitValue: '/compact',
+  },
+];
+
+/** Returns the commands matching a composer draft, or [] if not a slash query.
+ *  A slash query is a leading "/" with no space yet (still typing the name). */
+export function matchSlashCommands(draft: string): SlashCommand[] {
+  const t = draft.trimStart().toLowerCase();
+  if (!t.startsWith('/') || /\s/.test(t)) return [];
+  return SLASH_COMMANDS.filter(c => c.name.startsWith(t));
+}
+
 export interface ChatComposerProps {
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
   taskInput: string;
@@ -50,6 +81,23 @@ export function ChatComposer({
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // ── Slash-command menu (audit B1/6.1) ──────────────────────────────────────
+  const [slashActiveIdx, setSlashActiveIdx] = useState(0);
+  // Escape dismisses the menu for the current draft without clearing the text.
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const slashMatches = matchSlashCommands(taskInput);
+  const slashMenuOpen = slashMatches.length > 0 && !slashDismissed && !isRunning;
+  const activeSlashIdx = Math.min(slashActiveIdx, Math.max(0, slashMatches.length - 1));
+
+  const runSlashCommand = (cmd: SlashCommand) => {
+    // No-arg control commands (e.g. /compact) submit immediately.
+    setSlashDismissed(true);
+    setSlashActiveIdx(0);
+    setTaskInput('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+    onSubmit(cmd.submitValue);
+  };
+
   const removeAttachment = (idx: number) => {
     setAttachedFiles(prev => {
       const next = [...prev];
@@ -82,6 +130,10 @@ export function ChatComposer({
 
   const handleTextareaInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setTaskInput(e.target.value);
+    // Typing revives a dismissed slash menu and resets the highlight so the
+    // filtered list always starts at the top.
+    setSlashDismissed(false);
+    setSlashActiveIdx(0);
     const el = e.target;
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
@@ -318,6 +370,29 @@ export function ChatComposer({
             }
             rows={1}
             onKeyDown={e => {
+              // Slash-command menu keyboard nav takes priority over submit/newline.
+              if (slashMenuOpen) {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  setSlashActiveIdx(i => (i + 1) % slashMatches.length);
+                  return;
+                }
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  setSlashActiveIdx(i => (i - 1 + slashMatches.length) % slashMatches.length);
+                  return;
+                }
+                if (e.key === 'Enter' || e.key === 'Tab') {
+                  e.preventDefault();
+                  runSlashCommand(slashMatches[activeSlashIdx]);
+                  return;
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setSlashDismissed(true);
+                  return;
+                }
+              }
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 void handleFormSubmit(e as unknown as React.FormEvent);
@@ -325,6 +400,37 @@ export function ChatComposer({
             }}
             className="kim-composer__textarea"
           />
+
+          {slashMenuOpen && (
+            <div
+              className="kim-slash-menu"
+              role="listbox"
+              aria-label="Slash commands"
+              data-testid="slash-menu"
+            >
+              {slashMatches.map((cmd, i) => (
+                <button
+                  type="button"
+                  key={cmd.name}
+                  role="option"
+                  aria-selected={i === activeSlashIdx}
+                  className={
+                    'kim-slash-menu__item' +
+                    (i === activeSlashIdx ? ' kim-slash-menu__item--active' : '')
+                  }
+                  // onMouseDown (not onClick) so the textarea doesn't blur/submit first.
+                  onMouseDown={e => {
+                    e.preventDefault();
+                    runSlashCommand(cmd);
+                  }}
+                  onMouseEnter={() => setSlashActiveIdx(i)}
+                >
+                  <span className="kim-slash-menu__name">{cmd.name}</span>
+                  <span className="kim-slash-menu__hint">{cmd.hint}</span>
+                </button>
+              ))}
+            </div>
+          )}
 
           {heroMode && (
             <div className="kim-composer__left-tools">

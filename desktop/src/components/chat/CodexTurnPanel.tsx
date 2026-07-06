@@ -5,7 +5,7 @@
 // any of this state.
 
 import { useEffect, useRef, useState } from 'react';
-import type { CodexTurnState, CodexApprovalDecision, PendingCodexApproval, CodexPlanStep } from '../../hooks/useCodexTurn';
+import type { CodexTurnState, CodexApprovalDecision, PendingCodexApproval, CodexPlanStep, PendingUserInput } from '../../hooks/useCodexTurn';
 import type { HitlApprovalStatus } from './types';
 
 // ── A1: honest approval-card copy ────────────────────────────────────────────
@@ -310,16 +310,152 @@ export function TokenUsageChip({ usage }: { usage: CodexTurnState['tokenUsage'] 
   );
 }
 
+/** C4: render codex's question to the user (item/tool/requestUserInput) as an
+ *  answerable card. Previously these were silently auto-declined so codex
+ *  guessed and the user never saw the question. */
+export function QuestionCard({
+  request,
+  onAnswer,
+  onDismiss,
+}: {
+  request: PendingUserInput;
+  onAnswer: (answers: unknown) => void;
+  onDismiss: () => void;
+}) {
+  // answers: questionId → selected label (or typed free-text).
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const resolved = request.resolved;
+  const isElicitation = request.kind === 'elicitation';
+
+  // MCP elicitation is already declined server-side — render as an honest,
+  // non-answerable notice rather than pretending Kim can fill the form.
+  if (isElicitation) {
+    return (
+      <div className="kim-hitl-status" role="status" aria-live="polite" data-testid="codex-question-card">
+        <span className="kim-hitl-status__label">An MCP server asked for input</span>
+        <span className="kim-hitl-status__body">
+          {request.message
+            ? request.message
+            : 'A tool codex is using requested input.'}{' '}
+          Kim cannot fill MCP elicitation forms yet, so it was declined and codex
+          continued without it.
+        </span>
+      </div>
+    );
+  }
+
+  const submit = () => {
+    // Build the object map codex expects: { [id]: { answers: [label] } }.
+    // parse_user_input_line accepts bare strings / lists / this object shape.
+    const payload: Record<string, { answers: string[] }> = {};
+    for (const q of request.questions) {
+      const val = answers[q.id];
+      if (val !== undefined && val !== '') payload[q.id] = { answers: [val] };
+    }
+    onAnswer(payload);
+  };
+
+  const setAns = (qid: string, value: string) =>
+    setAnswers(prev => ({ ...prev, [qid]: value }));
+
+  const hasAnyAnswer = Object.values(answers).some(v => v !== '');
+
+  return (
+    <div className="kim-hitl-status" role="status" aria-live="polite" data-testid="codex-question-card">
+      <span className="kim-hitl-status__label">
+        {resolved ? 'Answer sent to Codex' : 'Codex needs your input'}
+      </span>
+      {request.questions.length === 0 && (
+        <span className="kim-hitl-status__body">
+          {request.message || 'Codex asked a question but sent no details.'}
+        </span>
+      )}
+      {request.questions.map(q => {
+        const label = [q.header, q.question].filter(Boolean).join(' — ') || 'Question';
+        const options = q.options ?? [];
+        return (
+          <div key={q.id} className="kim-codex-question">
+            <span className="kim-hitl-status__body"><strong>{label}</strong></span>
+            {options.length > 0 && !resolved && (
+              <span className="kim-hitl-status__actions">
+                {options.map((o, oi) => {
+                  const optLabel = o.label ?? `Option ${oi + 1}`;
+                  const picked = answers[q.id] === optLabel;
+                  return (
+                    <button
+                      key={oi}
+                      className={`kim-hitl-btn kim-hitl-btn--approve${picked ? ' kim-hitl-btn--active' : ''}`}
+                      onClick={() => setAns(q.id, optLabel)}
+                      aria-pressed={picked}
+                      title={o.description || undefined}
+                    >
+                      {optLabel}
+                    </button>
+                  );
+                })}
+              </span>
+            )}
+            {/* Free-text answer: always available for `isOther`/no-option
+                questions; codex accepts a typed reply as the answer. */}
+            {(options.length === 0 || q.isOther) && !resolved && (
+              <input
+                className="kim-codex-question__input"
+                type={q.isSecret ? 'password' : 'text'}
+                placeholder="Type your answer…"
+                value={answers[q.id] ?? ''}
+                onChange={e => setAns(q.id, e.target.value)}
+                aria-label={`Answer: ${label}`}
+              />
+            )}
+            {resolved && (
+              <span className="kim-hitl-status__body" style={{ opacity: 0.75 }}>
+                {answers[q.id] ? `You answered: ${q.isSecret ? '••••' : answers[q.id]}` : 'No answer given.'}
+              </span>
+            )}
+          </div>
+        );
+      })}
+      {!resolved && (
+        <span className="kim-hitl-status__actions">
+          <button
+            className="kim-hitl-btn kim-hitl-btn--approve"
+            onClick={submit}
+            disabled={!hasAnyAnswer}
+            aria-label="Send answer to Codex"
+          >
+            Send answer
+          </button>
+          <button
+            className="kim-hitl-btn kim-hitl-btn--deny"
+            onClick={onDismiss}
+            aria-label="Skip the question"
+            title="Codex proceeds without an answer."
+          >
+            Skip
+          </button>
+        </span>
+      )}
+    </div>
+  );
+}
+
 /** Everything a codex app-server turn streams, in one feed block. */
 export function CodexTurnPanel({ turn }: { turn: CodexTurnState }) {
   const hasContent =
-    turn.approval || turn.plan.length > 0 || turn.commandOutput || turn.diff.trim() || turn.tokenUsage;
+    turn.approval || turn.plan.length > 0 || turn.commandOutput || turn.diff.trim() || turn.tokenUsage || turn.userInput;
   if (!hasContent) return null;
   return (
     <div className="kim-msg-row kim-msg-row--assistant kim-codex-turn" data-testid="codex-turn-panel">
       <PlanChecklist steps={turn.plan} />
       <CommandOutputBlock output={turn.commandOutput} />
       {turn.approval && <ApprovalCard approval={turn.approval} onDecision={turn.respond} />}
+      {turn.userInput && (
+        <QuestionCard
+          request={turn.userInput}
+          onAnswer={turn.respondUserInput}
+          onDismiss={turn.dismissUserInput}
+        />
+      )}
       <DiffSummary diff={turn.diff} />
       <TokenUsageChip usage={turn.tokenUsage} />
     </div>

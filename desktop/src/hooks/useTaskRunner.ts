@@ -156,6 +156,11 @@ export function useTaskRunner({
           ollamaCloudModel: settings.ollama.cloud_model || null,
           ollamaContextLimitOverride: settings.ollama.context_limit_override ?? null,
           permissionMode: settings.permission_mode ?? 'full_auto',
+          // D-C3: the "Context budget" setting was a no-op — send_task accepts
+          // context_budget_tokens (forwarded as KIM_CONTEXT_BUDGET_TOKENS to the
+          // context meter) but the frontend never passed it, so every run used
+          // the 200k default. Wire the real value (0/falsy → backend default).
+          contextBudgetTokens: settings.context_budget_tokens || null,
         });
       } catch (err) {
         if (!stream.doneHandledRef.current) {
@@ -200,6 +205,19 @@ export function useTaskRunner({
     const task = makePendingTask(fullText);
 
     if (stream.isRunning) {
+      // D-C1: the "Queue messages while Kim is working" toggle was a no-op —
+      // messages were ALWAYS queued. Honor it: when queuing is disabled, don't
+      // silently swallow the message. Tell the user their options (Steer folds
+      // it into the running task; otherwise wait) instead of pretending it will
+      // run next.
+      if (settings.allow_message_queue === false) {
+        toast(
+          'Kim is still working. Turn on "Queue messages" in Settings to line this up, or use Steer to fold it into the current task.',
+          'warning',
+          5000
+        );
+        return;
+      }
       const nextCount = queuedTasks.length + 1;
       setQueuedTasks(prev => [...prev, task]);
       toast(`Queued message #${nextCount}. Kim will run it automatically next.`, 'info', 3000);

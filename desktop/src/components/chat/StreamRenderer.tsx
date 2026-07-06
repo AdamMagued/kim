@@ -21,6 +21,7 @@ import {
 import { buildThinkingTrace, traceToWorkedFor } from './parsers';
 import { ActivityFeed } from './ActivityFeed';
 import { CodexTurnPanel, HitlStatusCard } from './CodexTurnPanel';
+import { ContextMeter, type ContextMeterState } from './ContextMeter';
 import type { CodexTurnState } from '../../hooks/useCodexTurn';
 
 // ── Blobby Loader Component ──────────────────────────────────────────────────
@@ -118,6 +119,9 @@ export interface StreamRendererProps {
   setTaskInput: (val: string) => void;
   resolveProvider: () => string;
   tokenStats?: { input: number; output: number; total: number } | null;
+  /** A1/D-A1: context-usage state from the kim:context pipeline. Rendered as
+   *  the ContextMeter gauge above the composer (previously plumbed nowhere). */
+  contextState?: ContextMeterState | null;
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -161,6 +165,7 @@ export function StreamRenderer({
   setTaskInput,
   resolveProvider,
   tokenStats,
+  contextState,
 }: StreamRendererProps) {
 
   // ── Memoized derived values ────────────────────────────────────────────────
@@ -680,8 +685,11 @@ export function StreamRenderer({
           {renderHitlStatus()}
 
           {/* Error / retry — B4: suppress the legacy banner when the structured
-              run-failure card is shown for the same run (avoid double surface). */}
-          {taskError && !runFailure && (
+              run-failure card is shown for the same run (avoid double surface).
+              B2: never render the retry banner mid-run — a transient stderr line
+              would otherwise show a red "Retry" over a task that is still working
+              and inviting a duplicate-task retry. */}
+          {taskError && !runFailure && !isRunning && (
             <div className="kim-msg-row kim-msg-row--assistant">
               <div className="kim-task-error" role="alert">
                 <span className="kim-task-error__icon">⚠</span>
@@ -730,6 +738,9 @@ export function StreamRenderer({
           <div ref={bottomRef} />
         </div>
 
+        {!empty && contextState && (
+          <div className="kim-context-meter-wrap"><ContextMeter state={contextState} /></div>
+        )}
         {!empty && renderPermissionToggle()}
         {!empty && renderComposer(false)}
       </div>
@@ -809,8 +820,10 @@ export function StreamRenderer({
             {renderRateLimited()}
 
             {/* B3/B4: friendly agent-error text; suppressed when the structured
-                run-failure card already explains the same run. */}
-            {taskError && !runFailure && (
+                run-failure card already explains the same run. B2: and never
+                mid-run — a recovered stderr line must not show Resend Task over
+                a task that is still working. */}
+            {taskError && !runFailure && !isRunning && (
               <div className="kim-msg-row kim-msg-row--assistant">
                 <div style={{ maxWidth: '78%', minWidth: 0 }}>
                   <SignalCard kind="error" text={friendlyTaskError(taskError)} onAction={handleRetryLast} actionLabel="Resend Task" />
@@ -839,6 +852,9 @@ export function StreamRenderer({
         <div ref={bottomRef} />
       </div>
 
+      {contextState && (
+        <div className="kim-context-meter-wrap"><ContextMeter state={contextState} /></div>
+      )}
       {renderPermissionToggle()}
       {renderComposer()}
     </div>

@@ -566,6 +566,32 @@
   overflow: hidden;
 }
 
+/* C4: codex question card — per-question block + free-text input. */
+.kim-codex-question {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+.kim-codex-question__input {
+  appearance: none;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 13px;
+  padding: 6px 10px;
+  max-width: 420px;
+}
+.kim-codex-question__input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.kim-hitl-btn--active {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .kim-codex-output__toggle,
 .kim-codex-diff__toggle {
   display: block;

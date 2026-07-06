@@ -769,6 +769,16 @@
   gap: 2px;
   padding: 6px 24px 2px;
 }
+/* A1/D-A1: context meter sits just above the composer, aligned with it. */
+.kim-context-meter-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 4px 24px 0;
+}
+.kim-context-meter-wrap .kim-context-meter {
+  width: 100%;
+  max-width: 720px;
+}
 .kim-permission-toggle__btn {
   appearance: none;
   border: 1px solid transparent;
