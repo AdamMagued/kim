@@ -62,7 +62,9 @@ echo       Done.
 
 REM ── Install Playwright browsers ──────────────────────────────────────
 echo [5/6] Installing Playwright browsers (Chromium)...
-python -m playwright install chromium --quiet 2>nul
+REM NOTE: `playwright install` has no --quiet flag; passing it made this step
+REM fail on every run while 2>nul hid the real error. Keep output visible.
+python -m playwright install chromium
 if %ERRORLEVEL% neq 0 (
     echo       [WARN] Playwright browser install failed. Browser provider may not work.
     echo              You can install later with: python -m playwright install chromium

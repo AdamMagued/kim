@@ -98,6 +98,13 @@ def _hidden_regex_patterns() -> list[re.Pattern[str]]:
         except re.error:
             # JavaScript regex with constructs Python can't compile — skip.
             continue
+    # Guard against silent erosion: if JS-only regex syntax creeps into most
+    # of HIDDEN_REGEX, this mirror would quietly stop checking anything.
+    declared = len(re.findall(r"^\s*/", body, re.MULTILINE))
+    assert len(patterns) >= max(declared - 2, 10), (
+        f"only {len(patterns)} of {declared} HIDDEN_REGEX patterns compiled in "
+        "Python — too many JS-only patterns are escaping this producer-side check"
+    )
     return patterns
 
 

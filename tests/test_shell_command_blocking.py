@@ -24,6 +24,20 @@ from mcp_server.tools.shell import (
     handle_run_command,
 )
 
+@pytest.fixture(autouse=True)
+def _restore_config_module():
+    """Re-reload mcp_server.config under the pristine env after every test.
+
+    The two SHELL_SANDBOX_MODE tests reload the module under a patched env;
+    monkeypatch restores the env but not the module, leaving mcp_server.config
+    evaluated under the test env for the rest of the session. Autouse fixtures
+    finalize after monkeypatch, so the env is pristine again here.
+    """
+    yield
+    import mcp_server.config as _config
+    importlib.reload(_config)
+
+
 # Platform-aware test commands
 # Windows: 'echo %CD%' is a cmd.exe builtin that prints the cwd without any quoting issues.
 # POSIX:   'pwd' is the standard shell builtin.

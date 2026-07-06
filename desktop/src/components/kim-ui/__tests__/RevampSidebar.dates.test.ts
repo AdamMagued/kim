@@ -119,11 +119,11 @@ describe('formatTime_local_parse', () => {
     const twoDaysAgo = localDateStr(new Date(2025, 2, 13)); // '2025-03-13' (Thursday)
     const result = formatTime(twoDaysAgo);
 
-    // Within 7 days and not same-day → weekday short name
-    // We check it's a non-empty string that does NOT look like a time (HH:MM am/pm)
-    expect(result).toBeTruthy();
-    expect(result).not.toMatch(/^\d+:\d+/); // not a time
-    expect(result.length).toBeGreaterThan(0);
+    // Within 7 days and not same-day → weekday short name (e.g. "Thu").
+    // Positive shape assertion: mutation testing showed "not a time" +
+    // "non-empty" passed even when the wrong branch returned a month-day.
+    expect(result).toMatch(/^[A-Za-z]{2,}\.?$/); // letters only — a weekday name
+    expect(result).not.toMatch(/\d/); // no digits: not a time, not a month-day
   });
 
   it('returns a locale time string for a today date string (same-day path)', () => {
@@ -135,11 +135,10 @@ describe('formatTime_local_parse', () => {
     const todayStr = localDateStr(new Date()); // '2025-03-15'
     const result = formatTime(todayStr);
 
-    // Same-day path: should contain a numeric time indicator (hour)
-    expect(result).toBeTruthy();
-    // The result should be a time string, not a month/day or weekday
-    // toLocaleTimeString returns something like "12:00 AM" or "12:00"
-    expect(result).toMatch(/\d/); // contains at least one digit
+    // Same-day path: MUST be a time string like "12:00 AM" / "12:00" —
+    // positive HH:MM shape, not merely "contains a digit" (which a wrong
+    // month-day branch also satisfies).
+    expect(result).toMatch(/\d{1,2}:\d{2}/);
   });
 
   it('returns empty string for an invalid date', () => {
@@ -154,11 +153,10 @@ describe('formatTime_local_parse', () => {
     const oldDate = localDateStr(new Date(2025, 2, 1)); // '2025-03-01' (14 days ago)
     const result = formatTime(oldDate);
 
-    // Older than 7 days: toLocaleDateString with month+day → something like "Mar 1"
-    expect(result).toBeTruthy();
-    expect(result).not.toMatch(/^\d+:\d+/); // not a time
-    // Should contain a digit (the day number)
-    expect(result).toMatch(/\d/);
+    // Older than 7 days: month short name + day number, e.g. "Mar 1".
+    expect(result).toMatch(/[A-Za-z]{3}/); // month name present
+    expect(result).toMatch(/\d{1,2}/); // day number present
+    expect(result).not.toMatch(/\d{1,2}:\d{2}/); // and it is NOT a time
   });
 
   it('correctly parses YYYY-MM-DD as local midnight (not UTC)', () => {

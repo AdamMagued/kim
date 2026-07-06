@@ -125,7 +125,9 @@ function rustVariant(name, payload, fixed = false) {
   const variant = snakeToPascal(name);
   if (fixed || Object.keys(payload).length === 0) return `    ${variant},`;
   const fields = Object.entries(payload).map(([key, def]) => {
-    const attrs = def.default ? '        #[serde(default)]\n' : '';
+    // `optional` implies the wire message may legitimately omit the field, so
+    // the Rust decoder needs #[serde(default)] just like an explicit default.
+    const attrs = (def.default || def.optional) ? '        #[serde(default)]\n' : '';
     return `${attrs}        ${key}: ${rustType(def)},`;
   }).join('\n');
   return `    ${variant} {\n${fields}\n    },`;
@@ -157,18 +159,30 @@ function pyParam([key, def]) {
     : def.type === 'number' ? 'float'
     : def.type === 'unknown[]' ? 'list[object]'
     : 'dict[str, object]';
-  return `${key}: ${annotation}${def.optional ? " = ''" : ''}`;
+  // Type-appropriate defaults for optional fields (an optional bool/number
+  // must not silently receive a str default).
+  const pyDefault = annotation === 'str' ? " = ''"
+    : annotation === 'bool' ? ' = False'
+    : annotation === 'float' ? ' = 0.0'
+    : ' = None';
+  const optAnnotation = def.optional && pyDefault === ' = None'
+    ? `${annotation} | None` : annotation;
+  return `${key}: ${optAnnotation}${def.optional ? pyDefault : ''}`;
 }
 
 function renderPyEmitter(event) {
   const name = pyName(event.event);
   const params = Object.entries(event.payload).map(pyParam).join(', ');
   if (event.wireVariants) {
+    // Derive the discriminator variable from the schema instead of hardcoding
+    // `action` — a second wireVariants event keyed differently would otherwise
+    // generate Python referencing an undefined name.
+    const discriminator = Object.keys(event.payload)[0];
     const choices = event.wireVariants.map(variant => {
       const value = Object.values(variant.payload)[0];
       return `        ${JSON.stringify(value)}: ${JSON.stringify(variant.type)},`;
     }).join('\n');
-    return `def emit_${name}(${params}) -> None:\n    wire_type = {\n${choices}\n    }[action]\n    emit_event(wire_type)`;
+    return `def emit_${name}(${params}) -> None:\n    wire_type = {\n${choices}\n    }[${discriminator}]\n    emit_event(wire_type)`;
   }
   const fields = Object.keys(event.payload).map(key => `${key}=${key}`).join(', ');
   return `def emit_${name}(${params}) -> None:\n    emit_event(${JSON.stringify(wireType(event))}${fields ? `, ${fields}` : ''})`;

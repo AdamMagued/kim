@@ -28,6 +28,7 @@ jobs:
             rust-target: aarch64-apple-darwin
             cli-target-dir: target/aarch64-apple-darwin/release
             cli-asset-suffix: macos-aarch64
+            cli-triple: aarch64-apple-darwin
             cli-bin: kim
 
           - label: macOS Intel
@@ -36,6 +37,7 @@ jobs:
             rust-target: x86_64-apple-darwin
             cli-target-dir: target/x86_64-apple-darwin/release
             cli-asset-suffix: macos-x86_64
+            cli-triple: x86_64-apple-darwin
             cli-bin: kim
 
           - label: Linux (x64)
@@ -44,6 +46,7 @@ jobs:
             rust-target: ''
             cli-target-dir: target/release
             cli-asset-suffix: linux-x86_64
+            cli-triple: x86_64-unknown-linux-gnu
             cli-bin: kim
 
           - label: Windows (x64)
@@ -52,6 +55,7 @@ jobs:
             rust-target: ''
             cli-target-dir: target/release
             cli-asset-suffix: windows-x86_64
+            cli-triple: x86_64-pc-windows-msvc
             cli-bin: kim.exe
 
     runs-on: ${{ matrix.platform }}
@@ -248,6 +252,38 @@ jobs:
           cp "${SRC}" "${DEST}"
           echo "path=${DEST}" >> "$GITHUB_OUTPUT"
 
+      # ── Installer archive (scripts/install-kim.sh / install-kim.ps1) ─────
+      # The curl|sh installers download `kim-<triple>.tar.gz` (`.zip` on
+      # Windows) plus a `kim-<triple>.sha256` sidecar for checksum
+      # verification. Stage those here so the advertised install flow and the
+      # published assets can never drift apart again.
+      - name: Stage KimCLI install archive (+ sha256 sidecar)
+        id: cli-archive
+        shell: bash
+        run: |
+          BASE="kim-${{ matrix.cli-triple }}"
+          mkdir -p cli-dist/archive
+          cp "cli-dist/${{ steps.cli-asset.outputs.filename }}" "cli-dist/archive/${{ matrix.cli-bin }}"
+          if [[ "${{ matrix.cli-bin }}" == "kim.exe" ]]; then
+            ASSET="${BASE}.zip"
+            (cd cli-dist/archive && 7z a "../${ASSET}" kim.exe)
+          else
+            ASSET="${BASE}.tar.gz"
+            chmod +x "cli-dist/archive/kim"
+            tar -C cli-dist/archive -czf "cli-dist/${ASSET}" kim
+          fi
+          # Sidecar name/content must match what the installers expect:
+          # <asset minus .tar.gz/.zip>.sha256 containing "<hash>  <asset>".
+          cd cli-dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ASSET}" > "${BASE}.sha256"
+          else
+            shasum -a 256 "${ASSET}" > "${BASE}.sha256"
+          fi
+          cat "${BASE}.sha256"
+          echo "asset=cli-dist/${ASSET}" >> "$GITHUB_OUTPUT"
+          echo "sha=cli-dist/${BASE}.sha256" >> "$GITHUB_OUTPUT"
+
       # ── Sigstore / cosign signing for CLI binary ─────────────────────────
       # Signs the CLI binary using keyless OIDC signing via Sigstore, which
       # requires no long-lived secret — the runner's OIDC token is sufficient.
@@ -271,7 +307,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4 (#59)
         with:
           name: ${{ steps.cli-asset.outputs.filename }}
-          path: ${{ steps.cli-stage.outputs.path }}
+          path: |
+            ${{ steps.cli-stage.outputs.path }}
+            ${{ steps.cli-archive.outputs.asset }}
+            ${{ steps.cli-archive.outputs.sha }}
           retention-days: 7
 
       - name: Upload KimCLI to release
@@ -292,3 +331,5 @@ jobs:
             ${{ steps.cli-stage.outputs.path }}
             ${{ steps.cli-stage.outputs.path }}.sig
             ${{ steps.cli-stage.outputs.path }}.pem
+            ${{ steps.cli-archive.outputs.asset }}
+            ${{ steps.cli-archive.outputs.sha }}

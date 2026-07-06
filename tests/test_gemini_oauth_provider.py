@@ -5,7 +5,12 @@ import types
 import pytest
 
 
-def install_google_stubs():
+def install_google_stubs(monkeypatch):
+    """Install google.* stubs via monkeypatch.setitem so they are RESTORED
+    after each test — the previous version overwrote sys.modules["google"]
+    permanently, shadowing any real google namespace package for every later
+    test in the session. (gemini.py is REST-based today, so these stubs are
+    belt-and-braces for older import paths.)"""
     google_mod = types.ModuleType("google")
     genai_mod = types.ModuleType("google.generativeai")
     protos_mod = types.ModuleType("google.generativeai.protos")
@@ -39,13 +44,13 @@ def install_google_stubs():
     genai_mod.GenerationConfig = lambda **kwargs: types.SimpleNamespace(**kwargs)
     genai_mod.GenerativeModel = lambda **kwargs: types.SimpleNamespace(**kwargs)
 
-    sys.modules["google"] = google_mod
-    sys.modules["google.generativeai"] = genai_mod
-    sys.modules["google.generativeai.protos"] = protos_mod
+    monkeypatch.setitem(sys.modules, "google", google_mod)
+    monkeypatch.setitem(sys.modules, "google.generativeai", genai_mod)
+    monkeypatch.setitem(sys.modules, "google.generativeai.protos", protos_mod)
 
 
 def load_module(monkeypatch):
-    install_google_stubs()
+    install_google_stubs(monkeypatch)
     sys.modules.pop("orchestrator.providers.gemini", None)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("KIM_GOOGLE_ACCESS_TOKEN", raising=False)

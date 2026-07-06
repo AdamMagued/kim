@@ -86,11 +86,29 @@ class TestShellChildEnvBehavioral:
         }))
         _assert_no_secrets(out)
 
-    def test_git_still_works_under_minimal_env(self, planted_secrets):
+    def test_git_still_works_under_minimal_env(
+        self, planted_secrets, tmp_path, monkeypatch
+    ):
         """git spawns with the minimal env and must keep functioning
-        (HOME for ~/.gitconfig and PATH are in the allowlist)."""
-        from mcp_server.tools.git import _run_git
-        out = asyncio.run(_run_git("status", "--short"))
+        (HOME for ~/.gitconfig and PATH are in the allowlist).
+
+        Uses a freshly `git init`-ed tmp repo instead of os.getcwd(): the old
+        version ran `git status` in whatever directory pytest happened to be
+        launched from, and failed when the suite ran outside a git repo.
+        """
+        import subprocess
+
+        import mcp_server.tools.git as git_mod
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        # Point the handler's project root at the tmp repo; validate_path is
+        # scoped to the configured root, so bypass it for the tmp dir.
+        monkeypatch.setattr(git_mod, "PROJECT_ROOT", repo)
+        monkeypatch.setattr(git_mod, "validate_path", lambda p: p)
+
+        out = asyncio.run(git_mod._run_git("status", "--short"))
         assert "exit_code: 0" in out
 
 

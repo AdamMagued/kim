@@ -39,7 +39,8 @@ import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional, cast
 
 from dotenv import load_dotenv
 from mcp import ClientSession
@@ -316,7 +317,7 @@ class KimAgent:
                     self._last_step_signature = ""  # reset step dedupe on new plan
                     self._last_done_signature = ""
                     self._log("INFO", f"[STATUS] [PLAN]{sig}")
-                    emit_plan(plan_payload["steps"])
+                    emit_plan(cast("list[object]", plan_payload["steps"]))
 
         # ── STEP markers ────────────────────────────────────────────────
         # Match the LAST step marker in this turn (the most recent one wins —
@@ -541,8 +542,9 @@ class KimAgent:
 
         # Let the provider reset any per-session state (e.g. BrowserProvider
         # clears _sent_system_prompt so the new task gets its system prompt).
-        if hasattr(self.provider, "reset_session"):
-            self.provider.reset_session()
+        reset_session = getattr(self.provider, "reset_session", None)
+        if callable(reset_session):
+            reset_session()
 
         # Resume from saved session or start fresh
         if self._resume_session_id:
@@ -903,7 +905,7 @@ class KimAgent:
                     aborted_after = idx
                     break
 
-            summary_obj = {"ok": ok}
+            summary_obj: dict[str, object] = {"ok": ok}
             if not ok:
                 summary_obj["aborted_after"] = aborted_after
             result_text = json.dumps(summary_obj) + "\n\n" + "\n---\n".join(batch_results)
@@ -1986,8 +1988,9 @@ Rules:
             # Tell the provider directly — reset_session() (called just before
             # this) cleared its flag, and the env-var heuristic only covers
             # restored-thread spawns.
-            if hasattr(self.provider, "mark_thread_continuation"):
-                self.provider.mark_thread_continuation()
+            mark_continuation = getattr(self.provider, "mark_thread_continuation", None)
+            if callable(mark_continuation):
+                mark_continuation()
             self._log(
                 "INFO",
                 f"Continuing browser thread (turn {self._browser_thread_turns}, "
@@ -2195,8 +2198,10 @@ async def mcp_agent_context(
     provider = create_provider(name, config)
 
     async with mcp_session_context(config) as session:
-        store = SessionStore(base_dir=session_dir, session_id=resume_session_id) if (
-            session_dir or resume_session_id) else SessionStore()
+        store = SessionStore(
+            base_dir=Path(session_dir) if session_dir else None,
+            session_id=resume_session_id,
+        ) if (session_dir or resume_session_id) else SessionStore()
         agent = KimAgent(
             config=config, session=session, provider=provider,
             ui_bridge=ui_bridge,
