@@ -17,6 +17,7 @@ manually in the running app (see the stateful-threads memory note).
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -496,6 +497,103 @@ class TestCompactControlTasks(unittest.TestCase):
         from orchestrator import codex_bridge_service as svc
 
         self.assertNotIn("fix the login bug", svc._COMPACT_CONTROL_TASKS)
+
+
+# ---------------------------------------------------------------------------
+# Sandbox-change detection — a stored thread taught "read-only" must not be
+# reused after the user grants full access (it keeps refusing writes)
+# ---------------------------------------------------------------------------
+
+class TestSandboxFingerprint(unittest.TestCase):
+    def test_default_when_env_unset_or_empty(self):
+        from orchestrator import codex_bridge_service as svc
+
+        env = {k: v for k, v in os.environ.items() if k != "KIM_CODEX_BYPASS_SANDBOX"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(svc._sandbox_fingerprint(), "default")
+        with patch.dict(os.environ, {"KIM_CODEX_BYPASS_SANDBOX": ""}):
+            self.assertEqual(svc._sandbox_fingerprint(), "default")
+
+    def test_bypass_when_flag_is_1(self):
+        from orchestrator import codex_bridge_service as svc
+
+        with patch.dict(os.environ, {"KIM_CODEX_BYPASS_SANDBOX": "1"}):
+            self.assertEqual(svc._sandbox_fingerprint(), "bypass")
+        # Whitespace-tolerant, same as the launch-flag check.
+        with patch.dict(os.environ, {"KIM_CODEX_BYPASS_SANDBOX": " 1 "}):
+            self.assertEqual(svc._sandbox_fingerprint(), "bypass")
+
+    def test_non_1_values_are_default(self):
+        from orchestrator import codex_bridge_service as svc
+
+        for value in ("0", "true", "yes"):
+            with patch.dict(os.environ, {"KIM_CODEX_BYPASS_SANDBOX": value}):
+                self.assertEqual(svc._sandbox_fingerprint(), "default")
+
+
+class TestThreadSandboxChanged(unittest.TestCase):
+    def test_fresh_thread_never_counts_as_changed(self):
+        from orchestrator import codex_bridge_service as svc
+
+        self.assertFalse(svc._thread_sandbox_changed({}, "bypass"))
+        self.assertFalse(
+            svc._thread_sandbox_changed({"sent_instructions": False, "sandbox": "default"}, "bypass")
+        )
+
+    def test_legacy_sidecar_without_field_counts_as_default(self):
+        from orchestrator import codex_bridge_service as svc
+
+        legacy = {"sent_instructions": True, "turns": 4}
+        # The exact bug: thread taught read-only, user relaunches with bypass.
+        self.assertTrue(svc._thread_sandbox_changed(legacy, "bypass"))
+        self.assertFalse(svc._thread_sandbox_changed(legacy, "default"))
+
+    def test_matching_fingerprint_reuses_thread(self):
+        from orchestrator import codex_bridge_service as svc
+
+        state = {"sent_instructions": True, "sandbox": "bypass"}
+        self.assertFalse(svc._thread_sandbox_changed(state, "bypass"))
+        self.assertTrue(svc._thread_sandbox_changed(state, "default"))
+
+
+# ---------------------------------------------------------------------------
+# Relay-reasoning preview must stay on ONE [STATUS] line — the stdout parser
+# is line-based, so a newline inside the preview leaks its tail into the
+# answer stream (shows up as a truncated "Kim: …" fragment in the CLI)
+# ---------------------------------------------------------------------------
+
+class TestRelayReasoningPreview(unittest.TestCase):
+    @staticmethod
+    def _capture(response):
+        import contextlib
+        import io
+
+        from codex_engine.engine import _surface_relay_reasoning
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _surface_relay_reasoning(response, relay_num=1)
+        return buf.getvalue()
+
+    def test_multiline_content_collapses_to_one_status_line(self):
+        content = (
+            "Yes—I can generate the code for a Pong game.\n\n"
+            "However, I still can't truthfully claim that I've created files "
+            "or opened them because I don't have write access."
+        )
+        out = self._capture({"content": content})
+        lines = [line for line in out.splitlines() if line]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("[STATUS] "))
+        self.assertIn("However, I still can't", lines[0])
+
+    def test_brand_names_are_masked(self):
+        out = self._capture({"content": "ChatGPT will handle this task."})
+        self.assertIn("[STATUS] Kim will handle this task.", out)
+
+    def test_json_content_is_not_previewed(self):
+        out = self._capture({"content": '  {"text": "raw contract reply"}'})
+        self.assertEqual(out, "")
 
 
 if __name__ == "__main__":

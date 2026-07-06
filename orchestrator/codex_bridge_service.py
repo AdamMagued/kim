@@ -149,6 +149,28 @@ def _status(message: str) -> None:
     emit_status(message)
 
 
+def _sandbox_fingerprint() -> str:
+    """Identify the permission level baked into this run's codex instructions.
+
+    A stored browser thread was taught its abilities by the instructions sent
+    when it started; if the user changes the sandbox (e.g. sets
+    KIM_CODEX_BYPASS_SANDBOX=1), reusing that thread leaves the model believing
+    its OLD permission level. Compared against thread_state["sandbox"] to force
+    a fresh chat on change.
+    """
+    bypass = os.environ.get("KIM_CODEX_BYPASS_SANDBOX", "").strip() == "1"
+    return "bypass" if bypass else "default"
+
+
+def _thread_sandbox_changed(thread_state: dict, current: str) -> bool:
+    """True when a stored thread's instructions describe a different permission
+    level than *current* (sidecars from before this field existed count as
+    "default" — they were all created under the default read-only sandbox)."""
+    if not thread_state.get("sent_instructions"):
+        return False
+    return (thread_state.get("sandbox") or "default") != current
+
+
 def _is_git_repo(cwd: str) -> bool:
     """True if ``cwd`` (or any ancestor) is inside a git working tree.
 
@@ -361,16 +383,29 @@ async def _run_async(args: argparse.Namespace) -> int:
     bp_cfg = config.get("browser_provider") or {}
     stateful = bool(bp_cfg.get("stateful_threads", False))
     thread_state = load_thread_state(args.cwd, args.provider)
+    current_sandbox = _sandbox_fingerprint()
     if stateful and thread_state.get("sent_instructions"):
-        threshold = _get_compact_threshold(args.provider)
-        compact_at = float(bp_cfg.get("compact_at_ratio", 0.80))
-        max_turns = int(bp_cfg.get("max_thread_turns", 40))
-        est_tokens = int(thread_state.get("est_tokens") or 0)
-        turns = int(thread_state.get("turns") or 0)
-        if est_tokens >= int(threshold * compact_at) or turns >= max_turns:
-            _status("Browser thread near its limit — compacting into a fresh chat before this task…")
+        if _thread_sandbox_changed(thread_state, current_sandbox):
+            # The stored browser thread was taught the OLD permission level
+            # (e.g. read-only) and will keep refusing writes even after the
+            # user grants full access — start a fresh chat so the new codex
+            # instructions actually reach the model.
+            _status("Sandbox permissions changed — starting a fresh browser chat…")
             await _compact_browser_thread(provider, args.cwd, args.provider)
             thread_state = load_thread_state(args.cwd, args.provider)
+        else:
+            threshold = _get_compact_threshold(args.provider)
+            compact_at = float(bp_cfg.get("compact_at_ratio", 0.80))
+            max_turns = int(bp_cfg.get("max_thread_turns", 40))
+            est_tokens = int(thread_state.get("est_tokens") or 0)
+            turns = int(thread_state.get("turns") or 0)
+            if est_tokens >= int(threshold * compact_at) or turns >= max_turns:
+                _status("Browser thread near its limit — compacting into a fresh chat before this task…")
+                await _compact_browser_thread(provider, args.cwd, args.provider)
+                thread_state = load_thread_state(args.cwd, args.provider)
+    # Record the permission level this thread's instructions describe, so the
+    # next run can detect a change (persisted by save_thread_state below).
+    thread_state["sandbox"] = current_sandbox
 
     proxy = _CodexProxy(
         provider,

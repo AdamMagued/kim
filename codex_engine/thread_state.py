@@ -12,6 +12,8 @@ State shape:
         "turns": int,               # browser sends since the thread started
         "est_tokens": int,          # cumulative estimated in+out tokens
         "handoff": str | None,      # compact summary to seed the next fresh chat
+        "sandbox": str,             # permission fingerprint ("default"/"bypass")
+                                    # the thread's instructions described
         "updated_at": str,          # ISO timestamp of last write
     }
 """

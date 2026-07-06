@@ -1401,6 +1401,10 @@ def _surface_relay_reasoning(response: dict, relay_num: int) -> None:
         content[:150],
         flags=re.IGNORECASE,
     )
+    # Collapse to ONE line: the consumer parses stdout line-by-line, so a
+    # newline inside the preview would make its tail lines lose the [STATUS]
+    # prefix and be misparsed as answer text.
+    display = " ".join(display.split())
     if display and not display.startswith("{"):
         print(f"[STATUS] {display}", flush=True)
 
