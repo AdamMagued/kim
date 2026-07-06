@@ -78,6 +78,11 @@ def _deny(risk: str, reason: str, message: str) -> PolicyDecision:
 # ---------------------------------------------------------------------------
 
 def hitl_threshold() -> str | None:
+    # NOTE (G3): with neither config.yaml `hitl_risk_threshold` nor
+    # KIM_HITL_RISK_THRESHOLD set, this returns None and the risk-threshold
+    # arm of the gate is INERT — only argv escalation rules (and hard denies)
+    # gate calls. Set the key to "high" to require approval for high-risk
+    # tools (write_file, delete_file, run_python, mouse/keyboard, …).
     raw = get_config().get("hitl_risk_threshold") or os.environ.get(
         "KIM_HITL_RISK_THRESHOLD"
     )
@@ -302,8 +307,9 @@ def _git_escalations(tokens: list[str]) -> list[str]:
         out.append("git_force_push")
     if sub == "reset" and "--hard" in flags:
         out.append("git_reset_hard")
-    if sub == "clean" and any(
-        f.startswith("-") and "f" in f and not f.startswith("--") for f in flags
+    if sub == "clean" and (
+        "--force" in flags  # long form must escalate like -f/-fd (G1)
+        or any(f.startswith("-") and "f" in f and not f.startswith("--") for f in flags)
     ):
         out.append("git_clean_force")
     return out
@@ -320,8 +326,16 @@ def _scan_path_tokens(tokens: list[str], cwd: str | None) -> str | None:
     base_dir = Path(cwd) if cwd else PROJECT_ROOT
     for tok in tokens[1:]:
         if tok.startswith("-"):
-            continue
-        candidate = tok
+            # Glued option values (`--file=/etc/shadow`, `-o=/abs/x`) still
+            # carry a path — check the substring after the first '=' (G4).
+            eq = tok.find("=")
+            if eq == -1:
+                continue
+            candidate = tok[eq + 1:]
+            if not candidate:
+                continue
+        else:
+            candidate = tok
         # >>file / 2>/abs redirect prefixes are handled by shell.py; strip a
         # leading redirect so the target still gets path-checked here.
         candidate = candidate.lstrip("<>&123456789")
@@ -471,6 +485,9 @@ def _wrapped_command(tokens: list[str]) -> list[str]:
     return []
 
 
+_CHAIN_OPERATOR_TOKENS = frozenset({"&&", "||", ";", "|", "&"})
+
+
 def _analyze_shell(cmd: str, cwd: str | None) -> _ShellAnalysis:
     """Analyse a full run_command string, segment by segment."""
     try:
@@ -480,28 +497,51 @@ def _analyze_shell(cmd: str, cwd: str | None) -> _ShellAnalysis:
             deny_reason="malformed_quoting",
             deny_message="POLICY_DENIED: command has malformed shell quoting",
         )
-    analysis = _analyze_command_words(tokens, cwd)
-    if analysis.deny_reason:
-        return analysis
 
-    # Recurse into `sh -c '…'` payloads so nested commands see the same rules.
-    escalations = list(analysis.escalations)
-    if tokens:
-        base = Path(tokens[0]).name.lower()
-        if base in {"sh", "bash", "zsh", "fish", "dash", "ksh"}:
-            try:
-                c_index = tokens.index("-c")
-            except ValueError:
-                c_index = -1
-            if 0 <= c_index < len(tokens) - 1:
-                inner = _analyze_shell(tokens[c_index + 1], cwd)
-                if inner.deny_reason:
-                    return inner
-                escalations.extend(inner.escalations)
+    # Segment on chaining operator tokens so EVERY command in `a && b` is
+    # vetted, not just the first (G6). shlex.split keeps whitespace-separated
+    # `&&`/`||`/`;`/`|`/`&` as plain tokens.
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for tok in tokens:
+        if tok in _CHAIN_OPERATOR_TOKENS:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(tok)
+    segments.append(current)  # possibly empty: preserves empty-command handling
+
+    escalations: list[str] = []
+    worst_risk = "low"
+    binary = ""
+    for seg in segments:
+        analysis = _analyze_command_words(seg, cwd)
+        if analysis.deny_reason:
+            return analysis
+        escalations.extend(analysis.escalations)
+        if _RISK_ORDER.get(analysis.effective_risk, 2) > _RISK_ORDER.get(worst_risk, 0):
+            worst_risk = analysis.effective_risk
+        if not binary:
+            binary = analysis.binary
+
+        # Recurse into `sh -c '…'` payloads so nested commands see the same rules.
+        if seg:
+            base = Path(seg[0]).name.lower()
+            if base in {"sh", "bash", "zsh", "fish", "dash", "ksh"}:
+                try:
+                    c_index = seg.index("-c")
+                except ValueError:
+                    c_index = -1
+                if 0 <= c_index < len(seg) - 1:
+                    inner = _analyze_shell(seg[c_index + 1], cwd)
+                    if inner.deny_reason:
+                        return inner
+                    escalations.extend(inner.escalations)
     return _ShellAnalysis(
         escalations=tuple(dict.fromkeys(escalations)),
-        effective_risk=analysis.effective_risk,
-        binary=analysis.binary,
+        effective_risk=worst_risk,
+        binary=binary,
     )
 
 
@@ -578,6 +618,17 @@ def _enforce(name: str, args: dict) -> PolicyDecision:
 
     escalations: tuple = ()
     signature = f"{name}"
+    # G5: "accept for session" on a bare tool name would auto-approve EVERY
+    # later call of that tool. Scope the cache key to the reviewed target
+    # (path arguments) so approving write_file(a.txt) doesn't pre-approve
+    # write_file(~/.zshrc).
+    path_keys = _PATH_ARGS.get(name, ())
+    if path_keys:
+        discriminator = ",".join(
+            f"{k}={args.get(k)}" for k in path_keys if args.get(k) is not None
+        )
+        if discriminator:
+            signature = f"{name}:{discriminator}"
     if name == "run_command":
         analysis = _analyze_shell(str(args.get("cmd", "")), args.get("cwd"))
         if analysis.deny_reason:
@@ -589,6 +640,13 @@ def _enforce(name: str, args: dict) -> PolicyDecision:
             # Escalated shell calls are only session-cacheable per exact command.
             signature = f"run_command:cmd={str(args.get('cmd', '')).strip()}"
             reason = escalations[0]
+    elif name == "run_powershell":
+        # G2: PowerShell scripts get no argv-level analysis here (the shell
+        # allowlist/denylist grammar is POSIX-only), so a human always reviews
+        # them instead of dispatching a whole unvetted script.
+        escalations = ("powershell_script_unanalyzed",)
+        reason = escalations[0]
+        signature = f"run_powershell:script={str(args.get('script', '')).strip()}"
 
     threshold = hitl_threshold()
     over_threshold = bool(

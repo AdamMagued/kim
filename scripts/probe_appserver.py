@@ -190,6 +190,9 @@ async def run_probe(args: argparse.Namespace) -> int:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
+        # Default StreamReader limit is 64 KiB/line; large JSON-RPC lines
+        # (diffs, big command outputs) would crash the reader (C1).
+        limit=16 * 1024 * 1024,
     )
     assert proc.stdin is not None and proc.stdout is not None
 
@@ -214,7 +217,14 @@ async def run_probe(args: argparse.Namespace) -> int:
 
     async def reader() -> None:
         assert proc.stdout is not None
-        async for raw in proc.stdout:
+        while True:
+            try:
+                raw = await proc.stdout.readline()
+            except ValueError:
+                print("?? (line exceeded stream limit; skipped)", flush=True)
+                continue
+            if not raw:
+                break
             text = raw.decode("utf-8", errors="replace").strip()
             if not text:
                 continue

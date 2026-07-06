@@ -30,7 +30,7 @@ import tempfile
 import os
 
 from mcp_server.config import PROJECT_ROOT, CODE_TIMEOUT, SHELL_TIMEOUT, validate_path
-from mcp_server.os_utils import check_tool_available, IS_MACOS, IS_LINUX
+from mcp_server.os_utils import IS_MACOS, IS_LINUX
 
 logger = logging.getLogger(__name__)
 
@@ -278,15 +278,11 @@ async def handle_run_python(args: dict) -> str:
         if not str(resolved).endswith(".py"):
             return f"ERROR: Expected a .py file, got: {resolved.name}"
 
-        # Scan file content against the blocklist — defence-in-depth.
-        try:
-            file_content = resolved.read_text(encoding="utf-8", errors="replace")
-            block_msg = _check_code_blocked(file_content)
-            if block_msg:
-                return block_msg
-        except OSError as e:
-            return f"ERROR: Cannot read file for security scan: {e}"
-
+        # NOTE: the inline-snippet blocklist is NOT applied to files (M4).
+        # Nearly every real .py file contains `import os` or the word
+        # "subprocess" (even in comments), so scanning whole files blocked the
+        # tool's primary use case. Files are gated by validate_path + the HITL
+        # gate + minimal env + the OS sandbox instead.
         cmd = _sandbox_wrap_cmd([python, str(resolved)])
         return await _run_exec(cmd, cwd=cwd, timeout=timeout)
 
@@ -350,15 +346,9 @@ async def handle_run_node(args: dict) -> str:
         if not str(resolved).endswith((".js", ".mjs", ".cjs")):
             return f"ERROR: Expected a .js file, got: {resolved.name}"
 
-        # Scan file content against the Node blocklist — defence-in-depth.
-        try:
-            file_content = resolved.read_text(encoding="utf-8", errors="replace")
-            block_msg = _check_node_blocked(file_content)
-            if block_msg:
-                return block_msg
-        except OSError as e:
-            return f"ERROR: Cannot read file for security scan: {e}"
-
+        # NOTE: the inline-snippet blocklist is NOT applied to files (M4) —
+        # any real Node script `require`s fs/http/etc. Files are gated by
+        # validate_path + the HITL gate + minimal env + the OS sandbox.
         cmd = _sandbox_wrap_cmd([node, str(resolved)])
         return await _run_exec(cmd, cwd=cwd, timeout=timeout)
 
@@ -406,17 +396,22 @@ async def handle_lint_file(args: dict) -> str:
     if not resolved.exists():
         return f"ERROR: File not found: {resolved}"
 
-    # Prefer ruff, fall back to flake8
-    if check_tool_available("ruff"):
+    # Prefer ruff, fall back to flake8. The linter must be invoked by its
+    # ABSOLUTE path: availability is checked against the parent PATH, but the
+    # subprocess runs with the restricted sandbox PATH — a venv/homebrew ruff
+    # would resolve for the check yet FileNotFoundError at exec time (H3).
+    ruff_path = shutil.which("ruff")
+    flake8_path = shutil.which("flake8")
+    if ruff_path:
         linter = "ruff"
         if fix:
-            cmd = ["ruff", "check", "--fix", str(resolved)]
+            cmd = [ruff_path, "check", "--fix", str(resolved)]
         else:
-            cmd = ["ruff", "check", str(resolved)]
+            cmd = [ruff_path, "check", str(resolved)]
         logger.info(f"lint_file: using ruff for {resolved}")
-    elif check_tool_available("flake8"):
+    elif flake8_path:
         linter = "flake8"
-        cmd = ["flake8", str(resolved)]
+        cmd = [flake8_path, str(resolved)]
         if fix:
             logger.info("lint_file: --fix is not supported by flake8, running check only")
         logger.info(f"lint_file: using flake8 for {resolved}")

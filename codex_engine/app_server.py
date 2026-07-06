@@ -54,6 +54,12 @@ _SCHEMA_DIR = Path(__file__).resolve().parent / "appserver_schema"
 
 CLIENT_INFO = {"name": "kim", "title": "Kim code mode", "version": "1.0.0"}
 
+# asyncio's default StreamReader limit is 64 KiB per line; a single JSON-RPC
+# line (e.g. turn/diff/updated with a large unified diff, or item/completed
+# for a big command output) easily exceeds it and would raise ValueError out
+# of the reader, killing the whole turn (C1). 16 MiB is generous headroom.
+STREAM_LIMIT = 16 * 1024 * 1024
+
 # Decision vocabularies (see module docstring). ``decline_result_for`` picks
 # the right one per request method.
 V2_DECLINE = {"decision": "decline"}
@@ -183,6 +189,7 @@ class AppServerClient:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=STREAM_LIMIT,
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
@@ -313,7 +320,22 @@ class AppServerClient:
         proc = self._proc
         assert proc is not None and proc.stdout is not None
         try:
-            async for raw in proc.stdout:
+            while True:
+                try:
+                    raw = await proc.stdout.readline()
+                except ValueError:
+                    # One line exceeded STREAM_LIMIT. The reader keeps the
+                    # buffered data, so subsequent readline() calls drain the
+                    # oversized line in fragments — each fails JSON parsing and
+                    # is skipped. Degrade gracefully instead of killing the
+                    # turn (C1).
+                    logger.warning(
+                        "app-server emitted a line longer than %d bytes; skipping it",
+                        STREAM_LIMIT,
+                    )
+                    continue
+                if not raw:
+                    break
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
@@ -367,7 +389,14 @@ class AppServerClient:
     async def _read_stderr(self) -> None:
         proc = self._proc
         assert proc is not None and proc.stderr is not None
-        async for raw in proc.stderr:
+        while True:
+            try:
+                raw = await proc.stderr.readline()
+            except ValueError:
+                logger.warning("app-server stderr line exceeded stream limit; skipping")
+                continue
+            if not raw:
+                break
             line = raw.decode("utf-8", errors="replace").rstrip()
             if line:
                 self._stderr_tail.append(line)

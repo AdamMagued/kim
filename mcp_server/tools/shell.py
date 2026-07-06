@@ -17,6 +17,7 @@ import os
 import logging
 import re
 import shlex
+import signal
 import tempfile
 
 from mcp_server.config import SHELL_SANDBOX_MODE, SHELL_TIMEOUT, validate_path, PROJECT_ROOT
@@ -152,6 +153,24 @@ def _sandbox_env() -> dict[str, str]:
     return {key: value for key, value in env.items() if value}
 
 
+def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """Kill the subprocess and, on POSIX, its whole process group (L4).
+
+    Requires the child to have been spawned with ``start_new_session=True``;
+    otherwise falls back to killing just the immediate child.
+    """
+    try:
+        if not IS_WINDOWS and hasattr(os, "killpg"):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 def _basename(token: str) -> str:
     return token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
 
@@ -168,9 +187,15 @@ def _first_non_option(tokens: list[str], start: int = 0) -> str | None:
     return None
 
 
-def _check_single_segment(cmd: str) -> str | None:
+def _check_single_segment(cmd: str, powershell: bool = False) -> str | None:
     """Vet one already-isolated command segment (no chaining metacharacters
-    expected at this level).  Returns an error string or None if safe."""
+    expected at this level).  Returns an error string or None if safe.
+
+    ``powershell=True`` relaxes the POSIX-substitution checks that collide
+    with PowerShell's own grammar (M2): the backtick is PS's *escape*
+    character (`` `n `` == newline) and ``$( )`` is its subexpression syntax,
+    not sh command substitution — the script never reaches /bin/sh.
+    """
     cmd_clean = cmd.strip()
     if not cmd_clean:
         return None
@@ -183,7 +208,7 @@ def _check_single_segment(cmd: str) -> str | None:
     # survive as literal characters and execute via /bin/sh.  Block here so
     # that `echo \`rm -rf /tmp/x\`` is caught even when allow_chaining=True
     # (finding 1b — backtick stays in one segment after operator split).
-    if "`" in cmd_clean:
+    if "`" in cmd_clean and not powershell:
         return "BLOCKED: Command contains backtick command substitution"
 
     try:
@@ -208,9 +233,12 @@ def _check_single_segment(cmd: str) -> str | None:
             )
 
     # Detect process/command substitution tokens that may survive operator
-    # splitting (e.g. the <(rm ...) token in `cat <(rm ...)`) (finding 1)
+    # splitting (e.g. the <(rm ...) token in `cat <(rm ...)`) (finding 1).
+    # In PowerShell mode `$(…)` is the subexpression syntax (M2), but
+    # process substitution `<(`/`>(` has no PS meaning and stays blocked.
+    blocked_prefixes = ("<(", ">(") if powershell else ("<(", ">(", "$(")
     for token in tokens:
-        if token.startswith(("<(", ">(", "$(")):
+        if token.startswith(blocked_prefixes):
             return "BLOCKED: Command contains process or command substitution"
 
     # Redirection to an absolute path or parent-directory traversal is blocked
@@ -294,7 +322,9 @@ def _check_single_segment(cmd: str) -> str | None:
                 return f"BLOCKED: '{wrapped_name}' is a blocked command"
             wrapped_index = next(i for i in range(1, len(tokens)) if tokens[i] == wrapped)
             if wrapped_name in {"sudo", "doas", "command", "env", "nohup", "nice", "time", "sh", "bash", "zsh", "fish"}:
-                nested_msg = _check_single_segment(" ".join(tokens[wrapped_index:]))
+                nested_msg = _check_single_segment(
+                    " ".join(tokens[wrapped_index:]), powershell=powershell
+                )
                 if nested_msg:
                     return f"BLOCKED: wrapper contains blocked command. {nested_msg}"
             # busybox can proxy `find` — apply find-specific -delete/-exec checks
@@ -323,8 +353,13 @@ def _check_single_segment(cmd: str) -> str | None:
     return None
 
 
-def _check_blocked(cmd: str, allow_chaining: bool = False) -> str | None:
-    """Check if a command should be blocked. Returns an error message or None."""
+def _check_blocked(cmd: str, allow_chaining: bool = False, powershell: bool = False) -> str | None:
+    """Check if a command should be blocked. Returns an error message or None.
+
+    ``powershell=True`` vets a PowerShell script: POSIX-only substitution
+    checks (backtick, ``$( )``) are relaxed because they are ordinary PS
+    syntax (M2); the deny-command and redirect checks still apply.
+    """
     cmd_stripped = cmd.strip()
 
     # 1. Check for dangerous regex patterns in raw command
@@ -352,13 +387,13 @@ def _check_blocked(cmd: str, allow_chaining: bool = False) -> str | None:
         # between security and a full POSIX-shell parse.
         segments = _OPERATOR_SPLIT_RE.split(cmd_stripped)
         for raw_seg in segments:
-            seg_msg = _check_single_segment(raw_seg)
+            seg_msg = _check_single_segment(raw_seg, powershell=powershell)
             if seg_msg:
                 return seg_msg
         return None
 
     # 4. No metacharacters detected: vet as a single command segment
-    return _check_single_segment(cmd_stripped)
+    return _check_single_segment(cmd_stripped, powershell=powershell)
 
 
 async def handle_run_command(args: dict) -> str:
@@ -414,11 +449,13 @@ async def handle_run_command(args: dict) -> str:
             stderr=asyncio.subprocess.PIPE,
             cwd=exec_cwd,
             env=env,
+            # Own process group so a timeout kill reaches grandchildren too (L4).
+            start_new_session=not IS_WINDOWS,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_process_tree(proc)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2)
             except asyncio.TimeoutError:
@@ -458,7 +495,9 @@ async def handle_run_powershell(args: dict) -> str:
     # sandbox_mode is operator/server-config-only — never from model args (finding 2).
     sandbox_mode = _sandbox_enabled()
 
-    block_msg = _check_blocked(script, allow_chaining=True)  # PS scripts naturally chain
+    # PS scripts naturally chain; powershell=True relaxes the POSIX-only
+    # backtick/$() substitution checks that are ordinary PS syntax (M2).
+    block_msg = _check_blocked(script, allow_chaining=True, powershell=True)
     if block_msg:
         logger.warning("run_powershell BLOCKED")
         return block_msg
@@ -509,11 +548,13 @@ async def handle_run_powershell(args: dict) -> str:
             stderr=asyncio.subprocess.PIPE,
             cwd=exec_cwd,
             env=env,
+            # Own process group so a timeout kill reaches grandchildren too (L4).
+            start_new_session=not IS_WINDOWS,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_process_tree(proc)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2)
             except asyncio.TimeoutError:

@@ -13,10 +13,18 @@ _MAX_INTERVAL = 5.0
 async def handle_type_text(args: dict) -> str:
     if is_privacy_paused():  # K9
         return PRIVACY_ERROR
+    import asyncio
     import pyautogui
     import pyperclip
     import sys
     text = str(args["text"])
+    # L7: don't permanently clobber the user's clipboard (which may hold a
+    # password) — save it and restore it after the paste lands.
+    previous_clipboard: str | None = None
+    try:
+        previous_clipboard = pyperclip.paste()
+    except Exception:  # noqa: BLE001 — clipboard read may fail; typing still works
+        previous_clipboard = None
     try:
         pyperclip.copy(text)
         if sys.platform == "darwin":
@@ -28,6 +36,15 @@ async def handle_type_text(args: dict) -> str:
     except Exception as e:
         logger.error(f"type_text failed: {e}", exc_info=True)
         return f"ERROR: {e}"
+    finally:
+        if previous_clipboard is not None:
+            # Give the target app a beat to consume the paste before the
+            # clipboard flips back.
+            await asyncio.sleep(0.5)
+            try:
+                pyperclip.copy(previous_clipboard)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def handle_hotkey(args: dict) -> str:

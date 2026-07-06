@@ -125,7 +125,9 @@ async def handle_search_in_files(args: dict) -> str:
             cmd.extend([f"--context={context_lines}"])
         if include:
             cmd.extend(["--glob", include])
-        cmd.extend(["--max-count=500", pattern, search_dir])
+        # "--" ends option parsing so patterns starting with "-" (e.g.
+        # "->getValue") are not misread as rg flags (M3).
+        cmd.extend(["--max-count=500", "--", pattern, search_dir])
 
         logger.info(f"search_in_files [rg]: pattern={pattern!r} path={search_dir}")
         return await _run_search_cmd(cmd, cwd=search_dir, timeout=timeout)
@@ -141,7 +143,8 @@ async def handle_search_in_files(args: dict) -> str:
             cmd.extend([f"-C{context_lines}"])
         if include:
             cmd.extend(["--include", include])
-        cmd.extend([pattern, search_dir])
+        # "--" ends option parsing for dash-leading patterns (M3).
+        cmd.extend(["--", pattern, search_dir])
 
         logger.info(f"search_in_files [grep]: pattern={pattern!r} path={search_dir}")
         return await _run_search_cmd(cmd, cwd=search_dir, timeout=timeout)

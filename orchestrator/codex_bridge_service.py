@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import concurrent.futures
 import json
 import logging
 import os
@@ -28,8 +29,9 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 from orchestrator.events_gen import (
     LOG_TAG_ERROR,
@@ -81,6 +83,33 @@ _REPO = _HERE.parent
 _LOCAL_PROXY_KEY = "kim-proxy-key"
 
 logger = logging.getLogger("kim.codex_bridge_service")
+
+# asyncio's default StreamReader limit is 64 KiB per line. `codex exec --json`
+# emits whole tool results (e.g. a large file read) as ONE JSON line, which
+# blows past that and raises ValueError out of the stream iterator, killing
+# the task with "Codex bridge error: Separator is found…" (C1).
+_STREAM_LIMIT = 16 * 1024 * 1024
+
+
+async def _iter_stream_lines(stream: asyncio.StreamReader) -> AsyncIterator[str]:
+    """Yield decoded lines from a subprocess stream, tolerating over-limit lines.
+
+    A line longer than the StreamReader limit makes ``readline()`` raise
+    ``ValueError``; the buffered data survives, so continuing drains the
+    oversized line in fragments instead of crashing the whole run (C1).
+    """
+    while True:
+        try:
+            raw = await stream.readline()
+        except ValueError:
+            logger.warning(
+                "codex subprocess emitted a line longer than %d bytes; skipping it",
+                _STREAM_LIMIT,
+            )
+            continue
+        if not raw:
+            return
+        yield raw.decode("utf-8", errors="replace").rstrip()
 
 # ── Module-level cleanup state ────────────────────────────────────────────────
 
@@ -211,6 +240,47 @@ def _is_git_repo(cwd: str) -> bool:
     return False
 
 
+# One owned stdin read at a time (C2). A timed-out approval used to orphan a
+# run_in_executor(readline) thread that later STOLE the decision line meant
+# for the next approval (silently cascading declines) and blocked interpreter
+# shutdown. Instead: a single pending read is parked here on timeout and
+# reused by the next prompt; a decision that arrives AFTER its prompt already
+# timed out is discarded, never applied to a later approval.
+_pending_stdin_read: Optional["concurrent.futures.Future[str]"] = None
+
+
+def _begin_stdin_read() -> "concurrent.futures.Future[str]":
+    """Return the future for the single in-flight stdin readline.
+
+    Reuses a still-pending read left behind by a timed-out prompt (so the
+    reader never doubles up on stdin); discards an already-completed one (a
+    late decision belonging to the previous, timed-out approval).
+    """
+    global _pending_stdin_read  # noqa: PLW0603
+    fut = _pending_stdin_read
+    if fut is not None and fut.done():
+        logger.warning("Discarding stale HITL decision from a timed-out prompt")
+        _pending_stdin_read = None
+        fut = None
+    if fut is None:
+        fut = concurrent.futures.Future()
+
+        def _read(target: "concurrent.futures.Future[str]" = fut) -> None:
+            try:
+                line = sys.stdin.readline()
+            except Exception as exc:  # noqa: BLE001
+                if not target.cancelled():
+                    target.set_exception(exc)
+                return
+            if not target.cancelled():
+                target.set_result(line)
+
+        # Daemon thread: a read that never completes must not block exit.
+        threading.Thread(target=_read, name="kim-hitl-stdin", daemon=True).start()
+        _pending_stdin_read = fut
+    return fut
+
+
 async def _await_hitl_decision(timeout: float = 120.0) -> bool:
     """Block on stdin for a {"approved": bool} line from the Rust supervisor.
 
@@ -218,18 +288,27 @@ async def _await_hitl_decision(timeout: float = 120.0) -> bool:
     {"type": "hitl_approve", "approved": bool} to our stdin.  Returns True only
     on an explicit approval; any error/timeout denies.
     """
-    import asyncio
-
-    loop = asyncio.get_running_loop()
+    global _pending_stdin_read  # noqa: PLW0603
+    fut = _begin_stdin_read()
     try:
+        # shield: a timeout must not cancel the underlying read — the parked
+        # future is what lets the NEXT prompt pick the stream back up (C2).
         line: str = await asyncio.wait_for(
-            loop.run_in_executor(None, sys.stdin.readline),
-            timeout=timeout,
+            asyncio.shield(asyncio.wrap_future(fut)), timeout=timeout
         )
+    except asyncio.TimeoutError:
+        logger.warning("HITL stdin read timed out — denying")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        _pending_stdin_read = None
+        logger.warning("HITL stdin read failed (%s) — denying", exc)
+        return False
+    _pending_stdin_read = None
+    try:
         data = json.loads(line.strip())
         return bool(data.get("approved", False))
     except Exception as exc:  # noqa: BLE001
-        logger.warning("HITL stdin read failed (%s) — denying", exc)
+        logger.warning("HITL stdin decision malformed (%s) — denying", exc)
         return False
 
 
@@ -551,20 +630,19 @@ async def _run_async(args: argparse.Namespace) -> int:
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    limit=_STREAM_LIMIT,
                 )
                 _active_process = process
 
                 async def _stream_stdout() -> None:
                     assert process.stdout
-                    async for raw in process.stdout:
-                        line = raw.decode("utf-8", errors="replace").rstrip()
+                    async for line in _iter_stream_lines(process.stdout):
                         if line:
                             print(line, flush=True)
 
                 async def _drain_stderr() -> None:
                     assert process.stderr
-                    async for raw in process.stderr:
-                        line = raw.decode("utf-8", errors="replace").rstrip()
+                    async for line in _iter_stream_lines(process.stderr):
                         if line:
                             logger.debug("codex stderr: %s", line)
                             # Surface codex subprocess errors to the Kim activity feed.

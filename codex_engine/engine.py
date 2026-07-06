@@ -355,6 +355,8 @@ class _CodexProxy:
         self._last_tool_commands: Optional[tuple] = None  # last relay's tool-call signature (loop guard)
         # Cache: hash(json(prefix_items)) → summary_item dict
         # Avoids re-summarizing the same prefix on every Codex turn.
+        # Bounded (C5): one entry per distinct compacted prefix would
+        # otherwise accrete forever in a long app-server session.
         self._compaction_cache: dict[int, dict] = {}
         # Per-run cryptographically random bearer token (#47).
         # Codex receives it via OPENAI_API_KEY in env; the proxy verifies it on
@@ -372,6 +374,14 @@ class _CodexProxy:
         this there is a harmless no-op.
         """
         self._relay_count = 0
+
+    _COMPACTION_CACHE_MAX = 32
+
+    def _cache_compaction(self, key: int, value: dict) -> None:
+        """Insert into the compaction cache with FIFO eviction (C5)."""
+        self._compaction_cache[key] = value
+        while len(self._compaction_cache) > self._COMPACTION_CACHE_MAX:
+            self._compaction_cache.pop(next(iter(self._compaction_cache)))
 
     def _check_auth(self, request) -> bool:
         """Return True iff the request carries the correct bearer token (#47)."""
@@ -843,7 +853,7 @@ class _CodexProxy:
             "content": f"[CONTEXT SUMMARY — previous conversation compacted]\n{compressed}",
         }
 
-        self._compaction_cache[prefix_key] = summary_msg
+        self._cache_compaction(prefix_key, summary_msg)
         print(f"{LOG_TAG_STATUS} Context compacted — summary is {len(compressed)} chars", flush=True)
 
         return system_msgs + [summary_msg] + list(to_keep)
@@ -913,7 +923,7 @@ class _CodexProxy:
             ],
         }
 
-        self._compaction_cache[prefix_key] = summary_item
+        self._cache_compaction(prefix_key, summary_item)
 
         print(f"{LOG_TAG_STATUS} Context compacted — summary is {len(compressed)} chars", flush=True)
         logger.info(f"[compaction] Done. Summary: {len(compressed)} chars")
@@ -1923,6 +1933,11 @@ def _make_responses_tool_reply(resp_id: str, text: str, tool_calls: list) -> dic
 
 
 # ── Output parsing & surfacing ───────────────────────────────────────────────
+# C4 NOTE: _surface_codex_output / _extract_final_answer / _emit_bridge_answer
+# below have no live callers today, but the codegen contract test
+# (tests/test_events_codegen.py) asserts engine.py references LOG_TAG_TOOL and
+# LOG_TAG_ANSWER — these are their only users. Removing them would break that
+# guard, so the dead-code cleanup (a Low finding) is intentionally skipped.
 
 
 def _surface_codex_output(stdout_text: str) -> None:
@@ -1999,3 +2014,5 @@ def _emit_bridge_answer(answer: str) -> None:
     cleaned = answer.strip()
     if cleaned:
         print(f"{LOG_TAG_ANSWER} {json.dumps(cleaned, ensure_ascii=False)}", flush=True)
+
+

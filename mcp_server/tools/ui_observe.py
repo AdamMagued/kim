@@ -113,7 +113,8 @@ def _parse_elements(raw: str) -> tuple[str, str, list[UIElement]]:
     seen: set[tuple[str, str, int, int, int, int]] = set()
     for line in lines[1:]:
         parts = line.split("\t")
-        if len(parts) < 9 or parts[0] != "EL":
+        # 10 fields required: parts[6:10] unpacks four bounds values (L2).
+        if len(parts) < 10 or parts[0] != "EL":
             continue
         role = _clean(parts[2], 48)
         name = _clean(parts[3])
@@ -133,7 +134,9 @@ def _parse_elements(raw: str) -> tuple[str, str, list[UIElement]]:
 
 def _format_observation(app: str, window: str, elements: list[UIElement], limit: int) -> str:
     global _LAST_ELEMENTS
-    _LAST_ELEMENTS = {el.element_id: el for el in elements[:limit]}
+    # Rebuilt below from the SAME sorted/limited set that gets printed, so
+    # every displayed element id is actually clickable (M1).
+    _LAST_ELEMENTS = {}
 
     lines = [
         "STRUCTURED_UI_OBSERVATION",
@@ -180,6 +183,10 @@ def _format_observation(app: str, window: str, elements: list[UIElement], limit:
         elements,
         key=lambda el: (role_order.get(el.role, 9), el.y, el.x, el.element_id),
     )[:limit]
+    # Click map == displayed set (M1): before, it held the first `limit`
+    # elements in DOCUMENT order while the printout showed the role-sorted
+    # top `limit`, so a shown id could be "Unknown element_id" to click_ui.
+    _LAST_ELEMENTS = {el.element_id: el for el in sorted_elements}
 
     for el in sorted_elements:
         label = el.name or el.description or el.value or "(unlabeled)"
