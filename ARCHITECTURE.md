@@ -118,6 +118,31 @@ The 5 distinct execution layers:
 4. **_CodexProxy (aiohttp)**: Intercepts OpenAI-format API endpoints and maps them to local execution structures.
 5. **Codex CLI & BrowserProvider**: Connects to the browser provider using Chromium Developer Tools Protocol (CDP) to drive prompts in the live browser.
 
+### 4.1 App-server transport (`codex_bridge.transport: app-server`)
+
+Behind a config flag (default is still `exec`), layer 5 is replaced by
+`codex app-server` — newline-delimited JSON-RPC over stdio (client:
+`codex_engine/app_server.py`; transport: `orchestrator/codex_appserver_transport.py`):
+
+```
+codex_bridge_service.py ── transport branch
+  → AppServerClient (codex app-server, JSON-RPC 2.0)
+      thread/resume(codex_thread_id from the sidecar) or thread/start
+      → one turn/start per user message
+      → notifications → typed Kim events (plan/output/diff/tokens/deltas)
+      → item/commandExecution/requestApproval → kim:command-approval-request
+         → BLOCKS on the stdin decision line {type: approval_decision, id, decision}
+  → _CodexProxy unchanged (model calls still go to the browser LLM)
+```
+
+What changes vs `exec`: native per-command approvals (accept /
+acceptForSession / decline) inside a `workspace-write` sandbox
+(`KIM_CODEX_BYPASS_SANDBOX` is ignored on this path); true session resume via
+the persisted `codex_thread_id`; the browser is **model-only** — tool
+execution happens natively in codex. Protocol contract is pinned by
+`codex_engine/appserver_schema/` (regenerate + re-probe with
+`scripts/probe_appserver.py` on codex upgrades).
+
 ---
 
 ## 5. Browser Provider Mechanics

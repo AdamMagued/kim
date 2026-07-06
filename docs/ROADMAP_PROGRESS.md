@@ -517,3 +517,214 @@ the real app" mile:
 8. **CLI clippy is still not in CI** and still has ~5 pre-existing
    `config.rs`/`sessions.rs` lints (untouched). The A4 split added zero new
    lints; keep it that way if you touch `cli/src/provider/`.
+
+---
+
+## Phase 3 — App-server parity — CODE-COMPLETE (2026-07-06, branch `feat/roadmap-to-10`)
+
+Seven commits on top of Phase 2 (`a11bcca`). **This was the final phase: the
+P0–P3 program is code-complete.** Everything from
+`docs/PROPOSAL_codex_appserver_parity.md` Parts 0–5 landed, plus the Rb1 /
+Rb3 / Rb6 / S5 fold-ins. The legacy `exec` transport remains the default and
+untouched-green; the entire migration is additive behind
+`codex_bridge.transport: app-server`.
+
+1. **Part 0** `9264080` — transport flag, schema snapshot, probe script.
+2. **Part 1** `6a526bd` — `AppServerClient` + fake-server tests (16).
+3. **Part 3** `adf878f` — 10 typed Kim events (K5 codegen) + Rust forwarding.
+4. **Part 2 (KEYSTONE)** `cf19abb` — app-server transport in the service.
+5. **Rb1 + Rb3** `a203bb6` — repair metrics + browser auth-wall fail-fast.
+6. **Part 4** `2c85087` — CLI approval prompt / streams / interrupt.
+7. **Part 5** `a169f7a` — Tauri approval cards / plan / output / diff.
+
+### Part 0 — groundwork
+
+- `config.yaml.example` → `codex_bridge:` gains `transport: exec|app-server`
+  (default `exec`), `sandbox_mode` (workspace-write), `approval_policy`
+  (on-request), `approval_timeout_s` (120), `codex_compact_tokens` (300k).
+- `codex_engine/appserver_schema/`: the JSON-RPC protocol schema bundle
+  generated from **codex-cli 0.134.0** (`codex app-server
+  generate-json-schema`), plus `VERSION` (the drift pin) and
+  `SAMPLE_TURN.jsonl` (see Part 1).
+- `scripts/probe_appserver.py`: re-runnable JSON-RPC dump probe. Server
+  requests are ALWAYS auto-declined. `--canned` spins a loopback
+  Responses-API model so a full turn runs offline; `--escalate` forces a real
+  approval request. **Re-run this + regenerate the schema on every codex
+  upgrade.**
+
+### Part 1 — protocol client + P2 probe results (important facts)
+
+- `codex_engine/app_server.py`: newline-JSON-RPC client — id-correlated
+  `request()`, `events()` stream of `Notification | ServerRequest`,
+  `respond()`, graceful stop (stdin-EOF → SIGTERM → SIGKILL) with
+  auto-decline of outstanding approvals, stderr ring buffer, tolerant
+  parsing. Version gate: `check_schema_drift` refuses MAJOR drift vs the
+  snapshot, warns on minor.
+- **Probe P2 findings (recorded live, 2026-07-06, codex-cli 0.134.0):**
+  - `initialize` must send `capabilities: {experimentalApi: true}` — then the
+    **v2** approval methods arrive: `item/commandExecution/requestApproval` /
+    `item/fileChange/requestApproval` (server→client REQUESTS; params include
+    `command, cwd, reason, commandActions, proposedExecpolicyAmendment,
+    availableDecisions`). Response: `{"decision": accept | acceptForSession |
+    decline | cancel}`. v1 (`execCommandApproval`, vocab
+    `approved|approved_for_session|denied`) still handled defensively.
+  - The exec tool codex exposes to the model is **`exec_command`**
+    (`{"cmd": string, sandbox_permissions?, justification?}`); the name
+    `shell` is rejected ("unsupported call: shell").
+  - In `workspace-write`, an in-workspace command runs with NO approval;
+    escalation (`sandbox_permissions: "require_escalated"` or network) is
+    what triggers the approval request.
+  - `SAMPLE_TURN.jsonl` is a redacted real transcript of one canned turn
+    including the approval round-trip — the golden-test input.
+
+### Part 2 — the transport (keystone)
+
+- `orchestrator/codex_appserver_transport.py` (new, ~600 lines):
+  `run_app_server_task()` — version gate → `proxy.begin_turn()` (Rb6:
+  MAX_RELAYS is now per-turn) → spawn `codex app-server` with the minimal
+  env allowlist + `CODEX_API_KEY=<proxy bearer>` + **forwarded
+  `KIM_APPROVAL_SOCK`/`KIM_APPROVAL_TCP`** (Phase-2 gotcha #2 honored) and
+  **no CODEX_HOME override** (user's real `~/.codex` MCP servers/skills
+  apply) → `thread/resume(codex_thread_id)` when the sidecar id + cwd match
+  (any failure falls back to `thread/start`; id persisted immediately) →
+  ONE `turn/start` → event pump → typed Kim events.
+- Approvals BLOCK on the existing stdin decision channel:
+  `{"type":"approval_decision","id":…,"decision":…}` (legacy
+  `{"approved":bool}` still accepted). Timeout (config, 120s), non-interactive
+  env (no `KIM_TAURI_MODE`, no `KIM_STDIN_APPROVALS`, stdin not a TTY), and
+  unknown server requests → safest decline. `KIM_STDIN_APPROVALS=1` is the
+  CLI's "someone is listening" signal (a pipe can't be told from /dev/null).
+- **S5 done:** on this path `KIM_CODEX_BYPASS_SANDBOX` is IGNORED (with a
+  status note). Full-auto permission mode maps to `approvalPolicy: never`
+  INSIDE `workspace-write`; ask-modes keep `on-request`.
+- SIGTERM → `turn/interrupt` (3s grace) → hard stop. Tauri's cancel already
+  SIGTERMs first, so the app's Stop button gets graceful interrupts free.
+- Sidecar (`codex_engine/thread_state.py`): new `codex_thread_id` /
+  `codex_thread_cwd` (+ Rb1 `repairs` counters). `reset_thread_state`
+  PRESERVES the codex keys — browser-thread resets must not amnesia codex's
+  own transcript; they are independent context budgets.
+- Codex-side compaction: `thread/tokenUsage/updated` over
+  `codex_compact_tokens` fires `thread/compact/start` once per run; the
+  `/compact` control task now compacts BOTH the browser thread and
+  (best-effort) codex's transcript.
+- The outward contract is unchanged: `TASK_COMPLETE:` final line +
+  `emit_answer`; `_CodexProxy` byte-identical semantics (all stateful-thread
+  suites untouched and green).
+
+### Part 3 — typed events
+
+`events.schema.json` + regen: `kim:command-approval-request`,
+`kim:file-change-approval-request`, `kim:command-output`,
+`kim:assistant-delta`, `kim:reasoning-delta` (provider names scrubbed),
+`kim:plan-update`, `kim:diff-update`, `kim:token-usage`,
+`kim:item-lifecycle`, `kim:turn-lifecycle`. `subprocess.rs` forwards all 10
+(exhaustive `KimEvent` match). Golden test
+(`tests/test_appserver_golden.py`): `SAMPLE_TURN.jsonl` in → exact ordered
+typed-event sequence out.
+
+### Part 4 — CLI
+
+Bridge child now gets piped stdin (`KIM_STDIN_APPROVALS=1`); REPL decisions
+flow through `CodexTurnControl`; typed events map onto 6 new `AppEvent`
+variants; approval prompt is `Allow? [y]es once / [a]lways this session /
+[n]o` (default deny); dim capped command output, ✓/▸/○ plan checklist,
+one-line diff summary; Ctrl-C = SIGTERM-interrupt + 5s grace, then the old
+hard kill. Final answer deduped (streamed deltas vs `TASK_COMPLETE`).
+New modules (size gate): `cli/src/repl_turn.rs`,
+`cli/src/provider/typed_events.rs`.
+
+### Part 5 — Tauri
+
+`hitl.rs` owns the new `approval_decision` line too
+(`respond_approval_decision` command; unknown decisions downgrade to
+decline). React: `hooks/useCodexTurn.ts` + `components/chat/CodexTurnPanel.tsx`
+(ApprovalCard with the three decisions, PlanChecklist, CommandOutputBlock,
+DiffSummary; the legacy HITL card moved there as `HitlStatusCard`).
+ChatView wires the hook into StreamRenderer (`codexTurn` prop).
+
+### Rb1 / Rb3 fold-ins
+
+- Rb1: the proxy's re-ask/fence-salvage/quote-tolerance already existed;
+  added the §7.1 visibility piece — `thread_state["repairs"]` counts
+  `salvages` and `nudges` (persisted in the sidecar).
+- Rb3: `site_configs.detect_auth_wall` (login/Cloudflare URL + title
+  markers) — `_run_chat_flow` fails fast with
+  `NEED_HELP: AUTH_REQUIRED — …` instead of the 600s generation-wait hang.
+
+### Suite status at Phase 3 exit (all green, 2026-07-06)
+
+| Suite | Result |
+|---|---|
+| `venv/bin/python -m pytest tests/` | **1659 passed, 39 subtests** (CI-style w/ coverage: 64.24%, gate 55; 3 real-binary tests skip without codex) |
+| `desktop`: `tsc --noEmit` + `npm run test` | **tsc clean; 196 vitest (14 files)** |
+| `desktop/src-tauri`: `cargo test` + `clippy --all-targets -D warnings` | **109 passed; clippy clean** |
+| `cli`: `cargo test` + `fmt --check` | **149 passed (144 + 5 integration); fmt clean** |
+| pyright (bare, 1.1.411 — the unpinned CI version) | **0 errors** |
+| flake8 orchestrator | **clean** |
+| events schema drift / file-size gate | **no drift / OK** |
+
+### Exit criteria — met in code, proven headless
+
+- ✅ With `transport: app-server`: session resume across messages via the
+  persisted `codex_thread_id`, native per-command approvals over the stdin
+  channel — proven by fake-server tests (16), transport flow tests (34),
+  golden translation tests (4), **and 3 real-binary offline smokes**
+  (`tests/test_appserver_real_binary.py`, auto-skip without codex): the REAL
+  `codex app-server` + REAL `_CodexProxy` + canned browser replies executed
+  a command natively in the sandbox, resumed the same thread on message 2,
+  and the native approval decline BLOCKED / accept RAN an escalated command.
+- ✅ Legacy exec path untouched and green (dispatch test pins the default).
+- ✅ Browser is model-only on the app-server path.
+
+### OUTSTANDING — the live GUI/CLI smoke (needs the real app; NOT a code blocker)
+
+Everything below is UX verification of already-tested plumbing. A live agent
+(real `npm run tauri dev` + signed-in browser provider) should run:
+
+1. **Config**: in `config.yaml` set
+   `codex_bridge:\n  transport: app-server` (keep `approval_policy:
+   on-request`, `sandbox_mode: workspace-write`). Restart the app (Rust +
+   config reload).
+2. **Tauri pong smoke**: Code tab → pick a git-repo project folder → browser
+   provider (e.g. `browser:gemini`) → permission mode "ask always" → task:
+   *"make pong.html and open it"*. Expect: the task-level HITL card first
+   (pre-existing gate), then plan/item activity, then — when codex escalates
+   (`open pong.html` needs it, or any network command) — the new
+   **ApprovalCard** (Allow once / Always this session / Deny) with command +
+   cwd + reason. Click *Allow once* → the game opens. Watch
+   `kim:command-output` streaming in the collapsible block and the diff
+   summary line.
+3. **Session resume**: second message *"now add sound"* → the status line
+   "Resumed the previous codex session for this project." and codex
+   remembering what it built (no re-onboarding).
+   `cat kim_sessions/codex_threads/*.json` → `codex_thread_id` present and
+   stable across the two messages.
+4. **Interrupt**: start a long task, hit Stop → "asking codex to interrupt
+   the turn…" then a clean `turn_lifecycle: interrupted` (no zombie
+   `codex app-server` in `ps`).
+5. **CLI mirror**: `kim` → `/code` → browser provider → same pong task in a
+   scratch git repo → terminal approval prompt (`[y]/[a]/[n]`), `y` → game
+   opens; Esc/Ctrl-C mid-turn prints `⏹ interrupting…` and returns to the
+   prompt cleanly.
+6. **Decline path**: repeat with `n` → codex reports the command was declined
+   and finishes without executing it (nothing created outside the repo).
+
+### Gotchas for whoever flips the default (proposal Part 8)
+
+1. The default flip is ONE line (`config.yaml.example` + `_load_config`
+   default in `transport_name`) — but do it only after the live smoke above
+   and a week of local use, per the proposal.
+2. `codex app-server` is EXPERIMENTAL upstream. On any codex upgrade:
+   `codex app-server generate-json-schema --out codex_engine/appserver_schema`
+   + `scripts/probe_appserver.py --turn "…" --canned --escalate` and diff
+   `SAMPLE_TURN.jsonl`. The version gate warns on minor drift, refuses major.
+3. The transport keeps spawn-per-message (thread/resume each time). The
+   persistent-daemon optimization (proposal §7.2) is deliberately NOT built.
+4. `model_reroute`/`thread/rollback`/`turn/steer` and the Part-6 extras
+   (web_search flag, images, /review, thread/list) are unimplemented ceiling.
+5. On the app-server path codex writes real session rollouts under
+   `~/.codex/sessions` (that's what makes resume durable). Ephemeral mode
+   exists (`ephemeral: true` in thread/start) if that's ever unwanted.
+6. Windows: approval channel + env passthrough are wired, but SIGTERM-based
+   interrupt degrades to the hard kill (`send_sigterm` is unix-only) — the
+   service-side handler never fires; codex exits via stdin EOF.
