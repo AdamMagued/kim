@@ -142,6 +142,14 @@ def test_handoff_precedes_history_recap():
     assert handoff_pos < recap_pos
 
 
+def test_handoff_precedes_system_prompt():
+    # The handoff must appear BEFORE the (large) [SYSTEM] block so a fresh chat
+    # anchors on the prior conversation instead of the operating instructions.
+    messages = [{"role": "user", "content": "what did we discuss?"}]
+    prompt, _, _, _ = _fmt(messages, handoff="THE-HANDOFF", system="BIG SYSTEM PROMPT")
+    assert prompt.index("THE-HANDOFF") < prompt.index("[SYSTEM]")
+
+
 def test_no_handoff_block_when_none():
     messages = [{"role": "user", "content": "Task: t"}]
     prompt, _, _, _ = _fmt(messages)

@@ -297,9 +297,13 @@ def format_prompt(
     handoff_block = ""
     if not sent_system_prompt and handoff_summary and handoff_summary.strip():
         handoff_block = (
-            "[HANDOFF FROM PREVIOUS CHAT — this new chat continues an earlier "
-            "conversation that was compacted. Treat it as established context; "
-            "do not re-execute actions it lists as done.]\n"
+            "[HANDOFF FROM PREVIOUS CHAT — READ THIS FIRST]\n"
+            "This chat continues an earlier conversation that was summarized to "
+            "save space. The summary below IS our prior conversation: treat it as "
+            "established context and answer any question about what we discussed "
+            "or did from it. The operating instructions that follow are system "
+            "rules, NOT part of our conversation. Do not re-execute actions the "
+            "summary lists as already done.\n"
             f"{handoff_summary.strip()}\n"
             "[END HANDOFF]\n\n"
         )
@@ -338,15 +342,20 @@ def format_prompt(
 
         if is_codex_bridge:
             prompt = (
+                # Handoff goes FIRST so a fresh chat anchors on the prior
+                # conversation rather than the large [SYSTEM] block below it.
+                f"{handoff_block}"
                 f"[SYSTEM]\n{system}\n"
                 f"{_os_hint}\n\n"
                 + transport_marker_instruction(completion_hash) + "\n\n"
-                f"{handoff_block}"
                 f"{history_block}"
                 f"{last_text}"
             )
         else:
             prompt = (
+                # Handoff goes FIRST so a fresh chat anchors on the prior
+                # conversation rather than the large [SYSTEM] block below it.
+                f"{handoff_block}"
                 f"[SYSTEM]\n{system}\n"
                 f"{_os_hint}\n\n"
                 f"[AVAILABLE TOOLS]\n{tools_json}\n\n"
@@ -382,7 +391,6 @@ def format_prompt(
                 "HTML attributes or code), you MUST escape them (\\\") so the "
                 "JSON is valid.\n"
                 + transport_marker_instruction(completion_hash) + "\n\n"
-                f"{handoff_block}"
                 f"{history_block}"
                 f"{last_text}"
             )
