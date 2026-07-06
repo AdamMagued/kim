@@ -209,6 +209,13 @@ class BrowserProvider(BaseProvider):
         self._last_chat_page_url = None
         self._last_chat_site = None
 
+    def mark_thread_continuation(self) -> None:
+        """Agent-driven (stateful threads): the session's live web-chat thread
+        already received the system prompt on an earlier task, so this process
+        should send only delta messages. Complements the KIM_BROWSER_RESTORE_STATUS
+        heuristic, which only covers restored-thread spawns."""
+        self._sent_system_prompt = True
+
     def _estimate_prompt_usage(self, prompt: str, attachments: list[dict]) -> dict:
         image_count = sum(
             1 for a in attachments
@@ -317,6 +324,7 @@ class BrowserProvider(BaseProvider):
         tools: list[dict] | None = None,
         system: str = "",
         clear_chat: bool = False,
+        handoff: Optional[str] = None,
         **kwargs,
     ) -> dict:
         # Optimize prompt payload: if resuming an existing thread (url restored),
@@ -337,6 +345,7 @@ class BrowserProvider(BaseProvider):
             sent_system_prompt=sent_sys,
             max_inject_chars=self._max_inject_chars,
             use_webview_bridge=self._use_webview_bridge,
+            handoff_summary=handoff,
         )
         self._sent_system_prompt = new_sent
 

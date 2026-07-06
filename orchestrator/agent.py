@@ -84,6 +84,14 @@ logger = logging.getLogger(__name__)
 
 _COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
 
+# Deterministic bridge.js failure signatures for a follow-up send that never
+# registered in a reused browser thread (see bridge.js fail-fast diagnostics).
+# Stateful mode retries these once on a fresh chat instead of dying.
+_BROWSER_SEND_FAILURE_RE = re.compile(
+    r"Send did not register|No response turn detected",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # OS detection (extracted to orchestrator/agent_env.py)
@@ -196,6 +204,21 @@ class KimAgent:
         # refreshing/clearing the browser thread on the next actual user task;
         # API providers simply start from the reset Kim memory.
         self._clear_chat_on_next_call = bool(context_state.get("needs_fresh_chat"))
+        # ── Stateful browser threads ────────────────────────────────────
+        # When browser_provider.stateful_threads is on, a Kim session maps to
+        # ONE web-chat thread: the system prompt is sent once (first task),
+        # follow-up tasks are delta messages, and near the context budget the
+        # thread compacts itself and rolls over to a fresh chat seeded with
+        # the model-written handoff.
+        _bp_cfg = config.get("browser_provider") or {}
+        self._browser_stateful = bool(_bp_cfg.get("stateful_threads", False))
+        self._browser_compact_at_ratio = float(_bp_cfg.get("compact_at_ratio", 0.80))
+        self._browser_max_thread_turns = int(_bp_cfg.get("max_thread_turns", 40))
+        self._browser_thread_turns = int(context_state.get("browser_thread_turns") or 0)
+        self._browser_thread_nonce = str(context_state.get("browser_thread_nonce") or "")
+        self._browser_continuing_thread = False
+        self._pending_handoff: Optional[str] = None
+        self._thread_send_failures = 0
 
     def set_ui_bridge(self, bridge: Optional[UIBridge]) -> None:
         self._ui_bridge = bridge
@@ -222,6 +245,17 @@ class KimAgent:
     _last_done_signature: str = ""
     _current_plan_steps: list[str] = []
     _current_step_index: int = 0
+
+    # Stateful browser-thread defaults (class-level so partially-wired test
+    # agents built with object.__new__ keep working; __init__ overrides them).
+    _browser_stateful: bool = False
+    _browser_compact_at_ratio: float = 0.80
+    _browser_max_thread_turns: int = 40
+    _browser_thread_turns: int = 0
+    _browser_thread_nonce: str = ""
+    _browser_continuing_thread: bool = False
+    _pending_handoff: Optional[str] = None
+    _thread_send_failures: int = 0
 
     def _emit_plan_markers(self, content: str) -> None:
         """Detect PLAN: / STEP n: markers in an assistant text turn and forward
@@ -366,7 +400,11 @@ class KimAgent:
         if snapshot is None:
             return
         self._persist_context_state_extra(
-            {"needs_fresh_chat": self._clear_chat_on_next_call},
+            {
+                "needs_fresh_chat": self._clear_chat_on_next_call,
+                "browser_thread_turns": self._browser_thread_turns,
+                "browser_thread_nonce": self._browser_thread_nonce,
+            },
             snapshot=snapshot,
         )
         self._log("INFO", snapshot.to_log_line())
@@ -522,6 +560,10 @@ class KimAgent:
         else:
             self.memory.clear()
 
+        # Decide whether this task continues the session's browser thread or
+        # starts a fresh one (stateful mode), or always starts fresh (legacy).
+        self._decide_browser_thread(has_prior_history=len(self.memory) > 0)
+
         try:
             await self._refresh_tools()
             if not self._tools:
@@ -531,7 +573,15 @@ class KimAgent:
                     "",
                 ))
             self._emit_context_snapshot()
-            system_prompt = self._build_system_prompt(task)
+            # Pass the per-thread nonce only when one is active (stateful
+            # browser threads) — the default call stays kwarg-free so tests
+            # that stub _build_system_prompt(task) keep working.
+            if self._browser_thread_nonce:
+                system_prompt = self._build_system_prompt(
+                    task, nonce=self._browser_thread_nonce
+                )
+            else:
+                system_prompt = self._build_system_prompt(task)
         except Exception as _startup_err:
             self._log("ERROR", f"Agent startup failed: {_startup_err}")
             return self._complete_run(make_run_result(
@@ -557,6 +607,14 @@ class KimAgent:
         # open-window fallback for paths/models where the image cannot reach the model.
         first_content: Any = f"Task: {task}"   # what is shown in the chat bubble
         llm_first_content: Any = None          # what the model receives, when it differs
+        # Continuing a stateful browser thread: the thread's system prompt was
+        # sent on an earlier task with per-THREAD nonce markers, so wrap this
+        # task in the same markers to keep the prompt-injection defense
+        # coherent for delta messages. The bubble copy stays clean.
+        llm_task_text = f"Task: {task}"
+        if self._browser_continuing_thread:
+            llm_task_text = "Task:\n" + self._wrap_task_for_thread(task)
+            llm_first_content = llm_task_text
         if _uses_proactive_visual_context(self.provider, task):
             # Visual question on a browser web-chat model. Capture the screen and:
             #   1. attach it as an IMAGE so the bridge can paste it into the chat with a
@@ -585,7 +643,7 @@ class KimAgent:
                 if shot_b64:
                     self._run_screenshot_b64 = shot_b64
                     img_block = {"type": "image", "data": shot_b64, "media_type": "image/png"}
-                ctx = [f"Task: {task}"]
+                ctx = [llm_task_text]
                 if shot_b64:
                     ctx.append(
                         "\nA screenshot of my screen is attached. If you can access the image, "
@@ -616,13 +674,14 @@ class KimAgent:
         )
         self._session_store.append_message(first_msg)
 
-        # Browser web-chat threads submit reliably only on a FRESH chat: the first
-        # message of a session always sends, but submitting a follow-up into a reused
-        # thread is flaky — Gemini's send button doesn't always register programmatic
-        # input (diagnosed: prompt stuck in the editor, send never fires). The browser
-        # provider is free (no API tokens), so starting every message on a fresh chat
-        # and re-sending context is the right trade: reliable > the payload saving.
-        if type(self.provider).__name__ == "BrowserProvider":
+        # Legacy default (stateful_threads off): browser web-chat threads submit
+        # reliably only on a FRESH chat — submitting a follow-up into a reused
+        # thread was flaky (Gemini's send button didn't always register
+        # programmatic input), so every message starts a fresh chat and re-sends
+        # context. Stateful mode instead reuses the session's thread (the fresh/
+        # continue decision was made in _decide_browser_thread above) and falls
+        # back to a fresh chat only when a reused-thread send actually fails.
+        if self._is_browser_provider() and not self._browser_stateful:
             self._clear_chat_on_next_call = True
 
         for iteration in range(1, self.max_iterations + 1):
@@ -656,14 +715,26 @@ class KimAgent:
                 if len(call_tools) != len(self._tools):
                     self._log("INFO", "Screenshot attached — withholding screen-read tools on first turn so the answer comes from the image")
 
+            # ── Stateful browser thread rollover ────────────────────────
+            # When the session's web-chat thread nears its context budget (or
+            # the turn cap), ask the thread itself to compact into a handoff,
+            # then continue this task in a fresh chat seeded with it.
+            if (self._browser_stateful
+                    and self._is_browser_provider()
+                    and not self._clear_chat_on_next_call
+                    and self._should_rollover_browser_thread()):
+                await self._rollover_browser_thread(system_prompt)
+                request_messages = self.memory.get_messages()
+
             # ── LLM call with retry ─────────────────────────────────────
             try:
-                clear_chat = self._clear_chat_on_next_call and iteration == 1
+                clear_chat = self._clear_chat_on_next_call
                 response = await self._call_with_retry(
                     messages=request_messages,
                     tools=call_tools,
                     system=system_prompt,
                     clear_chat=clear_chat,
+                    handoff=self._pending_handoff if clear_chat else None,
                 )
             except Exception as e:
                 provider_error = classify_provider_error(e)
@@ -683,6 +754,8 @@ class KimAgent:
             # Compute the request-size estimate lazily — only when the provider
             # did not return exact input_tokens (avoids re-serializing ~50 tool
             # schemas on every iteration when real usage is already available).
+            if self._is_browser_provider():
+                self._browser_thread_turns += 1
             _usage = response.get("usage", {})
             _has_exact_input = bool(
                 _usage.get("input") or _usage.get("input_tokens") or _usage.get("prompt_tokens")
@@ -698,9 +771,30 @@ class KimAgent:
                 fallback_input_tokens=request_estimate,
                 fallback_source=type(self.provider).__name__,
             )
-            if self._clear_chat_on_next_call and iteration == 1:
+            if clear_chat:
                 self._clear_chat_on_next_call = False
+                self._pending_handoff = None
                 self._persist_context_state_extra({"needs_fresh_chat": False})
+
+            # ── Reused-thread send failure → fresh-thread fallback ──────
+            # bridge.js reports a deterministic error when a follow-up send
+            # never registers in a reused thread ("Send did not register" /
+            # "No response turn detected"). In stateful mode, degrade to the
+            # legacy behavior for this call: rebuild a local handoff and retry
+            # once on a fresh chat instead of dying with NEED_HELP.
+            if (self._browser_stateful
+                    and self._is_browser_provider()
+                    and response.get("type") == "text"
+                    and _BROWSER_SEND_FAILURE_RE.search(str(response.get("content", "")))):
+                self._thread_send_failures += 1
+                if self._thread_send_failures <= 1:
+                    self._log(
+                        "WARN",
+                        "[STATUS] Follow-up send failed in the reused thread — retrying on a fresh chat",
+                    )
+                    self._prepare_fresh_thread_fallback()
+                    continue
+                self._log("WARN", "Fresh-chat retry also failed to send; surfacing the provider error")
 
             # ── Tool call ────────────────────────────────────────────────
             if response["type"] == "tool_call":
@@ -1318,6 +1412,7 @@ class KimAgent:
         system: str,
         *,
         clear_chat: bool = False,
+        handoff: Optional[str] = None,
     ) -> dict:
         """
         Call the LLM provider with retry + exponential backoff for:
@@ -1346,6 +1441,8 @@ class KimAgent:
                 kwargs = {}
                 if clear_chat and _provider_accepts_kwarg(self.provider.complete, "clear_chat"):
                     kwargs["clear_chat"] = True
+                if handoff and _provider_accepts_kwarg(self.provider.complete, "handoff"):
+                    kwargs["handoff"] = handoff
                 # Use a provider-aware outer timeout so the cap is never shorter
                 # than the provider's own internal budget.
                 # - BrowserProvider: bridge path polls for up to _BRIDGE_TIMEOUT_S=720s;
@@ -1471,14 +1568,17 @@ class KimAgent:
     # System prompt
     # ------------------------------------------------------------------
 
-    def _build_system_prompt(self, task: str) -> str:
+    def _build_system_prompt(self, task: str, *, nonce: Optional[str] = None) -> str:
         if getattr(self.provider, "lean_system_prompt", False):
             return self._build_lean_system_prompt(task)
 
         tool_names = [t["name"] for t in self._tools]
         # Per-task nonce makes the user-instruction markers unguessable. Tool
         # results, file contents, and web pages cannot forge a matching pair.
-        nonce = secrets.token_hex(16)
+        # Stateful browser threads pass a per-THREAD nonce instead, so that
+        # follow-up tasks (sent as delta messages without a fresh system
+        # prompt) can wrap themselves in markers the thread already trusts.
+        nonce = nonce or secrets.token_hex(16)
         begin = f"<<<BEGIN_USER_INSTRUCTION_{nonce}>>>"
         end = f"<<<END_USER_INSTRUCTION_{nonce}>>>"
         prompt = f"""You are operating as Kim, a local desktop agent controlling a {_OS_NAME} computer through tools.
@@ -1848,6 +1948,176 @@ Rules:
         self._session_store.append_message({"role": "assistant", "content": done})
         return self._complete_run(make_run_result(AgentTermination.TASK_COMPLETE, done))
 
+    # ------------------------------------------------------------------
+    # Stateful browser threads (system prompt once + compact-and-rollover)
+    # ------------------------------------------------------------------
+
+    def _is_browser_provider(self) -> bool:
+        return type(self.provider).__name__ == "BrowserProvider"
+
+    def _decide_browser_thread(self, *, has_prior_history: bool) -> None:
+        """Choose fresh-vs-continue for the session's web-chat thread.
+
+        Stateful mode maps one Kim session to ONE browser thread: the first
+        task of a session starts a fresh thread; follow-up tasks continue it
+        unless a compact/rollover flagged needs_fresh_chat. Legacy mode keeps
+        the fresh-chat-per-message behavior (decided at the call site).
+        """
+        self._browser_continuing_thread = False
+        if not (self._browser_stateful and self._is_browser_provider()):
+            # Never let a stale persisted thread nonce leak into the per-task
+            # nonce of legacy/API-provider runs.
+            self._browser_thread_nonce = ""
+            return
+
+        if not has_prior_history:
+            # New Kim session → new browser thread.
+            self._clear_chat_on_next_call = True
+        elif not self._browser_thread_nonce:
+            # Thread state was lost (context sidecar missing): the markers the
+            # live thread trusts are unknown, so continuing is unsafe for the
+            # injection defense. Start fresh.
+            self._log("INFO", "Browser thread nonce missing — starting a fresh thread")
+            self._clear_chat_on_next_call = True
+
+        if self._clear_chat_on_next_call:
+            self._browser_thread_nonce = secrets.token_hex(16)
+            self._browser_thread_turns = 0
+            self._persist_context_state_extra({
+                "browser_thread_nonce": self._browser_thread_nonce,
+                "browser_thread_turns": 0,
+            })
+        else:
+            self._browser_continuing_thread = True
+            # Tell the provider directly — reset_session() (called just before
+            # this) cleared its flag, and the env-var heuristic only covers
+            # restored-thread spawns.
+            if hasattr(self.provider, "mark_thread_continuation"):
+                self.provider.mark_thread_continuation()
+            self._log(
+                "INFO",
+                f"Continuing browser thread (turn {self._browser_thread_turns}, "
+                "system prompt already sent)",
+            )
+
+    def _wrap_task_for_thread(self, task: str) -> str:
+        """Wrap a follow-up task in the thread's trusted nonce markers."""
+        nonce = self._browser_thread_nonce
+        return (
+            f"<<<BEGIN_USER_INSTRUCTION_{nonce}>>>\n{task}\n"
+            f"<<<END_USER_INSTRUCTION_{nonce}>>>"
+        )
+
+    def _should_rollover_browser_thread(self) -> bool:
+        if len(self.memory) == 0:
+            return False
+        budget = self._context_meter.budget
+        ratio = (self._context_meter.cumulative_input / budget) if budget > 0 else 0.0
+        if ratio >= self._browser_compact_at_ratio:
+            self._log(
+                "INFO",
+                f"Browser thread at {ratio:.0%} of context budget "
+                f"(threshold {self._browser_compact_at_ratio:.0%}) — rolling over",
+            )
+            return True
+        if self._browser_thread_turns >= self._browser_max_thread_turns:
+            self._log(
+                "INFO",
+                f"Browser thread reached {self._browser_thread_turns} turns "
+                f"(cap {self._browser_max_thread_turns}) — rolling over",
+            )
+            return True
+        return False
+
+    async def _rollover_browser_thread(self, system_prompt: str) -> None:
+        """Compact the live thread in-place, then arm a fresh chat seeded with
+        the handoff.
+
+        The thread already holds the full conversation, so the compact request
+        carries no transcript — the thread's own model writes the handoff.
+        Never raises: a failed in-thread compact degrades to the deterministic
+        local summary so the running task always continues.
+        """
+        self._log("INFO", "[STATUS] Browser thread near its limit — compacting into a fresh chat…")
+        summary_text: Optional[str] = None
+        artifact: Optional[dict] = None
+        try:
+            response = await self._call_with_retry(
+                messages=[{"role": "user", "content": build_in_thread_compact_prompt()}],
+                tools=[],
+                system=system_prompt,
+            )
+            self._track_context_usage(
+                response.get("usage", {}),
+                fallback_input_tokens=None,
+                fallback_source=f"{type(self.provider).__name__}:rollover_compact",
+            )
+            raw = str(response.get("content", "")).strip()
+            if raw:
+                artifact = _parse_compact_json(raw)
+                rendered = render_handoff_text(artifact)
+                if rendered.strip():
+                    summary_text = rendered
+        except Exception as e:
+            self._log("WARN", f"In-thread compact failed ({e}); falling back to local summary")
+
+        handoff: Optional[str] = summary_text
+        try:
+            compacted = _compaction.compact_messages(
+                list(self.memory._messages), summary_text=summary_text
+            )
+            self.memory.load_from_messages(compacted)
+            if not handoff:
+                handoff = self.memory.compact_summary
+        except Exception as e:
+            self._log("WARN", f"Local compaction during rollover failed: {e}")
+
+        if artifact:
+            artifact.setdefault("kind", "kim_browser_thread_rollover")
+            artifact.setdefault("source_session_id", self._session_store.session_id)
+            try:
+                self._session_store.save_compact_artifact(artifact)
+            except Exception as e:
+                logger.warning(f"Could not save rollover artifact: {e}")
+
+        self._arm_fresh_browser_thread(handoff)
+        self._log("INFO", "[STATUS] Thread compacted — continuing in a fresh chat")
+
+    def _prepare_fresh_thread_fallback(self) -> None:
+        """Arm a fresh-chat retry after a reused-thread send failure.
+
+        The thread is unresponsive, so no in-thread compact is possible —
+        build the handoff locally instead. Memory keeps the recent tail
+        verbatim, including the message the failed call was trying to send,
+        so the retry re-sends it on the fresh thread.
+        """
+        handoff: Optional[str] = None
+        try:
+            compacted = _compaction.compact_messages(list(self.memory._messages))
+            self.memory.load_from_messages(compacted)
+            handoff = self.memory.compact_summary
+        except Exception as e:
+            self._log("WARN", f"Local compaction for fresh-thread fallback failed: {e}")
+        self._arm_fresh_browser_thread(handoff)
+
+    def _arm_fresh_browser_thread(self, handoff: Optional[str]) -> None:
+        """Shared tail of rollover/fallback: reset meter + flag a seeded fresh chat."""
+        compacted_at = datetime.now(timezone.utc).isoformat()
+        snapshot = self._context_meter.reset_after_compact(compacted_at=compacted_at)
+        self._clear_chat_on_next_call = True
+        self._pending_handoff = handoff or None
+        self._browser_thread_turns = 0
+        self._persist_context_state_extra(
+            {
+                "needs_fresh_chat": True,
+                "browser_thread_turns": 0,
+                "browser_thread_nonce": self._browser_thread_nonce,
+            },
+            snapshot=snapshot,
+        )
+        self._log("INFO", snapshot.to_log_line())
+        self._print_context_json(snapshot)
+
     async def _generate_and_save_summary(self, task: str, result_summary: str) -> None:
         """Save a session summary to disk.
 
@@ -1901,7 +2171,12 @@ def _usage_int(usage: dict, *keys: str) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # Compact prompt helpers (extracted to orchestrator/compact_prompt.py)
 # ---------------------------------------------------------------------------
-from orchestrator.compact_prompt import _build_compact_prompt, _parse_compact_json  # noqa: E402,F401
+from orchestrator.compact_prompt import (  # noqa: E402,F401
+    _build_compact_prompt,
+    _parse_compact_json,
+    build_in_thread_compact_prompt,
+    render_handoff_text,
+)
 
 # ---------------------------------------------------------------------------
 # Convenience context manager

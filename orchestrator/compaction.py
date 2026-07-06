@@ -43,6 +43,7 @@ def should_compact(messages: list[dict], max_tokens: int = MAX_ESTIMATED_TOKENS)
 def compact_messages(
     messages: list[dict],
     preserve_recent: int = PRESERVE_RECENT_MESSAGES,
+    summary_text: str | None = None,
 ) -> list[dict]:
     """Return a compacted list: [system_summary_msg, ...recent_verbatim_msgs].
 
@@ -50,6 +51,10 @@ def compact_messages(
     containing the continuation summary, followed by the most recent
     ``preserve_recent`` messages verbatim.  Raises ValueError if there
     are no messages to compact.
+
+    ``summary_text`` replaces the deterministic local summary when the caller
+    already has a better one (e.g. the browser provider's in-thread compact,
+    where the live thread's own model writes the handoff).
     """
     if not messages:
         raise ValueError("compact_messages: empty message list")
@@ -68,7 +73,7 @@ def compact_messages(
     to_summarize = history[:keep_from]
     to_keep = history[keep_from:]
 
-    new_summary = _summarize_messages(to_summarize)
+    new_summary = summary_text.strip() if summary_text and summary_text.strip() else _summarize_messages(to_summarize)
     if existing_summary:
         merged = _merge_summaries(existing_summary, new_summary)
     else:

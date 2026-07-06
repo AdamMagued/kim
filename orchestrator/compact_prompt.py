@@ -44,6 +44,48 @@ def _build_compact_prompt(messages: list[dict]) -> str:
     )
 
 
+def build_in_thread_compact_prompt() -> str:
+    """Compact request for a live stateful browser thread.
+
+    Unlike ``_build_compact_prompt`` this sends NO transcript — the thread
+    already holds the full conversation, so the model summarizes what it can
+    see above.  Used by the mid-run thread rollover in stateful mode.
+    """
+    return (
+        "Compact our conversation above into a durable handoff artifact for a "
+        "fresh chat that will continue this same work. Preserve the original "
+        "task and its current status, concrete decisions, user preferences, "
+        "file paths, commands, provider/session details, errors, and the exact "
+        "next steps still pending.\n\n"
+        "Return ONLY valid JSON with this shape:\n"
+        '{"summary":"...","decisions":["..."],"paths":["..."],'
+        '"open_questions":["..."],"need_help":["..."],"next_steps":["..."]}\n\n'
+        "Do not call tools and do not wrap the JSON in markdown."
+    )
+
+
+def render_handoff_text(artifact: dict[str, Any]) -> str:
+    """Flatten a compact artifact into the plain-text handoff block that seeds
+    the first message of the replacement thread."""
+    parts: list[str] = []
+    summary = str(artifact.get("summary") or "").strip()
+    if summary:
+        parts.append(summary)
+    for key, label in (
+        ("decisions", "Decisions"),
+        ("paths", "Key files/paths"),
+        ("next_steps", "Next steps"),
+        ("open_questions", "Open questions"),
+        ("need_help", "Blockers"),
+    ):
+        items = artifact.get(key)
+        if isinstance(items, list):
+            lines = [str(i).strip() for i in items if str(i).strip()]
+            if lines:
+                parts.append(f"{label}:\n" + "\n".join(f"- {line}" for line in lines))
+    return "\n\n".join(parts)
+
+
 def _parse_compact_json(raw: str) -> dict[str, Any]:
     if not raw:
         return {"summary": "Conversation compacted, but the model returned an empty summary."}

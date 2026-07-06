@@ -6,6 +6,15 @@ browser_provider:
   cdp_url: http://localhost:9222
   max_history_messages: 6
   max_inject_chars: 12000
+  # Stateful web-chat threads (experimental): one Kim session = one browser
+  # thread. The system prompt is sent once per thread; follow-up tasks are
+  # small delta messages. Near the context budget (compact_at_ratio) or the
+  # turn cap (max_thread_turns), the thread compacts itself into a handoff
+  # and Kim continues in a fresh chat seeded with it. When off (default),
+  # every message starts a fresh chat and re-sends full context.
+  stateful_threads: false
+  compact_at_ratio: 0.8
+  max_thread_turns: 40
 custom_sites: {}
 logging:
   level: INFO

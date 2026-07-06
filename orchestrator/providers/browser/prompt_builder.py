@@ -201,9 +201,15 @@ def format_prompt(
     sent_system_prompt: bool,
     max_inject_chars: int,
     use_webview_bridge: bool,
+    handoff_summary: Optional[str] = None,
 ) -> tuple[str, list[dict], str, bool]:
     """
     Stateful prompt formatter for browser-based chat UIs.
+
+    ``handoff_summary`` is the model-written compact artifact from a previous
+    thread that this fresh thread continues. It is injected once, on the same
+    first send as the system prompt, and replaces nothing — the (short) recap
+    of the verbatim message tail still follows it.
 
     Returns:
         (prompt_text, attachments, completion_hash, new_sent_system_prompt)
@@ -288,6 +294,16 @@ def format_prompt(
                     "Now respond to the next user message:\n\n"
                 )
 
+    handoff_block = ""
+    if not sent_system_prompt and handoff_summary and handoff_summary.strip():
+        handoff_block = (
+            "[HANDOFF FROM PREVIOUS CHAT — this new chat continues an earlier "
+            "conversation that was compacted. Treat it as established context; "
+            "do not re-execute actions it lists as done.]\n"
+            f"{handoff_summary.strip()}\n"
+            "[END HANDOFF]\n\n"
+        )
+
     new_sent_system_prompt = sent_system_prompt
     if not sent_system_prompt:
         compact_tools = [
@@ -325,6 +341,7 @@ def format_prompt(
                 f"[SYSTEM]\n{system}\n"
                 f"{_os_hint}\n\n"
                 + transport_marker_instruction(completion_hash) + "\n\n"
+                f"{handoff_block}"
                 f"{history_block}"
                 f"{last_text}"
             )
@@ -365,6 +382,7 @@ def format_prompt(
                 "HTML attributes or code), you MUST escape them (\\\") so the "
                 "JSON is valid.\n"
                 + transport_marker_instruction(completion_hash) + "\n\n"
+                f"{handoff_block}"
                 f"{history_block}"
                 f"{last_text}"
             )
