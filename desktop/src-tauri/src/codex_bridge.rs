@@ -174,15 +174,23 @@ mod codex_bridge_tests {
     #[test]
     fn signed_in_heuristic_uses_parsed_url() {
         // False positives under the old substring check — now signed in.
-        assert!(url_looks_signed_in("https://claude.ai/chat/talk-about-authors"));
-        assert!(url_looks_signed_in("https://chatgpt.com/c/login-page-design-help"));
+        assert!(url_looks_signed_in(
+            "https://claude.ai/chat/talk-about-authors"
+        ));
+        assert!(url_looks_signed_in(
+            "https://chatgpt.com/c/login-page-design-help"
+        ));
         assert!(url_looks_signed_in("https://gemini.google.com/app/abc123"));
 
         // Real auth pages — signed out.
-        assert!(!url_looks_signed_in("https://accounts.google.com/v3/signin/identifier"));
+        assert!(!url_looks_signed_in(
+            "https://accounts.google.com/v3/signin/identifier"
+        ));
         assert!(!url_looks_signed_in("https://claude.ai/login"));
         assert!(!url_looks_signed_in("https://chatgpt.com/auth/login"));
-        assert!(!url_looks_signed_in("https://auth.openai.com/authorize?x=1"));
+        assert!(!url_looks_signed_in(
+            "https://auth.openai.com/authorize?x=1"
+        ));
 
         // Empty / unparsable.
         assert!(!url_looks_signed_in(""));

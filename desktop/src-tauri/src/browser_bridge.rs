@@ -717,8 +717,7 @@ mod title_pull_tests {
     use super::*;
 
     fn encode(payload: &BridgeCompleteResponse) -> String {
-        base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_string(payload).unwrap())
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(payload).unwrap())
     }
 
     fn sample(response: &str) -> BridgeCompleteResponse {

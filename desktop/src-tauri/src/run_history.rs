@@ -326,7 +326,10 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
         } else {
             "sleep 1; open -a \"Kim\"".to_string()
         };
-        let _ = std::process::Command::new("sh").arg("-c").arg(&open_cmd).spawn();
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&open_cmd)
+            .spawn();
         // Use app_handle.exit() instead of std::process::exit() so that Tauri's
         // cleanup handlers and Rust Drop implementations run before the process
         // terminates.  std::process::exit() skips all of this.

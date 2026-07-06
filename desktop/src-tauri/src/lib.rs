@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::{Emitter, Manager};
 
 pub mod account;
@@ -1049,7 +1049,7 @@ pub(crate) use hitl::hitl_respond_approval;
 pub(crate) use hitl::respond_approval_decision;
 pub(crate) mod subprocess;
 pub(crate) use subprocess::{
-    cancel_task, find_python_interpreter, process_exists, send_signal, send_task, steer_task,
+    cancel_task, find_python_interpreter, process_exists, send_task, steer_task,
 };
 
 // ---------------------------------------------------------------------------

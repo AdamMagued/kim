@@ -559,10 +559,7 @@ mod session_store_tests {
             "x\0y",
             "date with spaces",
         ] {
-            assert!(
-                validate_session_date(bad).is_err(),
-                "must reject {bad:?}"
-            );
+            assert!(validate_session_date(bad).is_err(), "must reject {bad:?}");
         }
     }
 
@@ -576,11 +573,7 @@ mod session_store_tests {
     #[test]
     fn resolve_rejects_traversal_session_date() {
         let base = tempfile::tempdir().unwrap();
-        let err = resolve_session_date_dir(
-            base.path(),
-            "sess-1",
-            Some("../../../../etc"),
-        );
+        let err = resolve_session_date_dir(base.path(), "sess-1", Some("../../../../etc"));
         assert!(err.is_err(), "traversal date must be rejected: {err:?}");
     }
 

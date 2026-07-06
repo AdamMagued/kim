@@ -122,7 +122,6 @@ impl TaskRuntime {
     pub fn is_occupied(&self) -> bool {
         self.pid.is_some() || self.starting
     }
-
 }
 
 /// Write a HITL/steer JSON line to the running child's stdin.
@@ -154,11 +153,12 @@ pub(crate) async fn write_stdin_line(msg: &str) -> Result<(), String> {
 
     let mut guard = tokio::time::timeout(WRITE_TIMEOUT, stdin.lock())
         .await
-        .map_err(|_| {
-            "Timed out waiting for agent stdin (another write is stuck).".to_string()
-        })?;
+        .map_err(|_| "Timed out waiting for agent stdin (another write is stuck).".to_string())?;
     tokio::time::timeout(WRITE_TIMEOUT, async {
-        guard.write_all(msg.as_bytes()).await.map_err(|e| e.to_string())?;
+        guard
+            .write_all(msg.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
         guard.flush().await.map_err(|e| e.to_string())
     })
     .await
