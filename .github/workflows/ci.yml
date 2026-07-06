@@ -176,7 +176,8 @@ jobs:
             flake8 \
             pyright \
             pytest \
-            pytest-asyncio
+            pytest-asyncio \
+            pytest-cov
 
       - name: pyright (basic type check — orchestrator/providers + mcp_server)
         run: |
@@ -215,9 +216,17 @@ jobs:
           print('All orchestrator modules import cleanly.')
           "
 
-      - name: pytest (unit tests)
+      - name: pytest (unit + integration tests, coverage gate)
         run: |
+          # T7 coverage gate: measured baseline is ~62% across the three
+          # Python runtimes (2026-07). The floor is a ratchet — raise it as
+          # coverage grows; never lower it to make a PR pass.
           python -m pytest tests/ -v \
             --ignore=tests/kim_test_suite.py \
             --ignore=tests/claw_test_suite.py \
-            --ignore=tests/test_gemini_user_project_mode.py
+            --ignore=tests/test_gemini_user_project_mode.py \
+            --cov=orchestrator \
+            --cov=mcp_server \
+            --cov=codex_engine \
+            --cov-report=term \
+            --cov-fail-under=55
