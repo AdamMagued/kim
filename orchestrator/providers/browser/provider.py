@@ -61,6 +61,8 @@ import json
 import logging
 import os
 import platform
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -125,6 +127,11 @@ class BrowserProvider(BaseProvider):
         self._force_headless = bool(bp_cfg.get("browser_force_headless", False))
         if self._force_headless:
             self._headless = True
+        # When Chrome isn't reachable over CDP in visible mode, launch it for the
+        # user (opt-out via browser_auto_launch: false) instead of erroring with
+        # manual instructions.  Tracks the spawned process so we don't re-launch.
+        self._auto_launch_chrome = bool(bp_cfg.get("browser_auto_launch", True))
+        self._chrome_proc: Optional[subprocess.Popen] = None
         self._preferred_site = (bp_cfg.get("preferred_site") or "").strip().lower() or None
 
         env_site = os.environ.get("KIM_PREFERRED_SITE", "").strip().lower()
@@ -485,38 +492,124 @@ class BrowserProvider(BaseProvider):
             logger.info("CDP unavailable — auto-launching headless Chromium")
             return await self._auto_launch(pw)
 
-        # Derive the port from the configured CDP URL so the help text matches
-        # what the provider actually tries to connect to (#3).
         import urllib.parse as _urlparse
         _cdp_port = _urlparse.urlparse(self._cdp_url).port or 9222
 
+        # Visible mode, no Chrome on the debugging port: open one for the user so
+        # they can sign in, then attach to it — instead of erroring out with
+        # manual instructions.  Opt out with browser_auto_launch: false.
+        if self._auto_launch_chrome:
+            browser = await self._launch_headed_chrome(pw, _cdp_port)
+            if browser is not None:
+                return browser
+
+        # Fallback: auto-launch disabled or Chrome not found. Keep it short.
+        chrome_hint = self._chrome_executable() or "google-chrome"
+        raise ConnectionError(
+            f"Cannot connect to Chrome at {self._cdp_url}, and Kim could not "
+            f"launch it automatically. Start Chrome yourself with:\n"
+            f'  "{chrome_hint}" --remote-debugging-port={_cdp_port} '
+            f'--user-data-dir="{self._user_data_dir}"\n'
+            f"then sign in to your AI chat and resend."
+        )
+
+    def _chrome_executable(self) -> Optional[str]:
+        """Locate a Chrome/Chromium binary for auto-launch, or None."""
         sys_name = platform.system()
         if sys_name == "Darwin":
-            launch_cmd = (
-                '/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome '
-                f'--remote-debugging-port={_cdp_port} --user-data-dir="{self._user_data_dir}"'
-            )
-        elif sys_name == "Linux":
-            launch_cmd = (
-                f'google-chrome --remote-debugging-port={_cdp_port} '
-                f'--user-data-dir="{self._user_data_dir}"'
-            )
-        else:
-            launch_cmd = (
-                f'chrome.exe --remote-debugging-port={_cdp_port} '
-                f'--user-data-dir="{self._user_data_dir}"'
-            )
-        raise ConnectionError(
-            f"Cannot connect to Chrome at {self._cdp_url}.\n"
-            f"\n"
-            f"Option A — Launch Chrome manually (for initial login):\n"
-            f"  {launch_cmd}\n"
-            f"\n"
-            f"Option B — Enable headless mode (after first login):\n"
-            f"  Set browser_headless: true in config.yaml\n"
-            f"\n"
-            f"Session data: {self._user_data_dir}"
+            candidates = [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ]
+        elif sys_name == "Windows":
+            candidates = [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            ]
+        else:  # Linux / other POSIX
+            candidates = [
+                "google-chrome", "google-chrome-stable",
+                "chromium", "chromium-browser",
+            ]
+        for cand in candidates:
+            if os.path.isabs(cand):
+                if os.path.exists(cand):
+                    return cand
+            else:
+                found = shutil.which(cand)
+                if found:
+                    return found
+        return None
+
+    def _site_launch_url(self) -> Optional[str]:
+        """Full URL to open on auto-launch so the user lands on the AI chat
+        (its sign-in page when signed out). Uses the preferred site's pattern."""
+        key = self._preferred_site
+        if not key or key not in self._site_configs:
+            # First configured site as a reasonable default.
+            key = next(iter(self._site_configs), None)
+        if not key:
+            return None
+        pattern = str(self._site_configs[key].get("url_pattern") or "").strip()
+        return f"https://{pattern}/" if pattern else None
+
+    async def _launch_headed_chrome(
+        self, pw: Playwright, port: int
+    ) -> Optional[Browser]:
+        """Launch a visible Chrome with remote debugging so the user can sign in,
+        then attach over CDP. Returns the connected browser, or None if Chrome
+        could not be found/started (caller then shows manual instructions)."""
+        chrome = self._chrome_executable()
+        if not chrome:
+            logger.warning("Auto-launch: no Chrome/Chromium binary found")
+            return None
+
+        args = [
+            chrome,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={self._user_data_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        launch_url = self._site_launch_url()
+        if launch_url:
+            args.append(launch_url)
+
+        logger.info(
+            "[STATUS] Chrome isn't running — opening it so you can sign in…"
         )
+        try:
+            # start_new_session detaches Chrome from this (short-lived) process so
+            # it keeps running after the task/bridge exits and is reused next turn.
+            popen_kwargs: dict = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if platform.system() != "Windows":
+                popen_kwargs["start_new_session"] = True
+            self._chrome_proc = subprocess.Popen(args, **popen_kwargs)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Auto-launch: failed to start Chrome: {e}")
+            return None
+
+        # Poll the debugging port until Chrome is ready (~15s).
+        last_err: Optional[Exception] = None
+        for _ in range(30):
+            await asyncio.sleep(0.5)
+            try:
+                browser = await pw.chromium.connect_over_cdp(self._cdp_url)
+                logger.info(
+                    "[STATUS] Chrome is open. If you're not signed in to your AI "
+                    "chat, sign in in the new window, then resend your message."
+                )
+                return browser
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+        logger.warning(
+            f"Auto-launch: Chrome started but CDP port {port} did not come up: {last_err}"
+        )
+        return None
 
     async def _auto_launch(self, pw: Playwright) -> Browser:
         session_path = Path(self._user_data_dir)

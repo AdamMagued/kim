@@ -4,6 +4,10 @@ use_real_browser: false
 browser_provider:
   browser_headless: false
   cdp_url: http://localhost:9222
+  # When Chrome isn't already listening on cdp_url (visible mode), open it for
+  # you with remote debugging so you can sign in, instead of erroring out with
+  # manual launch instructions. Set false to require launching Chrome yourself.
+  browser_auto_launch: true
   max_history_messages: 6
   max_inject_chars: 12000
   # Stateful web-chat threads (experimental): one Kim session = one browser
