@@ -248,7 +248,7 @@ class SessionStore:
         Prompt text, tool schemas, and model output are intentionally omitted.
         Only counts, timing, usage metadata, and normalized error code are kept.
         """
-        record = {
+        record: dict[str, object] = {
             "type": "llm_turn",
             "session_id": self.session_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),

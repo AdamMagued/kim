@@ -46,19 +46,38 @@ def main() -> int:
         return 2
     base = sys.argv[1]
 
+    # -z: NUL-separated records so paths with spaces/non-ASCII names are never
+    # quoted/escaped (git's core.quotepath octal-escapes them in text mode,
+    # which made Path(...).exists() fail and silently SKIP the file).
     diff = subprocess.run(
-        ["git", "diff", "--name-status", "--diff-filter=AMR", f"{base}...HEAD"],
+        ["git", "diff", "--name-status", "--diff-filter=AMR", "-z", f"{base}...HEAD"],
         capture_output=True,
         text=True,
         check=True,
     ).stdout
 
+    # Record shape in -z mode: STATUS \0 path \0   (A/M/D…)
+    #                          Rnnn   \0 old  \0 new \0
+    records: list[tuple[str, str, str | None]] = []  # (status, path, old_path)
+    fields = diff.split("\0")
+    i = 0
+    while i < len(fields):
+        status = fields[i]
+        if not status:
+            break
+        if status.startswith(("R", "C")):
+            if i + 2 >= len(fields):
+                break
+            records.append((status, fields[i + 2], fields[i + 1]))
+            i += 3
+        else:
+            if i + 1 >= len(fields):
+                break
+            records.append((status, fields[i + 1], None))
+            i += 2
+
     failures: list[str] = []
-    for line in diff.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        status, path = parts[0], parts[-1]  # renames: last field is new path
+    for status, path, old_path in records:
         p = Path(path)
         if p.suffix not in SOURCE_EXTS or path.endswith(EXEMPT_SUFFIXES):
             continue
@@ -72,7 +91,9 @@ def main() -> int:
                 f"  {path}: NEW file with {lines} lines (max {MAX_LINES}) — split it"
             )
         else:  # M or R — allowed to exist over the limit, but not to grow
-            base_lines = _base_line_count(base, path)
+            # For renames the file lived at old_path in base; compare against
+            # that so a pure rename of a legacy oversized file doesn't fail.
+            base_lines = _base_line_count(base, old_path or path)
             if base_lines is None or lines > base_lines:
                 grew = "" if base_lines is None else f" (was {base_lines})"
                 failures.append(

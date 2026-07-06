@@ -59,28 +59,30 @@ try {
         throw "Could not download $asset. Publish a Windows release asset with this exact name first, or set GITHUB_TOKEN for a private release."
     }
 
-    # Checksum verification (#58): download SHA256SUMS and verify before install.
+    # Checksum verification (#58): download the .sha256 sidecar published by
+    # release.yml and verify before install. Missing checksum material is a
+    # HARD FAILURE — an unverifiable download must never install silently.
+    # Set KIM_SKIP_CHECKSUM=1 to bypass (not recommended).
     $skipChecksum = $env:KIM_SKIP_CHECKSUM -eq "1"
     if (-not $skipChecksum) {
         $shaUrl = $url -replace '\.(zip|tar\.gz)$', '.sha256'
         $shaPath = Join-Path $tempRoot "SHA256SUMS"
         try {
             Invoke-WebRequest -Uri $shaUrl -OutFile $shaPath -Headers $headers -UseBasicParsing -ErrorAction Stop
-            $shaContent = Get-Content $shaPath -Raw
-            $expectedLine = $shaContent -split "`n" | Where-Object { $_ -match [regex]::Escape($asset) } | Select-Object -First 1
-            if ($expectedLine) {
-                $expectedHash = ($expectedLine -split '\s+')[0].Trim().ToLower()
-                $actualHash = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
-                if ($actualHash -ne $expectedHash) {
-                    throw "Checksum mismatch for $asset (expected $expectedHash, got $actualHash). Aborting."
-                }
-                Write-Host "Checksum verified: $expectedHash"
-            } else {
-                Write-Warning "No checksum entry found for $asset in SHA256SUMS; skipping verification"
-            }
-        } catch [System.Net.WebException] {
-            Write-Warning "SHA256SUMS not available for this release; skipping verification"
+        } catch {
+            throw "Checksum sidecar not available at $shaUrl. Refusing to install an unverifiable download. Set KIM_SKIP_CHECKSUM=1 to override (not recommended)."
         }
+        $shaContent = Get-Content $shaPath -Raw
+        $expectedLine = $shaContent -split "`n" | Where-Object { $_ -match [regex]::Escape($asset) } | Select-Object -First 1
+        if (-not $expectedLine) {
+            throw "No checksum entry found for $asset in $shaUrl. Aborting."
+        }
+        $expectedHash = ($expectedLine -split '\s+')[0].Trim().ToLower()
+        $actualHash = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
+        if ($actualHash -ne $expectedHash) {
+            throw "Checksum mismatch for $asset (expected $expectedHash, got $actualHash). Aborting."
+        }
+        Write-Host "Checksum verified: $expectedHash"
     }
 
     Expand-Archive -Path $archivePath -DestinationPath $extractDir -Force

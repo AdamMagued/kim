@@ -119,6 +119,12 @@ def test_import_succeeds(tmp_path, monkeypatch):
         if stripped.startswith("_LOG") and "open(" in stripped:
             open_line = stripped
             break
+    # The guarded open() must exist: if it was renamed/removed this half of
+    # the check would otherwise silently vanish while staying green.
+    assert open_line is not None, (
+        "_LOG = open(...) line not found in responses proxy source — "
+        "update this test if the log handle was renamed"
+    )
 
     fake_dir = str(tmp_path)
     ns: dict = {"os": os, "tempfile": tempfile}

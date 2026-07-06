@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -254,11 +255,21 @@ class TestGoldenTranscriptFixture:
         current_types = [classify(ln) for ln in lines]
 
         if not FIXTURE_PATH.exists():
-            FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            FIXTURE_PATH.write_text(
-                json.dumps({"lines": lines, "types": current_types}, indent=2)
+            # A missing golden must FAIL, not silently regenerate-and-pass:
+            # a deleted/gitignored fixture previously yielded green CI with
+            # zero comparison. Regeneration is explicit via env flag.
+            if os.environ.get("KIM_REGEN_GOLDEN") == "1":
+                FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                FIXTURE_PATH.write_text(
+                    json.dumps({"lines": lines, "types": current_types}, indent=2)
+                )
+                return  # Explicit regeneration requested
+            pytest.fail(
+                f"Golden fixture missing: {FIXTURE_PATH}. "
+                "If this is intentional (protocol change), regenerate with "
+                "KIM_REGEN_GOLDEN=1 pytest tests/test_v3_golden_transcript.py "
+                "and commit the fixture."
             )
-            return  # First run: just write
 
         fixture = json.loads(FIXTURE_PATH.read_text())
         saved_types = fixture.get("types", [])

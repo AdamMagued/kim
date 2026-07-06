@@ -192,10 +192,28 @@ mod tests {
                 .as_nanos()
         ));
         let fresh = store_attachment(&base, "keep.txt", b"x").unwrap();
-        // Sweep with a zero max-age would delete everything; use a long age so the
-        // fresh dir survives (proves we don't nuke recent attachments).
+        let stale = store_attachment(&base, "stale.txt", b"y").unwrap();
+        let stale_dir = stale.parent().unwrap().to_path_buf();
+
+        // A 7-day cutoff must keep both freshly-created dirs.
         sweep_old_attachments(&base, ATTACHMENT_MAX_AGE);
         assert!(fresh.exists(), "recent attachment must survive sweep");
+        assert!(stale.exists(), "recent attachment must survive sweep");
+
+        // Deletion branch: with a zero max-age every dir is older than the
+        // cutoff and must actually be removed. (The previous version of this
+        // test never created an old dir and never asserted a deletion, so a
+        // no-op sweep_old_attachments still passed it.)
+        std::thread::sleep(Duration::from_millis(20));
+        sweep_old_attachments(&base, Duration::ZERO);
+        assert!(
+            !stale_dir.exists(),
+            "sweep_old_attachments must remove dirs older than max_age"
+        );
+        assert!(
+            !fresh.exists(),
+            "sweep_old_attachments must remove ALL dirs older than max_age"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

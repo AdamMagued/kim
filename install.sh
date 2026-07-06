@@ -68,17 +68,16 @@ echo "      Done."
 
 # ── Install dependencies ────────────────────────────────────────────────
 echo "[4/6] Installing dependencies from requirements.txt..."
+# set -e (line 10) aborts on failure, so no manual $? check is needed here
+# (the old one was dead code — the script had already exited).
 pip install -r requirements.txt --quiet
-if [ $? -ne 0 ]; then
-    echo "[ERROR] Dependency installation failed."
-    exit 1
-fi
 echo "      Done."
 
 # ── Install Playwright browsers ─────────────────────────────────────────
 echo "[5/6] Installing Playwright browsers (Chromium)..."
-python -m playwright install chromium 2>/dev/null || {
-    echo "      [WARN] Playwright browser install failed."
+# Don't hide stderr: if this fails the user needs the real reason.
+python -m playwright install chromium || {
+    echo "      [WARN] Playwright browser install failed (see error above)."
     echo "             Install later with: python -m playwright install chromium"
 }
 echo "      Done."
@@ -102,8 +101,15 @@ mkdir -p logs
 mkdir -p sessions/chrome_data
 
 # ── Write project root for .app bundle discovery ─────────────────────────
-echo "$PWD" > "$HOME/.kim_root"
-echo "  Saved project root to ~/.kim_root (used by Kim.app)"
+# Guard: only record a directory that actually looks like the Kim repo so a
+# stray run from an unrelated directory can't poison Kim.app discovery.
+if [ -f "orchestrator/agent.py" ]; then
+    echo "$PWD" > "$HOME/.kim_root"
+    echo "  Saved project root to ~/.kim_root (used by Kim.app)"
+else
+    echo "  [WARN] $PWD does not look like the Kim repo (no orchestrator/agent.py);"
+    echo "         not writing ~/.kim_root."
+fi
 
 echo ""
 echo "  ╔═══════════════════════════════════════════════════════╗"

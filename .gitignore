@@ -80,3 +80,8 @@ Desktop.ini
 
 # ── graphify code graph (generated/regenerable; see repomap.md to rebuild) ─────
 graphify-out/
+
+# coverage.py binary artifact (CI/local pytest --cov output)
+.coverage
+.coverage.*
+htmlcov/

@@ -861,59 +861,152 @@ def test_summarize_trace_tool_combined_risk_and_error():
 _AGENT_PY_PATH = Path(__file__).resolve().parent.parent / "orchestrator" / "agent.py"
 
 
-def test_agent_calls_append_run_started():
-    """agent.run() must call append_run_started after the compact guard.
+# ---------------------------------------------------------------------------
+# Behavioral trace tests: drive the REAL agent methods against a REAL
+# SessionStore and assert the JSONL trace records appear on disk.
+# (The previous static source-grep versions passed even when the traced calls
+# were commented out — mutation-verified false confidence.)
+# ---------------------------------------------------------------------------
 
-    Static scan verifies the call exists and is wrapped in try/except so a
-    trace-write failure never aborts the agent run.
-    """
-    source = _AGENT_PY_PATH.read_text(encoding="utf-8")
-    assert "append_run_started" in source, (
-        "append_run_started not found in agent.py -- "
-        "agent.run() must call self._session_store.append_run_started(task)"
-    )
-    # Verify the call site is inside a try block (defensive guard)
-    idx = source.find("append_run_started")
-    # Scan backwards for 'try:' within a reasonable window
-    window = source[max(0, idx - 200): idx]
-    assert "try:" in window, (
-        "append_run_started call in agent.py is not inside a try block. "
-        "A trace-write failure must never abort the agent run."
-    )
+def _trace_records(store: SessionStore, record_type: str) -> list:
+    records = []
+    for line in store.session_file.read_text(encoding="utf-8").splitlines():
+        rec = json.loads(line)
+        if rec.get("type") == record_type:
+            records.append(rec)
+    return records
 
 
-def test_agent_execute_tool_appends_tool_trace_records():
-    """_execute_tool must append started and terminal tool_call trace records."""
-    source = _AGENT_PY_PATH.read_text(encoding="utf-8")
-    assert "append_tool_event" in source, (
-        "append_tool_event not found in agent.py -- _execute_tool should trace tool calls"
-    )
-    idx = source.find("async def _execute_tool")
-    assert idx != -1, "_execute_tool not found in agent.py"
-    # Scan the full function body (not a fixed byte window) so the assertion
-    # survives growth from future feature slices.
-    next_async_def = source.find("\nasync def ", idx + 1)
-    end = next_async_def if next_async_def != -1 else len(source)
-    body = source[idx:end]
-    assert '"started"' in body
-    assert '"completed"' in body
-    assert '"errored"' in body
-    assert "try:" in body and "except Exception" in body
+def test_agent_run_writes_run_started_record(tmp_path):
+    """agent.run() must append a run_started JSONL record with the task text."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tests.conftest import make_test_agent
+
+    store = SessionStore(base_dir=tmp_path, session_id="trace_run_started")
+    agent = make_test_agent(session_store=store)
+    # Terminate the run immediately after the trace is written: stub the loop
+    # collaborators (the run_started append itself stays REAL).
+    agent._refresh_tools = AsyncMock()
+    agent._tools = []  # run() exits early on the no-tools path
+    agent._complete_run = lambda result: result
+    agent._check_context_pressure = AsyncMock(return_value=None)
+    agent._emit_context_snapshot = lambda: None
+    agent._persist_context_state_extra = lambda *a, **k: None
+    agent._build_system_prompt = lambda task: "system"
+    agent._log = lambda level, msg: None
+    agent._is_cancelled = lambda: False
+    agent.session = MagicMock()
+
+    asyncio.run(agent.run("trace me please"))
+
+    records = _trace_records(store, "run_started")
+    assert len(records) == 1
+    assert records[0]["task"] == "trace me please"
+    assert records[0]["session_id"] == "trace_run_started"
 
 
-def test_agent_call_with_retry_appends_llm_trace_records():
-    """_call_with_retry must trace provider attempts without storing prompt text."""
-    source = _AGENT_PY_PATH.read_text(encoding="utf-8")
-    idx = source.find("async def _call_with_retry")
-    assert idx != -1, "_call_with_retry not found in agent.py"
-    body = source[idx: idx + 5000]
-    assert "append_llm_event" in body
-    assert '"started"' in body
-    assert '"completed"' in body
-    assert '"errored"' in body
-    assert "message_count=len(messages)" in body
-    assert "tool_count=len(tools)" in body
-    assert "usage=response.get" in body
+def test_agent_execute_tool_appends_tool_trace_records(tmp_path):
+    """The real _execute_tool must append started + completed tool_call records."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tests.conftest import make_test_agent
+
+    store = SessionStore(base_dir=tmp_path, session_id="trace_tool")
+    agent = make_test_agent(session_store=store)
+    agent._log = lambda level, msg: None
+    result = MagicMock()
+    result.content = [SimpleNamespace(text="file contents")]
+    agent.session = MagicMock()
+    agent.session.call_tool = AsyncMock(return_value=result)
+
+    output = asyncio.run(agent._execute_tool("read_file", {"path": "x.txt"}))
+
+    assert "file contents" in output
+    records = _trace_records(store, "tool_call")
+    phases = [r["phase"] for r in records]
+    assert phases == ["started", "completed"]
+    assert all(r["tool_name"] == "read_file" for r in records)
+    assert records[0]["arg_keys"] == ["path"]
+    assert records[0].get("risk_level")  # started record carries the risk tier
+    assert "duration_ms" in records[1]
+
+
+def test_agent_execute_tool_appends_errored_record_on_failure(tmp_path):
+    """A raising MCP call must yield an errored tool_call record, not a crash."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tests.conftest import make_test_agent
+
+    store = SessionStore(base_dir=tmp_path, session_id="trace_tool_err")
+    agent = make_test_agent(session_store=store)
+    agent._log = lambda level, msg: None
+    agent.session = MagicMock()
+    agent.session.call_tool = AsyncMock(side_effect=RuntimeError("boom"))
+
+    output = asyncio.run(agent._execute_tool("read_file", {"path": "x.txt"}))
+
+    assert output.startswith("ERROR calling read_file")
+    records = _trace_records(store, "tool_call")
+    phases = [r["phase"] for r in records]
+    assert phases == ["started", "errored"]
+    assert records[1]["error_code"] == "internal_error"
+
+
+def test_agent_call_with_retry_appends_llm_trace_records(tmp_path):
+    """The real _call_with_retry must trace started + completed llm_turn records
+    without storing prompt text."""
+    import asyncio
+
+    from tests.conftest import make_test_agent
+
+    store = SessionStore(base_dir=tmp_path, session_id="trace_llm")
+    agent = make_test_agent(session_store=store)
+    agent._log = lambda level, msg: None
+
+    messages = [{"role": "user", "content": "SECRET PROMPT TEXT"}]
+    tools = [{"name": "run_command"}, {"name": "task_complete"}]
+    response = asyncio.run(agent._call_with_retry(messages, tools, "system"))
+
+    assert isinstance(response, dict)
+    records = _trace_records(store, "llm_turn")
+    phases = [r["phase"] for r in records]
+    assert phases == ["started", "completed"]
+    assert records[0]["message_count"] == 1
+    assert records[0]["tool_count"] == 2
+    assert records[0]["provider"] == "FakeProvider"
+    assert "duration_ms" in records[1]
+    # Privacy contract: prompt text must never reach the trace file
+    assert "SECRET PROMPT TEXT" not in store.session_file.read_text(encoding="utf-8")
+
+
+def test_agent_call_with_retry_appends_errored_record(tmp_path):
+    """A non-retryable provider failure must append an errored llm_turn record."""
+    import asyncio
+
+    import pytest
+
+    from tests.conftest import make_test_agent
+
+    class AuthFailProvider:
+        async def complete(self, messages, tools, system):
+            raise PermissionError("invalid api key")
+
+    store = SessionStore(base_dir=tmp_path, session_id="trace_llm_err")
+    agent = make_test_agent(session_store=store, provider=AuthFailProvider())
+    agent._log = lambda level, msg: None
+
+    with pytest.raises(PermissionError):
+        asyncio.run(agent._call_with_retry([], [], "system"))
+
+    records = _trace_records(store, "llm_turn")
+    phases = [r["phase"] for r in records]
+    assert phases == ["started", "errored"]
+    assert records[1]["error_code"] == "auth"
 
 
 def test_no_tools_path_uses_complete_run():

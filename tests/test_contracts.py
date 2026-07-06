@@ -1,103 +1,144 @@
 """
 Contract lock-down tests (Phase 2).
 
-These tests verify the inviolable interfaces documented in CONTRACTS.md.
-If any of these fail after a change, the change broke a cross-system contract.
+These tests verify the inviolable interfaces documented in CONTRACTS.md by
+exercising the REAL product code (agent methods, events_gen emitters, the
+provider factory, and the tool-error classifier).
+
+An earlier version of this file constructed its own data and asserted on it
+(e.g. formatting a marker string inside the test and asserting the format it
+just wrote) — those tests could never fail on any product change and have
+been replaced or deleted.
 """
 
+import asyncio
 import json
-import re
 import unittest
+from unittest.mock import AsyncMock, MagicMock
+
+from tests.conftest import make_test_agent
 
 
-# ── 1. Stdout Protocol Contracts ───────────────────────────────────────────
+def _capture_agent_logs(agent):
+    logs: list[str] = []
+    agent._log = lambda level, message: logs.append(message)
+    return logs
+
+
+# ── 1. Stdout Protocol Contracts (real _emit_plan_markers output) ───────────
 
 
 class TestStdoutProtocolFormat(unittest.TestCase):
-    """Verify the stdout marker formats match what consumers expect."""
+    """Verify the stdout marker formats the REAL agent emits match what
+    consumers (ChatView parseLogLine / parsePlanFromActivity) expect."""
 
-    MARKERS_SIMPLE = ["[STATUS]", "[TOOL]", "[SUCCESS]", "[FAILED]"]
-    MARKERS_JSON = ["[PLAN]", "[STEP]", "[DONE]"]
+    def _markers_for(self, content: str) -> list[str]:
+        agent = make_test_agent()
+        logs = _capture_agent_logs(agent)
+        agent._emit_plan_markers(content)
+        return logs
 
-    def test_simple_markers_have_space_after_bracket(self):
-        """Simple markers: '[MARKER] content' — one space after ]."""
-        for marker in self.MARKERS_SIMPLE:
-            line = f"{marker} some content here"
-            self.assertTrue(line.startswith(f"{marker} "))
-
-    def test_json_markers_have_no_space_before_json(self):
-        """JSON markers: '[PLAN]{...}' — NO space between ] and {."""
-        for marker in self.MARKERS_JSON:
-            payload = {"test": "value"}
-            line = f"{marker}{json.dumps(payload, separators=(',', ':'))}"
-            # Must NOT have space between marker and JSON
-            bracket_pos = line.index("]")
-            self.assertEqual(line[bracket_pos + 1], "{",
-                             f"{marker} must be immediately followed by {{ — got: {line}")
+    def test_plan_marker_has_no_space_before_json(self):
+        logs = self._markers_for("PLAN: 2 steps\n1. First\n2. Second\n")
+        plan_lines = [line for line in logs if "[PLAN]" in line]
+        self.assertEqual(len(plan_lines), 1)
+        line = plan_lines[0]
+        # Contract: '[STATUS] [PLAN]{...}' — NO space between ] and {.
+        idx = line.index("[PLAN]")
+        self.assertEqual(line[idx + len("[PLAN]")], "{",
+                         f"[PLAN] must be immediately followed by {{ — got: {line}")
 
     def test_plan_json_shape(self):
-        """[PLAN] payload must have 'steps' array of strings."""
-        payload = {"steps": ["step one", "step two"]}
-        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        line = f"[PLAN]{encoded}"
-
-        # Parse back
-        json_start = line.index("{")
-        parsed = json.loads(line[json_start:])
-        self.assertIn("steps", parsed)
-        self.assertIsInstance(parsed["steps"], list)
-        for step in parsed["steps"]:
+        logs = self._markers_for("PLAN: 2 steps\n1. step one\n2. step two\n")
+        line = next(line for line in logs if "[PLAN]" in line)
+        payload = json.loads(line.split("[PLAN]", 1)[1])
+        self.assertIn("steps", payload)
+        self.assertIsInstance(payload["steps"], list)
+        for step in payload["steps"]:
             self.assertIsInstance(step, str)
+        self.assertEqual(payload["steps"], ["step one", "step two"])
 
     def test_step_json_shape(self):
-        """[STEP] payload must have 'index' (int) and 'name' (str)."""
-        payload = {"index": 1, "name": "Do the thing"}
-        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        line = f"[STEP]{encoded}"
-
-        json_start = line.index("{")
-        parsed = json.loads(line[json_start:])
-        self.assertIn("index", parsed)
-        self.assertIn("name", parsed)
-        self.assertIsInstance(parsed["index"], int)
-        self.assertIsInstance(parsed["name"], str)
+        logs = self._markers_for("STEP 1: Do the thing\n")
+        line = next(line for line in logs if "[STEP]" in line)
+        payload = json.loads(line.split("[STEP]", 1)[1])
+        self.assertIsInstance(payload["index"], int)
+        self.assertIsInstance(payload["name"], str)
+        self.assertEqual(payload, {"index": 1, "name": "Do the thing"})
 
     def test_done_json_shape(self):
-        """[DONE] payload must have 'index' (int) and 'summary' (str)."""
-        payload = {"index": 1, "summary": "Completed step"}
-        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        line = f"[DONE]{encoded}"
-
-        json_start = line.index("{")
-        parsed = json.loads(line[json_start:])
-        self.assertIn("index", parsed)
-        self.assertIn("summary", parsed)
-        self.assertIsInstance(parsed["index"], int)
-        self.assertIsInstance(parsed["summary"], str)
+        logs = self._markers_for("DONE 1: Completed step\n")
+        line = next(line for line in logs if "[DONE]" in line)
+        payload = json.loads(line.split("[DONE]", 1)[1])
+        self.assertIsInstance(payload["index"], int)
+        self.assertIsInstance(payload["summary"], str)
+        self.assertEqual(payload, {"index": 1, "summary": "Completed step"})
 
     def test_plan_steps_max_12_items_max_120_chars(self):
-        """PLAN steps: max 12, each truncated to 120 chars (per CONTRACTS.md)."""
-        steps = [f"step {i}" for i in range(15)]
-        truncated = [s[:120] for s in steps[:12]]
-        self.assertLessEqual(len(truncated), 12)
-        for s in truncated:
-            self.assertLessEqual(len(s), 120)
+        steps_text = "\n".join(f"{i}. {'x' * 200}" for i in range(1, 16))
+        logs = self._markers_for(f"PLAN: 15 steps\n{steps_text}\n")
+        line = next(line for line in logs if "[PLAN]" in line)
+        payload = json.loads(line.split("[PLAN]", 1)[1])
+        self.assertLessEqual(len(payload["steps"]), 12)
+        for step in payload["steps"]:
+            self.assertLessEqual(len(step), 120)
 
-    def test_tool_marker_format(self):
-        """[TOOL] format: tool_name(json_args_up_to_120_chars)."""
-        tool_name = "write_file"
-        args = {"path": "test.py", "content": "x" * 200}
-        args_str = json.dumps(args)[:120]
-        line = f"[TOOL] {tool_name}({args_str})"
-        self.assertTrue(line.startswith("[TOOL] "))
-        self.assertIn("write_file(", line)
+
+class TestTypedEventEmitters(unittest.TestCase):
+    """The generated events_gen emitters must write one JSON line per event
+    with the wire `type` discriminator the Rust/TS decoders key on."""
+
+    def _capture(self, fn, *args, **kwargs):
+        import io
+        import sys
+        buf = io.BytesIO()
+        real_stdout = sys.stdout
+
+        class _Stdout:
+            buffer = buf
+
+            def fileno(self):
+                raise ValueError("no fd in test")
+
+        sys.stdout = _Stdout()
+        try:
+            fn(*args, **kwargs)
+        finally:
+            sys.stdout = real_stdout
+        return buf.getvalue().decode("utf-8")
+
+    def test_emit_status_wire_format(self):
+        from orchestrator.events_gen import emit_status
+        out = self._capture(emit_status, "hello world")
+        record = json.loads(out.strip())
+        self.assertEqual(record["type"], "status")
+        self.assertEqual(record["message"], "hello world")
+
+    def test_emit_plan_wire_format(self):
+        from orchestrator.events_gen import emit_plan
+        out = self._capture(emit_plan, ["a", "b"])
+        record = json.loads(out.strip())
+        self.assertEqual(record["type"], "plan")
+        self.assertEqual(record["steps"], ["a", "b"])
+
+    def test_emit_step_and_done_wire_format(self):
+        from orchestrator.events_gen import emit_done, emit_step
+        out = self._capture(emit_step, 2, {"index": 2, "name": "x"})
+        record = json.loads(out.strip())
+        self.assertEqual(record["type"], "step")
+        self.assertEqual(record["n"], 2)
+        out = self._capture(emit_done, 3)
+        record = json.loads(out.strip())
+        self.assertEqual(record["type"], "done")
+        self.assertEqual(record["n"], 3)
 
 
 # ── 2. Provider Response Shape Contracts ───────────────────────────────────
 
 
 class TestProviderResponseShape(unittest.TestCase):
-    """Verify the provider response dict shape matches CONTRACTS.md."""
+    """Verify a REAL provider (FakeProvider — the reference implementation of
+    the response contract) produces dicts matching CONTRACTS.md."""
 
     def _validate_response(self, response: dict):
         self.assertIn("type", response)
@@ -111,33 +152,26 @@ class TestProviderResponseShape(unittest.TestCase):
             self.assertIn("content", response)
             self.assertIsInstance(response["content"], str)
 
-    def test_tool_call_response(self):
-        resp = {"type": "tool_call", "tool": "click", "args": {"x": 100, "y": 200}}
-        self._validate_response(resp)
+    def test_fake_provider_default_responses_conform(self):
+        from orchestrator.providers.fake import FakeProvider
+        provider = FakeProvider()
+        for _ in range(3):  # includes the looping terminal response
+            response = asyncio.run(provider.complete(messages=[], tools=[], system=""))
+            self._validate_response(response)
 
-    def test_text_response(self):
-        resp = {"type": "text", "content": "TASK_COMPLETE: done"}
-        self._validate_response(resp)
-
-    def test_tool_call_with_content(self):
-        """Optional 'content' field on tool_call (thinking/narration)."""
-        resp = {"type": "tool_call", "tool": "read_file", "args": {"path": "x"}, "content": "Let me read that"}
-        self._validate_response(resp)
-
-    def test_invalid_type_rejected(self):
-        resp = {"type": "unknown", "data": "bad"}
-        with self.assertRaises(AssertionError):
-            self._validate_response(resp)
-
-    def test_tool_call_missing_tool_rejected(self):
-        resp = {"type": "tool_call", "args": {"x": 1}}
-        with self.assertRaises(AssertionError):
-            self._validate_response(resp)
-
-    def test_text_missing_content_rejected(self):
-        resp = {"type": "text"}
-        with self.assertRaises(AssertionError):
-            self._validate_response(resp)
+    def test_fake_provider_scripted_responses_conform(self):
+        from orchestrator.providers.fake import FakeProvider
+        provider = FakeProvider(responses=[
+            {"type": "tool_call", "tool": "read_file", "args": {"path": "x"},
+             "content": "Let me read that"},
+            {"type": "text", "content": "TASK_COMPLETE: done"},
+        ])
+        first = asyncio.run(provider.complete(messages=[], tools=[], system=""))
+        second = asyncio.run(provider.complete(messages=[], tools=[], system=""))
+        self._validate_response(first)
+        self._validate_response(second)
+        self.assertEqual(first["type"], "tool_call")
+        self.assertEqual(second["type"], "text")
 
 
 # ── 3. Provider Names Contract ─────────────────────────────────────────────
@@ -179,133 +213,119 @@ class TestProviderNames(unittest.TestCase):
                 self.fail(f"create_provider rejected extended name: {name!r}")
 
 
-# ── 4. Canonical Message Format ────────────────────────────────────────────
+# ── 4+5. Run-loop contracts: completion signals + tool-result format ───────
 
 
-class TestCanonicalMessageFormat(unittest.TestCase):
-    """Verify message format matches base.py docstring."""
+def _build_run_agent(responses):
+    """Agent whose run() loop is REAL (response handling, memory, completion
+    detection) with only the environment collaborators stubbed."""
+    from orchestrator.providers.fake import FakeProvider
 
-    def test_text_message(self):
-        msg = {"role": "user", "content": "Hello"}
-        self.assertIn(msg["role"], ("user", "assistant"))
-        self.assertIsInstance(msg["content"], str)
+    agent = make_test_agent(provider=FakeProvider(responses=responses))
+    agent._refresh_tools = AsyncMock()
+    agent._tools = [
+        {"name": "run_command", "description": "d", "parameters": {}},
+        {"name": "task_complete", "description": "d", "parameters": {}},
+    ]
+    agent._check_context_pressure = AsyncMock(return_value=None)
+    agent._emit_context_snapshot = lambda: None
+    agent._persist_context_state_extra = lambda *a, **k: None
+    agent._build_system_prompt = lambda task: "system"
+    agent._is_stuck = lambda _: False
+    agent._log = lambda level, msg: None
+    agent._track_context_usage = lambda *a, **k: None
 
-    def test_multimodal_message(self):
-        msg = {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "What's in this image?"},
-                {"type": "image", "data": "base64data", "media_type": "image/png"},
-            ],
-        }
-        self.assertIn(msg["role"], ("user", "assistant"))
-        self.assertIsInstance(msg["content"], list)
-        for item in msg["content"]:
-            self.assertIn("type", item)
-            self.assertIn(item["type"], ("text", "image"))
-
-    def test_tool_result_message(self):
-        """Tool results are appended as user messages with prefix."""
-        msg = {"role": "user", "content": "[Tool result: write_file]\nWritten successfully"}
-        self.assertEqual(msg["role"], "user")
-        self.assertTrue(msg["content"].startswith("[Tool result: "))
-
-
-# ── 5. Task Completion Signals ─────────────────────────────────────────────
+    from types import SimpleNamespace
+    result = MagicMock()
+    result.content = [SimpleNamespace(text="tool ran ok")]
+    agent.session = MagicMock()
+    agent.session.call_tool = AsyncMock(return_value=result)
+    return agent
 
 
 class TestTaskCompletionSignals(unittest.TestCase):
-    """Verify TASK_COMPLETE and NEED_HELP regex patterns match the agent's."""
+    """The real run loop must recognize TASK_COMPLETE / NEED_HELP text and the
+    task_complete tool call, and terminate with the documented result dict."""
 
-    TASK_COMPLETE_RE = re.compile(r"\bTASK_COMPLETE:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
-    NEED_HELP_RE = re.compile(r"\bNEED_HELP:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
-
-    def test_task_complete_matches(self):
-        text = "I've finished the work.\nTASK_COMPLETE: All files written successfully."
-        m = self.TASK_COMPLETE_RE.search(text)
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1).strip(), "All files written successfully.")
-
-    def test_need_help_matches(self):
-        text = "I'm stuck.\nNEED_HELP: Cannot find the config file."
-        m = self.NEED_HELP_RE.search(text)
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1).strip(), "Cannot find the config file.")
+    def test_task_complete_text_terminates_run(self):
+        agent = _build_run_agent([
+            {"type": "text", "content": "All files written.\nTASK_COMPLETE: All files written successfully."},
+        ])
+        result = asyncio.run(agent.run("do the thing"))
+        self.assertTrue(result["success"])
+        self.assertEqual(result["termination"], "task_complete")
+        self.assertIn("All files written successfully", result["summary"])
 
     def test_task_complete_case_insensitive(self):
-        text = "task_complete: Done"
-        m = self.TASK_COMPLETE_RE.search(text)
-        self.assertIsNotNone(m)
+        agent = _build_run_agent([{"type": "text", "content": "task_complete: Done"}])
+        result = asyncio.run(agent.run("do the thing"))
+        self.assertTrue(result["success"])
+        self.assertEqual(result["termination"], "task_complete")
 
-    def test_task_complete_tool_names(self):
-        """task_complete as tool call is intercepted by the agent."""
-        valid_keys = ["message", "summary", "result"]
-        args = {"message": "All done"}
-        # At least one key must be present
-        found = any(args.get(k) for k in valid_keys)
-        self.assertTrue(found)
+    def test_need_help_text_terminates_run(self):
+        agent = _build_run_agent([
+            {"type": "text", "content": "I'm stuck.\nNEED_HELP: Cannot find the config file."},
+        ])
+        result = asyncio.run(agent.run("do the thing"))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["termination"], "need_help")
+        self.assertIn("Cannot find the config file", result["summary"])
+
+    def test_task_complete_tool_call_is_intercepted(self):
+        agent = _build_run_agent([
+            {"type": "tool_call", "tool": "task_complete", "args": {"summary": "All done"}},
+        ])
+        result = asyncio.run(agent.run("do the thing"))
+        self.assertTrue(result["success"])
+        self.assertEqual(result["termination"], "task_complete")
+        self.assertIn("All done", result["summary"])
 
 
-# ── 6. Plan Parsing Contract (agent._emit_plan_markers) ───────────────────
+class TestCanonicalMessageFormat(unittest.TestCase):
+    """Tool results must be fed back as user messages with the documented
+    '[Tool result: <name>]' prefix — produced by the real run loop."""
 
-
-class TestPlanParsing(unittest.TestCase):
-    """Verify plan/step/done regex patterns match real LLM output."""
-
-    PLAN_RE = re.compile(r"^\s*PLAN:\s*(\d+)\s*step", re.IGNORECASE | re.MULTILINE)
-    STEP_RE = re.compile(r"^\s*STEP\s*(\d+)\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-    DONE_RE = re.compile(r"^\s*DONE\s*(\d+)\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-
-    def test_plan_block_parsing(self):
-        content = "PLAN: 3 steps\n1. Read the file\n2. Edit the code\n3. Run tests"
-        m = self.PLAN_RE.search(content)
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1), "3")
-
-        after = content[m.end():]
-        steps = []
-        for raw in after.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            sm = re.match(r"^(\d+)[.)]\s+(.+?)\s*$", line)
-            if sm:
-                steps.append(sm.group(2).strip())
-        self.assertEqual(len(steps), 3)
-        self.assertEqual(steps[0], "Read the file")
-
-    def test_step_marker(self):
-        content = "STEP 2: Editing the configuration"
-        matches = list(self.STEP_RE.finditer(content))
-        self.assertEqual(len(matches), 1)
-        self.assertEqual(int(matches[0].group(1)), 2)
-        self.assertEqual(matches[0].group(2).strip(), "Editing the configuration")
-
-    def test_done_marker(self):
-        content = "DONE 1: File written successfully"
-        matches = list(self.DONE_RE.finditer(content))
-        self.assertEqual(len(matches), 1)
-        self.assertEqual(int(matches[0].group(1)), 1)
-        self.assertEqual(matches[0].group(2).strip(), "File written successfully")
+    def test_tool_result_message_prefix(self):
+        agent = _build_run_agent([
+            {"type": "tool_call", "tool": "run_command", "args": {"command": "ls"}},
+            {"type": "text", "content": "TASK_COMPLETE: done"},
+        ])
+        result = asyncio.run(agent.run("list files"))
+        self.assertTrue(result["success"])
+        tool_result_msgs = [
+            m for m in agent.memory.get_messages()
+            if m["role"] == "user" and isinstance(m["content"], str)
+            and m["content"].startswith("[Tool result: ")
+        ]
+        self.assertTrue(tool_result_msgs, "no [Tool result: ...] user message produced")
+        self.assertTrue(
+            tool_result_msgs[0]["content"].startswith("[Tool result: run_command]"))
 
 
 # ── 7. MCP Tool Error Envelope ─────────────────────────────────────────────
 
 
 class TestMCPErrorEnvelope(unittest.TestCase):
-    """Verify MCP tool error prefixes match what agent/UI expect."""
-
-    ERROR_PREFIXES = ["ERROR:", "PERMISSION_ERROR:", "OS_LIMITATION:"]
+    """Verify the REAL classifier recognizes the documented error prefixes."""
 
     def test_error_prefixes_are_recognized(self):
-        for prefix in self.ERROR_PREFIXES:
-            msg = f"{prefix} Something went wrong"
-            self.assertTrue(msg.startswith(prefix))
+        from orchestrator.tool_errors import classify_tool_output
+        expectations = {
+            "ERROR: Something went wrong": "execution_error",
+            "PERMISSION_ERROR: Something went wrong": "permission_denied",
+            "OS_LIMITATION: Something went wrong": "os_limitation",
+            "BLOCKED: dangerous command": "blocked",
+            "TIMEOUT: took too long": "timeout",
+            "NOT_FOUND: no such key": "not_found",
+            "ERROR calling read_file: transport died": "internal_error",
+        }
+        for message, code in expectations.items():
+            self.assertEqual(classify_tool_output(message), code, message)
 
     def test_normal_result_not_confused_with_error(self):
-        msg = "Written successfully"
-        for prefix in self.ERROR_PREFIXES:
-            self.assertFalse(msg.startswith(prefix))
+        from orchestrator.tool_errors import classify_tool_output
+        self.assertIsNone(classify_tool_output("Written successfully"))
+        self.assertIsNone(classify_tool_output(""))
 
 
 if __name__ == "__main__":

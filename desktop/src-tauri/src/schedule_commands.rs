@@ -446,52 +446,12 @@ pub(crate) async fn get_schedule_timer_status(
 mod tests {
     use super::*;
 
-    // -- async shape --
-
-    #[test]
-    fn test_list_scheduled_tasks_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(list_scheduled_tasks(false));
-        assert_is_async(list_scheduled_tasks(true));
-    }
-
-    #[test]
-    fn test_add_scheduled_task_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(add_scheduled_task("t".into(), "@daily".into(), None, false));
-        assert_is_async(add_scheduled_task(
-            "t".into(),
-            "@daily".into(),
-            Some("ollama".into()),
-            true,
-        ));
-    }
-
-    #[test]
-    fn test_update_scheduled_task_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(update_scheduled_task("id1".into(), None, None, None, None));
-        assert_is_async(update_scheduled_task(
-            "id1".into(),
-            Some("new task".into()),
-            None,
-            None,
-            Some(true),
-        ));
-    }
-
-    #[test]
-    fn test_delete_scheduled_task_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(delete_scheduled_task("id1".into()));
-    }
-
-    #[test]
-    fn test_run_due_scheduled_task_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(run_due_scheduled_task(false));
-        assert_is_async(run_due_scheduled_task(true));
-    }
+    // NOTE: five `test_*_is_async_fn` tests were deleted here. Each built a
+    // future for a Tauri command and passed it (unpolled) to
+    // `fn assert_is_async<F: Future>(_: F) {}` -- the command bodies never
+    // executed and the "test" was a compile-time no-op inflating the pass
+    // count. Behavioral coverage for these commands belongs in tests that
+    // await them against a fake kimctl (tracked follow-up).
 
     #[test]
     fn test_clamp_timer_interval_enforces_minimum() {

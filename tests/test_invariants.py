@@ -93,17 +93,32 @@ class TestCodeTabConstraint:
             r'unwrap_or_else\(\|\|\s*["\'](\w+)["\']\.to_string\(\)\)',
             content,
         )
-        if default_match:
-            assert default_match.group(1) != "openai", (
-                "Code tab default provider changed to 'openai' — constraint violated"
-            )
-
-    def test_cron_store_excludes_openai_gpt55(self):
-        src = Path(__file__).parent.parent / "orchestrator/cron_store.py"
-        content = src.read_text()
-        assert "gpt-5.5" in content, (
-            "cron_store.py no longer mentions gpt-5.5 exclusion — docstring may have been removed"
+        # Guard against silent vacuity: if the default-provider expression is
+        # refactored to another form this test must fail loudly, not pass.
+        assert default_match is not None, (
+            "default-provider unwrap_or_else expression not found in subprocess.rs — "
+            "update this test's regex to match the new form"
         )
+        assert default_match.group(1) != "openai", (
+            "Code tab default provider changed to 'openai' — constraint violated"
+        )
+
+    def test_scheduled_runner_excludes_openai_gpt55(self):
+        """The REAL enforcement lives in scheduled_runner.is_allowed_provider —
+        test it, not the cron_store docstring that merely mentions it."""
+        from orchestrator.scheduled_runner import is_allowed_provider
+
+        # Allowed for scheduled execution
+        assert is_allowed_provider("ollama")
+        assert is_allowed_provider("ollama-cloud")
+        assert is_allowed_provider("browser")
+        assert is_allowed_provider("browser:chatgpt")
+        assert is_allowed_provider(None)  # empty -> defaults to ollama
+
+        # The standing constraint: never openai / gpt-5.5
+        assert not is_allowed_provider("openai")
+        assert not is_allowed_provider("gpt-5.5")
+        assert not is_allowed_provider("claude")
 
 
 # ---------------------------------------------------------------------------

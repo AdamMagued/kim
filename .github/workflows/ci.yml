@@ -2,9 +2,21 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, 'feature/**', 'fix/**', 'kim-improvement', 'production-roadmap']
+    # Keep this list in sync with the branch names actually in use — a branch
+    # that matches nothing here gets ZERO CI (this bit us: `dev` != `develop`).
+    branches:
+      - main
+      - dev
+      - develop
+      - 'feature/**'
+      - 'feat/**'
+      - 'fix/**'
+      - 'integration/**'
+      - 'audit-fixes'
+      - 'kim-improvement'
+      - 'production-roadmap'
   pull_request:
-    branches: [main, kim-improvement]
+    branches: [main, dev, kim-improvement, 'integration/**']
   workflow_dispatch:
 
 concurrency:
@@ -35,6 +47,12 @@ jobs:
              || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             BASE=$(git rev-parse origin/main 2>/dev/null || git rev-parse HEAD~1)
           fi
+          # workflow_dispatch on main resolves BASE == HEAD: an empty diff would
+          # be a meaningless green, so fall back to the parent commit and say so.
+          if [ "$(git rev-parse "$BASE")" = "$(git rev-parse HEAD)" ]; then
+            echo "NOTICE: base == HEAD (manual dispatch on the base branch); comparing against HEAD~1 instead."
+            BASE=$(git rev-parse HEAD~1)
+          fi
           echo "Comparing against base: $BASE"
           python3 scripts/check_file_size_gate.py "$BASE"
 
@@ -64,7 +82,17 @@ jobs:
       - name: Events schema drift check
         run: |
           npm run gen:events
-          git diff --exit-code src/types/events.gen.ts src-tauri/src/events.gen.rs ../orchestrator/events_gen.py || (echo "ERROR: generated IPC bindings are out of sync with events.schema.json. Run 'npm run gen:events' and commit all generated outputs." && exit 1)
+          # Fail on ANY modified tracked file or NEW untracked file after
+          # regeneration — not just a hardcoded output list, so a fourth
+          # generator output (or a moved one) can't silently escape the gate.
+          cd ..
+          DRIFT="$(git status --porcelain -- desktop/src orchestrator desktop/src-tauri/src)"
+          if [ -n "$DRIFT" ]; then
+            echo "$DRIFT"
+            git diff -- desktop/src orchestrator desktop/src-tauri/src
+            echo "ERROR: generated IPC bindings are out of sync with events.schema.json. Run 'npm run gen:events' (in desktop/) and commit all generated outputs."
+            exit 1
+          fi
 
       - name: Vitest unit tests
         run: npm run test
@@ -155,12 +183,14 @@ jobs:
           # same dep set that ships.  Exclude heavy platform deps that need system
           # libs (playwright, pyautogui, pyobjc, pywin32) — they are guarded by
           # sys_platform markers and are not needed for unit tests.
+          # This install MUST fail the job if requirements.txt is broken
+          # (bad specifier, yanked pin, 404) — no `|| true`, no hidden stderr.
           pip install \
             -r requirements.txt \
             flake8 \
             pyright \
             --ignore-requires-python \
-            --no-deps 2>/dev/null || true
+            --no-deps
           # Re-install with deps to get transitive graph correct for the core subset
           pip install \
             mcp \
@@ -173,13 +203,14 @@ jobs:
             aiohttp \
             json5 \
             json-repair \
+            pillow \
             flake8 \
             pyright \
             pytest \
             pytest-asyncio \
             pytest-cov
 
-      - name: pyright (basic type check — orchestrator/providers + mcp_server)
+      - name: pyright (basic type check — orchestrator + mcp_server + codex_engine)
         run: |
           pyright --outputjson | python3 -c "
           import sys, json
@@ -224,9 +255,8 @@ jobs:
           python -m pytest tests/ -v \
             --ignore=tests/kim_test_suite.py \
             --ignore=tests/claw_test_suite.py \
-            --ignore=tests/test_gemini_user_project_mode.py \
             --cov=orchestrator \
             --cov=mcp_server \
             --cov=codex_engine \
             --cov-report=term \
-            --cov-fail-under=55
+            --cov-fail-under=60
