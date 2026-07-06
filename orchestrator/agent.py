@@ -862,8 +862,12 @@ class KimAgent:
         if tool_name == "batch":
             calls = tool_args.get("calls", [])
             if not isinstance(calls, list):
-                self._session_store.append_message(
-                    {"role": "user", "content": "[Tool result: batch]\nERROR: 'calls' must be a list."})
+                # M11: write the error to memory too (not just the session
+                # store) — otherwise the model never sees it in its next
+                # context and re-issues the same malformed batch.
+                err = "[Tool result: batch]\nERROR: 'calls' must be a list."
+                self.memory.add_user(err)
+                self._session_store.append_message({"role": "user", "content": err})
                 return None
 
             batch_results = []
@@ -1221,8 +1225,14 @@ class KimAgent:
                 # Preview mode already confirms every action in run() before
                 # the tool call reaches the server — don't double-prompt.
                 return "accept"
-            emit_hitl_approval_request(tool, risk, reason, preview)
-            decision = await bridge.decide_action(tool, tool_args)
+            # T1: every approval request carries a unique decision id. The UI
+            # echoes it back in the hitl_approve stdin line, and the bridge
+            # only applies a decision whose id matches this pending request —
+            # a late Approve for a timed-out prompt can no longer authorize
+            # the next tool.
+            request_id = str(request.get("id") or "") or secrets.token_hex(8)
+            emit_hitl_approval_request(tool, risk, reason, preview, id=request_id)
+            decision = await bridge.decide_action(tool, tool_args, request_id=request_id)
             emit_hitl_approval_result(
                 tool, decision in ("accept", "acceptForSession")
             )

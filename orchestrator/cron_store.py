@@ -416,7 +416,25 @@ class CronStore:
             if "task" in kwargs:
                 raw["task"] = str(kwargs["task"]).strip()
             if "schedule_expr" in kwargs:
-                raw["schedule_expr"] = str(kwargs["schedule_expr"]).strip()
+                new_expr = str(kwargs["schedule_expr"]).strip()
+                schedule_changed = new_expr != str(raw.get("schedule_expr", ""))
+                raw["schedule_expr"] = new_expr
+                # M8: recompute next_run_at so the new cadence takes effect now.
+                # due_tasks reads the stored next_run_at, so leaving the old one
+                # (e.g. @daily's "tomorrow") would ignore the new schedule until
+                # then. Anchor to last_run_at when the task has run, else now.
+                if schedule_changed:
+                    base = (
+                        _parse_utc_iso(str(raw["last_run_at"]))
+                        if raw.get("last_run_at")
+                        else datetime.now(timezone.utc)
+                    )
+                    try:
+                        raw["next_run_at"] = next_run_after(new_expr, base).isoformat()
+                    except ValueError:
+                        # Invalid expr — clear next_run_at; from_dict below will
+                        # reject the entry and this update returns None.
+                        raw["next_run_at"] = None
             if "provider" in kwargs:
                 raw["provider"] = str(kwargs["provider"]).strip() if kwargs["provider"] else None
             if "enabled" in kwargs:

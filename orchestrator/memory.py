@@ -218,7 +218,12 @@ def _strip_images(content: Content) -> Content:
     """
     if isinstance(content, str):
         return content
-    kept = [item for item in content if item.get("type") != "image"]
+    # L9: tolerate non-dict items (raw strings) — estimate_content_tokens
+    # accepts them, so this walk must too.
+    kept = [
+        item for item in content
+        if not (isinstance(item, dict) and item.get("type") == "image")
+    ]
     if not kept:
         return [{"type": "text", "text": "(screenshot removed — not in active window)"}]
     kept.append({"type": "text", "text": "(screenshot removed)"})

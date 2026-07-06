@@ -169,8 +169,19 @@ class OpenAIProvider(BaseProvider):
                 try:
                     args = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
+                    # M9: never silently swap malformed args for {} — log what
+                    # the model actually produced so the confusing downstream
+                    # "missing argument" failure has a trace.
+                    logger.warning(
+                        "Malformed tool-call arguments for %r (%r) — using {}",
+                        tc.function.name, str(tc.function.arguments)[:200],
+                    )
                     args = {}
                 return {"tool": tc.function.name, "args": args}
+
+            # H2: keep any assistant narration that accompanies the tool call —
+            # the agent reads response["content"] for PLAN/STEP markers.
+            narration = msg.content or ""
 
             if len(msg.tool_calls) > 1:
                 # Surface multi-tool requests as a `batch` call so the agent
@@ -180,6 +191,7 @@ class OpenAIProvider(BaseProvider):
                     "type": "tool_call",
                     "tool": "batch",
                     "args": {"calls": [_parse_one(tc) for tc in msg.tool_calls]},
+                    "content": narration,
                     "usage": usage,
                 }
 
@@ -189,6 +201,7 @@ class OpenAIProvider(BaseProvider):
                 "type": "tool_call",
                 "tool": parsed["tool"],
                 "args": parsed["args"],
+                "content": narration,
                 "usage": usage,
             }
 

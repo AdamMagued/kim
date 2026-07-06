@@ -17,6 +17,13 @@ import queue
 import sys
 import threading
 
+# Approval-gate timeouts (L15): named constants instead of scattered magic
+# numbers so the tray confirm dialog (60 s) and the stdin HITL decision channel
+# (120 s, matching codex_bridge's approval_timeout_s default) stay documented
+# and greppable.
+CONFIRM_TIMEOUT_S = 60.0
+STDIN_APPROVAL_TIMEOUT_S = 120.0
+
 
 class UIBridge:
     """
@@ -85,10 +92,13 @@ class UIBridge:
         self._confirm_queue.put_nowait((tool_name, args, event, result))
         # Wait without blocking the asyncio event loop
         loop = asyncio.get_running_loop()
-        timed_out = not await loop.run_in_executor(None, lambda: event.wait(timeout=60.0))
+        timed_out = not await loop.run_in_executor(
+            None, lambda: event.wait(timeout=CONFIRM_TIMEOUT_S)
+        )
         if timed_out:
             logging.getLogger(__name__).warning(
-                "Confirmation timed out after 60 s — auto-denying tool '%s'", tool_name
+                "Confirmation timed out after %.0f s — auto-denying tool '%s'",
+                CONFIRM_TIMEOUT_S, tool_name,
             )
         return result[0]
 
@@ -101,13 +111,20 @@ class UIBridge:
 
     # ── Rich approval decisions (K1 server-side HITL gate) ────────────
 
-    async def decide_action(self, tool_name: str, args: dict) -> str:
+    async def decide_action(
+        self, tool_name: str, args: dict, request_id: str | None = None
+    ) -> str:
         """Return "accept" | "acceptForSession" | "decline" for a tool call.
 
         Base implementation adapts the boolean confirm_action() so UIs that
         only know approve/deny keep working. Subclasses with a richer wire
         format (StdinApprovalBridge) override this to surface
         acceptForSession.
+
+        request_id (T1): the unique decision id this approval request was
+        emitted with. Implementations that read decisions from a shared
+        channel (stdin) MUST only apply a decision whose id matches it;
+        a late decision for an earlier prompt is discarded, never applied.
         """
         approved = await self.confirm_action(tool_name, args)
         return "accept" if approved else "decline"
@@ -125,6 +142,12 @@ class UIBridge:
                 event.set()
             except queue.Empty:
                 break
+        # T1/H3: also drop any stdin approval decision that arrived after its
+        # prompt was abandoned — it must never be applied to the next task's
+        # first high-risk tool.
+        pump = _STDIN_PUMP
+        if pump is not None and pump.is_running():
+            pump.drain_approvals()
 
     def reset(self) -> None:
         """Call before submitting a new task."""
@@ -136,6 +159,10 @@ class UIBridge:
                 event.set()
             except queue.Empty:
                 break
+        # T1/H3: stale approval decisions from the previous task are void.
+        pump = _STDIN_PUMP
+        if pump is not None and pump.is_running():
+            pump.drain_approvals()
 
 
 class UIBridgeLogHandler(logging.Handler):
@@ -178,16 +205,27 @@ class StdinApprovalBridge(UIBridge):
     or, with the generalized K1 vocabulary:
         {"type": "hitl_approve", "id": "…", "decision": "accept"|"acceptForSession"|"decline"}
 
-    Timeout: 120 s — auto-denies if no response arrives.
+    Timeout: STDIN_APPROVAL_TIMEOUT_S (120 s) — auto-denies if no response
+    arrives.
+
+    T1 decision-id contract: the emitted hitl_approval_request event carries a
+    unique ``id``; a decision line is applied only when its ``id`` matches the
+    currently pending request (id-less lines are accepted for backward
+    compatibility with pre-T1 writers). Late decisions for a timed-out prompt
+    are discarded, never applied to the next tool.
     """
 
-    async def decide_action(self, tool_name: str, args: dict) -> str:
+    async def decide_action(
+        self, tool_name: str, args: dict, request_id: str | None = None
+    ) -> str:
         if self._cancelled.is_set():
             return "decline"
         pump = get_stdin_pump()
         if pump.is_running():
             try:
-                data = await pump.next_approval(timeout=120.0)
+                data = await pump.next_approval(
+                    timeout=STDIN_APPROVAL_TIMEOUT_S, request_id=request_id
+                )
                 return normalize_decision(data)
             except Exception as exc:
                 logging.getLogger(__name__).warning(
@@ -195,13 +233,26 @@ class StdinApprovalBridge(UIBridge):
                     exc, tool_name,
                 )
                 return "decline"
+        # Legacy raw-readline fallback — unit tests only (the pump is always
+        # started in the Tauri runtime; see agent.py). Kept because tests patch
+        # sys.stdin directly. Applies the same id gate: a mismatched decision
+        # id means the line belongs to an earlier prompt → decline, don't
+        # apply it here.
         loop = asyncio.get_running_loop()
         try:
             line: str = await asyncio.wait_for(
                 loop.run_in_executor(None, sys.stdin.readline),
-                timeout=120.0,
+                timeout=STDIN_APPROVAL_TIMEOUT_S,
             )
-            return normalize_decision(json.loads(line.strip()))
+            data = json.loads(line.strip())
+            echo_id = data.get("id")
+            if echo_id is not None and request_id is not None and str(echo_id) != str(request_id):
+                logging.getLogger(__name__).warning(
+                    "Discarding approval decision for id %r (pending %r) — denying tool '%s'",
+                    echo_id, request_id, tool_name,
+                )
+                return "decline"
+            return normalize_decision(data)
         except Exception as exc:
             logging.getLogger(__name__).warning(
                 "HITL stdin approval failed (%s) — denying tool '%s'",
@@ -219,8 +270,8 @@ class StdinApprovalBridge(UIBridge):
         pump = get_stdin_pump()
         if pump.is_running():
             try:
-                data = await pump.next_approval(timeout=120.0)
-                return bool(data.get("approved", False))
+                data = await pump.next_approval(timeout=STDIN_APPROVAL_TIMEOUT_S)
+                return normalize_decision(data) in ("accept", "acceptForSession")
             except Exception as exc:
                 logging.getLogger(__name__).warning(
                     "HITL stdin approval failed (%s) — denying tool '%s'", exc, tool_name
@@ -230,7 +281,7 @@ class StdinApprovalBridge(UIBridge):
         try:
             line: str = await asyncio.wait_for(
                 loop.run_in_executor(None, sys.stdin.readline),
-                timeout=120.0,
+                timeout=STDIN_APPROVAL_TIMEOUT_S,
             )
             data = json.loads(line.strip())
             return bool(data.get("approved", False))
@@ -300,8 +351,62 @@ class StdinPump:
                 continue
             self._dispatch(data)
 
-    async def next_approval(self, timeout: float) -> dict:
-        return await asyncio.wait_for(self._approval_q.get(), timeout=timeout)
+    async def next_approval(self, timeout: float, request_id: str | None = None) -> dict:
+        """Wait for the decision line addressed to the pending approval request.
+
+        T1 contract:
+        - Decisions already queued when the request starts waiting predate it
+          and are discarded (a late Approve for a timed-out prompt must never
+          leak into the next tool's gate).
+        - While waiting, a decision whose ``id`` does not match ``request_id``
+          is discarded with a warning. Id-less decisions are applied for
+          backward compatibility with pre-T1 writers.
+        - Raises asyncio.TimeoutError when no matching decision arrives.
+        """
+        self.drain_approvals()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(
+                    f"no approval decision within {timeout:.0f}s"
+                )
+            data = await asyncio.wait_for(self._approval_q.get(), timeout=remaining)
+            echo_id = data.get("id")
+            if echo_id is None or request_id is None or str(echo_id) == str(request_id):
+                return data
+            logging.getLogger(__name__).warning(
+                "Discarding stale approval decision for id %r (pending %r)",
+                echo_id, request_id,
+            )
+
+    def drain_approvals(self) -> None:
+        """Drop every queued (stale) approval decision. Thread-safe: when the
+        pump has a loop, the drain is marshalled onto it; otherwise (tests
+        with _loop=None) it drains inline."""
+        def _drain() -> None:
+            while True:
+                try:
+                    stale = self._approval_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                logging.getLogger(__name__).warning(
+                    "Dropping stale approval decision line: id=%r", stale.get("id")
+                )
+
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                _drain()
+            else:
+                loop.call_soon_threadsafe(_drain)
+        else:
+            _drain()
 
 
 _STDIN_PUMP: "StdinPump | None" = None

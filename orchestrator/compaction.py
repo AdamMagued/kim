@@ -135,12 +135,25 @@ def _estimate_message_tokens(msg: dict) -> int:
 
 
 def _is_tool_result(msg: dict) -> bool:
-    """True if msg is a user message that starts with '[Tool result:'."""
+    """True if msg is a user message that starts with '[Tool result:'.
+
+    M4: multimodal tool results (screenshots) are LIST content of the shape
+    [{"type": "text", "text": "[Tool result: …"}, {"type": "image", …}] —
+    str(list) starts with "[{'type'…", so the old str() coercion never matched
+    them and a compaction boundary could orphan a screenshot result from its
+    tool call. Mirrors memory.py's list-aware check.
+    """
     if msg.get("role") != "user":
         return False
     content = msg.get("content", "")
-    text = content if isinstance(content, str) else str(content)
-    return text.lstrip().startswith("[Tool result:")
+    if isinstance(content, str):
+        return content.lstrip().startswith("[Tool result:")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                if str(item.get("text", "")).lstrip().startswith("[Tool result:"):
+                    return True
+    return False
 
 
 def _is_tool_call(msg: dict) -> bool:

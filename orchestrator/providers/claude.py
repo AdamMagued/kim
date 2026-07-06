@@ -124,12 +124,21 @@ class AnthropicProvider(BaseProvider):
 
         tool_blocks = [b for b in response.content if b.type == "tool_use"]
 
+        # Concatenate all text blocks. Also attached to tool_call responses:
+        # the agent reads response["content"] for the PLAN/STEP/THINKING
+        # narration that precedes a tool call (H2 — it was silently dropped
+        # for the API providers while Ollama/browser preserved it).
+        text = " ".join(
+            b.text for b in response.content if hasattr(b, "text") and b.text
+        )
+
         if len(tool_blocks) == 1:
             b = tool_blocks[0]
             return {
                 "type": "tool_call",
                 "tool": b.name,
                 "args": dict(b.input),
+                "content": text,
                 "usage": usage,
             }
 
@@ -142,11 +151,8 @@ class AnthropicProvider(BaseProvider):
                 "type": "tool_call",
                 "tool": "batch",
                 "args": {"calls": [{"tool": b.name, "args": dict(b.input)} for b in tool_blocks]},
+                "content": text,
                 "usage": usage,
             }
 
-        # Fallback: concatenate all text blocks
-        text = " ".join(
-            b.text for b in response.content if hasattr(b, "text") and b.text
-        )
         return {"type": "text", "content": text or "", "usage": usage}

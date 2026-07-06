@@ -77,7 +77,9 @@ async def _cli_main(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     if args.provider:
         config["provider"] = args.provider
-    if args.max_iter:
+    # L13: use `is not None` so an explicit --max-iter 0 is honored rather than
+    # silently dropped by a falsy check.
+    if args.max_iter is not None:
         config["max_iterations"] = args.max_iter
 
     log_level = logging.DEBUG if args.verbose else logging.INFO

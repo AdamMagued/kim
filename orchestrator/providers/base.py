@@ -79,6 +79,18 @@ class ProviderError(Exception):
         super().__init__(self.message)
 
 
+class ProviderEnvironmentError(EnvironmentError):
+    """A provider-environment problem the user must fix (daemon not running,
+    model not installed/pulled, nothing configured).
+
+    Subclasses EnvironmentError so existing ``except EnvironmentError``
+    call sites keep working, but classify_provider_error() can distinguish it
+    from a transient OSError: retrying a stopped daemon or a missing model
+    five times under a false "rate limited" banner only hides the actionable
+    message (H1).
+    """
+
+
 def classify_provider_error(error: Exception) -> ProviderError:
     """Classify provider exceptions without requiring every provider to wrap them.
 
@@ -88,6 +100,12 @@ def classify_provider_error(error: Exception) -> ProviderError:
     """
     if isinstance(error, ProviderError):
         return error
+
+    # Environment problems (daemon stopped, model not installed) need the user
+    # to act — never retryable, and checked before every message heuristic so
+    # wording like "not running" can't be mistaken for a transient failure.
+    if isinstance(error, ProviderEnvironmentError):
+        return ProviderError("environment", str(error), retryable=False)
 
     import re as _re_provider_error
 
@@ -127,7 +145,9 @@ def classify_provider_error(error: Exception) -> ProviderError:
 
     if "rate" in lowered and "limit" in lowered:
         return ProviderError("rate_limit", message, retryable=True)
-    if "429" in lowered or "ratelimit" in error_type:
+    # Digit-bounded like the 400/5xx checks — a bare "429" substring would
+    # also match e.g. "error 14290" (L4).
+    if _re_provider_error.search(r"(?<!\d)429(?!\d)", lowered) or "ratelimit" in error_type:
         return ProviderError("rate_limit", message, retryable=True)
 
     for code in ("500", "502", "503", "529"):

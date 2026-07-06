@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from orchestrator.providers.base import BaseProvider
+from orchestrator.providers.base import BaseProvider, ProviderEnvironmentError
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,11 @@ class OllamaProvider(BaseProvider):
             _env_or_cfg(config, "KIM_OLLAMA_KEEP_ALIVE", "ollama", "keep_alive", default=ollama_cfg.get("keep_alive") or "5m")  # noqa: E501
         ).strip()
         self._timeout_s = 600.0
+        # L11: True when _local_model was auto-picked (not user-configured).
+        self._auto_selected_model = False
+        # M13: per-model context-limit cache so every completion doesn't shell
+        # out to `ollama ps` (and POST /api/show) again.
+        self._context_limit_cache: dict[str, tuple[int | None, str | None]] = {}
         logger.info(
             "OllamaProvider: base_url=%s mode=%s local_model=%s cloud_model=%s",
             self._base_url,
@@ -279,7 +284,7 @@ class OllamaProvider(BaseProvider):
                 resp = await client.get(f"{self._base_url}/api/version")
                 resp.raise_for_status()
             except httpx.HTTPError as exc:
-                raise EnvironmentError(
+                raise ProviderEnvironmentError(
                     "Ollama is installed but not running. Start Ollama, then try again."
                 ) from exc
 
@@ -287,7 +292,26 @@ class OllamaProvider(BaseProvider):
         if self._mode == "cloud":
             return self._cloud_model or DEFAULT_OLLAMA_CLOUD_MODEL
         if self._local_model:
-            return self._local_model
+            # L11: an AUTO-selected model may be removed mid-session; re-check
+            # it against the installed tags and re-select instead of failing
+            # every later turn with "not installed". A user-configured model
+            # is never second-guessed here (_validate_model reports it).
+            if not self._auto_selected_model:
+                return self._local_model
+            if tags is None:
+                tags = await self._fetch_tags()
+            names = {
+                str(item.get("name") or "").strip().lower()
+                for item in tags
+                if isinstance(item, dict)
+            }
+            if self._local_model.lower() in names:
+                return self._local_model
+            logger.info(
+                "OllamaProvider: auto-selected model %r is no longer installed — re-selecting.",
+                self._local_model,
+            )
+            self._local_model = ""
 
         if tags is None:
             tags = await self._fetch_tags()
@@ -295,15 +319,16 @@ class OllamaProvider(BaseProvider):
             first = str((tags[0] or {}).get("name") or "").strip()
             if first:
                 self._local_model = first
+                self._auto_selected_model = True
                 return first
-        raise EnvironmentError(
+        raise ProviderEnvironmentError(
             "No local Ollama models are installed. Pull a model in Settings → AI → Ollama, then try again."
         )
 
     async def _validate_model(self, model: str, tags: list[dict] | None = None) -> None:
         if self._mode == "cloud":
             if not model.strip():
-                raise EnvironmentError(
+                raise ProviderEnvironmentError(
                     "No Ollama cloud model selected. Pick a model in Settings → AI → Ollama, then try again."
                 )
             return
@@ -316,7 +341,7 @@ class OllamaProvider(BaseProvider):
             if isinstance(item, dict)
         }
         if model.strip().lower() not in names:
-            raise EnvironmentError(
+            raise ProviderEnvironmentError(
                 f"Ollama local model {model!r} is not installed. Pull it in Settings → AI → Ollama or pick another model."  # noqa: E501
             )
 
@@ -426,12 +451,12 @@ class OllamaProvider(BaseProvider):
                     detail = (await resp.aread()).decode("utf-8", errors="replace").strip()
                     lowered = detail.lower()
                     if _looks_like_vision_model_error(lowered):
-                        raise EnvironmentError(
+                        raise ProviderEnvironmentError(
                             "The selected Ollama model does not appear to support images. "
                             "Pick a vision-capable Ollama model or use structured UI observation instead of screenshots."  # noqa: E501
                         )
                     if "not found" in lowered or "pull" in lowered:
-                        raise EnvironmentError(
+                        raise ProviderEnvironmentError(
                             f"Ollama model {payload.get('model')!r} is unavailable. Pull it in Settings → AI → Ollama or pick another model."  # noqa: E501
                         )
                     if "sign in" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
@@ -453,12 +478,12 @@ class OllamaProvider(BaseProvider):
                         if "sign in" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
                             raise PermissionError("Sign in to Ollama to use cloud models.")
                         if _looks_like_vision_model_error(lowered):
-                            raise EnvironmentError(
+                            raise ProviderEnvironmentError(
                                 "The selected Ollama model does not appear to support images. "
                                 "Pick a vision-capable Ollama model or use structured UI observation instead of screenshots."  # noqa: E501
                             )
                         if "not found" in lowered or "pull" in lowered:
-                            raise EnvironmentError(
+                            raise ProviderEnvironmentError(
                                 f"Ollama model {payload.get('model')!r} is unavailable. Pull it in Settings → AI → Ollama or pick another model."  # noqa: E501
                             )
                         raise RuntimeError(detail)
@@ -528,20 +553,29 @@ class OllamaProvider(BaseProvider):
         if context_limit is not None:
             usage["context_limit"] = context_limit
             usage["context_limit_source"] = context_source
-        elif self._context_override:
-            usage["context_limit"] = self._context_override
-            usage["context_limit_source"] = "override"
         else:
+            # L10: no separate override branch — _resolve_context_limit already
+            # returns (self._context_override, "override") when ps/show fail,
+            # so context_limit is None only when there is no override either.
             usage["context_limit_source"] = context_source or "unknown"
         return usage
 
     async def _resolve_context_limit(self, model: str) -> tuple[int | None, str | None]:
+        # M13: `ollama ps` + /api/show can add seconds per turn — resolve once
+        # per model and reuse. Only positive answers are cached so a transient
+        # failure doesn't pin (None, None) for the whole session.
+        cached = self._context_limit_cache.get(model)
+        if cached is not None:
+            return cached
+
         ps_limit = await asyncio.to_thread(self._context_limit_from_ps_sync, model)
         if ps_limit:
+            self._context_limit_cache[model] = (ps_limit, "ollama_ps")
             return ps_limit, "ollama_ps"
 
         show_limit = await self._context_limit_from_show(model)
         if show_limit:
+            self._context_limit_cache[model] = (show_limit, "api_show")
             return show_limit, "api_show"
 
         if self._context_override:
@@ -636,8 +670,21 @@ def _normalize_tool_arguments(raw: Any) -> dict[str, Any]:
     if isinstance(raw, str):
         try:
             parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
+            if not isinstance(parsed, dict):
+                logger.warning(
+                    "Ollama tool-call arguments are not an object (%r) — using {}",
+                    raw[:200],
+                )
+                return {}
+            return parsed
         except json.JSONDecodeError:
+            # M9: never silently swap malformed args for {} — the tool then
+            # fails with a confusing "missing argument" error and no trace of
+            # what the model actually produced.
+            logger.warning(
+                "Ollama tool-call arguments are not valid JSON (%r) — using {}",
+                raw[:200],
+            )
             return {}
     return {}
 

@@ -676,7 +676,14 @@ class SessionStore:
         for date_dir in sorted(base.iterdir(), reverse=True):
             if not date_dir.is_dir():
                 continue
-            for summary_file in sorted(date_dir.glob("*.summary.txt"), reverse=True):
+            # L1: within a day, order by mtime (newest first). The filename is a
+            # random-hex session id, so sorting by name gave an arbitrary order
+            # and "recent context" was not actually the newest session.
+            for summary_file in sorted(
+                date_dir.glob("*.summary.txt"),
+                key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+                reverse=True,
+            ):
                 session_id = summary_file.stem.replace(".summary", "")
                 try:
                     text = summary_file.read_text(encoding="utf-8").strip()

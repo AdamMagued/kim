@@ -40,6 +40,12 @@ async def complete_via_webview_bridge(
     site = preferred_site or "claude"
     known_sites = site_configs or SITE_CONFIGS
     if site not in known_sites:
+        # L5: never silently reroute an unknown/typo'd preferred_site — the
+        # user asked for one provider and would get another with no notice.
+        logger.warning(
+            "Unknown preferred_site %r (known: %s) — falling back to claude.",
+            site, ", ".join(sorted(known_sites)),
+        )
         site = "claude"
 
     bridge_attachments: list[dict] = []

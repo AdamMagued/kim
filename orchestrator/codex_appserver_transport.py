@@ -35,9 +35,11 @@ import contextlib
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import sys
+import threading
 from typing import Any, Awaitable, Callable, Optional
 
 from codex_engine.app_server import (
@@ -193,29 +195,114 @@ def parse_decision_line(line: str) -> Optional[tuple[str, Optional[str]]]:
     return None
 
 
-async def _read_stdin_decision(timeout: float) -> Optional[tuple[str, Optional[str]]]:
-    """Block on stdin until a decision line arrives (or timeout/EOF → None)."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while True:
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            return None
+class _StdinDecisionPump:
+    """T1/H4: the single owned stdin reader for this process.
+
+    The old per-request ``run_in_executor(sys.stdin.readline)`` leaked a
+    blocked reader thread whenever ``wait_for`` timed out — cancellation does
+    not stop a blocking ``readline``, so the abandoned thread eventually
+    consumed the NEXT approval's decision line. This pump owns stdin with one
+    daemon thread for the life of the process and hands parsed decision
+    tuples to whoever is currently waiting; non-decision lines are ignored.
+
+    Also intended for reuse by codex_bridge_service's own gate reads so the
+    process keeps exactly one stdin reader.
+    """
+
+    _EOF = ("__eof__", None)
+
+    def __init__(self) -> None:
+        self._q: "queue.Queue[tuple[str, Optional[str]]]" = queue.Queue()
+        self._started = False
+        self._start_lock = threading.Lock()
+        self._eof = False
+
+    def start(self) -> None:
+        with self._start_lock:
+            if self._started:
+                return
+            self._started = True
+            threading.Thread(
+                target=self._read_loop, daemon=True, name="kim-stdin-decisions"
+            ).start()
+
+    def _read_loop(self) -> None:
         try:
-            line: str = await asyncio.wait_for(
-                loop.run_in_executor(None, sys.stdin.readline), timeout=remaining
-            )
-        except asyncio.TimeoutError:
-            return None
+            for line in sys.stdin:
+                parsed = parse_decision_line(line)
+                if parsed is not None:
+                    self._q.put(parsed)
+                # Not a decision (e.g. a steer line) — ignore, keep reading.
         except Exception as exc:  # noqa: BLE001
             logger.warning("approval stdin read failed (%s) — declining", exc)
-            return None
-        if not line:  # EOF — the supervisor went away
-            return None
-        parsed = parse_decision_line(line)
-        if parsed is not None:
-            return parsed
-        # Not a decision (e.g. a steer line) — keep waiting for one.
+        self._eof = True
+        self._q.put(self._EOF)  # wake any waiter: the supervisor went away
+
+    def drain(self) -> None:
+        """Drop queued (stale) decisions — none can belong to a request that
+        has not started waiting yet."""
+        while True:
+            try:
+                stale = self._q.get_nowait()
+            except queue.Empty:
+                return
+            if stale == self._EOF:
+                self._q.put(self._EOF)
+                return
+            logger.warning("dropping stale approval decision line: id=%r", stale[1])
+
+    def _get_blocking(self, timeout: float) -> Any:
+        """One bounded queue read → decision tuple | "empty" | "eof"."""
+        try:
+            item = self._q.get(timeout=timeout)
+        except queue.Empty:
+            return "empty"
+        if item == self._EOF:
+            self._q.put(self._EOF)  # keep EOF visible to later waiters
+            return "eof"
+        return item
+
+    async def read_decision(self, timeout: float) -> Optional[tuple[str, Optional[str]]]:
+        """Await the next decision (or None on timeout/EOF).
+
+        Polls the queue in short blocking slices so that if this coroutine is
+        cancelled/abandoned, the worker thread expires within ~0.25 s instead
+        of squatting on the queue where it could swallow a later decision.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            result = await loop.run_in_executor(
+                None, self._get_blocking, min(0.25, remaining)
+            )
+            if result == "eof":
+                return None
+            if result != "empty":
+                return result
+
+
+_DECISION_PUMP: Optional[_StdinDecisionPump] = None
+
+
+def get_decision_pump() -> _StdinDecisionPump:
+    global _DECISION_PUMP
+    if _DECISION_PUMP is None:
+        _DECISION_PUMP = _StdinDecisionPump()
+    return _DECISION_PUMP
+
+
+async def _read_stdin_decision(timeout: float) -> Optional[tuple[str, Optional[str]]]:
+    """Wait for the next decision line (or timeout/EOF → None).
+
+    Routed through the process-wide stdin pump so a timed-out wait never
+    leaves an orphaned reader thread blocked on stdin (T1/H4).
+    """
+    pump = get_decision_pump()
+    pump.start()
+    return await pump.read_decision(timeout)
 
 
 def _scrub(text: str) -> str:
@@ -285,13 +372,16 @@ class AppServerTurnRunner:
                 env=build_appserver_env(self._bearer),
             )
         self._client = client
-        await client.start()
-        if self._register_process is not None:
-            proc = getattr(client, "_proc", None)
-            if proc is not None:
-                self._register_process(proc)
         previous_handler: Any = None
+        # start() is inside the try so a failure after the child spawns
+        # (initialize error, register hook raising) still reaches the
+        # finally's client.stop() and never leaks the codex process (L7).
         try:
+            await client.start()
+            if self._register_process is not None:
+                proc = getattr(client, "_proc", None)
+                if proc is not None:
+                    self._register_process(proc)
             await client.initialize()
             await self._resume_or_start()
             if self._install_signal_handler:
@@ -469,19 +559,36 @@ class AppServerTurnRunner:
                 "declining the escalated action. Re-run from Kim to approve it."
             )
             return "decline"
-        parsed = await self._decision_reader(self._approval_timeout)
-        if parsed is None:
-            emit_status(
-                f"No approval decision within {int(self._approval_timeout)}s — declining."
-            )
-            return "decline"
-        decision, echo_id = parsed
-        if echo_id is not None and echo_id != request_id:
+        # T1: decisions queued before this request started waiting are stale
+        # (e.g. a late Approve for an earlier, timed-out prompt) — drop them
+        # instead of letting them authorize THIS request. Only the default
+        # stdin reader has a queue to drain; injected test readers do not.
+        if self._decision_reader is _read_stdin_decision:
+            get_decision_pump().drain()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._approval_timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                emit_status(
+                    f"No approval decision within {int(self._approval_timeout)}s — declining."
+                )
+                return "decline"
+            parsed = await self._decision_reader(remaining)
+            if parsed is None:
+                emit_status(
+                    f"No approval decision within {int(self._approval_timeout)}s — declining."
+                )
+                return "decline"
+            decision, echo_id = parsed
+            if echo_id is None or echo_id == request_id:
+                # Id-less decisions are accepted for backward compatibility
+                # with pre-T1 writers (legacy {"approved": bool} lines).
+                return decision
             logger.warning(
-                "approval decision id %r does not match request %r — applying it anyway "
-                "(one outstanding approval at a time)", echo_id, request_id,
+                "discarding approval decision for id %r — it does not match the "
+                "pending request %r", echo_id, request_id,
             )
-        return decision
 
     def _file_change_files(self, params: dict, item_id: str) -> list:
         """Best-effort [{path, kind}] from the tracked fileChange item."""
@@ -639,6 +746,7 @@ class AppServerTurnRunner:
 
 async def check_binary_version(binary_path: str) -> tuple[bool, Optional[str]]:
     """Part-0 version gate: run ``codex --version``; refuse only on major drift."""
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             binary_path, "--version",
@@ -648,6 +756,12 @@ async def check_binary_version(binary_path: str) -> tuple[bool, Optional[str]]:
         raw, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
         version_output = raw.decode("utf-8", errors="replace")
     except Exception as exc:  # noqa: BLE001
+        # A hung `codex --version` must not be leaked on timeout (L8).
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
         logger.warning("codex --version failed (%s) — skipping the version gate", exc)
         return True, None
     return check_schema_drift(version_output)

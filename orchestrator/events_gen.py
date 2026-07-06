@@ -153,8 +153,8 @@ def emit_rate_limited(delay: float, attempt: float, max_retries: float) -> None:
     emit_event("rate_limited", delay=delay, attempt=attempt, max_retries=max_retries)
 
 
-def emit_hitl_approval_request(tool: str, risk: str, reason: str, preview: str) -> None:
-    emit_event("hitl_approval_request", tool=tool, risk=risk, reason=reason, preview=preview)
+def emit_hitl_approval_request(tool: str, risk: str, reason: str, preview: str, id: str = '') -> None:
+    emit_event("hitl_approval_request", tool=tool, risk=risk, reason=reason, preview=preview, id=id)
 
 
 def emit_hitl_approval_result(tool: str, approved: bool) -> None:

@@ -801,3 +801,83 @@ def test_popen_receives_log_file_not_devnull(tmp_path):
     assert captured_kwargs["stderr"] is not real_subprocess.DEVNULL
     # The file handle should be a real IO object (already closed after Popen)
     assert hasattr(captured_kwargs["stdout"], "name"), "expected a file handle with a .name"
+
+
+# ---------------------------------------------------------------------------
+# PID reaper: reboot PID-reuse guard (M6) + register-before-timeout (M7)
+# ---------------------------------------------------------------------------
+
+def test_reaper_does_not_kill_pid_from_a_previous_boot(tmp_path):
+    """M6: an entry whose boot_ref predates this boot must be dropped, never
+    SIGKILLed — the OS may have reused its PID for an innocent process."""
+    import json as _json
+    import os as _os
+    from unittest.mock import patch as _patch
+
+    from orchestrator.scheduled_runner import (
+        _boot_ref,
+        _pid_registry_path,
+        _reap_stale_agents,
+    )
+
+    reg = _pid_registry_path(tmp_path)
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    # A long-running entry (elapsed > timeout) but from a DIFFERENT boot.
+    reg.write_text(_json.dumps([{
+        "task_id": "t1",
+        "pid": 999999,
+        "started_at": 0.0,
+        "boot_ref": _boot_ref() - 10_000,  # clearly a prior boot
+    }]))
+
+    killed = []
+    with _patch.object(_os, "kill", side_effect=lambda p, s: killed.append((p, s))):
+        _reap_stale_agents(tmp_path, timeout_seconds=1.0)
+
+    assert killed == []  # never killed a foreign-boot PID
+    assert _json.loads(reg.read_text()) == []  # but dropped from the registry
+
+
+def test_reaper_kills_stale_agent_from_current_boot(tmp_path):
+    """The reaper still kills a genuinely stale agent from THIS boot."""
+    import json as _json
+    import os as _os
+    from unittest.mock import patch as _patch
+
+    from orchestrator.scheduled_runner import (
+        _boot_ref,
+        _pid_registry_path,
+        _reap_stale_agents,
+    )
+
+    reg = _pid_registry_path(tmp_path)
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    reg.write_text(_json.dumps([{
+        "task_id": "t1",
+        "pid": 424242,
+        "started_at": 0.0,          # long ago → elapsed > timeout
+        "boot_ref": _boot_ref(),    # this boot
+    }]))
+
+    killed = []
+    with _patch("orchestrator.scheduled_runner._pid_exists", return_value=True), \
+         _patch.object(_os, "kill", side_effect=lambda p, s: killed.append((p, s))):
+        _reap_stale_agents(tmp_path, timeout_seconds=1.0)
+
+    assert killed == [(424242, 9)]
+
+
+def test_register_agent_pid_records_boot_ref(tmp_path):
+    """M6: registration stamps the current boot_ref so the reaper can verify."""
+    import json as _json
+
+    from orchestrator.scheduled_runner import (
+        _boot_ref,
+        _pid_registry_path,
+        _register_agent_pid,
+    )
+
+    _register_agent_pid(tmp_path, "t1", 12345)
+    entries = _json.loads(_pid_registry_path(tmp_path).read_text())
+    assert entries[0]["pid"] == 12345
+    assert abs(entries[0]["boot_ref"] - _boot_ref()) <= 1

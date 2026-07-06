@@ -34,7 +34,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from orchestrator.providers.base import BaseProvider
+from orchestrator.providers.base import BaseProvider, ProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -255,9 +255,16 @@ class GeminiProvider(BaseProvider):
             # Enhanced error message for user-project mode
             if self._auth_mode == "oauth_user_project":
                 if exc.code == 429:
-                    raise RuntimeError(
+                    # M10: raise a pre-classified ProviderError — the message
+                    # mentions "API key", which classify_provider_error's auth
+                    # markers would otherwise misread as an auth failure. A
+                    # free-tier quota won't reset within retry backoff, so it
+                    # is not retryable.
+                    raise ProviderError(
+                        "rate_limit",
                         f"Your Google Gemini free-tier quota has been exceeded for project {self._quota_project}. "
-                        f"Wait for your quota to reset, upgrade to a paid plan, or use an API key."
+                        f"Wait for your quota to reset, upgrade to a paid plan, or use an API key.",
+                        retryable=False,
                     ) from exc
                 elif exc.code in (400, 403):
                     raise RuntimeError(
@@ -442,6 +449,21 @@ class GeminiProvider(BaseProvider):
         }
         candidates = response.get("candidates") or []
         if not candidates:
+            # M2: a blocked prompt returns no candidates but does carry
+            # promptFeedback.blockReason — surface it instead of an empty
+            # string the agent nudge-loops on.
+            block_reason = str((response.get("promptFeedback") or {}).get("blockReason") or "")
+            if block_reason:
+                logger.warning("Gemini blocked the prompt: %s", block_reason)
+                return {
+                    "type": "text",
+                    "content": (
+                        f"NEED_HELP: Gemini blocked this request (blockReason: {block_reason}). "
+                        "Rephrase the task or use a different provider."
+                    ),
+                    "usage": usage,
+                }
+            logger.warning("Gemini returned no candidates and no blockReason: %r", response)
             return {"type": "text", "content": "", "usage": usage}
 
         parts = ((candidates[0].get("content") or {}).get("parts") or [])
@@ -457,11 +479,15 @@ class GeminiProvider(BaseProvider):
                 )
             elif part.get("text"):
                 text_chunks.append(str(part["text"]))
+        # H2: narration accompanying a tool call is consumed by the agent
+        # (response["content"] → PLAN/STEP markers) — don't drop it.
+        narration = "".join(text_chunks)
         if len(tool_calls) == 1:
             return {
                 "type": "tool_call",
                 "tool": tool_calls[0]["tool"],
                 "args": tool_calls[0]["args"],
+                "content": narration,
                 "usage": usage,
             }
         if len(tool_calls) > 1:
@@ -471,9 +497,24 @@ class GeminiProvider(BaseProvider):
                 "type": "tool_call",
                 "tool": "batch",
                 "args": {"calls": tool_calls},
+                "content": narration,
                 "usage": usage,
             }
-        return {"type": "text", "content": "".join(text_chunks), "usage": usage}
+        if not narration:
+            # M2: an empty candidate with a non-STOP finishReason (SAFETY /
+            # RECITATION / MAX_TOKENS / …) would otherwise read as an empty
+            # answer with no explanation.
+            finish_reason = str(candidates[0].get("finishReason") or "")
+            if finish_reason and finish_reason.upper() != "STOP":
+                logger.warning("Gemini returned empty content with finishReason=%s", finish_reason)
+                return {
+                    "type": "text",
+                    "content": (
+                        f"NEED_HELP: Gemini returned no content (finishReason: {finish_reason})."
+                    ),
+                    "usage": usage,
+                }
+        return {"type": "text", "content": narration, "usage": usage}
 
 
 def _parse_optional_expiry(value: Any) -> float | None:
