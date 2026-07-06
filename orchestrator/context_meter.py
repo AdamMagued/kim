@@ -82,12 +82,17 @@ class ContextMeter:
         fallback_input_tokens: int | None = None,
         source: str = "api",
         estimated: bool = False,
+        accumulate: bool = False,
     ) -> ContextSnapshot | None:
         """Merge provider usage into the cumulative context counter.
 
         ``usage`` accepts Kim's canonical keys (``input``/``output``) plus common
         vendor aliases. If no input token count is available, the optional
         fallback estimate is used and the snapshot is labelled as estimated.
+
+        ``accumulate=True`` is for stateful (browser-thread) providers that send
+        only the per-turn delta: the delta is *added* to the running total instead
+        of replacing it, so the meter tracks the real in-thread context fill.
         """
         usage = usage or {}
         input_tokens = _usage_int(usage, "input", "input_tokens", "prompt_tokens")
@@ -112,6 +117,7 @@ class ContextMeter:
             source=str(usage.get("source") or source or "unknown"),
             estimated=usage_estimated,
             output_tokens=output_tokens or 0,
+            accumulate=accumulate,
         )
 
     def add_input(
@@ -121,12 +127,21 @@ class ContextMeter:
         source: str,
         estimated: bool,
         output_tokens: int = 0,
+        accumulate: bool = False,
     ) -> ContextSnapshot:
         tokens = max(0, int(tokens or 0))
-        # Stateless APIs re-send the full conversation history on every turn, so
-        # summing input counts grows ~quadratically and produces spurious WARN/CRITICAL
-        # phases. Use the most-recent request size as the window-fill estimate instead.
-        self.cumulative_input = tokens
+        if accumulate:
+            # Stateful browser threads only send the NEW delta each turn (the
+            # thread itself retains the earlier turns), so the window fill is
+            # the running sum of deltas plus the model's own replies — both
+            # occupy the live thread's context.
+            self.cumulative_input += tokens + max(0, int(output_tokens or 0))
+        else:
+            # Stateless APIs re-send the full conversation history on every turn, so
+            # summing input counts grows ~quadratically and produces spurious
+            # WARN/CRITICAL phases. Use the most-recent request size as the
+            # window-fill estimate instead.
+            self.cumulative_input = tokens
         return self.snapshot(
             last_input=tokens,
             last_output=max(0, int(output_tokens or 0)),
@@ -161,10 +176,22 @@ class ContextMeter:
         data["budget_version"] = CONTEXT_BUDGET_VERSION
         return data
 
-    def reset_after_compact(self, *, compacted_at: str) -> ContextSnapshot:
-        self.cumulative_input = 0
+    def reset_after_compact(
+        self,
+        *,
+        compacted_at: str,
+        new_cumulative_input: int = 0,
+    ) -> ContextSnapshot:
+        """Reset the meter after a compaction.
+
+        ``new_cumulative_input`` should be an estimate of the post-compaction
+        context (the summary + preserved tail that the next turn will re-send).
+        Persisting a literal 0 while messages remain would be fiction — the very
+        next real turn re-sends the compacted set, so snapshot that size now.
+        """
+        self.cumulative_input = max(0, int(new_cumulative_input or 0))
         self.last_compact_at = compacted_at
-        return self.snapshot(source="compact", estimated=False)
+        return self.snapshot(source="compact", estimated=self.cumulative_input > 0)
 
 
 def coerce_budget(value: Any, default: int = DEFAULT_CONTEXT_BUDGET_TOKENS) -> int:
