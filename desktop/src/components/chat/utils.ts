@@ -11,6 +11,8 @@
 
 import type { KimMessage, TextBlock, ToolUseBlock, ToolResultBlock, SessionInfo } from '../../types';
 import type { ActivityItem, LivePlanParsed, TouchedFile, CodexRunGroup } from './types';
+// K5: bracket-tag vocabulary from the generated event manifest (single source of truth).
+import { LogTags } from '../../types/events.gen';
 
 // ── Simple helpers ────────────────────────────────────────────────────────────
 
@@ -105,10 +107,10 @@ export function cleanAssistantAnswerText(t: string): string {
 export function parseAnswerLine(raw: string): string | null {
   const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
   const stripped = line.replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.,]?\d*\s+/, '');
-  const markerIdx = stripped.indexOf('[ANSWER]');
+  const markerIdx = stripped.indexOf(LogTags.ANSWER);
   if (markerIdx === -1) return null;
 
-  const payload = stripped.slice(markerIdx + '[ANSWER]'.length).trim();
+  const payload = stripped.slice(markerIdx + LogTags.ANSWER.length).trim();
   if (!payload) return '';
 
   try {
@@ -317,9 +319,9 @@ export const HIDDEN_REGEX: RegExp[] = [
 ];
 
 export function isNoiseLine(raw: string): boolean {
-  if (raw.startsWith('[STATUS]') || raw.includes('[STATUS]') || raw.startsWith('[ANSWER]') || raw.includes('[ANSWER]')) return false;
-  if (raw.includes('[SUCCESS]') || raw.includes('[FAILED]') || raw.includes('[ERROR]')) return false;
-  if (raw.startsWith('[TOOL]')) return false;
+  if (raw.startsWith(LogTags.STATUS) || raw.includes(LogTags.STATUS) || raw.startsWith(LogTags.ANSWER) || raw.includes(LogTags.ANSWER)) return false;
+  if (raw.includes(LogTags.SUCCESS) || raw.includes(LogTags.FAILED) || raw.includes(LogTags.ERROR)) return false;
+  if (raw.startsWith(LogTags.TOOL)) return false;
   const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
   const lower = line.toLowerCase();
   for (const sub of HIDDEN_SUBSTRINGS) {
@@ -442,14 +444,14 @@ export const TOOL_MAP: Record<string, { icon: string; label: (args: Record<strin
 export function parseLogLine(raw: string, id: number): ActivityItem | null {
   if (!raw.trim()) return null;
 
-  if (raw.includes('[SUCCESS]')) {
+  if (raw.includes(LogTags.SUCCESS)) {
     let text = raw.replace(/.*\[SUCCESS\]\s*/, '').trim();
     if (/^Codex (?:completed|finished)/i.test(text) || /\bLLM calls\b/i.test(text)) {
       text = 'Task completed';
     }
     return { id, kind: 'success', icon: '✓', text: text || 'Task completed successfully' };
   }
-  if (raw.includes('[FAILED]') || (raw.includes('[ERROR]') && !raw.startsWith('[err]'))) {
+  if (raw.includes(LogTags.FAILED) || (raw.includes(LogTags.ERROR) && !raw.startsWith('[err]'))) {
     const msg = raw.replace(/.*\[(FAILED|ERROR)\]\s*/, '').trim();
     return { id, kind: 'error', icon: '⚠', text: friendlyError(msg) };
   }
@@ -477,15 +479,15 @@ export function parseLogLine(raw: string, id: number): ActivityItem | null {
     return { id, kind: 'error', icon: '⚠', text: friendlyError(reason || 'Kim needs your help to continue.') };
   }
 
-  if (stripped.startsWith('[STATUS]') || raw.startsWith('[STATUS]')) {
-    const text = (stripped.startsWith('[STATUS]') ? stripped : raw)
+  if (stripped.startsWith(LogTags.STATUS) || raw.startsWith(LogTags.STATUS)) {
+    const text = (stripped.startsWith(LogTags.STATUS) ? stripped : raw)
       .replace(/^\[STATUS\]\s*/, '').trim();
     if (text) return { id, kind: 'status', icon: '›', text };
     return null;
   }
-  const embeddedStatusIdx = stripped.indexOf('[STATUS]');
+  const embeddedStatusIdx = stripped.indexOf(LogTags.STATUS);
   if (isErr && embeddedStatusIdx !== -1) {
-    const text = stripped.slice(embeddedStatusIdx + '[STATUS]'.length).trim();
+    const text = stripped.slice(embeddedStatusIdx + LogTags.STATUS.length).trim();
     if (text) return { id, kind: 'status', icon: '›', text };
   }
 
@@ -524,7 +526,7 @@ export function parseLogLine(raw: string, id: number): ActivityItem | null {
     return { id, kind: 'error', icon: '⚠', text: friendlyError(msg) };
   }
 
-  if (raw.includes('[FAILED]') || raw.includes('[ERROR]')) {
+  if (raw.includes(LogTags.FAILED) || raw.includes(LogTags.ERROR)) {
     const msg = raw.replace(/.*\[(FAILED|ERROR)\]\s*/, '').trim();
     return { id, kind: 'error', icon: '⚠', text: friendlyError(msg) };
   }
@@ -703,10 +705,10 @@ export function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | n
   const orphanStructuredSteps = new Map<number, string>();
   for (const it of items) {
     const t = it.text;
-    const planTag = t.indexOf('[PLAN]{');
+    const planTag = t.indexOf(LogTags.PLAN + '{');
     if (planTag !== -1) {
       try {
-        const json = t.slice(planTag + '[PLAN]'.length);
+        const json = t.slice(planTag + LogTags.PLAN.length);
         const parsed = JSON.parse(json) as { steps?: unknown };
         if (Array.isArray(parsed.steps)) {
           const arr = parsed.steps.filter(s => typeof s === 'string') as string[];
@@ -720,10 +722,10 @@ export function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | n
       } catch {}
       continue;
     }
-    const stepTag = t.indexOf('[STEP]{');
+    const stepTag = t.indexOf(LogTags.STEP + '{');
     if (stepTag !== -1) {
       try {
-        const json = t.slice(stepTag + '[STEP]'.length);
+        const json = t.slice(stepTag + LogTags.STEP.length);
         const parsed = JSON.parse(json) as { index?: number; name?: unknown };
         if (typeof parsed.index === 'number' && parsed.index > 0) {
           if (structuredSteps) {
@@ -736,10 +738,10 @@ export function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | n
       } catch {}
       continue;
     }
-    const doneTag = t.indexOf('[DONE]{');
+    const doneTag = t.indexOf(LogTags.DONE + '{');
     if (doneTag !== -1) {
       try {
-        const json = t.slice(doneTag + '[DONE]'.length);
+        const json = t.slice(doneTag + LogTags.DONE.length);
         const parsed = JSON.parse(json) as { index?: number };
         if (typeof parsed.index === 'number' && parsed.index > 0) {
           structuredDone.add(parsed.index);

@@ -31,7 +31,13 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from orchestrator.events_gen import emit_hitl_approval_request, emit_status
+from orchestrator.events_gen import (
+    LOG_TAG_ERROR,
+    LOG_TAG_FAILED,
+    LOG_TAG_TASK_COMPLETE,
+    emit_hitl_approval_request,
+    emit_status,
+)
 
 from codex_engine.engine import (
     CODEX_BINARY,
@@ -298,14 +304,14 @@ async def _run_compact_task(args: argparse.Namespace, config: dict) -> int:
             print(handoff, flush=True)
             print(f"───── END HANDOFF ({len(handoff)} chars) ─────", flush=True)
         print(
-            "TASK_COMPLETE: Context compacted. The next code task will continue "
+            f"{LOG_TAG_TASK_COMPLETE} Context compacted. The next code task will continue "
             "from the handoff in a fresh browser chat.",
             flush=True,
         )
     else:
         _status("Could not summarize the current thread — the next code task starts fresh.")
         print(
-            "TASK_COMPLETE: Thread reset. No handoff could be generated, so the "
+            f"{LOG_TAG_TASK_COMPLETE} Thread reset. No handoff could be generated, so the "
             "next code task starts a fresh browser chat without prior context.",
             flush=True,
         )
@@ -317,7 +323,7 @@ async def _run_async(args: argparse.Namespace) -> int:
 
     if not args.provider.lower().startswith("browser"):
         print(
-            f"[ERROR] codex_bridge_service requires a browser provider; got {args.provider!r}.",
+            f"{LOG_TAG_ERROR} codex_bridge_service requires a browser provider; got {args.provider!r}.",
             file=sys.stderr,
         )
         return 2
@@ -338,7 +344,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         approved = await _request_hitl_approval(args.task)
         if not approved:
             _status("Codex launch denied by user. No code was executed.")
-            print("[FAILED] Codex launch denied by user.", flush=True)
+            print(f"{LOG_TAG_FAILED} Codex launch denied by user.", flush=True)
             return 1
 
     # Gate: Codex refuses to run outside a git repo (so its edits stay
@@ -356,7 +362,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             else:
                 _status("Codex launch declined — this folder is not a git repository.")
                 print(
-                    "[FAILED] Not a git repository and running Codex here was declined.",
+                    f"{LOG_TAG_FAILED} Not a git repository and running Codex here was declined.",
                     flush=True,
                 )
                 return 1
@@ -365,7 +371,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             # Codex's safety gate silently.
             _status("Not a git repository — Codex needs a git repo or explicit confirmation.")
             print(
-                "[FAILED] Not a git repository. Run Kim from inside a git repo, "
+                f"{LOG_TAG_FAILED} Not a git repository. Run Kim from inside a git repo, "
                 "`git init` here, or confirm when prompted to run anyway.",
                 flush=True,
             )
@@ -382,7 +388,7 @@ async def _run_async(args: argparse.Namespace) -> int:
     binary = os.environ.get("CODEX_BIN", "").strip() or CODEX_BINARY
     binary_path = shutil.which(binary) if not os.path.isabs(binary) else binary
     if not binary_path or not os.path.exists(binary_path):
-        print(f"[FAILED] Codex binary not found: {binary}.", flush=True)
+        print(f"{LOG_TAG_FAILED} Codex binary not found: {binary}.", flush=True)
         return 1
 
     _status(f"codex binary: {binary_path}")
@@ -543,7 +549,7 @@ async def _run_async(args: argparse.Namespace) -> int:
                     except Exception:
                         pass
                     print(
-                        f"[FAILED] Codex task timed out after {task_timeout // 60} minutes.",
+                        f"{LOG_TAG_FAILED} Codex task timed out after {task_timeout // 60} minutes.",
                         flush=True,
                     )
                     return 1
@@ -552,13 +558,13 @@ async def _run_async(args: argparse.Namespace) -> int:
                 _active_process = None
 
                 if exit_code != 0:
-                    print(f"[FAILED] Codex exited with code {exit_code}.", flush=True)
+                    print(f"{LOG_TAG_FAILED} Codex exited with code {exit_code}.", flush=True)
 
                 return exit_code
 
             except Exception as e:
                 logger.exception("Codex bridge service crashed")
-                print(f"[FAILED] Codex bridge error: {e}", flush=True)
+                print(f"{LOG_TAG_FAILED} Codex bridge error: {e}", flush=True)
                 return 1
             finally:
                 _active_process = None

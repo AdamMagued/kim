@@ -27,6 +27,24 @@ ANSWER = "kim:answer"
 DIFF = "kim:diff"
 ACTIVITY = "kim:activity"
 
+# K5: named bracket-tag constants — the single source of truth for the
+# text-protocol vocabulary. Emitters (codex_engine, codex_bridge_service)
+# must reference these instead of re-typing the literals.
+LOG_TAG_STATUS = "[STATUS]"
+LOG_TAG_PLAN = "[PLAN]"
+LOG_TAG_STEP = "[STEP]"
+LOG_TAG_DONE = "[DONE]"
+LOG_TAG_CONTEXT = "[CONTEXT]"
+LOG_TAG_STATS = "[STATS]"
+LOG_TAG_TOOL = "[TOOL]"
+LOG_TAG_ANSWER = "[ANSWER]"
+LOG_TAG_DIFF = "[DIFF]"
+LOG_TAG_SUCCESS = "[SUCCESS]"
+LOG_TAG_FAILED = "[FAILED]"
+LOG_TAG_ERROR = "[ERROR]"
+LOG_TAG_TASK_COMPLETE = "TASK_COMPLETE:"
+LOG_TAG_NEED_HELP = "NEED_HELP:"
+
 LEGACY_LOG_TAGS = {
     "[STATUS]": {"tag":"[STATUS]","event":"kim:status"},
     "[PLAN]": {"tag":"[PLAN]","event":"kim:plan"},

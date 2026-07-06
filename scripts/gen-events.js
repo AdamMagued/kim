@@ -20,6 +20,11 @@ function toConstKey(event) {
   return event.replace(/^kim:/, '').replace(/-/g, '_').toUpperCase();
 }
 
+/** '[STATUS]' -> 'STATUS', 'TASK_COMPLETE:' -> 'TASK_COMPLETE' */
+function tagConstKey(tag) {
+  return tag.replace(/[\[\]:]/g, '');
+}
+
 function wireType(event) {
   return event.wireType ?? event.event.replace(/^kim:/, '').replace(/-/g, '_');
 }
@@ -66,6 +71,15 @@ export type KimEventName = (typeof KimEventNames)[keyof typeof KimEventNames];
 
 /** Legacy markers retained for the uncontrolled Codex compatibility stream. */
 export const LegacyLogTags = ${JSON.stringify(Object.fromEntries(legacyTags.map(item => [item.tag, item])), null, 2)} as const;
+
+/**
+ * K5: named bracket-tag constants — the single source of truth for the
+ * text-protocol vocabulary. Hand parsers (chat/utils.ts, chat/parsers.ts)
+ * must reference these instead of re-typing the literals.
+ */
+export const LogTags = {
+${legacyTags.map(item => `  ${tagConstKey(item.tag)}: ${JSON.stringify(item.tag)},`).join('\n')}
+} as const;
 
 ${tsInterfaces}
 
@@ -161,6 +175,7 @@ function renderPyEmitter(event) {
 }
 
 const pyConstants = events.map(event => `${toConstKey(event.event)} = ${JSON.stringify(event.event)}`).join('\n');
+const pyTagConstants = legacyTags.map(item => `LOG_TAG_${tagConstKey(item.tag)} = ${JSON.stringify(item.tag)}`).join('\n');
 const pyLegacy = legacyTags.map(item => `    ${JSON.stringify(item.tag)}: ${JSON.stringify(item)},`).join('\n');
 const pyEmitters = events.map(renderPyEmitter).join('\n\n\n');
 const pythonOut = `# flake8: noqa
@@ -175,6 +190,11 @@ import sys
 from typing import Any
 
 ${pyConstants}
+
+# K5: named bracket-tag constants — the single source of truth for the
+# text-protocol vocabulary. Emitters (codex_engine, codex_bridge_service)
+# must reference these instead of re-typing the literals.
+${pyTagConstants}
 
 LEGACY_LOG_TAGS = {
 ${pyLegacy}

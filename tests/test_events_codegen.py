@@ -40,3 +40,26 @@ def test_generated_legacy_manifest_covers_text_protocol():
         "NEED_HELP:",
     }
     assert expected == set(events_gen.LEGACY_LOG_TAGS)
+
+
+def test_generated_named_tag_constants_match_manifest():
+    """K5: every legacy tag has a generated LOG_TAG_<NAME> constant whose value
+    is the tag string — the constants emitters must use instead of literals."""
+    for tag in events_gen.LEGACY_LOG_TAGS:
+        name = "LOG_TAG_" + tag.strip("[]:").replace("[", "").replace("]", "")
+        assert getattr(events_gen, name) == tag
+
+
+def test_codex_emitters_use_generated_tag_constants():
+    """The codex engine + bridge service source the bracket vocabulary from
+    events_gen (no re-typed '[STATUS] ' style print literals)."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    engine = (repo / "codex_engine" / "engine.py").read_text()
+    bridge = (repo / "orchestrator" / "codex_bridge_service.py").read_text()
+    assert "LOG_TAG_STATUS" in engine and "LOG_TAG_ANSWER" in engine
+    assert "LOG_TAG_FAILED" in bridge and "LOG_TAG_TASK_COMPLETE" in bridge
+    for src, fname in [(engine, "engine.py"), (bridge, "codex_bridge_service.py")]:
+        for literal in ('print("[STATUS]', 'print(f"[STATUS]', 'print("[FAILED]', 'print(f"[FAILED]'):
+            assert literal not in src, f"{fname} re-types a bracket literal: {literal}"

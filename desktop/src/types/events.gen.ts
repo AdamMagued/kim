@@ -89,6 +89,28 @@ export const LegacyLogTags = {
   }
 } as const;
 
+/**
+ * K5: named bracket-tag constants — the single source of truth for the
+ * text-protocol vocabulary. Hand parsers (chat/utils.ts, chat/parsers.ts)
+ * must reference these instead of re-typing the literals.
+ */
+export const LogTags = {
+  STATUS: "[STATUS]",
+  PLAN: "[PLAN]",
+  STEP: "[STEP]",
+  DONE: "[DONE]",
+  CONTEXT: "[CONTEXT]",
+  STATS: "[STATS]",
+  TOOL: "[TOOL]",
+  ANSWER: "[ANSWER]",
+  DIFF: "[DIFF]",
+  SUCCESS: "[SUCCESS]",
+  FAILED: "[FAILED]",
+  ERROR: "[ERROR]",
+  TASK_COMPLETE: "TASK_COMPLETE:",
+  NEED_HELP: "NEED_HELP:",
+} as const;
+
 /** A human-readable status message from the agent loop (activity feed item). */
 export interface KimStatusPayload {
   /** Status text to display in activity feed. */

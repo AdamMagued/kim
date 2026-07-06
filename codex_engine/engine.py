@@ -49,6 +49,14 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     from orchestrator.providers.browser_provider import BrowserProvider
 
+# K5: bracket-tag vocabulary comes from the generated event manifest so the
+# text protocol cannot drift between the three runtimes.
+from orchestrator.events_gen import (  # noqa: E402
+    LOG_TAG_ANSWER,
+    LOG_TAG_STATUS,
+    LOG_TAG_TOOL,
+)
+
 logger = logging.getLogger("kim.codex_bridge")
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -542,7 +550,7 @@ class _CodexProxy:
                 # The stored thread is unresponsive/gone — degrade once to the
                 # legacy behavior: fresh chat, full context, pending handoff.
                 logger.warning(f"[relay #{relay_num}] Stored-thread send failed — retrying on a fresh chat")
-                print("[STATUS] Stored thread did not respond — retrying on a fresh chat…", flush=True)
+                print(f"{LOG_TAG_STATUS} Stored thread did not respond — retrying on a fresh chat…", flush=True)
                 prompt = _extract_prompt_from_responses_request(body)
                 clear_chat = True
                 handoff = str(self._thread_state.get("handoff") or "").strip() or None
@@ -588,7 +596,7 @@ class _CodexProxy:
         cmds = _tool_command_signature(responses_reply)
         if _is_repeat_of_previous(cmds, self._last_tool_commands):
             logger.info(f"[relay #{relay_num}] Repeated tool call {cmds} — ending turn (loop guard)")
-            print("[STATUS] Command already ran — finishing up…", flush=True)
+            print(f"{LOG_TAG_STATUS} Command already ran — finishing up…", flush=True)
             # Honest final answer: name the command that actually repeated —
             # never claim work ("the file was created") the commands don't show.
             subs = sorted(_signature_subcommands(cmds))
@@ -636,7 +644,7 @@ class _CodexProxy:
             logger.info(f"[relay #{relay_num}] Prose reply has salvageable actions — executing, no nudge")
             return response
         logger.info(f"[relay #{relay_num}] Reply had no actionable command — sending one nudge")
-        print("[STATUS] Reply had no runnable command — asking for it…", flush=True)
+        print(f"{LOG_TAG_STATUS} Reply had no runnable command — asking for it…", flush=True)
         is_chatgpt = bool(self._provider_name) and "chatgpt" in self._provider_name.lower()
         nudge = _TERMINAL_NUDGE if is_chatgpt else _CONTRACT_NUDGE
         try:
@@ -801,7 +809,7 @@ class _CodexProxy:
             return system_msgs + [cached] + list(to_keep)
 
         logger.info(f"[relay #{relay_num}] [compaction] Summarizing {len(to_summarize)} messages, keeping {len(to_keep)}")
-        print(f"[STATUS] Compacting context — summarizing {len(to_summarize)} messages…", flush=True)
+        print(f"{LOG_TAG_STATUS} Compacting context — summarizing {len(to_summarize)} messages…", flush=True)
 
         # Convert chat messages to codex-bridge item format for the summarizer
         items_for_summary = [
@@ -823,7 +831,7 @@ class _CodexProxy:
         }
 
         self._compaction_cache[prefix_key] = summary_msg
-        print(f"[STATUS] Context compacted — summary is {len(compressed)} chars", flush=True)
+        print(f"{LOG_TAG_STATUS} Context compacted — summary is {len(compressed)} chars", flush=True)
 
         return system_msgs + [summary_msg] + list(to_keep)
 
@@ -869,7 +877,7 @@ class _CodexProxy:
 
         # First pass: LLM summarization
         logger.info(f"[relay #{relay_num}] [compaction] Summarizing {len(to_summarize)} items, keeping {len(to_keep)}")
-        print(f"[STATUS] Compacting context — summarizing {len(to_summarize)} messages…", flush=True)
+        print(f"{LOG_TAG_STATUS} Compacting context — summarizing {len(to_summarize)} messages…", flush=True)
 
         new_summary = await _summarize_messages(to_summarize, self._provider)
 
@@ -894,7 +902,7 @@ class _CodexProxy:
 
         self._compaction_cache[prefix_key] = summary_item
 
-        print(f"[STATUS] Context compacted — summary is {len(compressed)} chars", flush=True)
+        print(f"{LOG_TAG_STATUS} Context compacted — summary is {len(compressed)} chars", flush=True)
         logger.info(f"[compaction] Done. Summary: {len(compressed)} chars")
 
         return [summary_item] + list(to_keep)
@@ -1224,7 +1232,7 @@ def _announce_commands(tool_calls: list) -> None:
             line = _humanize_command(cmd)
             if line not in seen:
                 seen.append(line)
-                print(f"[STATUS] {line}…", flush=True)
+                print(f"{LOG_TAG_STATUS} {line}…", flush=True)
 
 
 def _salvage_action_reply(content: object, request_tools: object) -> Optional[list]:
@@ -1902,9 +1910,9 @@ def _surface_codex_output(stdout_text: str) -> None:
         if not line:
             continue
         if "Running:" in line or "Executing:" in line:
-            print(f"[TOOL] {line}", flush=True)
+            print(f"{LOG_TAG_TOOL} {line}", flush=True)
         elif line.startswith("✓") or line.startswith("✗"):
-            print(f"[STATUS] {line}", flush=True)
+            print(f"{LOG_TAG_STATUS} {line}", flush=True)
 
 
 def _extract_final_answer(stdout_text: str) -> Optional[str]:
@@ -1963,10 +1971,10 @@ def _surface_relay_reasoning(response: dict, relay_num: int) -> None:
     # prefix and be misparsed as answer text.
     display = " ".join(display.split())
     if display and not display.startswith("{"):
-        print(f"[STATUS] {display}", flush=True)
+        print(f"{LOG_TAG_STATUS} {display}", flush=True)
 
 
 def _emit_bridge_answer(answer: str) -> None:
     cleaned = answer.strip()
     if cleaned:
-        print(f"[ANSWER] {json.dumps(cleaned, ensure_ascii=False)}", flush=True)
+        print(f"{LOG_TAG_ANSWER} {json.dumps(cleaned, ensure_ascii=False)}", flush=True)

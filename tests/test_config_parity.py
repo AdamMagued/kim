@@ -143,9 +143,11 @@ class TestCrossLanguageProviderParity:
     config's winner is only observable at runtime, so these guard it statically."""
 
     def test_rust_subprocess_fallback_is_canonical(self):
+        # K2: the GUI provider default is the literal passed to
+        # task_spec::promote_provider(provider, "<default>", is_codex).
         src = (_REPO / "desktop" / "src-tauri" / "src" / "subprocess.rs").read_text()
         m = re.search(
-            r"""unwrap_or_else\(\|\|\s*["'](\w+)["']\.to_string\(\)\)""", src
+            r"""promote_provider\(provider,\s*["'](\w+)["']""", src
         )
         assert m is not None, "could not find the provider fallback in subprocess.rs"
         assert m.group(1) == CANONICAL_PROVIDER, (
