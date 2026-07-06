@@ -247,6 +247,19 @@ pub(crate) async fn stream_codex_subprocess(
     let _ = tx.send(AppEvent::Done(is_browser));
 }
 
+/// Newline-terminate a discrete status/thought line. `ThoughtChunk` renders
+/// raw (it is designed for token streams), so whole-line events from the codex
+/// bridge — status messages, narration, tool output — must carry their own
+/// trailing newline or consecutive lines concatenate into one unreadable blob
+/// ("✓ Using Codex via browser bridge (browser:chatgpt)codex binary: …").
+fn line_chunk(text: &str) -> String {
+    if text.ends_with('\n') {
+        text.to_string()
+    } else {
+        format!("{text}\n")
+    }
+}
+
 /// Stateless wrapper kept for tests and one-shot callers; the streaming loop
 /// uses the stateful variant so the final answer isn't printed twice.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -270,7 +283,7 @@ pub(crate) fn process_codex_line_stateful(
             // Kim's own status events from codex_bridge_service.
             if json.get("type").and_then(Value::as_str) == Some("status") {
                 if let Some(msg) = json.get("message").and_then(Value::as_str) {
-                    let _ = tx.send(AppEvent::ThoughtChunk(msg.to_string()));
+                    let _ = tx.send(AppEvent::ThoughtChunk(line_chunk(msg)));
                 }
                 return;
             }
@@ -287,7 +300,7 @@ pub(crate) fn process_codex_line_stateful(
         }
         // Legacy bracket prefix format / plain assistant text.
         if let Some(rest) = line.strip_prefix("[STATUS] ") {
-            let _ = tx.send(AppEvent::ThoughtChunk(rest.to_string()));
+            let _ = tx.send(AppEvent::ThoughtChunk(line_chunk(rest)));
         } else if let Some(rest) = line.strip_prefix("[SUCCESS] ") {
             let _ = tx.send(AppEvent::TextChunk(rest.to_string()));
         } else if let Some(rest) = line.strip_prefix("[FAILED] ") {
@@ -342,7 +355,7 @@ fn emit_codex_json_event(json: &Value, tx: &UnboundedSender<AppEvent>) {
                 .or_else(|| json.get("text").and_then(Value::as_str))
                 .unwrap_or_default();
             if !text.is_empty() {
-                let _ = tx.send(AppEvent::ThoughtChunk(text.to_string()));
+                let _ = tx.send(AppEvent::ThoughtChunk(line_chunk(text)));
             }
         }
         Some("function_call") => {
@@ -358,7 +371,7 @@ fn emit_codex_json_event(json: &Value, tx: &UnboundedSender<AppEvent>) {
                 if !trimmed.is_empty() {
                     // char-boundary-safe truncation — byte slicing panics mid-UTF-8 (A5)
                     let display = crate::sessions::truncate(trimmed, 300);
-                    let _ = tx.send(AppEvent::ThoughtChunk(display));
+                    let _ = tx.send(AppEvent::ThoughtChunk(line_chunk(&display)));
                 }
             }
         }
@@ -385,7 +398,7 @@ fn emit_codex_json_event(json: &Value, tx: &UnboundedSender<AppEvent>) {
                             if !trimmed.is_empty() {
                                 // char-boundary-safe truncation (A5)
                                 let display = crate::sessions::truncate(trimmed, 300);
-                                let _ = tx.send(AppEvent::ThoughtChunk(display));
+                                let _ = tx.send(AppEvent::ThoughtChunk(line_chunk(&display)));
                             }
                         }
                     }
@@ -474,9 +487,48 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.ends_with('…'))),
+                .any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.trim_end().ends_with('…'))),
             "expected a truncated ThoughtChunk, got {events:?}"
         );
+    }
+
+    // ── Discrete bridge lines must be newline-terminated ─────────────────────
+    // ThoughtChunk renders raw (token-stream semantics); without a trailing
+    // newline every status/narration line concatenates into one blob:
+    //   "✓ Using Codex via browser bridge (browser:chatgpt)codex binary: …
+    //    Sandbox permissions changed — starting a fresh browser chat…codex …"
+
+    #[test]
+    fn bridge_status_lines_are_newline_terminated() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        process_codex_line(
+            r#"{"type":"status","message":"✓ Using Codex via browser bridge (browser:chatgpt)"}"#,
+            &tx,
+            true,
+        );
+        process_codex_line("[STATUS] codex binary: /opt/homebrew/bin/codex", &tx, true);
+        process_codex_line(
+            r#"{"type":"reasoning","text":"Saying hello before we jump in."}"#,
+            &tx,
+            true,
+        );
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 3, "got {events:?}");
+        for e in &events {
+            match e {
+                AppEvent::ThoughtChunk(t) => assert!(
+                    t.ends_with('\n'),
+                    "discrete bridge line must end with a newline, got {t:?}"
+                ),
+                other => panic!("expected ThoughtChunk, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn line_chunk_does_not_double_newline() {
+        assert_eq!(line_chunk("already terminated\n"), "already terminated\n");
+        assert_eq!(line_chunk("bare line"), "bare line\n");
     }
 
     // ── Codex lifecycle events must not leak as raw JSON (bridge path) ───────

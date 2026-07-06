@@ -1940,6 +1940,21 @@ def _make_responses_tool_reply(resp_id: str, text: str, tool_calls: list) -> dic
 # guard, so the dead-code cleanup (a Low finding) is intentionally skipped.
 
 
+def _is_benign_codex_stderr(line: str) -> bool:
+    """True for informational codex CLI chatter that is not an error.
+
+    Codex is launched with stdin=/dev/null; because that is not a TTY, codex
+    prints "Reading additional input from stdin..." (and immediately gets EOF).
+    Surfacing that in the user-visible activity feed as a codex error is pure
+    noise on every run. Used by the live stderr drain in
+    ``orchestrator/codex_bridge_service._run_async``.
+    """
+    lowered = line.strip().lower()
+    if not lowered:
+        return True
+    return "stdin" in lowered and ("reading" in lowered or "input" in lowered)
+
+
 def _surface_codex_output(stdout_text: str) -> None:
     for line in stdout_text.splitlines():
         line = line.strip()

@@ -283,6 +283,45 @@ class TestCompactBrowserThread(unittest.IsolatedAsyncioTestCase):
         saved = ts.load_thread_state("/proj/a", "browser:gemini")
         self.assertIsNone(saved["handoff"])
 
+    async def test_compact_reset_is_owned_by_the_current_cli_session(self):
+        # /compact writes a reset sidecar carrying the handoff. Without an
+        # owner stamp, the very next task in the SAME session would treat the
+        # sidecar as foreign (new stricter _cli_session_changed) and drop the
+        # handoff — while a sidecar left unowned was ALSO the bug that let a
+        # brand-new session resurrect it. Stamping at compact time gives both:
+        # same-session continuity, zero context for a new session.
+        from orchestrator import codex_bridge_service as svc
+
+        provider = _RecordingProvider(
+            [{"type": "text", "content": json.dumps({"summary": "did things"})}]
+        )
+        with patch.dict(os.environ, {"KIM_CLI_SESSION_ID": "sess-live"}):
+            ok, _ = await svc._compact_browser_thread(provider, "/proj/a", "browser:chatgpt")
+
+        self.assertTrue(ok)
+        saved = ts.load_thread_state("/proj/a", "browser:chatgpt")
+        self.assertEqual(saved.get("cli_session"), "sess-live")
+        self.assertIn(saved.get("sandbox"), ("default", "bypass"))
+        # Same session → not changed; a NEW session (fresh `kim` launch) → changed.
+        self.assertFalse(svc._cli_session_changed(saved, "sess-live"))
+        self.assertTrue(svc._cli_session_changed(saved, "sess-next-launch"))
+
+    async def test_compact_reset_without_session_env_stays_unowned(self):
+        from orchestrator import codex_bridge_service as svc
+
+        provider = _RecordingProvider(
+            [{"type": "text", "content": json.dumps({"summary": "desktop compact"})}]
+        )
+        env = {k: v for k, v in os.environ.items() if k != "KIM_CLI_SESSION_ID"}
+        with patch.dict(os.environ, env, clear=True):
+            await svc._compact_browser_thread(provider, "/proj/b", "browser:chatgpt")
+
+        saved = ts.load_thread_state("/proj/b", "browser:chatgpt")
+        # Desktop compacts stay session-less (desktop sets no session id)…
+        self.assertNotIn("cli_session", saved)
+        # …which means any CLI session later starts it fresh, with no handoff.
+        self.assertTrue(svc._cli_session_changed(saved, "some-cli-session"))
+
 
 # ---------------------------------------------------------------------------
 # /compact control-task routing parity with the chat agent
@@ -550,11 +589,23 @@ class TestCliSessionChanged(unittest.TestCase):
         # falsely resets a shared thread.
         self.assertFalse(svc._cli_session_changed({"cli_session": "sess-x"}, ""))
 
-    def test_legacy_sidecar_without_session_does_not_reset(self):
+    def test_unowned_sidecar_counts_as_changed_for_a_cli_session(self):
         from orchestrator import codex_bridge_service as svc
 
-        # A sidecar from before this field existed: reuse once, then record.
-        self.assertFalse(svc._cli_session_changed({"sent_instructions": True}, "sess-new"))
+        # The fresh-chat-resurrects-old-context bug: a sidecar with no
+        # cli_session (desktop-written or legacy) must NOT be resumed by a new
+        # CLI session — a new `kim` launch is a new chat with zero context.
+        # Previously this returned False, which routed the run into the
+        # sandbox-change branch, compacted the OLD browser chat, and seeded its
+        # summary into what the user rightly expected to be a fresh session.
+        self.assertTrue(svc._cli_session_changed({"sent_instructions": True}, "sess-new"))
+
+    def test_empty_stored_session_counts_as_changed(self):
+        from orchestrator import codex_bridge_service as svc
+
+        self.assertTrue(
+            svc._cli_session_changed({"sent_instructions": True, "cli_session": ""}, "sess-new")
+        )
 
 
 class TestThreadSandboxChanged(unittest.TestCase):

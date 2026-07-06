@@ -140,7 +140,7 @@ pub(crate) async fn stream_via_bridge(
         tokio::select! {
             r = &mut response_future => break r,
             _ = heartbeat.tick() => {
-                let _ = tx.send(AppEvent::ThoughtChunk("Kim desktop is working…".to_string()));
+                let _ = tx.send(AppEvent::ThoughtChunk("Kim desktop is working…\n".to_string()));
             }
         }
     };
@@ -222,7 +222,7 @@ async fn poll_bridge_session_answer(
         }
         if last_beat.elapsed() >= Duration::from_secs(5) {
             let _ = tx.send(AppEvent::ThoughtChunk(
-                "Kim desktop is working…".to_string(),
+                "Kim desktop is working…\n".to_string(),
             ));
             last_beat = Instant::now();
         }
