@@ -385,7 +385,14 @@ async def _run_async(args: argparse.Namespace) -> int:
     thread_state = load_thread_state(args.cwd, args.provider)
     current_sandbox = _sandbox_fingerprint()
     if stateful and thread_state.get("sent_instructions"):
-        if _thread_sandbox_changed(thread_state, current_sandbox):
+        if thread_state.get("burned"):
+            # The stored thread ignored the tool protocol even after a format
+            # nudge — its context argues against compliance, so resuming it
+            # only compounds the refusals. Drop it (no compact: a summary
+            # written by a refusing thread carries the refusal with it).
+            _status("Previous browser thread ignored the tool protocol — starting fresh…")
+            thread_state = reset_thread_state(args.cwd, args.provider)
+        elif _thread_sandbox_changed(thread_state, current_sandbox):
             # The stored browser thread was taught the OLD permission level
             # (e.g. read-only) and will keep refusing writes even after the
             # user grants full access — start a fresh chat so the new codex

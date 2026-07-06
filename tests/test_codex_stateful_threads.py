@@ -751,6 +751,26 @@ class TestContractNudge(unittest.IsolatedAsyncioTestCase):
         result = await proxy._nudge_contract_retry(original, relay_num=1)
         self.assertIs(result, original)
         self.assertEqual(len(provider.calls), 1)
+        # Ignoring the explicit nudge burns the thread: refusals compound, so
+        # the next task must start a fresh chat instead of resuming this one.
+        self.assertTrue(proxy._thread_state.get("burned"))
+
+    async def test_successful_retry_does_not_burn_thread(self):
+        proxy, provider = _proxy(
+            responses=[{"type": "text", "content": json.dumps({"text": "ok"})}]
+        )
+        original = {"type": "text", "content": "Sure, I'll do that right away."}
+        await proxy._nudge_contract_retry(original, relay_num=1)
+        self.assertFalse(proxy._thread_state.get("burned"))
+
+    def test_reset_thread_state_clears_burned(self):
+        with TemporaryDirectory() as tmp:
+            with patch.object(ts, "_STATE_DIR", Path(tmp)):
+                ts.save_thread_state("/proj/x", "browser:chatgpt",
+                                     {"sent_instructions": True, "burned": True})
+                state = ts.reset_thread_state("/proj/x", "browser:chatgpt")
+                self.assertNotIn("burned", state)
+                self.assertNotIn("burned", ts.load_thread_state("/proj/x", "browser:chatgpt"))
 
     async def test_provider_error_keeps_original(self):
         class _Boom:

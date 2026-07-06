@@ -764,6 +764,12 @@ class _CodexProxy:
         retry_content = retry.get("content") if isinstance(retry, dict) else None
         if _parse_contract(retry_content) is not None:
             return retry
+        # The thread ignored the contract even after an explicit format
+        # nudge — it has talked itself out of the protocol (each refusal in
+        # a chat makes the next more likely). Mark it burned so the next
+        # task starts a fresh chat instead of resuming this one.
+        self._thread_state["burned"] = True
+        logger.warning(f"[relay #{relay_num}] Thread ignored the format nudge — marked burned")
         return response
 
     def _note_relay_result(

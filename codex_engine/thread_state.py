@@ -14,6 +14,8 @@ State shape:
         "handoff": str | None,      # compact summary to seed the next fresh chat
         "sandbox": str,             # permission fingerprint ("default"/"bypass")
                                     # the thread's instructions described
+        "burned": bool,             # thread ignored the tool protocol even
+                                    # after a format nudge — never resume it
         "updated_at": str,          # ISO timestamp of last write
     }
 """
