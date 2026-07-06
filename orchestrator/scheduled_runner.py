@@ -35,6 +35,7 @@ import contextlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -175,6 +176,46 @@ def _pid_exists(pid: int) -> bool:
             return False
 
 
+def _kill_process_tree(pid: int) -> None:
+    """Kill a runaway scheduled agent AND its descendants (finding 5.1).
+
+    A bare os.kill(pid, 9) reaps only the agent, orphaning the MCP server,
+    controlled browser, and any shell-tool subprocesses it spawned — the reaper
+    that exists to stop runaways would leave untracked runaways behind. Agents
+    are spawned as session leaders (start_new_session=True), so on POSIX the
+    whole process group can be killed at once. The group kill is used ONLY when
+    the target is confirmed to be its own group leader (pgid == pid); otherwise
+    a group kill could reach the runner/app's own group, so fall back to a
+    single-process kill.
+    """
+    if sys.platform == "win32":
+        # taskkill /T terminates the whole tree; fall back to a plain kill.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=10, check=False,
+            )
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+        return
+
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return  # already gone
+    if pgid == pid:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)
+
+
 # ---------------------------------------------------------------------------
 # PID registry for orphan reaping
 # ---------------------------------------------------------------------------
@@ -244,6 +285,7 @@ def _write_pid_registry_atomic(reg_path: Path, data: list) -> None:
     tmp_fd, tmp_name = tempfile.mkstemp(dir=reg_path.parent, prefix=".pids_tmp")
     try:
         os.write(tmp_fd, text)
+        os.fsync(tmp_fd)  # durable before the atomic rename (finding 4.3)
         os.close(tmp_fd)
         os.replace(tmp_name, str(reg_path))
     except OSError:
@@ -294,10 +336,9 @@ def _reap_stale_agents(
                 if not _pid_exists(pid):
                     continue  # already exited — drop from registry
                 if elapsed > timeout_seconds:
-                    try:
-                        os.kill(pid, 9)
-                    except OSError:
-                        pass
+                    # Kill the whole process group so orphaned children (MCP
+                    # server, browser, shell subprocesses) go with it (5.1).
+                    _kill_process_tree(pid)
                     # drop from registry after kill (do not append to surviving)
                 else:
                     surviving.append(entry)
@@ -515,6 +556,14 @@ def run_next_due_task(
             # Spawn the agent.  Popen is non-blocking (fork+exec returns
             # immediately; the child runs asynchronously), so the lock is
             # held for only a brief moment here.
+            # Spawn as a session/process-group leader so the reaper can later
+            # kill the agent AND its descendants as a group (finding 5.1). On
+            # POSIX this makes pgid == pid; on Windows a new process group.
+            _group_kwargs: dict = {}
+            if sys.platform == "win32":
+                _group_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                _group_kwargs["start_new_session"] = True
             try:
                 proc = subprocess.Popen(
                     args,
@@ -522,6 +571,7 @@ def run_next_due_task(
                     env=env,
                     stdout=log_fh,
                     stderr=log_fh,
+                    **_group_kwargs,
                 )
             except OSError as exc:
                 log_fh.close()

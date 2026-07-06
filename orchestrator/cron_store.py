@@ -305,10 +305,15 @@ class CronStore:
     def _save(self, data: dict[str, dict]) -> None:
         self._file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._file.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        # fsync the temp file before the atomic rename (finding 4.3). os.replace
+        # is crash-atomic, but without fsync a power loss between write and
+        # rename can leave a zero-byte schedules file — _load then "starts empty"
+        # and the next _save makes the loss permanent.
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, self._file)
 
     @staticmethod

@@ -30,10 +30,32 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _resolve_writable_log_dir(preferred: str) -> Path:
+    """Return a directory the log handler can actually write to.
+
+    A packaged/installed Kim may ship a read-only ``logs/`` next to the code, in
+    which case the MCP server's structured audit trail would silently vanish
+    (finding 5.3). Fall back to a per-user temp dir so logging survives. The
+    probe write confirms writability, not just that mkdir succeeded.
+    """
+    candidates = [Path(preferred), Path(tempfile.gettempdir()) / "kim_logs"]
+    for cand in candidates:
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            probe = cand / ".write_probe"
+            probe.touch()
+            probe.unlink()
+            return cand
+        except OSError:
+            continue
+    return Path(tempfile.gettempdir())
 
 # ---------------------------------------------------------------------------
 # Secret redaction
@@ -42,6 +64,9 @@ from pathlib import Path
 _REDACT_PATTERNS: list[tuple[re.Pattern, str]] = [
     # OpenAI / Anthropic style keys  (sk-...)
     (re.compile(r"sk-[A-Za-z0-9_\-]{10,}", re.ASCII), "sk-***REDACTED***"),
+    # Google API keys (AIza + 35 url-safe chars) — the one provider key Kim
+    # sends via header, so include it in the redaction set (finding 6.6).
+    (re.compile(r"AIza[0-9A-Za-z_\-]{35}", re.ASCII), "AIza***REDACTED***"),
     # GitHub personal-access / fine-grained tokens
     (re.compile(r"ghp_[A-Za-z0-9]{10,}", re.ASCII), "ghp_***REDACTED***"),
     (re.compile(r"github_pat_[A-Za-z0-9_]{10,}", re.ASCII), "github_pat_***REDACTED***"),
@@ -199,7 +224,9 @@ def setup_structured_logging(
             root.removeHandler(h)
             h.close()
 
-    # JSON Lines handler
+    # JSON Lines handler — resolve a writable dir first so a read-only packaged
+    # logs/ falls back to temp instead of losing the audit trail (finding 5.3).
+    log_dir = str(_resolve_writable_log_dir(log_dir))
     json_handler = JSONLineHandler(log_dir=log_dir, level=level)
     root.addHandler(json_handler)
 
@@ -238,7 +265,10 @@ def apply_log_retention(log_dir: str = "logs", keep_days: int = 7) -> int:
     log_path = Path(log_dir)
     if not log_path.exists():
         return 0
-    cutoff = _date.today() - timedelta(days=keep_days)
+    # Compare against the UTC date, matching the UTC-dated filenames written by
+    # _get_file() — a local today() was off by up to a day near the boundary
+    # and could delete a file that is not yet older than keep_days (finding 6.6).
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=keep_days)
     for f in log_path.glob("kim_*.jsonl"):
         try:
             date_str = f.stem[len("kim_"):]  # "YYYY-MM-DD"
