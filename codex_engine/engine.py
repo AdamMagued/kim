@@ -93,6 +93,24 @@ _COMPACT_THRESHOLDS: dict[str, int] = {
 }
 _DEFAULT_COMPACT_THRESHOLD = 100_000
 
+# Deterministic provider-failure signatures for a send into a stored browser
+# thread that never registered or whose tab is gone (bridge.js fail-fast
+# diagnostics + BrowserProvider NEED_HELP messages). Mirrors the agent-side
+# _BROWSER_SEND_FAILURE_RE in orchestrator/agent.py — kept local so the engine
+# does not import the (heavy) orchestrator agent module.
+_THREAD_SEND_FAILURE_RE = re.compile(
+    r"Send did not register|No response turn detected|lost the active browser chat",
+    re.IGNORECASE,
+)
+
+
+def _is_thread_send_failure(response: object) -> bool:
+    if not isinstance(response, dict):
+        return False
+    if response.get("type") != "text":
+        return False
+    return bool(_THREAD_SEND_FAILURE_RE.search(str(response.get("content", ""))))
+
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
@@ -478,9 +496,21 @@ class _CodexProxy:
     """Minimal HTTP server that translates Codex Responses API calls
     into BrowserProvider.complete() calls, with auto-compaction."""
 
-    def __init__(self, browser_provider: "BrowserProvider", provider_name: str = ""):
+    def __init__(
+        self,
+        browser_provider: "BrowserProvider",
+        provider_name: str = "",
+        thread_state: Optional[dict] = None,
+        stateful: bool = False,
+    ):
         self._provider = browser_provider
         self._provider_name = provider_name
+        # Cross-task browser-thread state (codex_engine/thread_state.py sidecar,
+        # loaded/saved by codex_bridge_service). Mutated in place so the service
+        # can persist whatever the run left behind. ``stateful`` gates thread
+        # CONTINUATION across tasks; handoff consumption works either way.
+        self._thread_state: dict = thread_state if isinstance(thread_state, dict) else {}
+        self._stateful = bool(stateful)
         self._server = None
         self._runner = None
         self._port = 0
@@ -579,15 +609,34 @@ class _CodexProxy:
 
         is_first_relay = self._last_sent_count == 0 or compacted
 
+        continuing_thread = False
         if is_first_relay:
-            # First relay or post-compaction: send full context and start a fresh browser chat.
-            prompt = _extract_prompt_from_responses_request(body)
-            clear_chat = True
-            # Ensure system prompt is re-injected when the new browser chat opens.
-            if hasattr(self._provider, '_sent_system_prompt'):
-                self._provider._sent_system_prompt = False
+            continuing_thread = (
+                self._stateful
+                and not compacted
+                and bool(self._thread_state.get("sent_instructions"))
+            )
+            if continuing_thread:
+                # Stateful mode: the session's browser thread already holds the
+                # codex system prompt from a previous task — send only the new
+                # task items (env context + user task), not the instructions.
+                prompt = _extract_delta_prompt(input_items) or _extract_prompt_from_responses_request(body)
+                clear_chat = False
+                if hasattr(self._provider, "mark_thread_continuation"):
+                    self._provider.mark_thread_continuation()
+                logger.info(
+                    f"[relay #{relay_num}] First relay — continuing stored browser thread "
+                    f"(delta only, {self._thread_state.get('turns', 0)} prior turns)"
+                )
+            else:
+                # First relay or post-compaction: send full context and start a fresh browser chat.
+                prompt = _extract_prompt_from_responses_request(body)
+                clear_chat = True
+                # Ensure system prompt is re-injected when the new browser chat opens.
+                if hasattr(self._provider, '_sent_system_prompt'):
+                    self._provider._sent_system_prompt = False
+                logger.info(f"[relay #{relay_num}] First relay — sending full context")
             self._last_sent_count = len(input_items) if isinstance(input_items, list) else 0
-            logger.info(f"[relay #{relay_num}] First relay — sending full context ({self._last_sent_count} items)")
         else:
             # Subsequent relay: send only new user-side items since the last relay.
             delta_items = input_items[self._last_sent_count:] if isinstance(input_items, list) else []
@@ -613,24 +662,84 @@ class _CodexProxy:
                 logger.info(f"[relay #{relay_num}] Empty delta (no cache) — sending 'Continue.'")
             clear_chat = False
 
+        # A pending compact handoff seeds the first send of a fresh chat only.
+        handoff = None
+        if is_first_relay and clear_chat:
+            handoff = str(self._thread_state.get("handoff") or "").strip() or None
+
         try:
+            extra_kwargs = {"handoff": handoff} if handoff else {}
             response = await self._provider.complete(
                 messages=[{"role": "user", "content": prompt}],
                 tools=[],
                 system=_codex_browser_system_prompt(),
                 clear_chat=clear_chat,
+                **extra_kwargs,
             )
+            if continuing_thread and _is_thread_send_failure(response):
+                # The stored thread is unresponsive/gone — degrade once to the
+                # legacy behavior: fresh chat, full context, pending handoff.
+                logger.warning(f"[relay #{relay_num}] Stored-thread send failed — retrying on a fresh chat")
+                print("[STATUS] Stored thread did not respond — retrying on a fresh chat…", flush=True)
+                prompt = _extract_prompt_from_responses_request(body)
+                clear_chat = True
+                handoff = str(self._thread_state.get("handoff") or "").strip() or None
+                if hasattr(self._provider, '_sent_system_prompt'):
+                    self._provider._sent_system_prompt = False
+                extra_kwargs = {"handoff": handoff} if handoff else {}
+                response = await self._provider.complete(
+                    messages=[{"role": "user", "content": prompt}],
+                    tools=[],
+                    system=_codex_browser_system_prompt(),
+                    clear_chat=True,
+                    **extra_kwargs,
+                )
         except Exception as e:
             logger.error(f"[relay #{relay_num}] Browser LLM call failed: {e}")
             return web.json_response(
                 {"error": {"message": f"LLM call failed: {e}"}}, status=502,
             )
 
+        self._note_relay_result(
+            is_first_relay=is_first_relay,
+            cleared_chat=clear_chat,
+            consumed_handoff=handoff,
+            response=response,
+        )
+
         responses_reply = _provider_response_to_responses_api(response, relay_num)
         self._last_proxy_response = responses_reply
         _surface_relay_reasoning(response, relay_num)
 
         return _sse_or_json(stream, responses_reply)
+
+    def _note_relay_result(
+        self,
+        *,
+        is_first_relay: bool,
+        cleared_chat: bool,
+        consumed_handoff: Optional[str],
+        response: object,
+    ) -> None:
+        """Update the cross-task thread-state accounting after a browser send."""
+        state = self._thread_state
+        if cleared_chat:
+            # Fresh chat: restart the thread accounting.
+            state["turns"] = 0
+            state["est_tokens"] = 0
+        if consumed_handoff:
+            state["handoff"] = None
+        if is_first_relay:
+            state["sent_instructions"] = True
+        usage = response.get("usage", {}) if isinstance(response, dict) else {}
+        if not isinstance(usage, dict):
+            usage = {}
+        state["turns"] = int(state.get("turns") or 0) + 1
+        state["est_tokens"] = (
+            int(state.get("est_tokens") or 0)
+            + int(usage.get("input") or 0)
+            + int(usage.get("output") or 0)
+        )
 
     async def _handle_chat_completions(self, request):
         """Handle POST /v1/chat/completions — standard OpenAI chat format."""

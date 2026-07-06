@@ -937,6 +937,13 @@ async fn apply_repl_outcome(
             Ok(false)
         }
         CommandOutcome::Compact => {
+            // Code mode + browser provider: the browser thread is the
+            // cross-task memory, so /compact runs through the codex bridge
+            // service (summarize the live thread → seed the next fresh chat).
+            // Chat mode keeps the local TUI-transcript trim below.
+            if app.mode == AppMode::Code && provider::is_browser_provider(&app.config.provider) {
+                return stream_repl_turn(app, "/compact".to_string()).await;
+            }
             compact_app_messages(app);
             if let Some(last) = app.messages.last() {
                 print_message(last);

@@ -36,9 +36,26 @@ from orchestrator.events_gen import emit_hitl_approval_request, emit_status
 from codex_engine.engine import (
     CODEX_BINARY,
     _CodexProxy,
+    _codex_browser_system_prompt,
+    _get_compact_threshold,
     _write_codex_config,
 )
+from codex_engine.thread_state import (
+    load_thread_state,
+    reset_thread_state,
+    save_thread_state,
+)
+from orchestrator.compact_prompt import (
+    _parse_compact_json,
+    build_in_thread_compact_prompt,
+    render_handoff_text,
+)
 from orchestrator.providers.base import create_provider
+
+# Control tasks that compact the code-mode browser thread instead of running
+# Codex. Mirrors _COMPACT_CONTROL_TASKS in orchestrator/agent.py so /compact
+# behaves the same in the Code tab and CLI code mode as in normal chat.
+_COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
 
 # Repo root — used to locate the default ``config.yaml`` when ``--config`` is
 # omitted (see ``_load_config`` below). Import resolution for ``codex_engine.*``,
@@ -163,6 +180,58 @@ async def _request_hitl_approval(task: str) -> bool:
         return False
 
 
+async def _compact_browser_thread(provider, cwd: str, provider_name: str) -> tuple[bool, str]:
+    """Ask the live code-mode browser thread to compact itself into a handoff.
+
+    The thread already holds the conversation, so the compact request carries
+    no transcript. The handoff (or nothing, on failure) is written to the
+    thread-state sidecar; either way the next code task starts a fresh chat.
+    Returns (summarized_ok, handoff_text).
+    """
+    handoff = ""
+    try:
+        # Delta-only send: don't re-inject the codex system prompt into the
+        # thread we are about to retire.
+        if hasattr(provider, "mark_thread_continuation"):
+            provider.mark_thread_continuation()
+        response = await provider.complete(
+            messages=[{"role": "user", "content": build_in_thread_compact_prompt()}],
+            tools=[],
+            system=_codex_browser_system_prompt(),
+        )
+        raw = str(response.get("content", "")).strip() if isinstance(response, dict) else ""
+        if raw and not raw.upper().startswith("NEED_HELP"):
+            artifact = _parse_compact_json(raw)
+            handoff = render_handoff_text(artifact).strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("In-thread compact failed: %s", exc)
+
+    reset_thread_state(cwd, provider_name, handoff=handoff or None)
+    return bool(handoff), handoff
+
+
+async def _run_compact_task(args: argparse.Namespace, config: dict) -> int:
+    """Handle a /compact control task: compact the thread, arm a fresh chat, exit."""
+    _status("Compacting the code-mode browser thread…")
+    provider = create_provider(args.provider, config)
+    ok, _handoff = await _compact_browser_thread(provider, args.cwd, args.provider)
+    if ok:
+        _status("Context compacted — the next code task starts a fresh chat seeded with the handoff.")
+        print(
+            "TASK_COMPLETE: Context compacted. The next code task will continue "
+            "from the handoff in a fresh browser chat.",
+            flush=True,
+        )
+    else:
+        _status("Could not summarize the current thread — the next code task starts fresh.")
+        print(
+            "TASK_COMPLETE: Thread reset. No handoff could be generated, so the "
+            "next code task starts a fresh browser chat without prior context.",
+            flush=True,
+        )
+    return 0
+
+
 async def _run_async(args: argparse.Namespace) -> int:
     global _active_process, _active_proxy  # noqa: PLW0603
 
@@ -176,6 +245,11 @@ async def _run_async(args: argparse.Namespace) -> int:
     config = _load_config(args.config)
     config["provider"] = args.provider
     os.environ["PROJECT_ROOT"] = args.cwd
+
+    # /compact control task: compact the browser thread instead of running
+    # Codex. No HITL gate — nothing executes in the user's project.
+    if args.task.strip().lower() in _COMPACT_CONTROL_TASKS:
+        return await _run_compact_task(args, config)
 
     # Gate: when running under Tauri, require explicit HITL approval before
     # spawning Codex.  Codex can run arbitrary shell commands, so this is a
@@ -203,7 +277,30 @@ async def _run_async(args: argparse.Namespace) -> int:
 
     _status(f"codex binary: {binary_path}")
 
-    proxy = _CodexProxy(provider, provider_name=args.provider)
+    # ── Cross-task browser-thread state (stateful mode + handoff seeding) ──
+    # The per-run auto-compaction inside the proxy only sees the CURRENT run's
+    # items, so growth of a reused thread across tasks is checked here, before
+    # the task starts.
+    bp_cfg = config.get("browser_provider") or {}
+    stateful = bool(bp_cfg.get("stateful_threads", False))
+    thread_state = load_thread_state(args.cwd, args.provider)
+    if stateful and thread_state.get("sent_instructions"):
+        threshold = _get_compact_threshold(args.provider)
+        compact_at = float(bp_cfg.get("compact_at_ratio", 0.80))
+        max_turns = int(bp_cfg.get("max_thread_turns", 40))
+        est_tokens = int(thread_state.get("est_tokens") or 0)
+        turns = int(thread_state.get("turns") or 0)
+        if est_tokens >= int(threshold * compact_at) or turns >= max_turns:
+            _status("Browser thread near its limit — compacting into a fresh chat before this task…")
+            await _compact_browser_thread(provider, args.cwd, args.provider)
+            thread_state = load_thread_state(args.cwd, args.provider)
+
+    proxy = _CodexProxy(
+        provider,
+        provider_name=args.provider,
+        thread_state=thread_state,
+        stateful=stateful,
+    )
     _active_proxy = proxy
     proxy_port = await proxy.start()
 
@@ -312,6 +409,9 @@ async def _run_async(args: argparse.Namespace) -> int:
     finally:
         await proxy.stop()
         _active_proxy = None
+        # Persist whatever the run left behind (turns, token estimate,
+        # sent_instructions, remaining handoff) for the next code task.
+        save_thread_state(args.cwd, args.provider, thread_state)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
