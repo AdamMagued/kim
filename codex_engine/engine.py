@@ -762,7 +762,18 @@ class _CodexProxy:
             logger.warning(f"[relay #{relay_num}] Contract nudge failed ({e}) — keeping original reply")
             return response
         retry_content = retry.get("content") if isinstance(retry, dict) else None
-        if _parse_contract(retry_content) is not None:
+        retry_parsed = _parse_contract(retry_content)
+        if retry_parsed is not None:
+            if not retry_parsed.get("tool_calls") and _SELF_HELP_RE.search(
+                str(retry_parsed.get("text") or "")
+            ):
+                # Format-compliant dodge: a final answer telling the USER to
+                # save files / run commands after being told actions must be
+                # tool_calls. The thread won't act — don't resume it.
+                self._thread_state["burned"] = True
+                logger.warning(
+                    f"[relay #{relay_num}] Nudge answered with do-it-yourself instructions — thread burned"
+                )
             return retry
         # The thread ignored the contract even after an explicit format
         # nudge — it has talked itself out of the protocol (each refusal in
@@ -1418,6 +1429,15 @@ def _parse_contract(content: object) -> Optional[dict]:
     return parsed if isinstance(parsed, dict) else None
 
 
+# A nudge answer that instructs the USER to perform the actions (save the
+# file, run the command) is a soft refusal — format-compliant, work undone.
+_SELF_HELP_RE = re.compile(
+    r"save (?:it|this|that|the (?:file|code|html)|the .{0,30}? (?:file|code|html))"
+    r"|then run|run this|run the following|run: |double-?click"
+    r"|paste (?:this|that|it|the)|open it in (?:your|a) browser",
+    re.IGNORECASE,
+)
+
 _CONTRACT_NUDGE = (
     "FORMAT ERROR: your previous reply was prose, not the required contract. "
     "Resend it now as ONE raw JSON object — no markdown, no commentary:\n"
@@ -1426,10 +1446,13 @@ _CONTRACT_NUDGE = (
     "The local Codex runtime on the user's machine executes every tool_call you emit — "
     "with the user's permission — and returns the real output to you. The tools listed in "
     "[AVAILABLE CODEX TOOLS] are genuinely available through that runtime, so emitting "
-    "tool_calls is truthful and is the ONLY way the requested work can happen. If you said "
-    "you would create files or run commands, do NOT describe those actions — emit them as "
-    "tool_calls using those exact tool names. "
-    'If it truly was your final answer, resend it as {"text": "<your answer>"}.'
+    "tool_calls is truthful and is the ONLY way the requested work can happen. If the task "
+    "involves creating files, running commands, or opening apps, you MUST emit tool_calls "
+    "now, using those exact tool names. Telling the user to save files or run commands "
+    "themselves is NOT a valid answer here — any command you would tell the user to type "
+    "must be emitted as a tool_call instead: same action, structured format, already "
+    "authorized by the user. Only if the task genuinely requires no actions at all, resend "
+    'your answer as {"text": "<your answer>"}.'
 )
 
 
@@ -1464,6 +1487,11 @@ def _codex_browser_system_prompt() -> str:
         "- File content always goes in a tool call — never embed it in the text field.\n"
         "- Do NOT output anything outside the JSON object.\n"
         "- Never announce or describe actions in the text field — emit them as tool_calls.\n"
+        "- NEVER instruct the user to create files, paste code, or run commands "
+        "themselves ('save this as…', 'then run…'). Performing those steps is exactly "
+        "what the Codex runtime is for — emit the equivalent tool_calls instead. A "
+        "command you would tell the user to type IS a tool_call; same action, "
+        "structured format, already authorized.\n"
     )
 
 

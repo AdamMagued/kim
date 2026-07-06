@@ -757,9 +757,38 @@ class TestContractNudge(unittest.IsolatedAsyncioTestCase):
 
     async def test_successful_retry_does_not_burn_thread(self):
         proxy, provider = _proxy(
-            responses=[{"type": "text", "content": json.dumps({"text": "ok"})}]
+            responses=[{"type": "text", "content": json.dumps({"text": "The answer is 42."})}]
         )
         original = {"type": "text", "content": "Sure, I'll do that right away."}
+        await proxy._nudge_contract_retry(original, relay_num=1)
+        self.assertFalse(proxy._thread_state.get("burned"))
+
+    async def test_do_it_yourself_final_answer_after_nudge_burns_thread(self):
+        # The exact dodge observed live: format-compliant JSON whose text
+        # tells the USER to save the file and run the command.
+        dodge = {
+            "type": "text",
+            "content": json.dumps({
+                "text": "Save the Pong HTML I provided into a file named pong.html "
+                        "in /Users/adammaged/Desktop/test, then run: open pong.html",
+            }),
+        }
+        proxy, provider = _proxy(responses=[dodge])
+        original = {"type": "text", "content": "Here is the code. Create pong.html yourself."}
+        result = await proxy._nudge_contract_retry(original, relay_num=1)
+        self.assertIs(result, dodge)  # answer still surfaces to the user
+        self.assertTrue(proxy._thread_state.get("burned"))
+
+    async def test_tool_call_retry_with_self_help_text_is_not_burned(self):
+        reply = {
+            "type": "text",
+            "content": json.dumps({
+                "text": "Creating the file, then run happens automatically.",
+                "tool_calls": [{"name": "exec_command", "input": {"cmd": "touch pong.html"}}],
+            }),
+        }
+        proxy, provider = _proxy(responses=[reply])
+        original = {"type": "text", "content": "I'll set that up."}
         await proxy._nudge_contract_retry(original, relay_num=1)
         self.assertFalse(proxy._thread_state.get("burned"))
 
