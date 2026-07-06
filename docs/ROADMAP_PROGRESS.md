@@ -296,3 +296,224 @@ call_tool → policy.enforce → (approve) → approvals.request_approval
    Phase-1 logic. The CLI crate has ~9 *unfixed* newer-clippy lints in
    `config.rs`/`sessions.rs` — CI does not run clippy on the CLI crate, so they
    are out of scope; leave them for a dedicated cleanup or the CLI's own split.
+
+---
+
+## Phase 2 — Architecture & testability spine — DONE (2026-07-06, branch `feat/roadmap-to-10`)
+
+Nine commits on top of Phase 1 (`5f0e4fe`):
+
+1. **K2/A1/A3** `2ffba90` — `TaskSpec`/`EnvBuilder`/`SpawnSupervisor`; both spawn paths unified.
+2. **K5/A2** `b2c9137` — event-manifest codegen owns the bracket-tag vocabulary.
+3. **T5** `213f1cb` — `useChatStream` Vitest suite (25 tests).
+4. **T4** `0f66614` — codex-proxy golden SSE tests (13 tests).
+5. **T6/T7** `e3c0720` — offline E2E smoke through the real proxy + CI coverage gate.
+6. **K3/T3** `38a8dd5` — injectable `PageDriver` seam + recorded-DOM contract tests.
+7. **A4/T2(cli)** `617f41d` — `provider.rs` split (2252→588, 6 files) + `cli/tests/cli_flow.rs`.
+8. **K5 followup** `5ce3808` — hold `utils.ts` under the size gate + refresh the src-tauri guide.
+
+### K2 / A1 / A3 — spawn decomposition + dual-path unification (done)
+
+- **`desktop/src-tauri/src/task_spec.rs`** (new, `pub`, 613 lines): the *pure*
+  half. `TaskSpec` (program/args/cwd/envs/stdin/session/source/is_codex),
+  `EnvBuilder` (ordered pair assembly: `orchestrator_base`, `permission_mode`,
+  `webview_bridge`, `ollama`, `set_opt`), and three named builders —
+  `chat_task_spec`, `codex_browser_spec`, `codex_direct_spec` — plus
+  `promote_provider`, `is_browser_provider`, `run_id_for_session`,
+  `ProviderRoute`. Nothing touches Tauri/tokio/fs; 11 unit tests.
+- **`desktop/src-tauri/src/spawn_supervisor.rs`** (new, 150): the *effectful*
+  half. `reserve_slot` (stale-pid recovery) → `spawn` (registers pid + stdin in
+  `TaskRuntime`, releases slot on any failure) → `supervise` (stdout/stderr
+  pumps through the one translator, pid-guarded `clear_if_pid`).
+- **`send_task`** (`subprocess.rs`): **568 → 146 lines**, orchestrating
+  `build_gui_chat_spec` / `build_gui_codex_spec` (async input resolution) →
+  `spawn_supervisor`. The codex arm and Chrome-launch block are extracted
+  helpers. **`/v1/task`** (`http_bridge.rs`) rebuilt on the SAME
+  `chat_task_spec` builder + supervisor (detached supervision on the Tauri
+  async runtime); its argv unit tests now call the real builder.
+- **`TaskRuntime`**: the dual `gui_stdin`/`bridge_stdin` handles collapsed to
+  one `stdin` (both paths now spawn a tokio child). `SpawnSource` moved to
+  `task_spec` (pub) and re-exported.
+- **`codex_route.rs`** (new, ~180): `configure_codex_direct_provider` +
+  `selected_ollama_codex_model` extracted from `lib.rs`, now returning a pure
+  `ProviderRoute` (`lib.rs` dropped below its baseline; Q6 gate green).
+- **`tests/task_spawn.rs`** (new, T2): spawn-path parity matrix (GUI vs bridge
+  argv/HITL contract can't diverge) + a behavioral fake-recorder spawn test
+  that proves a `TaskSpec` is directly executable and reproduces its declared
+  argv/env.
+- **Three intentional unifications** (were latent GUI/bridge divergences):
+  (a) the bridge path now pipes stderr to `kim-agent-error` (was `inherit`);
+  (b) direct codex CLI runs no longer receive `KIM_GEMINI_AUTHUSER` (unused
+  there); (c) the GUI chat run-id base is the session id (`gui-<ts>` when the
+  run is unnamed). None change observable task behavior.
+
+### K5 / A2 — event-manifest codegen for the log vocabulary (done)
+
+- `scripts/gen-events.js` now emits **named tag constants** from the same
+  `legacyTags` manifest: TS `LogTags.<NAME>` (`events.gen.ts`) and Python
+  `LOG_TAG_<NAME>` (`events_gen.py`). Single source of truth for the
+  `[STATUS]/[TOOL]/[ANSWER]/[PLAN]/…/TASK_COMPLETE:` vocabulary.
+- Emitters retargeted: `codex_engine/engine.py` + `codex_bridge_service.py`
+  print sites reference `LOG_TAG_*`; frontend `chat/utils.ts` +
+  `chat/parsers.ts` reference `LogTags.*` (all plain literals + the
+  `[PLAN]{`/`[STEP]{`/`[DONE]{` compound prefixes).
+- `tests/test_events_codegen.py`: pins the constants to the manifest and
+  asserts the codex emitters use them (drift guard). CI "Events schema drift
+  check" still passes (regen is a no-op).
+
+### A6 / R-2 — typed-IPC flip (code-complete; live step outstanding)
+
+- Ground truth: the default was **already `typed`** on this branch
+  (`config.rs default_ipc_protocol()`, `config.yaml.example`, and the three
+  config parse tests). The frontend already wires **17 typed `KimEventNames`
+  listeners** in `useChatStream.ts`, and `forward_agent_stdout_line` decodes
+  into the generated `KimEvent` enum. So the *code* flip is done — there was
+  nothing left to flip. What is NOT possible from a worktree is the **live-app
+  confirmation** (below).
+- Bonus finding: `emit_diff` was **already wired** into `agent.py` (:1355) —
+  the older map's "hand-parsed, un-emitted" note for `[DIFF]` was stale.
+
+### K3 / T3 — injectable PageDriver + recorded-DOM contract tests (done)
+
+- **`orchestrator/providers/browser/page_driver.py`** (new): `PageDriver`
+  protocol — `async acquire() -> (PageLike|None, site|None)` — plus
+  `PageLike`/`LocatorLike`/`ElementLike`/`KeyboardLike` sub-protocols
+  documenting the exact page surface the driver loop uses. A real Playwright
+  Page satisfies it structurally (no code change to the real path).
+- `BrowserProvider.__init__(config, page_driver=None)` +
+  `complete(..., page_driver=None)` (call-site wins). The downstream driver
+  body was extracted **verbatim** into `_run_chat_flow(page, site, …)`, shared
+  by the real-CDP and injected-driver branches; the driver path skips the
+  playwright import / `_connect` / `_find_chat_page`. `MARKDOWN_SERIALIZER_JS`
+  moved to **`markdown_scraper.py`** to keep provider.py under the size gate
+  (1465 → 1464).
+- **`tests/fixtures/dom/`**: 4 synthesized response snapshots (chatgpt
+  tool-call + code-fences, gemini text + tool-call), realistic nesting.
+- **`tests/test_browser_dom_contract.py`** (11 tests): html.parser DOM shim +
+  a Python mirror of the serializer + a `FakePageDriver` state machine; drives
+  `complete()` end-to-end over the fixtures covering the completion-hash and
+  stop-button exit paths, fence reconstruction (both language sources),
+  gemini bare-JSON tool-call survival, driver precedence, `(None,None)` →
+  NEED_HELP, and the injection-verification hard gate.
+
+### A4 / T2(cli) — provider.rs split + cli integration tests (done)
+
+- `cli/src/provider.rs` **2252 → 588** (facade: types, `PROVIDERS`,
+  `stream_kim_request` router, message/prompt helpers, re-exports). New
+  `cli/src/provider/`: `bridge.rs` (333), `llm_stream.rs` (239), `sse.rs`
+  (501, incl. `ThinkParser`), `codex_stream.rs` (539), `responses_proxy.rs`
+  (135, owns `include_str!("../responses_proxy.py")`). Pure structural move;
+  31 inline tests redistributed; public surface for agentic/commands/main
+  unchanged.
+- **`cli/tests/cli_flow.rs`** (5 tests): drives the real `kim` binary
+  (`CARGO_BIN_EXE_kim`) end-to-end against a std-only `TcpListener` fake HTTP
+  server — chat SSE (incl. `<think>`), in-stream error payload, HTTP 500,
+  `browser:*` bridge routing + token header, and the bridge-down actionable
+  message. The binary is copied into a temp cwd so `find_kim_repo_root` takes
+  the plain `stream_kim_request` path, not the agentic Python path.
+
+### T4 / T5 / T6 / T7 — testing payload (done)
+
+- **T4** `tests/test_codex_proxy_golden.py` (13): canned browser reply →
+  `_provider_response_to_responses_api` → `_make_sse_response`; exact frame
+  sequences for tool-call and text replies, bash-fence salvage, DONE-marker
+  stripping, non-stream JSON path. **First** coverage of the SSE framing.
+- **T5** `desktop/src/hooks/__tests__/useChatStream.test.tsx` (25): mocked
+  Tauri `listen`/`invoke`; HITL flow, 800ms/2000ms dedup windows, context
+  meter, typed `kim:*` events, the `kim-agent-done` finalizer
+  (success/failure/provider-error precedence), cancellation, rate-limit
+  auto-clear.
+- **T6** `tests/test_e2e_smoke.py` (3): a fake codex binary does REAL loopback
+  HTTP against the real `_CodexProxy` — bearer auth, translation, and SSE
+  framing all live; only `BrowserProvider` is canned. Covers text reply,
+  tool-call (function_call frames), and 401 on a wrong bearer.
+- **T7** `.github/workflows/ci.yml`: pytest now runs with `pytest-cov` over
+  `orchestrator+mcp_server+codex_engine`, `--cov-fail-under=55` (measured
+  baseline **63%**; the floor is a ratchet). Rust integration dirs
+  (`task_spawn.rs`, `cli/tests/`) run under the existing cargo jobs.
+
+### Suite status at Phase 2 exit (all green, 2026-07-06)
+
+| Suite | Result |
+|---|---|
+| `venv/bin/python -m pytest tests/` (CI ignores) + coverage | **1579 passed, 39 subtests; coverage 63.40% (gate 55)** |
+| `desktop`: `tsc --noEmit` + `npm run test` | **tsc clean; 185 vitest (13 files)** |
+| `desktop/src-tauri`: `cargo test` + `clippy --all-targets -D warnings` | **107 passed (101 unit + 6 integration); clippy clean** |
+| `cli`: `cargo test --test-threads=1` + `fmt --check` | **141 passed (136 + 5 integration); fmt clean** |
+| pyright (pyrightconfig: providers + mcp_server + codex_engine) | **0 errors** |
+| flake8 orchestrator + new test files | **clean** |
+| events schema drift / file-size gate | **no drift / OK** |
+
+### Exit criteria — all met (code)
+
+- ✅ `send_task` < 150 lines (146), orchestrating named builders.
+- ✅ One `TaskRuntime` owns both spawn paths (`spawn_supervisor`).
+- ✅ `BrowserProvider.complete()` accepts an injected driver.
+- ✅ `tests/fixtures/dom/` exists (4 snapshots) with passing contract tests.
+- ✅ `useChatStream` has a Vitest suite.
+- ✅ CI runs integration (rust dirs) + coverage gate.
+- ✅ The typed-IPC flip is DONE in code (was already `typed`; verified end to
+  end in config + frontend listeners).
+
+### LIVE-APP VERIFICATION STILL NEEDED (cannot run the GUI from a worktree)
+
+A separate live-test agent (Sonnet + the running `npm run tauri dev` app)
+should confirm — none of these are code blockers, they are the "prove it in
+the real app" mile:
+
+1. **Typed IPC end to end (A6/R-2).** Run a real Chat-tab task with a browser
+   provider and watch the activity feed populate from `kim:status`/`kim:tool`/
+   `kim:plan`/`kim:step`/`kim:answer`/`kim:context` (NOT the legacy
+   `kim-agent-output` text path). Confirm the plan pills, step advance, token
+   meter, and final answer all render. Then a **kimctl** run (`/v1/task`) and
+   confirm the SAME typed events reach the desktop UI (the #33 fix path).
+2. **Both spawn paths after the K2 rewrite.** (a) GUI Chat task (ollama +
+   browser:gemini), (b) GUI Code task (codex direct + codex browser-bridge),
+   (c) `kimctl` `/v1/task`. For each: task starts, streams, HITL approval
+   round-trips (approve / acceptForSession / decline), stop button cancels,
+   and no "A task is already running" wedge after completion or cancel.
+3. **HITL over the unified stdin.** With `permission_mode=ask_always`, trigger
+   a gated tool from BOTH a GUI run and a `kimctl` run and confirm the approval
+   prompt appears and the decision unblocks the agent (the single
+   `TaskRuntime.stdin` now serves both).
+4. **Steering (`steer_task`).** Mid-run steer message folds in (uses the same
+   single stdin handle).
+5. **Codex browser-bridge status lines** still render (the `[STATUS] Routing
+   to Codex via Kim's browser provider …` emit now happens inside
+   `build_gui_codex_spec`).
+
+### Gotchas for the Phase 3 (app-server parity) implementer
+
+1. **Spawn changes belong in `task_spec.rs` builders, never inline.** The
+   whole point of K2 was that GUI and `/v1/task` can no longer diverge — Phase
+   3's app-server transport should add a new named builder (e.g.
+   `codex_appserver_spec`) and route it through `spawn_supervisor`, not fork a
+   third spawn body. `SpawnSource` is the enum to extend if you need a third
+   provenance.
+2. **The approval channel is per-session, socket-based** (unchanged from Phase
+   1): `KIM_APPROVAL_SOCK`/`KIM_APPROVAL_TCP`. If the app-server transport
+   spawns codex with its own env, forward these two vars or codex-side
+   approvals default-deny. Put them in the spec's `extra_envs`.
+3. **`TaskRuntime.stdin` is now a single tokio handle.** The native-approvals-
+   over-stdin work in Part 2 writes through `write_stdin_line` — it already
+   works for both paths. Don't reintroduce a second handle.
+4. **Typed Kim events (Part 3) extend K5.** Add new events to
+   `events.schema.json` and rerun `npm run gen:events`; the new approval/plan/
+   diff events should also get `LOG_TAG_*`/`LogTags.*` constants if they have a
+   text-protocol form. The drift check + the new
+   `test_generated_named_tag_constants_match_manifest` will keep you honest.
+5. **The T6 smoke (`tests/test_e2e_smoke.py`) is the app-server integration
+   template.** It already exercises the real proxy over loopback with a fake
+   codex; Part 1's `app_server.py` fake-server tests can reuse the
+   `codex_bridge_harness` + this fake-binary-does-real-HTTP pattern.
+6. **`PageDriver` is the seam for "browser is now model-only" (Part 2/5).**
+   When tool execution moves native, the browser's job shrinks to
+   `_run_chat_flow`; contract-test any wait-heuristic changes against the
+   `tests/fixtures/dom/` snapshots via `FakePageDriver` (Rb2) rather than live.
+7. **pytest-cov is now a CI dep and a local dep.** The gate is
+   `--cov-fail-under=55` (baseline 63%). If a Phase-3 refactor adds a lot of
+   untested transport code, either test it or the gate fails — do not lower the
+   floor to pass.
+8. **CLI clippy is still not in CI** and still has ~5 pre-existing
+   `config.rs`/`sessions.rs` lints (untouched). The A4 split added zero new
+   lints; keep it that way if you touch `cli/src/provider/`.
