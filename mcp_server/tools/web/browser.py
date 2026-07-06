@@ -18,7 +18,9 @@ import asyncio
 import logging
 import os
 import shutil
+import socket
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -64,10 +66,60 @@ def _resolve_user_data_dir() -> Path:
 
 USER_DATA_DIR = _resolve_user_data_dir()
 
+# 3.3: single-flight launch state. Chrome launches were fire-and-forget
+# (Popen with no handle), so on repeated CDP-connect failures the retry
+# ladder spawned MULTIPLE Chrome processes on the SAME --user-data-dir —
+# profile-lock ("SingletonLock") failures and corruption. Track the launch
+# so a second attempt while one is still coming up becomes a no-op.
+_LAUNCH_COOLDOWN_S = float(os.environ.get("KIM_BROWSER_LAUNCH_COOLDOWN_S", "30"))
+_dedicated_launch_proc: subprocess.Popen | None = None
+_last_launch_at: dict[int, float] = {}  # port -> monotonic timestamp
+
+
+def _port_listening(port: int, timeout_s: float = 0.5) -> bool:
+    """True if something already accepts TCP connections on the CDP port."""
+    for host in ("127.0.0.1", "localhost"):
+        try:
+            with socket.create_connection((host, port), timeout=timeout_s):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _launch_allowed(port: int) -> bool:
+    """Single-flight gate: refuse a new launch if one is plausibly in flight.
+
+    A launch is "in flight" when the port already answers, when the tracked
+    dedicated process is still alive, or when a launch on this port happened
+    within the cooldown window (covers the macOS ``open -a`` path, whose
+    Popen handle exits immediately and cannot be tracked).
+    """
+    if _port_listening(port):
+        return False
+    if (
+        port == _DEDICATED_CDP_PORT
+        and _dedicated_launch_proc is not None
+        and _dedicated_launch_proc.poll() is None
+    ):
+        return False
+    last = _last_launch_at.get(port)
+    if last is not None and (time.monotonic() - last) < _LAUNCH_COOLDOWN_S:
+        return False
+    return True
+
 
 async def _launch_real_browser() -> bool:
     """Attempt to launch the user's real browser with remote debugging enabled."""
     cdp_arg = f"--remote-debugging-port={_REAL_BROWSER_CDP_PORT}"
+
+    if not _launch_allowed(_REAL_BROWSER_CDP_PORT):
+        logger.info(
+            "web: real-browser launch skipped — one is already running or "
+            f"was launched <{_LAUNCH_COOLDOWN_S:.0f}s ago (single-flight, 3.3)"
+        )
+        return True
+    _last_launch_at[_REAL_BROWSER_CDP_PORT] = time.monotonic()
 
     try:
         _env = minimal_subprocess_env()  # S4: no parent-env (secrets) inherit
@@ -139,10 +191,19 @@ async def _connect_over_cdp(port: int) -> Any | None:
 
 async def _launch_dedicated_browser() -> bool:
     """Launch Kim's own detached browser process so it survives MCP exit."""
+    global _dedicated_launch_proc, _last_connection_error
     executable = _browser_executable()
     if not executable:
         _last_connection_error = "No Chrome/Chromium executable found"
         return False
+
+    if not _launch_allowed(_DEDICATED_CDP_PORT):
+        logger.info(
+            "web: dedicated-browser launch skipped — one is already running or "
+            f"was launched <{_LAUNCH_COOLDOWN_S:.0f}s ago (single-flight, 3.3)"
+        )
+        return True
+    _last_launch_at[_DEDICATED_CDP_PORT] = time.monotonic()
 
     args = [
         executable,
@@ -154,7 +215,9 @@ async def _launch_dedicated_browser() -> bool:
         "about:blank",
     ]
     try:
-        subprocess.Popen(
+        # 3.3: keep the handle so a later launch attempt can see this one is
+        # still alive (poll() also reaps it if it exited, avoiding zombies).
+        _dedicated_launch_proc = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

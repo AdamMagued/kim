@@ -512,10 +512,26 @@ class BrowserProvider(BaseProvider):
 
         if image_attachments:
             logger.info(f"[STATUS] Uploading screenshot to {site}…")
-            await self._inject_image_clipboard(
+            image_delivered = await self._inject_image_clipboard(
                 page, cfg, str(image_attachments[-1]["data_base64"])
             )
             await page.wait_for_timeout(1200)
+            if not image_delivered:
+                # Screenshot-honesty (7.2/7.3): the prompt says "[Screenshot
+                # attached]" but the paste failed — make the missing image
+                # structurally known to the site model instead of letting it
+                # confabulate a screen description from no pixels.
+                logger.warning(
+                    f"Screenshot paste failed on {site} — appending "
+                    "not-attached note to the prompt."
+                )
+                prompt = (
+                    f"{prompt}\n\n"
+                    "[System note: The screenshot mentioned above could NOT "
+                    "be attached. You have NOT seen the image. Do not claim "
+                    "to see the screen; answer from the text context only, "
+                    "or say the screenshot was unavailable.]"
+                )
 
         logger.info(f"[STATUS] Preparing {site}…")
         await self._dismiss_popups(page)
@@ -990,7 +1006,11 @@ class BrowserProvider(BaseProvider):
 
     async def _inject_image_clipboard(
         self, page: Page, cfg: dict, image_b64: str
-    ) -> None:
+    ) -> bool:
+        """Paste an image into the chat editor. Returns True only when the
+        clipboard write + paste keystroke both went through — callers must
+        NOT tell the site model "a screenshot is attached" when this returns
+        False (screenshot-honesty, 7.2/7.3)."""
         if not image_b64.startswith("data:"):
             data_uri = f"data:image/png;base64,{image_b64}"
         else:
@@ -999,7 +1019,7 @@ class BrowserProvider(BaseProvider):
         input_sel = await self._find_selector(page, cfg["input_selectors"])
         if not input_sel:
             logger.warning("Cannot paste image — editor not found")
-            return
+            return False
 
         await page.click(input_sel)
         await asyncio.sleep(0.2)
@@ -1017,8 +1037,10 @@ class BrowserProvider(BaseProvider):
             await asyncio.sleep(0.2)
             await page.keyboard.press(f"{MOD_KEY}+v")
             logger.info("Screenshot pasted into editor via clipboard")
+            return True
         except Exception as e:
             logger.warning(f"Clipboard image injection failed: {e}")
+            return False
 
     # ==================================================================
     # Text injection via clipboard paste

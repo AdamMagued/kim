@@ -420,6 +420,23 @@ def format_prompt(
         # L2: prompt[-0:] is the WHOLE prompt — guard the zero-tail case
         # (only reachable with a very small max_inject_chars).
         tail = prompt[-tail_len:] if tail_len else ""
-        prompt = prompt[:head_end] + notice + tail
+        trimmed = prompt[:head_end] + notice + tail
+
+        # 4.2: the head is capped at max_inject_chars // 2, so when the
+        # [SYSTEM] block alone exceeds half the budget, head_end lands BEFORE
+        # the transport-marker instruction and the model never learns to emit
+        # [END_OF_RESPONSE_xxxx] — _wait_for_generation_complete then polls
+        # for the full generation timeout EVERY turn (~20-min hangs). The
+        # marker instruction is the transport contract: it must survive
+        # trimming unconditionally, so re-append it if the trim cut it.
+        marker_instr = transport_marker_instruction(completion_hash)
+        if marker_instr not in trimmed:
+            suffix = "\n\n" + marker_instr
+            budget = max(0, max_inject_chars - len(suffix))
+            head_end = min(head_end, budget)
+            tail_len = max(0, budget - head_end - len(notice))
+            tail = prompt[-tail_len:] if tail_len else ""
+            trimmed = prompt[:head_end] + notice + tail + suffix
+        prompt = trimmed
 
     return prompt, attachments, completion_hash, new_sent_system_prompt

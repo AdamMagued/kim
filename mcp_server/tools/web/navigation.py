@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import logging
 import re
 import urllib.parse
 from typing import Any
@@ -15,6 +16,13 @@ from typing import Any
 from mcp_server.config import USE_REAL_BROWSER
 
 from . import browser
+
+logger = logging.getLogger(__name__)
+
+
+def _default_port(scheme: str) -> int | None:
+    return {"http": 80, "https": 443}.get((scheme or "").lower())
+
 
 def _whatwg_ipv4_part(tok: str) -> int:
     """Parse one IPv4 host part the way the WHATWG URL parser does.
@@ -153,27 +161,46 @@ async def handle_web_open(args: dict) -> str:
 
     page = await browser._page()
 
-    # Track any origin-scoped route we add so we can remove it after navigation.
-    _auth_route_pattern: str | None = None
+    # Track any URL-scoped route we add so we can remove it after navigation.
+    _auth_route_matcher: Any = None
     _auth_route_handler: Any = None
+    _auth_unroute_failed = False
 
     if username and password:
         # BrowserContext.set_http_credentials() does not exist in Playwright (#50).
-        # The only supported way to scope HTTP Basic-auth credentials to a specific
-        # origin without affecting every other request on the shared context is to
-        # install a temporary page.route() handler that injects the Authorization
-        # header for matching URLs, then unroute it after navigation completes.
-        parsed_origin = urllib.parse.urlparse(url)
-        origin_prefix = f"{parsed_origin.scheme}://{parsed_origin.netloc}"
+        # The only supported way to scope HTTP Basic-auth credentials without
+        # affecting every other request on the shared context is to install a
+        # temporary page.route() handler that injects the Authorization header,
+        # then unroute it after navigation completes.
+        #
+        # 3.2: the route is scoped to the EXACT requested URL (scheme + host +
+        # port + path + query), not "{origin}/**" — an origin glob kept
+        # replaying the Authorization header onto every same-origin request,
+        # including redirects to other paths, for the whole navigation.
+        target = urllib.parse.urlparse(url)
+        target_path = target.path or "/"
         creds_b64 = base64.b64encode(f"{username}:{password}".encode()).decode()
         auth_header_value = f"Basic {creds_b64}"
+
+        def _matches_target(request_url: str) -> bool:
+            try:
+                req = urllib.parse.urlparse(str(request_url))
+            except Exception:
+                return False
+            return (
+                req.scheme == target.scheme
+                and req.hostname == target.hostname
+                and (req.port or _default_port(req.scheme)) == (target.port or _default_port(target.scheme))
+                and (req.path or "/") == target_path
+                and req.query == target.query
+            )
 
         async def _do_auth_route(route, request):
             await route.continue_(headers={**request.headers, "Authorization": auth_header_value})
 
         _auth_route_handler = _do_auth_route
-        _auth_route_pattern = f"{origin_prefix}/**"
-        await page.route(_auth_route_pattern, _auth_route_handler)
+        _auth_route_matcher = _matches_target
+        await page.route(_auth_route_matcher, _auth_route_handler)
     # (No else branch: the old `set_extra_http_headers({})` call was leftover
     # from the removed set_http_credentials approach (#50) — it cleared headers
     # that were never set. L7.)
@@ -184,12 +211,32 @@ async def handle_web_open(args: dict) -> str:
     except Exception as e:
         _goto_error = e
     finally:
-        # Always unroute the auth handler so it doesn't leak into future navigations.
-        if _auth_route_pattern and _auth_route_handler:
+        # Always unroute the auth handler so it doesn't leak into future
+        # navigations. 3.2: a swallowed unroute failure used to let the
+        # credential-injecting handler silently persist on the reused page —
+        # now the failure is logged and surfaced to the caller.
+        if _auth_route_matcher and _auth_route_handler:
             try:
-                await page.unroute(_auth_route_pattern, _auth_route_handler)
-            except Exception:
-                pass
+                await page.unroute(_auth_route_matcher, _auth_route_handler)
+            except Exception as unroute_err:
+                logger.error(
+                    "web_open: failed to remove HTTP-auth route handler — "
+                    f"credentials may persist on this page: {unroute_err}"
+                )
+                _auth_unroute_failed = True
+                try:
+                    await page.unroute_all()
+                    _auth_unroute_failed = False
+                    logger.info("web_open: unroute_all() cleared the stuck auth route")
+                except Exception:
+                    pass
+
+    unroute_warn = (
+        "\nWARNING: the temporary HTTP-auth handler could not be removed; "
+        "credentials may still be injected on this page until it is closed."
+        if _auth_unroute_failed
+        else ""
+    )
 
     if _goto_error is not None:
         err_text = str(_goto_error)
@@ -205,14 +252,16 @@ async def handle_web_open(args: dict) -> str:
                     "The site rejected the supplied HTTP authentication credentials. "
                     "Do not call web_observe/web_text/web_screenshot for page content yet; "
                     "ask the user to verify the username/password or sign in manually."
+                    + unroute_warn
                 )
             return (
                 f"AUTH_REQUIRED: {url}{mode_str}\n"
                 "The site is open but blocked by an HTTP authentication popup. "
                 "Call web_open again with username and password if you have them; "
                 "otherwise ask the user to sign in manually."
+                + unroute_warn
             )
-        return f"ERROR: navigation failed: {_goto_error}"
+        return f"ERROR: navigation failed: {_goto_error}{unroute_warn}"
 
     if page.url.startswith("chrome-error://"):
         mode_str = " (Real Browser)" if browser._is_real_browser else " (Dedicated Kim Browser)"
@@ -220,6 +269,7 @@ async def handle_web_open(args: dict) -> str:
             f"ERROR: browser error page after opening {url}{mode_str}\n"
             "The controlled browser did not reach usable page content. "
             "Do not treat this as open; ask for help or retry with valid credentials."
+            + unroute_warn
         )
     try:
         title = await page.title()
@@ -236,7 +286,7 @@ async def handle_web_open(args: dict) -> str:
     else:
         mode_str = " (Dedicated Kim Browser)"
 
-    return f"Opened: {page.url}{mode_str}\nTitle: {title}"
+    return f"Opened: {page.url}{mode_str}\nTitle: {title}{unroute_warn}"
 
 
 async def handle_web_wait_for(args: dict) -> str:

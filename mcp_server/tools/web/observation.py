@@ -6,6 +6,14 @@ the last-observation snapshot and its form diagnostics. Resolution and
 action submodules read that state through this module — the scalar values
 (``_last_observation``, ``_last_form_diagnostics``, ``_observe_generation``)
 are rebound on every observation, so they must not be ``from``-imported.
+
+SINGLE-RUN INVARIANT (3.6-web): this element state is module-global and NOT
+keyed by session/run. That is safe today because the orchestrator spawns ONE
+MCP server subprocess per run, so the process boundary IS the session
+boundary. If the MCP server is ever shared across concurrent runs, element
+ids from one run would resolve against another run's page — use
+``reset_element_state()`` at run boundaries (or key these maps by a session
+token) before making that change.
 """
 
 from __future__ import annotations
@@ -30,6 +38,21 @@ _element_data_map: dict[str, dict[str, Any]] = {}
 _last_observation: dict[str, Any] | None = None
 _last_form_diagnostics: dict[str, Any] = {}
 _observe_generation: int = 0
+
+
+def reset_element_state() -> None:
+    """Clear all observation state (see SINGLE-RUN INVARIANT in module docstring).
+
+    Call this at a run/session boundary if one MCP server process ever serves
+    more than one run, so element ids can never bleed across runs.
+    """
+    global _last_observation, _last_form_diagnostics, _observe_generation
+    _element_map.clear()
+    _element_data_map.clear()
+    _last_observation = None
+    _last_form_diagnostics = {}
+    _observe_generation = 0
+
 
 def _is_field(el: dict[str, Any]) -> bool:
     roles = _role_candidates(el)
