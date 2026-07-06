@@ -639,6 +639,16 @@ class _CodexProxy:
                 if hasattr(self._provider, '_sent_system_prompt'):
                     self._provider._sent_system_prompt = False
                 logger.info(f"[relay #{relay_num}] First relay — sending full context")
+            # ChatGPT weighs the END of a long prompt far more than the top —
+            # codex's forwarded schemas bury the terminal rules, and turn 1
+            # comes back as "save this as game.html" prose. A compact reminder
+            # at the tail fixes the recency bias.
+            if bool(self._provider_name) and "chatgpt" in self._provider_name.lower():
+                prompt += (
+                    "\n\n(Format reminder: reply with ONE short narration line, then "
+                    "EXACTLY ONE shell command in a single ```bash block — create files "
+                    "with a command, never paste code for me to save myself.)"
+                )
             self._last_sent_count = len(input_items) if isinstance(input_items, list) else 0
         else:
             # Subsequent relay: send only new user-side items since the last relay.
@@ -1740,8 +1750,10 @@ def _file_directive_tool_calls(name: str, body: str, wants_open: bool) -> list:
 # file, run the command) is a soft refusal — format-compliant, work undone.
 _SELF_HELP_RE = re.compile(
     r"save (?:it|this|that|the (?:file|code|html)|the .{0,30}? (?:file|code|html))"
+    r"|save (?:it |this |that )?as\b"
+    r"|you can save"
     r"|then run|run this|run the following|run: |double-?click"
-    r"|paste (?:this|that|it|the)|open it in (?:your|a) browser",
+    r"|paste (?:this|that|it|the)|open (?:it )?in (?:your|a|the) browser",
     re.IGNORECASE,
 )
 
@@ -2113,6 +2125,11 @@ def _surface_relay_reasoning(response: dict, relay_num: int) -> None:
     # the salvage layer already runs the command. If the reply is only a code
     # block, there's nothing to preview.
     prose = content.split("```", 1)[0]
+    # A save-it-yourself dodge ("you can save as game.html and open in your
+    # browser") is NOT Kim's thinking — Kim salvages and does the work itself,
+    # and the humanized "Creating game.html…" lines narrate it truthfully.
+    if _SELF_HELP_RE.search(prose):
+        return
     # Drop command-introduction lines ("Run these commands in your terminal:",
     # "Now open it:") — the humanized activity lines already narrate those.
     kept = [

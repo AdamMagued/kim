@@ -1138,6 +1138,30 @@ class TestRepeatedCommandLoopGuard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[TOOL RESULT]", sent)
         self.assertIn("reply with just DONE", sent)
 
+    async def test_format_reminder_appended_to_chatgpt_first_relay(self):
+        from codex_engine.engine import _CodexProxy
+
+        # ChatGPT weighs the END of the prompt — turn 1 ignored the terminal
+        # rules buried above codex's schemas ("save this as game.html" prose).
+        provider = _RecordingProvider([{"type": "text", "content": "DONE"}])
+        proxy = _CodexProxy(
+            provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
+        )
+        await proxy._handle_responses(self._request(proxy, 1))
+        sent = provider.calls[0]["messages"][0]["content"]
+        self.assertTrue(sent.rstrip().endswith("never paste code for me to save myself.)"))
+
+    async def test_format_reminder_not_appended_for_gemini(self):
+        from codex_engine.engine import _CodexProxy
+
+        provider = _RecordingProvider([{"type": "text", "content": "DONE"}])
+        proxy = _CodexProxy(
+            provider, provider_name="browser:gemini", thread_state={}, stateful=False
+        )
+        await proxy._handle_responses(self._request(proxy, 1))
+        sent = provider.calls[0]["messages"][0]["content"]
+        self.assertNotIn("Format reminder", sent)
+
     async def test_done_reminder_not_sent_to_gemini(self):
         from codex_engine.engine import _CodexProxy
 
@@ -1308,6 +1332,23 @@ class TestRelayReasoningDisplay(unittest.TestCase):
     def test_fence_only_reply_prints_nothing(self):
         out = self._capture("```bash\nopen index.html\n```")
         self.assertEqual(out, "")
+
+    def test_save_it_yourself_dodge_is_not_shown_as_thinking(self):
+        # "you can save as game.html and open in your browser" is the model's
+        # dodge, not Kim's plan — Kim salvages and does it itself, so showing
+        # that prose as thinking is misleading. The humanized "Creating
+        # game.html…" lines narrate the truth.
+        out = self._capture(
+            "Here's a simple, fun HTML game you can save as game.html and open "
+            "in your browser.\n```html\n<!DOCTYPE html>\n```"
+        )
+        self.assertEqual(out, "")
+
+    def test_honest_narration_is_still_shown(self):
+        out = self._capture(
+            "Writing the whole game file now.\n```bash\nprintf x > game.html\n```"
+        )
+        self.assertIn("Writing the whole game file now.", out)
 
 
 class TestDoneReply(unittest.TestCase):
