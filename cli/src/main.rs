@@ -1170,6 +1170,15 @@ async fn stream_repl_turn(
 /// Consume one turn's streamed events, render them, and persist the result.
 /// Extracted from `stream_repl_turn` so it can be driven by a stubbed event
 /// channel with an injected `save` sink in tests — no network required. (A1/A2)
+/// Erase the current terminal line if the loading spinner was drawn on it.
+/// No-op when `active` is false so callers can invoke it unconditionally.
+fn clear_spinner_line(active: bool) {
+    if active {
+        print!("\r\x1b[2K");
+        let _ = stdout().flush();
+    }
+}
+
 async fn consume_turn_events<S, C>(
     app: &mut App,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
@@ -1187,9 +1196,20 @@ where
     let mut last_tool_line = String::new();
     let mut bridge_used = false;
 
+    // Loading indicator: while we wait for the first output (browser providers
+    // can take many seconds to scrape a reply), animate a spinner in place.
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let show_spinner = stdout().is_terminal();
+    let mut spin_i = 0usize;
+    let mut spinner_active = false;
+    let mut produced_output = false;
+    let mut spinner = tokio::time::interval(Duration::from_millis(100));
+    spinner.tick().await; // consume the immediate first tick
+
     tokio::pin!(cancel);
     loop {
         let event = tokio::select! {
+            biased;
             maybe = rx.recv() => match maybe {
                 Some(event) => event,
                 None => break,
@@ -1197,6 +1217,7 @@ where
             _ = &mut cancel => {
                 // A6: cancel mid-stream — keep whatever already streamed, drop
                 // back to the prompt instead of killing the whole CLI.
+                clear_spinner_line(spinner_active);
                 if printed_answer_label && !assistant.ends_with('\n') {
                     println!();
                 }
@@ -1207,9 +1228,29 @@ where
                 }
                 return Ok(false);
             }
+            _ = spinner.tick(), if show_spinner && !produced_output => {
+                let frame = SPINNER[spin_i % SPINNER.len()];
+                spin_i += 1;
+                print!(
+                    "\r{}",
+                    paint_dim(&format!(
+                        "{frame} thinking… ({}s)",
+                        started.elapsed().as_secs()
+                    ))
+                );
+                let _ = stdout().flush();
+                spinner_active = true;
+                continue;
+            }
         };
+        // A real event arrived — wipe the spinner line before rendering it.
+        if spinner_active {
+            clear_spinner_line(true);
+            spinner_active = false;
+        }
         match event {
             AppEvent::TextChunk(chunk) => {
+                produced_output = true;
                 if !printed_answer_label {
                     if printed_thinking {
                         println!();
@@ -1223,6 +1264,7 @@ where
                 assistant.push_str(&chunk);
             }
             AppEvent::ThoughtChunk(chunk) => {
+                produced_output = true;
                 if !printed_thinking && !printed_answer_label {
                     printed_thinking = true;
                 }
@@ -1230,6 +1272,7 @@ where
                 stdout().flush()?;
             }
             AppEvent::ToolEvent { verb, target } => {
+                produced_output = true;
                 let line = format!("{verb}: {target}");
                 if line != last_tool_line {
                     if printed_answer_label && !assistant.ends_with('\n') {
@@ -1256,6 +1299,10 @@ where
                 return Ok(false);
             }
         }
+    }
+    // The stream closed (or ended) while the spinner was on-screen — wipe it.
+    if spinner_active {
+        clear_spinner_line(true);
     }
 
     if printed_answer_label {

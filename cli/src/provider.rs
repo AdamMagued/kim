@@ -1110,21 +1110,22 @@ fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: boo
         return;
     }
     if is_bridge {
-        // New typed JSON format from codex_bridge_service.
         if let Ok(json) = serde_json::from_str::<Value>(line) {
-            match json.get("type").and_then(Value::as_str) {
-                Some("status") => {
-                    if let Some(msg) = json.get("message").and_then(Value::as_str) {
-                        let _ = tx.send(AppEvent::ThoughtChunk(msg.to_string()));
-                    }
+            // Kim's own status events from codex_bridge_service.
+            if json.get("type").and_then(Value::as_str) == Some("status") {
+                if let Some(msg) = json.get("message").and_then(Value::as_str) {
+                    let _ = tx.send(AppEvent::ThoughtChunk(msg.to_string()));
                 }
-                _ => {
-                    let _ = tx.send(AppEvent::TextChunk(format!("{line}\n")));
-                }
+                return;
             }
+            // Otherwise these are Codex's raw --json protocol events, forwarded
+            // verbatim by the bridge. Route them through the shared handler so
+            // lifecycle noise (thread.started/turn.started/turn.completed) is
+            // dropped instead of leaking to the user as raw JSON.
+            emit_codex_json_event(&json, tx);
             return;
         }
-        // Legacy bracket prefix format.
+        // Legacy bracket prefix format / plain assistant text.
         if let Some(rest) = line.strip_prefix("[STATUS] ") {
             let _ = tx.send(AppEvent::ThoughtChunk(rest.to_string()));
         } else if let Some(rest) = line.strip_prefix("[SUCCESS] ") {
@@ -1136,11 +1137,20 @@ fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: boo
         }
         return;
     }
-    // Codex JSON-stream format.
+    // Direct Codex JSON-stream format.
     let Ok(json) = serde_json::from_str::<Value>(line) else {
         let _ = tx.send(AppEvent::TextChunk(format!("{line}\n")));
         return;
     };
+    emit_codex_json_event(&json, tx);
+}
+
+/// Translate a single Codex `--json` event into an `AppEvent`. Shared by the
+/// direct-codex path and the browser-bridge path (which forwards Codex's raw
+/// events). Unknown events surface only their human-readable `text` (if any) —
+/// never the raw JSON envelope — so lifecycle events like `thread.started`,
+/// `turn.started`, and `turn.completed` are dropped rather than leaked.
+fn emit_codex_json_event(json: &Value, tx: &UnboundedSender<AppEvent>) {
     match json.get("type").and_then(Value::as_str) {
         Some("message") => {
             if let Some(blocks) = json.get("content").and_then(Value::as_array) {
@@ -1188,7 +1198,7 @@ fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: boo
         Some("item.completed") => {
             if let Some(item) = json.get("item") {
                 match item.get("type").and_then(Value::as_str) {
-                    Some("agent_message") => {
+                    Some("agent_message") | Some("assistant_message") => {
                         if let Some(text) = item.get("text").and_then(Value::as_str) {
                             if !text.is_empty() {
                                 let _ = tx.send(AppEvent::TextChunk(text.to_string()));
@@ -1225,7 +1235,21 @@ fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: boo
                 let _ = tx.send(AppEvent::Err(msg.to_string()));
             }
         }
-        _ => {}
+        _ => {
+            // Unknown event: surface any human-readable text it carries (some
+            // Codex schema versions wrap the answer differently), but never the
+            // raw JSON. Text-less lifecycle events fall through and are dropped.
+            let text = json.get("text").and_then(Value::as_str).or_else(|| {
+                json.get("item")
+                    .and_then(|i| i.get("text"))
+                    .and_then(Value::as_str)
+            });
+            if let Some(text) = text {
+                if !text.is_empty() {
+                    let _ = tx.send(AppEvent::TextChunk(text.to_string()));
+                }
+            }
+        }
     }
 }
 
@@ -1710,6 +1734,78 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.ends_with('…'))),
             "expected a truncated ThoughtChunk, got {events:?}"
+        );
+    }
+
+    // ── Codex lifecycle events must not leak as raw JSON (bridge path) ───────
+
+    #[test]
+    fn bridge_drops_codex_lifecycle_events() {
+        // These are Codex's --json protocol envelopes forwarded by the bridge.
+        // None of them should reach the user as text.
+        for line in [
+            r#"{"type":"thread.started","thread_id":"abc"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":0}}"#,
+            r#"{"type":"item.started","item":{"type":"agent_message"}}"#,
+        ] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            process_codex_line(line, &tx, true);
+            let events = drain(&mut rx);
+            assert!(
+                events.is_empty(),
+                "lifecycle event should be dropped, got {events:?} for {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_renders_agent_message_as_text_not_json() {
+        let line = r#"{"type":"item.completed","item":{"type":"agent_message","text":"Hi there"}}"#;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        process_codex_line(line, &tx, true);
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::TextChunk(t) if t == "Hi there")),
+            "agent message should render as clean text, got {events:?}"
+        );
+        // And nothing should carry a raw JSON brace.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AppEvent::TextChunk(t) if t.contains('{'))),
+            "no raw JSON should leak, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn bridge_status_event_is_a_thought() {
+        let line = r#"{"type":"status","message":"Sending message to gemini…"}"#;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        process_codex_line(line, &tx, true);
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::ThoughtChunk(t) if t.contains("Sending"))),
+            "status should be a ThoughtChunk, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn bridge_unknown_event_surfaces_text_only() {
+        // A future/unknown Codex event that still carries an answer must show the
+        // text, never the JSON envelope.
+        let line = r#"{"type":"assistant.turn","text":"the answer"}"#;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        process_codex_line(line, &tx, true);
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], AppEvent::TextChunk(t) if t == "the answer"),
+            "unknown event should surface its text, got {events:?}"
         );
     }
 
