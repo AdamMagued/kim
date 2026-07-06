@@ -391,7 +391,11 @@ class TestContinueCachedAccounting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.calls, [])  # cache hit — no browser send
 
     async def test_real_followup_is_not_swallowed_by_cache(self):
-        proxy, provider = _proxy()
+        # Contract-format reply — prose would (correctly) draw a format nudge
+        # and a second browser call (TestContractNudge).
+        proxy, provider = _proxy(
+            responses=[{"type": "text", "content": json.dumps({"text": "ok"})}]
+        )
         proxy._last_sent_count = 2
         proxy._last_proxy_response = {"id": "cached"}
         await proxy._handle_responses(
@@ -554,6 +558,70 @@ class TestThreadSandboxChanged(unittest.TestCase):
         state = {"sent_instructions": True, "sandbox": "bypass"}
         self.assertFalse(svc._thread_sandbox_changed(state, "bypass"))
         self.assertTrue(svc._thread_sandbox_changed(state, "default"))
+
+
+# ---------------------------------------------------------------------------
+# Contract nudge — a prose reply ("I'll create the files…") must get ONE
+# format re-ask instead of being handed to codex as a final answer
+# ---------------------------------------------------------------------------
+
+class TestContractNudge(unittest.IsolatedAsyncioTestCase):
+    async def test_prose_reply_is_retried_and_retry_used(self):
+        retry_reply = {
+            "type": "text",
+            "content": json.dumps({
+                "text": "creating the file",
+                "tool_calls": [{"name": "shell", "input": {"command": ["touch", "pong.html"]}}],
+            }),
+        }
+        proxy, provider = _proxy(responses=[retry_reply])
+        original = {"type": "text", "content": "I'll create the files and open them for you."}
+
+        result = await proxy._nudge_contract_retry(original, relay_num=1)
+
+        self.assertIs(result, retry_reply)
+        self.assertEqual(len(provider.calls), 1)
+        sent = provider.calls[0]["messages"][0]["content"]
+        self.assertIn("FORMAT ERROR", sent)
+        self.assertIn("tool_calls", sent)
+        # Same thread — the nudge must never wipe the chat.
+        self.assertFalse(provider.calls[0]["kwargs"]["clear_chat"])
+
+    async def test_contract_reply_is_not_nudged(self):
+        proxy, provider = _proxy()
+        for content in (
+            json.dumps({"text": "final answer"}),
+            json.dumps({"text": "", "tool_calls": [{"name": "shell", "input": {}}]}),
+        ):
+            original = {"type": "text", "content": content}
+            result = await proxy._nudge_contract_retry(original, relay_num=1)
+            self.assertIs(result, original)
+        self.assertEqual(provider.calls, [])
+
+    async def test_failed_retry_keeps_original_and_nudges_only_once(self):
+        proxy, provider = _proxy(responses=[{"type": "text", "content": "still prose, sorry"}])
+        original = {"type": "text", "content": "Sure, I'll do that right away."}
+        result = await proxy._nudge_contract_retry(original, relay_num=1)
+        self.assertIs(result, original)
+        self.assertEqual(len(provider.calls), 1)
+
+    async def test_provider_error_keeps_original(self):
+        class _Boom:
+            async def complete(self, *a, **k):
+                raise RuntimeError("bridge down")
+
+        proxy = _CodexProxy(_Boom(), provider_name="browser:gemini", thread_state={}, stateful=False)
+        original = {"type": "text", "content": "Narrating instead of acting."}
+        result = await proxy._nudge_contract_retry(original, relay_num=1)
+        self.assertIs(result, original)
+
+    async def test_send_failure_and_non_text_are_not_nudged(self):
+        proxy, provider = _proxy()
+        failure = {"type": "text", "content": "No response turn detected after submit"}
+        self.assertIs(await proxy._nudge_contract_retry(failure, relay_num=1), failure)
+        tool = {"type": "tool_call", "content": "irrelevant"}
+        self.assertIs(await proxy._nudge_contract_retry(tool, relay_num=1), tool)
+        self.assertEqual(provider.calls, [])
 
 
 # ---------------------------------------------------------------------------

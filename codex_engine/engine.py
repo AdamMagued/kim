@@ -714,6 +714,8 @@ class _CodexProxy:
                 {"error": {"message": f"LLM call failed: {e}"}}, status=502,
             )
 
+        response = await self._nudge_contract_retry(response, relay_num)
+
         self._note_relay_result(
             is_first_relay=is_first_relay,
             cleared_chat=clear_chat,
@@ -726,6 +728,40 @@ class _CodexProxy:
         _surface_relay_reasoning(response, relay_num)
 
         return _sse_or_json(stream, responses_reply)
+
+    async def _nudge_contract_retry(self, response: dict, relay_num: int) -> dict:
+        """One-shot format re-ask when a reply ignored the JSON contract.
+
+        A prose reply ("I'll create the files…") parses as a FINAL ANSWER, so
+        codex ends the turn having executed nothing — the model narrated its
+        actions instead of emitting tool_calls. Re-ask once on the same thread;
+        if the retry parses, use it, otherwise keep the original reply.
+        """
+        if not isinstance(response, dict) or response.get("type") != "text":
+            return response
+        content = response.get("content", "")
+        if not isinstance(content, str) or not content.strip():
+            return response
+        if _parse_contract(content) is not None:
+            return response
+        if _is_thread_send_failure(response):
+            return response
+        logger.info(f"[relay #{relay_num}] Reply ignored the JSON contract — sending one format nudge")
+        print("[STATUS] Reply was prose instead of tool calls — asking for the actions…", flush=True)
+        try:
+            retry = await self._provider.complete(
+                messages=[{"role": "user", "content": _CONTRACT_NUDGE}],
+                tools=[],
+                system=_codex_browser_system_prompt(),
+                clear_chat=False,
+            )
+        except Exception as e:
+            logger.warning(f"[relay #{relay_num}] Contract nudge failed ({e}) — keeping original reply")
+            return response
+        retry_content = retry.get("content") if isinstance(retry, dict) else None
+        if _parse_contract(retry_content) is not None:
+            return retry
+        return response
 
     def _note_relay_result(
         self,
@@ -1241,6 +1277,37 @@ def _make_chat_tool_reply(resp_id: str, text: str, tool_calls: list) -> dict:
     }
 
 
+def _parse_contract(content: object) -> Optional[dict]:
+    """Parse a browser reply against the bridge contract ({"text", "tool_calls"}).
+
+    Returns the parsed dict, or None when the reply is not contract JSON
+    (prose, code fences, bare strings, …). Shared by the reply converter and
+    the one-shot format nudge so both agree on what counts as a violation.
+    """
+    if not isinstance(content, str) or not content.strip():
+        return None
+    parsed = None
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        try:
+            import json_repair  # type: ignore[import-not-found]
+            parsed = json_repair.repair_json(content, return_objects=True)
+        except Exception:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+_CONTRACT_NUDGE = (
+    "FORMAT ERROR: your previous reply was prose, not the required contract. "
+    "Resend it now as ONE raw JSON object — no markdown, no commentary:\n"
+    '  {"text": "brief reasoning", "tool_calls": [{"name": "TOOL_NAME", "input": {...}}]}\n'
+    "If you said you would create files or run commands, do NOT describe those actions — "
+    "emit them as tool_calls using the exact tool names from the [SYSTEM PROMPT]. "
+    'If it truly was your final answer, resend it as {"text": "<your answer>"}.'
+)
+
+
 def _codex_browser_system_prompt() -> str:
     return (
         "You are Kim, a coding assistant (codex bridge json mode). "
@@ -1268,18 +1335,8 @@ def _provider_response_to_responses_api(response: dict, relay_num: int) -> dict:
 
     content = response.get("content", "")
     if isinstance(content, str):
-        # Try clean JSON first, then json_repair as fallback
-        parsed = None
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, TypeError):
-            try:
-                import json_repair  # type: ignore[import-not-found]
-                parsed = json_repair.repair_json(content, return_objects=True)
-            except Exception:
-                pass
-
-        if isinstance(parsed, dict):
+        parsed = _parse_contract(content)
+        if parsed is not None:
             text = parsed.get("text", "")
             tool_calls = parsed.get("tool_calls", [])
             if tool_calls:
