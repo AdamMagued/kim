@@ -519,6 +519,7 @@ class _CodexProxy:
         self._relay_count = 0
         self._last_sent_count = 0  # how many input_items were forwarded to the browser last relay
         self._last_proxy_response: Optional[dict] = None  # last Responses API reply sent to Codex
+        self._last_tool_commands: Optional[tuple] = None  # last relay's tool-call signature (loop guard)
         # Cache: hash(json(prefix_items)) → summary_item dict
         # Avoids re-summarizing the same prefix on every Codex turn.
         self._compaction_cache: dict[int, dict] = {}
@@ -728,6 +729,21 @@ class _CodexProxy:
         responses_reply = _provider_response_to_responses_api(
             response, relay_num, request_tools=body.get("tools")
         )
+        # Loop guard: if this relay's tool calls are IDENTICAL to the previous
+        # relay's, the model is repeating itself (e.g. re-sending
+        # `open game.html` every turn because an empty tool result gives it no
+        # signal to stop). Re-running the same command achieves nothing, so end
+        # the turn with a plain final answer — codex sees no tool call and
+        # finishes, which is the "it never registers as done" fix.
+        cmds = _tool_command_signature(responses_reply)
+        if cmds and cmds == self._last_tool_commands:
+            logger.info(f"[relay #{relay_num}] Repeated tool call {cmds} — ending turn (loop guard)")
+            print("[STATUS] Command already ran — finishing up…", flush=True)
+            responses_reply = _make_responses_text_reply(
+                f"resp_{uuid.uuid4().hex[:16]}", "Done — the file was created and opened."
+            )
+            cmds = None
+        self._last_tool_commands = cmds
         self._last_proxy_response = responses_reply
         _surface_relay_reasoning(response, relay_num)
 
@@ -1782,6 +1798,22 @@ def _is_done_reply(content: object) -> bool:
     if not isinstance(content, str):
         return False
     return bool(_DONE_RE.search(content)) and not bool(_FILE_WRITE_RE.search(content))
+
+
+def _tool_command_signature(reply: object):
+    """Signature of the tool calls in a Responses-API reply, for loop detection.
+
+    Returns a tuple of (name, arguments) pairs, or None when the reply has no
+    function calls (a plain text/final answer). Two relays with the same
+    non-None signature mean the model re-issued the identical command.
+    """
+    if not isinstance(reply, dict):
+        return None
+    sig = []
+    for item in reply.get("output") or []:
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            sig.append((item.get("name"), item.get("arguments")))
+    return tuple(sig) if sig else None
 
 
 def _provider_response_to_responses_api(

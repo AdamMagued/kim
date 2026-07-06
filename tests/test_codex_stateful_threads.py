@@ -930,6 +930,98 @@ class TestFileDirectiveSalvage(unittest.TestCase):
         self.assertIn(body, cmd)
 
 
+class TestToolCommandSignature(unittest.TestCase):
+    def test_signature_extracts_function_calls(self):
+        from codex_engine.engine import (
+            _provider_response_to_responses_api,
+            _tool_command_signature,
+        )
+
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": json.dumps(
+                {"text": "", "tool_calls": [{"name": "exec", "input": {"cmd": "open x.html"}}]}
+            )},
+            relay_num=1,
+            request_tools=_CODEX_TOOLS,
+        )
+        sig = _tool_command_signature(reply)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig[0][0], "exec_command")
+
+    def test_text_only_reply_has_no_signature(self):
+        from codex_engine.engine import (
+            _provider_response_to_responses_api,
+            _tool_command_signature,
+        )
+
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": json.dumps({"text": "just talking"})}, relay_num=1
+        )
+        self.assertIsNone(_tool_command_signature(reply))
+
+
+class TestRepeatedCommandLoopGuard(unittest.IsolatedAsyncioTestCase):
+    """The model re-sends `open game.html` every turn (an empty tool result
+    gives it no signal to stop); codex keeps relaying and the task never
+    registers as done. A repeated identical command must end the turn."""
+
+    @staticmethod
+    def _request(proxy, n_items):
+        # Codex appends a tool result each relay, so the input grows — that
+        # non-empty delta is what drives a fresh browser call (not the
+        # empty-delta cache path).
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        items = [{"role": "user", "content": "make a game"}]
+        for i in range(n_items - 1):
+            items.append({"type": "function_call_output", "output": f"result {i}"})
+        body = {
+            "stream": False,
+            "instructions": "codex",
+            "tools": _CODEX_TOOLS,
+            "input": items,
+        }
+        return SimpleNamespace(
+            headers={"Authorization": f"Bearer {proxy._bearer_token}"},
+            json=AsyncMock(return_value=body),
+        )
+
+    async def test_second_identical_command_ends_the_turn(self):
+        from codex_engine.engine import _CodexProxy, _tool_command_signature
+
+        cmd_reply = {"type": "text", "content": "```bash\nopen game.html\n```"}
+        provider = _RecordingProvider([cmd_reply])  # loops on the same reply
+        proxy = _CodexProxy(
+            provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
+        )
+
+        import json as _json
+        first = _json.loads((await proxy._handle_responses(self._request(proxy, 1))).text)
+        second = _json.loads((await proxy._handle_responses(self._request(proxy, 2))).text)
+        # First relay runs the command; second (identical) ends with a text
+        # answer and NO function call, so codex finishes.
+        self.assertIsNotNone(_tool_command_signature(first))
+        self.assertIsNone(_tool_command_signature(second))
+
+    async def test_distinct_commands_are_not_suppressed(self):
+        from codex_engine.engine import _CodexProxy, _tool_command_signature
+
+        provider = _RecordingProvider([
+            {"type": "text", "content": "```bash\nprintf '%s' 'x' > game.html\n```"},
+            {"type": "text", "content": "```bash\nopen game.html\n```"},
+        ])
+        proxy = _CodexProxy(
+            provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
+        )
+        import json as _json
+        first = _json.loads((await proxy._handle_responses(self._request(proxy, 1))).text)
+        second = _json.loads((await proxy._handle_responses(self._request(proxy, 2))).text)
+        # Two different commands both execute — the guard only trips on repeats.
+        self.assertIsNotNone(_tool_command_signature(first))
+        self.assertIsNotNone(_tool_command_signature(second))
+
+
 class TestDoneReply(unittest.TestCase):
     """A DONE signal ends the turn cleanly instead of salvaging trailing
     'you could also…' chatter into another relay (the browser-chat hang)."""
