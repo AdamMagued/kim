@@ -15,6 +15,52 @@ from orchestrator.providers.browser.site_configs import SITE_CONFIGS, _BRIDGE_TI
 
 logger = logging.getLogger(__name__)
 
+# Structural honesty note appended when the bridge reports that NO attachment
+# actually reached the provider even though we sent an image (7.2/7.3): the
+# site model was then answering "describe what you see" WITHOUT the image, so
+# the reply must not be presented as if it had vision.
+_IMAGE_NOT_DELIVERED_NOTE = (
+    "\n\n[Kim note: the screenshot could NOT be attached to the browser "
+    "provider — the reply above was produced WITHOUT seeing the image and "
+    "may describe the screen inaccurately.]"
+)
+
+
+def _apply_attachment_signal(result: dict, data: dict, sent_attachments: list[dict]) -> dict:
+    """Gate the "image attached" claim on the bridge's REAL upload signal.
+
+    bridge.js returns ``attachments_uploaded`` in its done payload. When the
+    field is present (newer desktop builds; requires the Rust /v1/result
+    handler to forward it — see results.rs) and it says 0 attachments landed
+    while we sent an image, append a structural disclaimer to text replies so
+    the confabulation risk is visible instead of silent. The raw count is
+    also attached to the result dict for agent-side gating.
+
+    When the field is absent (older bridge), behavior is unchanged.
+    """
+    uploaded = data.get("attachments_uploaded")
+    if uploaded is None:
+        return result
+    try:
+        uploaded_n = int(uploaded)
+    except (TypeError, ValueError):
+        return result
+
+    result["attachments_uploaded"] = uploaded_n
+    images_sent = sum(
+        1 for a in sent_attachments
+        if str(a.get("mime_type", "")).startswith("image/")
+    )
+    if images_sent and uploaded_n == 0 and result.get("type") == "text":
+        content = str(result.get("content") or "")
+        result["content"] = content + _IMAGE_NOT_DELIVERED_NOTE
+        logger.warning(
+            "Bridge reported attachments_uploaded=0 for %d image(s) — "
+            "appended not-delivered disclaimer to the reply.",
+            images_sent,
+        )
+    return result
+
 
 async def complete_via_webview_bridge(
     *,
@@ -220,9 +266,10 @@ async def complete_via_webview_bridge(
             "content": "NEED_HELP: In-app browser bridge returned an empty response.",
         }
 
-    return parse_response(
+    result = parse_response(
         raw_response.strip(), completion_hash, known_tools=known_tools
     )
+    return _apply_attachment_signal(result, data, bridge_attachments)
 
 
 async def _complete_via_webview_bridge_legacy(
@@ -296,6 +343,9 @@ async def _complete_via_webview_bridge_legacy(
             "content": "NEED_HELP: In-app browser bridge returned an empty response.",
         }
 
-    return parse_response(
+    result = parse_response(
         raw_response.strip(), completion_hash, known_tools=known_tools
+    )
+    return _apply_attachment_signal(
+        result, data, list(payload.get("attachments") or [])
     )
