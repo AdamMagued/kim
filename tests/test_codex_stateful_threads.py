@@ -620,6 +620,94 @@ class TestRenderCodexTools(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Tool-name normalization — browser models shorten/alias tool names ("exec"
+# for exec_command); codex rejects unknown tools, so the proxy snaps them
+# onto the real names from the request
+# ---------------------------------------------------------------------------
+
+_CODEX_TOOLS = [
+    {
+        "type": "function",
+        "name": "exec_command",
+        "description": "Runs a command in a PTY.",
+        "parameters": {
+            "type": "object",
+            "properties": {"cmd": {"type": "string"}, "workdir": {"type": "string"}},
+            "required": ["cmd"],
+        },
+    },
+    {"type": "function", "name": "update_plan", "parameters": {"required": ["plan"]}},
+    {"type": "web_search"},
+]
+
+
+class TestNormalizeToolCalls(unittest.TestCase):
+    def test_exec_prefix_snaps_to_exec_command(self):
+        from codex_engine.engine import _normalize_tool_calls
+
+        out = _normalize_tool_calls(
+            [{"name": "exec", "input": {"cmd": "open pong.html"}}], _CODEX_TOOLS
+        )
+        self.assertEqual(out[0]["name"], "exec_command")
+        self.assertEqual(out[0]["input"], {"cmd": "open pong.html"})
+
+    def test_shell_alias_snaps_to_exec_command(self):
+        from codex_engine.engine import _normalize_tool_calls
+
+        for alias in ("shell", "bash", "run_command", "terminal"):
+            out = _normalize_tool_calls([{"name": alias, "input": {"cmd": "ls"}}], _CODEX_TOOLS)
+            self.assertEqual(out[0]["name"], "exec_command", alias)
+
+    def test_command_argv_list_coerced_to_cmd_string(self):
+        from codex_engine.engine import _normalize_tool_calls
+
+        out = _normalize_tool_calls(
+            [{"name": "shell", "input": {"command": ["echo", "hello world"]}}], _CODEX_TOOLS
+        )
+        self.assertEqual(out[0]["name"], "exec_command")
+        self.assertEqual(out[0]["input"], {"cmd": "echo 'hello world'"})
+
+    def test_valid_names_and_inputs_untouched(self):
+        from codex_engine.engine import _normalize_tool_calls
+
+        calls = [{"name": "exec_command", "input": {"cmd": "ls"}},
+                 {"name": "update_plan", "input": {"plan": []}}]
+        out = _normalize_tool_calls(calls, _CODEX_TOOLS)
+        self.assertEqual(out, calls)
+
+    def test_unknown_name_without_match_passes_through(self):
+        from codex_engine.engine import _normalize_tool_calls
+
+        out = _normalize_tool_calls([{"name": "teleport", "input": {}}], _CODEX_TOOLS)
+        self.assertEqual(out[0]["name"], "teleport")
+
+    def test_no_request_tools_is_a_no_op(self):
+        from codex_engine.engine import _normalize_tool_calls
+
+        calls = [{"name": "exec", "input": {"cmd": "ls"}}]
+        self.assertEqual(_normalize_tool_calls(calls, None), calls)
+        self.assertEqual(_normalize_tool_calls(calls, []), calls)
+
+    def test_converter_applies_normalization_end_to_end(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        reply = _provider_response_to_responses_api(
+            {
+                "type": "text",
+                "content": json.dumps({
+                    "text": "creating file",
+                    "tool_calls": [{"name": "exec", "input": {"cmd": "touch pong.html"}}],
+                }),
+            },
+            relay_num=1,
+            request_tools=_CODEX_TOOLS,
+        )
+        call = next(o for o in reply["output"] if o["type"] == "function_call")
+        self.assertEqual(call["name"], "exec_command")
+        self.assertIn("touch pong.html", call["arguments"])
+
+
+# ---------------------------------------------------------------------------
 # Contract nudge — a prose reply ("I'll create the files…") must get ONE
 # format re-ask instead of being handed to codex as a final answer
 # ---------------------------------------------------------------------------

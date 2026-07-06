@@ -49,6 +49,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import shutil
 import tempfile
 import uuid
@@ -723,7 +724,9 @@ class _CodexProxy:
             response=response,
         )
 
-        responses_reply = _provider_response_to_responses_api(response, relay_num)
+        responses_reply = _provider_response_to_responses_api(
+            response, relay_num, request_tools=body.get("tools")
+        )
         self._last_proxy_response = responses_reply
         _surface_relay_reasoning(response, relay_num)
 
@@ -1184,6 +1187,75 @@ def _render_codex_tools(tools: object) -> str:
     return "[AVAILABLE CODEX TOOLS]\n" + "\n".join(rendered) + "\n"
 
 
+_EXEC_ALIASES = {
+    "exec", "shell", "bash", "sh", "zsh", "run", "execute", "terminal",
+    "cmd", "command", "run_command", "run_shell_command", "execute_command",
+}
+
+
+def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
+    """Snap model-invented tool names onto the real tools from the request.
+
+    Browser models routinely shorten or alias tool names ("exec" for
+    "exec_command", "shell" for the exec tool) — codex then rejects the call
+    as an unknown tool and the whole task stalls. The proxy knows the real
+    tool list from the request body, so repair what is unambiguous. Also
+    coerces a "command" argument (string or argv list) into the "cmd" string
+    the codex exec tool requires.
+    """
+    by_name: dict = {}
+    if isinstance(request_tools, list):
+        for tool in request_tools:
+            if not isinstance(tool, dict):
+                continue
+            fn_raw = tool.get("function")
+            fn = fn_raw if isinstance(fn_raw, dict) else {}
+            name = tool.get("name") or fn.get("name")
+            if name:
+                by_name[str(name)] = tool
+    if not by_name:
+        return tool_calls
+
+    exec_tool = next(
+        (n for n in by_name if "exec" in n.lower() or "shell" in n.lower() or "command" in n.lower()),
+        None,
+    )
+
+    normalized = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            normalized.append(tc)
+            continue
+        name = str(tc.get("name") or "")
+        if name and name not in by_name:
+            fixed = None
+            low = name.lower()
+            if len(low) >= 3:
+                fixed = next(
+                    (n for n in by_name if n.lower().startswith(low) or low.startswith(n.lower())),
+                    None,
+                )
+            if fixed is None and low in _EXEC_ALIASES:
+                fixed = exec_tool
+            if fixed:
+                logger.info(f"Normalized tool name {name!r} -> {fixed!r}")
+                tc = {**tc, "name": fixed}
+        # Coerce command->cmd for the exec tool (argv lists become one string).
+        target = by_name.get(str(tc.get("name") or ""))
+        if target is not None:
+            required = ((target.get("parameters") or {}).get("required")) or []
+            inp = tc.get("input")
+            if "cmd" in required and isinstance(inp, dict) and "cmd" not in inp and "command" in inp:
+                cmd_val = inp["command"]
+                if isinstance(cmd_val, list):
+                    cmd_val = shlex.join(str(part) for part in cmd_val)
+                new_inp = {k: v for k, v in inp.items() if k != "command"}
+                new_inp["cmd"] = str(cmd_val)
+                tc = {**tc, "input": new_inp}
+        normalized.append(tc)
+    return normalized
+
+
 def _extract_prompt_from_responses_request(body: dict) -> str:
     """Extract a human-readable prompt from a Codex Responses API request."""
     parts = []
@@ -1389,7 +1461,9 @@ def _codex_browser_system_prompt() -> str:
     )
 
 
-def _provider_response_to_responses_api(response: dict, relay_num: int) -> dict:
+def _provider_response_to_responses_api(
+    response: dict, relay_num: int, request_tools: object = None
+) -> dict:
     """Convert a BrowserProvider response to OpenAI Responses API format."""
     resp_id = f"resp_{uuid.uuid4().hex[:16]}"
 
@@ -1403,6 +1477,7 @@ def _provider_response_to_responses_api(response: dict, relay_num: int) -> dict:
             text = parsed.get("text", "")
             tool_calls = parsed.get("tool_calls", [])
             if tool_calls:
+                tool_calls = _normalize_tool_calls(tool_calls, request_tools)
                 return _make_responses_tool_reply(resp_id, text, tool_calls)
             return _make_responses_text_reply(resp_id, text or content)
 
