@@ -217,7 +217,10 @@ pub async fn stream_agentic_request(
     .env("KIM_TAURI_MODE", "1")
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
-    .stderr(Stdio::null())
+    // F10: stderr was Stdio::null() — a child that died on startup (missing
+    // venv dep, import error) produced only "Kim: (no response)". Pipe it and
+    // drain concurrently (bounded tail) so crashes are diagnosable.
+    .stderr(Stdio::piped())
     .kill_on_drop(true);
     if let Some(id) = resume_session_id {
         cmd.arg("--resume").arg(id);
@@ -238,15 +241,29 @@ pub async fn stream_agentic_request(
         }
     };
     let mut child_stdin = child.stdin.take();
+    // F10: bounded concurrent stderr drain (shared helper, see provider.rs).
+    let stderr_tail = child.stderr.take().map(crate::provider::drain_stderr_tail);
     let mut lines = BufReader::new(stdout).lines();
     let mut saw_done = false;
+    let mut had_output = false;
+    // F9: a stdout read error must surface instead of masquerading as EOF.
+    let mut read_err: Option<String> = None;
     // The final answer is emitted as `[SUCCESS]/[FAILED] <text>` and is the LAST
     // output; a multi-line answer spills onto following lines that match no marker.
     // Buffer from the first answer line to EOF so multi-line answers aren't truncated
     // to their first line.
     let mut answer_buf: Option<String> = None;
 
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) => {
+                read_err = Some(e.to_string());
+                break;
+            }
+        };
+        had_output = true;
         if let Some(buf) = answer_buf.as_mut() {
             buf.push('\n');
             buf.push_str(line.trim_end_matches(['\r', '\n']));
@@ -305,34 +322,58 @@ pub async fn stream_agentic_request(
             let _ = tx.send(AppEvent::TextChunk(render_markdown(trimmed)));
         }
     }
+    // On a read error, close our end of the stdout pipe before wait() so a
+    // still-writing child can't block forever on a full pipe. (F9)
+    drop(lines);
     // Process exited (stdout EOF). End the turn. used_bridge=false: this is the local
     // Python agent, not the desktop HTTP bridge (so we don't print "via Kim desktop").
-    let _ = child.wait().await;
+    let exit_ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
+    // F9/F10: surface failures instead of ending like a normal short answer.
+    if read_err.is_some() || !exit_ok || !had_output {
+        let tail = match stderr_tail {
+            Some(handle) => handle.await.unwrap_or_default(),
+            None => String::new(),
+        };
+        if let Some(e) = read_err {
+            let extra = if tail.is_empty() {
+                String::new()
+            } else {
+                format!("\n{tail}")
+            };
+            let _ = tx.send(AppEvent::Err(format!(
+                "Kim agent output read error: {e}{extra}"
+            )));
+            return;
+        }
+        if (!exit_ok || !had_output) && !tail.is_empty() {
+            let _ = tx.send(AppEvent::Err(format!("Kim agent: {tail}")));
+            return;
+        }
+    }
     let _ = tx.send(AppEvent::Done(false));
 }
 
-/// Blocking-ish terminal y/N approval prompt (off the async runtime).
+/// Terminal y/N approval prompt. Reads through the process-wide owned stdin
+/// reader (F6/T1): a Ctrl-C mid-prompt no longer leaks a blocked reader thread
+/// whose late line could be applied to the next prompt or swallow REPL input.
 async fn prompt_hitl(tool: &str, risk: &str, reason: &str, preview: &str) -> bool {
-    let tool = tool.to_string();
-    let risk = risk.to_string();
-    let reason = reason.to_string();
-    let preview = preview.to_string();
-    tokio::task::spawn_blocking(move || {
-        use std::io::{self, Write};
-        eprintln!("\n\x1b[33mApproval required\x1b[0m: {tool} (risk: {risk}; {reason})");
-        if !preview.is_empty() {
-            eprintln!("\x1b[2m{preview}\x1b[0m");
-        }
-        eprint!("Allow this action? [y/N] ");
-        let _ = io::stderr().flush();
-        let mut buf = String::new();
-        if io::stdin().read_line(&mut buf).is_err() {
-            return false;
-        }
-        matches!(buf.trim().to_lowercase().as_str(), "y" | "yes")
-    })
-    .await
-    .unwrap_or(false)
+    use std::io::{IsTerminal, Write};
+    eprintln!("\n\x1b[33mApproval required\x1b[0m: {tool} (risk: {risk}; {reason})");
+    if !preview.is_empty() {
+        eprintln!("\x1b[2m{preview}\x1b[0m");
+    }
+    // F5: when stdin is not a terminal, the queued lines are prompts, not
+    // approval answers — never consume one; deny by default.
+    if !std::io::stdin().is_terminal() {
+        eprintln!("Allow this action? [y/N] n  (stdin is not a terminal — auto-denied)");
+        return false;
+    }
+    eprint!("Allow this action? [y/N] ");
+    let _ = std::io::stderr().flush();
+    match crate::stdin_reader::read_stdin_line().await {
+        Some(line) => matches!(line.trim().to_lowercase().as_str(), "y" | "yes"),
+        None => false,
+    }
 }
 
 #[cfg(test)]

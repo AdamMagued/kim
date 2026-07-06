@@ -378,10 +378,10 @@ async fn doctor(config: &KimConfig) -> CommandOutcome {
         ),
         format!("Source root: {}", source_root_status()),
         format!("Bridge token: {}", crate::provider::bridge_token_source()),
-        format!(
-            "python3: {}",
-            command_status("python3", &["--version"]).await
-        ),
+        // F12: report the interpreter the CLI actually runs (find_python:
+        // repo venv first, then system), not a bare PATH probe of `python3` —
+        // the two could disagree in both directions.
+        format!("python: {}", python_status().await),
         format!("codex: {}", command_status("codex", &["--version"]).await),
         format!("git: {}", command_status("git", &["--version"]).await),
         format!("cargo: {}", command_status("cargo", &["--version"]).await),
@@ -881,6 +881,24 @@ fn format_source_root(found: Option<&std::path::Path>) -> String {
     }
 }
 
+/// F12: doctor's python line must reflect what chat/code mode actually run —
+/// `find_python` (repo venv first, then python3/python) — not a PATH probe.
+async fn python_status() -> String {
+    let root =
+        crate::sessions::find_kim_repo_root().unwrap_or_else(|| std::path::PathBuf::from("."));
+    match crate::agentic::find_python(&root) {
+        Some(python) => {
+            let shown = python.display().to_string();
+            format!(
+                "{} — {}",
+                shown,
+                command_status(&shown, &["--version"]).await
+            )
+        }
+        None => "not found (tried repo venv, python3, python)".to_string(),
+    }
+}
+
 async fn command_status(program: &str, args: &[&str]) -> String {
     match Command::new(program).args(args).output().await {
         Ok(output) if output.status.success() => {
@@ -974,10 +992,11 @@ async fn validate_api_key(provider: &str, key: &str) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?
             .status(),
+        // F15: pass the key in a header, not the URL query string — URLs leak
+        // into proxy logs and reqwest error messages include the full URL.
         "gemini" => client
-            .get(format!(
-                "https://generativelanguage.googleapis.com/v1beta/models?key={key}"
-            ))
+            .get("https://generativelanguage.googleapis.com/v1beta/models")
+            .header("x-goog-api-key", key)
             .send()
             .await
             .map_err(|e| e.to_string())?
@@ -1035,14 +1054,41 @@ async fn run_project_command(program: &str, args: &str) -> CommandOutcome {
     shell(program, &split, &format!("{program} {args}")).await
 }
 
+/// F18: hard deadline for slash-command subprocesses (`/run`, `/git`,
+/// `/search`, `/files`). Without one, `/run sleep 10000` wedged the REPL and
+/// Ctrl-C killed the whole CLI.
+const SLASH_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run a slash-command subprocess with a timeout; `kill_on_drop` reaps the
+/// child when the deadline fires. Timeouts surface as an `io::Error` so
+/// callers' `ErrorKind::NotFound` fallbacks keep working unchanged.
+async fn output_with_timeout(mut cmd: Command) -> Result<std::process::Output, std::io::Error> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(SLASH_CMD_TIMEOUT, cmd.output()).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "timed out after {}s (process killed)",
+                SLASH_CMD_TIMEOUT.as_secs()
+            ),
+        )),
+    }
+}
+
 async fn run_shell(args: &str) -> CommandOutcome {
     if args.trim().is_empty() {
         return CommandOutcome::Message("Usage: /run <command>".to_string());
     }
     #[cfg(windows)]
-    let output = Command::new("cmd").args(["/C", args]).output().await;
+    let mut cmd = Command::new("cmd");
+    #[cfg(windows)]
+    cmd.args(["/C", args]);
     #[cfg(not(windows))]
-    let output = Command::new("sh").args(["-lc", args]).output().await;
+    let mut cmd = Command::new("sh");
+    #[cfg(not(windows))]
+    cmd.args(["-lc", args]);
+    let output = output_with_timeout(cmd).await;
     format_output(args, output)
 }
 
@@ -1050,21 +1096,19 @@ async fn search(args: &str) -> CommandOutcome {
     if args.trim().is_empty() {
         return CommandOutcome::Message("Usage: /search <query>".to_string());
     }
-    let output = Command::new("rg")
-        .args(["--line-number", "--hidden", args])
-        .output()
-        .await;
+    let mut cmd = Command::new("rg");
+    cmd.args(["--line-number", "--hidden", args]);
+    let output = output_with_timeout(cmd).await;
     match &output {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             #[cfg(windows)]
             {
-                let output = Command::new("cmd")
-                    .args([
-                        "/C",
-                        &format!("findstr /r /s /n /p \"{}\" *", args.replace('"', "")),
-                    ])
-                    .output()
-                    .await;
+                let mut cmd = Command::new("cmd");
+                cmd.args([
+                    "/C",
+                    &format!("findstr /r /s /n /p \"{}\" *", args.replace('"', "")),
+                ]);
+                let output = output_with_timeout(cmd).await;
                 return format_output(&format!("findstr {args}"), output);
             }
             #[cfg(not(windows))]
@@ -1079,15 +1123,16 @@ async fn search(args: &str) -> CommandOutcome {
 
 async fn files(args: &str) -> CommandOutcome {
     let path = if args.trim().is_empty() { "." } else { args };
-    let output = Command::new("rg").args(["--files", path]).output().await;
+    let mut cmd = Command::new("rg");
+    cmd.args(["--files", path]);
+    let output = output_with_timeout(cmd).await;
     match &output {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             #[cfg(windows)]
             {
-                let output = Command::new("cmd")
-                    .args(["/C", &format!("dir /s /b \"{}\"", path.replace('"', ""))])
-                    .output()
-                    .await;
+                let mut cmd = Command::new("cmd");
+                cmd.args(["/C", &format!("dir /s /b \"{}\"", path.replace('"', ""))]);
+                let output = output_with_timeout(cmd).await;
                 return format_output(&format!("dir {path}"), output);
             }
             #[cfg(not(windows))]
@@ -1120,9 +1165,15 @@ fn init_project() -> CommandOutcome {
 }
 
 async fn shell(program: &str, args: &[&str], label: &str) -> CommandOutcome {
-    let output = Command::new(program).args(args).output().await;
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    let output = output_with_timeout(cmd).await;
     format_output(label, output)
 }
+
+/// F18: cap the rendered subprocess output so a huge `rg` result doesn't get
+/// buffered/printed in full (chars, not bytes — truncate is char-safe).
+const MAX_OUTPUT_CHARS: usize = 200_000;
 
 fn format_output(
     label: &str,
@@ -1142,6 +1193,11 @@ fn format_output(
             }
             if text.trim().is_empty() {
                 text = format!("`{label}` completed with no output.");
+            } else if text.chars().nth(MAX_OUTPUT_CHARS).is_some() {
+                text = format!(
+                    "{}\n… (output truncated at {MAX_OUTPUT_CHARS} characters)",
+                    crate::sessions::truncate(&text, MAX_OUTPUT_CHARS)
+                );
             }
             CommandOutcome::Message(text)
         }

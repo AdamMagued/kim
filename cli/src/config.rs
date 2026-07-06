@@ -121,13 +121,11 @@ fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
                 format!("could not create temp config {}: {e}", tmp_path.display()),
             )
         })?;
-        file.write_all(content.as_bytes()).map_err(|e| {
+        file.write_all(content.as_bytes()).inspect_err(|_e| {
             let _ = fs::remove_file(&tmp_path);
-            e
         })?;
-        file.sync_all().map_err(|e| {
+        file.sync_all().inspect_err(|_e| {
             let _ = fs::remove_file(&tmp_path);
-            e
         })?;
     } // file closed before rename
 
@@ -138,6 +136,23 @@ fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
             format!("could not commit config to {}: {e}", path.display()),
         )
     })
+}
+
+pub fn config_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        Some(
+            std::env::temp_dir()
+                .join(format!("kim-cli-test-{}", std::process::id()))
+                .join(CONFIG_DIR_NAME)
+                .join(CONFIG_FILE_NAME),
+        )
+    }
+
+    #[cfg(not(test))]
+    {
+        dirs::home_dir().map(|home| home.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
+    }
 }
 
 #[cfg(test)]
@@ -212,12 +227,7 @@ mod tests {
         let tmp_count = fs::read_dir(dir)
             .expect("read dir")
             .flatten()
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .map_or(false, |x| x == "tmp")
-            })
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"))
             .count();
         let _ = fs::remove_dir_all(dir);
         assert_eq!(
@@ -266,22 +276,5 @@ mod tests {
         let loaded = KimConfig::load_from(&path);
         let _ = fs::remove_dir_all(path.parent().unwrap());
         assert_eq!(loaded, KimConfig::default());
-    }
-}
-
-pub fn config_path() -> Option<PathBuf> {
-    #[cfg(test)]
-    {
-        Some(
-            std::env::temp_dir()
-                .join(format!("kim-cli-test-{}", std::process::id()))
-                .join(CONFIG_DIR_NAME)
-                .join(CONFIG_FILE_NAME),
-        )
-    }
-
-    #[cfg(not(test))]
-    {
-        dirs::home_dir().map(|home| home.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
     }
 }

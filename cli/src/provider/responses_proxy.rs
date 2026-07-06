@@ -78,7 +78,17 @@ pub(crate) async fn start_responses_proxy(
         }
     };
 
-    let stdout = child.stdout.take()?;
+    // F11: `.take()?` returned None silently, ending the turn with no
+    // diagnostic; every other failure path here sends an Err event.
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = tx.send(AppEvent::Err(
+                "Failed to capture responses proxy stdout.".to_string(),
+            ));
+            return None;
+        }
+    };
     let mut lines = BufReader::new(stdout).lines();
     let port_line =
         match tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line()).await {
@@ -113,6 +123,15 @@ pub(crate) fn write_codex_config(
     model: &str,
     codex_home: &std::path::Path,
 ) -> Result<(), String> {
+    // F19: the model name is interpolated into TOML unescaped — a quote,
+    // backslash, or newline (typo/paste) produced invalid TOML and a confusing
+    // codex parse error. Reject up front with an actionable message.
+    if model.chars().any(|c| matches!(c, '"' | '\\' | '\n' | '\r')) {
+        return Err(format!(
+            "model name {model:?} contains characters that are not valid here \
+             (quotes, backslashes, or newlines). Fix it with /model."
+        ));
+    }
     std::fs::create_dir_all(codex_home)
         .map_err(|e| format!("Cannot create kim codex home {}: {e}", codex_home.display()))?;
     let config_path = codex_home.join("config.toml");
@@ -132,4 +151,34 @@ pub(crate) fn write_codex_config(
             config_path.display()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_codex_config;
+
+    // ── F19: model names that would break the generated TOML are rejected ───
+
+    #[test]
+    fn write_codex_config_rejects_toml_breaking_model_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for bad in ["lla\"ma", "back\\slash", "line\nbreak", "cr\rmodel"] {
+            let err = write_codex_config(12345, bad, dir.path())
+                .expect_err("TOML-breaking model name must be rejected");
+            assert!(
+                err.contains("model name"),
+                "error should mention the model name, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_codex_config_accepts_normal_model_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_codex_config(12345, "qwen2.5-coder:7b", dir.path()).expect("valid name must pass");
+        let content =
+            std::fs::read_to_string(dir.path().join("config.toml")).expect("config written");
+        assert!(content.contains("model = \"qwen2.5-coder:7b\""));
+        assert!(content.contains("base_url = \"http://127.0.0.1:12345/v1\""));
+    }
 }

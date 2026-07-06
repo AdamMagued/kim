@@ -18,6 +18,48 @@ use super::{
 /// Formerly hardcoded inline as the slightly-wrong magic number 8096.
 const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 
+/// F2/F16: byte-level SSE line assembler. Network chunks split multi-byte
+/// UTF-8 sequences at arbitrary offsets; decoding each chunk independently
+/// (the old `String::from_utf8_lossy` per chunk) corrupted any CJK/emoji/dash
+/// character straddling a boundary into `��` — and that corruption was
+/// persisted into the session file. Buffer raw bytes, split on `\n` at the
+/// byte level, and decode only complete lines. `drain` also removes the old
+/// full-buffer reallocation per line (F16).
+struct SseLineBuffer {
+    buf: Vec<u8>,
+}
+
+impl SseLineBuffer {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Feed one network chunk; invokes `on_line` for each complete
+    /// (trimmed) line.
+    fn push_chunk(&mut self, bytes: &[u8], mut on_line: impl FnMut(&str)) {
+        self.buf.extend_from_slice(bytes);
+        let mut start = 0usize;
+        while let Some(rel) = self.buf[start..].iter().position(|&b| b == b'\n') {
+            let end = start + rel;
+            let line = String::from_utf8_lossy(&self.buf[start..end]);
+            on_line(line.trim());
+            start = end + 1;
+        }
+        if start > 0 {
+            self.buf.drain(..start);
+        }
+    }
+
+    /// Flush any trailing line left after the stream ends.
+    fn finish(self, mut on_line: impl FnMut(&str)) {
+        let line = String::from_utf8_lossy(&self.buf);
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            on_line(trimmed);
+        }
+    }
+}
+
 pub(crate) async fn stream_openai_compatible(
     config: &KimConfig,
     messages: &[ChatMessage],
@@ -92,7 +134,7 @@ pub(crate) async fn stream_openai_compatible(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut line_buf = String::new();
+    let mut line_buf = SseLineBuffer::new();
     let mut parser = ThinkParser::new();
 
     while let Some(chunk) = stream.next().await {
@@ -103,21 +145,13 @@ pub(crate) async fn stream_openai_compatible(
             }
             Ok(b) => b,
         };
-        line_buf.push_str(&String::from_utf8_lossy(&bytes));
-        loop {
-            match line_buf.find('\n') {
-                None => break,
-                Some(pos) => {
-                    let line = line_buf[..pos].trim().to_string();
-                    line_buf = line_buf[pos + 1..].to_string();
-                    process_openai_sse_line(&line, &mut parser, &tx);
-                }
-            }
-        }
+        line_buf.push_chunk(&bytes, |line| {
+            process_openai_sse_line(line, &mut parser, &tx);
+        });
     }
-    if !line_buf.trim().is_empty() {
-        process_openai_sse_line(line_buf.trim(), &mut parser, &tx);
-    }
+    line_buf.finish(|line| {
+        process_openai_sse_line(line, &mut parser, &tx);
+    });
     parser.flush(&tx);
     let _ = tx.send(AppEvent::Done(false));
 }
@@ -183,7 +217,7 @@ pub(crate) async fn stream_anthropic(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut line_buf = String::new();
+    let mut line_buf = SseLineBuffer::new();
     let mut parser = ThinkParser::new();
 
     while let Some(chunk) = stream.next().await {
@@ -194,21 +228,13 @@ pub(crate) async fn stream_anthropic(
             }
             Ok(b) => b,
         };
-        line_buf.push_str(&String::from_utf8_lossy(&bytes));
-        loop {
-            match line_buf.find('\n') {
-                None => break,
-                Some(pos) => {
-                    let line = line_buf[..pos].trim().to_string();
-                    line_buf = line_buf[pos + 1..].to_string();
-                    process_anthropic_sse_line(&line, &mut parser, &tx);
-                }
-            }
-        }
+        line_buf.push_chunk(&bytes, |line| {
+            process_anthropic_sse_line(line, &mut parser, &tx);
+        });
     }
-    if !line_buf.trim().is_empty() {
-        process_anthropic_sse_line(line_buf.trim(), &mut parser, &tx);
-    }
+    line_buf.finish(|line| {
+        process_anthropic_sse_line(line, &mut parser, &tx);
+    });
     parser.flush(&tx);
     let _ = tx.send(AppEvent::Done(false));
 }
@@ -216,6 +242,48 @@ pub(crate) async fn stream_anthropic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── SseLineBuffer (F2): UTF-8 chars split across chunks must survive ────
+
+    fn collect_lines(chunks: &[&[u8]]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut buf = SseLineBuffer::new();
+        for chunk in chunks {
+            buf.push_chunk(chunk, |line| out.push(line.to_string()));
+        }
+        buf.finish(|line| out.push(line.to_string()));
+        out
+    }
+
+    #[test]
+    fn sse_line_buffer_survives_utf8_split_across_chunks() {
+        // "data: é—🦀\n" split in the middle of each multi-byte sequence.
+        let full = "data: é—🦀\n".as_bytes();
+        for split in 1..full.len() {
+            let lines = collect_lines(&[&full[..split], &full[split..]]);
+            assert_eq!(
+                lines,
+                vec!["data: é—🦀".to_string()],
+                "split at byte {split} corrupted the line"
+            );
+            assert!(
+                !lines[0].contains('\u{FFFD}'),
+                "split at byte {split} produced a replacement character"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_line_buffer_emits_multiple_lines_and_trailing_tail() {
+        let lines = collect_lines(&[b"a\nb\nc", b"d"]);
+        assert_eq!(lines, vec!["a", "b", "cd"]);
+    }
+
+    #[test]
+    fn sse_line_buffer_trims_and_skips_blank_tail() {
+        let lines = collect_lines(&[b"  data: x  \n", b"   "]);
+        assert_eq!(lines, vec!["data: x"]);
+    }
 
     // ── anthropic_max_tokens_constant (#24) ──────────────────────────────────
     // Regression guard: the constant must be the corrected 8192 value (not the

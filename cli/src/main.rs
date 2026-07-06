@@ -6,6 +6,7 @@ mod provider;
 mod repl_turn;
 use repl_turn::consume_turn_events;
 mod sessions;
+mod stdin_reader;
 
 use std::io::{self, stdout, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1074,6 +1075,18 @@ fn is_compact_control_task(task: &str) -> bool {
 /// Interactive y/N: confirm running Codex in a directory that is not a git repo.
 /// Returns true only on an explicit yes; a non-tty / EOF / read error is "no".
 fn confirm_run_outside_git_repo(cwd: &Path) -> bool {
+    // F5: when stdin is not a terminal (piped/one-shot), reading here would
+    // steal the next queued prompt line as the y/N answer (or hit EOF).
+    // Auto-decline instead of consuming input that isn't an answer.
+    if !io::stdin().is_terminal() {
+        eprintln!(
+            "⚠  {} is not a git repository and stdin is not a terminal — \
+             declining the code-mode run. Run from a git repo, `git init` first, \
+             or use an interactive terminal to confirm.",
+            cwd.display()
+        );
+        return false;
+    }
     print!(
         "⚠  {} is not a git repository.\n   \
          Codex can't track or undo its edits here. Run anyway? [y/N] ",
@@ -1104,6 +1117,16 @@ async fn stream_repl_turn(
                 println!(
                     "Cancelled. Codex needs a git repo — run Kim from inside one, \
                      or `git init` here first."
+                );
+                // F5: record the cancellation so one-shot mode exits non-zero.
+                // Previously nothing was pushed, `run_oneshot`'s last-message-is-
+                // Error check never fired, and scripts saw a bogus exit 0.
+                app.push(
+                    MessageRole::Error,
+                    format!(
+                        "Cancelled: {} is not a git repository; the code-mode run was declined.",
+                        cwd.display()
+                    ),
                 );
                 return Ok(false);
             }

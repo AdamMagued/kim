@@ -113,6 +113,10 @@ pub(crate) async fn stream_via_bridge(
             "{}/v1/task",
             config.desktop_bridge_url.trim_end_matches('/')
         ))
+        // F7: without a deadline a wedged desktop app (accepted TCP, hung
+        // webview) left the turn spinning forever on the heartbeat. Match the
+        // 300 s poll-path deadline.
+        .timeout(std::time::Duration::from_secs(300))
         .json(&json!({
             "task": prompt,
             "provider": config.provider,

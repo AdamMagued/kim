@@ -87,53 +87,6 @@ fn send_sigterm(pid: u32) {
     }
 }
 
-#[cfg(test)]
-mod approval_prompt_tests {
-    use super::*;
-
-    #[test]
-    fn approval_prompt_shows_command_cwd_reason_and_network_badge() {
-        let prompt = format_approval_prompt(
-            "npx playwright install",
-            "/home/u/proj",
-            "needs browsers",
-            "network",
-        );
-        assert!(prompt.contains("$ npx playwright install"));
-        assert!(prompt.contains("(in /home/u/proj)"));
-        assert!(prompt.contains("reason: needs browsers"));
-        assert!(prompt.contains("[network access]"));
-        assert!(prompt.contains("[y]es once / [a]lways this session / [n]o"));
-    }
-
-    #[test]
-    fn approval_prompt_file_change_shape() {
-        let prompt = format_approval_prompt("apply changes to: a.rs, b.rs", "", "", "files");
-        assert!(prompt.starts_with("Codex wants to apply changes to: a.rs, b.rs"));
-        assert!(!prompt.contains("$ "));
-    }
-
-    #[test]
-    fn approval_input_mapping_denies_by_default() {
-        assert_eq!(map_approval_input("y"), "accept");
-        assert_eq!(map_approval_input("YES\n"), "accept");
-        assert_eq!(map_approval_input("a"), "acceptForSession");
-        assert_eq!(map_approval_input("always"), "acceptForSession");
-        assert_eq!(map_approval_input("n"), "decline");
-        assert_eq!(map_approval_input(""), "decline");
-        assert_eq!(map_approval_input("whatever"), "decline");
-    }
-
-    #[test]
-    fn decision_line_is_the_part3_stdin_vocabulary() {
-        let line = build_decision_line("7", "acceptForSession");
-        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["type"], "approval_decision");
-        assert_eq!(v["id"], "7");
-        assert_eq!(v["decision"], "acceptForSession");
-    }
-}
-
 pub(crate) async fn consume_turn_events<S, C>(
     app: &mut App,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
@@ -154,6 +107,8 @@ where
     let mut bridge_used = false;
     let mut command_output_lines = 0usize;
     let mut command_output_capped = false;
+    // F13: last cumulative (input, output) token usage seen this turn.
+    let mut token_usage: Option<(u64, u64)> = None;
 
     // Loading indicator: while we wait for the first output (browser providers
     // can take many seconds to scrape a reply), animate a spinner in place.
@@ -277,17 +232,19 @@ where
                 }
                 print!("{}", format_approval_prompt(&command, &cwd, &reason, &risk));
                 stdout().flush()?;
-                // Between turns rustyline owns stdin; mid-turn (here) nothing
-                // else reads it — same mechanism as confirm_run_outside_git_repo.
-                let input = tokio::task::spawn_blocking(|| {
-                    let mut line = String::new();
-                    match io::stdin().read_line(&mut line) {
-                        Ok(_) => line,
-                        Err(_) => String::new(),
-                    }
-                })
-                .await
-                .unwrap_or_default();
+                // F5/F6: read via the single owned stdin reader (a leaked
+                // blocking read can no longer swallow later input, and a stale
+                // answer is discarded, never applied to the next prompt). When
+                // stdin is not a terminal, queued lines are prompts — deny
+                // instead of stealing one as the answer.
+                let input = if io::stdin().is_terminal() {
+                    crate::stdin_reader::read_stdin_line()
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    println!();
+                    String::new() // maps to "decline"
+                };
                 let decision = map_approval_input(&input);
                 if let Some(dtx) = decision_tx.as_ref() {
                     let _ = dtx.send(build_decision_line(&id, decision));
@@ -301,14 +258,20 @@ where
             }
             AppEvent::CommandOutput(chunk) => {
                 produced_output = true;
-                command_output_lines += chunk.lines().count().max(1);
-                if command_output_lines <= 40 {
-                    for line in chunk.lines() {
+                // F8: count per line so a chunk crossing the 40-line cap still
+                // shows its first lines. The old whole-chunk check hid a 50-line
+                // first chunk entirely.
+                for line in chunk.lines() {
+                    if command_output_lines < 40 {
+                        command_output_lines += 1;
                         println!("{}", paint_dim(&format!("  │ {line}")));
+                    } else {
+                        if !command_output_capped {
+                            command_output_capped = true;
+                            print_note("  │ … (further command output hidden)");
+                        }
+                        break;
                     }
-                } else if !command_output_capped {
-                    command_output_capped = true;
-                    print_note("  │ … (further command output hidden)");
                 }
             }
             AppEvent::PlanUpdate(steps) => {
@@ -342,8 +305,10 @@ where
                     print_note(&format!("diff: {files} file(s), +{added} −{removed}"));
                 }
             }
-            AppEvent::TokenUsage { .. } => {
-                // Tracked codex-side; too chatty to render per update.
+            AppEvent::TokenUsage { input, output } => {
+                // Cumulative codex-side usage; too chatty to render per update.
+                // Kept and shown once in the end-of-turn footer (F13).
+                token_usage = Some((input, output));
             }
             AppEvent::TurnPhase(phase) => {
                 if phase == "interrupted" {
@@ -357,6 +322,13 @@ where
             AppEvent::Err(error) => {
                 if printed_answer_label && !assistant.ends_with('\n') {
                     println!();
+                }
+                // F3: keep the already-streamed partial answer in history (the
+                // user saw it on screen); dropping it made resume/follow-ups
+                // lose everything before the mid-stream error. Mirrors the
+                // cancel path above.
+                if !assistant.trim().is_empty() {
+                    app.push(MessageRole::Assistant, std::mem::take(&mut assistant));
                 }
                 app.push(MessageRole::Error, error.clone());
                 print_message(&UiMessage {
@@ -389,10 +361,62 @@ where
     }
 
     let via = if bridge_used { " via Kim desktop" } else { "" };
+    // F13: render the (cumulative) token usage once, in the turn footer.
+    let tokens = token_usage
+        .map(|(input, output)| format!(" · tokens {input}↑ {output}↓"))
+        .unwrap_or_default();
     print_note(&format!(
-        "done in {}{}",
+        "done in {}{}{}",
         format_repl_elapsed(started.elapsed()),
-        via
+        via,
+        tokens
     ));
     Ok(false)
+}
+
+#[cfg(test)]
+mod approval_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn approval_prompt_shows_command_cwd_reason_and_network_badge() {
+        let prompt = format_approval_prompt(
+            "npx playwright install",
+            "/home/u/proj",
+            "needs browsers",
+            "network",
+        );
+        assert!(prompt.contains("$ npx playwright install"));
+        assert!(prompt.contains("(in /home/u/proj)"));
+        assert!(prompt.contains("reason: needs browsers"));
+        assert!(prompt.contains("[network access]"));
+        assert!(prompt.contains("[y]es once / [a]lways this session / [n]o"));
+    }
+
+    #[test]
+    fn approval_prompt_file_change_shape() {
+        let prompt = format_approval_prompt("apply changes to: a.rs, b.rs", "", "", "files");
+        assert!(prompt.starts_with("Codex wants to apply changes to: a.rs, b.rs"));
+        assert!(!prompt.contains("$ "));
+    }
+
+    #[test]
+    fn approval_input_mapping_denies_by_default() {
+        assert_eq!(map_approval_input("y"), "accept");
+        assert_eq!(map_approval_input("YES\n"), "accept");
+        assert_eq!(map_approval_input("a"), "acceptForSession");
+        assert_eq!(map_approval_input("always"), "acceptForSession");
+        assert_eq!(map_approval_input("n"), "decline");
+        assert_eq!(map_approval_input(""), "decline");
+        assert_eq!(map_approval_input("whatever"), "decline");
+    }
+
+    #[test]
+    fn decision_line_is_the_part3_stdin_vocabulary() {
+        let line = build_decision_line("7", "acceptForSession");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "approval_decision");
+        assert_eq!(v["id"], "7");
+        assert_eq!(v["decision"], "acceptForSession");
+    }
 }

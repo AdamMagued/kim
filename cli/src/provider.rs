@@ -81,6 +81,36 @@ pub struct CodexTurnControl {
     pub pid_slot: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
 }
 
+/// F1/F10/F20: shared child-stderr pump. Drains a child's stderr concurrently
+/// with the stdout stream into a bounded tail buffer (last ~8 KiB), so a
+/// verbose child can never fill the OS pipe buffer, block in `write(2)`, and
+/// hang the turn. The returned handle resolves to the captured tail once the
+/// child closes stderr; callers await it only on failure paths.
+pub(crate) fn drain_stderr_tail(
+    stderr: tokio::process::ChildStderr,
+) -> tokio::task::JoinHandle<String> {
+    use tokio::io::AsyncReadExt;
+    const MAX_TAIL_BYTES: usize = 8 * 1024;
+    tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut buf = [0u8; 4096];
+        let mut tail: Vec<u8> = Vec::new();
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    tail.extend_from_slice(&buf[..n]);
+                    if tail.len() > MAX_TAIL_BYTES {
+                        let cut = tail.len() - MAX_TAIL_BYTES;
+                        tail.drain(..cut);
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&tail).trim().to_string()
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageAttachment {
     pub(crate) name: String,

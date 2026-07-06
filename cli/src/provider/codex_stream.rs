@@ -182,32 +182,54 @@ pub(crate) async fn stream_codex_subprocess(
             }));
         }
     }
-    let stderr_pipe = child.stderr.take();
+    // F1: drain stderr CONCURRENTLY with the stdout stream. It was previously
+    // read only after stdout EOF + child.wait(); a child logging ≥ ~64 KiB to
+    // stderr filled the OS pipe, blocked in write(2), stopped emitting stdout,
+    // and the turn hung on the spinner forever.
+    let stderr_tail = child.stderr.take().map(super::drain_stderr_tail);
     let mut lines = BufReader::new(stdout).lines();
     let mut had_output = false;
     let mut saw_streamed_answer = false;
+    // F9: a read error (invalid UTF-8, I/O failure) must surface, not silently
+    // truncate the turn like a clean EOF.
+    let mut read_err: Option<String> = None;
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        had_output = true;
-        process_codex_line_stateful(&line, &tx, is_browser, &mut saw_streamed_answer);
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                had_output = true;
+                process_codex_line_stateful(&line, &tx, is_browser, &mut saw_streamed_answer);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                read_err = Some(e.to_string());
+                break;
+            }
+        }
     }
     if let Some(pump) = _decision_pump.take() {
         pump.abort();
     }
+    // On a read error, close our end of the stdout pipe before wait() so a
+    // still-writing child can't block forever on a full pipe.
+    drop(lines);
 
     let exit_ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
-    if !had_output || !exit_ok {
-        let mut stderr_msg = String::new();
-        if let Some(pipe) = stderr_pipe {
-            let mut err_lines = BufReader::new(pipe).lines();
-            while let Ok(Some(line)) = err_lines.next_line().await {
-                if !stderr_msg.is_empty() {
-                    stderr_msg.push('\n');
-                }
-                stderr_msg.push_str(line.trim());
-            }
-        }
-        if !stderr_msg.trim().is_empty() {
+    if read_err.is_some() || !had_output || !exit_ok {
+        let stderr_msg = match stderr_tail {
+            Some(handle) => handle.await.unwrap_or_default(),
+            None => String::new(),
+        };
+        if let Some(e) = read_err {
+            let extra = if stderr_msg.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", stderr_msg.trim())
+            };
+            let _ = tx.send(AppEvent::Err(format!(
+                "codex output read error: {e}{extra}"
+            )));
+        } else if !stderr_msg.trim().is_empty() {
             let _ = tx.send(AppEvent::Err(format!("codex: {}", stderr_msg.trim())));
         } else if !had_output {
             let _ = tx.send(AppEvent::Err(
