@@ -146,6 +146,89 @@ pub(crate) fn forward_agent_stdout_line(
                         serde_json::json!({"kind": kind, "text": text}),
                     );
                 }
+                // Codex app-server transport (parity Part 3/5): native
+                // approvals, live command output, plan/diff/token streams.
+                KimEvent::CommandApprovalRequest {
+                    id,
+                    command,
+                    cwd,
+                    reason,
+                    risk,
+                    network,
+                    amendment,
+                } => {
+                    let _ = app.emit(
+                        "kim:command-approval-request",
+                        serde_json::json!({
+                            "id": id,
+                            "command": command,
+                            "cwd": cwd,
+                            "reason": reason,
+                            "risk": risk,
+                            "network": network,
+                            "amendment": amendment,
+                        }),
+                    );
+                }
+                KimEvent::FileChangeApprovalRequest { id, files, reason } => {
+                    let _ = app.emit(
+                        "kim:file-change-approval-request",
+                        serde_json::json!({"id": id, "files": files, "reason": reason}),
+                    );
+                }
+                KimEvent::CommandOutput { item_id, chunk } => {
+                    let _ = app.emit(
+                        "kim:command-output",
+                        serde_json::json!({"item_id": item_id, "chunk": chunk}),
+                    );
+                }
+                KimEvent::AssistantDelta { chunk } => {
+                    let _ = app.emit("kim:assistant-delta", serde_json::json!({"chunk": chunk}));
+                }
+                KimEvent::ReasoningDelta { chunk } => {
+                    let _ = app.emit("kim:reasoning-delta", serde_json::json!({"chunk": chunk}));
+                }
+                KimEvent::PlanUpdate { steps } => {
+                    let _ = app.emit("kim:plan-update", serde_json::json!({"steps": steps}));
+                }
+                KimEvent::DiffUpdate { unified_diff } => {
+                    let _ = app.emit(
+                        "kim:diff-update",
+                        serde_json::json!({"unified_diff": unified_diff}),
+                    );
+                }
+                KimEvent::TokenUsage {
+                    input,
+                    output,
+                    total,
+                } => {
+                    let _ = app.emit(
+                        "kim:token-usage",
+                        serde_json::json!({"input": input, "output": output, "total": total}),
+                    );
+                }
+                KimEvent::ItemLifecycle {
+                    item_id,
+                    kind,
+                    phase,
+                    title,
+                } => {
+                    let _ = app.emit(
+                        "kim:item-lifecycle",
+                        serde_json::json!({
+                            "item_id": item_id,
+                            "kind": kind,
+                            "phase": phase,
+                            "title": title,
+                        }),
+                    );
+                }
+                KimEvent::TurnLifecycle { phase, turn_id } => {
+                    let _ = app.emit(
+                        "kim:turn-lifecycle",
+                        serde_json::json!({"phase": phase, "turn_id": turn_id}),
+                    );
+                }
             }
         } else if is_codex {
             let _ = app.emit("kim-agent-output", line);

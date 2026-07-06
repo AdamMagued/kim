@@ -21,6 +21,16 @@ export const KimEventNames = {
   ANSWER: 'kim:answer' as const,
   DIFF: 'kim:diff' as const,
   ACTIVITY: 'kim:activity' as const,
+  COMMAND_APPROVAL_REQUEST: 'kim:command-approval-request' as const,
+  FILE_CHANGE_APPROVAL_REQUEST: 'kim:file-change-approval-request' as const,
+  COMMAND_OUTPUT: 'kim:command-output' as const,
+  ASSISTANT_DELTA: 'kim:assistant-delta' as const,
+  REASONING_DELTA: 'kim:reasoning-delta' as const,
+  PLAN_UPDATE: 'kim:plan-update' as const,
+  DIFF_UPDATE: 'kim:diff-update' as const,
+  TOKEN_USAGE: 'kim:token-usage' as const,
+  ITEM_LIFECYCLE: 'kim:item-lifecycle' as const,
+  TURN_LIFECYCLE: 'kim:turn-lifecycle' as const,
 } as const;
 
 export type KimEventName = (typeof KimEventNames)[keyof typeof KimEventNames];
@@ -261,6 +271,96 @@ export interface KimActivityPayload {
   text: string;
 }
 
+/** Codex app-server: native per-command approval request. Block until the user answers with an approval_decision stdin line (accept | acceptForSession | decline). */
+export interface KimCommandApprovalRequestPayload {
+  /** Approval request id — echo it back in the approval_decision stdin line. */
+  id: string;
+  /** Full shell command codex wants to run. */
+  command: string;
+  /** Working directory the command would run in. */
+  cwd: string;
+  /** Model-provided justification (may be empty). */
+  reason: string;
+  /** Risk hint: 'network' when the command needs network access, else '' (sandbox escalation). */
+  risk: string;
+  /** True when this is a managed-network approval (command needs network access). */
+  network: boolean;
+  /** Proposed execpolicy amendment tokens (allow similar commands without prompting); may be empty. */
+  amendment: unknown[];
+}
+
+/** Codex app-server: native file-change (patch) approval request. */
+export interface KimFileChangeApprovalRequestPayload {
+  /** Approval request id — echo it back in the approval_decision stdin line. */
+  id: string;
+  /** Changed files: [{path, kind}] best-effort; may be empty. */
+  files: unknown[];
+  /** Model-provided justification (may be empty). */
+  reason: string;
+}
+
+/** Codex app-server: live output chunk from a running command. */
+export interface KimCommandOutputPayload {
+  /** Command-execution item id this chunk belongs to. */
+  item_id: string;
+  /** Raw output chunk (may contain partial lines). */
+  chunk: string;
+}
+
+/** Codex app-server: streaming assistant-message text delta. */
+export interface KimAssistantDeltaPayload {
+  /** Assistant text delta. */
+  chunk: string;
+}
+
+/** Codex app-server: streaming reasoning text delta (provider names scrubbed). */
+export interface KimReasoningDeltaPayload {
+  /** Reasoning text delta. */
+  chunk: string;
+}
+
+/** Codex app-server: the turn's plan checklist changed. */
+export interface KimPlanUpdatePayload {
+  /** Plan steps: [{text/step, status}] as sent by codex. */
+  steps: unknown[];
+}
+
+/** Codex app-server: cumulative unified diff of the turn's file changes. */
+export interface KimDiffUpdatePayload {
+  /** Unified diff text (whole-turn snapshot, not incremental). */
+  unified_diff: string;
+}
+
+/** Codex app-server: codex-side transcript token usage snapshot. */
+export interface KimTokenUsagePayload {
+  /** Cumulative input tokens. */
+  input: number;
+  /** Cumulative output tokens. */
+  output: number;
+  /** Cumulative total tokens. */
+  total: number;
+}
+
+/** Codex app-server: a thread item started or completed. */
+export interface KimItemLifecyclePayload {
+  /** Item id. */
+  item_id: string;
+  /** Item kind (commandExecution | agentMessage | fileChange | reasoning | …). */
+  kind: string;
+  /** 'started' or 'completed'. */
+  phase: string;
+  /** Human-readable label (command string, file list, …); may be empty. */
+  title: string;
+}
+
+/** Codex app-server: a turn started / completed / was interrupted. */
+export interface KimTurnLifecyclePayload {
+  /** 'started' | 'completed' | 'interrupted' | 'failed'. */
+  phase: string;
+  /** Codex turn id (may be empty). */
+  turn_id: string;
+}
+
 /** Discriminated union of all typed IPC events. */
 export type KimEvent =
   | { event: typeof KimEventNames.STATUS; payload: KimStatusPayload }
@@ -279,7 +379,17 @@ export type KimEvent =
   | { event: typeof KimEventNames.TOOL; payload: KimToolPayload }
   | { event: typeof KimEventNames.ANSWER; payload: KimAnswerPayload }
   | { event: typeof KimEventNames.DIFF; payload: KimDiffPayload }
-  | { event: typeof KimEventNames.ACTIVITY; payload: KimActivityPayload };
+  | { event: typeof KimEventNames.ACTIVITY; payload: KimActivityPayload }
+  | { event: typeof KimEventNames.COMMAND_APPROVAL_REQUEST; payload: KimCommandApprovalRequestPayload }
+  | { event: typeof KimEventNames.FILE_CHANGE_APPROVAL_REQUEST; payload: KimFileChangeApprovalRequestPayload }
+  | { event: typeof KimEventNames.COMMAND_OUTPUT; payload: KimCommandOutputPayload }
+  | { event: typeof KimEventNames.ASSISTANT_DELTA; payload: KimAssistantDeltaPayload }
+  | { event: typeof KimEventNames.REASONING_DELTA; payload: KimReasoningDeltaPayload }
+  | { event: typeof KimEventNames.PLAN_UPDATE; payload: KimPlanUpdatePayload }
+  | { event: typeof KimEventNames.DIFF_UPDATE; payload: KimDiffUpdatePayload }
+  | { event: typeof KimEventNames.TOKEN_USAGE; payload: KimTokenUsagePayload }
+  | { event: typeof KimEventNames.ITEM_LIFECYCLE; payload: KimItemLifecyclePayload }
+  | { event: typeof KimEventNames.TURN_LIFECYCLE; payload: KimTurnLifecyclePayload };
 
 const KimWireEventMap = {
   "status": { event: KimEventNames.STATUS },
@@ -300,6 +410,16 @@ const KimWireEventMap = {
   "answer": { event: KimEventNames.ANSWER },
   "diff": { event: KimEventNames.DIFF },
   "activity": { event: KimEventNames.ACTIVITY },
+  "command_approval_request": { event: KimEventNames.COMMAND_APPROVAL_REQUEST },
+  "file_change_approval_request": { event: KimEventNames.FILE_CHANGE_APPROVAL_REQUEST },
+  "command_output": { event: KimEventNames.COMMAND_OUTPUT },
+  "assistant_delta": { event: KimEventNames.ASSISTANT_DELTA },
+  "reasoning_delta": { event: KimEventNames.REASONING_DELTA },
+  "plan_update": { event: KimEventNames.PLAN_UPDATE },
+  "diff_update": { event: KimEventNames.DIFF_UPDATE },
+  "token_usage": { event: KimEventNames.TOKEN_USAGE },
+  "item_lifecycle": { event: KimEventNames.ITEM_LIFECYCLE },
+  "turn_lifecycle": { event: KimEventNames.TURN_LIFECYCLE },
 } as const;
 
 /** Decode one Python stdout JSON event using the schema-generated wire map. */

@@ -26,6 +26,16 @@ TOOL = "kim:tool"
 ANSWER = "kim:answer"
 DIFF = "kim:diff"
 ACTIVITY = "kim:activity"
+COMMAND_APPROVAL_REQUEST = "kim:command-approval-request"
+FILE_CHANGE_APPROVAL_REQUEST = "kim:file-change-approval-request"
+COMMAND_OUTPUT = "kim:command-output"
+ASSISTANT_DELTA = "kim:assistant-delta"
+REASONING_DELTA = "kim:reasoning-delta"
+PLAN_UPDATE = "kim:plan-update"
+DIFF_UPDATE = "kim:diff-update"
+TOKEN_USAGE = "kim:token-usage"
+ITEM_LIFECYCLE = "kim:item-lifecycle"
+TURN_LIFECYCLE = "kim:turn-lifecycle"
 
 # K5: named bracket-tag constants — the single source of truth for the
 # text-protocol vocabulary. Emitters (codex_engine, codex_bridge_service)
@@ -165,3 +175,43 @@ def emit_diff(path: str, added: float, removed: float) -> None:
 
 def emit_activity(kind: str, text: str) -> None:
     emit_event("activity", kind=kind, text=text)
+
+
+def emit_command_approval_request(id: str, command: str, cwd: str, reason: str, risk: str, network: bool, amendment: list[object]) -> None:
+    emit_event("command_approval_request", id=id, command=command, cwd=cwd, reason=reason, risk=risk, network=network, amendment=amendment)
+
+
+def emit_file_change_approval_request(id: str, files: list[object], reason: str) -> None:
+    emit_event("file_change_approval_request", id=id, files=files, reason=reason)
+
+
+def emit_command_output(item_id: str, chunk: str) -> None:
+    emit_event("command_output", item_id=item_id, chunk=chunk)
+
+
+def emit_assistant_delta(chunk: str) -> None:
+    emit_event("assistant_delta", chunk=chunk)
+
+
+def emit_reasoning_delta(chunk: str) -> None:
+    emit_event("reasoning_delta", chunk=chunk)
+
+
+def emit_plan_update(steps: list[object]) -> None:
+    emit_event("plan_update", steps=steps)
+
+
+def emit_diff_update(unified_diff: str) -> None:
+    emit_event("diff_update", unified_diff=unified_diff)
+
+
+def emit_token_usage(input: float, output: float, total: float) -> None:
+    emit_event("token_usage", input=input, output=output, total=total)
+
+
+def emit_item_lifecycle(item_id: str, kind: str, phase: str, title: str) -> None:
+    emit_event("item_lifecycle", item_id=item_id, kind=kind, phase=phase, title=title)
+
+
+def emit_turn_lifecycle(phase: str, turn_id: str) -> None:
+    emit_event("turn_lifecycle", phase=phase, turn_id=turn_id)

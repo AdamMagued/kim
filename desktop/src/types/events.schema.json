@@ -181,6 +181,101 @@
         "kind": { "type": "'status' | 'success' | 'error'", "description": "Activity severity and presentation kind." },
         "text": { "type": "string", "description": "Human-readable activity text." }
       }
+    },
+    {
+      "event": "kim:command-approval-request",
+      "typeName": "KimCommandApprovalRequest",
+      "description": "Codex app-server: native per-command approval request. Block until the user answers with an approval_decision stdin line (accept | acceptForSession | decline).",
+      "payload": {
+        "id": { "type": "string", "description": "Approval request id — echo it back in the approval_decision stdin line." },
+        "command": { "type": "string", "description": "Full shell command codex wants to run." },
+        "cwd": { "type": "string", "description": "Working directory the command would run in." },
+        "reason": { "type": "string", "default": true, "description": "Model-provided justification (may be empty)." },
+        "risk": { "type": "string", "default": true, "description": "Risk hint: 'network' when the command needs network access, else '' (sandbox escalation)." },
+        "network": { "type": "boolean", "default": true, "description": "True when this is a managed-network approval (command needs network access)." },
+        "amendment": { "type": "unknown[]", "default": true, "description": "Proposed execpolicy amendment tokens (allow similar commands without prompting); may be empty." }
+      }
+    },
+    {
+      "event": "kim:file-change-approval-request",
+      "typeName": "KimFileChangeApprovalRequest",
+      "description": "Codex app-server: native file-change (patch) approval request.",
+      "payload": {
+        "id": { "type": "string", "description": "Approval request id — echo it back in the approval_decision stdin line." },
+        "files": { "type": "unknown[]", "description": "Changed files: [{path, kind}] best-effort; may be empty." },
+        "reason": { "type": "string", "default": true, "description": "Model-provided justification (may be empty)." }
+      }
+    },
+    {
+      "event": "kim:command-output",
+      "typeName": "KimCommandOutput",
+      "description": "Codex app-server: live output chunk from a running command.",
+      "payload": {
+        "item_id": { "type": "string", "description": "Command-execution item id this chunk belongs to." },
+        "chunk": { "type": "string", "description": "Raw output chunk (may contain partial lines)." }
+      }
+    },
+    {
+      "event": "kim:assistant-delta",
+      "typeName": "KimAssistantDelta",
+      "description": "Codex app-server: streaming assistant-message text delta.",
+      "payload": {
+        "chunk": { "type": "string", "description": "Assistant text delta." }
+      }
+    },
+    {
+      "event": "kim:reasoning-delta",
+      "typeName": "KimReasoningDelta",
+      "description": "Codex app-server: streaming reasoning text delta (provider names scrubbed).",
+      "payload": {
+        "chunk": { "type": "string", "description": "Reasoning text delta." }
+      }
+    },
+    {
+      "event": "kim:plan-update",
+      "typeName": "KimPlanUpdate",
+      "description": "Codex app-server: the turn's plan checklist changed.",
+      "payload": {
+        "steps": { "type": "unknown[]", "description": "Plan steps: [{text/step, status}] as sent by codex." }
+      }
+    },
+    {
+      "event": "kim:diff-update",
+      "typeName": "KimDiffUpdate",
+      "description": "Codex app-server: cumulative unified diff of the turn's file changes.",
+      "payload": {
+        "unified_diff": { "type": "string", "description": "Unified diff text (whole-turn snapshot, not incremental)." }
+      }
+    },
+    {
+      "event": "kim:token-usage",
+      "typeName": "KimTokenUsage",
+      "description": "Codex app-server: codex-side transcript token usage snapshot.",
+      "payload": {
+        "input": { "type": "number", "rustType": "u64", "description": "Cumulative input tokens." },
+        "output": { "type": "number", "rustType": "u64", "description": "Cumulative output tokens." },
+        "total": { "type": "number", "rustType": "u64", "description": "Cumulative total tokens." }
+      }
+    },
+    {
+      "event": "kim:item-lifecycle",
+      "typeName": "KimItemLifecycle",
+      "description": "Codex app-server: a thread item started or completed.",
+      "payload": {
+        "item_id": { "type": "string", "description": "Item id." },
+        "kind": { "type": "string", "description": "Item kind (commandExecution | agentMessage | fileChange | reasoning | …)." },
+        "phase": { "type": "string", "description": "'started' or 'completed'." },
+        "title": { "type": "string", "default": true, "description": "Human-readable label (command string, file list, …); may be empty." }
+      }
+    },
+    {
+      "event": "kim:turn-lifecycle",
+      "typeName": "KimTurnLifecycle",
+      "description": "Codex app-server: a turn started / completed / was interrupted.",
+      "payload": {
+        "phase": { "type": "string", "description": "'started' | 'completed' | 'interrupted' | 'failed'." },
+        "turn_id": { "type": "string", "default": true, "description": "Codex turn id (may be empty)." }
+      }
     }
   ],
   "legacyTags": [
