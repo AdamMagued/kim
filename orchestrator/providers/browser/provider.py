@@ -65,7 +65,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, cast
 
 # Playwright is only needed for the CDP fallback path (driving an external
 # Chrome). The primary desktop path is the in-app webview bridge (httpx), which
@@ -404,8 +404,9 @@ class BrowserProvider(BaseProvider):
                 page, site = await driver.acquire()
                 if page is None or site is None:
                     return self._lost_chat_result()
+                # cast: PageLike stands in for the concrete Page (string form: Page is TYPE_CHECKING-only).
                 return await self._run_chat_flow(
-                    page, site, prompt, attachments, tools, completion_hash, clear_chat, estimated_usage
+                    cast("Page", page), site, prompt, attachments, tools, completion_hash, clear_chat, estimated_usage
                 )
 
             # Playwright is imported lazily (module top only imports it under
