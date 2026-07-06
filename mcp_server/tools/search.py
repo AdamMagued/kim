@@ -15,6 +15,7 @@ import asyncio
 import fnmatch
 import logging
 import os
+import re
 from pathlib import Path
 
 from mcp_server.config import PROJECT_ROOT, SHELL_TIMEOUT, validate_path
@@ -25,6 +26,46 @@ logger = logging.getLogger(__name__)
 # Max results to prevent overwhelming the LLM context window
 MAX_SEARCH_RESULTS = 100
 MAX_FIND_RESULTS = 200
+
+# Leading "<path><sep><lineno><sep>" prefix emitted by every grep-family backend
+# (rg / grep -n / findstr /N). ``:`` separates path↔lineno for matches, ``-``
+# for context lines; a Windows drive letter (``C:\``) is not followed by digits
+# so the non-greedy capture skips past it to the real path↔lineno boundary.
+_MATCH_PREFIX_RE = re.compile(r"^(?P<path>.+?)[:-]\d+[:-]")
+
+
+def _extract_path(line: str) -> str | None:
+    """Return the file-path component of a ``path:lineno:content`` search line,
+    or None for structural lines (blank, ``--`` group separators, headers)."""
+    m = _MATCH_PREFIX_RE.match(line)
+    return m.group("path") if m else None
+
+
+def _drop_denied_paths(output: str, cwd: str) -> str:
+    """Post-filter raw grep-family output: drop every line whose file path fails
+    ``config.validate_path`` (secret-file / out-of-sandbox deny-list), for EVERY
+    backend. This is the authoritative sandbox check for ``search_in_files`` — it
+    reuses the exact same deny logic ``read_file``/``write_file`` rely on, so a
+    directory search that recurses into a denied file (id_rsa, *.pem, .env,
+    credentials*, .npmrc, …) yields NOTHING from that file.
+    """
+    kept: list[str] = []
+    for line in output.split("\n"):
+        path = _extract_path(line)
+        if path is None:
+            # Structural line (``--`` separator, blank) — carries no file content.
+            kept.append(line)
+            continue
+        target = path if os.path.isabs(path) else os.path.join(cwd, path)
+        try:
+            validate_path(target)
+        except PermissionError:
+            continue  # secret / out-of-sandbox file — drop this hit entirely
+        except Exception:
+            # Never let a filter error surface a hit we could not validate.
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 async def _run_search_cmd(cmd: list[str], cwd: str, timeout: int) -> str:
@@ -51,6 +92,11 @@ async def _run_search_cmd(cmd: list[str], cwd: str, timeout: int) -> str:
 
         if exit_code not in (0, 1):
             return f"ERROR (exit {exit_code}): {err}" if err else f"ERROR: exit code {exit_code}"
+
+        # F1: drop any hit whose file path is denied by the sandbox (secret
+        # files / out-of-sandbox), for every backend, BEFORE the empty check so
+        # a search that only matched denied files reports "No matches found."
+        out = _drop_denied_paths(out, cwd)
 
         if not out.strip():
             return "No matches found."
@@ -219,6 +265,17 @@ async def handle_find_files(args: dict) -> str:
                 continue
             if any(p in ("node_modules", "__pycache__", ".git", "venv", ".venv") for p in parts):
                 continue
+
+            # F1: never disclose the name/size of a sandbox-denied file
+            # (id_rsa, *.pem, credentials*, .env, .npmrc, …) — same deny logic
+            # read_file uses. Directories stay listable so traversal still works.
+            if match.is_file():
+                try:
+                    validate_path(str(match))
+                except PermissionError:
+                    continue
+                except Exception:
+                    continue
 
             # Apply type filter
             if type_filter == "file" and not match.is_file():
