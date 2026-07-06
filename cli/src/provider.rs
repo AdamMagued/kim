@@ -37,10 +37,47 @@ pub struct ChatMessage {
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     ThoughtChunk(String),
-    ToolEvent { verb: String, target: String },
+    ToolEvent {
+        verb: String,
+        target: String,
+    },
     TextChunk(String),
     Done(bool),
     Err(String),
+    /// Codex app-server (parity Part 4): native approval request. The REPL
+    /// must answer via the codex decision channel or codex auto-declines on
+    /// timeout. `risk == "network"` marks a managed-network escalation;
+    /// `risk == "files"` a file-change (patch) approval.
+    ApprovalRequest {
+        id: String,
+        command: String,
+        cwd: String,
+        reason: String,
+        risk: String,
+    },
+    /// Live output chunk from a codex-executed command.
+    CommandOutput(String),
+    /// Turn plan checklist: (step text, status) pairs.
+    PlanUpdate(Vec<(String, String)>),
+    /// Whole-turn unified diff snapshot.
+    DiffUpdate(String),
+    /// Codex-side cumulative token usage.
+    TokenUsage {
+        input: u64,
+        output: u64,
+    },
+    /// Turn lifecycle phase: started | completed | interrupted | failed.
+    TurnPhase(String),
+}
+
+/// Control plumbing for one code-mode turn on the app-server transport
+/// (parity Part 4): the REPL sends approval-decision JSON lines down
+/// `decision_rx` → the bridge child's stdin, and `pid_slot` exposes the
+/// child's pid so Ctrl-C can SIGTERM it (the service maps SIGTERM →
+/// `turn/interrupt`) before escalating to a hard kill.
+pub struct CodexTurnControl {
+    pub decision_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    pub pid_slot: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +198,7 @@ pub async fn stream_kim_request(
     _session_id: &str,
     allow_non_git: bool,
     tx: UnboundedSender<AppEvent>,
+    codex_control: Option<CodexTurnControl>,
 ) {
     let prompt = messages
         .iter()
@@ -177,7 +215,15 @@ pub async fn stream_kim_request(
     // Browser providers intentionally stay on this path so Code mode can use
     // orchestrator.codex_bridge_service instead of the desktop chat bridge.
     if code_mode {
-        stream_codex_subprocess(config, prompt, allow_non_git, _session_id, tx).await;
+        stream_codex_subprocess(
+            config,
+            prompt,
+            allow_non_git,
+            _session_id,
+            tx,
+            codex_control,
+        )
+        .await;
         return;
     }
 

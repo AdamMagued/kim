@@ -8,7 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::config::KimConfig;
 
 use super::responses_proxy::{start_responses_proxy, write_codex_config, ProxyHandle};
-use super::{kim_root_or_error, AppEvent};
+use super::{kim_root_or_error, AppEvent, CodexTurnControl};
 
 pub(crate) async fn stream_codex_subprocess(
     config: &KimConfig,
@@ -16,8 +16,9 @@ pub(crate) async fn stream_codex_subprocess(
     allow_non_git: bool,
     session_id: &str,
     tx: UnboundedSender<AppEvent>,
+    control: Option<CodexTurnControl>,
 ) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -78,6 +79,12 @@ pub(crate) async fn stream_codex_subprocess(
                 "KIM_CODEX_SKIP_GIT_CHECK",
                 if allow_non_git { "1" } else { "0" },
             )
+            // Parity Part 4: stdin is the approval decision channel — the
+            // REPL answers native codex approvals with approval_decision
+            // JSON lines. The env var tells the service someone is listening
+            // (stdin is a pipe, not a TTY, so it can't tell on its own).
+            .env("KIM_STDIN_APPROVALS", "1")
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -150,13 +157,41 @@ pub(crate) async fn stream_codex_subprocess(
             return;
         }
     };
+    // Parity Part 4: expose the child's pid (Ctrl-C sends SIGTERM → the
+    // service maps it to turn/interrupt) and pump REPL approval decisions
+    // into the child's stdin.
+    let mut _decision_pump: Option<tokio::task::JoinHandle<()>> = None;
+    if let Some(mut control) = control {
+        if let Ok(mut slot) = control.pid_slot.lock() {
+            *slot = child.id();
+        }
+        if let Some(mut stdin) = child.stdin.take() {
+            _decision_pump = Some(tokio::spawn(async move {
+                while let Some(line) = control.decision_rx.recv().await {
+                    let framed = if line.ends_with('\n') {
+                        line
+                    } else {
+                        format!("{line}\n")
+                    };
+                    if stdin.write_all(framed.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    let _ = stdin.flush().await;
+                }
+            }));
+        }
+    }
     let stderr_pipe = child.stderr.take();
     let mut lines = BufReader::new(stdout).lines();
     let mut had_output = false;
+    let mut saw_streamed_answer = false;
 
     while let Ok(Some(line)) = lines.next_line().await {
         had_output = true;
-        process_codex_line(&line, &tx, is_browser);
+        process_codex_line_stateful(&line, &tx, is_browser, &mut saw_streamed_answer);
+    }
+    if let Some(pump) = _decision_pump.take() {
+        pump.abort();
     }
 
     let exit_ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
@@ -189,7 +224,20 @@ pub(crate) async fn stream_codex_subprocess(
     let _ = tx.send(AppEvent::Done(is_browser));
 }
 
+/// Stateless wrapper kept for tests and one-shot callers; the streaming loop
+/// uses the stateful variant so the final answer isn't printed twice.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_bridge: bool) {
+    let mut saw_streamed_answer = false;
+    process_codex_line_stateful(line, tx, is_bridge, &mut saw_streamed_answer);
+}
+
+pub(crate) fn process_codex_line_stateful(
+    line: &str,
+    tx: &UnboundedSender<AppEvent>,
+    is_bridge: bool,
+    saw_streamed_answer: &mut bool,
+) {
     let line = line.trim();
     if line.is_empty() {
         return;
@@ -201,6 +249,10 @@ pub(crate) fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_
                 if let Some(msg) = json.get("message").and_then(Value::as_str) {
                     let _ = tx.send(AppEvent::ThoughtChunk(msg.to_string()));
                 }
+                return;
+            }
+            // Typed Kim events from the app-server transport (parity Part 4).
+            if emit_typed_kim_event(&json, tx, saw_streamed_answer) {
                 return;
             }
             // Otherwise these are Codex's raw --json protocol events, forwarded
@@ -217,6 +269,13 @@ pub(crate) fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_
             let _ = tx.send(AppEvent::TextChunk(rest.to_string()));
         } else if let Some(rest) = line.strip_prefix("[FAILED] ") {
             let _ = tx.send(AppEvent::Err(rest.to_string()));
+        } else if let Some(rest) = line.strip_prefix("TASK_COMPLETE:") {
+            // Final-answer contract line. On the app-server transport the
+            // answer already streamed as assistant_delta events — printing
+            // it again would duplicate it.
+            if !*saw_streamed_answer {
+                let _ = tx.send(AppEvent::TextChunk(format!("{}\n", rest.trim())));
+            }
         } else {
             let _ = tx.send(AppEvent::TextChunk(format!("{line}\n")));
         }
@@ -228,6 +287,145 @@ pub(crate) fn process_codex_line(line: &str, tx: &UnboundedSender<AppEvent>, is_
         return;
     };
     emit_codex_json_event(&json, tx);
+}
+
+/// Translate one typed Kim event (app-server transport, Part 3 vocabulary)
+/// into an `AppEvent`. Returns false when the type is not a typed Kim event
+/// so the caller can fall through to the raw-codex handler.
+fn emit_typed_kim_event(
+    json: &Value,
+    tx: &UnboundedSender<AppEvent>,
+    saw_streamed_answer: &mut bool,
+) -> bool {
+    let text = |key: &str| {
+        json.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    match json.get("type").and_then(Value::as_str) {
+        Some("assistant_delta") => {
+            let chunk = text("chunk");
+            if !chunk.is_empty() {
+                *saw_streamed_answer = true;
+                let _ = tx.send(AppEvent::TextChunk(chunk));
+            }
+            true
+        }
+        Some("reasoning_delta") => {
+            let chunk = text("chunk");
+            if !chunk.is_empty() {
+                let _ = tx.send(AppEvent::ThoughtChunk(chunk));
+            }
+            true
+        }
+        Some("command_output") => {
+            let chunk = text("chunk");
+            if !chunk.is_empty() {
+                let _ = tx.send(AppEvent::CommandOutput(chunk));
+            }
+            true
+        }
+        Some("command_approval_request") => {
+            let _ = tx.send(AppEvent::ApprovalRequest {
+                id: text("id"),
+                command: text("command"),
+                cwd: text("cwd"),
+                reason: text("reason"),
+                risk: text("risk"),
+            });
+            true
+        }
+        Some("file_change_approval_request") => {
+            let files = json
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|f| f.get("path").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let _ = tx.send(AppEvent::ApprovalRequest {
+                id: text("id"),
+                command: if files.is_empty() {
+                    "apply file changes".to_string()
+                } else {
+                    format!("apply changes to: {files}")
+                },
+                cwd: String::new(),
+                reason: text("reason"),
+                risk: "files".to_string(),
+            });
+            true
+        }
+        Some("plan_update") => {
+            let steps = json
+                .get("steps")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|s| {
+                            let step = s
+                                .get("step")
+                                .or_else(|| s.get("text"))
+                                .and_then(Value::as_str)?;
+                            let status =
+                                s.get("status").and_then(Value::as_str).unwrap_or("pending");
+                            Some((step.to_string(), status.to_string()))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let _ = tx.send(AppEvent::PlanUpdate(steps));
+            true
+        }
+        Some("diff_update") => {
+            let _ = tx.send(AppEvent::DiffUpdate(text("unified_diff")));
+            true
+        }
+        Some("token_usage") => {
+            let _ = tx.send(AppEvent::TokenUsage {
+                input: json.get("input").and_then(Value::as_u64).unwrap_or(0),
+                output: json.get("output").and_then(Value::as_u64).unwrap_or(0),
+            });
+            true
+        }
+        Some("turn_lifecycle") => {
+            let _ = tx.send(AppEvent::TurnPhase(text("phase")));
+            true
+        }
+        Some("item_lifecycle") => {
+            // Command items double as activity lines; the rest are internal.
+            if json.get("kind").and_then(Value::as_str) == Some("commandExecution")
+                && json.get("phase").and_then(Value::as_str) == Some("started")
+            {
+                let title = text("title");
+                if !title.is_empty() {
+                    let _ = tx.send(AppEvent::ToolEvent {
+                        verb: "Running".to_string(),
+                        target: title,
+                    });
+                }
+            }
+            true
+        }
+        Some("answer") => {
+            // The final answer duplicates the streamed assistant deltas.
+            if !*saw_streamed_answer {
+                let answer = text("text");
+                if !answer.is_empty() {
+                    let _ = tx.send(AppEvent::TextChunk(answer));
+                }
+                *saw_streamed_answer = true;
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Translate a single Codex `--json` event into an `AppEvent`. Shared by the
@@ -511,6 +709,125 @@ mod tests {
         assert_eq!(&with_bypass[n - 3], "-C");
         assert_eq!(&with_bypass[n - 2], cwd);
         assert_eq!(&with_bypass[n - 1], prompt);
+    }
+
+    // ── Typed Kim events (app-server transport, parity Part 4) ──────────────
+
+    #[test]
+    fn typed_approval_request_maps_to_app_event() {
+        let line = r#"{"type":"command_approval_request","id":"7","command":"npx playwright install","cwd":"/proj","reason":"needs browsers","risk":"network","network":true,"amendment":[]}"#;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        process_codex_line(line, &tx, true);
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AppEvent::ApprovalRequest {
+                id,
+                command,
+                cwd,
+                reason,
+                risk,
+            } => {
+                assert_eq!(id, "7");
+                assert_eq!(command, "npx playwright install");
+                assert_eq!(cwd, "/proj");
+                assert_eq!(reason, "needs browsers");
+                assert_eq!(risk, "network");
+            }
+            other => panic!("expected ApprovalRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_file_change_approval_summarizes_files() {
+        let line = r#"{"type":"file_change_approval_request","id":"3","files":[{"path":"a.rs","kind":"edit"},{"path":"b.rs","kind":"add"}],"reason":"patch"}"#;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        process_codex_line(line, &tx, true);
+        let events = drain(&mut rx);
+        match &events[0] {
+            AppEvent::ApprovalRequest { command, risk, .. } => {
+                assert!(command.contains("a.rs") && command.contains("b.rs"));
+                assert_eq!(risk, "files");
+            }
+            other => panic!("expected ApprovalRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_stream_events_map_and_lifecycle_is_quiet() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut saw = false;
+        for line in [
+            r#"{"type":"assistant_delta","chunk":"Hello"}"#,
+            r#"{"type":"reasoning_delta","chunk":"thinking"}"#,
+            r#"{"type":"command_output","item_id":"i1","chunk":"ls output"}"#,
+            r#"{"type":"plan_update","steps":[{"step":"write file","status":"inProgress"}]}"#,
+            r#"{"type":"diff_update","unified_diff":"+++ b/a\n+x"}"#,
+            r#"{"type":"token_usage","input":10,"output":5,"total":15}"#,
+            r#"{"type":"turn_lifecycle","phase":"completed","turn_id":"t1"}"#,
+            r#"{"type":"item_lifecycle","item_id":"i1","kind":"commandExecution","phase":"started","title":"touch x"}"#,
+            r#"{"type":"item_lifecycle","item_id":"m1","kind":"agentMessage","phase":"completed","title":""}"#,
+        ] {
+            process_codex_line_stateful(line, &tx, true, &mut saw);
+        }
+        let events = drain(&mut rx);
+        assert!(matches!(&events[0], AppEvent::TextChunk(t) if t == "Hello"));
+        assert!(matches!(&events[1], AppEvent::ThoughtChunk(t) if t == "thinking"));
+        assert!(matches!(&events[2], AppEvent::CommandOutput(t) if t == "ls output"));
+        assert!(
+            matches!(&events[3], AppEvent::PlanUpdate(steps) if steps == &[("write file".to_string(), "inProgress".to_string())])
+        );
+        assert!(matches!(&events[4], AppEvent::DiffUpdate(d) if d.contains("+x")));
+        assert!(matches!(
+            &events[5],
+            AppEvent::TokenUsage {
+                input: 10,
+                output: 5
+            }
+        ));
+        assert!(matches!(&events[6], AppEvent::TurnPhase(p) if p == "completed"));
+        assert!(
+            matches!(&events[7], AppEvent::ToolEvent { verb, target } if verb == "Running" && target == "touch x")
+        );
+        // agentMessage lifecycle is internal — nothing after the ToolEvent.
+        assert_eq!(events.len(), 8);
+    }
+
+    #[test]
+    fn answer_and_task_complete_dedupe_against_streamed_deltas() {
+        // With streamed deltas: both the typed answer event and the raw
+        // TASK_COMPLETE line are swallowed.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut saw = false;
+        process_codex_line_stateful(
+            r#"{"type":"assistant_delta","chunk":"Built pong."}"#,
+            &tx,
+            true,
+            &mut saw,
+        );
+        process_codex_line_stateful(
+            r#"{"type":"answer","text":"Built pong."}"#,
+            &tx,
+            true,
+            &mut saw,
+        );
+        process_codex_line_stateful("TASK_COMPLETE: Built pong.", &tx, true, &mut saw);
+        let events = drain(&mut rx);
+        let texts: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::TextChunk(_)))
+            .collect();
+        assert_eq!(texts.len(), 1, "answer must not repeat: {events:?}");
+
+        // Without deltas (exec path / compact task): the answer text shows once.
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let mut saw2 = false;
+        process_codex_line_stateful("TASK_COMPLETE: Context compacted.", &tx2, true, &mut saw2);
+        let events2 = drain(&mut rx2);
+        assert!(
+            matches!(&events2[0], AppEvent::TextChunk(t) if t.contains("Context compacted")),
+            "got {events2:?}"
+        );
     }
 
     #[test]

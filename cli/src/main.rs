@@ -1130,6 +1130,24 @@ async fn stream_repl_turn(
     } else {
         crate::agentic::agentic_available(&config.provider)
     };
+    // Parity Part 4: code-mode turns get a decision channel (REPL → child
+    // stdin, for native codex approvals) and a pid slot (Ctrl-C → SIGTERM →
+    // turn/interrupt before the hard kill).
+    let (codex_control, decision_tx, child_pid) = if code_mode {
+        let (dtx, drx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let pid_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<u32>));
+        (
+            Some(crate::provider::CodexTurnControl {
+                decision_rx: drx,
+                pid_slot: pid_slot.clone(),
+            }),
+            Some(dtx),
+            Some(pid_slot),
+        )
+    } else {
+        (None, None, None)
+    };
+
     let handle = if let Some((root, python)) = agentic {
         let prompt2 = prompt.clone();
         let sid = session_id.clone();
@@ -1150,7 +1168,16 @@ async fn stream_repl_turn(
     } else {
         maybe_note_plain_chat(code_mode, &config.provider);
         tokio::spawn(async move {
-            stream_kim_request(&config, &history, code_mode, &session_id, allow_non_git, tx).await;
+            stream_kim_request(
+                &config,
+                &history,
+                code_mode,
+                &session_id,
+                allow_non_git,
+                tx,
+                codex_control,
+            )
+            .await;
         })
     };
 
@@ -1160,7 +1187,16 @@ async fn stream_repl_turn(
     let cancel = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    let result = consume_turn_events(app, rx, Instant::now(), save_current_session, cancel).await;
+    let result = consume_turn_events(
+        app,
+        rx,
+        Instant::now(),
+        save_current_session,
+        cancel,
+        decision_tx,
+        child_pid,
+    )
+    .await;
     // Reap the request task (kill_on_drop reaps any child subprocess). No-op if
     // it already finished.
     handle.abort();
@@ -1179,12 +1215,123 @@ fn clear_spinner_line(active: bool) {
     }
 }
 
+/// Render one native codex approval request and read the user's decision from
+/// the terminal. Pure formatting/mapping helpers are split out for tests.
+fn format_approval_prompt(command: &str, cwd: &str, reason: &str, risk: &str) -> String {
+    let mut out = String::from("Codex wants to ");
+    if risk == "files" {
+        out.push_str(&format!("{command}\n"));
+    } else {
+        out.push_str("run:\n");
+        out.push_str(&format!("  $ {command}"));
+        if !cwd.is_empty() {
+            out.push_str(&format!("    (in {cwd})"));
+        }
+        out.push('\n');
+    }
+    if !reason.is_empty() || risk == "network" {
+        out.push_str("  ");
+        if !reason.is_empty() {
+            out.push_str(&format!("reason: {reason}"));
+        }
+        if risk == "network" {
+            out.push_str("   [network access]");
+        }
+        out.push('\n');
+    }
+    out.push_str("Allow? [y]es once / [a]lways this session / [n]o: ");
+    out
+}
+
+/// Map one terminal input line to a decision. Anything unrecognized denies.
+fn map_approval_input(input: &str) -> &'static str {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => "accept",
+        "a" | "always" => "acceptForSession",
+        _ => "decline",
+    }
+}
+
+/// The stdin decision line the bridge service expects (Part 3 vocabulary).
+fn build_decision_line(id: &str, decision: &str) -> String {
+    serde_json::json!({
+        "type": "approval_decision",
+        "id": id,
+        "decision": decision,
+    })
+    .to_string()
+}
+
+/// Best-effort SIGTERM so the bridge service can map it to `turn/interrupt`.
+/// (tokio's kill_on_drop is SIGKILL — that skips the graceful path.)
+fn send_sigterm(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid; // Windows: no SIGTERM — the kill_on_drop path handles it.
+    }
+}
+
+#[cfg(test)]
+mod approval_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn approval_prompt_shows_command_cwd_reason_and_network_badge() {
+        let prompt = format_approval_prompt(
+            "npx playwright install",
+            "/home/u/proj",
+            "needs browsers",
+            "network",
+        );
+        assert!(prompt.contains("$ npx playwright install"));
+        assert!(prompt.contains("(in /home/u/proj)"));
+        assert!(prompt.contains("reason: needs browsers"));
+        assert!(prompt.contains("[network access]"));
+        assert!(prompt.contains("[y]es once / [a]lways this session / [n]o"));
+    }
+
+    #[test]
+    fn approval_prompt_file_change_shape() {
+        let prompt = format_approval_prompt("apply changes to: a.rs, b.rs", "", "", "files");
+        assert!(prompt.starts_with("Codex wants to apply changes to: a.rs, b.rs"));
+        assert!(!prompt.contains("$ "));
+    }
+
+    #[test]
+    fn approval_input_mapping_denies_by_default() {
+        assert_eq!(map_approval_input("y"), "accept");
+        assert_eq!(map_approval_input("YES\n"), "accept");
+        assert_eq!(map_approval_input("a"), "acceptForSession");
+        assert_eq!(map_approval_input("always"), "acceptForSession");
+        assert_eq!(map_approval_input("n"), "decline");
+        assert_eq!(map_approval_input(""), "decline");
+        assert_eq!(map_approval_input("whatever"), "decline");
+    }
+
+    #[test]
+    fn decision_line_is_the_part3_stdin_vocabulary() {
+        let line = build_decision_line("7", "acceptForSession");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "approval_decision");
+        assert_eq!(v["id"], "7");
+        assert_eq!(v["decision"], "acceptForSession");
+    }
+}
+
 async fn consume_turn_events<S, C>(
     app: &mut App,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     started: Instant,
     mut save: S,
     cancel: C,
+    decision_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    child_pid: Option<std::sync::Arc<std::sync::Mutex<Option<u32>>>>,
 ) -> Result<bool, Box<dyn std::error::Error>>
 where
     S: FnMut(&App),
@@ -1195,6 +1342,8 @@ where
     let mut printed_thinking = false;
     let mut last_tool_line = String::new();
     let mut bridge_used = false;
+    let mut command_output_lines = 0usize;
+    let mut command_output_capped = false;
 
     // Loading indicator: while we wait for the first output (browser providers
     // can take many seconds to scrape a reply), animate a spinner in place.
@@ -1220,6 +1369,29 @@ where
                 clear_spinner_line(spinner_active);
                 if printed_answer_label && !assistant.ends_with('\n') {
                     println!();
+                }
+                // Parity Part 4: interrupt, don't kill. SIGTERM lets the
+                // bridge service map it to a graceful turn/interrupt; the
+                // caller's handle.abort() (SIGKILL via kill_on_drop) stays
+                // the hard fallback after a 5s grace drain.
+                let pid = child_pid
+                    .as_ref()
+                    .and_then(|slot| slot.lock().ok().and_then(|p| *p));
+                if let Some(pid) = pid {
+                    print_note("⏹ interrupting…");
+                    send_sigterm(pid);
+                    let grace = tokio::time::sleep(Duration::from_secs(5));
+                    tokio::pin!(grace);
+                    loop {
+                        tokio::select! {
+                            maybe = rx.recv() => match maybe {
+                                Some(AppEvent::TurnPhase(phase)) if phase == "interrupted" => break,
+                                Some(_) => continue,   // drain quietly
+                                None => break,          // child exited
+                            },
+                            _ = &mut grace => break,
+                        }
+                    }
                 }
                 print_note("(cancelled)");
                 if !assistant.trim().is_empty() {
@@ -1280,6 +1452,92 @@ where
                     }
                     print_note(&line);
                     last_tool_line = line;
+                }
+            }
+            AppEvent::ApprovalRequest {
+                id,
+                command,
+                cwd,
+                reason,
+                risk,
+            } => {
+                produced_output = true;
+                if printed_answer_label && !assistant.ends_with('\n') {
+                    println!();
+                }
+                print!("{}", format_approval_prompt(&command, &cwd, &reason, &risk));
+                stdout().flush()?;
+                // Between turns rustyline owns stdin; mid-turn (here) nothing
+                // else reads it — same mechanism as confirm_run_outside_git_repo.
+                let input = tokio::task::spawn_blocking(|| {
+                    let mut line = String::new();
+                    match io::stdin().read_line(&mut line) {
+                        Ok(_) => line,
+                        Err(_) => String::new(),
+                    }
+                })
+                .await
+                .unwrap_or_default();
+                let decision = map_approval_input(&input);
+                if let Some(dtx) = decision_tx.as_ref() {
+                    let _ = dtx.send(build_decision_line(&id, decision));
+                }
+                let verdict = match decision {
+                    "accept" => "approved once",
+                    "acceptForSession" => "approved for this session",
+                    _ => "denied",
+                };
+                print_note(&format!("({verdict})"));
+            }
+            AppEvent::CommandOutput(chunk) => {
+                produced_output = true;
+                command_output_lines += chunk.lines().count().max(1);
+                if command_output_lines <= 40 {
+                    for line in chunk.lines() {
+                        println!("{}", paint_dim(&format!("  │ {line}")));
+                    }
+                } else if !command_output_capped {
+                    command_output_capped = true;
+                    print_note("  │ … (further command output hidden)");
+                }
+            }
+            AppEvent::PlanUpdate(steps) => {
+                produced_output = true;
+                if !steps.is_empty() {
+                    if printed_answer_label && !assistant.ends_with('\n') {
+                        println!();
+                    }
+                    for (step, status) in &steps {
+                        let mark = match status.as_str() {
+                            "completed" => "✓",
+                            "inProgress" | "in_progress" => "▸",
+                            _ => "○",
+                        };
+                        println!("{}", paint_dim(&format!("  {mark} {step}")));
+                    }
+                }
+            }
+            AppEvent::DiffUpdate(diff) => {
+                produced_output = true;
+                let files = diff.lines().filter(|l| l.starts_with("+++ ")).count();
+                let added = diff
+                    .lines()
+                    .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+                    .count();
+                let removed = diff
+                    .lines()
+                    .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+                    .count();
+                if files > 0 || added > 0 || removed > 0 {
+                    print_note(&format!("diff: {files} file(s), +{added} −{removed}"));
+                }
+            }
+            AppEvent::TokenUsage { .. } => {
+                // Tracked codex-side; too chatty to render per update.
+            }
+            AppEvent::TurnPhase(phase) => {
+                if phase == "interrupted" {
+                    print_note("⏹ turn interrupted");
                 }
             }
             AppEvent::Done(used_bridge) => {
@@ -1711,6 +1969,8 @@ mod tests {
             Instant::now(),
             save_into(&dir),
             std::future::ready(()),
+            None,
+            None,
         )
         .await;
         assert!(res.is_ok(), "cancelled turn should return Ok, not hang");
@@ -1737,6 +1997,8 @@ mod tests {
             Instant::now(),
             save_into(&dir),
             std::future::pending::<()>(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1781,6 +2043,8 @@ mod tests {
             Instant::now(),
             save_into(&dir),
             std::future::pending::<()>(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1803,6 +2067,8 @@ mod tests {
             Instant::now(),
             save_into(&dir),
             std::future::pending::<()>(),
+            None,
+            None,
         )
         .await
         .unwrap();
