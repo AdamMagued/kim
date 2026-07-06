@@ -750,11 +750,11 @@ class _CodexProxy:
             return response
         if _is_thread_send_failure(response):
             return response
-        if _extract_shell_blocks(content) or _extract_file_directive(content) is not None:
-            # The prose carries executable actions (shell fences or a save-as
-            # file directive) — the converter executes those directly; nudging
-            # would waste a round trip (and protocol-refusing models answer
-            # the nudge with another refusal).
+        if _reply_has_salvageable_actions(content):
+            # The prose carries executable actions (json/shell fences or a
+            # save-as file directive) — the converter executes those directly;
+            # nudging would waste a round trip (and protocol-refusing models
+            # answer the nudge with another refusal).
             logger.info(f"[relay #{relay_num}] Prose reply has salvageable actions — executing, no nudge")
             return response
         logger.info(f"[relay #{relay_num}] Reply ignored the JSON contract — sending one format nudge")
@@ -775,8 +775,7 @@ class _CodexProxy:
             retry_text = str(retry_parsed.get("text") or "")
             if (
                 not retry_parsed.get("tool_calls")
-                and not _extract_shell_blocks(retry_text)
-                and _extract_file_directive(retry_text) is None
+                and not _reply_has_salvageable_actions(retry_text)
                 and _SELF_HELP_RE.search(retry_text)
             ):
                 # Format-compliant dodge: a final answer telling the USER to
@@ -787,8 +786,8 @@ class _CodexProxy:
                     f"[relay #{relay_num}] Nudge answered with do-it-yourself instructions — thread burned"
                 )
             return retry
-        if _extract_shell_blocks(retry_content) or _extract_file_directive(retry_content) is not None:
-            # Refused the JSON but handed over the work — good enough.
+        if _reply_has_salvageable_actions(retry_content):
+            # Refused the JSON reply but handed over the work — good enough.
             return retry
         # The thread ignored the contract even after an explicit format
         # nudge — it has talked itself out of the protocol (each refusal in
@@ -1288,6 +1287,15 @@ def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
     return normalized
 
 
+def _reply_has_salvageable_actions(content: object) -> bool:
+    """True when a non-contract reply still describes executable work."""
+    return bool(
+        _extract_json_tool_fences(content)
+        or _extract_shell_blocks(content)
+        or _extract_file_directive(content) is not None
+    )
+
+
 def _salvage_action_reply(content: object, request_tools: object) -> Optional[list]:
     """Convert a non-tool-call reply's described actions into real tool calls.
 
@@ -1298,6 +1306,10 @@ def _salvage_action_reply(content: object, request_tools: object) -> Optional[li
     Returns normalized tool calls, or None when the reply describes nothing
     executable.
     """
+    json_calls = _extract_json_tool_fences(content)
+    if json_calls:
+        print("[STATUS] Executing the tool call from Kim's reply…", flush=True)
+        return _normalize_tool_calls(json_calls, request_tools)
     blocks = _extract_shell_blocks(content)
     if blocks:
         print("[STATUS] Executing the shell commands from Kim's reply…", flush=True)
@@ -1513,6 +1525,42 @@ def _extract_shell_blocks(content: object) -> list:
     return [block.strip() for block in _SHELL_FENCE_RE.findall(content) if block.strip()]
 
 
+# Tool calls the model wrapped in a ```json fence ("Run this in your Codex
+# environment") instead of emitting them as its reply. Accepts three dict
+# shapes: a full contract ({"tool_calls": [...]}), a single call
+# ({"name", "input"}), or a bare exec input ({"cmd": ...}).
+_JSON_FENCE_RE = re.compile(r"```(?:json)?[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_json_tool_fences(content: object) -> list:
+    if not isinstance(content, str):
+        return []
+    calls = []
+    for block in _JSON_FENCE_RE.findall(content):
+        block = block.strip()
+        if not block.startswith(("{", "[")):
+            continue
+        try:
+            parsed = json.loads(block)
+        except (json.JSONDecodeError, TypeError):
+            try:
+                import json_repair  # type: ignore[import-not-found]
+                parsed = json_repair.repair_json(block, return_objects=True)
+            except Exception:
+                continue
+        for obj in parsed if isinstance(parsed, list) else [parsed]:
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("tool_calls"):
+                calls.extend(tc for tc in obj["tool_calls"] if isinstance(tc, dict))
+            elif obj.get("name") and isinstance(obj.get("input"), dict):
+                calls.append(obj)
+            elif isinstance(obj.get("cmd"), str) and obj["cmd"].strip():
+                inp = {k: v for k, v in obj.items() if k in ("cmd", "workdir")}
+                calls.append({"name": "exec", "input": inp})
+    return calls
+
+
 # "Save this code as X" replies: the model hands over a filename, the full
 # file content in a fence, and an open instruction — Kim synthesizes the
 # commands itself instead of begging the model to emit them.
@@ -1668,15 +1716,23 @@ def _provider_response_to_responses_api(
             if tool_calls:
                 tool_calls = _normalize_tool_calls(tool_calls, request_tools)
                 return _make_responses_tool_reply(resp_id, text, tool_calls)
+            # No tool_calls: the model may still have described actions — a
+            # ```bash/json fence or a save-as directive. Try the parsed `text`
+            # first (a genuine final answer embeds fences there with real
+            # newlines), then the full `content` (json_repair may have reduced
+            # `parsed` to a bare {"cmd": …} lifted out of a ```json fence,
+            # leaving the fence only in content).
             salvaged = _salvage_action_reply(text, request_tools)
+            if salvaged is None:
+                salvaged = _salvage_action_reply(content, request_tools)
             if salvaged is not None:
                 return _make_responses_tool_reply(resp_id, text, salvaged)
             return _make_responses_text_reply(resp_id, text or content)
 
         # Prose reply — before treating it as a final answer, execute any
-        # actions the model described: ```bash fences, or a "save this code
-        # as X" directive with the file body in a fence. Protocol-refusing
-        # models still hand the work over in these shapes.
+        # actions the model described: ```bash/json fences, or a "save this
+        # code as X" directive with the file body in a fence. Protocol-
+        # refusing models still hand the work over in these shapes.
         salvaged = _salvage_action_reply(content, request_tools)
         if salvaged is not None:
             return _make_responses_tool_reply(resp_id, content, salvaged)

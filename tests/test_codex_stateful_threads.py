@@ -767,6 +767,67 @@ class TestShellFenceSalvage(unittest.TestCase):
         self.assertEqual(reply["output"][0]["type"], "message")
 
 
+class TestJsonFenceSalvage(unittest.TestCase):
+    """The model writes a literal tool call in a ```json fence ('Run this in
+    your Codex environment') instead of emitting it as the reply."""
+
+    # Live shape: bare {"cmd": "bash -lc '...heredoc... open index.html'"}.
+    _PROSE = (
+        "I can't open a window, but here's the game.\n\n"
+        "Run this in your Codex environment:\n\n"
+        '```json\n{"cmd":"bash -lc \'cat > index.html << \\"EOF\\"\\n'
+        '<!DOCTYPE html>\\n<canvas></canvas>\\nEOF\\nopen index.html\'"}\n```\n\n'
+        "After it runs your browser should open."
+    )
+
+    def test_bare_cmd_object_becomes_exec_call(self):
+        from codex_engine.engine import _extract_json_tool_fences
+
+        calls = _extract_json_tool_fences(self._PROSE)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "exec")
+        cmd = calls[0]["input"]["cmd"]
+        self.assertIn("cat > index.html", cmd)
+        self.assertIn("open index.html", cmd)
+
+    def test_full_contract_in_json_fence(self):
+        from codex_engine.engine import _extract_json_tool_fences
+
+        prose = (
+            "Here you go:\n```json\n"
+            '{"text":"","tool_calls":[{"name":"exec_command","input":{"cmd":"ls"}}]}'
+            "\n```"
+        )
+        calls = _extract_json_tool_fences(prose)
+        self.assertEqual(calls, [{"name": "exec_command", "input": {"cmd": "ls"}}])
+
+    def test_single_call_object_in_json_fence(self):
+        from codex_engine.engine import _extract_json_tool_fences
+
+        prose = '```json\n{"name":"exec","input":{"cmd":"open x.html"}}\n```'
+        calls = _extract_json_tool_fences(prose)
+        self.assertEqual(calls[0]["input"]["cmd"], "open x.html")
+
+    def test_non_tool_json_fence_ignored(self):
+        from codex_engine.engine import _extract_json_tool_fences
+
+        self.assertEqual(_extract_json_tool_fences('```json\n{"score": 42}\n```'), [])
+        self.assertEqual(_extract_json_tool_fences("no fences"), [])
+
+    def test_json_fence_end_to_end_normalizes_to_exec_command(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": self._PROSE},
+            relay_num=1,
+            request_tools=_CODEX_TOOLS,
+        )
+        calls = [o for o in reply["output"] if o["type"] == "function_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "exec_command")
+        self.assertIn("open index.html", calls[0]["arguments"])
+
+
 class TestFileDirectiveSalvage(unittest.TestCase):
     """'Save this code as X' replies: filename directive + fenced body →
     Kim synthesizes the write+open commands the model refused to emit."""
