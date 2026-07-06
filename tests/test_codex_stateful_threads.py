@@ -268,6 +268,34 @@ class TestCompactBrowserThread(unittest.IsolatedAsyncioTestCase):
 # /compact control-task routing parity with the chat agent
 # ---------------------------------------------------------------------------
 
+class TestIsGitRepo(unittest.TestCase):
+    """The non-git-repo gate that decides whether Codex needs
+    --skip-git-repo-check (codex_bridge_service._is_git_repo)."""
+
+    def test_dir_with_dot_git_is_a_repo(self):
+        from orchestrator import codex_bridge_service as svc
+
+        with TemporaryDirectory() as d:
+            (Path(d) / ".git").mkdir()
+            self.assertTrue(svc._is_git_repo(d))
+
+    def test_nested_dir_walks_up_to_dot_git(self):
+        from orchestrator import codex_bridge_service as svc
+
+        with TemporaryDirectory() as d:
+            (Path(d) / ".git").mkdir()
+            nested = Path(d) / "src" / "deep"
+            nested.mkdir(parents=True)
+            self.assertTrue(svc._is_git_repo(str(nested)))
+
+    def test_dir_without_dot_git_is_not_a_repo(self):
+        from orchestrator import codex_bridge_service as svc
+
+        with TemporaryDirectory() as d:
+            # A bare temp dir has no .git anywhere up its tree.
+            self.assertFalse(svc._is_git_repo(str(Path(d) / "child")))
+
+
 class TestCompactControlTasks(unittest.TestCase):
     def test_compact_control_tasks_recognized(self):
         from orchestrator import codex_bridge_service as svc

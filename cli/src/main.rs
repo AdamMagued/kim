@@ -6,7 +6,7 @@ mod provider;
 mod sessions;
 
 use std::io::{self, stdout, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use commands::{
@@ -127,6 +127,9 @@ pub struct App {
     pub view: ViewState,
     pub provider_ready: bool,
     pub status: String,
+    /// Set once the user confirms running Codex outside a git repo (code mode),
+    /// so we don't re-prompt every turn of the session.
+    pub allow_non_git_codex: bool,
 }
 
 impl App {
@@ -142,6 +145,7 @@ impl App {
             view: ViewState::SessionMenu,
             provider_ready: false,
             status: "ready".to_string(),
+            allow_non_git_codex: false,
         };
         if let Some(id) = resume_id {
             app.resume_session(id);
@@ -1055,10 +1059,55 @@ fn maybe_note_plain_chat(code_mode: bool, provider: &str) {
     }
 }
 
+/// Control tasks that never spawn Codex (they compact the browser thread), so
+/// they must skip the git-repo confirmation. Mirrors `_COMPACT_CONTROL_TASKS`
+/// in orchestrator/codex_bridge_service.py.
+fn is_compact_control_task(task: &str) -> bool {
+    matches!(
+        task.trim().to_ascii_lowercase().as_str(),
+        "/compact" | "compact" | "__kim_compact_context__"
+    )
+}
+
+/// Interactive y/N: confirm running Codex in a directory that is not a git repo.
+/// Returns true only on an explicit yes; a non-tty / EOF / read error is "no".
+fn confirm_run_outside_git_repo(cwd: &Path) -> bool {
+    print!(
+        "⚠  {} is not a git repository.\n   \
+         Codex can't track or undo its edits here. Run anyway? [y/N] ",
+        cwd.display()
+    );
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 async fn stream_repl_turn(
     app: &mut App,
     prompt: String,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    // Code mode runs Codex, which refuses to operate outside a git repository
+    // (so its edits stay trackable/undoable). Rather than fail hard, confirm
+    // once per session before running in a non-git directory. Compact control
+    // tasks never reach Codex, so they skip this.
+    if app.mode == AppMode::Code && !is_compact_control_task(&prompt) && !app.allow_non_git_codex {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if !crate::provider::is_git_repo(&cwd) {
+            if confirm_run_outside_git_repo(&cwd) {
+                app.allow_non_git_codex = true;
+            } else {
+                println!(
+                    "Cancelled. Codex needs a git repo — run Kim from inside one, \
+                     or `git init` here first."
+                );
+                return Ok(false);
+            }
+        }
+    }
+
     app.view = ViewState::InChat;
     app.push(MessageRole::User, prompt.clone());
     // Persist the user turn up front so the session file exists even if the
@@ -1070,6 +1119,7 @@ async fn stream_repl_turn(
     let history = app.chat_history();
     let config = app.config.clone();
     let code_mode = app.mode == AppMode::Code;
+    let allow_non_git = app.allow_non_git_codex;
     let session_id = app.current_session_id.clone();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
@@ -1100,7 +1150,7 @@ async fn stream_repl_turn(
     } else {
         maybe_note_plain_chat(code_mode, &config.provider);
         tokio::spawn(async move {
-            stream_kim_request(&config, &history, code_mode, &session_id, tx).await;
+            stream_kim_request(&config, &history, code_mode, &session_id, allow_non_git, tx).await;
         })
     };
 
@@ -1584,6 +1634,7 @@ mod tests {
             view: ViewState::InChat,
             provider_ready: true,
             status: "ready".to_string(),
+            allow_non_git_codex: false,
         }
     }
 

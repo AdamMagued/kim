@@ -149,35 +149,75 @@ def _status(message: str) -> None:
     emit_status(message)
 
 
-async def _request_hitl_approval(task: str) -> bool:
-    """Emit a HITL approval request event and block on stdin for the user's decision (#2).
+def _is_git_repo(cwd: str) -> bool:
+    """True if ``cwd`` (or any ancestor) is inside a git working tree.
 
-    The Rust supervisor reads our stdout, sees the event, shows a confirmation
-    dialog in the UI, then writes {"type": "hitl_approve", "approved": bool} to
-    our stdin.  We block here (with a 120 s timeout) until that decision arrives.
+    Mirrors the check Codex itself performs before ``codex exec``: it walks up
+    looking for a ``.git`` marker (a directory in a normal clone, or a file in a
+    git worktree/submodule).  Used to decide whether Codex needs the explicit
+    ``--skip-git-repo-check`` opt-in.
+    """
+    try:
+        start = Path(cwd).resolve()
+    except Exception:  # noqa: BLE001
+        return False
+    for cur in (start, *start.parents):
+        if (cur / ".git").exists():
+            return True
+    return False
 
-    Returns True if approved, False if denied or timed out.
+
+async def _await_hitl_decision(timeout: float = 120.0) -> bool:
+    """Block on stdin for a {"approved": bool} line from the Rust supervisor.
+
+    The supervisor reads our stdout, shows a confirmation dialog, then writes
+    {"type": "hitl_approve", "approved": bool} to our stdin.  Returns True only
+    on an explicit approval; any error/timeout denies.
     """
     import asyncio
 
+    loop = asyncio.get_running_loop()
+    try:
+        line: str = await asyncio.wait_for(
+            loop.run_in_executor(None, sys.stdin.readline),
+            timeout=timeout,
+        )
+        data = json.loads(line.strip())
+        return bool(data.get("approved", False))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("HITL stdin read failed (%s) — denying", exc)
+        return False
+
+
+async def _request_hitl_approval(task: str) -> bool:
+    """Emit a HITL approval request event and block on stdin for the decision (#2).
+
+    Returns True if approved, False if denied or timed out.
+    """
     emit_hitl_approval_request(
         "codex_bridge",
         "high",
         "Codex can execute arbitrary shell commands in your project directory.",
         task[:200],
     )
+    return await _await_hitl_decision()
 
-    loop = asyncio.get_running_loop()
-    try:
-        line: str = await asyncio.wait_for(
-            loop.run_in_executor(None, sys.stdin.readline),
-            timeout=120.0,
-        )
-        data = json.loads(line.strip())
-        return bool(data.get("approved", False))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("HITL stdin read failed (%s) — denying Codex launch", exc)
-        return False
+
+async def _request_git_check_approval(cwd: str) -> bool:
+    """Ask the user to confirm running Codex in a non-git directory.
+
+    Codex normally refuses to run outside a git repository so its edits stay
+    trackable/undoable.  When the user opts in we pass ``--skip-git-repo-check``;
+    this gate makes that opt-in explicit rather than silent.
+    """
+    emit_hitl_approval_request(
+        "codex_bridge_git_check",
+        "high",
+        "This folder is not a git repository, so Codex cannot track or undo its "
+        "edits here. Run Codex in this directory anyway?",
+        cwd[:200],
+    )
+    return await _await_hitl_decision()
 
 
 async def _compact_browser_thread(provider, cwd: str, provider_name: str) -> tuple[bool, str]:
@@ -259,6 +299,36 @@ async def _run_async(args: argparse.Namespace) -> int:
         if not approved:
             _status("Codex launch denied by user. No code was executed.")
             print("[FAILED] Codex launch denied by user.", flush=True)
+            return 1
+
+    # Gate: Codex refuses to run outside a git repo (so its edits stay
+    # trackable) unless --skip-git-repo-check is passed.  Rather than fail hard,
+    # let the user opt in explicitly.  The CLI does its own terminal y/N prompt
+    # and signals approval via KIM_CODEX_SKIP_GIT_CHECK=1; the desktop uses the
+    # stdin HITL dialog.  Either way the opt-in is never silent.
+    skip_git_check = False
+    if not _is_git_repo(args.cwd):
+        if os.environ.get("KIM_CODEX_SKIP_GIT_CHECK", "").strip() == "1":
+            skip_git_check = True
+        elif os.environ.get("KIM_TAURI_MODE") == "1":
+            if await _request_git_check_approval(args.cwd):
+                skip_git_check = True
+            else:
+                _status("Codex launch declined — this folder is not a git repository.")
+                print(
+                    "[FAILED] Not a git repository and running Codex here was declined.",
+                    flush=True,
+                )
+                return 1
+        else:
+            # No interactive channel to confirm on — refuse rather than bypass
+            # Codex's safety gate silently.
+            _status("Not a git repository — Codex needs a git repo or explicit confirmation.")
+            print(
+                "[FAILED] Not a git repository. Run Kim from inside a git repo, "
+                "`git init` here, or confirm when prompted to run anyway.",
+                flush=True,
+            )
             return 1
 
     _status(f"✓ Using Codex via browser bridge ({args.provider})")
@@ -348,6 +418,8 @@ async def _run_async(args: argparse.Namespace) -> int:
             ]
             if bypass_flag == "1":
                 cmd.append("--dangerously-bypass-approvals-and-sandbox")
+            if skip_git_check:
+                cmd.append("--skip-git-repo-check")
             cmd += ["-C", args.cwd, args.task]
 
             try:

@@ -115,6 +115,21 @@ pub fn is_browser_provider(name: &str) -> bool {
     n.eq_ignore_ascii_case("browser") || n.to_ascii_lowercase().starts_with("browser:")
 }
 
+/// True if `dir` (or any ancestor) is inside a git working tree — the same
+/// check Codex performs before `codex exec`. Walks up looking for a `.git`
+/// marker (a directory in a normal clone, a file in a worktree/submodule).
+pub fn is_git_repo(dir: &Path) -> bool {
+    let mut cur = dir.to_path_buf();
+    loop {
+        if cur.join(".git").exists() {
+            return true;
+        }
+        if !cur.pop() {
+            return false;
+        }
+    }
+}
+
 pub fn provider_info(name: &str) -> Option<ProviderInfo> {
     PROVIDERS
         .iter()
@@ -129,6 +144,7 @@ pub async fn stream_kim_request(
     messages: &[ChatMessage],
     code_mode: bool,
     _session_id: &str,
+    allow_non_git: bool,
     tx: UnboundedSender<AppEvent>,
 ) {
     let prompt = messages
@@ -146,7 +162,7 @@ pub async fn stream_kim_request(
     // Browser providers intentionally stay on this path so Code mode can use
     // orchestrator.codex_bridge_service instead of the desktop chat bridge.
     if code_mode {
-        stream_codex_subprocess(config, prompt, tx).await;
+        stream_codex_subprocess(config, prompt, allow_non_git, tx).await;
         return;
     }
 
@@ -915,7 +931,12 @@ fn split_before_tail_chars(text: &str, keep: usize) -> usize {
 Codex subprocess (Code mode)
 =========================================================== */
 
-async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: UnboundedSender<AppEvent>) {
+async fn stream_codex_subprocess(
+    config: &KimConfig,
+    prompt: &str,
+    allow_non_git: bool,
+    tx: UnboundedSender<AppEvent>,
+) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
 
@@ -965,6 +986,13 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
             .current_dir(&kim_root)
             .env("PYTHONPATH", &kim_root)
             .env("PROJECT_ROOT", &kim_root)
+            // Signal the bridge that the user already confirmed running Codex
+            // outside a git repo (see the y/N prompt in stream_repl_turn). Only
+            // set when approved so the bridge's own gate stays in force otherwise.
+            .env(
+                "KIM_CODEX_SKIP_GIT_CHECK",
+                if allow_non_git { "1" } else { "0" },
+            )
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -1010,7 +1038,7 @@ async fn stream_codex_subprocess(config: &KimConfig, prompt: &str, tx: Unbounded
         // CLI user, even those who didn't need it.
         let bypass_sandbox = std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1");
         let cwd_str = cwd.to_string_lossy().into_owned();
-        let codex_args = build_codex_args(prompt, &cwd_str, bypass_sandbox);
+        let codex_args = build_codex_args(prompt, &cwd_str, bypass_sandbox, allow_non_git);
         match Command::new("codex")
             .args(&codex_args)
             .env("OPENAI_API_KEY", "ollama")
@@ -1308,10 +1336,15 @@ async fn start_responses_proxy(
 /// Always produces `["exec", "--json", …, "-C", cwd, prompt]`.
 /// The `--dangerously-bypass-approvals-and-sandbox` flag is inserted only when
 /// `bypass` is true (opt-in via `KIM_CODEX_BYPASS_SANDBOX=1`).
-fn build_codex_args(prompt: &str, cwd: &str, bypass: bool) -> Vec<String> {
+/// `--skip-git-repo-check` is inserted only when `skip_git_check` is true (the
+/// user confirmed running Codex outside a git repo).
+fn build_codex_args(prompt: &str, cwd: &str, bypass: bool, skip_git_check: bool) -> Vec<String> {
     let mut args: Vec<String> = vec!["exec".into(), "--json".into()];
     if bypass {
         args.push("--dangerously-bypass-approvals-and-sandbox".into());
+    }
+    if skip_git_check {
+        args.push("--skip-git-repo-check".into());
     }
     args.push("-C".into());
     args.push(cwd.to_string());
@@ -1965,7 +1998,7 @@ mod tests {
         let cwd = "/home/user/project";
 
         // bypass=false: the dangerous flag must NOT appear.
-        let no_bypass = build_codex_args(prompt, cwd, false);
+        let no_bypass = build_codex_args(prompt, cwd, false, false);
         assert!(
             !no_bypass
                 .iter()
@@ -1984,7 +2017,7 @@ mod tests {
         assert_eq!(&no_bypass[n - 1], prompt, "prompt must be the last arg");
 
         // bypass=true: the flag must appear, and argv must still end correctly.
-        let with_bypass = build_codex_args(prompt, cwd, true);
+        let with_bypass = build_codex_args(prompt, cwd, true, false);
         assert!(
             with_bypass
                 .iter()
@@ -1996,6 +2029,44 @@ mod tests {
         assert_eq!(&with_bypass[n - 3], "-C");
         assert_eq!(&with_bypass[n - 2], cwd);
         assert_eq!(&with_bypass[n - 1], prompt);
+    }
+
+    #[test]
+    fn codex_args_skip_git_check_gated() {
+        let prompt = "hi";
+        let cwd = "/tmp/not-a-repo";
+
+        // skip_git_check=false: the flag must NOT appear.
+        let off = build_codex_args(prompt, cwd, false, false);
+        assert!(
+            !off.iter().any(|a| a == "--skip-git-repo-check"),
+            "skip_git_check=false must not include the flag; got {off:?}"
+        );
+
+        // skip_git_check=true: the flag appears, argv still ends -C cwd prompt.
+        let on = build_codex_args(prompt, cwd, false, true);
+        assert!(
+            on.iter().any(|a| a == "--skip-git-repo-check"),
+            "skip_git_check=true must include the flag; got {on:?}"
+        );
+        let n = on.len();
+        assert_eq!(&on[n - 3], "-C");
+        assert_eq!(&on[n - 2], cwd);
+        assert_eq!(&on[n - 1], prompt);
+    }
+
+    #[test]
+    fn is_git_repo_walks_up_to_dot_git() {
+        // .git in an ancestor → inside a repo, even from a nested subdir.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let nested = repo.path().join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(is_git_repo(&nested), "should find .git in an ancestor dir");
+
+        // A fresh temp dir with no .git anywhere up the tree → not a repo.
+        let bare = tempfile::tempdir().unwrap();
+        assert!(!is_git_repo(bare.path()), "no .git ancestor → false");
     }
 
     // ── anthropic_max_tokens_constant (#24) ──────────────────────────────────
