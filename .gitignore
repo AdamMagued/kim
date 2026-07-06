@@ -38,6 +38,9 @@ desktop/.vite/
 logs/
 *.log
 *.jsonl
+# …but committed test fixtures are not runtime traces — keep them tracked.
+!codex_engine/appserver_schema/*.jsonl
+!tests/**/*.jsonl
 
 # ── Runtime: browser session persistence ──────────────────────────────────────
 sessions/
