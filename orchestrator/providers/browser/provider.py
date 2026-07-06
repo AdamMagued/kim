@@ -824,11 +824,20 @@ class BrowserProvider(BaseProvider):
             old_conv = self._extract_conversation_id(self._last_chat_page_url)
             new_conv = self._extract_conversation_id(new_url)
             if old_conv != new_conv:
-                logger.info(
-                    f"Conversation changed within {old_site}: "
-                    f"{old_conv!r} -> {new_conv!r}, will re-inject system prompt."
-                )
-                self._sent_system_prompt = False
+                if re.match(r"^/(?:new|app|chat)?/?$", old_conv):
+                    # A brand-new chat materialized its conversation id
+                    # (chatgpt.com/ → /c/<id> after the first reply) — same
+                    # conversation, the system prompt is already in it.
+                    logger.debug(
+                        f"New chat got its conversation id within {old_site}: "
+                        f"{old_conv!r} -> {new_conv!r} (keeping system prompt)"
+                    )
+                else:
+                    logger.info(
+                        f"Conversation changed within {old_site}: "
+                        f"{old_conv!r} -> {new_conv!r}, will re-inject system prompt."
+                    )
+                    self._sent_system_prompt = False
             else:
                 logger.debug(
                     f"URL changed within same site {old_site}: "

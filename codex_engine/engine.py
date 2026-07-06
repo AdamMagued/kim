@@ -778,6 +778,11 @@ class _CodexProxy:
             return response
         if _parse_contract(content) is not None:
             return response
+        if _is_done_reply(content):
+            # A bare DONE is the terminal-mode finish signal, not a missing
+            # command — nudging it makes the model say DONE twice and falsely
+            # burns the thread.
+            return response
         if _is_thread_send_failure(response):
             return response
         if _reply_has_salvageable_actions(content):
@@ -820,6 +825,10 @@ class _CodexProxy:
             return retry
         if _reply_has_salvageable_actions(retry_content):
             # Refused the JSON reply but handed over the work — good enough.
+            return retry
+        if _is_done_reply(retry_content):
+            # The nudge was answered with the finish signal — the task is
+            # done; don't burn a thread that just completed cleanly.
             return retry
         # The thread ignored the contract even after an explicit format
         # nudge — it has talked itself out of the protocol (each refusal in

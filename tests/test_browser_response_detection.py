@@ -380,6 +380,44 @@ class TestFindChatPagePreferredSite(unittest.IsolatedAsyncioTestCase):
         self.assertIs(page, gemini)
 
 
+class TestMaybeResetSystemPrompt(unittest.TestCase):
+    """A brand-new chat materializing its conversation id (chatgpt.com/ →
+    /c/<id> after the first reply) is the SAME conversation — re-injecting the
+    full [SYSTEM] block mid-chat confused both the model and the user."""
+
+    def test_new_chat_getting_its_id_keeps_system_prompt(self):
+        p = _provider(preferred_site="chatgpt")
+        p._sent_system_prompt = True
+        p._last_chat_site = "chatgpt"
+        p._last_chat_page_url = "https://chatgpt.com/"
+        p._maybe_reset_system_prompt("https://chatgpt.com/c/abc123")
+        self.assertTrue(p._sent_system_prompt)
+
+    def test_gemini_app_root_getting_id_keeps_system_prompt(self):
+        p = _provider(preferred_site="gemini")
+        p._sent_system_prompt = True
+        p._last_chat_site = "gemini"
+        p._last_chat_page_url = "https://gemini.google.com/app"
+        p._maybe_reset_system_prompt("https://gemini.google.com/app/deadbeef")
+        self.assertTrue(p._sent_system_prompt)
+
+    def test_real_conversation_switch_still_resets(self):
+        p = _provider(preferred_site="chatgpt")
+        p._sent_system_prompt = True
+        p._last_chat_site = "chatgpt"
+        p._last_chat_page_url = "https://chatgpt.com/c/abc123"
+        p._maybe_reset_system_prompt("https://chatgpt.com/c/other456")
+        self.assertFalse(p._sent_system_prompt)
+
+    def test_site_change_still_resets(self):
+        p = _provider(preferred_site="chatgpt")
+        p._sent_system_prompt = True
+        p._last_chat_site = "chatgpt"
+        p._last_chat_page_url = "https://chatgpt.com/c/abc123"
+        p._maybe_reset_system_prompt("https://gemini.google.com/app/x")
+        self.assertFalse(p._sent_system_prompt)
+
+
 class TestOpenPreferredSiteTab(unittest.IsolatedAsyncioTestCase):
     async def test_opens_launch_url_in_new_tab(self):
         p = _provider(preferred_site="chatgpt")

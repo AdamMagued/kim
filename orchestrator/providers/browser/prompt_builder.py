@@ -400,11 +400,18 @@ def format_prompt(
         prompt = last_text + "\n\n" + transport_marker_instruction(completion_hash)
 
     if len(prompt) > max_inject_chars:
-        trim_at = max_inject_chars - 200
-        prompt = (
-            prompt[:200]
-            + "\n…[earlier context trimmed — see browser history]…\n"
-            + prompt[-trim_at:]
-        )
+        # Preserve the ENTIRE [SYSTEM] block + transport-marker instruction as
+        # the head — a 200-char head silently drops the operating rules (the
+        # codex terminal contract, the JSON contract), and the model then
+        # answers in free prose. Trim from the middle instead: the head runs
+        # through the end of the marker instruction, capped at half the budget.
+        notice = "\n…[earlier context trimmed — see browser history]…\n"
+        head_end = 200
+        anchor = "END_OF_RESPONSE marker or KIM_* token."
+        marker_end = prompt.find(anchor)
+        if marker_end != -1:
+            head_end = min(marker_end + len(anchor), max_inject_chars // 2)
+        tail_len = max(0, max_inject_chars - head_end - len(notice))
+        prompt = prompt[:head_end] + notice + prompt[-tail_len:]
 
     return prompt, attachments, completion_hash, new_sent_system_prompt

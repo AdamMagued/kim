@@ -1155,6 +1155,39 @@ class TestRepeatedCommandLoopGuard(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("reply with just DONE", sent)
 
 
+class TestDoneSkipsNudge(unittest.IsolatedAsyncioTestCase):
+    """Real run 2026-07-06: the model replied a clean DONE and the bridge
+    answered with the 'I couldn't run that' nudge — making it say DONE twice
+    and falsely burning the thread. DONE is the finish signal, never nudged."""
+
+    async def test_done_reply_is_not_nudged(self):
+        from codex_engine.engine import _CodexProxy
+
+        provider = _RecordingProvider([{"type": "text", "content": "should not be called"}])
+        proxy = _CodexProxy(
+            provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
+        )
+        response = {"type": "text", "content": "DONE"}
+        result = await proxy._nudge_contract_retry(response, relay_num=2)
+        self.assertIs(result, response)
+        self.assertEqual(provider.calls, [])  # no nudge round-trip
+        self.assertNotIn("burned", proxy._thread_state)
+
+    async def test_done_answer_to_nudge_does_not_burn_thread(self):
+        from codex_engine.engine import _CodexProxy
+
+        # If a nudge does go out (non-DONE prose) and the model answers DONE,
+        # the thread completed cleanly — it must not be marked burned.
+        provider = _RecordingProvider([{"type": "text", "content": "Done."}])
+        proxy = _CodexProxy(
+            provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
+        )
+        response = {"type": "text", "content": "I think everything is in place now, all good."}
+        result = await proxy._nudge_contract_retry(response, relay_num=2)
+        self.assertEqual(result, {"type": "text", "content": "Done."})
+        self.assertNotIn("burned", proxy._thread_state)
+
+
 class TestRepeatGuardHelpers(unittest.TestCase):
     """Unit coverage for the subset loop-guard primitives."""
 

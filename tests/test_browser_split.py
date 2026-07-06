@@ -231,6 +231,40 @@ class TestFormatPrompt(unittest.TestCase):
         )
         assert len(result) == 4
 
+    def test_trim_preserves_full_system_block(self):
+        # Real run 2026-07-06: codex's forwarded tool schemas blew past
+        # max_inject_chars and the old head-of-200-chars trim cut the terminal
+        # rules mid-sentence — ChatGPT never saw "one command per turn" and
+        # answered in save-it-yourself prose. The trim must keep the ENTIRE
+        # [SYSTEM] block + marker instruction and cut the middle instead.
+        system = (
+            "You are Kim (codex bridge terminal mode). "
+            "Reply with EXACTLY ONE shell command per turn."
+        )
+        huge_middle = "x" * 20000
+        messages = [{"role": "user", "content": f"{huge_middle}\nmake me a game"}]
+        prompt, _, _, _ = self.format(
+            messages, [], system,
+            sent_system_prompt=False, max_inject_chars=8000, use_webview_bridge=False,
+        )
+        assert len(prompt) <= 8000 + 100
+        assert "EXACTLY ONE shell command per turn" in prompt  # system intact
+        assert "KIM_* token." in prompt.split("…[earlier context trimmed")[0]  # marker in head
+        assert "…[earlier context trimmed — see browser history]…" in prompt
+        assert "make me a game" in prompt  # tail (the actual task) survives
+
+    def test_trim_without_system_still_works(self):
+        # Continuation sends (sent_system_prompt=True) have the marker at the
+        # END — the head cap must not duplicate or lose it.
+        messages = [{"role": "user", "content": "y" * 20000 + "\nfinal ask"}]
+        prompt, _, _, _ = self.format(
+            messages, [], "",
+            sent_system_prompt=True, max_inject_chars=8000, use_webview_bridge=False,
+        )
+        assert len(prompt) <= 8000 + 100
+        assert "final ask" in prompt
+        assert prompt.count("KIM_* token.") == 1
+
     def test_data_uri_extracted(self):
         msg = "look at data:image/png;base64,iVBORw0KGgo= this"
         messages = [{"role": "user", "content": msg}]
