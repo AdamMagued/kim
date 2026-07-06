@@ -103,4 +103,8 @@ export interface HitlApprovalStatus {
   preview?: string;
   /** T1: correlation id — echoed back on the decision so Python voids stale approvals. */
   id?: string;
+  /** A3/B10: true once the user clicked a decision and it was handed to the
+   *  backend. Disables the card's buttons so a second click can't buffer a
+   *  stdin decision line that the NEXT approval gate would consume. */
+  decisionSent?: boolean;
 }
