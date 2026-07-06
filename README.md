@@ -16,7 +16,6 @@ Kim is a local AI agent platform that connects any cloud LLM (Claude, Gemini, GP
 - **Code workspace:** Integrated code agent (Code tab) powered by Claw/Codex with browser-provider backend
 - **MCP server:** 31 OS-control tools exposed via the Model Context Protocol — usable from Claude Code or any MCP client
 - **Session history:** Every run is saved as a JSONL trace in `kim_sessions/`
-- **Relay:** Optional phone-to-desktop task relay (feature-flag off in 1.0)
 
 ---
 

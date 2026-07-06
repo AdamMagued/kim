@@ -21,7 +21,6 @@ mod google_oauth;
 pub(crate) mod http_bridge;
 pub mod ollama;
 pub mod provider_auth;
-pub mod relay;
 pub mod run_history;
 pub mod schedule_commands;
 mod scheduler;
@@ -29,7 +28,6 @@ mod screenshot_flash;
 pub mod secrets;
 pub mod session_commands;
 mod speed_access;
-pub mod voice_config;
 pub(crate) use browser_bridge::*;
 mod paths;
 pub(crate) use paths::*;
@@ -726,7 +724,6 @@ pub(crate) mod window_manager;
 pub(crate) use window_manager::{set_task_active_mode, show_main_window};
 pub(crate) mod updater;
 
-#[tauri::command]
 async fn session_browser_meta_read(
     session_id: String,
     session_date: Option<String>,
@@ -1192,19 +1189,6 @@ pub(crate) use subprocess::{
 };
 
 // ---------------------------------------------------------------------------
-// Voice config (config.yaml — voice:/enabled, voice:/engine, voice:/voice_id)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Phone relay (config.yaml `relay:` block + RELAY_PC_API_KEY env var)
-// ---------------------------------------------------------------------------
-//
-// The PC reads `relay.url` from config.yaml so the user can point Kim at a
-// different relay (self-hosted, staging, etc.) without rebuilding. The PC
-// authenticates to the relay with `RELAY_PC_API_KEY` — which we keep in the
-// .env file rather than the YAML so it doesn't end up in screenshots.
-
-// ---------------------------------------------------------------------------
 // Account — ~/.config/kim/account.json (platform-native config dir)
 // ---------------------------------------------------------------------------
 
@@ -1286,11 +1270,9 @@ pub fn run() {
             session_commands::reveal_logs,
             session_commands::set_privacy_pause,
             session_commands::get_privacy_pause,
-            session_commands::delete_session,
             run_history::get_platform_info,
             run_history::run_update,
             browser_bridge::open_browser_signin_window,
-            session_browser_meta_read,
             session_browser_meta_write,
             session_browser_url_commit,
             restore_browser_for_session,
@@ -1304,19 +1286,12 @@ pub fn run() {
             cancel_task,
             hitl_respond_approval,
             steer_task,
-            voice_config::read_voice_config,
-            voice_config::write_voice_config,
-            relay::read_relay_config,
-            relay::write_relay_url,
-            relay::relay_pair_init,
-            relay::relay_pair_status,
             google_oauth::google_oauth_status,
             google_oauth::google_oauth_start,
             google_oauth::google_oauth_disconnect,
             google_oauth::google_oauth_test,
             account::load_account,
             account::save_account,
-            account::clear_account,
             account::reset_onboarding,
             account::delete_all_sessions,
             secrets::store_github_token,
@@ -1339,7 +1314,6 @@ pub fn run() {
             schedule_commands::add_scheduled_task,
             schedule_commands::update_scheduled_task,
             schedule_commands::delete_scheduled_task,
-            schedule_commands::list_due_scheduled_tasks,
             schedule_commands::run_due_scheduled_task,
             schedule_commands::start_schedule_timer,
             schedule_commands::stop_schedule_timer,

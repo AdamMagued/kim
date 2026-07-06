@@ -23,9 +23,6 @@ mss~=9.0
 Pillow~=10.0
 playwright~=1.40
 
-# ── Relay Server ─────────────────────────────────────────────────────────────
-# fastapi and uvicorn are NOT listed here — they are relay-only dependencies.
-# Install them via:  pip install -r requirements-relay.txt
 
 # ── Window Management (platform-conditional) ────────────────────────────────
 # pygetwindow: Windows only — used for window listing, focus, and resize.
@@ -47,6 +44,3 @@ pynput~=1.7
 pytest~=8.0
 pytest-asyncio~=0.23
 
-# ── Voice / TTS (optional — install separately for Kim's voice) ─────────────
-# kokoro, sounddevice, and soundfile are NOT listed here — they are optional.
-# Install them via:  pip install -r requirements-voice.txt

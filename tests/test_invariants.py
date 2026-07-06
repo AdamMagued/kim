@@ -134,7 +134,6 @@ class TestCSSImportOrder:
         "settings-shader.css",
         "typing-animations.css",
         "revamp.css",
-        "relay.css",
     ]
 
     def _read_imports(self) -> list[str]:
@@ -170,29 +169,31 @@ class TestCSSImportOrder:
 
 
 # ---------------------------------------------------------------------------
-# 4. II-J relay feature-flag: pane hidden but code preserved
+# 4. Relay decommissioned (Phase 0 A5/S6 — supersedes the old II-J flag-off)
 # ---------------------------------------------------------------------------
 
-class TestRelayFeatureFlag:
-    """Relay pane is feature-flagged off; code must still exist (not deleted)."""
+class TestRelayDecommissioned:
+    """The phone-relay subsystem was removed in Phase 0 (roadmap A5/S6).
 
-    def test_relay_flag_is_false(self):
-        src = Path(__file__).parent.parent / "desktop/src/components/kim-ui/RevampSettings.tsx"
-        content = src.read_text()
-        assert "RELAY_ENABLED = false" in content, (
-            "RELAY_ENABLED must be false in RevampSettings.tsx (II-J)"
+    It was never enabled (RELAY_ENABLED=false since inception) and shipped a
+    deployable server (relay_server/ + Dockerfile + railway.toml) that was
+    pure attack surface. If relay comes back, it must come back deliberately
+    through a new design — not by accident. Git history preserves the code.
+    """
+
+    def test_relay_server_is_gone(self):
+        root = Path(__file__).parent.parent
+        assert not (root / "relay_server").exists(), (
+            "relay_server/ must stay deleted (decommissioned in Phase 0); "
+            "resurrect deliberately or not at all"
         )
+        assert not (root / "railway.toml").exists(), "relay deploy config must stay deleted"
 
-    def test_relay_code_preserved(self):
-        pane_info = Path(__file__).parent.parent / "desktop/src/components/kim-ui/settings-panes/PaneInfo.tsx"
-        content = pane_info.read_text()
-        assert "PaneRelay" in content, "PaneRelay code must not be deleted (II-J: flag off, not delete)"
-
-    def test_relay_pane_id_preserved(self):
+    def test_relay_ui_is_gone(self):
         src = Path(__file__).parent.parent / "desktop/src/components/kim-ui/RevampSettings.tsx"
         content = src.read_text()
-        assert "'relay'" in content, (
-            "PaneId 'relay' must still exist in RevampSettings.tsx (code preserved, just flagged off)"
+        assert "'relay'" not in content and "PaneRelay" not in content, (
+            "relay settings pane must stay removed (decommissioned in Phase 0)"
         )
 
 

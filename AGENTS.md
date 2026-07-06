@@ -44,6 +44,3 @@ cd desktop/src-tauri && cargo test # Rust tests (desktop)
 cd cli && cargo test               # Rust tests (kim CLI)
 ```
 After every push, confirm the remote CI run is green: `gh run list --limit 1`.
-
-## Known pre-existing issue
-`desktop/src/components/PairingModal.tsx` — missing `qrcode.react` types. Ignore; predates recent work.

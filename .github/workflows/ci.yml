@@ -12,6 +12,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── File-size gate (Q6): no new/growing source files over 800 lines ───────
+  file-size-gate:
+    name: File-size gate (Q6)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4 (#59)
+        with:
+          fetch-depth: 0
+
+      - name: Check new/changed files stay under 800 lines
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          # New branches / force-pushes / workflow_dispatch: fall back to the
+          # default branch, then to the parent commit.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            BASE=$(git rev-parse origin/main 2>/dev/null || git rev-parse HEAD~1)
+          fi
+          echo "Comparing against base: $BASE"
+          python3 scripts/check_file_size_gate.py "$BASE"
+
   # ── Frontend: TypeScript + Vite build + Vitest ─────────────────────────────
   frontend:
     name: Frontend (TS + Vite + Vitest)

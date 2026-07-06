@@ -48,10 +48,6 @@ openai_base_url: ''
 preview_mode: false
 project_root: .
 provider: ollama
-relay:
-  pc_api_key: ''
-  poll_interval: 2
-  url: ''
 screenshot_scale: 0.75
 shell:
   blocked_commands:
@@ -60,17 +56,3 @@ shell:
   - del /S /Q C:\
   - rd /S /Q C:\
   timeout: 30
-voice:
-  enabled: true
-  engine: kokoro
-  human_quirks: false
-  hume:
-    description: A warm, clear, and friendly female voice.
-    voice_name: Alice Bennett
-  maya1:
-    max_new_tokens: 2048
-    model_id: maya-research/maya1
-    speaker_description: A young female with a warm, clear, and natural voice.
-    use_4bit: false
-  speed: 1.0
-  voice_id: af_heart

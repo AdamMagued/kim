@@ -18,7 +18,7 @@ The Rust Tauri backend provides a secure, sandboxed bridge to the OS, handling c
 - `main.rs`: Application entry point and Tauri application bootstrap configuration.
 - `lib.rs`: The central Tauri command router and subprocess manager (spawns the Python agent).
 - `google_oauth.rs`: Secure PKCE OAuth 2.0 desktop loopback flow management.
-- **Command Modules**: Specific command routines extracted into distinct modules (`account.rs`, `ollama.rs`, `relay.rs`, `session_commands.rs`, `voice_config.rs`, `feedback.rs`, etc.).
+- **Command Modules**: Specific command routines extracted into distinct modules (`account.rs`, `ollama.rs`, `session_commands.rs`, `feedback.rs`, etc.).
 - `build.rs`: Native desktop build configuration scripting.
 
 ---
@@ -92,8 +92,8 @@ The agent loop formats outputs printed to stdout, which `subprocess.rs` captures
 ### Surface D — WebView Automation Bridge (`browser_bridge.rs` + `bridge.js`)
 `desktop/src-tauri/src/browser_bridge.rs` manages a persistent in-app WebView window (`kim-browser-automate`) and injects `bridge.js` (extracted from `lib.rs` and loaded via `include_str!("bridge.js")`). The injected script intercepts outgoing fetch/XHR calls inside the target site (Claude, ChatGPT, Gemini) and re-routes them through the `/v1/send` HTTP bridge so the Python `BrowserProvider` can intercept LLM responses without a Playwright subprocess.
 
-### Surface E — Phone Relay (`relay.rs`)
-`desktop/src-tauri/src/relay.rs` manages the optional phone-to-PC relay integration. Tauri commands (`read_relay_config`, `write_relay_url`, `relay_pair_init`, `relay_pair_status`) wire the relay URL and RELAY_PC_API_KEY configuration stored in `config.yaml`.
+### Surface E — Phone Relay (removed)
+The phone-relay subsystem (relay_server/, `relay.rs`, the hidden settings pane) was decommissioned in Phase 0 of `docs/ROADMAP_TO_10.md` (A5/S6): it was never enabled and shipped a deployable server that was pure attack surface. Git history preserves the code if it is ever redesigned.
 
 ---
 

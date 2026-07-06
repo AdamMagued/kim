@@ -169,7 +169,6 @@ pub async fn save_account(account: KimAccount) -> Result<(), String> {
     write_account_atomic_inner(&path, &to_write)
 }
 
-#[tauri::command]
 pub async fn clear_account() -> Result<(), String> {
     let path = account_path();
     if path.exists() {

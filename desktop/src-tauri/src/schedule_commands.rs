@@ -9,7 +9,6 @@
 //!   `add_scheduled_task`      -- schedule add <task> <expr> [opts] --json
 //!   `update_scheduled_task`   -- schedule update <id> [opts] --json
 //!   `delete_scheduled_task`   -- schedule delete <id> --json
-//!   `list_due_scheduled_tasks`-- schedule due [--as-of] --json
 //!   `run_due_scheduled_task`  -- schedule run-due [--dry-run] --json
 
 use crate::{default_project_root, subprocess::find_python_interpreter};
@@ -294,38 +293,6 @@ pub(crate) async fn delete_scheduled_task(id: String) -> Result<String, String> 
         .map_err(|e| format!("Executor error: {e}"))?
 }
 
-// ---------------------------------------------------------------------------
-// list_due_scheduled_tasks
-// ---------------------------------------------------------------------------
-
-/// Build args for `kimctl schedule due --json [--as-of <ISO>]`.
-pub(crate) fn build_due_args(python: &str, as_of: Option<&str>) -> Vec<String> {
-    let mut args = vec![
-        python.to_string(),
-        "-m".to_string(),
-        "kimctl".to_string(),
-        "schedule".to_string(),
-        "due".to_string(),
-        "--json".to_string(),
-    ];
-    if let Some(ts) = as_of {
-        args.push("--as-of".to_string());
-        args.push(ts.to_string());
-    }
-    args
-}
-
-/// Return the JSON array of due scheduled tasks by calling
-/// `python -m kimctl schedule due --json [--as-of <ISO>]`.
-#[tauri::command]
-pub(crate) async fn list_due_scheduled_tasks(as_of: Option<String>) -> Result<String, String> {
-    let kim_root = default_project_root();
-    let python = find_python_interpreter(&kim_root)?;
-    let args = build_due_args(&python, as_of.as_deref());
-    tokio::task::spawn_blocking(move || run_kimctl(&args, &kim_root))
-        .await
-        .map_err(|e| format!("Executor error: {e}"))?
-}
 
 // ---------------------------------------------------------------------------
 // run_due_scheduled_task
@@ -520,14 +487,6 @@ mod tests {
         assert_is_async(delete_scheduled_task("id1".into()));
     }
 
-    #[test]
-    fn test_list_due_scheduled_tasks_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(list_due_scheduled_tasks(None));
-        assert_is_async(list_due_scheduled_tasks(Some(
-            "2026-06-05T12:00:00+00:00".into(),
-        )));
-    }
 
     #[test]
     fn test_run_due_scheduled_task_is_async_fn() {
@@ -602,22 +561,8 @@ mod tests {
         assert!(args.contains(&"--json".to_string()));
     }
 
-    // -- build_due_args --
 
-    #[test]
-    fn test_build_due_args_without_as_of() {
-        let args = build_due_args("python3", None);
-        assert_eq!(args[4], "due");
-        assert!(args.contains(&"--json".to_string()));
-        assert!(!args.contains(&"--as-of".to_string()));
-    }
 
-    #[test]
-    fn test_build_due_args_with_as_of() {
-        let args = build_due_args("python3", Some("2026-06-05T12:00:00+00:00"));
-        let idx = args.iter().position(|a| a == "--as-of").unwrap();
-        assert_eq!(args[idx + 1], "2026-06-05T12:00:00+00:00");
-    }
 
     // -- build_add_args --
 
