@@ -293,7 +293,6 @@ pub(crate) async fn delete_scheduled_task(id: String) -> Result<String, String> 
         .map_err(|e| format!("Executor error: {e}"))?
 }
 
-
 // ---------------------------------------------------------------------------
 // run_due_scheduled_task
 // ---------------------------------------------------------------------------
@@ -487,7 +486,6 @@ mod tests {
         assert_is_async(delete_scheduled_task("id1".into()));
     }
 
-
     #[test]
     fn test_run_due_scheduled_task_is_async_fn() {
         fn assert_is_async<F: std::future::Future>(_: F) {}
@@ -562,9 +560,6 @@ mod tests {
         assert!(args.contains(&"--enabled-only".to_string()));
         assert!(args.contains(&"--json".to_string()));
     }
-
-
-
 
     // -- build_add_args --
 

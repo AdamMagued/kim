@@ -452,537 +452,119 @@ pub(crate) async fn send_task(
     app_handle: tauri::AppHandle,
     _state: State<'_, TaskState>,
 ) -> Result<String, String> {
-    use std::process::Stdio;
-    use tokio::io::AsyncBufReadExt;
-    use tokio::process::Command;
+    use crate::task_spec;
 
     // Refuse to start a second task if one is already running or spawning.
+    if crate::task_runtime::task_runtime()
+        .lock()
+        .await
+        .is_occupied()
     {
-        let rt = crate::task_runtime::task_runtime().lock().await;
-        if rt.is_occupied() {
-            return Err(
-                "A task is already running. Stop it before starting a new one.".to_string(),
-            );
-        }
+        return Err("A task is already running. Stop it before starting a new one.".to_string());
     }
     let app_config = app_handle.state::<config::AppConfig>();
 
-    // The Kim repo root (where orchestrator/, mcp_server/, and venv/ live).
-    // This is ALWAYS used for finding the Python interpreter, setting PYTHONPATH,
-    // and as the working directory so `python -m orchestrator.agent` resolves.
+    // The Kim repo root (interpreter, PYTHONPATH, cwd) vs the target project
+    // the user wants Kim/Codex to work on (MCP tools' PROJECT_ROOT).
     let kim_root = default_project_root();
-
-    // The target project the user wants Kim/Codex to work on.  For the normal
-    // Chat tab this is typically the Kim repo itself.  For the Code tab it is
-    // the user's external code project.  MCP tools use PROJECT_ROOT to know
-    // which directory to operate in (file reads/writes, git, search, etc.).
     let target_root = project_root
         .map(PathBuf::from)
         .filter(|p| p.exists())
         .unwrap_or_else(|| kim_root.clone());
-
     // Codex mode is ONLY when the target project is a real external project,
     // i.e. distinct from the Kim repo itself. The Chat tab passes the Kim
     // repo as project_root (so MCP tools know the workspace), but those
     // sessions must still land in kim_sessions/, not .codex/sessions/.
     let is_codex = target_root.canonicalize().ok() != kim_root.canonicalize().ok();
-
     let session_dir = if is_codex {
         target_root.join(".codex").join("sessions")
     } else {
         kim_root.join("kim_sessions")
     };
+    let provider_arg = task_spec::promote_provider(provider, "ollama", is_codex);
+    let is_browser = task_spec::is_browser_provider(&provider_arg);
+    let session_id = resume_session_id
+        .clone()
+        .unwrap_or_else(|| "gui".to_string());
 
-    // Default to Ollama (no API key in Kim) when the caller omits a provider.
-    // The frontend normally sends an explicit provider, but keeping this
-    // fallback aligned with Settings avoids surprise Browser runs.
-    let provider_arg = {
-        let raw = provider
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "ollama".to_string());
-        // In Code-tab (Codex) mode, bare "gemini" / "claude" / "chatgpt" etc.
-        // have no direct API key path in Kim — promote them to "browser:<name>"
-        // so they route through the browser bridge automatically.
-        if is_codex {
-            let lower = raw.trim().to_ascii_lowercase();
-            match lower.as_str() {
-                "gemini" | "claude" | "chatgpt" | "grok" | "deepseek-browser"
-                    if !raw.starts_with("browser:") =>
-                {
-                    format!("browser:{}", lower)
-                }
-                _ => raw,
-            }
-        } else {
-            raw
-        }
-    };
-    // Whether the user picked a browser-backed provider in the composer (e.g.
-    // "browser:gemini"). For Code-tab tasks this routes Codex through Kim's
-    // BrowserProvider via the file-bridge instead of calling Anthropic.
-    let is_browser_provider = provider_arg == "browser" || provider_arg.starts_with("browser:");
-
-    let code_backend = if is_codex {
-        Some(find_code_backend(&kim_root).ok_or_else(|| {
-            "Code agent binary not found. Build `pythonExperimentTool/codex-code/rust` for Codex, build `pythonExperimentTool/claw-code/rust` for the bundled compatibility backend, or set CODEX_BIN/CLAW_BIN to the binary path.".to_string()
-        })?)
-    } else {
-        None
-    };
-
-    // Code sessions run the coding-agent binary directly against the user's
-    // project, with its own coding-agent system prompt. Chat (Kim) sessions
-    // continue to run `python -m orchestrator.agent` with the desktop-control
-    // system prompt. Routing them through different binaries is what keeps the
-    // two personas separate end-to-end.
-    let mut cmd = if is_codex {
-        let code_backend = code_backend
-            .as_ref()
-            .expect("code backend resolved for code mode");
-        let code_bin = &code_backend.binary;
-
-        if is_browser_provider {
-            if code_backend.kind == CodeBackendKind::Claw {
-                return Err("Browser-backed Code mode needs the Codex binary. This checkout only has the bundled Claw compatibility binary, so switch the provider to Ollama/OpenAI or build/set CODEX_BIN.".to_string());
-            }
-            // ── Browser-bridge mode ──────────────────────────────────────
-            // Spawn `python -m orchestrator.run_codex_bridge`, which spawns
-            // Codex with CODEX_FILE_BRIDGE=1 and relays each LLM request
-            // through Kim's BrowserProvider. No Anthropic key required.
-            let python = find_python_interpreter(&kim_root)?;
-            let _ = app_handle.emit(
-                "kim-agent-output",
-                format!(
-                    "[STATUS] Routing to Codex via Kim's browser provider ({})",
-                    provider_arg
-                ),
-            );
-            let _ = app_handle.emit(
-                "kim-agent-output",
-                format!("[STATUS] codex binary: {}", code_bin.display()),
-            );
-            let mut c = Command::new(&python);
-            c.args(["-m", "orchestrator.codex_bridge_service"])
-                .arg("--task")
-                .arg(&task)
-                .arg("--cwd")
-                .arg(target_root.to_string_lossy().to_string())
-                .arg("--provider")
-                .arg(&provider_arg)
-                .current_dir(&kim_root)
-                .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
-                // Tell codex_bridge_service exactly which codex binary to spawn,
-                // so it doesn't have to repeat the search dance.
-                .env("CODEX_BIN", code_bin.to_string_lossy().to_string())
-                // Signal Tauri mode so codex_bridge_service emits a HITL
-                // approval request before spawning Codex (#2). Stdin pipe is
-                // required for the Python side to receive the approval decision.
-                .env("KIM_TAURI_MODE", "1")
-                .stdin(Stdio::piped())
-                // Forward webview-bridge creds so BrowserProvider can drive
-                // the in-app sign-in window in headless mode if configured.
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            // Map permission_mode → KIM_HITL_RISK_THRESHOLD (same vocab as send_task).
-            match permission_mode.as_deref().unwrap_or("full_auto") {
-                "ask_risky" => {
-                    c.env("KIM_HITL_RISK_THRESHOLD", "high");
-                }
-                "ask_always" => {
-                    c.env("KIM_HITL_RISK_THRESHOLD", "medium");
-                }
-                _ => {} // full_auto: no gate
-            }
-            c
-        } else {
-            // ── Direct API mode ──────────────────────────────────────────
-            let mut c = Command::new(code_bin);
-            if code_backend.kind == CodeBackendKind::Codex {
-                // New OpenAI Codex CLI: uses `exec --json` subcommand.
-                // When the provider is Ollama, use --oss --local-provider ollama
-                // so Codex bypasses its own ChatGPT account auth entirely and
-                // routes through the local Ollama daemon instead.
-                c.arg("exec").arg("--json");
-                // Gate the sandbox-bypass flag behind an explicit opt-in env var (#1).
-                // Default: sandboxed + approvals enabled.
-                if std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1") {
-                    c.arg("--dangerously-bypass-approvals-and-sandbox");
-                }
-                c.arg("-C")
-                    .arg(target_root.to_string_lossy().to_string())
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                let route = if provider_arg.trim().eq_ignore_ascii_case("ollama") {
-                    let model = selected_ollama_codex_model(
-                        ollama_mode.as_deref(),
-                        ollama_base_url.as_deref(),
-                        ollama_local_model.as_deref(),
-                        ollama_cloud_model.as_deref(),
-                        &app_config,
-                    )
-                    .await?;
-                    c.arg("--oss")
-                        .arg("--local-provider")
-                        .arg("ollama")
-                        .arg("--model")
-                        .arg(&model);
-                    format!("Ollama via local daemon ({model})")
-                } else {
-                    configure_codex_direct_provider(
-                        &mut c,
-                        &provider_arg,
-                        &kim_root,
-                        ollama_base_url.as_deref(),
-                        ollama_mode.as_deref(),
-                        ollama_local_model.as_deref(),
-                        ollama_cloud_model.as_deref(),
-                        &app_config,
-                    )
-                    .await?
-                };
-                let _ = app_handle.emit(
-                    "kim-agent-output",
-                    format!(
-                        "[STATUS] ✓ Using Codex CLI via {}: {}",
-                        route,
-                        code_bin.display(),
-                    ),
-                );
-                c.arg(&task);
-            } else {
-                // Claw compatibility binary: uses old --output-format json interface.
-                c.arg("--output-format")
-                    .arg("json")
-                    .current_dir(&target_root)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                let route = configure_codex_direct_provider(
-                    &mut c,
-                    &provider_arg,
-                    &kim_root,
-                    ollama_base_url.as_deref(),
-                    ollama_mode.as_deref(),
-                    ollama_local_model.as_deref(),
-                    ollama_cloud_model.as_deref(),
-                    &app_config,
-                )
-                .await?;
-                let _ = app_handle.emit(
-                    "kim-agent-output",
-                    format!(
-                        "[STATUS] Routing code task to {} via {}: {}",
-                        code_backend.kind.label(),
-                        route,
-                        code_bin.display(),
-                    ),
-                );
-                c.arg("prompt").arg(&task);
-            }
-            c
-        }
-    } else {
-        let python = find_python_interpreter(&kim_root)?;
-        let mut c = Command::new(&python);
-        // K1: unique per-run id for file checkpoints (~/.kim/checkpoints/<id>).
-        let sess = resume_session_id.as_deref().unwrap_or("run");
-        let sess_safe: String = sess
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                    ch
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let run_id = format!(
-            "{}-{}",
-            sess_safe,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        );
-        c.env("KIM_RUN_ID", &run_id);
-        // Let the frontend associate this run's pill with its checkpoint id.
-        let _ = app_handle.emit("kim-run-id", run_id.clone());
-        // When the resolved interpreter is the bundled sidecar, invoke it
-        // directly (it is a standalone executable, not a Python binary).
-        // Otherwise use the standard `python -m orchestrator.agent` invocation.
-        if !is_bundled_orchestrator(&python) {
-            c.args(["-m", "orchestrator.agent"]);
-        }
-        c.arg("--task")
-            .arg(&task)
-            .arg("--session-dir")
-            .arg(session_dir.to_string_lossy().to_string())
-            .current_dir(&kim_root)
-            // Tell the MCP server which directory to operate on (file tools, git, etc.).
-            // For the Chat tab this is the Kim repo itself.
-            .env("PROJECT_ROOT", target_root.to_str().unwrap_or(""))
-            // Ensure `import orchestrator` and `import mcp_server` always resolve
-            // from the Kim repo, regardless of the target project.
-            .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
-            // Signal to Python that we are running under Tauri so StdinApprovalBridge
-            // is auto-wired when a HITL risk threshold is set.
-            .env("KIM_TAURI_MODE", "1")
-            // Pipe stdin so hitl_respond_approval can write approval decisions to it.
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // Map permission_mode → KIM_HITL_RISK_THRESHOLD env var.
-        match permission_mode.as_deref().unwrap_or("full_auto") {
-            "ask_risky" => {
-                c.env("KIM_HITL_RISK_THRESHOLD", "high");
-            }
-            "ask_always" => {
-                c.env("KIM_HITL_RISK_THRESHOLD", "medium");
-            }
-            _ => {} // full_auto: no threshold = no HITL gate
-        }
-        c
-    };
-
+    // Caller-resolved env extras shared by the orchestrator-backed specs.
     let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();
-    // The webview-bridge creds let BrowserProvider drive the in-app sign-in
-    // window. Forward them whenever a browser provider is in play, including
-    // Codex-via-browser-bridge runs, so headless flows stay consistent.
-    if !is_codex || is_browser_provider {
+    let mut extra = task_spec::EnvBuilder::new();
+    if !is_codex || is_browser {
         if let Some(cfg) = &bridge_cfg {
-            cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
-                .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
-                .env("KIM_WEBVIEW_WINDOW_LABEL", "kim-browser-signin");
+            extra = extra.webview_bridge(Some((cfg.base_url.as_str(), cfg.token.as_str())));
         }
     }
-
-    if is_browser_provider {
-        let restore_status = browser_restore_status_for_session(
-            &session_dir,
-            resume_session_id.as_deref(),
-            &provider_arg,
+    if is_browser {
+        extra = extra.set(
+            "KIM_BROWSER_RESTORE_STATUS",
+            browser_restore_status_for_session(
+                &session_dir,
+                resume_session_id.as_deref(),
+                &provider_arg,
+            ),
         );
-        cmd.env("KIM_BROWSER_RESTORE_STATUS", restore_status);
     }
-
-    if !is_codex && provider_arg.trim().eq_ignore_ascii_case("gemini") {
-        let google_env = google_oauth::google_oauth_env_for_agent().await.map_err(|err| {
-            format!(
-                "Google for Kim is not connected. Open Settings → Account → Google for Kim (API), then Continue with Google. {}",
-                err
-            )
-        })?;
-        for (key, value) in google_env.as_env_pairs() {
-            cmd.env(key, value);
-        }
-    }
-
-    // Chrome CDP launch is needed whenever a browser provider is in play —
-    // both for Kim's Chat-tab tasks and for Codex running in browser-bridge
-    // mode (which calls into BrowserProvider via run_codex_bridge).
-    if is_browser_provider {
-        if bridge_cfg.is_none() {
-            let root_for_chrome = kim_root.clone();
-            match tokio::task::spawn_blocking(move || launch_chrome_for_cdp(&root_for_chrome)).await
-            {
-                Ok(Ok(true)) => {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => {
-                    eprintln!("[Kim] Chrome launch skipped: {}", e);
-                }
-                Err(e) => {
-                    eprintln!("[Kim] Chrome launch task panicked: {}", e);
-                }
-            }
-        } else {
-            eprintln!("[Kim] Browser provider using in-app bridge (no Chrome CDP launch)");
-        }
-    }
-
-    let resume_arg = if is_codex {
-        None
-    } else {
-        resume_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    };
-    if let Some(resume_id) = resume_arg {
-        cmd.arg("--resume").arg(resume_id);
-    }
-
-    if !is_codex {
-        cmd.arg("--provider").arg(&provider_arg);
-    }
-
-    if !is_codex && provider_arg.trim().eq_ignore_ascii_case("ollama") {
-        if let Some(base_url) = ollama_base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            cmd.env("KIM_OLLAMA_BASE_URL", base_url);
-        }
-        if let Some(mode) = ollama_mode
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            cmd.env("KIM_OLLAMA_MODE", mode);
-        }
-        if let Some(model) = ollama_local_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            cmd.env("KIM_OLLAMA_LOCAL_MODEL", model);
-        }
-        if let Some(model) = ollama_cloud_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            cmd.env("KIM_OLLAMA_CLOUD_MODEL", model);
-        }
-        if let Some(limit) = ollama_context_limit_override.filter(|n| *n > 0) {
-            cmd.env("KIM_OLLAMA_CONTEXT_LIMIT_OVERRIDE", limit.to_string());
-        }
-    }
-
     if let Some(idx) = google_authuser {
-        cmd.env("KIM_GEMINI_AUTHUSER", idx.to_string());
+        extra = extra.set("KIM_GEMINI_AUTHUSER", idx.to_string());
     }
 
-    if !is_codex {
-        if let Some(budget) = context_budget_tokens.filter(|b| *b > 0) {
-            cmd.env("KIM_CONTEXT_BUDGET_TOKENS", budget.to_string());
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
-
-    // Reserve the runner slot immediately before spawning.
-    {
-        let mut rt = crate::task_runtime::task_runtime().lock().await;
-        // #25: recover from a stale dead pid (e.g. a missed clear after a
-        // wait() error) instead of blocking every future task until restart.
-        // Mirrors the /v1/task bridge path.
-        if let Some(pid) = rt.pid {
-            if !process_exists(pid) {
-                rt.clear();
-            }
-        }
-        rt.reserve().map_err(|_| {
-            "A task is already running. Stop it before starting a new one.".to_string()
-        })?;
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            let mut rt = crate::task_runtime::task_runtime().lock().await;
-            rt.release();
-            return Err(format!("Failed to start Kim: {}", e));
-        }
+    // Build the pure TaskSpec via the named builder for this spawn shape.
+    let inputs = GuiSpawnInputs {
+        kim_root: &kim_root,
+        target_root: &target_root,
+        session_dir: &session_dir,
+        task: &task,
+        provider_arg: &provider_arg,
+        session_id: &session_id,
+        resume: resume_session_id.as_deref(),
+        permission: permission_mode.as_deref(),
+        ollama_base_url: ollama_base_url.as_deref(),
+        ollama_mode: ollama_mode.as_deref(),
+        ollama_local_model: ollama_local_model.as_deref(),
+        ollama_cloud_model: ollama_cloud_model.as_deref(),
+        ollama_context_limit_override,
+        context_budget_tokens,
+    };
+    let (spec, was_claw) = if !is_codex {
+        (build_gui_chat_spec(&inputs, extra).await?, false)
+    } else {
+        build_gui_codex_spec(&inputs, extra, &app_handle, &app_config).await?
     };
 
-    // Record the PID so cancel_task can signal it.
-    let Some(child_pid) = child.id() else {
-        let mut rt = crate::task_runtime::task_runtime().lock().await;
-        rt.release();
-        return Err("Failed to read child PID after spawn.".to_string());
-    };
-    {
-        let mut rt = crate::task_runtime::task_runtime().lock().await;
-        rt.store_pid(
-            child_pid,
-            resume_session_id
-                .clone()
-                .unwrap_or_else(|| "gui".to_string()),
-            crate::task_runtime::SpawnSource::Gui,
-        );
+    // K1: let the frontend associate this run's pill with its checkpoint id.
+    if let Some((_, run_id)) = spec.envs.iter().find(|(k, _)| k == "KIM_RUN_ID") {
+        let _ = app_handle.emit("kim-run-id", run_id.clone());
     }
+
+    // Chrome CDP launch whenever a browser provider is in play (Chat tasks
+    // and Codex browser-bridge runs) and no in-app bridge is available.
+    if is_browser {
+        maybe_launch_chrome_for_cdp(&kim_root, bridge_cfg.is_none()).await;
+    }
+
+    // Reserve the runner slot immediately before spawning, then hand the
+    // whole process lifecycle to the supervisor.
+    crate::spawn_supervisor::reserve_slot()
+        .await
+        .map_err(|_| "A task is already running. Stop it before starting a new one.".to_string())?;
+    let sup = crate::spawn_supervisor::spawn(spec).await?;
     // K7: reflect the running task in the tray status line.
     crate::speed_access::set_tray_status(&app_handle, Some(task.as_str()));
-
-    // Store stdin handle for HITL approval round-trip.
-    // Always stored for the Kim orchestrator path (!is_codex).
-    // Also stored for the Codex browser-bridge path (is_codex && is_browser_provider):
-    // codex_bridge_service emits hitl_approval_request on stdout before spawning Codex
-    // and reads the approval from stdin, so the round-trip requires a live handle here.
-    // Direct Codex CLI runs (is_codex && !is_browser_provider) use Stdio::null on stdin
-    // and never emit HITL requests, so they are intentionally excluded.
-    if !is_codex || is_browser_provider {
-        crate::task_runtime::task_runtime().lock().await.gui_stdin = child.stdin.take();
-    }
-
     let ipc_typed = app_config.ipc_protocol == "typed";
-    let stdout_handle = if let Some(stdout) = child.stdout.take() {
-        let reader = tokio::io::BufReader::new(stdout);
-        let app = app_handle.clone();
-        Some(tokio::spawn(async move {
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                forward_agent_stdout_line(&app, ipc_typed, is_codex, &line);
-            }
-        }))
-    } else {
-        None
-    };
+    let wait_result = crate::spawn_supervisor::supervise(sup, app_handle.clone(), ipc_typed).await;
 
-    let stderr_handle = if let Some(stderr) = child.stderr.take() {
-        let reader = tokio::io::BufReader::new(stderr);
-        let app = app_handle.clone();
-        Some(tokio::spawn(async move {
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = app.emit("kim-agent-error", line);
-            }
-        }))
-    } else {
-        None
-    };
-
-    // #25: don't `?` on wait() before cleanup — a propagated error here used
-    // to skip the clear below, leaving a stale pid that blocked every future
-    // task with "A task is already running" until app restart.
-    let wait_result = child.wait().await;
-
-    if let Some(handle) = stdout_handle {
-        let _ = handle.await;
-    }
-    if let Some(handle) = stderr_handle {
-        let _ = handle.await;
-    }
-
-    // Clear the recorded PID regardless of exit reason (normal, error, cancelled).
-    // Guarded by pid (#24): if a cancel poller already cleared us and a new
-    // task has since stored its own pid, this late clear must be a no-op.
-    {
-        let mut rt = crate::task_runtime::task_runtime().lock().await;
-        rt.clear_if_pid(child_pid);
-    }
-    // K7: tray back to idle.
+    // K7: tray back to idle; restore UI state regardless of exit reason.
     crate::speed_access::set_tray_status(&app_handle, None);
-
     let _ = set_task_active_mode(app_handle.clone(), false).await;
     if let Some(flash_win) = app_handle.get_webview_window("screenshot-flash") {
         let _ = flash_win.close();
     }
 
-    let status = wait_result.map_err(|e| e.to_string())?;
+    let status = wait_result?;
 
     if is_codex {
-        if code_backend
-            .as_ref()
-            .is_some_and(|backend| backend.kind == CodeBackendKind::Claw)
-        {
+        if was_claw {
             let _ = mirror_latest_claw_session_to_codex(&target_root);
         }
         if let Some(session) = newest_codex_session(&target_root) {
@@ -1000,6 +582,212 @@ pub(crate) async fn send_task(
     } else {
         "Task ended".to_string()
     })
+}
+
+// ---------------------------------------------------------------------------
+// K2 — named spec builders for the GUI spawn path. These resolve the async /
+// IO-dependent inputs (interpreter, provider route, OAuth env) and delegate
+// the actual argv/env assembly to the pure builders in `task_spec`.
+// ---------------------------------------------------------------------------
+
+/// The GUI `send_task` inputs shared by both spec builders.
+struct GuiSpawnInputs<'a> {
+    kim_root: &'a Path,
+    target_root: &'a Path,
+    session_dir: &'a Path,
+    task: &'a str,
+    provider_arg: &'a str,
+    session_id: &'a str,
+    resume: Option<&'a str>,
+    permission: Option<&'a str>,
+    ollama_base_url: Option<&'a str>,
+    ollama_mode: Option<&'a str>,
+    ollama_local_model: Option<&'a str>,
+    ollama_cloud_model: Option<&'a str>,
+    ollama_context_limit_override: Option<u32>,
+    context_budget_tokens: Option<u32>,
+}
+
+/// Chat-tab spec: `python -m orchestrator.agent` with the desktop-control
+/// persona. Resolves the Google OAuth env (gemini) and Ollama overrides,
+/// then delegates to `task_spec::chat_task_spec`.
+async fn build_gui_chat_spec(
+    p: &GuiSpawnInputs<'_>,
+    mut extra: crate::task_spec::EnvBuilder,
+) -> Result<crate::task_spec::TaskSpec, String> {
+    use crate::task_spec;
+
+    if p.provider_arg.trim().eq_ignore_ascii_case("gemini") {
+        let google_env = google_oauth::google_oauth_env_for_agent().await.map_err(|err| {
+            format!(
+                "Google for Kim is not connected. Open Settings → Account → Google for Kim (API), then Continue with Google. {}",
+                err
+            )
+        })?;
+        extra = extra.extend(google_env.as_env_pairs());
+    }
+    if p.provider_arg.trim().eq_ignore_ascii_case("ollama") {
+        extra = extra.ollama(
+            p.ollama_base_url,
+            p.ollama_mode,
+            p.ollama_local_model,
+            p.ollama_cloud_model,
+            p.ollama_context_limit_override,
+        );
+    }
+    if let Some(budget) = p.context_budget_tokens.filter(|b| *b > 0) {
+        extra = extra.set("KIM_CONTEXT_BUDGET_TOKENS", budget.to_string());
+    }
+    let python = find_python_interpreter(p.kim_root)?;
+    Ok(task_spec::chat_task_spec(task_spec::ChatSpecParams {
+        bundled_sidecar: is_bundled_orchestrator(&python),
+        python: &python,
+        kim_root: p.kim_root,
+        project_root: p.target_root,
+        session_dir: p.session_dir,
+        task: p.task,
+        provider: p.provider_arg,
+        session_id: p.session_id.to_string(),
+        resume: p.resume.map(str::to_string),
+        permission_mode: p.permission,
+        source: task_spec::SpawnSource::Gui,
+        extra_envs: extra.build(),
+    }))
+}
+
+/// Code-tab spec: either the Codex browser-bridge (`codex_bridge_service`
+/// relaying through Kim's BrowserProvider) or the direct codex/claw CLI.
+/// Returns the spec plus whether the Claw compatibility backend was used
+/// (the caller mirrors Claw sessions after exit).
+async fn build_gui_codex_spec(
+    p: &GuiSpawnInputs<'_>,
+    extra: crate::task_spec::EnvBuilder,
+    app_handle: &tauri::AppHandle,
+    app_config: &config::AppConfig,
+) -> Result<(crate::task_spec::TaskSpec, bool), String> {
+    use crate::task_spec;
+
+    let backend = find_code_backend(p.kim_root).ok_or_else(|| {
+        "Code agent binary not found. Build `pythonExperimentTool/codex-code/rust` for Codex, build `pythonExperimentTool/claw-code/rust` for the bundled compatibility backend, or set CODEX_BIN/CLAW_BIN to the binary path.".to_string()
+    })?;
+
+    if task_spec::is_browser_provider(p.provider_arg) {
+        // Browser-bridge mode: codex_bridge_service relays each LLM request
+        // through Kim's BrowserProvider. No Anthropic key needed.
+        if backend.kind == CodeBackendKind::Claw {
+            return Err("Browser-backed Code mode needs the Codex binary. This checkout only has the bundled Claw compatibility binary, so switch the provider to Ollama/OpenAI or build/set CODEX_BIN.".to_string());
+        }
+        let python = find_python_interpreter(p.kim_root)?;
+        let _ = app_handle.emit(
+            "kim-agent-output",
+            format!(
+                "[STATUS] Routing to Codex via Kim's browser provider ({})",
+                p.provider_arg
+            ),
+        );
+        let _ = app_handle.emit(
+            "kim-agent-output",
+            format!("[STATUS] codex binary: {}", backend.binary.display()),
+        );
+        let spec = task_spec::codex_browser_spec(task_spec::CodexBridgeSpecParams {
+            python: &python,
+            kim_root: p.kim_root,
+            target_root: p.target_root,
+            task: p.task,
+            provider: p.provider_arg,
+            codex_bin: &backend.binary,
+            session_id: p.session_id.to_string(),
+            permission_mode: p.permission,
+            extra_envs: extra.build(),
+        });
+        return Ok((spec, false));
+    }
+
+    // Direct API mode: run the codex/claw binary itself.
+    let was_claw = backend.kind == CodeBackendKind::Claw;
+    let route = if !was_claw && p.provider_arg.trim().eq_ignore_ascii_case("ollama") {
+        // Codex bypasses its ChatGPT auth entirely via --oss.
+        let model = selected_ollama_codex_model(
+            p.ollama_mode,
+            p.ollama_base_url,
+            p.ollama_local_model,
+            p.ollama_cloud_model,
+            app_config,
+        )
+        .await?;
+        task_spec::ProviderRoute {
+            args: vec![
+                "--oss".into(),
+                "--local-provider".into(),
+                "ollama".into(),
+                "--model".into(),
+                model.clone(),
+            ],
+            envs: vec![],
+            label: format!("Ollama via local daemon ({model})"),
+        }
+    } else {
+        configure_codex_direct_provider(
+            p.provider_arg,
+            p.kim_root,
+            p.ollama_base_url,
+            p.ollama_mode,
+            p.ollama_local_model,
+            p.ollama_cloud_model,
+            app_config,
+        )
+        .await?
+    };
+    let status_line = if was_claw {
+        format!(
+            "[STATUS] Routing code task to {} via {}: {}",
+            backend.kind.label(),
+            route.label,
+            backend.binary.display(),
+        )
+    } else {
+        format!(
+            "[STATUS] ✓ Using Codex CLI via {}: {}",
+            route.label,
+            backend.binary.display(),
+        )
+    };
+    let _ = app_handle.emit("kim-agent-output", status_line);
+    let spec = task_spec::codex_direct_spec(task_spec::CodexDirectSpecParams {
+        code_bin: &backend.binary,
+        is_claw: was_claw,
+        target_root: p.target_root,
+        task: p.task,
+        // Gated behind an explicit opt-in env var (#1). Default: sandboxed +
+        // approvals enabled.
+        bypass_sandbox: std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1"),
+        route,
+        session_id: p.session_id.to_string(),
+    });
+    Ok((spec, was_claw))
+}
+
+/// Launch Chrome for CDP if no in-app webview bridge is configured, waiting
+/// briefly for the debug port to come up. Best-effort: failures are logged,
+/// never fatal.
+async fn maybe_launch_chrome_for_cdp(kim_root: &Path, no_bridge: bool) {
+    if !no_bridge {
+        eprintln!("[Kim] Browser provider using in-app bridge (no Chrome CDP launch)");
+        return;
+    }
+    let root_for_chrome = kim_root.to_path_buf();
+    match tokio::task::spawn_blocking(move || launch_chrome_for_cdp(&root_for_chrome)).await {
+        Ok(Ok(true)) => {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => {
+            eprintln!("[Kim] Chrome launch skipped: {}", e);
+        }
+        Err(e) => {
+            eprintln!("[Kim] Chrome launch task panicked: {}", e);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

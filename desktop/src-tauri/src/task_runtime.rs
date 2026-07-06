@@ -35,14 +35,9 @@
 use std::sync::OnceLock;
 use tokio::sync::Mutex as TokioMutex;
 
-/// Source that spawned the currently-running task.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SpawnSource {
-    /// Spawned by the Tauri GUI `send_task` command.
-    Gui,
-    /// Spawned by the HTTP bridge `/v1/task` endpoint (kimctl CLI).
-    Bridge,
-}
+/// Source that spawned the currently-running task. Defined in `task_spec`
+/// (the pub K2 seam) and re-exported here for existing call sites.
+pub(crate) use crate::task_spec::SpawnSource;
 
 /// All mutable state for the one agent subprocess that may be running at a time.
 #[derive(Default)]
@@ -58,12 +53,11 @@ pub(crate) struct TaskRuntime {
     /// Which path spawned the current task.  Used by `cancel()` to emit the
     /// right cleanup events.
     pub source: Option<SpawnSource>,
-    /// Stdin handle for the GUI path (tokio async child).
-    /// Written by `hitl_respond_approval` / `steer_task`.
-    pub gui_stdin: Option<tokio::process::ChildStdin>,
-    /// Stdin handle for the bridge path (std sync child).
-    /// Written by `/v1/task/approve`.
-    pub bridge_stdin: Option<std::process::ChildStdin>,
+    /// Stdin handle of the running child (K2: both spawn paths now go through
+    /// `spawn_supervisor`, which always spawns a tokio child, so one handle
+    /// serves the GUI `hitl_respond_approval` / `steer_task` commands and the
+    /// bridge `/v1/task/approve` endpoint alike).
+    pub stdin: Option<tokio::process::ChildStdin>,
 }
 
 impl TaskRuntime {
@@ -101,8 +95,7 @@ impl TaskRuntime {
         self.starting = false;
         self.session_id = None;
         self.source = None;
-        self.gui_stdin = None;
-        self.bridge_stdin = None;
+        self.stdin = None;
     }
 
     /// Clear only if the stored pid still matches `pid` (#24).
@@ -124,23 +117,17 @@ impl TaskRuntime {
         self.pid.is_some() || self.starting
     }
 
-    /// Convenience: write a HITL/steer JSON line to whichever stdin handle is
-    /// currently active. Called by both the Tauri command path (GUI) and the
-    /// HTTP bridge path (CLI) so that cross-path approval always works.
+    /// Convenience: write a HITL/steer JSON line to the running child's stdin.
+    /// Called by both the Tauri command path (GUI) and the HTTP bridge path
+    /// (CLI) so that cross-path approval always works.
     pub(crate) async fn write_stdin_line(&mut self, msg: &str) -> Result<(), String> {
-        use std::io::Write as _;
         use tokio::io::AsyncWriteExt as _;
 
-        if let Some(ref mut s) = self.gui_stdin {
+        if let Some(ref mut s) = self.stdin {
             s.write_all(msg.as_bytes())
                 .await
                 .map_err(|e| e.to_string())?;
             s.flush().await.map_err(|e| e.to_string())?;
-            return Ok(());
-        }
-        if let Some(ref mut s) = self.bridge_stdin {
-            s.write_all(msg.as_bytes()).map_err(|e| e.to_string())?;
-            s.flush().map_err(|e| e.to_string())?;
             return Ok(());
         }
         Err("No agent stdin available".to_string())

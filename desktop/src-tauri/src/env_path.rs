@@ -136,8 +136,7 @@ mod tests {
         // The APPENDED segment introduces no duplicates — neither of an
         // existing entry nor among itself. (The pre-existing PATH may already
         // contain duplicates; we preserve it verbatim and never dedupe it.)
-        let original_entries: Vec<&str> =
-            original.split(':').filter(|p| !p.is_empty()).collect();
+        let original_entries: Vec<&str> = original.split(':').filter(|p| !p.is_empty()).collect();
         let fixed_entries: Vec<&str> = fixed.split(':').filter(|p| !p.is_empty()).collect();
         let appended = &fixed_entries[original_entries.len()..];
         let mut seen = std::collections::HashSet::new();

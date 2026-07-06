@@ -730,7 +730,10 @@ mod tests {
 
     #[test]
     fn whoami_success_with_account_is_signed_in() {
-        assert_eq!(classify_whoami_output(true, "alice@example.com\n", ""), Ok(true));
+        assert_eq!(
+            classify_whoami_output(true, "alice@example.com\n", ""),
+            Ok(true)
+        );
     }
 
     #[test]

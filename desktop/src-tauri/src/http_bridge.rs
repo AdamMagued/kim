@@ -1176,27 +1176,18 @@ fn handle_webview_bridge_request(
                 return;
             }
 
-            // Reject if a task is already running or starting.
-            let reserve_result = tauri::async_runtime::block_on(async {
-                let mut rt = crate::task_runtime::task_runtime().lock().await;
-                if let Some(pid) = rt.pid {
-                    if process_exists(pid) {
-                        return Err("A task is already running. Cancel it first.".to_string());
-                    }
-                    rt.clear();
-                }
-                rt.reserve()
-                    .map_err(|_| "A task is already starting. Try again in a moment.".to_string())
-            });
-            if let Err(error) = reserve_result {
-                respond_json(
-                    request,
-                    409,
-                    serde_json::json!({
-                        "ok": false,
-                        "error": error,
-                    }),
-                );
+            // Reject if a task is already running or starting (K2: the
+            // stale-pid recovery + reservation is shared with the GUI path
+            // via spawn_supervisor::reserve_slot).
+            if let Err(error) =
+                tauri::async_runtime::block_on(crate::spawn_supervisor::reserve_slot())
+            {
+                let msg = if error.contains("starting") {
+                    "A task is already starting. Try again in a moment."
+                } else {
+                    "A task is already running. Cancel it first."
+                };
+                respond_json(request, 409, serde_json::json!({"ok": false, "error": msg}));
                 return;
             }
 
@@ -1204,9 +1195,7 @@ fn handle_webview_bridge_request(
             let python = match find_python_interpreter(&kim_root) {
                 Ok(p) => p,
                 Err(e) => {
-                    tauri::async_runtime::block_on(async {
-                        crate::task_runtime::task_runtime().lock().await.release();
-                    });
+                    tauri::async_runtime::block_on(crate::spawn_supervisor::release_slot());
                     respond_json(request, 500, serde_json::json!({"ok": false, "error": e}));
                     return;
                 }
@@ -1233,115 +1222,34 @@ fn handle_webview_bridge_request(
                 .filter(|s| !s.trim().is_empty() && s != "desktop")
                 .unwrap_or_else(|| "browser".to_string());
 
-            let bridge_cfg = WEBVIEW_BRIDGE_CFG.get().cloned();
-
-            // NOTE (#16): this spawn block is a near-duplicate of subprocess.rs::send_task.
-            // Any env/flag changes here must be mirrored there. TODO: extract a shared
-            // helper once Tauri v2 async Command is stable across both contexts.
-            let run_id = {
-                let sess_safe: String = session_id
-                    .chars()
-                    .map(|ch| {
-                        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                            ch
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                format!(
-                    "{}-{}",
-                    sess_safe,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0)
-                )
-            };
-            let mut cmd = std::process::Command::new(&python);
-            // When the resolved interpreter is the bundled sidecar it's a standalone
-            // executable, not a Python binary — invoke it directly (matches the canonical
-            // spawn in subprocess.rs). Otherwise `<python> -m orchestrator.agent`.
-            if !crate::subprocess::is_bundled_orchestrator(&python) {
-                cmd.args(["-m", "orchestrator.agent"]);
-            }
-            cmd.arg("--task")
-                .arg(&parsed.task)
-                .arg("--session-dir")
-                .arg(session_dir.to_string_lossy().to_string())
-                .arg("--resume")
-                .arg(&session_id)
-                .arg("--provider")
-                .arg(&provider)
-                .current_dir(&kim_root)
-                .env("KIM_RUN_ID", &run_id) // matches subprocess.rs (#16)
-                .env("PROJECT_ROOT", kim_root.to_str().unwrap_or(""))
-                .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
-                .stdin(std::process::Stdio::piped()) // required for HITL approval (#15)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit());
-            // Own process group so a later /v1/cancel (kill -TERM -<pid>) reaps the whole
-            // process tree (MCP server, browser/Playwright helpers), not just the parent
-            // Python — mirrors subprocess.rs. Without this the children are orphaned.
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                cmd.process_group(0);
-            }
-
+            // Caller-resolved env extras (K2: the argv/env assembly itself is
+            // the same task_spec::chat_task_spec builder the GUI path uses, so
+            // the two spawn paths can no longer diverge on env/HITL/stdin).
+            let mut extra = crate::task_spec::EnvBuilder::new();
             if let Ok(guard) = KIM_PREFERRED_SITE
                 .get_or_init(|| StdMutex::new(None))
                 .lock()
             {
                 if let Some(site) = &*guard {
-                    cmd.env("KIM_PREFERRED_SITE", site);
+                    extra = extra.set("KIM_PREFERRED_SITE", site);
                 }
             }
-
-            if let Some(cfg) = &bridge_cfg {
-                cmd.env("KIM_WEBVIEW_BRIDGE_URL", &cfg.base_url)
-                    .env("KIM_WEBVIEW_BRIDGE_TOKEN", &cfg.token)
-                    .env("KIM_WEBVIEW_WINDOW_LABEL", "kim-browser-signin");
+            if let Some(cfg) = WEBVIEW_BRIDGE_CFG.get() {
+                extra = extra.webview_bridge(Some((cfg.base_url.as_str(), cfg.token.as_str())));
             }
-
-            // Honour permission_mode from the /v1/task request (#15).
-            // Maps to KIM_HITL_RISK_THRESHOLD that the orchestrator already reads.
-            // Use the same vocabulary as subprocess.rs send_task so both code paths
-            // behave identically:
-            //   full_auto   → no threshold (no HITL gate)
-            //   ask_risky   → KIM_HITL_RISK_THRESHOLD=high  (risky tools need approval)
-            //   ask_always  → KIM_HITL_RISK_THRESHOLD=medium (all medium+ tools)
-            // Also set KIM_TAURI_MODE=1 so StdinApprovalBridge is auto-wired.
-            cmd.env("KIM_TAURI_MODE", "1");
-            // #37: accept both the canonical vocabulary and the legacy aliases
-            // that this endpoint's docs historically advertised, so an
-            // integrator using either gets the HITL gate they asked for instead
-            // of a silent full-auto.
-            match parsed.permission_mode.as_deref().unwrap_or("full_auto") {
-                "ask_risky" | "confirm-sensitive" => {
-                    cmd.env("KIM_HITL_RISK_THRESHOLD", "high");
-                }
-                "ask_always" | "confirm-all" => {
-                    cmd.env("KIM_HITL_RISK_THRESHOLD", "medium");
-                }
-                _ => {} // full_auto / auto / unknown: no threshold = no HITL gate
+            if crate::task_spec::is_browser_provider(&provider) {
+                extra = extra.set(
+                    "KIM_BROWSER_RESTORE_STATUS",
+                    browser_restore_status_for_session(&session_dir, Some(&session_id), &provider),
+                );
             }
-
-            if provider == "browser" || provider.starts_with("browser:") {
-                let restore_status =
-                    browser_restore_status_for_session(&session_dir, Some(&session_id), &provider);
-                cmd.env("KIM_BROWSER_RESTORE_STATUS", restore_status);
-            }
-
             if provider.trim().eq_ignore_ascii_case("gemini") {
                 let google_env = match tauri::async_runtime::block_on(
                     google_oauth::google_oauth_env_for_agent(),
                 ) {
                     Ok(value) => value,
                     Err(err) => {
-                        tauri::async_runtime::block_on(async {
-                            crate::task_runtime::task_runtime().lock().await.release();
-                        });
+                        tauri::async_runtime::block_on(crate::spawn_supervisor::release_slot());
                         respond_json(
                             request,
                             400,
@@ -1356,25 +1264,27 @@ fn handle_webview_bridge_request(
                         return;
                     }
                 };
-                for (key, value) in google_env.as_env_pairs() {
-                    cmd.env(key, value);
-                }
+                extra = extra.extend(google_env.as_env_pairs());
             }
 
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    let child_pid = child.id();
-                    tauri::async_runtime::block_on(async {
-                        let mut rt = crate::task_runtime::task_runtime().lock().await;
-                        rt.store_pid(
-                            child_pid,
-                            session_id.clone(),
-                            crate::task_runtime::SpawnSource::Bridge,
-                        );
-                        rt.bridge_stdin = child.stdin.take();
-                    });
+            let spec = crate::task_spec::chat_task_spec(crate::task_spec::ChatSpecParams {
+                bundled_sidecar: crate::subprocess::is_bundled_orchestrator(&python),
+                python: &python,
+                kim_root: &kim_root,
+                project_root: &kim_root,
+                session_dir: &session_dir,
+                task: &parsed.task,
+                provider: &provider,
+                session_id: session_id.clone(),
+                resume: Some(session_id.clone()),
+                permission_mode: parsed.permission_mode.as_deref(),
+                source: crate::task_spec::SpawnSource::Bridge,
+                extra_envs: extra.build(),
+            });
 
-                    // Emit event so the desktop UI knows a task started
+            match tauri::async_runtime::block_on(crate::spawn_supervisor::spawn(spec)) {
+                Ok(sup) => {
+                    // Emit event so the desktop UI knows a task started.
                     let _ = app_handle.emit(
                         "kim-agent-started",
                         serde_json::json!({
@@ -1383,51 +1293,21 @@ fn handle_webview_bridge_request(
                         }),
                     );
 
-                    // Background thread: read stdout and forward events to the UI.
-                    // #33: route through the same translator the GUI path uses so
-                    // typed kim:* events (plan/step/tool/answer/…) reach the
-                    // frontend's typed listeners. Previously this emitted every
-                    // line raw on kim-agent-output, and the frontend's
-                    // decodeKimEventLine silently discarded typed JSON — so a
-                    // kimctl-launched task showed almost nothing in the desktop UI.
+                    // Detached supervision: pump stdout through the same typed
+                    // translator the GUI path uses (#33), wait for exit, then
+                    // restore the UI. Runs on the Tauri async runtime; the
+                    // bridge thread answers the HTTP request immediately.
                     let ipc_typed =
                         app_handle.state::<crate::config::AppConfig>().ipc_protocol == "typed";
-                    let reader_handle = if let Some(stdout) = child.stdout.take() {
-                        let reader = std::io::BufReader::new(stdout);
-                        use std::io::BufRead;
-                        let app_handle_out = app_handle.clone();
-                        Some(std::thread::spawn(move || {
-                            for l in reader.lines().map_while(Result::ok) {
-                                crate::subprocess::forward_agent_stdout_line(
-                                    &app_handle_out,
-                                    ipc_typed,
-                                    false,
-                                    &l,
-                                );
-                            }
-                        }))
-                    } else {
-                        None
-                    };
-
-                    // Background thread: wait for child to exit, then clear PID
                     let app_for_wait = app_handle.clone();
-                    std::thread::spawn(move || {
-                        let mut child = child;
-                        let status = child.wait();
-                        let success = status.as_ref().map(|s| s.success()).unwrap_or(false);
-                        if let Some(handle) = reader_handle {
-                            let _ = handle.join();
-                        }
-                        // #24: pid-guarded — if a cancel poller already cleared
-                        // us and a new task stored its own pid meanwhile, this
-                        // late clear must be a no-op.
-                        tauri::async_runtime::block_on(async {
-                            crate::task_runtime::task_runtime()
-                                .lock()
-                                .await
-                                .clear_if_pid(child_pid);
-                        });
+                    tauri::async_runtime::spawn(async move {
+                        let status = crate::spawn_supervisor::supervise(
+                            sup,
+                            app_for_wait.clone(),
+                            ipc_typed,
+                        )
+                        .await;
+                        let success = status.map(|s| s.success()).unwrap_or(false);
                         if let Some(cancel_win) = app_for_wait.get_webview_window("cancel-widget") {
                             let _ = cancel_win.close();
                         }
@@ -1453,9 +1333,7 @@ fn handle_webview_bridge_request(
                     );
                 }
                 Err(e) => {
-                    tauri::async_runtime::block_on(async {
-                        crate::task_runtime::task_runtime().lock().await.release();
-                    });
+                    // spawn() released the reservation already.
                     respond_json(
                         request,
                         500,
@@ -2039,24 +1917,27 @@ pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Resul
 
 #[cfg(test)]
 mod tests {
-    /// Mirror the argv-building logic that lives inside the `/v1/task` HTTP handler
-    /// (http_bridge.rs lines ~1087-1098).  The handler calls
-    /// `crate::subprocess::is_bundled_orchestrator` to decide whether to prepend
-    /// `-m orchestrator.agent`, then appends `--task` and `--session-dir`.
-    ///
-    /// Keeping the mirror here (rather than calling the handler directly) lets us
-    /// exercise the decision branch in isolation without needing a Tauri AppHandle.
+    /// K2: build the REAL argv the `/v1/task` handler produces, by calling the
+    /// shared `task_spec::chat_task_spec` builder exactly like the handler
+    /// does (no more hand-mirrored logic that could drift).
     fn build_task_argv(interpreter: &str, task: &str, session_dir: &str) -> Vec<String> {
-        let mut args: Vec<String> = vec![];
-        if !crate::subprocess::is_bundled_orchestrator(interpreter) {
-            args.push("-m".to_string());
-            args.push("orchestrator.agent".to_string());
-        }
-        args.push("--task".to_string());
-        args.push(task.to_string());
-        args.push("--session-dir".to_string());
-        args.push(session_dir.to_string());
-        args
+        use crate::task_spec::{chat_task_spec, ChatSpecParams, SpawnSource};
+        use std::path::Path;
+        chat_task_spec(ChatSpecParams {
+            python: interpreter,
+            bundled_sidecar: crate::subprocess::is_bundled_orchestrator(interpreter),
+            kim_root: Path::new("/kim"),
+            project_root: Path::new("/kim"),
+            session_dir: Path::new(session_dir),
+            task,
+            provider: "browser",
+            session_id: "test".to_string(),
+            resume: None,
+            permission_mode: None,
+            source: SpawnSource::Bridge,
+            extra_envs: vec![],
+        })
+        .args
     }
 
     /// Regression: a bundled sidecar interpreter must NOT receive `-m orchestrator.agent`
