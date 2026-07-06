@@ -228,7 +228,9 @@ function InlinePlanBlock({ plan, look = 'card' }: { plan: Extract<TraceItem, { k
             // compact style
             const palette =
               it.status === 'done'
-                ? { color: 'var(--kim-green)', bg: '#1d2a22', border: '#2a3d33' }
+                // L14: theme-aware — the old hardcoded dark hexes (#1d2a22 /
+                // #2a3d33) were wrong in the light theme.
+                ? { color: 'var(--kim-green)', bg: 'color-mix(in srgb, var(--kim-green) 14%, transparent)', border: 'color-mix(in srgb, var(--kim-green) 30%, transparent)' }
                 : it.status === 'active'
                 ? { color: 'var(--kim-accent)', bg: 'var(--kim-accent-soft)', border: 'var(--kim-accent-line)' }
                 : { color: 'var(--kim-text-4)', bg: 'transparent', border: 'var(--kim-border)' };

@@ -245,6 +245,10 @@ export function WorkedForPill({
 }: WorkedForPillProps) {
   const [open, setOpen] = useState(defaultOpen);
 
+  // L14: the ~170-line <style> block used to be injected PER INSTANCE;
+  // inject it once into document.head instead.
+  ensureWorkedForCss();
+
   const stats = useMemo(() => {
     const thoughts = trace.filter(t => t.kind === "think").length;
     return { thoughts, tools: trace.length - thoughts };
@@ -255,7 +259,6 @@ export function WorkedForPill({
       className={"wf-root" + (className ? " " + className : "")}
       style={{ ...tokens, fontFamily: "var(--wf-sans)", maxWidth: 720 }}
     >
-      <style>{CSS}</style>
 
       <button
         className="wf-pill"
@@ -324,6 +327,17 @@ export function WorkedForPill({
       </div>
     </div>
   );
+}
+
+// L14: single shared <style> injection (was rendered per WorkedForPill instance).
+let _wfCssInjected = false;
+function ensureWorkedForCss() {
+  if (_wfCssInjected || typeof document === 'undefined') return;
+  _wfCssInjected = true;
+  const el = document.createElement('style');
+  el.id = 'kim-workedfor-css';
+  el.textContent = CSS;
+  document.head.appendChild(el);
 }
 
 const CSS = `

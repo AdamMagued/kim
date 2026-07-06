@@ -123,6 +123,57 @@ describe('useCodexTurn — streams', () => {
     expect(result.current.tokenUsage).toEqual({ input: 100, output: 20, total: 120 });
   });
 
+  // M5: when respond_approval_decision rejects, the card must re-open (drop the
+  // optimistic resolved) so the user can retry — otherwise the turn hangs.
+  it('respond() re-opens the card when the invoke rejects', async () => {
+    const { result } = await renderTurn();
+    emit('kim:command-approval-request', {
+      id: '7', command: 'rm x', cwd: '/p', reason: '', risk: '', network: false, amendment: [],
+    });
+    invokeMock.mockRejectedValueOnce(new Error('dead run'));
+    await act(async () => {
+      result.current.respond('accept');
+      await Promise.resolve();
+    });
+    expect(result.current.approval?.resolved).toBeNull();
+    // Retry now works because the resolved-guard is cleared.
+    invokeMock.mockResolvedValueOnce(undefined);
+    act(() => result.current.respond('decline'));
+    expect(result.current.approval?.resolved).toBe('decline');
+  });
+
+  // M6: a terminal turn phase clears a still-pending approval (dead approval id).
+  it('a terminal turn phase clears a pending approval card', async () => {
+    const { result } = await renderTurn();
+    emit('kim:command-approval-request', {
+      id: '3', command: 'c', cwd: '', reason: '', risk: '', network: false, amendment: [],
+    });
+    expect(result.current.approval?.resolved).toBeNull();
+    emit('kim:turn-lifecycle', { phase: 'failed', turn_id: 't1' });
+    expect(result.current.approval).toBeNull();
+  });
+
+  // M6: kim-agent-done (legacy run end) also clears a pending approval.
+  it('kim-agent-done clears a pending approval card', async () => {
+    const { result } = await renderTurn();
+    emit('kim:command-approval-request', {
+      id: '4', command: 'c', cwd: '', reason: '', risk: '', network: false, amendment: [],
+    });
+    emit('kim-agent-done', true);
+    expect(result.current.approval).toBeNull();
+  });
+
+  // M6: a RESOLVED card survives a terminal phase (kept as a record).
+  it('a resolved approval card survives a terminal phase', async () => {
+    const { result } = await renderTurn();
+    emit('kim:command-approval-request', {
+      id: '8', command: 'c', cwd: '', reason: '', risk: '', network: false, amendment: [],
+    });
+    act(() => result.current.respond('accept'));
+    emit('kim:turn-lifecycle', { phase: 'completed', turn_id: 't1' });
+    expect(result.current.approval?.resolved).toBe('accept');
+  });
+
   it('a new turn clears the previous turn state', async () => {
     const { result } = await renderTurn();
     emit('kim:plan-update', { steps: [{ step: 's', status: 'pending' }] });

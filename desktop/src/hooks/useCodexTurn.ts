@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
+import { toast } from '../components/Toast';
 import {
   KimEventNames,
   type KimCommandApprovalRequestPayload,
@@ -130,7 +131,21 @@ export function useCodexTurn(): CodexTurnState {
           setPlan([]);
           setCommandOutput('');
           setDiff('');
+        } else {
+          // M6: terminal phases (completed / failed / interrupted) — a still-
+          // pending approval belongs to a dead turn; clear it so the card's
+          // buttons don't target a dead approval id. Resolved cards stay
+          // visible as a record of the decision.
+          setApproval(prev => (prev && prev.resolved === null ? null : prev));
         }
+      }),
+      // M6: the legacy run lifecycle can end a run without a turn/completed
+      // notification (cancel, agent exit). Clear a pending approval then too.
+      listen('kim-agent-done', () => {
+        setApproval(prev => (prev && prev.resolved === null ? null : prev));
+      }),
+      listen('kim-agent-cancelled', () => {
+        setApproval(prev => (prev && prev.resolved === null ? null : prev));
       }),
     ];
     return () => {
@@ -144,7 +159,15 @@ export function useCodexTurn(): CodexTurnState {
     const current = approvalRef.current;
     if (!current || current.resolved) return;
     setApproval({ ...current, resolved: decision });
-    void invoke('respond_approval_decision', { id: current.id, decision }).catch(() => undefined);
+    void invoke('respond_approval_decision', { id: current.id, decision }).catch(() => {
+      // M5: the optimistic "Approved/Denied" was a lie on failure — codex never
+      // got the decision, the turn hung, and the resolved-guard blocked
+      // re-answering. Re-open the card and tell the user.
+      setApproval(prev =>
+        prev && prev.id === current.id ? { ...prev, resolved: null } : prev
+      );
+      toast('Could not send the approval decision — try again.', 'error', 4000);
+    });
   }, []);
 
   return { approval, plan, commandOutput, diff, tokenUsage, turnPhase, respond };

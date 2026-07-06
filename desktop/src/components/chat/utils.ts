@@ -454,17 +454,14 @@ export function parseLogLine(raw: string, id: number): ActivityItem | null {
     return { id, kind: 'error', icon: '⚠', text: friendlyError(msg) };
   }
 
-  if (isNoiseLine(raw)) return null;
-  if (raw.startsWith('[truncated')) return null;
-
-  if (raw.startsWith('⏹')) {
-    return { id, kind: 'cancelled', icon: '⏹', text: 'Task stopped' };
-  }
-
   const isErr = raw.startsWith('[err]');
   const line = isErr ? raw.slice(5).trim() : raw;
   const stripped = line.replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.,]?\d*\s+/, '');
 
+  // M9: match the protocol directives BEFORE the noise filter — a NEED_HELP /
+  // TASK_COMPLETE reason containing a hidden substring (e.g. "screenshot",
+  // "stdin") used to be swallowed, ending the run with a generic error banner
+  // instead of the agent's actual question.
   const taskCompleteMatch = stripped.match(/(?:^|\b)TASK_COMPLETE:\s*(.+)$/i);
   if (taskCompleteMatch) {
     const summary = taskCompleteMatch[1].trim();
@@ -475,6 +472,13 @@ export function parseLogLine(raw: string, id: number): ActivityItem | null {
   if (needHelpMatch) {
     const reason = needHelpMatch[1].trim();
     return { id, kind: 'error', icon: '⚠', text: friendlyError(reason || 'Kim needs your help to continue.') };
+  }
+
+  if (isNoiseLine(raw)) return null;
+  if (raw.startsWith('[truncated')) return null;
+
+  if (raw.startsWith('⏹')) {
+    return { id, kind: 'cancelled', icon: '⏹', text: 'Task stopped' };
   }
 
   if (stripped.startsWith(LogTags.STATUS) || raw.startsWith(LogTags.STATUS)) {

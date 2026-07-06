@@ -194,6 +194,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // L16: cancelled-flag pattern (as used elsewhere) — if the effect cleans up
+    // before listen() resolves, immediately unsubscribe instead of leaking.
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     listen<ScheduleTimerTickEvent>('schedule-timer-tick', (event) => {
       const payload = event.payload;
@@ -207,8 +210,8 @@ export default function App() {
       } else if (result?.launched) {
         toast(`Scheduled task launched: ${result.task || result.task_id || 'task'}`, 'success', 4500);
       }
-    }).then((fn) => { unlisten = fn; }).catch(() => {});
-    return () => { unlisten?.(); };
+    }).then((fn) => { if (cancelled) fn(); else unlisten = fn; }).catch(() => {});
+    return () => { cancelled = true; unlisten?.(); };
   }, []);
 
   useEffect(() => {

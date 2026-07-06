@@ -75,12 +75,18 @@ function BlobLoader({ which }: { which: 3 | 6 | 12 | 15 | 20 }) {
 export interface StreamRendererProps {
   messages: KimMessage[];
   loadingMessages: boolean;
+  /** M17: set when the session file couldn't be read — rendered instead of the
+   *  bare "No messages in this session" empty state. */
+  loadError?: string | null;
   liveHistory: { role: 'user' | 'assistant'; content: string }[];
   runHistory: { activity: ActivityItem[]; durationSec: number; provider?: string | null }[];
   codexRuns: CodexRunGroup[];
   taskError: string | null;
   hitlApprovalStatus: HitlApprovalStatus | null;
-  onHitlRespond?: (approved: boolean) => void;
+  // M3: carries the full decision vocabulary so the legacy HITL card can send
+  // acceptForSession (the narrowed `(approved: boolean) => void` type silently
+  // dropped the decision param the hook already supports).
+  onHitlRespond?: (approved: boolean, decision?: 'accept' | 'acceptForSession' | 'decline') => void;
   codexTurn?: CodexTurnState | null;
   permissionMode?: PermissionMode;
   onPermissionModeChange?: (mode: PermissionMode) => void;
@@ -93,6 +99,9 @@ export interface StreamRendererProps {
   autoFollowOutput: boolean;
   setAutoFollowOutput: (val: boolean) => void;
   bottomRef: RefObject<HTMLDivElement | null>;
+  /** H1: attached to `.kim-messages` so useSessionScroll can detect the user
+   *  scrolling up (was created but never attached — auto-follow was forced). */
+  outputRef?: RefObject<HTMLDivElement | null>;
   newestMsgIdx: number | null;
   queuedTasks: PendingTask[];
   lastRunTask: PendingTask | null;
@@ -116,6 +125,7 @@ export interface StreamRendererProps {
 export function StreamRenderer({
   messages,
   loadingMessages,
+  loadError,
   liveHistory,
   runHistory,
   codexRuns,
@@ -134,6 +144,7 @@ export function StreamRenderer({
   autoFollowOutput,
   setAutoFollowOutput,
   bottomRef,
+  outputRef,
   newestMsgIdx,
   queuedTasks,
   lastRunTask,
@@ -333,6 +344,41 @@ export function StreamRenderer({
     });
   }, [collapsedLive, runHistory, savedUserCount, savedAsstCount, settings.typing_animation, stableRetry, stableEdit, renderWorkedFor]);
 
+  // L2: session-branch saved-message nodes, memoized like the live lists so
+  // the O(msgs × activity) regex work in renderWorkedFor doesn't re-run on
+  // every 50ms activity flush / 1s elapsed tick in long sessions.
+  const savedMsgNodes = useMemo(() => {
+    let userMsgIdx = -1;
+    return collapsedSaved.map(({ msg, retries, srcIdx }, i) => {
+      if (msg.role === 'user' && isRealUserMessage(msg)) userMsgIdx += 1;
+      if (isIntermediateToolCall(msg)) return null;
+
+      let workedRun: { activity: ActivityItem[]; durationSec: number; provider?: string | null } | null = null;
+      if (msg.role === 'assistant') {
+        const savedIdx = userMsgIdx - liveAsstCount;
+        workedRun = runHistory[savedIdx] ?? null;
+        if (!workedRun) {
+          // Use precomputed map — avoids re-calling synthesizeExchangeActivity per render
+          const synth = synthActivityMap.get(userMsgIdx) ?? null;
+          if (synth) workedRun = { activity: synth, durationSec: 0 };
+        }
+      }
+
+      return (
+        <div key={`msg-${srcIdx}`}>
+          {workedRun && renderWorkedFor(userMsgIdx, workedRun)}
+          <MessageBubble
+            message={msg}
+            animate={i === newestMsgIdx}
+            typingAnimation={settings.typing_animation ?? 'none'}
+            onRetry={stableRetry}
+            retries={retries}
+          />
+        </div>
+      );
+    });
+  }, [collapsedSaved, runHistory, liveAsstCount, synthActivityMap, newestMsgIdx, settings.typing_animation, stableRetry, renderWorkedFor]);
+
   // ── Render Helpers ─────────────────────────────────────────────────────────
 
   function renderHitlStatus() {
@@ -474,8 +520,9 @@ export function StreamRenderer({
     return (
       <div className="kim-msg-row kim-msg-row--assistant">
         <div className="kim-file-pills">
+          {/* L10: key by path — index keys mis-reconcile when the list mutates */}
           {files.map((f, i) => (
-            <span key={i} className="kim-file-pill">
+            <span key={f.path || i} className="kim-file-pill">
               <span className="kim-file-pill__name">{basename(f.path)}</span>
               {(f.added > 0 || f.removed > 0) && (
                 <span className="kim-file-pill__stats">
@@ -518,7 +565,7 @@ export function StreamRenderer({
 
         {/* B11: only the bottom sentinel gets bottomRef — binding it here too
             made the scroll target mount-order-dependent. */}
-        <div className="kim-messages">
+        <div className="kim-messages" ref={outputRef}>
           {empty && (
             <div
               style={{
@@ -695,7 +742,7 @@ export function StreamRenderer({
       {renderConnectorsChrome()}
 
       {/* Messages */}
-      <div className="kim-messages">
+      <div className="kim-messages" ref={outputRef}>
         {loadingMessages ? (
           <div className="kim-messages__loading">
             <svg width="0" height="0" style={{ position: 'absolute' }}>
@@ -712,7 +759,10 @@ export function StreamRenderer({
           </div>
         ) : messages.length === 0 ? (
           <div className="kim-messages__empty">
-            <div className="kim-messages__empty-text">No messages in this session</div>
+            {/* M17: distinguish "couldn't read the file" from "genuinely empty" */}
+            <div className="kim-messages__empty-text" role={loadError ? 'alert' : undefined}>
+              {loadError ?? 'No messages in this session'}
+            </div>
           </div>
         ) : (
           <>
@@ -741,38 +791,8 @@ export function StreamRenderer({
                 </div>
               ))
             ) : (
-              /* Normal message view */
-              (() => {
-                let userMsgIdx = -1;
-                return collapsedSaved.map(({ msg, retries, srcIdx }, i) => {
-                  if (msg.role === 'user' && isRealUserMessage(msg)) userMsgIdx += 1;
-                  if (isIntermediateToolCall(msg)) return null;
-
-                  let workedRun: { activity: ActivityItem[]; durationSec: number; provider?: string | null } | null = null;
-                  if (msg.role === 'assistant') {
-                    const savedIdx = userMsgIdx - liveAsstCount;
-                    workedRun = runHistory[savedIdx] ?? null;
-                    if (!workedRun) {
-                      // Use precomputed map — avoids re-calling synthesizeExchangeActivity per render
-                      const synth = synthActivityMap.get(userMsgIdx) ?? null;
-                      if (synth) workedRun = { activity: synth, durationSec: 0 };
-                    }
-                  }
-
-                  return (
-                    <div key={`msg-${srcIdx}`}>
-                      {workedRun && renderWorkedFor(userMsgIdx, workedRun)}
-                      <MessageBubble
-                        message={msg}
-                        animate={i === newestMsgIdx}
-                        typingAnimation={settings.typing_animation ?? 'none'}
-                        onRetry={handleRetryLast}
-                        retries={retries}
-                      />
-                    </div>
-                  );
-                });
-              })()
+              /* Normal message view — L2: memoized node list (savedMsgNodes) */
+              savedMsgNodes
             )}
 
             {/* Newly added messages in this session — same memo strategy:
@@ -795,6 +815,23 @@ export function StreamRenderer({
                 <div style={{ maxWidth: '78%', minWidth: 0 }}>
                   <SignalCard kind="error" text={friendlyTaskError(taskError)} onAction={handleRetryLast} actionLabel="Resend Task" />
                 </div>
+              </div>
+            )}
+
+            {/* H1: "Jump to latest" pill — the session branch never had one even
+                though auto-follow can now be paused here too. */}
+            {!autoFollowOutput && (activity.length > 0 || isRunning) && (
+              <div className="kim-jump-latest-wrap">
+                <button
+                  type="button"
+                  className="kim-jump-latest-btn"
+                  onClick={() => {
+                    setAutoFollowOutput(true);
+                    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+                  }}
+                >
+                  Jump to latest
+                </button>
               </div>
             )}
           </>

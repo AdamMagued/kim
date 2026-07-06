@@ -277,6 +277,9 @@ function PaneData({
   async function handleGistBackup() {
     if (!account.github_token) return;
     setGistState('working');
+    // L12: clear any stale red "Backup failed" message from an earlier attempt
+    // so a later successful backup doesn't render success + old failure text.
+    setStatusMsg('');
     try {
       const gistId = await invoke<string>('backup_to_gist', {
         token: account.github_token,

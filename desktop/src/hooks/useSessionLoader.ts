@@ -40,6 +40,11 @@ export function useSessionLoader({
 
     const isCodexContinuation =
       isSessionChange && prevId !== null && session.session_type === 'codex' && stream.hasSentMessageRef.current;
+    // L6 (documented, not changed): this compares a backend session id against
+    // the numeric task counter (PendingTask.id is 1,2,3…), so it is almost
+    // certainly never true. Left as-is because changing the comparison would
+    // alter session-transition semantics; the isCodexContinuation branch above
+    // covers the real seamless-transition case.
     const isSelfTransition =
       isSessionChange && prevId === null && session.session_id === stream.currentTaskRef.current?.id.toString();
     const isSeamlessTransition = isSelfTransition || isCodexContinuation;
@@ -84,7 +89,12 @@ export function useSessionLoader({
             }
           }
         })
-        .catch(() => {});
+        .catch(() => {
+          // M17: don't swallow silently — durations/traces will be missing, so
+          // leave a trace for debugging without spamming the user with a toast
+          // for auxiliary data.
+          console.warn('load_run_history failed for session', session.session_id);
+        });
     }
 
     invoke<KimMessage[]>('load_session_messages', {
@@ -131,11 +141,17 @@ export function useSessionLoader({
           const grouped = groupCodexMessages(msgs);
           // Merge durations captured from load_run_history (if it already resolved),
           // so the codex "Worked for …" pills show the real duration, not 0.
+          // H9: on a same-session reload (messageReloadNonce bump after a run),
+          // load_run_history is NOT re-invoked, so capturedCodexRuns stays null
+          // and the pills reverted to "…". Fall back to the already-loaded
+          // stream.runHistory durations in that case.
+          const durationSource: Array<{ durationSec: number }> | null =
+            capturedCodexRuns ?? (isSessionChange ? null : stream.runHistory);
           setCodexRuns(
-            capturedCodexRuns
+            durationSource
               ? grouped.map((run, i) =>
-                  capturedCodexRuns![i]?.durationSec > 0
-                    ? { ...run, durationSec: capturedCodexRuns![i].durationSec }
+                  durationSource[i]?.durationSec > 0
+                    ? { ...run, durationSec: durationSource[i].durationSec }
                     : run
                 )
               : grouped

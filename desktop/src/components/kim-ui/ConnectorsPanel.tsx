@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { openUrl } from '@tauri-apps/plugin-opener';
 
 export type ConnectorState = 'connected' | 'available' | 'soon';
 
@@ -46,6 +47,10 @@ export function ConnectorsPanel({ connectors, onClose, onConnect, onManage }: Pr
 
   return (
     <div
+      // H4: the backdrop (rendered by ChatView) closes on any click; without
+      // this, every click INSIDE the panel (category chips, search box,
+      // Connect) bubbled up and dismissed the whole panel.
+      onClick={(e) => e.stopPropagation()}
       style={{
         width: 460,
         height: '100%',
@@ -194,17 +199,8 @@ export function ConnectorsPanel({ connectors, onClose, onConnect, onManage }: Pr
           <>
             <div style={{ display: 'flex', alignItems: 'center', padding: '16px 4px 8px' }}>
               <span className="kr-eyebrow">coming soon</span>
-              <span
-                style={{
-                  marginLeft: 'auto',
-                  fontSize: 11,
-                  color: 'var(--kim-text-3)',
-                  cursor: 'pointer',
-                  fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
-                }}
-              >
-                request →
-              </span>
+              {/* M14: no request flow exists yet — don't render a fake
+                  cursor:pointer control that silently does nothing. */}
             </div>
             {soon.map((c) => (
               <ConnectorRow key={c.id} c={c} onConnect={onConnect} onManage={onManage} />
@@ -236,7 +232,13 @@ export function ConnectorsPanel({ connectors, onClose, onConnect, onManage }: Pr
           Building your own?
           <span style={{ color: 'var(--kim-text-3)' }}> Wire any HTTP API as a custom MCP server.</span>
         </div>
-        <button type="button" className="kr-btn" style={{ fontSize: 12, padding: '6px 10px' }}>
+        <button
+          type="button"
+          className="kr-btn"
+          style={{ fontSize: 12, padding: '6px 10px' }}
+          // M14: was a dead button — open the MCP docs in the system browser.
+          onClick={() => { void openUrl('https://modelcontextprotocol.io/').catch(() => {}); }}
+        >
           Docs
         </button>
       </div>
@@ -323,14 +325,18 @@ function ConnectorRow({
             </div>
             <div style={{ fontSize: 12, color: 'var(--kim-text-3)', lineHeight: 1.5 }}>{c.desc}</div>
           </div>
-          <button
-            type="button"
-            className="kr-btn"
-            onClick={() => onManage?.(c)}
-            style={{ fontSize: 12, padding: '5px 10px', alignSelf: 'flex-start' }}
-          >
-            Manage
-          </button>
+          {/* M14: only render when a real handler exists — a silent no-op
+              button reads as broken. */}
+          {onManage && (
+            <button
+              type="button"
+              className="kr-btn"
+              onClick={() => onManage(c)}
+              style={{ fontSize: 12, padding: '5px 10px', alignSelf: 'flex-start' }}
+            >
+              Manage
+            </button>
+          )}
         </div>
         <div style={{ display: 'flex', gap: 6, marginTop: 12, flexWrap: 'wrap', position: 'relative' }}>
           {c.tools != null && (
@@ -441,11 +447,12 @@ function ConnectorRow({
         <div style={{ fontSize: 11.5, color: 'var(--kim-text-3)', lineHeight: 1.5 }}>{c.desc}</div>
       </div>
       <div style={{ flexShrink: 0, alignSelf: 'center' }}>
-        {c.state === 'available' && (
+        {/* M14: only render Connect when a real handler exists. */}
+        {c.state === 'available' && onConnect && (
           <button
             type="button"
             className="kr-btn kr-btn-primary"
-            onClick={() => onConnect?.(c)}
+            onClick={() => onConnect(c)}
             style={{ fontSize: 12, padding: '6px 12px' }}
           >
             Connect

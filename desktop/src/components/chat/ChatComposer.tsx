@@ -13,6 +13,9 @@ export interface ChatComposerProps {
   cancelling: boolean;
   handleCancel: () => void;
   onSubmit: (fullText: string) => void;
+  /** M1: K3 mid-run steering — inject text into the RUNNING agent instead of
+   *  queuing it as the next task. Only shown while a run is active. */
+  onSteer?: (text: string) => void;
   activeTab: 'chat' | 'code';
   activeProjectPath?: string | null;
   settings: Settings;
@@ -32,6 +35,7 @@ export function ChatComposer({
   cancelling,
   handleCancel,
   onSubmit,
+  onSteer,
   activeTab,
   activeProjectPath,
   settings,
@@ -92,72 +96,83 @@ export function ChatComposer({
     const results: AttachedFile[] = [];
     for (const file of arr) {
       const sizeLabel = fmtBytes(file.size);
-      if (file.type.startsWith('image/')) {
-        if (file.size > MAX_IMAGE_BYTES) {
-          toast(`${file.name} is too large (max ${fmtBytes(MAX_IMAGE_BYTES)}).`, 'warning', 4000);
-          continue;
-        }
-        const base64 = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            const url = reader.result as string;
-            resolve(url.split(',')[1]);
-          };
-          reader.onerror = reject;
-          reader.readAsDataURL(file);
-        });
-        const previewUrl = URL.createObjectURL(file);
-        try {
-          const savedPath = await invoke<string>('save_attachment', {
-            filename: file.name,
-            dataBase64: base64,
+      // L10: stable chip identity (name alone can collide across duplicates).
+      const attachId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      // M16: isolate failures per file — one unreadable file used to reject the
+      // whole `void processFiles(...)` call as an unhandled rejection, silently
+      // dropping every remaining file in the batch.
+      try {
+        if (file.type.startsWith('image/')) {
+          if (file.size > MAX_IMAGE_BYTES) {
+            toast(`${file.name} is too large (max ${fmtBytes(MAX_IMAGE_BYTES)}).`, 'warning', 4000);
+            continue;
+          }
+          const base64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              const url = reader.result as string;
+              resolve(url.split(',')[1]);
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
           });
-          results.push({ name: file.name, kind: 'image', savedPath, previewUrl, sizeLabel });
-        } catch {
-          toast(`Could not save image: ${file.name}`, 'error', 3000);
-        }
-      } else if (
-        file.type.startsWith('text/') ||
-        /\.(md|txt|py|js|ts|tsx|jsx|json|yaml|yml|toml|sh|bash|zsh|fish|csv|xml|sql|rs|go|java|c|cpp|h|swift|kt|rb|php|html|css|scss|less|env|gitignore|dockerfile)$/i.test(
-          file.name
-        )
-      ) {
-        if (file.size > MAX_TEXT_BYTES) {
-          toast(`${file.name} is too large to inline (max ${fmtBytes(MAX_TEXT_BYTES)}). Attach a smaller excerpt.`, 'warning', 4000);
-          continue;
-        }
-        const content = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = reject;
-          reader.readAsText(file);
-        });
-        results.push({ name: file.name, kind: 'text', content, sizeLabel });
-      } else if (file.type.startsWith('audio/') || file.type.startsWith('video/')) {
-        toast(`${file.name}: audio and video files are not supported.`, 'warning', 4000);
-      } else {
-        if (file.size > MAX_BINARY_BYTES) {
-          toast(`${file.name} is too large (max ${fmtBytes(MAX_BINARY_BYTES)}).`, 'warning', 4000);
-          continue;
-        }
-        const base64 = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            const url = reader.result as string;
-            resolve(url.includes(',') ? url.split(',')[1] : url);
-          };
-          reader.onerror = reject;
-          reader.readAsDataURL(file);
-        });
-        try {
-          const savedPath = await invoke<string>('save_attachment', {
-            filename: file.name,
-            dataBase64: base64,
+          const previewUrl = URL.createObjectURL(file);
+          try {
+            const savedPath = await invoke<string>('save_attachment', {
+              filename: file.name,
+              dataBase64: base64,
+            });
+            results.push({ id: attachId, name: file.name, kind: 'image', savedPath, previewUrl, sizeLabel });
+          } catch {
+            // M16: don't leak the object URL when the save fails.
+            URL.revokeObjectURL(previewUrl);
+            toast(`Could not save image: ${file.name}`, 'error', 3000);
+          }
+        } else if (
+          file.type.startsWith('text/') ||
+          /\.(md|txt|py|js|ts|tsx|jsx|json|yaml|yml|toml|sh|bash|zsh|fish|csv|xml|sql|rs|go|java|c|cpp|h|swift|kt|rb|php|html|css|scss|less|env|gitignore|dockerfile)$/i.test(
+            file.name
+          )
+        ) {
+          if (file.size > MAX_TEXT_BYTES) {
+            toast(`${file.name} is too large to inline (max ${fmtBytes(MAX_TEXT_BYTES)}). Attach a smaller excerpt.`, 'warning', 4000);
+            continue;
+          }
+          const content = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsText(file);
           });
-          results.push({ name: file.name, kind: 'binary', savedPath, sizeLabel });
-        } catch {
-          toast(`Could not save attachment: ${file.name}`, 'error', 3000);
+          results.push({ id: attachId, name: file.name, kind: 'text', content, sizeLabel });
+        } else if (file.type.startsWith('audio/') || file.type.startsWith('video/')) {
+          toast(`${file.name}: audio and video files are not supported.`, 'warning', 4000);
+        } else {
+          if (file.size > MAX_BINARY_BYTES) {
+            toast(`${file.name} is too large (max ${fmtBytes(MAX_BINARY_BYTES)}).`, 'warning', 4000);
+            continue;
+          }
+          const base64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              const url = reader.result as string;
+              resolve(url.includes(',') ? url.split(',')[1] : url);
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+          });
+          try {
+            const savedPath = await invoke<string>('save_attachment', {
+              filename: file.name,
+              dataBase64: base64,
+            });
+            results.push({ id: attachId, name: file.name, kind: 'binary', savedPath, sizeLabel });
+          } catch {
+            toast(`Could not save attachment: ${file.name}`, 'error', 3000);
+          }
         }
+      } catch {
+        toast(`Could not read ${file.name}.`, 'error', 3000);
       }
     }
     if (results.length > 0) {
@@ -243,7 +258,7 @@ export function ChatComposer({
       {attachedFiles.length > 0 && (
         <div className="kim-composer__attachments">
           {attachedFiles.map((f, i) => (
-            <div key={i} className="kim-composer__attach-chip">
+            <div key={f.id ?? `${f.name}-${i}`} className="kim-composer__attach-chip">
               {f.kind === 'image' && f.previewUrl ? (
                 <img src={f.previewUrl} alt={f.name} className="kim-composer__attach-thumb" />
               ) : (
@@ -399,6 +414,25 @@ export function ChatComposer({
                 >
                   <path d="M11.5 5.5L6 11a2.5 2.5 0 01-3.5-3.5L8 2a1.5 1.5 0 012 2L4.5 9.5a.5.5 0 00.7.7L10 5.5" />
                 </svg>
+              </button>
+            )}
+            {/* M1: mid-run steering — sends the drafted text to the RUNNING
+                agent (steer_task) instead of queuing it as the next task. */}
+            {isRunning && !cancelling && onSteer && taskInput.trim() && (
+              <button
+                type="button"
+                className="kim-btn"
+                title="Steer the running task with this message (Send queues it as the next task instead)"
+                aria-label="Steer the running task"
+                onClick={() => {
+                  const text = taskInput.trim();
+                  if (!text) return;
+                  onSteer(text);
+                  setTaskInput('');
+                  if (textareaRef.current) textareaRef.current.style.height = 'auto';
+                }}
+              >
+                Steer
               </button>
             )}
             {isRunning && !cancelling && (

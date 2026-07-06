@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
+import { toast } from '../components/Toast';
 import type { ActivityItem, PendingTask, HitlApprovalStatus, LivePlanParsed } from '../components/chat/types';
 import type { SessionInfo, Settings } from '../types';
 import { parseAgentLine, buildThinkingTrace } from '../components/chat/parsers';
@@ -9,6 +10,9 @@ import {
   KimEventNames,
   type KimActivityPayload,
   type KimAnswerPayload,
+  type KimAssistantDeltaPayload,
+  type KimItemLifecyclePayload,
+  type KimReasoningDeltaPayload,
   type KimContextPayload,
   type KimDiffPayload,
   type KimDonePayload,
@@ -27,6 +31,10 @@ import {
 } from '../types/events.gen';
 
 const MAX_ACTIVITY_ITEMS = 300;
+
+// L4: named constant for the one non-generated event this hook listens to
+// (kim-run-id is emitted straight from Rust and isn't in KimEventNames).
+const KIM_RUN_ID_EVENT = 'kim-run-id';
 
 function providerErrorMessage(code: string | null): string | null {
   if (!code) return null;
@@ -225,6 +233,54 @@ export function useChatStream({
     scheduleActivityFlush();
   }, [scheduleActivityFlush]);
 
+  // ── M7: streamed assistant/reasoning deltas (codex app-server transport) ──
+  // kim:assistant-delta / kim:reasoning-delta / kim:item-lifecycle arrive from
+  // Rust but previously had no listeners — streamed text was dropped on the
+  // floor. Assistant deltas accumulate into ONE live bubble (flushed at 50ms,
+  // like activity) that the final kim:answer replaces; reasoning deltas are
+  // line-buffered into the activity feed; item-lifecycle 'started' items become
+  // activity entries.
+  const streamingAnswerRef = useRef<{ active: boolean; text: string }>({ active: false, text: '' });
+  const assistantFlushTimerRef = useRef<number | null>(null);
+  const reasoningBufRef = useRef('');
+
+  const resetDeltaStreams = useCallback(() => {
+    if (assistantFlushTimerRef.current !== null) {
+      window.clearTimeout(assistantFlushTimerRef.current);
+      assistantFlushTimerRef.current = null;
+    }
+    streamingAnswerRef.current = { active: false, text: '' };
+    reasoningBufRef.current = '';
+  }, []);
+
+  const flushAssistantDelta = useCallback(() => {
+    const text = streamingAnswerRef.current.text;
+    if (!text.trim()) return;
+    setLiveHistory(prev => {
+      if (!streamingAnswerRef.current.active) {
+        streamingAnswerRef.current.active = true;
+        return [...prev, { role: 'assistant', content: text }];
+      }
+      // Replace the streaming bubble (the last assistant entry we appended).
+      for (let i = prev.length - 1; i >= 0; i--) {
+        if (prev[i].role === 'assistant') {
+          const next = [...prev];
+          next[i] = { role: 'assistant', content: text };
+          return next;
+        }
+      }
+      return [...prev, { role: 'assistant', content: text }];
+    });
+  }, []);
+
+  const scheduleAssistantFlush = useCallback(() => {
+    if (assistantFlushTimerRef.current !== null) return;
+    assistantFlushTimerRef.current = window.setTimeout(() => {
+      assistantFlushTimerRef.current = null;
+      flushAssistantDelta();
+    }, 50);
+  }, [flushAssistantDelta]);
+
   const clearActivityNow = useCallback(() => {
     if (activityFlushTimerRef.current !== null) {
       window.clearTimeout(activityFlushTimerRef.current);
@@ -402,6 +458,9 @@ export function useChatStream({
     let unlistenTypedAnswer: (() => void) | undefined;
     let unlistenTypedDiff: (() => void) | undefined;
     let unlistenTypedActivity: (() => void) | undefined;
+    let unlistenTypedAssistantDelta: (() => void) | undefined;
+    let unlistenTypedReasoningDelta: (() => void) | undefined;
+    let unlistenTypedItemLifecycle: (() => void) | undefined;
     let unlistenRunId: (() => void) | undefined;
 
     // Typed IPC listeners own Kim's UI state. The raw listener below remains
@@ -495,7 +554,7 @@ export function useChatStream({
       }));
     }).then(fn => { if (!cancelled) unlistenTypedHitlResult = fn; else fn(); });
 
-    listen<string>('kim-run-id', e => { setLastRunId(e.payload); }) // K1
+    listen<string>(KIM_RUN_ID_EVENT, e => { setLastRunId(e.payload); }) // K1
       .then(fn => { if (!cancelled) unlistenRunId = fn; else fn(); });
 
     listen<KimRunFailedPayload>(KimEventNames.RUN_FAILED, e => {
@@ -541,12 +600,76 @@ export function useChatStream({
       const text = e.payload.text.trim();
       if (!text) return;
       answerReceivedThisRunRef.current = true;
+      // M7: if assistant deltas were streaming, the final answer REPLACES the
+      // streaming bubble instead of appending a duplicate.
+      const wasStreaming = streamingAnswerRef.current.active;
+      resetDeltaStreams();
       setLiveHistory(prev => {
+        if (wasStreaming) {
+          for (let i = prev.length - 1; i >= 0; i--) {
+            if (prev[i].role === 'assistant') {
+              const next = [...prev];
+              next[i] = { role: 'assistant', content: text };
+              return next;
+            }
+          }
+        }
         const last = prev[prev.length - 1];
         if (last?.role === 'assistant' && last.content.trim() === text) return prev;
         return [...prev, { role: 'assistant', content: text }];
       });
     }).then(fn => { if (!cancelled) unlistenTypedAnswer = fn; else fn(); });
+
+    // M7: streamed assistant text (codex app-server transport) — previously no
+    // listener existed and these events were dropped.
+    listen<KimAssistantDeltaPayload>(KimEventNames.ASSISTANT_DELTA, e => {
+      const chunk = e.payload.chunk;
+      if (!chunk) return;
+      streamingAnswerRef.current.text += chunk;
+      // A streamed answer counts as "answer received" so the success-line
+      // fallback below doesn't append a duplicate bubble.
+      if (streamingAnswerRef.current.text.trim()) answerReceivedThisRunRef.current = true;
+      scheduleAssistantFlush();
+    }).then(fn => { if (!cancelled) unlistenTypedAssistantDelta = fn; else fn(); });
+
+    // M7: streamed reasoning — surface completed lines in the activity feed
+    // (mirrors the raw path's per-line codex_reasoning handling).
+    listen<KimReasoningDeltaPayload>(KimEventNames.REASONING_DELTA, e => {
+      reasoningBufRef.current += e.payload.chunk ?? '';
+      let nl = reasoningBufRef.current.indexOf('\n');
+      while (nl !== -1) {
+        const lineText = reasoningBufRef.current.slice(0, nl).trim();
+        reasoningBufRef.current = reasoningBufRef.current.slice(nl + 1);
+        nl = reasoningBufRef.current.indexOf('\n');
+        if (!lineText) continue;
+        const id = ++activityCounterRef.current;
+        enqueueActivityUpdate(prev => {
+          const next = [...prev, { id, kind: 'tool' as const, icon: '💭', text: lineText }];
+          return next.length > MAX_ACTIVITY_ITEMS ? next.slice(-MAX_ACTIVITY_ITEMS) : next;
+        });
+      }
+    }).then(fn => { if (!cancelled) unlistenTypedReasoningDelta = fn; else fn(); });
+
+    // M7: item lifecycle — show started commands / file changes in the feed.
+    listen<KimItemLifecyclePayload>(KimEventNames.ITEM_LIFECYCLE, e => {
+      if (e.payload.phase !== 'started') return;
+      const title = (e.payload.title ?? '').trim();
+      let text: string | null = null;
+      if (e.payload.kind === 'commandExecution') {
+        text = title ? `Running \`${title.length > 80 ? `${title.slice(0, 80)}…` : title}\`` : 'Running a command';
+      } else if (e.payload.kind === 'fileChange') {
+        text = title ? `Editing ${title}` : 'Editing files';
+      } else if (e.payload.kind === 'webSearch') {
+        text = title ? `Searching the web for "${title}"` : 'Searching the web';
+      }
+      if (!text) return;
+      const item: ActivityItem = { id: ++activityCounterRef.current, kind: 'tool', icon: '⚡', text };
+      if (isDuplicateActivityItem(item)) return;
+      enqueueActivityUpdate(prev => {
+        const next = [...prev, item];
+        return next.length > MAX_ACTIVITY_ITEMS ? next.slice(-MAX_ACTIVITY_ITEMS) : next;
+      });
+    }).then(fn => { if (!cancelled) unlistenTypedItemLifecycle = fn; else fn(); });
 
     listen<KimDiffPayload>(KimEventNames.DIFF, e => {
       enqueueActivityUpdate(prev => {
@@ -569,6 +692,18 @@ export function useChatStream({
         appendTypedActivity('error', message);
       } else if (e.payload.kind === 'success') {
         appendTypedActivity('success', e.payload.text);
+        // M8: raw-path parity — when a run ends with a [SUCCESS] line but no
+        // ANSWER ever arrived, the summary must still become an assistant
+        // bubble (otherwise a success-without-answer stream renders nothing).
+        const successText = e.payload.text.trim();
+        const genericSuccess = /^Task completed(?: successfully)?$/i.test(successText);
+        if (successText && !genericSuccess && !answerReceivedThisRunRef.current) {
+          setLiveHistory(prev => {
+            const last = prev[prev.length - 1];
+            if (last?.role === 'assistant' && last.content.trim() === successText) return prev;
+            return [...prev, { role: 'assistant', content: successText }];
+          });
+        }
       } else {
         setTypedStatus(e.payload.text);
         appendTypedActivity('status', e.payload.text);
@@ -585,6 +720,14 @@ export function useChatStream({
 
     listen<boolean>('kim-agent-done', event => {
       invoke('set_task_active_mode', { active: false }).catch(() => {});
+      // M7: land any still-buffered streamed assistant text, then reset the
+      // delta stream state for the next run.
+      if (assistantFlushTimerRef.current !== null) {
+        window.clearTimeout(assistantFlushTimerRef.current);
+        assistantFlushTimerRef.current = null;
+        flushAssistantDelta();
+      }
+      resetDeltaStreams();
       const wasCancelled = cancelFlagRef.current;
       const hadNeedHelp = needHelpFlagRef.current;
       doneHandledRef.current = true;
@@ -594,7 +737,9 @@ export function useChatStream({
       // passive effect only runs after this callback returns. Clearing the ref
       // now would make that effect read `false` and auto-run the next queued
       // task, defeating Stop. The flag is reset by the next runPendingTask().
-      setIsCancelled(false);
+      // L1: don't clobber a cancel that already happened — kim-agent-done often
+      // arrives AFTER kim-agent-cancelled set isCancelled=true.
+      setIsCancelled(wasCancelled);
       needHelpFlagRef.current = false;
       setIsRunning(false);
       setCancelling(false);
@@ -668,6 +813,7 @@ export function useChatStream({
 
     listen<boolean>('kim-agent-cancelled', () => {
       invoke('set_task_active_mode', { active: false }).catch(() => {});
+      resetDeltaStreams(); // M7: drop buffered deltas from the cancelled run
       cancelFlagRef.current = true;
       setIsCancelled(true); // Fix 4: keep state in sync with ref
       appendRaw('⏹ Task cancelled');
@@ -704,19 +850,33 @@ export function useChatStream({
       unlistenTypedAnswer?.();
       unlistenTypedDiff?.();
       unlistenTypedActivity?.();
+      unlistenTypedAssistantDelta?.();
+      unlistenTypedReasoningDelta?.();
+      unlistenTypedItemLifecycle?.();
       unlistenRunId?.();
+      // M7: cancel a pending assistant-delta flush on teardown.
+      if (assistantFlushTimerRef.current !== null) {
+        window.clearTimeout(assistantFlushTimerRef.current);
+        assistantFlushTimerRef.current = null;
+      }
     };
     // commitCurrentBrowserUrl intentionally omitted — accessed via ref so this effect
     // registers listeners once and doesn't re-run (and leak handlers) on session switch.
-  }, [appendRaw, appendTypedActivity, enqueueActivityUpdate, flushActivityNow, clearActivityNow, isDuplicateActivityItem, setMessageReloadNonce]);
+  }, [appendRaw, appendTypedActivity, enqueueActivityUpdate, flushActivityNow, clearActivityNow, isDuplicateActivityItem, setMessageReloadNonce, flushAssistantDelta, resetDeltaStreams, scheduleAssistantFlush]);
 
   // Derived state to satisfy Prompt 8 explicit signature.
   // #34: prefer the typed kim:plan-driven plan, but fall back to parsing the
   // legacy activity stream so runs whose plan arrives only as text (codex and
   // kimctl-bridge streams that don't emit typed kim:plan) still render a live
   // plan checklist instead of nothing.
-  const livePlan = typedLivePlan ?? parsePlanFromActivity(activity);
-  const traceItems = buildThinkingTrace(activity, livePlan);
+  // L1: memoized — both functions are O(N) regex passes that used to run on
+  // EVERY ChatView render (~20x/sec during a run) for values with no consumer
+  // outside this hook's public API / tests.
+  const livePlan = useMemo(
+    () => typedLivePlan ?? parsePlanFromActivity(activity),
+    [typedLivePlan, activity],
+  );
+  const traceItems = useMemo(() => buildThinkingTrace(activity, livePlan), [activity, livePlan]);
   const planSteps = livePlan?.steps ?? [];
   const activityEntries = activity;
   const lastStatus = typedStatus || (activity.filter(a => a.kind === 'status').slice(-1)[0]?.text ?? '');
@@ -795,6 +955,10 @@ export function useChatStream({
       invoke('hitl_respond_approval', {
         approved,
         decision: decision ?? (approved ? 'accept' : 'decline'),
-      }).catch(() => {}),
+      }).catch(() => {
+        // M4: clicking Approve/Deny used to silently no-op when the invoke
+        // rejected (dead run, IPC error) — card stayed pending, agent blocked.
+        toast('Could not send your approval decision — the run may have ended.', 'error', 4000);
+      }),
   };
 }

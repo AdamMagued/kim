@@ -100,11 +100,10 @@ export interface KimAccount {
   display_name: string;
   github_username?: string;
   /**
-   * @security Known limitation: this token is stored in plaintext in the local
-   * account JSON file. Migrating it to the OS keychain requires new Rust
-   * `keychain_store` / `keychain_load` commands (outside the React layer).
-   * Do not log or transmit this value. See docs/archive/PRODUCTION_ROADMAP.md for the
-   * keychain migration task.
+   * @security In-memory only. The PAT is persisted to the OS keychain via the
+   * `store_github_token` Rust command, and `save_account` strips this field
+   * before writing account.json — it never touches disk in plaintext (see
+   * OnboardingFlow/PaneAccount). Do not log or transmit this value.
    */
   github_token?: string;
   github_avatar_url?: string;

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 export type ToastKind = 'info' | 'success' | 'error' | 'warning';
 
@@ -104,9 +104,12 @@ export function ToastProvider() {
     return () => { _setToasts = null; };
   }, []);
 
-  function remove(id: number) {
+  // H6: stable identity — `remove` is in every ToastItem's effect deps, so a
+  // per-render function re-armed ALL visible toasts' hide timers whenever any
+  // new toast arrived (earlier toasts never expired during an error burst).
+  const remove = useCallback((id: number) => {
     setToasts(prev => prev.filter(t => t.id !== id));
-  }
+  }, []);
 
   if (toasts.length === 0) return null;
 

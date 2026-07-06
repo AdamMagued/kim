@@ -39,7 +39,11 @@ export function useAuthStatus(provider: string | null | undefined) {
     probed: false,
   });
   const lastProviderRef = useRef<string | null>(null);
-  const inFlightRef = useRef(false);
+  // H5: key the in-flight guard by provider so switching providers can start a
+  // new probe while the old one is still pending, and stamp responses with the
+  // provider they were requested for so a slow old probe can't be shown as the
+  // new provider's auth state.
+  const inFlightProviderRef = useRef<string | null>(null);
 
   const normalized = (provider ?? '').toLowerCase().replace(/^browser:/, '').trim();
   const supported = ['chatgpt', 'openai', 'claude', 'anthropic', 'gemini', 'google', 'deepseek', 'grok'].includes(normalized);
@@ -49,18 +53,24 @@ export function useAuthStatus(provider: string | null | undefined) {
       setState({ status: null, loading: false, probed: true });
       return;
     }
-    if (inFlightRef.current) return;
-    inFlightRef.current = true;
+    // Same-provider probe already pending — don't stack a duplicate.
+    if (inFlightProviderRef.current === normalized) return;
+    const target = normalized;
+    inFlightProviderRef.current = target;
     setState(prev => ({ ...prev, loading: true }));
+    // Discard results that land after the user switched to another provider.
+    const isStale = () => lastProviderRef.current !== null && lastProviderRef.current !== target;
     try {
       const result = await invoke<ProviderAuthStatus>('provider_check_auth', {
-        provider: normalized,
+        provider: target,
       });
+      if (isStale()) return;
       setState({ status: result, loading: false, probed: true });
     } catch (err) {
+      if (isStale()) return;
       setState({
         status: {
-          provider: normalized,
+          provider: target,
           signed_in: false,
           error: String(err),
         },
@@ -68,7 +78,7 @@ export function useAuthStatus(provider: string | null | undefined) {
         probed: true,
       });
     } finally {
-      inFlightRef.current = false;
+      if (inFlightProviderRef.current === target) inFlightProviderRef.current = null;
     }
   }, [normalized, supported]);
 

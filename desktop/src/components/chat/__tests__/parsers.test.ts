@@ -87,6 +87,29 @@ describe('Chat Parsers and Plan Extractors', () => {
         expect(parsed.payload).toBe('Reached conversational loop.');
       }
     });
+
+    // M9: a NEED_HELP reason containing a hidden/noise substring (e.g.
+    // "screenshot") used to be swallowed by the noise filter, so the run ended
+    // with a generic error banner instead of the agent's real question.
+    it('parses NEED_HELP even when the reason contains a noise substring', () => {
+      const line = 'NEED_HELP: I need a screenshot to see what is on screen.';
+      const parsed = parseAgentLine(line, 1);
+      expect(parsed.type).toBe('need_help');
+      if (parsed.type === 'need_help') {
+        expect(parsed.payload).toContain('screenshot');
+      }
+    });
+
+    // M9: TASK_COMPLETE is likewise hoisted above the noise filter.
+    it('parses TASK_COMPLETE even when the summary contains a noise substring', () => {
+      const line = 'TASK_COMPLETE: Took a screenshot and saved it.';
+      const parsed = parseAgentLine(line, 1);
+      expect(parsed.type).toBe('activity_item');
+      if (parsed.type === 'activity_item') {
+        expect(parsed.payload.kind).toBe('success');
+        expect(parsed.payload.text).toContain('screenshot');
+      }
+    });
   });
 
   describe('parseAgentLine Kim lifecycle JSON lines', () => {

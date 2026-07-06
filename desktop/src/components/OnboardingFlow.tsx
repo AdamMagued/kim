@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { KimAccount } from '../types';
+import { toast } from './Toast';
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
 function ArrowIcon() {
@@ -96,15 +97,20 @@ export function OnboardingFlow({ onComplete }: Props) {
     }
   }
 
-  const handleFinish = useCallback(async () => {
+  // H7: `includeGitHub=false` (the "Skip for now" path) must NOT store the PAT
+  // or link the account, even when a token was verified before the user
+  // changed their mind and skipped.
+  const handleFinish = useCallback(async (includeGitHub = true) => {
     if (!nameReady || saving) return;
     setSaving(true);
+    const gh = includeGitHub ? githubUser : null;
+    const ghToken = includeGitHub ? token.trim() : '';
     const account: KimAccount = {
       display_name: name.trim(),
-      github_username: githubUser?.login,
+      github_username: gh?.login,
       // github_token intentionally omitted — stored in OS keychain via
       // store_github_token below, never written to account.json.
-      github_avatar_url: githubUser?.avatar_url,
+      github_avatar_url: gh?.avatar_url,
       gist_id: undefined,
       created_at: new Date().toISOString(),
       google_accounts: [],
@@ -115,8 +121,8 @@ export function OnboardingFlow({ onComplete }: Props) {
       // Linux Secret Service) before saving the account record.  The Rust
       // save_account command strips github_token before writing account.json so
       // the secret never touches disk even if callers include it.
-      if (githubUser && token.trim()) {
-        await invoke('store_github_token', { token: token.trim() });
+      if (gh && ghToken) {
+        await invoke('store_github_token', { token: ghToken });
       }
       await invoke('save_account', { account });
       setToken('');
@@ -125,18 +131,25 @@ export function OnboardingFlow({ onComplete }: Props) {
       // round-trip.  save_account (above) already stripped the token from disk.
       const accountForState: KimAccount = {
         ...account,
-        ...(githubUser && token.trim() ? { github_token: token.trim() } : {}),
+        ...(gh && ghToken ? { github_token: ghToken } : {}),
       };
       // Exit animation before calling onComplete
       setLeaving(true);
       setTimeout(() => onComplete(accountForState), 500);
-    } catch {
+    } catch (err) {
+      // M15: surface the failure — previously "Get started" flipped back with
+      // zero feedback and the user was stranded on the onboarding screen.
       setSaving(false);
+      toast(
+        typeof err === 'string' ? err : 'Could not save your account. Please try again.',
+        'error',
+        5000
+      );
     }
   }, [nameReady, saving, name, githubUser, token, onComplete]);
 
   function skipGitHub() {
-    handleFinish();
+    void handleFinish(false);
   }
 
   async function signInWithOllama() {
@@ -276,7 +289,7 @@ export function OnboardingFlow({ onComplete }: Props) {
               </button>
               <button
                 className={`kim-ob__send-btn kim-ob__send-btn--wide${githubUser && !saving ? ' kim-ob__send-btn--ready' : ''}`}
-                onClick={handleFinish}
+                onClick={() => void handleFinish()}
                 disabled={saving}
               >
                 {saving ? 'Setting up…' : 'Get started →'}
