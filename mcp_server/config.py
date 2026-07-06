@@ -180,7 +180,7 @@ DEFAULT_USE_REAL_BROWSER: bool = False
 USE_REAL_BROWSER: bool = _as_bool(
     _cfg.get("use_real_browser", DEFAULT_USE_REAL_BROWSER), DEFAULT_USE_REAL_BROWSER
 )
-VOICE_ENABLED: bool = _as_bool(_cfg.get("voice_enabled"), False)
+VOICE_ENABLED: bool = _as_bool(_cfg.get("voice_enabled", False), False)
 
 # ── Site connectors ───────────────────────────────────────────────────────
 # `connectors.enabled` is a list of connector ids (e.g. ["guc_cms",
