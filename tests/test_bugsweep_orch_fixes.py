@@ -155,10 +155,14 @@ def test_m2_gemini_normal_stop_stays_plain_text():
     parsed = provider._parse_rest_response({
         "candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "hello"}]}}],
     })
+    # A normal STOP passes the text through unchanged (finalize_text_content is
+    # a no-op for non-truncation/-block reasons). stop_reason is now surfaced
+    # and cache_creation_tokens is always present (findings 3.1 / 3.8).
     assert parsed == {
         "type": "text",
         "content": "hello",
-        "usage": {"input": 0, "output": 0, "cache_read_tokens": 0},
+        "stop_reason": "STOP",
+        "usage": {"input": 0, "output": 0, "cache_creation_tokens": 0, "cache_read_tokens": 0},
     }
 
 

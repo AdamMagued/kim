@@ -11,7 +11,9 @@ Tests:
 from __future__ import annotations
 
 import json
+import os
 import tempfile
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -51,6 +53,12 @@ class TestPruneOldSessions:
             base = Path(tmp)
             old_date = date.today() - timedelta(days=3)
             path = _write_session(base, old_date, "abc", [_make_message_with_screenshot()])
+            # Backdate the file mtime so it is treated as a truly-dead old
+            # session — the strip pass now skips recently-touched files to avoid
+            # racing a resumed session that appends to its original date dir
+            # (finding 4.1).
+            _old = time.time() - 7200
+            os.utime(path, (_old, _old))
 
             result = SessionStore.prune_old_sessions(
                 max_age_days=30, screenshot_strip_age_days=2, base_dir=base

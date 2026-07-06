@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -36,6 +37,12 @@ _DEFAULT_BASE_DIR = Path(__file__).resolve().parent.parent / "kim_sessions"
 
 # Rotate the active JSONL when it exceeds this size (finding 4: size cap)
 _MAX_SESSION_BYTES = 50 * 1024 * 1024  # 50 MB
+
+# The prune screenshot-strip pass rewrites session files in place. A resumed
+# session appends into its ORIGINAL (old) date dir, so a file touched within
+# this window may still be live — skip it to avoid racing a concurrent append
+# and dropping messages (finding 4.1).
+_STRIP_SKIP_RECENT_SECONDS = 3600  # 1 hour
 
 
 class SessionStore:
@@ -53,7 +60,22 @@ class SessionStore:
         session_id: Optional[str] = None,
     ) -> None:
         self.base_dir = Path(base_dir) if base_dir else _DEFAULT_BASE_DIR
-        self.session_id = session_id or uuid4().hex[:8]
+        if session_id:
+            # Explicit id (resume, or caller-chosen): used as-is; the block
+            # below adopts its existing date dir.
+            self.session_id = session_id
+        else:
+            # Fresh session: pick an 8-hex id that does not already exist on
+            # disk, so a birthday collision in the ~4.3B space cannot silently
+            # append this session into an unrelated one and merge transcripts on
+            # resume (finding 4.2). Fall back to a full-length id in the
+            # astronomically unlikely event every probe collides.
+            self.session_id = uuid4().hex
+            for _ in range(1000):
+                candidate = uuid4().hex[:8]
+                if SessionStore.find_session_file(candidate, base_dir=self.base_dir) is None:
+                    self.session_id = candidate
+                    break
 
         # When resuming a session, append to the original date dir instead of
         # creating a parallel file under today's date. Otherwise the same
@@ -804,6 +826,16 @@ class SessionStore:
                             logger.warning(f"Could not delete {compact_file}: {e}")
                     deleted += 1
                 elif dir_date <= strip_cutoff:
+                    # Skip files touched recently: a resumed session appends into
+                    # its ORIGINAL date dir, so a read-all → rewrite → replace
+                    # here could race a live append and drop messages written
+                    # between the read and the rename (finding 4.1). A truly-dead
+                    # old session won't have a fresh mtime.
+                    try:
+                        if (time.time() - jsonl_file.stat().st_mtime) < _STRIP_SKIP_RECENT_SECONDS:
+                            continue
+                    except OSError:
+                        pass
                     # Strip screenshot data in place
                     try:
                         messages = _read_jsonl(jsonl_file)

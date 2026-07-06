@@ -24,6 +24,12 @@ import threading
 CONFIRM_TIMEOUT_S = 60.0
 STDIN_APPROVAL_TIMEOUT_S = 120.0
 
+# Upper bound on buffered UI log records. The queue is drained by a UI consumer;
+# when none is attached (headless, tests, or a stalled UI) an unbounded queue
+# would accumulate every log line for the process lifetime (finding 6.5). At the
+# cap the oldest record is dropped so memory stays bounded.
+LOG_QUEUE_MAXSIZE = 10000
+
 
 class UIBridge:
     """
@@ -37,8 +43,9 @@ class UIBridge:
     """
 
     def __init__(self) -> None:
-        # Log records -> UI log window
-        self.log_queue: queue.Queue = queue.Queue()
+        # Log records -> UI log window. Bounded so a missing/stalled consumer
+        # can't grow it without limit (finding 6.5); log() drops oldest at cap.
+        self.log_queue: queue.Queue = queue.Queue(maxsize=LOG_QUEUE_MAXSIZE)
         # Confirmation requests: (tool_name, args, threading.Event, [bool])
         self._confirm_queue: queue.Queue = queue.Queue()
         # Hide/show requests for screenshot blink: ("hide"|"show", threading.Event)
@@ -57,8 +64,23 @@ class UIBridge:
     # ── Logging ────────────────────────────────────────────────────────
 
     def log(self, level: str, message: str) -> None:
-        """Put a (level, message) tuple for the UI to render."""
-        self.log_queue.put_nowait((level.upper(), message))
+        """Put a (level, message) tuple for the UI to render.
+
+        Drops the oldest record when the bounded queue is full (finding 6.5)
+        rather than raising or growing without bound when no UI is draining it.
+        """
+        item = (level.upper(), message)
+        try:
+            self.log_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self.log_queue.get_nowait()  # evict oldest
+            except queue.Empty:
+                pass
+            try:
+                self.log_queue.put_nowait(item)
+            except queue.Full:
+                pass
 
     # ── Window visibility (screenshot blink) ──────────────────────────
 
@@ -291,6 +313,16 @@ class StdinApprovalBridge(UIBridge):
             )
             return False
 
+    def cancel(self) -> None:
+        # Beyond the base drain of the confirm queue, wake any in-flight stdin
+        # approval wait so a cancel is noticed immediately instead of after the
+        # full approval timeout (finding 6.2). The injected decline is id-less,
+        # so a still-pending next_approval accepts it and returns "decline".
+        super().cancel()
+        pump = get_stdin_pump()
+        if pump.is_running():
+            pump.inject_decline()
+
 
 class StdinPump:
     """K3: single background reader for the agent's stdin.
@@ -331,14 +363,41 @@ class StdinPump:
                 self._approval_q.put_nowait(data)
 
     def start(self) -> None:
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
         if self._started:
+            # The pump is a process-lifetime singleton. If a DIFFERENT event
+            # loop now owns the runtime (e.g. a second asyncio.run()), rebind to
+            # it — otherwise approval/steer lines are marshalled onto the dead
+            # original loop via call_soon_threadsafe and silently lost, so every
+            # approval times out (finding 6.1). A fresh loop has nothing pending,
+            # so recreating the queue is safe.
+            if current is not None and current is not self._loop:
+                self._loop = current
+                self._approval_q = asyncio.Queue()
             return
         self._started = True
-        try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._loop = None
+        self._loop = current
         threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def inject_decline(self) -> None:
+        """Push an id-less decline so a pending next_approval wakes immediately.
+
+        Used on cancel so the agent doesn't hang for the full approval timeout
+        before noticing (finding 6.2). If nothing is waiting, the decline is
+        stale and drain_approvals() drops it at the start of the next request.
+        """
+        payload = {"type": "hitl_approve", "decision": "decline", "_injected": True}
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._approval_q.put_nowait, payload)
+        else:
+            try:
+                self._approval_q.put_nowait(payload)
+            except Exception:
+                pass
 
     def _read_loop(self) -> None:
         for line in sys.stdin:

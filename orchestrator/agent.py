@@ -85,6 +85,19 @@ logger = logging.getLogger(__name__)
 
 _COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
 
+# ── Client-side tool-call timeout budget (finding 2.1) ─────────────────────
+# asyncio.wait_for on session.call_tool must wait STRICTLY LONGER than the
+# server can legitimately spend, or it abandons a still-running call and the
+# model re-issues it — running the side effect twice. The budget is the sum of
+# the approval round-trip backstop (only when a UI bridge can prompt a human)
+# and the tool-execution ceiling, plus a margin.
+#   _APPROVAL_BACKSTOP_S mirrors mcp_server/approvals.py _APPROVAL_TIMEOUT_S.
+#   _MAX_SHELL_EXEC_S mirrors mcp_server/tools/shell.py MAX_SHELL_TIMEOUT_S.
+_APPROVAL_BACKSTOP_S = float(os.environ.get("KIM_APPROVAL_TIMEOUT_S", "150"))
+_MAX_SHELL_EXEC_S = 600.0
+_DEFAULT_TOOL_EXEC_S = 120.0
+_CLIENT_TIMEOUT_MARGIN_S = 60.0
+
 # Deterministic bridge.js failure signatures for a follow-up send that never
 # registered in a reused browser thread (see bridge.js fail-fast diagnostics).
 # Stateful mode retries these once on a fresh chat instead of dying.
@@ -1330,12 +1343,20 @@ class KimAgent:
         t0 = _time.monotonic()
         output = ""
 
-        # The MCP server may pause this call on a human approval (K1); give
-        # gated calls room for the round-trip (150 s server backstop) plus
-        # execution. Low-risk tools keep the tight timeout.
-        _call_timeout = 120.0
-        if self._ui_bridge is not None and _risk.get("level") != "low":
-            _call_timeout = 300.0
+        # The client timeout MUST exceed the longest the server could
+        # legitimately spend on this call, or asyncio.wait_for abandons a call
+        # the server is still running — the model then re-issues it and the
+        # side effect happens twice (finding 2.1). Server-side worst case =
+        # approval round-trip backstop (when a UI bridge can prompt a human)
+        # + the tool-execution ceiling. Any tool can be gated depending on the
+        # HITL threshold, so the approval budget is keyed off the presence of a
+        # bridge, not the tool's own risk level.
+        _approval_budget = _APPROVAL_BACKSTOP_S if self._ui_bridge is not None else 0.0
+        _exec_budget = (
+            _MAX_SHELL_EXEC_S if name in ("run_command", "run_powershell")
+            else _DEFAULT_TOOL_EXEC_S
+        )
+        _call_timeout = _approval_budget + _exec_budget + _CLIENT_TIMEOUT_MARGIN_S
 
         try:
             result = await asyncio.wait_for(

@@ -14,7 +14,7 @@ from typing import Any
 
 import openai
 
-from orchestrator.providers.base import BaseProvider
+from orchestrator.providers.base import BaseProvider, finalize_text_content
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,10 @@ class OpenAIProvider(BaseProvider):
     def _parse_response(self, response) -> dict:
         choice = response.choices[0]
         msg = choice.message
+        # "stop" is normal; "length" means truncated and "content_filter" a
+        # safety block — surface it so neither is mistaken for a complete
+        # answer (finding 3.1).
+        finish_reason = getattr(choice, "finish_reason", None)
 
         # Extract token usage.
         # OpenAI's prompt_tokens INCLUDES cached_tokens (cache_read is a subset, not additive).
@@ -192,6 +196,7 @@ class OpenAIProvider(BaseProvider):
                     "tool": "batch",
                     "args": {"calls": [_parse_one(tc) for tc in msg.tool_calls]},
                     "content": narration,
+                    "stop_reason": finish_reason,
                     "usage": usage,
                 }
 
@@ -202,7 +207,13 @@ class OpenAIProvider(BaseProvider):
                 "tool": parsed["tool"],
                 "args": parsed["args"],
                 "content": narration,
+                "stop_reason": finish_reason,
                 "usage": usage,
             }
 
-        return {"type": "text", "content": msg.content or "", "usage": usage}
+        return {
+            "type": "text",
+            "content": finalize_text_content(msg.content or "", finish_reason),
+            "stop_reason": finish_reason,
+            "usage": usage,
+        }

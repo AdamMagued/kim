@@ -34,7 +34,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from orchestrator.providers.base import BaseProvider, ProviderError
+from orchestrator.providers.base import BaseProvider, finalize_text_content, ProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -445,6 +445,9 @@ class GeminiProvider(BaseProvider):
         usage = {
             "input": usage_meta.get("promptTokenCount", 0) or 0,
             "output": usage_meta.get("candidatesTokenCount", 0) or 0,
+            # Gemini never reports cache-creation tokens; include the key as 0 so
+            # consumers see the same usage shape as the other providers (3.8).
+            "cache_creation_tokens": 0,
             "cache_read_tokens": usage_meta.get("cachedContentTokenCount", 0) or 0,
         }
         candidates = response.get("candidates") or []
@@ -500,11 +503,11 @@ class GeminiProvider(BaseProvider):
                 "content": narration,
                 "usage": usage,
             }
+        finish_reason = str(candidates[0].get("finishReason") or "")
         if not narration:
             # M2: an empty candidate with a non-STOP finishReason (SAFETY /
             # RECITATION / MAX_TOKENS / …) would otherwise read as an empty
             # answer with no explanation.
-            finish_reason = str(candidates[0].get("finishReason") or "")
             if finish_reason and finish_reason.upper() != "STOP":
                 logger.warning("Gemini returned empty content with finishReason=%s", finish_reason)
                 return {
@@ -512,9 +515,17 @@ class GeminiProvider(BaseProvider):
                     "content": (
                         f"NEED_HELP: Gemini returned no content (finishReason: {finish_reason})."
                     ),
+                    "stop_reason": finish_reason,
                     "usage": usage,
                 }
-        return {"type": "text", "content": narration, "usage": usage}
+        # A NON-empty answer that stopped for MAX_TOKENS is truncated — annotate
+        # it so it isn't mistaken for a complete reply (finding 3.1).
+        return {
+            "type": "text",
+            "content": finalize_text_content(narration, finish_reason),
+            "stop_reason": finish_reason or None,
+            "usage": usage,
+        }
 
 
 def _parse_optional_expiry(value: Any) -> float | None:

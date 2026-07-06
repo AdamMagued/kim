@@ -121,5 +121,7 @@ def test_parse_rest_response_preserves_usage_and_tool_calls(monkeypatch):
         "args": {"cmd": "ls"},
         # H2: narration accompanying a tool call is preserved (empty here).
         "content": "",
-        "usage": {"input": 10, "output": 4, "cache_read_tokens": 0},
+        # cache_creation_tokens is now always present (0 for Gemini) so the
+        # usage shape matches the other providers (finding 3.8).
+        "usage": {"input": 10, "output": 4, "cache_creation_tokens": 0, "cache_read_tokens": 0},
     }

@@ -859,12 +859,18 @@ def test_reaper_kills_stale_agent_from_current_boot(tmp_path):
         "boot_ref": _boot_ref(),    # this boot
     }]))
 
+    # The reaper now kills the whole process group via _kill_process_tree so
+    # orphaned children (MCP server, browser, shell) go with the agent
+    # (finding 5.1); assert it targets the stale pid.
     killed = []
     with _patch("orchestrator.scheduled_runner._pid_exists", return_value=True), \
-         _patch.object(_os, "kill", side_effect=lambda p, s: killed.append((p, s))):
+         _patch(
+             "orchestrator.scheduled_runner._kill_process_tree",
+             side_effect=lambda p: killed.append(p),
+         ):
         _reap_stale_agents(tmp_path, timeout_seconds=1.0)
 
-    assert killed == [(424242, 9)]
+    assert killed == [424242]
 
 
 def test_register_agent_pid_records_boot_ref(tmp_path):
