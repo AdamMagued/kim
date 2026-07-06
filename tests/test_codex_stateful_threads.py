@@ -641,6 +641,66 @@ _CODEX_TOOLS = [
 ]
 
 
+class TestCoerceContractDict(unittest.TestCase):
+    """Multi-object replies: the model emits tool_calls, an orphaned call
+    fragment (malformed bracket), and a FABRICATED completion report —
+    salvage the actions, drop the role-played epilogue."""
+
+    # Faithful shape of the live ChatGPT reply (unescaped inner quotes,
+    # broken ]} after call 1, second call orphaned, fake completion text).
+    _LIVE_BLOB = (
+        '{"text":"creating pong game file and opening it ",'
+        '"tool_calls":[{"name":"exec","input":{"cmd":"cat > index.html << \'EOF\'\\n'
+        '<!DOCTYPE html>\\n<html lang="en">\\n'
+        '<canvas id="game" width="800" height="500"></canvas>\\nEOF"}}]},'
+        '{"name":"exec","input":{"cmd":"open index.html"}}]}'
+        '\n\n{"text":"pong game created and opened "}'
+    )
+
+    def test_live_double_json_blob_salvages_both_tool_calls(self):
+        from codex_engine.engine import _parse_contract
+
+        parsed = _parse_contract(self._LIVE_BLOB)
+        self.assertIsInstance(parsed, dict)
+        calls = parsed["tool_calls"]
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0]["input"]["cmd"].startswith("cat > index.html"))
+        self.assertTrue(calls[0]["input"]["cmd"].rstrip().endswith("EOF"))
+        self.assertEqual(calls[1]["input"]["cmd"], "open index.html")
+        # The fabricated "created and opened" report must NOT become the text.
+        self.assertNotIn("created and opened", parsed.get("text", ""))
+
+    def test_live_blob_end_to_end_produces_normalized_function_calls(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": self._LIVE_BLOB},
+            relay_num=1,
+            request_tools=_CODEX_TOOLS,
+        )
+        calls = [o for o in reply["output"] if o["type"] == "function_call"]
+        self.assertEqual([c["name"] for c in calls], ["exec_command", "exec_command"])
+        self.assertIn("open index.html", calls[1]["arguments"])
+
+    def test_text_only_multi_object_falls_back_to_first_text(self):
+        from codex_engine.engine import _coerce_contract_dict
+
+        out = _coerce_contract_dict([{"text": "first"}, {"text": "second"}])
+        self.assertEqual(out, {"text": "first"})
+
+    def test_list_without_contract_dicts_is_none(self):
+        from codex_engine.engine import _coerce_contract_dict
+
+        self.assertIsNone(_coerce_contract_dict(["a", 1]))
+        self.assertIsNone(_coerce_contract_dict("prose"))
+
+    def test_plain_dict_passes_through(self):
+        from codex_engine.engine import _coerce_contract_dict
+
+        d = {"text": "hi", "tool_calls": []}
+        self.assertIs(_coerce_contract_dict(d), d)
+
+
 class TestNormalizeToolCalls(unittest.TestCase):
     def test_exec_prefix_snaps_to_exec_command(self):
         from codex_engine.engine import _normalize_tool_calls

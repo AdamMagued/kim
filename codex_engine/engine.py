@@ -1408,6 +1408,35 @@ def _make_chat_tool_reply(resp_id: str, text: str, tool_calls: list) -> dict:
     }
 
 
+def _coerce_contract_dict(parsed: object) -> Optional[dict]:
+    """Coerce a parsed reply into one contract dict.
+
+    Browser models sometimes emit SEVERAL JSON objects in one reply — the
+    observed live case: a tool_calls object, an orphaned {"name","input"}
+    fragment split off by a malformed bracket, and a fabricated
+    completion-report text ("pong game created and opened") role-playing the
+    runtime's answer. json_repair returns those as a list; salvage the real
+    actions and drop the fabricated epilogue.
+    """
+    if isinstance(parsed, dict):
+        return parsed
+    if not isinstance(parsed, list):
+        return None
+    dicts = [d for d in parsed if isinstance(d, dict)]
+    base = next((d for d in dicts if d.get("tool_calls")), None)
+    if base is not None:
+        # Orphaned tool-call-shaped fragments belong to the same array.
+        extras = [
+            d for d in dicts
+            if d is not base and "name" in d and "input" in d
+            and "tool_calls" not in d and "text" not in d
+        ]
+        if extras:
+            base = {**base, "tool_calls": list(base["tool_calls"]) + extras}
+        return base
+    return next((d for d in dicts if "text" in d), None)
+
+
 def _parse_contract(content: object) -> Optional[dict]:
     """Parse a browser reply against the bridge contract ({"text", "tool_calls"}).
 
@@ -1426,7 +1455,7 @@ def _parse_contract(content: object) -> Optional[dict]:
             parsed = json_repair.repair_json(content, return_objects=True)
         except Exception:
             return None
-    return parsed if isinstance(parsed, dict) else None
+    return _coerce_contract_dict(parsed)
 
 
 # A nudge answer that instructs the USER to perform the actions (save the
@@ -1492,6 +1521,9 @@ def _codex_browser_system_prompt() -> str:
         "what the Codex runtime is for — emit the equivalent tool_calls instead. A "
         "command you would tell the user to type IS a tool_call; same action, "
         "structured format, already authorized.\n"
+        "- After a tool-call JSON object, STOP. Do not invent the tool's result or "
+        "add a completion report — the runtime sends you the REAL output as the next "
+        "message, and only then do you continue.\n"
     )
 
 
