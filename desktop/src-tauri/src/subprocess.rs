@@ -111,10 +111,14 @@ pub(crate) fn forward_agent_stdout_line(
                     risk,
                     reason,
                     preview,
+                    id,
                 } => {
+                    // T1: forward the request's correlation id so the UI can echo
+                    // it back on the decision; Python only applies a decision whose
+                    // id matches the pending request (stale decisions are voided).
                     let _ = app.emit(
                         "kim:hitl-approval-request",
-                        serde_json::json!({"tool": tool, "risk": risk, "reason": reason, "preview": preview}),
+                        serde_json::json!({"tool": tool, "risk": risk, "reason": reason, "preview": preview, "id": id}),
                     );
                 }
                 KimEvent::HitlApprovalResult { tool, approved } => {
@@ -1111,11 +1115,13 @@ mod tests {
                 risk,
                 reason,
                 preview,
+                id,
             } => {
                 assert_eq!(tool, "run_command");
                 assert_eq!(risk, "high");
                 assert_eq!(reason, "arbitrary_code_execution");
                 assert_eq!(preview, ""); // absent in legacy line → default
+                assert_eq!(id, ""); // absent in legacy line → default
             }
             _ => panic!("Expected HitlApprovalRequest, got {:?}", event),
         }
