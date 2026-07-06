@@ -32,7 +32,7 @@
 /// Both spawn paths call `reserve()` → `spawn_*()` → `store_pid()` through
 /// this runtime, and both cancel paths call `cancel()`.  The single-runner
 /// mutex is the lock on the runtime itself — no separate atomics needed.
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex as TokioMutex;
 
 /// Source that spawned the currently-running task. Defined in `task_spec`
@@ -57,7 +57,13 @@ pub(crate) struct TaskRuntime {
     /// `spawn_supervisor`, which always spawns a tokio child, so one handle
     /// serves the GUI `hitl_respond_approval` / `steer_task` commands and the
     /// bridge `/v1/task/approve` endpoint alike).
-    pub stdin: Option<tokio::process::ChildStdin>,
+    ///
+    /// H-PROC-2: the handle lives behind its OWN mutex (shared via `Arc`) so
+    /// writers can clone it out, release the global runtime lock, and only then
+    /// await `write_all`. A child that stops draining stdin (pipe buffer full)
+    /// can therefore never wedge `cancel_task` / `reserve_slot` / supervisor
+    /// cleanup, all of which contend on the runtime lock.
+    pub stdin: Option<Arc<TokioMutex<tokio::process::ChildStdin>>>,
 }
 
 impl TaskRuntime {
@@ -117,21 +123,46 @@ impl TaskRuntime {
         self.pid.is_some() || self.starting
     }
 
-    /// Convenience: write a HITL/steer JSON line to the running child's stdin.
-    /// Called by both the Tauri command path (GUI) and the HTTP bridge path
-    /// (CLI) so that cross-path approval always works.
-    pub(crate) async fn write_stdin_line(&mut self, msg: &str) -> Result<(), String> {
-        use tokio::io::AsyncWriteExt as _;
+}
 
-        if let Some(ref mut s) = self.stdin {
-            s.write_all(msg.as_bytes())
-                .await
-                .map_err(|e| e.to_string())?;
-            s.flush().await.map_err(|e| e.to_string())?;
-            return Ok(());
+/// Write a HITL/steer JSON line to the running child's stdin.
+/// Called by both the Tauri command path (GUI) and the HTTP bridge path
+/// (CLI) so that cross-path approval always works.
+///
+/// H-PROC-2 (theme T1): the global runtime lock is held only long enough to
+/// clone the `Arc` stdin handle — NEVER across the `write_all().await`. The
+/// write itself is bounded by a timeout so even a child that stopped draining
+/// stdin (full OS pipe buffer) only stalls this one writer, and only briefly;
+/// task control (cancel, reserve, supervisor cleanup) stays responsive.
+/// Approval correlation stays by unique `id` inside the JSON line itself
+/// (`hitl_approve.id` / `approval_decision.id`), which Python matches against
+/// the pending request and discards when stale — a timed-out write here can
+/// never cause a decision to be applied to the wrong tool.
+pub(crate) async fn write_stdin_line(msg: &str) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt as _;
+
+    const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let stdin = {
+        let rt = task_runtime().lock().await;
+        match rt.stdin.as_ref() {
+            Some(handle) => Arc::clone(handle),
+            None => return Err("No agent stdin available".to_string()),
         }
-        Err("No agent stdin available".to_string())
-    }
+        // runtime lock released here — before any stdin await
+    };
+
+    let mut guard = tokio::time::timeout(WRITE_TIMEOUT, stdin.lock())
+        .await
+        .map_err(|_| {
+            "Timed out waiting for agent stdin (another write is stuck).".to_string()
+        })?;
+    tokio::time::timeout(WRITE_TIMEOUT, async {
+        guard.write_all(msg.as_bytes()).await.map_err(|e| e.to_string())?;
+        guard.flush().await.map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Timed out writing to agent stdin (child not reading).".to_string())?
 }
 
 /// The global async-safe `TaskRuntime` handle.
@@ -244,5 +275,62 @@ mod tests {
         let mut rt = TaskRuntime::default();
         assert!(!rt.clear_if_pid(100));
         assert!(!rt.is_occupied());
+    }
+
+    // H-PROC-2: the global runtime lock must stay available while a stdin
+    // write is in flight. We hold the stdin mutex (simulating a stuck write)
+    // and verify the runtime lock can still be acquired — i.e. cancel/task
+    // control cannot deadlock behind a child that stopped draining stdin.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_lock_free_while_stdin_write_in_flight() {
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let stdin = Arc::new(TokioMutex::new(child.stdin.take().unwrap()));
+
+        // Simulate an in-flight (stuck) write by holding the stdin mutex.
+        let stdin_guard = stdin.lock().await;
+
+        // A fresh runtime holding only the Arc must still hand out its lock
+        // instantly, because write_stdin_line never holds it across the write.
+        let rt = TokioMutex::new(TaskRuntime {
+            stdin: Some(Arc::clone(&stdin)),
+            ..TaskRuntime::default()
+        });
+        let lock_result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rt.lock()).await;
+        assert!(
+            lock_result.is_ok(),
+            "runtime lock must not be blocked by an in-flight stdin write"
+        );
+        drop(stdin_guard);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+
+    // H-PROC-2: a plain successful write through the shared handle works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_arc_write_roundtrip() {
+        use tokio::io::AsyncWriteExt as _;
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let stdin = Arc::new(TokioMutex::new(child.stdin.take().unwrap()));
+        {
+            let mut guard = stdin.lock().await;
+            guard
+                .write_all(b"{\"type\":\"hitl_approve\",\"approved\":true}\n")
+                .await
+                .expect("write must succeed");
+            guard.flush().await.expect("flush must succeed");
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
     }
 }

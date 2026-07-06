@@ -92,7 +92,12 @@ pub(crate) async fn spawn(spec: TaskSpec) -> Result<SupervisedChild, String> {
         let mut rt = task_runtime().lock().await;
         rt.store_pid(pid, spec.session_id.clone(), spec.source);
         if spec.stdin == StdinMode::Piped {
-            rt.stdin = child.stdin.take();
+            // H-PROC-2: stdin lives behind its own Arc<Mutex> so HITL/steer
+            // writers never hold the global runtime lock across an await.
+            rt.stdin = child
+                .stdin
+                .take()
+                .map(|s| std::sync::Arc::new(tokio::sync::Mutex::new(s)));
         }
     }
 
@@ -137,11 +142,17 @@ pub(crate) async fn supervise(
 
     let wait_result = sup.child.wait().await;
 
+    // L-PROC-10: surface pump-task panics instead of silently dropping them —
+    // a dead pump means UI output stopped mid-run and we want that in the log.
     if let Some(handle) = stdout_handle {
-        let _ = handle.await;
+        if let Err(e) = handle.await {
+            eprintln!("[Kim] stdout pump task failed: {e}");
+        }
     }
     if let Some(handle) = stderr_handle {
-        let _ = handle.await;
+        if let Err(e) = handle.await {
+            eprintln!("[Kim] stderr pump task failed: {e}");
+        }
     }
 
     task_runtime().lock().await.clear_if_pid(sup.pid);

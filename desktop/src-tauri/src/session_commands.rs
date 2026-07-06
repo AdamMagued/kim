@@ -34,10 +34,19 @@ pub async fn summarize_session(
     session_id: String,
     session_type: String,
     project_root: Option<String>,
+    kim_dir: Option<String>,
 ) -> Result<(), String> {
     crate::validate_session_id(&session_id)?;
 
-    let mut dirs_to_search: Vec<PathBuf> = vec![crate::default_sessions_dir()];
+    // M-CMD-1: honour a configured kim sessions dir (same optional parameter
+    // list_sessions / load_session_messages accept). Searched FIRST so a
+    // custom kim_sessions_dir no longer yields "Session file not found" for a
+    // session that is visible in the sidebar. Falls back to the default dir.
+    let mut dirs_to_search: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = kim_dir.filter(|d| !d.trim().is_empty()) {
+        dirs_to_search.push(crate::session_base_dir("kim", Some(dir), None));
+    }
+    dirs_to_search.push(crate::default_sessions_dir());
     if session_type == "codex" {
         if let Some(ref pr) = project_root {
             let codex_dir = PathBuf::from(pr).join(".codex").join("sessions");

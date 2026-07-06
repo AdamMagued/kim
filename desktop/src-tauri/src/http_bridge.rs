@@ -3,6 +3,40 @@ use std::time::Duration;
 use tauri::Manager;
 use tiny_http::{Method, Request, Server};
 
+/// M-BRIDGE-3: upper bound for any request body. Generous enough for several
+/// base64 PNG screenshots in a /v1/send, small enough that a token-holding
+/// local process can no longer OOM the app with a multi-GB POST.
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Read at most `cap` bytes of UTF-8 from `reader`; error if the stream holds
+/// more. Split out from `read_body_capped` so it is unit-testable.
+fn read_capped_string<R: std::io::Read>(reader: R, cap: usize) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut body = String::new();
+    reader
+        .take(cap as u64 + 1)
+        .read_to_string(&mut body)
+        .map_err(|e| format!("Invalid body: {}", e))?;
+    if body.len() > cap {
+        return Err(format!("Request body too large (max {} bytes).", cap));
+    }
+    Ok(body)
+}
+
+/// Read a request body with a hard size cap (M-BRIDGE-3). Rejects on the
+/// declared Content-Length when available, and always caps the actual read.
+fn read_body_capped(request: &mut Request) -> Result<String, String> {
+    if let Some(len) = request.body_length() {
+        if len > MAX_BODY_BYTES {
+            return Err(format!(
+                "Request body too large ({} bytes; max {}).",
+                len, MAX_BODY_BYTES
+            ));
+        }
+    }
+    read_capped_string(request.as_reader(), MAX_BODY_BYTES)
+}
+
 fn handle_webview_bridge_request(
     mut request: Request,
     app_handle: tauri::AppHandle,
@@ -64,15 +98,13 @@ fn handle_webview_bridge_request(
             respond_json(request, 200, serde_json::json!({"ok": true}));
         }
         (Method::Post, "/v1/open") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(
-                    request,
-                    400,
-                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
-                );
-                return;
-            }
+            let body = match read_body_capped(&mut request) {
+                Ok(b) => b,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
 
             let parsed: BridgeOpenRequest = match serde_json::from_str(&body) {
                 Ok(v) => v,
@@ -92,19 +124,20 @@ fn handle_webview_bridge_request(
                     200,
                     serde_json::json!({"ok": true, "message": msg}),
                 ),
-                Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": e})),
+                // L-BRIDGE-13: failures here are caused by the caller's input
+                // (empty/invalid/non-http URL) or a busy task — client errors,
+                // not server faults.
+                Err(e) => respond_json(request, 400, serde_json::json!({"ok": false, "error": e})),
             }
         }
         (Method::Post, "/v1/callback") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(
-                    request,
-                    400,
-                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
-                );
-                return;
-            }
+            let body = match read_body_capped(&mut request) {
+                Ok(b) => b,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
 
             let parsed: BridgeCallbackRequest = match serde_json::from_str(&body) {
                 Ok(v) => v,
@@ -148,94 +181,19 @@ fn handle_webview_bridge_request(
 
             respond_json(request, 200, serde_json::json!({"ok": true}));
         }
-        (Method::Get, path) if path.starts_with("/v1/ping") => {
-            let full_uri = request.url().to_string();
-            let url = match tauri::Url::parse(&format!("http://localhost{}", full_uri)) {
-                Ok(u) => u,
+        // M-BRIDGE-5: the /v1/ping GET route was removed — it was doubly dead:
+        // both Rust send sites pass a null callbackUrl (so bridge.js never
+        // pings), and an <img> beacon cannot carry X-Kim-Token so any real
+        // ping would have 401'd before reaching the handler. Result delivery
+        // is the IPC/callback store plus the title-pull in collect_bridge_payload.
+        (Method::Post, "/v1/complete") => {
+            let body = match read_body_capped(&mut request) {
+                Ok(b) => b,
                 Err(e) => {
-                    respond_json(
-                        request,
-                        400,
-                        serde_json::json!({"ok": false, "error": format!("Invalid ping URI: {}", e)}),
-                    );
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
                     return;
                 }
             };
-            let mut req_id = String::new();
-            let mut payload_str = String::new();
-            for (key, value) in url.query_pairs() {
-                if key == "req_id" {
-                    req_id = value.into_owned();
-                } else if key == "data" {
-                    payload_str = value.into_owned();
-                }
-            }
-
-            agent_debug_log(
-                "H2",
-                "ping received",
-                serde_json::json!({
-                    "reqId": req_id,
-                    "payloadStrLen": payload_str.len(),
-                }),
-            );
-
-            if !req_id.is_empty() && !payload_str.is_empty() {
-                match base64::engine::general_purpose::STANDARD.decode(&payload_str) {
-                    Ok(decoded) => match String::from_utf8(decoded) {
-                        Ok(json_str) => {
-                            if let Ok(ipc_event) = serde_json::from_str::<BridgeIpcEvent>(&json_str)
-                            {
-                                handle_bridge_ipc_event(ipc_event, &app_handle);
-                            } else {
-                                match serde_json::from_str::<BridgeCompleteResponse>(&json_str) {
-                                    Ok(payload) => {
-                                        let store = WEBVIEW_BRIDGE_RESULTS
-                                            .get_or_init(|| StdMutex::new(HashMap::new()));
-                                        if let Ok(mut guard) = store.lock() {
-                                            guard.insert(req_id, payload);
-                                        }
-                                        notify_bridge_result();
-                                    }
-                                    Err(e) => {
-                                        agent_debug_log(
-                                            "H2",
-                                            "ping json parse failed",
-                                            serde_json::json!({ "error": e.to_string(), "json_str": json_str }),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            agent_debug_log(
-                                "H2",
-                                "ping utf8 parse failed",
-                                serde_json::json!({ "error": e.to_string() }),
-                            );
-                        }
-                    },
-                    Err(e) => {
-                        agent_debug_log(
-                            "H2",
-                            "ping base64 parse failed",
-                            serde_json::json!({ "error": e.to_string(), "payload_str": payload_str }),
-                        );
-                    }
-                }
-            }
-            respond_json(request, 200, serde_json::json!({"ok": true}));
-        }
-        (Method::Post, "/v1/complete") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(
-                    request,
-                    400,
-                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
-                );
-                return;
-            }
 
             let parsed: BridgeCompleteRequest = match serde_json::from_str(&body) {
                 Ok(v) => v,
@@ -346,16 +304,57 @@ fn handle_webview_bridge_request(
                 .map(|cfg| format!("{}/v1/callback", cfg.base_url))
                 .unwrap_or_else(|| "http://127.0.0.1:18991/v1/callback".to_string());
 
+            // M-BRIDGE-6: /v1/complete must stage the same environment as the
+            // split /v1/send path. Without this, an image request fired the
+            // native_paste Cmd+V against the user's STALE clipboard into
+            // whatever app was frontmost, and long text prompts were never
+            // staged for the paste-verify flow.
+            let has_image_attachment = parsed
+                .attachments
+                .iter()
+                .any(|a| a.mime_type == "image/png");
+            if !parsed.attachments.is_empty() {
+                let _clip_ok = write_first_png_to_clipboard(&parsed.attachments);
+                agent_debug_log(
+                    "H1",
+                    "complete: clipboard write",
+                    serde_json::json!({ "ok": _clip_ok }),
+                );
+            } else {
+                let _clip_ok = write_text_prompt_to_clipboard(&parsed.prompt);
+                agent_debug_log(
+                    "H1",
+                    "complete: prompt clipboard write",
+                    serde_json::json!({ "ok": _clip_ok, "promptLen": parsed.prompt.len() }),
+                );
+            }
+
             // The window stays offscreen (1x1 at -10000,-10000) during
             // headless operation.  JS keeps running at 1x1 size, so we
-            // do NOT need to show it to the user.
-            if should_keep_browser_visible() {
+            // do NOT need to show it to the user. Image sends need the
+            // webview visible+key so the trusted Cmd+V lands in its editor.
+            if has_image_attachment {
+                show_browser_window_impl(&app_handle);
+                let _ = window.set_focus();
+            } else if should_keep_browser_visible() {
                 show_browser_window_impl(&app_handle);
             } else if !is_browser_window_offscreen(&window) {
                 // Legacy /v1/complete fallback must follow the same rule as
                 // split /v1/send: normal provider sends should not take focus
                 // or cover the user's target app.
                 hide_browser_window_offscreen(&window);
+            }
+
+            // Snapshot + restore the user's frontmost app around the prompt
+            // injection, exactly like /v1/send (skip for image sends, which
+            // need the webview to stay key for the trusted paste).
+            let saved_frontmost = if has_image_attachment {
+                None
+            } else {
+                save_frontmost_app()
+            };
+            if let Some(app) = saved_frontmost {
+                schedule_frontmost_restore(app);
             }
 
             let mut completion = run_bridge_completion_once(
@@ -420,15 +419,13 @@ fn handle_webview_bridge_request(
         // Injects the prompt and returns immediately with a req_id.
         // Python can then long-poll /v1/result/{reqId} for the actual response.
         (Method::Post, "/v1/send") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(
-                    request,
-                    400,
-                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
-                );
-                return;
-            }
+            let body = match read_body_capped(&mut request) {
+                Ok(b) => b,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
 
             let parsed: BridgeCompleteRequest = match serde_json::from_str(&body) {
                 Ok(v) => v,
@@ -816,15 +813,13 @@ fn handle_webview_bridge_request(
             }
         }
         (Method::Post, "/v1/browser/meta") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(
-                    request,
-                    400,
-                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
-                );
-                return;
-            }
+            let body = match read_body_capped(&mut request) {
+                Ok(b) => b,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
 
             #[derive(Deserialize)]
             struct BrowserMetaWriteRequest {
@@ -876,11 +871,10 @@ fn handle_webview_bridge_request(
                     return;
                 }
             };
-            let mut meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id)
-                .unwrap_or_default();
-
+            // Input validation first (errors depend only on the inputs, not on
+            // the stored meta) so bad requests still get a 400.
             if let Err(e) = apply_browser_meta_writes(
-                &mut meta,
+                &mut BrowserSessionMeta::default(),
                 parsed.browser_last_site.clone(),
                 parsed.site.clone(),
                 parsed.url.clone(),
@@ -889,22 +883,31 @@ fn handle_webview_bridge_request(
                 respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
                 return;
             }
-
-            match write_browser_session_meta_to_dir(&date_dir, &parsed.session_id, &meta) {
-                Ok(()) => respond_json(request, 200, serde_json::json!({"ok": true, "meta": meta})),
+            // M-STORE-1: read-modify-write under the process-wide meta lock so
+            // a concurrent UI/bridge commit can't discard this write's fields.
+            match update_browser_session_meta(&date_dir, &parsed.session_id, |meta| {
+                apply_browser_meta_writes(
+                    meta,
+                    parsed.browser_last_site.clone(),
+                    parsed.site.clone(),
+                    parsed.url.clone(),
+                    parsed.last_llm_provider.clone(),
+                )
+            }) {
+                Ok(meta) => {
+                    respond_json(request, 200, serde_json::json!({"ok": true, "meta": meta}))
+                }
                 Err(e) => respond_json(request, 500, serde_json::json!({"ok": false, "error": e})),
             }
         }
         (Method::Post, "/v1/browser/commit-url") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(
-                    request,
-                    400,
-                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
-                );
-                return;
-            }
+            let body = match read_body_capped(&mut request) {
+                Ok(b) => b,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
 
             #[derive(Deserialize)]
             struct BrowserCommitRequest {
@@ -967,14 +970,18 @@ fn handle_webview_bridge_request(
                     return;
                 }
             };
-            let mut meta = read_browser_session_meta_from_dir(&date_dir, &parsed.session_id)
-                .unwrap_or_default();
-
+            // M-STORE-1: both branches read-modify-write under the process-wide
+            // meta lock so a concurrent UI session-switch commit can't discard
+            // the thread URL this bridge commit is saving (the known
+            // "reused-thread vanishes" symptom).
             if browser_url_is_bad_for_commit(&current_url, &site) {
                 // Preserve any useful previous URL; only update the last-site hint.
-                meta.browser_last_site = Some(site);
-                meta.browser_threads_updated_at_ms = Some(now_ms());
-                let _ = write_browser_session_meta_to_dir(&date_dir, &parsed.session_id, &meta);
+                let meta = update_browser_session_meta(&date_dir, &parsed.session_id, |meta| {
+                    meta.browser_last_site = Some(site.clone());
+                    meta.browser_threads_updated_at_ms = Some(now_ms());
+                    Ok(())
+                })
+                .unwrap_or_default();
                 respond_json(
                     request,
                     200,
@@ -983,11 +990,13 @@ fn handle_webview_bridge_request(
                 return;
             }
 
-            meta.browser_threads.insert(site.clone(), current_url);
-            meta.browser_last_site = Some(site);
-            meta.browser_threads_updated_at_ms = Some(now_ms());
-            match write_browser_session_meta_to_dir(&date_dir, &parsed.session_id, &meta) {
-                Ok(()) => respond_json(
+            match update_browser_session_meta(&date_dir, &parsed.session_id, |meta| {
+                meta.browser_threads.insert(site.clone(), current_url.clone());
+                meta.browser_last_site = Some(site.clone());
+                meta.browser_threads_updated_at_ms = Some(now_ms());
+                Ok(())
+            }) {
+                Ok(meta) => respond_json(
                     request,
                     200,
                     serde_json::json!({"ok": true, "committed": true, "meta": meta}),
@@ -996,15 +1005,13 @@ fn handle_webview_bridge_request(
             }
         }
         (Method::Post, "/v1/browser/restore") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(
-                    request,
-                    400,
-                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
-                );
-                return;
-            }
+            let body = match read_body_capped(&mut request) {
+                Ok(b) => b,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
 
             #[derive(Deserialize)]
             struct BrowserRestoreRequest {
@@ -1126,15 +1133,13 @@ fn handle_webview_bridge_request(
             }
         }
         (Method::Post, "/v1/task") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(
-                    request,
-                    400,
-                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
-                );
-                return;
-            }
+            let body = match read_body_capped(&mut request) {
+                Ok(b) => b,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
 
             #[derive(Deserialize)]
             struct TaskRequest {
@@ -1201,20 +1206,29 @@ fn handle_webview_bridge_request(
                 }
             };
 
+            // M-BRIDGE-4: a client session_id becomes a file stem and flows
+            // into --session-id/--resume argv — validate it like every other
+            // route does instead of pushing the traversal to the Python side.
+            if let Some(sid) = parsed.session_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                if let Err(e) = validate_session_id(sid) {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    tauri::async_runtime::block_on(crate::spawn_supervisor::release_slot());
+                    return;
+                }
+            }
             let session_id = parsed
                 .session_id
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| {
+                    // M-BRIDGE-4: full millisecond timestamp + 32 random bits —
+                    // the old (ts&0xFFFF, counter&0xFFFF) fallback was 8 hex
+                    // chars and collision-prone across restarts.
+                    use rand::Rng as _;
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    let counter = WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    format!(
-                        "{:04x}{:04x}",
-                        (ts & 0xFFFF) as u16,
-                        (counter & 0xFFFF) as u16
-                    )
+                    format!("{:x}-{:08x}", ts, rand::thread_rng().gen::<u32>())
                 });
             let session_dir = kim_root.join("kim_sessions");
             let provider = parsed
@@ -1376,15 +1390,20 @@ fn handle_webview_bridge_request(
                                         break;
                                     }
                                 }
-                                if process_exists(pid) {
-                                    let _ = send_signal(pid, true);
-                                }
-                                // #24: pid-guarded — never wipe a successor task.
+                                // M-PROC-3: only escalate to SIGKILL if the
+                                // runtime still tracks THIS pid — after exit +
+                                // pid reuse a blind group-kill would hit an
+                                // unrelated process tree.
                                 tauri::async_runtime::block_on(async {
-                                    crate::task_runtime::task_runtime()
-                                        .lock()
-                                        .await
-                                        .clear_if_pid(pid);
+                                    let mut rt =
+                                        crate::task_runtime::task_runtime().lock().await;
+                                    if rt.pid == Some(pid) {
+                                        if process_exists(pid) {
+                                            let _ = send_signal(pid, true);
+                                        }
+                                        // #24: pid-guarded — never wipe a successor task.
+                                        rt.clear_if_pid(pid);
+                                    }
                                 });
                             });
                             respond_json(
@@ -1432,15 +1451,13 @@ fn handle_webview_bridge_request(
         // here; we write a JSON line to the orchestrator's stdin so the Python
         // StdinApprovalBridge receives it and unblocks the agent loop.
         (Method::Post, "/v1/task/approve") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(
-                    request,
-                    400,
-                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
-                );
-                return;
-            }
+            let body = match read_body_capped(&mut request) {
+                Ok(b) => b,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
             let payload = match crate::hitl::approve_line_from_body(&body) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1448,10 +1465,10 @@ fn handle_webview_bridge_request(
                     return;
                 }
             };
-            let result = tauri::async_runtime::block_on(async {
-                let mut rt = crate::task_runtime::task_runtime().lock().await;
-                rt.write_stdin_line(&payload).await
-            });
+            // H-PROC-2: write via the shared stdin handle — never holds the
+            // global runtime lock across the stdin await.
+            let result =
+                tauri::async_runtime::block_on(crate::task_runtime::write_stdin_line(&payload));
             match result {
                 Ok(()) => respond_json(request, 200, serde_json::json!({"ok": true})),
                 Err(e) => respond_json(request, 409, serde_json::json!({"ok": false, "error": e})),
@@ -1479,15 +1496,13 @@ fn handle_webview_bridge_request(
             respond_json(request, 200, serde_json::json!({"ok": true}));
         }
         (Method::Post, "/v1/browser/click") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(
-                    request,
-                    400,
-                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
-                );
-                return;
-            }
+            let body = match read_body_capped(&mut request) {
+                Ok(b) => b,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
 
             #[derive(Deserialize)]
             struct ClickRequest {
@@ -1515,10 +1530,15 @@ fn handle_webview_bridge_request(
                 );
                 match win.eval(&js) {
                     Ok(()) => {
+                        // M-BRIDGE-7: `eval` only confirms the script was
+                        // DISPATCHED — the "element found" boolean inside the
+                        // JS is not readable here. Report `dispatched` instead
+                        // of claiming `clicked: true` for selectors that may
+                        // have matched nothing.
                         respond_json(
                             request,
                             200,
-                            serde_json::json!({"ok": true, "clicked": true}),
+                            serde_json::json!({"ok": true, "dispatched": true}),
                         );
                     }
                     Err(e) => {
@@ -1607,15 +1627,13 @@ fn handle_webview_bridge_request(
             }
         }
         (Method::Post, "/v1/provider") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                respond_json(
-                    request,
-                    400,
-                    serde_json::json!({"ok": false, "error": format!("Invalid body: {}", e)}),
-                );
-                return;
-            }
+            let body = match read_body_capped(&mut request) {
+                Ok(b) => b,
+                Err(e) => {
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
+                    return;
+                }
+            };
 
             #[derive(Deserialize)]
             struct ProviderRequest {
@@ -1656,10 +1674,23 @@ fn handle_webview_bridge_request(
                     return;
                 }
 
-                if let Ok(js_url) = serde_json::to_string(url) {
-                    let _ = win.eval(format!("window.location.href = {};", js_url));
+                // L-BRIDGE-13: a failed navigation eval must not report
+                // {"ok": true} — the caller would proceed against the old page.
+                match serde_json::to_string(url)
+                    .map_err(|e| e.to_string())
+                    .and_then(|js_url| {
+                        win.eval(format!("window.location.href = {};", js_url))
+                            .map_err(|e| e.to_string())
+                    }) {
+                    Ok(()) => {
+                        respond_json(request, 200, serde_json::json!({"ok": true, "site": site}))
+                    }
+                    Err(e) => respond_json(
+                        request,
+                        500,
+                        serde_json::json!({"ok": false, "error": format!("Navigation failed: {e}"), "site": site}),
+                    ),
                 }
-                respond_json(request, 200, serde_json::json!({"ok": true, "site": site}));
             } else {
                 if is_bridge_task_running() {
                     respond_json(
@@ -1899,10 +1930,39 @@ pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Resul
             "[Kim] In-app browser bridge listening at {} (mode=sentinel_v1, timeout={}s)",
             base_url, timeout_secs,
         );
+        // L-BRIDGE-10: cap concurrent request threads. Each GET /v1/result can
+        // block for up to bridge_timeout_secs in 500ms webview-eval loops, so
+        // unbounded thread-per-request allowed hundreds of webview-hammering
+        // threads. Excess requests get a fast 429 instead of a thread.
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc as StdArc;
+        const MAX_IN_FLIGHT: usize = 32;
+        let in_flight = StdArc::new(AtomicUsize::new(0));
+        /// Decrement-on-drop so a panicking handler still releases its slot.
+        struct SlotGuard(StdArc<AtomicUsize>);
+        impl Drop for SlotGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
         for request in server.incoming_requests() {
+            if in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_IN_FLIGHT {
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+                respond_json(
+                    request,
+                    429,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "Bridge is handling too many concurrent requests. Retry shortly.",
+                    }),
+                );
+                continue;
+            }
             let app = app_handle.clone();
             let tok = token.clone();
+            let guard = SlotGuard(StdArc::clone(&in_flight));
             std::thread::spawn(move || {
+                let _guard = guard;
                 handle_webview_bridge_request(request, app, tok);
             });
         }
@@ -1917,6 +1977,29 @@ pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Resul
 
 #[cfg(test)]
 mod tests {
+    // ── M-BRIDGE-3: request-body cap ────────────────────────────────────────
+
+    #[test]
+    fn read_capped_string_accepts_small_bodies() {
+        let body = super::read_capped_string(std::io::Cursor::new(b"{\"ok\":true}"), 1024);
+        assert_eq!(body.unwrap(), "{\"ok\":true}");
+    }
+
+    #[test]
+    fn read_capped_string_rejects_oversized_bodies() {
+        let big = vec![b'a'; 2049];
+        let err = super::read_capped_string(std::io::Cursor::new(big), 2048);
+        assert!(err.is_err(), "body over the cap must be rejected");
+        assert!(err.unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn read_capped_string_accepts_exact_cap() {
+        let exact = vec![b'a'; 2048];
+        let body = super::read_capped_string(std::io::Cursor::new(exact), 2048).unwrap();
+        assert_eq!(body.len(), 2048);
+    }
+
     /// K2: build the REAL argv the `/v1/task` handler produces, by calling the
     /// shared `task_spec::chat_task_spec` builder exactly like the handler
     /// does (no more hand-mirrored logic that could drift).

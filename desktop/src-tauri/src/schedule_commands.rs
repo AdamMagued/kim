@@ -15,7 +15,7 @@ use crate::{default_project_root, subprocess::find_python_interpreter};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -30,8 +30,10 @@ fn run_kimctl(args: &[String], kim_root: &PathBuf) -> Result<String, String> {
     for arg in &args[1..] {
         cmd.arg(arg);
     }
+    // L-PROC-9: pass the raw OsStr -- `.to_str().unwrap_or("")` silently set
+    // PYTHONPATH="" on non-UTF-8 paths, yielding a confusing ModuleNotFoundError.
     cmd.current_dir(kim_root)
-        .env("PYTHONPATH", kim_root.to_str().unwrap_or(""));
+        .env("PYTHONPATH", kim_root.as_os_str());
 
     let output = cmd
         .output()
@@ -358,26 +360,24 @@ pub(crate) async fn start_schedule_timer(
         let handle = tokio::spawn(async move {
             let kim_root = default_project_root();
             loop {
-                // Guard: skip this tick if an interactive or bridge task is
-                // already running, matching the guard in scheduler.rs:51-56.
-                // Avoids launching a scheduled task concurrently with a live
-                // agent run (second-agent race).
+                // Guard: skip this tick if an agent task is already running or
+                // starting, matching the guard in scheduler.rs. Avoids launching
+                // a scheduled task concurrently with a live agent run.
                 //
-                // Two agent-tracking paths must both be checked:
-                //   1. TaskState (set by subprocess.rs run_task for IPC/interactive runs)
-                //   2. BRIDGE_TASK_PID / is_bridge_task_running (set by http_bridge.rs for
-                //      kimctl /v1/task runs - those never touch TaskState)
-                let busy = if let Some(task_state) = app_handle.try_state::<crate::TaskState>() {
-                    let g = task_state.lock().await;
-                    g.pid.is_some() || g.starting
-                } else {
-                    false
+                // H-PROC-1: read TaskRuntime, the single store BOTH spawn paths
+                // populate (GUI send_task and bridge /v1/task). The old check on
+                // the legacy TaskState managed state was dead code: nothing ever
+                // set its pid/starting.
+                let busy = {
+                    let mut rt = crate::task_runtime::task_runtime().lock().await;
+                    if let Some(pid) = rt.pid {
+                        if !crate::subprocess::process_exists(pid) {
+                            rt.clear();
+                        }
+                    }
+                    rt.is_occupied()
                 };
                 if busy {
-                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                    continue;
-                }
-                if crate::is_bridge_task_running() {
                     tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
                     continue;
                 }

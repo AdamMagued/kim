@@ -48,19 +48,39 @@ async fn scheduler_tick(app_handle: &tauri::AppHandle) {
         return;
     }
     // (b) never stomp an interactive run — skip this tick if one is active.
-    if let Some(task_state) = app_handle.try_state::<crate::TaskState>() {
-        let guard = task_state.lock().await;
-        if guard.pid.is_some() || guard.starting {
+    // H-PROC-1: the guard must read TaskRuntime, the store both spawn paths
+    // (GUI send_task and bridge /v1/task) actually populate. The old check on
+    // the legacy `TaskState` managed state was dead code — nothing ever set
+    // its pid/starting, so scheduled runs could stomp live interactive tasks.
+    {
+        let mut rt = crate::task_runtime::task_runtime().lock().await;
+        // Recover from a stale dead pid so a missed clear can't disable the
+        // scheduler forever (same recovery reserve_slot performs).
+        if let Some(pid) = rt.pid {
+            if !crate::subprocess::process_exists(pid) {
+                rt.clear();
+            }
+        }
+        if rt.is_occupied() {
             return;
         }
     }
     // Fire any due schedules and log the outcome to the status channel.
     match crate::schedule_commands::run_due_scheduled_task(false).await {
         Ok(json) => {
-            let _ = app_handle.emit(
-                "kim-agent-output",
-                format!("[STATUS] Scheduler ran due tasks: {json}"),
-            );
+            // L-PROC-7: only surface ticks that actually launched something —
+            // the idle result `{"ok":true,"launched":false,...}` fires every
+            // 60s and would spam the agent chat channel.
+            let launched = serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .and_then(|v| v.get("launched").and_then(|l| l.as_bool()))
+                .unwrap_or(true);
+            if launched {
+                let _ = app_handle.emit(
+                    "kim-agent-output",
+                    format!("[STATUS] Scheduler ran due tasks: {json}"),
+                );
+            }
         }
         Err(e) => {
             let _ = app_handle.emit("kim-agent-output", format!("[STATUS] Scheduler error: {e}"));

@@ -175,18 +175,36 @@ fn export_as_zip(sessions_base: &Path, out: &Path) -> Result<String, String> {
     let opts: FileOptions<'_, ()> =
         FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
+    // M-IO-2: propagate per-file write failures (disk full, bad entry name)
+    // instead of `.ok()`-swallowing them — a silently corrupted archive that
+    // still reports "Exported N" makes the user believe the backup succeeded.
     let mut count = 0usize;
+    let mut first_err: Option<String> = None;
     collect_jsonl_files(sessions_base, &mut |rel, data| {
-        zip.start_file(rel, opts).ok();
-        zip.write_all(data).ok();
+        if first_err.is_some() {
+            return;
+        }
+        if let Err(e) = zip
+            .start_file(&rel, opts)
+            .map_err(|e| e.to_string())
+            .and_then(|()| zip.write_all(data).map_err(|e| e.to_string()))
+        {
+            first_err = Some(format!("Failed to write {} into export: {}", rel, e));
+            return;
+        }
         count += 1;
     });
+    if let Some(e) = first_err {
+        return Err(e);
+    }
 
     // Include account metadata, but never export credentials/tokens.
     if account_path().exists() {
         let data = sanitized_account_json(None);
-        zip.start_file("account.json", opts).ok();
-        let _ = zip.write_all(data.as_bytes());
+        zip.start_file("account.json", opts)
+            .map_err(|e| format!("Failed to add account.json to export: {}", e))?;
+        zip.write_all(data.as_bytes())
+            .map_err(|e| format!("Failed to write account.json into export: {}", e))?;
     }
 
     zip.finish().map_err(|e| e.to_string())?;
@@ -501,8 +519,16 @@ pub async fn backup_to_gist(
     }
 
     let gist: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let gist_id = gist["id"].as_str().unwrap_or("").to_string();
-    Ok(gist_id)
+    // M-IO-3: a missing/empty id must be an error — returning "" made the next
+    // backup PATCH the malformed URL `…/gists/`. Note this backup intentionally
+    // uploads only the sanitized account plus a session INDEX ({path, line
+    // count}); session contents are exported via export_data, not the gist.
+    let gist_id = gist["id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "GitHub did not return a gist id for the backup.".to_string())?;
+    Ok(gist_id.to_string())
 }
 
 #[tauri::command]
@@ -530,13 +556,13 @@ pub async fn restore_from_gist(token: String, gist_id: String) -> Result<KimAcco
         if let Ok(mut account) = serde_json::from_str::<KimAccount>(acct_content) {
             account.github_token = None;
             account.gist_id = Some(gist_id.clone());
-            if !account_path().exists() {
-                let dir = account_dir();
-                fs::create_dir_all(&dir).ok();
-                if let Ok(raw) = serde_json::to_string_pretty(&account) {
-                    fs::write(account_path(), raw).ok();
-                }
-            }
+            // M-IO-1: the user explicitly asked to restore this gist, so the
+            // restored account must actually land on disk (the old code
+            // skipped the write whenever account.json existed and `.ok()`-
+            // swallowed write failures, leaving UI and disk divergent until
+            // the next save). Persist through the same atomic+locked writer
+            // as save_account and propagate errors.
+            crate::account::save_account(account.clone()).await?;
             return Ok(account);
         }
     }

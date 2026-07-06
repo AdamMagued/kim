@@ -53,7 +53,11 @@ pub(crate) fn open_browser_signin_window_with_visibility(
         }
 
         let js_url = serde_json::to_string(trimmed).map_err(|e| e.to_string())?;
-        let _ = existing.eval(format!("window.location.href = {};", js_url));
+        // L-BRIDGE-13: a failed navigation eval must surface as an error, not
+        // as "Navigated existing Kim browser window".
+        existing
+            .eval(format!("window.location.href = {};", js_url))
+            .map_err(|e| format!("Failed to navigate Kim browser window: {e}"))?;
         // Preserve current visibility: if the caller wants invisible and the
         // window is currently shown, hide it; if visible and currently hidden,
         // bring it back into view.
@@ -367,9 +371,6 @@ pub(crate) fn collect_bridge_payload(
     let result_store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
     let (lock, condvar) = WEBVIEW_BRIDGE_NOTIFY.get_or_init(|| (StdMutex::new(()), Condvar::new()));
 
-    // For legacy fallback: if IPC isn't delivering, fall back to title polling
-    let req_id_json = serde_json::to_string(req_id)
-        .map_err(|e| format!("Failed to encode req_id for JS: {}", e))?;
     let mut ipc_wait_loops: u64 = 0;
 
     loop {
@@ -454,7 +455,7 @@ pub(crate) fn collect_bridge_payload(
         // Tauri IPC (emit) does NOT work on external pages — __TAURI_INTERNALS__
         // is not injected even with remote IPC capabilities. The JS bridge stores
         // results in window.__kimBridgeStore which we poll via title-pull.
-        match pull_payload_from_js_store_legacy(window, &req_id_json) {
+        match pull_payload_from_js_store_legacy(window, req_id) {
             Ok(Some(payload)) => {
                 agent_debug_log(
                     "H2",
@@ -475,14 +476,55 @@ pub(crate) fn collect_bridge_payload(
     }
 }
 
+/// H-BRIDGE-2: `document.title` is a single shared slot on the ONE provider
+/// window, but the split send/receive API lets several `GET /v1/result/{id}`
+/// collectors title-pull concurrently (WEBVIEW_BRIDGE_LOCK is released once
+/// `/v1/send` returns). This mutex serialises each eval→sleep→read→clear
+/// cycle so collectors can't interleave their title writes.
+static TITLE_PULL_LOCK: StdMutex<()> = StdMutex::new(());
+
+pub(crate) const TITLE_PULL_NULL_MARKER: &str = "__KIMBRIDGE_NONE__";
+
+/// Decode one title-pull read. The title must carry the `req_id|` stamp the
+/// matching write placed there (H-BRIDGE-2): a title written for another
+/// collector's req_id is discarded instead of being returned as OUR payload
+/// (the old format was un-attributed base64, so a swap was undetectable and
+/// request A's LLM response could be handed to request B).
+pub(crate) fn decode_title_pull_payload(
+    req_id: &str,
+    title: &str,
+) -> Option<BridgeCompleteResponse> {
+    let payload_b64 = title.strip_prefix(&format!("{req_id}|"))?;
+    if payload_b64 == TITLE_PULL_NULL_MARKER
+        || payload_b64.trim().is_empty()
+        || payload_b64.contains(' ')
+    {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload_b64)
+        .ok()?;
+    let decoded_str = String::from_utf8(decoded).ok()?;
+    serde_json::from_str::<BridgeCompleteResponse>(&decoded_str).ok()
+}
+
 /// Legacy title-polling fallback — only used when IPC isn't available.
 /// Kept for backward compatibility with pages that don't have IPC access.
 pub(crate) fn pull_payload_from_js_store_legacy(
     window: &tauri::WebviewWindow,
-    req_id_json: &str,
+    req_id: &str,
 ) -> Result<Option<BridgeCompleteResponse>, String> {
-    const NULL_MARKER: &str = "__KIMBRIDGE_NONE__";
+    let req_id_json = serde_json::to_string(req_id)
+        .map_err(|e| format!("Failed to encode req_id for JS: {}", e))?;
 
+    // Serialise the whole eval→sleep→read→clear cycle across collectors
+    // (H-BRIDGE-2). Held only in bridge HTTP threads, never on the async runtime.
+    let _pull_guard = TITLE_PULL_LOCK
+        .lock()
+        .map_err(|_| "Title-pull lock poisoned.".to_string())?;
+
+    // Stamp the req_id into the title so the read below can verify it is OUR
+    // write (and not a concurrent collector's) before decoding.
     let write_js = format!(
         r#"(() => {{
             try {{
@@ -490,13 +532,13 @@ pub(crate) fn pull_payload_from_js_store_legacy(
                 const entry = store[{req_id_json}];
                 const data = (entry && typeof entry.data === 'string' && entry.data.length > 0)
                     ? entry.data : '{null_marker}';
-                document.title = data;
+                document.title = {req_id_json} + '|' + data;
             }} catch (_) {{
-                document.title = '{null_marker}';
+                document.title = {req_id_json} + '|' + '{null_marker}';
             }}
         }})()"#,
         req_id_json = req_id_json,
-        null_marker = NULL_MARKER,
+        null_marker = TITLE_PULL_NULL_MARKER,
     );
     window.eval(write_js).map_err(|e| e.to_string())?;
 
@@ -507,24 +549,11 @@ pub(crate) fn pull_payload_from_js_store_legacy(
     agent_debug_log(
         "H2",
         "title pull read title",
-        serde_json::json!({ "reqId": req_id_json, "title": title }),
+        serde_json::json!({ "reqId": req_id, "title": title }),
     );
 
-    if title == NULL_MARKER || title.trim().is_empty() || title.contains(' ') {
+    let Some(payload) = decode_title_pull_payload(req_id, &title) else {
         return Ok(None);
-    }
-
-    let decoded = match base64::engine::general_purpose::STANDARD.decode(&title) {
-        Ok(b) => b,
-        Err(_) => return Ok(None),
-    };
-    let decoded_str = match String::from_utf8(decoded) {
-        Ok(s) => s,
-        Err(_) => return Ok(None),
-    };
-    let payload: BridgeCompleteResponse = match serde_json::from_str(&decoded_str) {
-        Ok(p) => p,
-        Err(_) => return Ok(None),
     };
 
     let clear_js = format!(
@@ -681,4 +710,63 @@ pub(crate) async fn open_browser_signin_window(
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
     open_browser_signin_window_impl(&url, provider_name, &app_handle)
+}
+
+#[cfg(test)]
+mod title_pull_tests {
+    use super::*;
+
+    fn encode(payload: &BridgeCompleteResponse) -> String {
+        base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(payload).unwrap())
+    }
+
+    fn sample(response: &str) -> BridgeCompleteResponse {
+        BridgeCompleteResponse {
+            ok: true,
+            response: Some(response.to_string()),
+            error: None,
+            site: Some("claude".to_string()),
+        }
+    }
+
+    // H-BRIDGE-2: a title stamped with OUR req_id decodes to our payload.
+    #[test]
+    fn decode_accepts_own_req_id() {
+        let payload = sample("answer for A");
+        let title = format!("r-1-7|{}", encode(&payload));
+        let got = decode_title_pull_payload("r-1-7", &title).expect("must decode own payload");
+        assert_eq!(got.response.as_deref(), Some("answer for A"));
+    }
+
+    // H-BRIDGE-2 core regression: another collector's payload must be
+    // DISCARDED, not returned as ours (previously undetectable → response
+    // swap between concurrent /v1/result collectors).
+    #[test]
+    fn decode_rejects_other_collectors_payload() {
+        let payload = sample("answer for A");
+        let title = format!("r-1-7|{}", encode(&payload));
+        assert!(
+            decode_title_pull_payload("r-1-8", &title).is_none(),
+            "payload stamped for r-1-7 must never be returned to r-1-8"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_null_marker_and_garbage() {
+        assert!(decode_title_pull_payload("r-1-7", "r-1-7|__KIMBRIDGE_NONE__").is_none());
+        assert!(decode_title_pull_payload("r-1-7", "r-1-7|not base64!!").is_none());
+        // Normal page titles (no stamp at all).
+        assert!(decode_title_pull_payload("r-1-7", "Claude").is_none());
+        assert!(decode_title_pull_payload("r-1-7", "Gemini - Google").is_none());
+        assert!(decode_title_pull_payload("r-1-7", "").is_none());
+    }
+
+    // A req_id that is a prefix of another must not cross-match.
+    #[test]
+    fn decode_prefix_req_ids_do_not_cross_match() {
+        let payload = sample("x");
+        let title = format!("r-1-71|{}", encode(&payload));
+        assert!(decode_title_pull_payload("r-1-7", &title).is_none());
+    }
 }

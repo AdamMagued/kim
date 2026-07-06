@@ -34,6 +34,35 @@ pub(crate) fn validate_session_id(session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate that a user-supplied `session_date` is a safe single path
+/// component (H-BRIDGE-1). Without this, a bridge caller could pass
+/// `session_date="../../../../Users/<u>/.ssh"` and read/write files outside
+/// the sessions tree via /v1/browser/meta, /commit-url and /restore.
+/// Date buckets are created by `chrono_like_today` as `YYYY-MM-DD`, so the
+/// same conservative charset used for session ids is more than enough.
+pub(crate) fn validate_session_date(session_date: &str) -> Result<(), String> {
+    if session_date.is_empty() {
+        return Err("session_date is empty".to_string());
+    }
+    if session_date.len() > 64 {
+        return Err("session_date is too long".to_string());
+    }
+    if session_date.contains('/')
+        || session_date.contains('\\')
+        || session_date.contains("..")
+        || session_date.contains('\0')
+    {
+        return Err("session_date contains illegal characters".to_string());
+    }
+    if !session_date
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err("session_date contains illegal characters".to_string());
+    }
+    Ok(())
+}
+
 pub(crate) fn browser_session_meta_filename(session_id: &str) -> String {
     format!("{}.browser.json", session_id)
 }
@@ -86,6 +115,33 @@ pub(crate) fn write_browser_session_meta_to_dir(
     }
 }
 
+/// M-STORE-1: serialises the read→modify→write cycle on `.browser.json`
+/// session metadata. The UI (session switch) and the bridge (task-end URL
+/// commit) can interleave whole-file read-modify-writes; without this lock the
+/// second rename discards the first writer's fields (the saved provider thread
+/// URL vanished, so the next run opened a fresh thread).
+static BROWSER_META_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read-modify-write a session's `.browser.json` under the process-wide lock.
+/// All writers must go through this helper so concurrent commits merge instead
+/// of clobbering each other.
+pub(crate) fn update_browser_session_meta<F>(
+    date_dir: &Path,
+    session_id: &str,
+    apply: F,
+) -> Result<BrowserSessionMeta, String>
+where
+    F: FnOnce(&mut BrowserSessionMeta) -> Result<(), String>,
+{
+    let _guard = BROWSER_META_LOCK
+        .lock()
+        .map_err(|_| "browser meta lock poisoned".to_string())?;
+    let mut meta = read_browser_session_meta_from_dir(date_dir, session_id).unwrap_or_default();
+    apply(&mut meta)?;
+    write_browser_session_meta_to_dir(date_dir, session_id, &meta)?;
+    Ok(meta)
+}
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -135,13 +191,22 @@ pub(crate) fn resolve_session_date_dir(
 ) -> Result<PathBuf, String> {
     validate_session_id(session_id)?;
 
-    if let Some(date) = session_date.map(str::trim).filter(|d| !d.is_empty()) {
-        let dir = base.join(date);
+    // H-BRIDGE-1: the client-controlled date component must be validated
+    // exactly like session_id — otherwise it is a path-traversal vector.
+    let requested: Option<PathBuf> = match session_date.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(date) => {
+            validate_session_date(date)?;
+            Some(base.join(date))
+        }
+        None => None,
+    };
+
+    // Use the requested date bucket when the session actually lives there.
+    if let Some(dir) = &requested {
         if dir.join(format!("{}.jsonl", session_id)).exists()
             || dir.join(browser_session_meta_filename(session_id)).exists()
-            || dir.exists()
         {
-            return Ok(dir);
+            return Ok(dir.clone());
         }
     }
 
@@ -165,6 +230,16 @@ pub(crate) fn resolve_session_date_dir(
             {
                 return Ok(dir);
             }
+        }
+    }
+
+    // Brand-new session with an explicitly requested (validated) date bucket:
+    // honour it only if the bucket already exists. L-STORE-2: this check runs
+    // AFTER the scan above, so an existing date dir that does not contain the
+    // session can no longer shadow the dir where the session actually lives.
+    if let Some(dir) = requested {
+        if dir.exists() {
+            return Ok(dir);
         }
     }
 
@@ -195,8 +270,20 @@ pub(crate) fn read_sessions_from_dir(
         let date_dir = date_entry.path();
         let date_str = date_entry.file_name().to_string_lossy().to_string();
 
-        let mut jsonl_files: Vec<_> = fs::read_dir(&date_dir)
-            .map_err(|e| e.to_string())?
+        // L-STORE-3: one unreadable date subdir must not blank the whole
+        // session list — skip it and keep listing the rest.
+        let dir_entries = match fs::read_dir(&date_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!(
+                    "[Kim] list_sessions: skipping unreadable dir {}: {}",
+                    date_dir.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let mut jsonl_files: Vec<_> = dir_entries
             .filter_map(|e| e.ok())
             .filter(|e| {
                 let name = e.file_name();
@@ -453,4 +540,114 @@ pub(crate) fn infer_session_title(
 
     let short_id: String = session_id.chars().take(8).collect();
     format!("Session {}", short_id)
+}
+
+#[cfg(test)]
+mod session_store_tests {
+    use super::*;
+
+    // ── H-BRIDGE-1: session_date must be validated like session_id ──────────
+
+    #[test]
+    fn session_date_traversal_rejected() {
+        for bad in [
+            "../../../../Users/victim/.ssh",
+            "..",
+            "a/b",
+            "a\\b",
+            "2026-07-06/..",
+            "x\0y",
+            "date with spaces",
+        ] {
+            assert!(
+                validate_session_date(bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_date_valid_forms_accepted() {
+        for good in ["2026-07-06", "2025-12-31", "legacy_bucket-1.2"] {
+            assert!(validate_session_date(good).is_ok(), "must accept {good:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_traversal_session_date() {
+        let base = tempfile::tempdir().unwrap();
+        let err = resolve_session_date_dir(
+            base.path(),
+            "sess-1",
+            Some("../../../../etc"),
+        );
+        assert!(err.is_err(), "traversal date must be rejected: {err:?}");
+    }
+
+    // ── L-STORE-2: an existing-but-wrong date dir must not shadow the scan ──
+
+    #[test]
+    fn resolve_prefers_dir_that_contains_the_session() {
+        let base = tempfile::tempdir().unwrap();
+        let wrong = base.path().join("2026-01-01");
+        let right = base.path().join("2026-07-06");
+        std::fs::create_dir_all(&wrong).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(right.join("sess-1.jsonl"), "{}\n").unwrap();
+
+        // Caller asks for the wrong (existing, empty) bucket — the resolver
+        // must return the bucket that actually holds the session file.
+        let dir = resolve_session_date_dir(base.path(), "sess-1", Some("2026-01-01")).unwrap();
+        assert_eq!(dir, right, "must resolve to the dir containing the session");
+    }
+
+    #[test]
+    fn resolve_honours_requested_dir_when_session_lives_there() {
+        let base = tempfile::tempdir().unwrap();
+        let bucket = base.path().join("2026-07-06");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("sess-2.jsonl"), "{}\n").unwrap();
+        let dir = resolve_session_date_dir(base.path(), "sess-2", Some("2026-07-06")).unwrap();
+        assert_eq!(dir, bucket);
+    }
+
+    #[test]
+    fn resolve_brand_new_session_uses_existing_requested_bucket() {
+        let base = tempfile::tempdir().unwrap();
+        let bucket = base.path().join("2026-07-01");
+        std::fs::create_dir_all(&bucket).unwrap();
+        // No session files anywhere: requested existing bucket is honoured.
+        let dir = resolve_session_date_dir(base.path(), "brand-new", Some("2026-07-01")).unwrap();
+        assert_eq!(dir, bucket);
+    }
+
+    // ── M-STORE-1: concurrent read-modify-writes must merge, not clobber ────
+
+    #[test]
+    fn concurrent_meta_updates_do_not_lose_fields() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().to_path_buf();
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let dir = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                update_browser_session_meta(&dir, "sess-m", |meta| {
+                    meta.browser_threads
+                        .insert(format!("site{i}"), format!("https://example.com/{i}"));
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let meta = read_browser_session_meta_from_dir(&dir, "sess-m").unwrap();
+        assert_eq!(
+            meta.browser_threads.len(),
+            8,
+            "all 8 concurrent writers' fields must survive: {:?}",
+            meta.browser_threads
+        );
+    }
 }

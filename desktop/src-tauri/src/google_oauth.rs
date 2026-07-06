@@ -172,7 +172,9 @@ fn write_secret(secret: &GoogleOAuthSecret) -> Result<(), String> {
         .map_err(|e| format!("Could not save Google token to OS secure storage: {e}"))
 }
 
-fn delete_secret() -> Result<(), String> {
+/// Delete the stored Google OAuth secret (idempotent). `pub(crate)` so
+/// `account::clear_account` can wipe it on account reset (H-ACCT-1).
+pub(crate) fn delete_secret() -> Result<(), String> {
     let entry = keyring_entry()?;
     match entry.delete_password() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -341,6 +343,22 @@ async fn fetch_userinfo(access_token: &str) -> Result<UserInfoResponse, String> 
 pub async fn google_oauth_env_for_agent() -> Result<AgentGoogleOAuthEnv, String> {
     let secret = read_secret()?.ok_or_else(|| "Google for Kim is not connected.".to_string())?;
     let refreshed = refresh_access_token(&secret).await?;
+    // L-AUTH-2: Google may rotate the refresh token on refresh. Persist the
+    // new one, or the stored token eventually goes stale and forces a manual
+    // reconnect. Best-effort: a keychain write failure must not fail the run
+    // (the fresh access token is still valid for this session).
+    if let Some(new_refresh) = refreshed
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != secret.refresh_token)
+    {
+        let mut updated = secret.clone();
+        updated.refresh_token = new_refresh.to_string();
+        if let Err(e) = write_secret(&updated) {
+            eprintln!("[Kim] google oauth: could not persist rotated refresh token: {e}");
+        }
+    }
     let expires_at = now_epoch() + refreshed.expires_in.unwrap_or(3600);
     Ok(AgentGoogleOAuthEnv {
         access_token: refreshed.access_token,

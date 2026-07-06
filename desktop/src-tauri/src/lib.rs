@@ -4,10 +4,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
+use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
-use tokio::sync::Mutex;
 
 pub mod account;
 pub mod browser_bridge;
@@ -51,19 +50,9 @@ use http_bridge::{capitalize, start_webview_bridge_server};
 use ollama::ollama_tags;
 use screenshot_flash::show_screenshot_flash;
 
-// ---------------------------------------------------------------------------
-// Shared state — currently running agent child (for cancellation)
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
-pub struct RunningTask {
-    /// PID of the running agent subprocess, if any.
-    pid: Option<u32>,
-    /// True while a task has reserved the runner slot but has not spawned yet.
-    starting: bool,
-}
-
-pub type TaskState = Arc<Mutex<RunningTask>>;
+// H-PROC-1: the legacy `RunningTask`/`TaskState` managed state was removed.
+// Nothing ever wrote its pid/starting fields — all real task state lives in
+// `task_runtime::TaskRuntime` — so every guard reading it was dead code.
 
 #[derive(Clone, Debug)]
 struct WebviewBridgeConfig {
@@ -761,11 +750,11 @@ async fn session_browser_meta_write(
     let stype = session_type.unwrap_or_else(|| "kim".to_string());
     let base = session_base_dir(&stype, kim_dir, codex_dir);
     let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
-    let mut meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
-
-    apply_browser_meta_writes(&mut meta, browser_last_site, site, url, last_llm_provider)?;
-    write_browser_session_meta_to_dir(&date_dir, &session_id, &meta)?;
-    Ok(meta)
+    // M-STORE-1: read-modify-write under the process-wide meta lock so a
+    // concurrent bridge commit can't discard this write's fields.
+    update_browser_session_meta(&date_dir, &session_id, |meta| {
+        apply_browser_meta_writes(meta, browser_last_site, site, url, last_llm_provider)
+    })
 }
 
 #[tauri::command]
@@ -803,13 +792,14 @@ async fn session_browser_url_commit(
         let stype = session_type.clone().unwrap_or_else(|| "kim".to_string());
         let base = session_base_dir(&stype, kim_dir, codex_dir);
         let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
-        let mut meta =
-            read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
-        if meta.browser_last_site.as_deref() != Some(site.as_str()) {
-            meta.browser_last_site = Some(site);
-            meta.browser_threads_updated_at_ms = Some(now_ms());
-            let _ = write_browser_session_meta_to_dir(&date_dir, &session_id, &meta);
-        }
+        // M-STORE-1: read-modify-write under the process-wide meta lock.
+        let meta = update_browser_session_meta(&date_dir, &session_id, |meta| {
+            if meta.browser_last_site.as_deref() != Some(site.as_str()) {
+                meta.browser_last_site = Some(site.clone());
+                meta.browser_threads_updated_at_ms = Some(now_ms());
+            }
+            Ok(())
+        })?;
         return Ok(meta);
     }
 
@@ -968,6 +958,19 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
             // Store the child handle so it can be killed on app exit (#8).
             // Without this, Chrome processes accumulate as zombies.
             if let Ok(mut guard) = CDP_CHROME_CHILD.get_or_init(|| StdMutex::new(None)).lock() {
+                // M-PROC-4: reap any previous child before overwriting the
+                // slot. Dropping a Child without kill()+wait() leaves either
+                // an orphaned live Chrome or a zombie for the app's lifetime
+                // (e.g. when the first spawn never opened the debug port).
+                if let Some(mut old) = guard.take() {
+                    match old.try_wait() {
+                        Ok(Some(_)) => {} // already exited and now reaped
+                        _ => {
+                            let _ = old.kill();
+                            let _ = old.wait();
+                        }
+                    }
+                }
                 *guard = Some(child);
             }
             // Caller is responsible for the post-launch wait so it can use
@@ -984,6 +987,9 @@ pub(crate) fn kill_cdp_chrome() {
         if let Ok(mut child_opt) = guard.lock() {
             if let Some(mut child) = child_opt.take() {
                 let _ = child.kill();
+                // M-PROC-4: reap after kill so the process doesn't linger as
+                // a zombie until our own exit.
+                let _ = child.wait();
             }
         }
     }
@@ -1067,7 +1073,6 @@ pub fn run() {
     // #23: repair the minimal launchd PATH before anything shells out —
     // packaged GUI launches otherwise can't find ollama/git/etc.
     env_path::fix_gui_path();
-    let task_state: TaskState = Arc::new(Mutex::new(RunningTask::default()));
     let schedule_timer_state = schedule_commands::new_schedule_timer_state();
     let config_path = config_yaml_path(None);
     let config = config::load_config(&config_path);
@@ -1115,7 +1120,6 @@ pub fn run() {
             scheduler::start_scheduler(app.handle().clone());
             Ok(())
         })
-        .manage(task_state)
         .manage(schedule_timer_state)
         .manage(config)
         .invoke_handler(tauri::generate_handler![
