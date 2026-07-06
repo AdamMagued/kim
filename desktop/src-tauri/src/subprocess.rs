@@ -580,7 +580,7 @@ pub(crate) async fn send_task(
                 .arg(&provider_arg)
                 .current_dir(&kim_root)
                 .env("PYTHONPATH", kim_root.to_str().unwrap_or(""))
-                // Tell run_codex_subtask exactly which codex binary to spawn,
+                // Tell codex_bridge_service exactly which codex binary to spawn,
                 // so it doesn't have to repeat the search dance.
                 .env("CODEX_BIN", code_bin.to_string_lossy().to_string())
                 // Signal Tauri mode so codex_bridge_service emits a HITL

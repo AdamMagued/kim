@@ -1,86 +1,123 @@
-"""
-Regression test: run_codex_subtask() must pass environment variables via
-the subprocess `env=` dict parameter, NOT by mutating os.environ.
+"""Behavioral env-scoping tests for the live codex spawn path (K4/Q4).
 
-If someone refactors codex_engine/engine.py and accidentally uses os.environ[k] = v
-instead of the local env dict, this test will break.
+The codex subprocess must receive ONLY the hardened minimal-allowlist env
+built by orchestrator/codex_bridge_service.py — never a spread of the parent
+``os.environ``. These tests spawn a REAL fake codex binary via _run_async and
+assert on the env dict the child process actually observed.
+
+(The old version of this file grepped the source of the dead
+``run_codex_subtask`` — which pinned the contradictory ``**os.environ``
+contract. Both are gone; this file now pins the hardened contract.)
 """
 
-import ast
-import inspect
-import textwrap
+from __future__ import annotations
+
+import tempfile
+import unittest
 from pathlib import Path
 
-# Locate the source file
-_CODEX_BRIDGE = Path(__file__).resolve().parent.parent / "codex_engine" / "engine.py"
+from codex_bridge_harness import (
+    EXPECTED_POSIX_ENV_KEYS,
+    FAKE_BEARER_TOKEN,
+    FAKE_PROXY_PORT,
+    PLATFORM_INJECTED_ENV_KEYS,
+    run_bridge,
+)
 
 
-def _get_function_source(source_text: str, func_name: str) -> str:
-    """Extract the source of a top-level async function from source_text."""
-    tree = ast.parse(source_text)
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
-            lines = source_text.splitlines()
-            return "\n".join(lines[node.lineno - 1 : node.end_lineno])
-    raise ValueError(f"Function {func_name!r} not found")
+class TestCodexEnvScoping(unittest.IsolatedAsyncioTestCase):
+    """The env dict actually passed to the codex subprocess."""
 
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="kim-envscope-")
+        self.tmp = Path(self._tmp.name)
 
-class TestCodexEnvScoping:
-    """Verify env-var isolation in codex_bridge.run_codex_subtask."""
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
 
-    def test_source_file_exists(self):
-        assert _CODEX_BRIDGE.exists(), f"Expected engine.py at {_CODEX_BRIDGE}"
-
-    def test_env_dict_is_passed_to_subprocess(self):
-        """The subprocess must receive env= as a keyword argument."""
-        source = _CODEX_BRIDGE.read_text(encoding="utf-8")
-        func_src = _get_function_source(source, "run_codex_subtask")
-
-        # The env dict must be constructed as a local variable
-        assert "env = {" in func_src or "env={" in func_src, (
-            "run_codex_subtask should build a local env dict via `env = {...}`"
+    async def test_child_env_is_exactly_the_minimal_allowlist(self):
+        """Child env keys == the hardened allowlist — nothing inherited beyond it."""
+        result = await run_bridge(self.tmp)
+        self.assertEqual(result.rc, 0)
+        self.assertIsNotNone(result.capture, "fake codex binary was never spawned")
+        child_keys = set(result.capture["env"].keys())
+        # Everything on the allowlist must be present…
+        self.assertTrue(
+            EXPECTED_POSIX_ENV_KEYS <= child_keys,
+            f"missing allowlist keys: {EXPECTED_POSIX_ENV_KEYS - child_keys}",
+        )
+        # …and nothing else may leak in (modulo OS-injected vars).
+        extras = child_keys - EXPECTED_POSIX_ENV_KEYS - PLATFORM_INJECTED_ENV_KEYS
+        self.assertEqual(
+            extras,
+            set(),
+            f"parent env leaked into the codex subprocess: {sorted(extras)}",
         )
 
-        # The env dict must be passed via env= keyword to create_subprocess_exec
-        assert "env=env" in func_src, (
-            "run_codex_subtask must pass `env=env` to create_subprocess_exec"
+    async def test_parent_secrets_never_reach_the_child(self):
+        """Secret-looking parent vars must not appear in the child env."""
+        planted = {
+            "OPENAI_API_KEY": "sk-real-parent-key-LEAK",
+            "ANTHROPIC_API_KEY": "sk-ant-parent-LEAK",
+            "AWS_SECRET_ACCESS_KEY": "aws-parent-LEAK",
+            "GITHUB_TOKEN": "ghp_parent-LEAK",
+            "KIM_TEST_PLANTED_SECRET": "planted-LEAK",
+        }
+        result = await run_bridge(self.tmp, env=planted)
+        self.assertEqual(result.rc, 0)
+        child_env = result.capture["env"]
+        for key, value in planted.items():
+            self.assertNotEqual(
+                child_env.get(key),
+                value,
+                f"parent secret {key} leaked into the codex subprocess",
+            )
+        # And none of the planted *values* appear anywhere in the child env.
+        for value in planted.values():
+            self.assertNotIn(value, child_env.values())
+
+    async def test_api_keys_are_the_per_run_proxy_bearer_token(self):
+        """CODEX_API_KEY / OPENAI_API_KEY must be the proxy's per-run token."""
+        result = await run_bridge(
+            self.tmp, env={"OPENAI_API_KEY": "sk-real-parent-key"}
+        )
+        child_env = result.capture["env"]
+        self.assertEqual(child_env["CODEX_API_KEY"], FAKE_BEARER_TOKEN)
+        self.assertEqual(child_env["OPENAI_API_KEY"], FAKE_BEARER_TOKEN)
+
+    async def test_base_url_points_at_the_local_proxy(self):
+        result = await run_bridge(self.tmp)
+        self.assertEqual(
+            result.capture["env"]["OPENAI_BASE_URL"],
+            f"http://127.0.0.1:{FAKE_PROXY_PORT}/v1",
         )
 
-    def test_no_os_environ_mutation(self):
-        """run_codex_subtask must NOT mutate os.environ directly."""
-        source = _CODEX_BRIDGE.read_text(encoding="utf-8")
-        func_src = _get_function_source(source, "run_codex_subtask")
+    async def test_codex_home_is_an_ephemeral_config_dir(self):
+        """CODEX_HOME must be a per-run temp config dir, not the real HOME."""
+        result = await run_bridge(self.tmp)
+        child_env = result.capture["env"]
+        codex_home = child_env["CODEX_HOME"]
+        self.assertIn("kim-codex-config-", codex_home)
+        self.assertNotEqual(codex_home, child_env.get("HOME"))
 
-        # These patterns indicate direct os.environ mutation
-        forbidden_patterns = [
-            "os.environ[",        # os.environ["KEY"] = value
-            "os.environ.update",  # os.environ.update({...})
-            "os.putenv",          # os.putenv("KEY", value)
-        ]
-        for pattern in forbidden_patterns:
-            assert pattern not in func_src, (
-                f"run_codex_subtask must not use `{pattern}` — "
-                "env vars should be scoped via the subprocess env= dict, "
-                "not by mutating the global os.environ"
+    async def test_path_and_home_are_forwarded_from_parent(self):
+        """The allowlisted basics come from the parent env, unmodified."""
+        result = await run_bridge(self.tmp)
+        child_env = result.capture["env"]
+        self.assertEqual(child_env["PATH"], result.parent_env.get("PATH", ""))
+        self.assertEqual(child_env["HOME"], result.parent_env.get("HOME", ""))
+
+    async def test_parent_environ_is_not_mutated(self):
+        """The spawn must scope env via the env= dict, not os.environ writes."""
+        result = await run_bridge(self.tmp)
+        for key in ("CODEX_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"):
+            self.assertNotIn(
+                key,
+                result.parent_env,
+                f"{key} was written into the parent os.environ instead of "
+                "being scoped to the subprocess env dict",
             )
 
-    def test_env_dict_spreads_os_environ(self):
-        """The local env dict should inherit from os.environ via spread."""
-        source = _CODEX_BRIDGE.read_text(encoding="utf-8")
-        func_src = _get_function_source(source, "run_codex_subtask")
 
-        assert "**os.environ" in func_src, (
-            "run_codex_subtask should spread os.environ into the local env dict "
-            "so the subprocess inherits the parent environment"
-        )
-
-    def test_env_dict_sets_required_keys(self):
-        """The env dict must include CODEX_HOME, CODEX_API_KEY, etc."""
-        source = _CODEX_BRIDGE.read_text(encoding="utf-8")
-        func_src = _get_function_source(source, "run_codex_subtask")
-
-        required_keys = ["CODEX_HOME", "CODEX_API_KEY", "OPENAI_API_KEY"]
-        for key in required_keys:
-            assert f'"{key}"' in func_src or f"'{key}'" in func_src, (
-                f"env dict must set {key}"
-            )
+if __name__ == "__main__":
+    unittest.main()

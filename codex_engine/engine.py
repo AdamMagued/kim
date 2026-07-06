@@ -2,9 +2,10 @@
 Codex engine — the Codex bridge runtime.
 
 This top-level package is the canonical home for the Codex bridge "engine":
-``_CodexProxy``, ``run_codex_subtask``, and the subprocess/config helpers. It is
-consumed by the orchestrator-side launcher ``orchestrator/codex_bridge_service.py``,
-which imports it as a normal sibling package (``from codex_engine.engine import …``).
+``_CodexProxy`` and the subprocess/config helpers. It is consumed by the
+orchestrator-side launcher ``orchestrator/codex_bridge_service.py``, which owns
+the Codex subprocess spawn (hardened minimal-allowlist env) and imports this
+module as a normal sibling package (``from codex_engine.engine import …``).
 It is not an MCP tool — it is not registered in ``mcp_server/tool_registry.py``.
 
 Spawns an OpenAI Codex CLI subprocess and routes its LLM calls through
@@ -29,20 +30,10 @@ Auto-compaction (claw-style two-pass):
     summarizes older messages via the browser LLM (first pass), then applies
     priority-based line selection to keep the summary under a character budget
     (second pass — adapted from claw's summary_compression.rs).
-
-Usage:
-    from codex_engine.engine import run_codex_subtask
-
-    result = await run_codex_subtask(
-        task="write fibonacci.py and test it",
-        browser_provider=provider,
-        cwd="/path/to/project",
-    )
 """
 
 from __future__ import annotations
 
-import asyncio
 import hmac
 import json
 import logging
@@ -50,9 +41,7 @@ import os
 import re
 import secrets
 import shlex
-import shutil
 import sys
-import tempfile
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -112,170 +101,6 @@ def _is_thread_send_failure(response: object) -> bool:
     if response.get("type") != "text":
         return False
     return bool(_THREAD_SEND_FAILURE_RE.search(str(response.get("content", ""))))
-
-
-# ── Public API ───────────────────────────────────────────────────────────────
-
-
-async def run_codex_subtask(
-    task: str,
-    browser_provider: "BrowserProvider",
-    cwd: Optional[str] = None,
-    codex_binary: Optional[str] = None,
-    model: Optional[str] = None,
-    provider_name: Optional[str] = None,
-) -> dict:
-    """
-    Spawn Codex with a local proxy and relay LLM calls through the browser.
-
-    Args:
-        task:              The coding task to pass to Codex (natural language).
-        browser_provider:  Kim's BrowserProvider instance for LLM calls.
-        cwd:               Working directory for Codex (defaults to current dir).
-        codex_binary:      Override path to the codex binary.
-        model:             Model name to pass to Codex (optional).
-        provider_name:     Provider identifier string (e.g. 'browser:gemini') for
-                           selecting the correct compaction threshold.
-
-    Returns:
-        {"success": bool, "exit_code": int, "message": str}
-    """
-    binary = codex_binary or os.environ.get("CODEX_BIN", "").strip() or CODEX_BINARY
-
-    binary_path = shutil.which(binary) if not os.path.isabs(binary) else binary
-    if not binary_path or not os.path.exists(binary_path):
-        return {
-            "success": False,
-            "exit_code": -1,
-            "message": f"Codex binary not found: {binary}. Install with: npm i -g @openai/codex",
-        }
-
-    # Default cwd to the caller-supplied project dir or a safe temp dir — never
-    # inherit os.getcwd() which may be the app root containing secrets (#1).
-    working_dir = cwd or tempfile.mkdtemp(prefix="kim-codex-work-")
-
-    logger.info(f"Starting Codex subtask: {task[:80]}…")
-    logger.info(f"  binary: {binary_path}")
-    logger.info(f"  cwd: {working_dir}")
-
-    # Reset so system prompt is injected fresh at the start of each Codex session.
-    if hasattr(browser_provider, '_sent_system_prompt'):
-        browser_provider._sent_system_prompt = False
-
-    proxy = _CodexProxy(browser_provider, provider_name=provider_name or "")
-    proxy_port = await proxy.start()
-
-    logger.info(f"  proxy: http://127.0.0.1:{proxy_port}")
-
-    config_dir = Path(tempfile.mkdtemp(prefix="kim-codex-config-"))
-    config_file = config_dir / "config.toml"
-    _write_codex_config(config_file, proxy_port, model)
-
-    process: Optional[asyncio.subprocess.Process] = None  # type: ignore[name-defined]
-    try:
-        # Build the subprocess env: spread os.environ so the process inherits
-        # PATH, HOME and other runtime vars the agent set, then override the
-        # keys that must point at the local proxy (#47).  The CODEX_API_KEY /
-        # OPENAI_API_KEY overrides ensure no external API key leaks out of the
-        # local proxy boundary.
-        env = {
-            **os.environ,
-            "CODEX_HOME": str(config_dir),
-            # Per-run bearer token that the proxy validates (#47).
-            "CODEX_API_KEY": proxy._bearer_token,
-            "OPENAI_API_KEY": proxy._bearer_token,
-            "OPENAI_BASE_URL": f"http://127.0.0.1:{proxy_port}/v1",
-        }
-
-        # --dangerously-bypass-approvals-and-sandbox is only included when the
-        # operator explicitly opts in via KIM_CODEX_BYPASS_SANDBOX=1 (#1).
-        bypass_flag = os.environ.get("KIM_CODEX_BYPASS_SANDBOX", "").strip()
-        cmd = [
-            str(binary_path),
-            "exec", "--json",
-        ]
-        if bypass_flag == "1":
-            cmd.append("--dangerously-bypass-approvals-and-sandbox")
-        cmd += ["-C", working_dir, task]
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            env=env,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        stderr_lines: list[str] = []
-
-        async def _stream_stdout() -> None:
-            assert process and process.stdout
-            async for raw in process.stdout:
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    print(line, flush=True)
-
-        async def _drain_stderr() -> None:
-            assert process and process.stderr
-            await _drain_stderr_to(process.stderr, stderr_lines)
-
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(_stream_stdout(), _drain_stderr()),
-                timeout=600,
-            )
-        except asyncio.TimeoutError:
-            logger.error("Codex subprocess timed out after 600s")
-            try:
-                process.kill()
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except (ProcessLookupError, OSError, asyncio.TimeoutError):
-                # Process already exited or OS-level kill failed — nothing to do.
-                pass
-            return {
-                "success": False,
-                "exit_code": -1,
-                "message": "Codex task timed out after 10 minutes.",
-            }
-
-        exit_code = await process.wait()
-        success = exit_code == 0
-        stderr_text = "\n".join(stderr_lines[-10:])
-
-        result_msg = (
-            "Task completed successfully."
-            if success
-            else f"Codex exited with code {exit_code}: {stderr_text[:300]}"
-        )
-
-    except Exception as e:
-        logger.error(f"Codex bridge error: {e}", exc_info=True)
-        return {
-            "success": False,
-            "exit_code": -1,
-            "message": f"Codex bridge error: {e}",
-        }
-    finally:
-        # Kill the subprocess on every non-normal exit (exception, cancellation,
-        # BrokenPipeError from stdout, etc.).  The timeout path already kills
-        # explicitly; this guard covers all other early-exit paths so Codex
-        # never becomes an orphan process.
-        if process is not None and process.returncode is None:
-            try:
-                process.kill()
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except (ProcessLookupError, OSError, asyncio.TimeoutError):
-                # Process already exited or OS-level kill failed — nothing to do.
-                pass
-        await proxy.stop()
-        shutil.rmtree(str(config_dir), ignore_errors=True)
-
-    logger.info(result_msg[:200])
-    return {
-        "success": success,
-        "exit_code": exit_code,
-        "message": result_msg,
-    }
 
 
 # ── Codex config generation ─────────────────────────────────────────────────
@@ -2069,27 +1894,6 @@ def _make_responses_tool_reply(resp_id: str, text: str, tool_calls: list) -> dic
 
 
 # ── Output parsing & surfacing ───────────────────────────────────────────────
-
-
-async def _drain_stderr_to(
-    stderr_stream: asyncio.StreamReader,
-    stderr_lines: list,
-    max_line_chars: int = 200,
-) -> None:
-    """Read all lines from stderr, accumulate them, and surface each one in real time.
-
-    Lines are printed as ``[STATUS] codex: {line}`` (truncated to *max_line_chars*)
-    so they appear in the user-visible activity feed rather than disappearing into a
-    debug log.  Accumulated lines remain available for the non-zero-exit error message.
-    Empty lines are skipped to avoid cluttering the UI with blank status entries.
-    """
-    async for raw in stderr_stream:
-        line = raw.decode("utf-8", errors="replace").rstrip()
-        if not line:
-            continue
-        stderr_lines.append(line)
-        logger.debug("codex stderr: %s", line)
-        print(f"[STATUS] codex: {line[:max_line_chars]}", flush=True)
 
 
 def _surface_codex_output(stdout_text: str) -> None:
