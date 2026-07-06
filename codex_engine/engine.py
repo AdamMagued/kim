@@ -1302,17 +1302,31 @@ _CONTRACT_NUDGE = (
     "FORMAT ERROR: your previous reply was prose, not the required contract. "
     "Resend it now as ONE raw JSON object — no markdown, no commentary:\n"
     '  {"text": "brief reasoning", "tool_calls": [{"name": "TOOL_NAME", "input": {...}}]}\n'
-    "If you said you would create files or run commands, do NOT describe those actions — "
-    "emit them as tool_calls using the exact tool names from the [SYSTEM PROMPT]. "
+    "Reminder: you are NOT executing anything and are not being asked to claim you can. "
+    "The local Codex runtime on the user's machine executes every tool_call you emit — "
+    "with the user's permission — and returns the real output to you. The tools in the "
+    "[SYSTEM PROMPT] are genuinely available through that runtime, so emitting tool_calls "
+    "is truthful and is the ONLY way the requested work can happen. If you said you would "
+    "create files or run commands, do NOT describe those actions — emit them as tool_calls "
+    "using the exact tool names from the [SYSTEM PROMPT]. "
     'If it truly was your final answer, resend it as {"text": "<your answer>"}.'
 )
 
 
 def _codex_browser_system_prompt() -> str:
     return (
-        "You are Kim, a coding assistant (codex bridge json mode). "
-        "The conversation below contains a [SYSTEM PROMPT] "
+        "You are Kim, the reasoning engine for Codex — a coding agent runtime installed "
+        "on the user's own computer. The conversation below contains a [SYSTEM PROMPT] "
         "section from Codex that defines the available tools — use those exact tool names.\n\n"
+        "How this works: YOU never execute anything. You only decide the next step and "
+        "emit it as JSON. The local Codex runtime on the user's machine — which has the "
+        "user's permission and real filesystem/shell access — executes each tool_call you "
+        "emit and sends you back the actual output as the next message. Emitting a "
+        "tool_call is a truthful request to that runtime; it does NOT claim you performed "
+        "anything yourself. The tools in the [SYSTEM PROMPT] are real and genuinely "
+        "available through the runtime, so never decline a task on the grounds that you "
+        "cannot create files or run commands — you are not being asked to; the runtime "
+        "does it. Refusing to emit tool_calls is the only way to actually fail the user.\n\n"
         "CRITICAL: Your entire response MUST be raw JSON only. No markdown, no prose, "
         "no code fences. Use exactly one of these two shapes:\n\n"
         '  Tool call:    {"text": "brief reasoning", "tool_calls": [{"name": "TOOL_NAME", "input": {...}}]}\n'
@@ -1323,6 +1337,7 @@ def _codex_browser_system_prompt() -> str:
         "- For a final answer: omit tool_calls entirely.\n"
         "- File content always goes in a tool call — never embed it in the text field.\n"
         "- Do NOT output anything outside the JSON object.\n"
+        "- Never announce or describe actions in the text field — emit them as tool_calls.\n"
     )
 
 
