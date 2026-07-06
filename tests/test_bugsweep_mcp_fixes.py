@@ -189,6 +189,46 @@ class C5CompactionCacheBoundTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# C3 — a timed-out `codex --version` child must be reaped, not orphaned
+# ---------------------------------------------------------------------------
+
+class C3VersionTimeoutReapTest(unittest.IsolatedAsyncioTestCase):
+    async def test_hung_version_child_is_killed(self):
+        from orchestrator import codex_appserver_transport as transport
+
+        # A "binary" that ignores --version and sleeps far past the timeout.
+        hang = sys.executable
+        spawned: dict[str, asyncio.subprocess.Process] = {}
+        real_exec = asyncio.create_subprocess_exec
+
+        async def _capture(*args, **kwargs):
+            proc = await real_exec(
+                hang, "-c", "import time; time.sleep(30)", **kwargs
+            )
+            spawned["proc"] = proc
+            return proc
+
+        async def _timeout(coro, *a, **k):
+            # Close the wrapped coroutine (as real wait_for cancellation would)
+            # so it doesn't leak an "never awaited" warning, then time out.
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            raise asyncio.TimeoutError
+
+        with patch.object(transport.asyncio, "wait_for", _timeout), \
+                patch.object(transport.asyncio, "create_subprocess_exec", _capture):
+            ok, msg = await transport.check_binary_version("/fake/codex")
+
+        # On a failed version check we still allow the run (fail-open)...
+        self.assertTrue(ok)
+        self.assertIsNone(msg)
+        # ...but the spawned child must have been reaped, not left running.
+        proc = spawned["proc"]
+        await asyncio.wait_for(proc.wait(), timeout=5)
+        self.assertIsNotNone(proc.returncode)
+
+
+# ---------------------------------------------------------------------------
 # H1 — a dead browser context is reset and reconnected
 # ---------------------------------------------------------------------------
 
