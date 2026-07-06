@@ -39,8 +39,9 @@ logger = logging.getLogger(__name__)
 # call, bypassing the validate_path sandbox (finding 3, partial — cat/cp/mv
 # require a tier-based confirmation system outside this module's scope).
 _DENY_COMMANDS = frozenset({
-    # Destructive filesystem tools
-    "rm", "rmdir", "del", "format", "diskpart", "mkfs", "dd", "shred",
+    # Destructive filesystem tools — includes the cmd.exe aliases `erase`
+    # (== del) and `rd` (== rmdir) so `rd /s /q C:\...` cannot slip past (1.2)
+    "rm", "rmdir", "rd", "del", "erase", "format", "diskpart", "mkfs", "dd", "shred",
     # Truncation (finding 5)
     "truncate",
     # Network / exfiltration tools (finding 3, partial)
@@ -78,7 +79,37 @@ _REDIR_OP_RE = re.compile(r"^\d*>>?$|^&>>?$")
 # form.  Covers \d*>> ?, &>> ?, and < (input redirect).
 _REDIR_PREFIX_RE = re.compile(r"^(\d*>>?|&>>?|<)")
 
-_SANDBOX_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# /usr/local/bin (and /snap/bin on Linux) are included so translated app
+# launches (google-chrome, gedit, snap-installed tools) resolve under the
+# sandbox PATH (1.3).
+_SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if IS_LINUX and os.path.isdir("/snap/bin"):
+    _SANDBOX_PATH += ":/snap/bin"
+
+# Absolute-path redirect targets: POSIX ("/etc/passwd"), Windows drive-absolute
+# ("C:\Windows\...", "C:/Windows/..."), and UNC ("\\server\share") forms (1.2).
+# Matches any drive-letter prefix (not just drive+slash) because POSIX-mode
+# shlex strips backslashes, turning 'C:\Windows\x' into 'C:Windowsx' — the
+# drive prefix is the reliable invariant. Drive-relative targets ("C:file")
+# escape the cwd too, so blocking them is correct, not collateral.
+_WIN_ABS_TARGET_RE = re.compile(r"^[A-Za-z]:")
+
+
+def _is_blocked_redirect_target(target: str) -> bool:
+    """True when a redirect target is an absolute path (POSIX, Windows
+    drive-absolute, or UNC) outside the safe set, or contains traversal."""
+    if ".." in target:
+        return True
+    if target in _SAFE_ABSOLUTE_REDIRECTS:
+        return False
+    # A single leading backslash covers both UNC (\\server\...) and
+    # root-relative (\Windows\...) forms — including after POSIX-mode shlex
+    # collapses doubled backslashes.
+    return (
+        target.startswith("/")
+        or target.startswith("\\")
+        or bool(_WIN_ABS_TARGET_RE.match(target))
+    )
 
 # Env vars that can be used for code injection even in non-sandboxed mode.
 # An operator may disable the sandbox for legitimate reasons, but the child
@@ -251,21 +282,13 @@ def _check_single_segment(cmd: str, powershell: bool = False) -> str | None:
     for i, tok in enumerate(tokens):
         # Space-separated form: standalone operator followed by separate target
         if _REDIR_OP_RE.match(tok) and i + 1 < len(tokens):
-            target = tokens[i + 1]
-            if (
-                target.startswith("/")
-                and target not in _SAFE_ABSOLUTE_REDIRECTS
-            ) or ".." in target:
+            if _is_blocked_redirect_target(tokens[i + 1]):
                 return "BLOCKED: Redirection to absolute path or parent traversal"
         # No-space form: operator prefix merged with target in the same token
         # e.g. '>/etc/passwd', '>>/abs/p', '2>/dev/null', '< /etc/shadow'
         m = _REDIR_PREFIX_RE.match(tok)
         if m and m.end() < len(tok):
-            target = tok[m.end():]
-            if (
-                target.startswith("/")
-                and target not in _SAFE_ABSOLUTE_REDIRECTS
-            ) or ".." in target:
+            if _is_blocked_redirect_target(tok[m.end():]):
                 return "BLOCKED: Redirection to absolute path or parent traversal"
 
     first_cmd = _basename(tokens[0])

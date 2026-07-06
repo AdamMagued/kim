@@ -86,7 +86,10 @@ async def handle_scroll(args: dict) -> str:
     x = int(args.get("x", -1))
     y = int(args.get("y", -1))
     clicks = max(1, min(int(args.get("clicks", 3)), _MAX_SCROLL_CLICKS))
-    direction = str(args.get("direction", "up"))
+    # Normalize case/whitespace: "Up"/"UP " must scroll up, not silently down.
+    direction = str(args.get("direction", "up")).strip().lower()
+    if direction not in ("up", "down"):
+        return f"ERROR: invalid scroll direction {direction!r}; use 'up' or 'down'"
     amount = clicks if direction == "up" else -clicks
     try:
         if x >= 0 and y >= 0:
