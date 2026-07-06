@@ -17,30 +17,31 @@ Real app root is `kim-pro/`. Never modify anything outside `kim-pro/`.
 
 ## Architecture pointer
 See `ARCHITECTURE.md` for the full layer diagram and IPC protocol spec.
-See `PRODUCTION_ROADMAP.md` for the current work backlog and sequencing.
+See `ROADMAP.md` for the current work backlog and sequencing (it points at the
+active plan, `docs/ROADMAP_TO_10.md`).
 
 ## Per-directory guides (load only the one you need)
 | Directory | Guide | What's there |
 |---|---|---|
-| `orchestrator/` | `orchestrator/AGENTS.md` | Agent loop, providers, session store |
-| `mcp_server/` | `mcp_server/AGENTS.md` | 31 OS-control tools, tool registry |
-| `desktop/src/` | `desktop/src/AGENTS.md` | React UI, IPC event consumers |
-| `desktop/src-tauri/` | `desktop/src-tauri/AGENTS.md` | Rust shell, subprocess mgmt |
+| `orchestrator/` | `orchestrator/CLAUDE.md` | Agent loop, providers, session store |
+| `mcp_server/` | `mcp_server/CLAUDE.md` | 50 OS-control tools, tool registry |
+| `desktop/src/` | `desktop/src/CLAUDE.md` | React UI, IPC event consumers |
+| `desktop/src-tauri/` | `desktop/src-tauri/CLAUDE.md` | Rust shell, subprocess mgmt |
 
 ## How-to recipes
 `HOW_TO.md` — exact minimal file sets for common change patterns.
 
 ## Finding things fast
 1. Know which file → open it directly.
-2. Don't know → grep/find with a targeted pattern; `repomap.md` if it exists.
+2. Don't know → grep/find with a targeted pattern.
 3. Never do a broad full-repo sweep as a first move.
 
 ## Test commands (all four suites — cli/ is a separate crate, easy to forget)
 ```
-python -m pytest tests/            # 927+ Python tests (venv required)
-cd desktop && npx tsc --noEmit && npm run test  # 73 Vitest tests
-cd desktop/src-tauri && cargo test # 54 Rust tests (desktop)
-cd cli && cargo test               # 90 Rust tests (kim CLI)
+python -m pytest tests/            # Python tests (venv required)
+cd desktop && npx tsc --noEmit && npm run test  # Vitest tests
+cd desktop/src-tauri && cargo test # Rust tests (desktop)
+cd cli && cargo test               # Rust tests (kim CLI)
 ```
 After every push, confirm the remote CI run is green: `gh run list --limit 1`.
 

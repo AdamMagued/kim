@@ -458,7 +458,7 @@ export function useChatStream({
     // Typed run lifecycle events — capture-only in current slice.
     // terminationReasonRef gives the kim-agent-done handler richer context;
     // exposing it to the UI (e.g. a termination-specific banner) is the
-    // remaining Tier 2b gap documented in HARNESS_ROADMAP.md.
+    // remaining Tier 2b gap documented in docs/archive/HARNESS_ROADMAP.md.
     listen<KimRunDonePayload>(KimEventNames.RUN_DONE, e => {
       terminationReasonRef.current = e.payload.termination;
     }).then(fn => { if (!cancelled) unlistenTypedRunDone = fn; else fn(); });

@@ -142,10 +142,10 @@ No telemetry, no accounts, no cloud storage.
 <!-- TODO(human): Choose a license before making this repo public.
      Options: MIT (permissive open source), Apache-2.0 (permissive + patent grant),
      source-available (e.g. Business Source License), or proprietary.
-     See PRODUCTION_ROADMAP.md § P0-4 for tradeoffs.
+     See docs/archive/PRODUCTION_ROADMAP.md § P0-4 for tradeoffs.
      A LICENSE file must be added once the decision is made. -->
 
-License TBD — see [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) § P0-4.
+License TBD — see [docs/archive/PRODUCTION_ROADMAP.md](docs/archive/PRODUCTION_ROADMAP.md) § P0-4.
 
 ---
 

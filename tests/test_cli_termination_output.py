@@ -14,7 +14,7 @@ Background:
 
     The full typed-payload path — extending KimEvent::Done in Rust to carry
     termination + updating the frontend kim:done listener — requires Phase 6 and
-    is tracked in HARNESS_ROADMAP.md Tier 2b.
+    is tracked in docs/archive/HARNESS_ROADMAP.md Tier 2b.
 
 Test strategy:
     orchestrator/agent.py imports `from mcp import ClientSession` which is not

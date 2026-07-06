@@ -6,7 +6,7 @@ All notable changes to this project are documented here. Format follows
 
 ## [0.10.0] / kim-cli [0.3.0] — 2026-06-19
 
-Production-readiness sweep from `DEEP_DIVE_AUDIT.md` (mission prompts 1–13).
+Production-readiness sweep from `docs/archive/DEEP_DIVE_AUDIT.md` (mission prompts 1–13).
 
 ### Added
 - **Agentic `kim chat`** (P7): chat runs the REAL Kim agent tool loop in the

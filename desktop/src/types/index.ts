@@ -103,7 +103,7 @@ export interface KimAccount {
    * @security Known limitation: this token is stored in plaintext in the local
    * account JSON file. Migrating it to the OS keychain requires new Rust
    * `keychain_store` / `keychain_load` commands (outside the React layer).
-   * Do not log or transmit this value. See PRODUCTION_ROADMAP.md for the
+   * Do not log or transmit this value. See docs/archive/PRODUCTION_ROADMAP.md for the
    * keychain migration task.
    */
   github_token?: string;
