@@ -267,6 +267,41 @@ class TestArgvRuleTable:
         d = enforce("run_powershell", {"script": "Get-ChildItem"})
         assert d.action == "approve"
 
+    def test_run_powershell_escalates_even_without_threshold(self):
+        """The PS escalation is unconditional — no threshold config needed."""
+        d = enforce("run_powershell", {"script": "Get-ChildItem"})
+        assert d.action == "approve"
+        assert d.reason == "powershell_script_unanalyzed"
+
+    def test_run_powershell_secret_path_is_denied_not_approved(self):
+        """A PS script referencing a secret-sandbox path must hard-deny
+        (parity with run_command's _scan_path_tokens arm) — a human should
+        never even see an approval card for it."""
+        d = enforce("run_powershell", {"script": "Get-Content ~/.ssh/id_rsa"})
+        assert d.action == "deny"
+        assert d.reason == "sensitive_path_argument"
+
+    def test_run_powershell_env_file_is_denied(self):
+        d = enforce("run_powershell", {"script": "Get-Content ~/.env"})
+        assert d.action == "deny"
+        assert d.reason == "sensitive_path_argument"
+
+    def test_run_powershell_glued_separator_path_is_denied(self):
+        """PS separators glued to the path token still get scanned."""
+        d = enforce(
+            "run_powershell",
+            {"script": "echo hi; type ~/.aws/credentials|Out-Null"},
+        )
+        assert d.action == "deny"
+        assert d.reason == "sensitive_path_argument"
+
+    def test_run_powershell_malformed_quoting_still_escalates(self):
+        """Unparseable scripts fall back to whitespace split; the
+        unconditional human-approval escalation still applies."""
+        d = enforce("run_powershell", {"script": 'Write-Host "unterminated'})
+        assert d.action == "approve"
+        assert d.reason == "powershell_script_unanalyzed"
+
     def test_policy_never_raises_it_denies(self):
         """Fail-closed: garbage input yields deny, not an exception."""
         d = enforce("run_command", {"cmd": 'cat "unterminated'})

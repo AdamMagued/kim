@@ -13,7 +13,12 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-_WEB_PY = Path(__file__).resolve().parent.parent / "mcp_server" / "tools" / "web.py"
+# The web tool was decomposed into a package; the CDP connect logic lives in
+# the browser-session submodule now.
+_WEB_PY = (
+    Path(__file__).resolve().parent.parent
+    / "mcp_server" / "tools" / "web" / "browser.py"
+)
 
 
 def test_connect_over_cdp_passes_explicit_timeout():
