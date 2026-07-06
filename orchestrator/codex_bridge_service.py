@@ -254,9 +254,16 @@ async def _run_compact_task(args: argparse.Namespace, config: dict) -> int:
     """Handle a /compact control task: compact the thread, arm a fresh chat, exit."""
     _status("Compacting the code-mode browser thread…")
     provider = create_provider(args.provider, config)
-    ok, _handoff = await _compact_browser_thread(provider, args.cwd, args.provider)
+    ok, handoff = await _compact_browser_thread(provider, args.cwd, args.provider)
     if ok:
         _status("Context compacted — the next code task starts a fresh chat seeded with the handoff.")
+        # Temporary verification aid: with KIM_DEBUG_COMPACT=1 set, print the
+        # model-written handoff so you can confirm it actually summarized the
+        # conversation (not just reported success).
+        if os.environ.get("KIM_DEBUG_COMPACT") == "1" and handoff:
+            print("───── COMPACTED HANDOFF (KIM_DEBUG_COMPACT) ─────", flush=True)
+            print(handoff, flush=True)
+            print(f"───── END HANDOFF ({len(handoff)} chars) ─────", flush=True)
         print(
             "TASK_COMPLETE: Context compacted. The next code task will continue "
             "from the handoff in a fresh browser chat.",
@@ -448,19 +455,33 @@ async def _run_async(args: argparse.Namespace) -> int:
                             # Surface codex subprocess errors to the Kim activity feed.
                             _status(f"codex error: {line}")
 
+                # Whole-run budget. Browser relays are slow (a single one may
+                # legitimately take minutes of typing + generation), and one
+                # Codex task spans many relays — a budget at or below the
+                # per-relay browser waits (600s each in site_configs) kills
+                # healthy long tasks. Default 1800s; config codex_bridge.task_timeout_s.
+                try:
+                    task_timeout = int(
+                        (config.get("codex_bridge") or {}).get("task_timeout_s", 1800)
+                    )
+                except (TypeError, ValueError):
+                    task_timeout = 1800
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(_stream_stdout(), _drain_stderr()),
-                        timeout=600,
+                        timeout=task_timeout,
                     )
                 except asyncio.TimeoutError:
-                    logger.error("Codex subprocess timed out after 600s")
+                    logger.error("Codex subprocess timed out after %ds", task_timeout)
                     try:
                         process.kill()
                         await asyncio.wait_for(process.wait(), timeout=5)
                     except Exception:
                         pass
-                    print("[FAILED] Codex task timed out after 10 minutes.", flush=True)
+                    print(
+                        f"[FAILED] Codex task timed out after {task_timeout // 60} minutes.",
+                        flush=True,
+                    )
                     return 1
 
                 exit_code = await process.wait()

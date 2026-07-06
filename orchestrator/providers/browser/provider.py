@@ -61,6 +61,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -98,6 +99,17 @@ logger = logging.getLogger(__name__)
 # Re-export for backward compatibility (tests access these via the provider instance)
 _MOD_KEY = MOD_KEY
 _to_list = to_list
+
+
+def _normalize_for_marker(text: str) -> str:
+    """Collapse whitespace and markdown styling characters for marker matching.
+
+    Chat UIs sometimes style the completion sentinel (wrap it in backticks,
+    italicize the underscores, split it across a line break), which makes a raw
+    substring check miss it and costs a long idle wait. Comparing normalized
+    text against the normalized marker survives that styling.
+    """
+    return re.sub(r"[\s`*_]+", "", text or "")
 
 
 class BrowserProvider(BaseProvider):
@@ -685,6 +697,30 @@ class BrowserProvider(BaseProvider):
                     matches.append((page, site_key))
                     break
 
+        if self._preferred_site:
+            # The user explicitly selected this site (e.g. browser:chatgpt) —
+            # it is authoritative, not a tie-breaker. Never fall back to a
+            # different site's tab (a focused Gemini tab must not hijack a
+            # chatgpt run). If no tab of the preferred site is open, open one —
+            # unless we are mid-task on that same site (lost tab), where the
+            # NEED_HELP path below must win so the LLM context isn't dropped.
+            preferred_matches = [
+                (p, sk) for p, sk in matches if sk == self._preferred_site
+            ]
+            if not preferred_matches:
+                if self._last_chat_site == self._preferred_site:
+                    return None, None
+                page = await self._open_preferred_site_tab(browser)
+                if page is None:
+                    return None, None
+                self._last_chat_page_url = page.url
+                self._last_chat_site = self._preferred_site
+                logger.info(
+                    f"Opened new {self._preferred_site} tab: {page.url}"
+                )
+                return page, self._preferred_site
+            matches = preferred_matches
+
         if not matches:
             return None, None
 
@@ -740,6 +776,29 @@ class BrowserProvider(BaseProvider):
         self._last_chat_site = site_key
         logger.info(f"Found {site_key} tab: {page.url}")
         return page, site_key
+
+    async def _open_preferred_site_tab(self, browser) -> Optional[Page]:
+        """Open a new tab on the user's preferred site (fresh task only).
+
+        Used when the user explicitly selected a site (browser:chatgpt) but no
+        tab of that site is open — switching providers must open the requested
+        site, not silently reuse whatever chat tab happens to exist.
+        """
+        url = self._site_launch_url()
+        if not url:
+            return None
+        try:
+            contexts = getattr(browser, "contexts", None)
+            target = contexts[0] if contexts else browser
+            page = await target.new_page()
+            await page.goto(url, wait_until="domcontentloaded")
+            await asyncio.sleep(2.0)
+            return page
+        except Exception as e:
+            logger.warning(
+                f"Could not open a new {self._preferred_site} tab: {e}"
+            )
+            return None
 
     @staticmethod
     def _extract_conversation_id(url: str) -> str:
@@ -1107,7 +1166,7 @@ class BrowserProvider(BaseProvider):
 
         logger.info(f"[STATUS] {site} is responding…")
 
-        await self._wait_for_generation_complete(
+        definitive = await self._wait_for_generation_complete(
             page,
             cfg["stop_selectors"],
             cfg["response_selectors"],
@@ -1116,7 +1175,10 @@ class BrowserProvider(BaseProvider):
             min_index=new_element_index
         )
 
-        await asyncio.sleep(1.5)
+        # The sentinel is only emitted after the full response has rendered, so
+        # a definitive completion needs no extra settle time. The long pause is
+        # only for the heuristic exit, where late chunks may still be painting.
+        await asyncio.sleep(0.2 if definitive else 1.5)
 
         logger.info(f"[STATUS] Reading {site}'s response…")
         return await self._scrape_last_response(page, cfg["response_selectors"], min_index=new_element_index)
@@ -1141,6 +1203,19 @@ class BrowserProvider(BaseProvider):
     async def _wait_for_new_response(
         self, page: Page, response_sel: str, initial_count: int
     ) -> bool:
+        # Snapshot the last pre-send response element: some sites (and reused
+        # threads) stream the new answer INTO an existing element instead of
+        # appending one, so a count-only check would wait out the full timeout
+        # while the reply renders on screen.
+        initial_last_text = ""
+        if initial_count > 0:
+            try:
+                initial_last_text = await (
+                    page.locator(response_sel).nth(initial_count - 1).inner_text()
+                )
+            except Exception:
+                pass
+
         deadline = asyncio.get_running_loop().time() + RESPONSE_WAIT_S
         while asyncio.get_running_loop().time() < deadline:
             count = await page.locator(response_sel).count()
@@ -1149,19 +1224,40 @@ class BrowserProvider(BaseProvider):
                     f"Response element count: {initial_count} -> {count}"
                 )
                 return True
+            if initial_count > 0:
+                try:
+                    current_last = await (
+                        page.locator(response_sel).nth(initial_count - 1).inner_text()
+                    )
+                    if current_last != initial_last_text:
+                        logger.debug(
+                            "Response streaming into existing element "
+                            f"(count still {count})"
+                        )
+                        return True
+                except Exception:
+                    pass
             await asyncio.sleep(0.5)
         return False
 
     async def _wait_for_generation_complete(
         self, page: Page, stop_selectors: list[str], response_selectors: list[str],
-        completion_hash: Optional[str], site: str = "AI", min_index: int = 0
-    ) -> None:
+        completion_hash: Optional[str], site: str = "AI", min_index: int = 0,
+        min_generation_s: float = 5.0,
+    ) -> bool:
+        """Wait until the site finishes generating.
+
+        Returns True when the completion sentinel was found (definitive — the
+        response is fully rendered), False when we fell back to the idle/stop
+        heuristics or timed out (caller should allow extra settle time).
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + GENERATION_WAIT_S
         last_status = loop.time()
-        min_generation_time = loop.time() + 5.0
+        min_generation_time = loop.time() + min_generation_s
         elapsed = 0
 
+        norm_hash = _normalize_for_marker(completion_hash) if completion_hash else ""
         last_text_len = 0
         idle_count = 0
 
@@ -1172,13 +1268,21 @@ class BrowserProvider(BaseProvider):
                 logger.debug(
                     f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}"
                 )
-                if completion_hash and completion_hash in current_text:
+                if norm_hash and norm_hash in _normalize_for_marker(current_text):
                     logger.debug("Generation complete (completion hash found)")
-                    return
+                    return True
             except Exception as e:
                 logger.debug(f"[DEBUG] _scrape_last_response failed: {e}")
 
             if len(current_text) > last_text_len:
+                idle_count = 0
+                last_text_len = len(current_text)
+            elif 0 < len(current_text) < last_text_len:
+                # Text SHRANK (e.g. Gemini collapsing its "thinking" panel into
+                # a shorter final answer). That's still activity — resync the
+                # baseline. Without this the idle counter freezes at a length
+                # the text can never reach again and the loop only exits via
+                # the full timeout while the answer sits on screen.
                 idle_count = 0
                 last_text_len = len(current_text)
             elif len(current_text) > 0 and len(current_text) == last_text_len:
@@ -1210,7 +1314,7 @@ class BrowserProvider(BaseProvider):
                 # exact bug where a reply was cut off mid-sentence). So stay patient
                 # while the hash is pending and only fall back to the text-settled
                 # heuristic after a much longer idle.
-                hash_pending = bool(completion_hash) and completion_hash not in current_text
+                hash_pending = bool(norm_hash) and norm_hash not in _normalize_for_marker(current_text)
                 idle_needed = 20 if hash_pending else 8  # ~15s vs ~6s of stable text
                 if idle_count > idle_needed and loop.time() > min_generation_time:
                     if hash_pending:
@@ -1221,7 +1325,7 @@ class BrowserProvider(BaseProvider):
                         )
                     else:
                         logger.debug("Generation complete (stop button hidden & text settled)")
-                    return
+                    return False
             now = loop.time()
             if now - last_status >= 3:
                 elapsed = int(now - (deadline - GENERATION_WAIT_S))
@@ -1235,6 +1339,7 @@ class BrowserProvider(BaseProvider):
             f"Generation did not complete after {GENERATION_WAIT_S}s "
             "— scraping anyway"
         )
+        return False
 
     async def _scrape_last_response(
         self, page: Page, response_selectors: list[str], min_index: int = 0

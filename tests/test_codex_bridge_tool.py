@@ -18,6 +18,7 @@ Three contracts guarded here:
 from __future__ import annotations
 
 import ast
+import importlib
 import os
 import sys
 import tempfile
@@ -189,11 +190,20 @@ class _FakeBrowserProvider:
 
 
 def _stub_heavy_imports():
-    """Stub out modules that are not installed in the test environment."""
+    """Stub out modules that are not installed in the test environment.
+
+    Only stub when the real package is genuinely missing — installing an empty
+    module unconditionally poisons ``sys.modules`` for every later test in the
+    same run (``from aiohttp import web`` then fails with ImportError even
+    though aiohttp is installed).
+    """
     for name in ("aiohttp",):
-        if name not in sys.modules:
-            stub = types.ModuleType(name)
-            sys.modules[name] = stub
+        if name in sys.modules:
+            continue
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            sys.modules[name] = types.ModuleType(name)
 
 
 class TestCmdBuilderRuntime(unittest.IsolatedAsyncioTestCase):

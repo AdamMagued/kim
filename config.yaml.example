@@ -20,6 +20,11 @@ browser_provider:
   compact_at_ratio: 0.8
   max_thread_turns: 40
 custom_sites: {}
+codex_bridge:
+  # Whole-run budget for one Codex code-mode task (seconds). Browser relays
+  # are slow — a single one can take minutes — so keep this comfortably above
+  # the per-relay browser waits (600s).
+  task_timeout_s: 1800
 logging:
   level: INFO
 max_iterations: 25

@@ -646,6 +646,10 @@ class _CodexProxy:
             # This breaks the Continue. loop that occurs when Codex keeps asking for more
             # after a plain-text (non-tool-call) answer.
             if delta_items and _is_continue_only_delta(delta_items) and self._last_proxy_response is not None:
+                # Consume the keepalive items: without advancing the cursor the
+                # stale "Continue." messages would be re-included in every later
+                # delta and forwarded to the browser as duplicate [USER] noise.
+                self._last_sent_count = len(input_items)
                 logger.info(f"[relay #{relay_num}] Continue.-only delta — returning cached response")
                 return _sse_or_json(stream, self._last_proxy_response)
 
@@ -666,6 +670,16 @@ class _CodexProxy:
         handoff = None
         if is_first_relay and clear_chat:
             handoff = str(self._thread_state.get("handoff") or "").strip() or None
+            if handoff and os.environ.get("KIM_DEBUG_COMPACT") == "1":
+                # Temporary verification aid: confirm the compact handoff is
+                # injected into the fresh chat (KIM_DEBUG_COMPACT=1).
+                print(
+                    json.dumps({
+                        "type": "status",
+                        "message": f"[compact] seeding fresh chat with a {len(handoff)}-char handoff",
+                    }),
+                    flush=True,
+                )
 
         try:
             extra_kwargs = {"handoff": handoff} if handoff else {}
@@ -960,8 +974,13 @@ def _is_continue_only_delta(items: list) -> bool:
                     if isinstance(block, dict) and block.get("type") in ("input_text", "text"):
                         text += block.get("text", "")
                 text = text.strip()
-            # Allow "Continue." possibly followed by the append-marker instruction
-            if not text.startswith("Continue"):
+            # Allow "Continue." possibly followed by the append-marker
+            # instruction. Match the exact Codex keepalive prefix (with the
+            # period) — a real user message like "Continue working on X" must
+            # NOT be swallowed by the cached-response short-circuit. Today user
+            # text only appears mid-turn as Codex keepalives, but mid-turn user
+            # injection (turn/steer) will change that.
+            if not text.startswith("Continue."):
                 return False
     return has_user
 
@@ -1008,7 +1027,9 @@ def _extract_delta_prompt(items: list) -> str:
             output = item.get("output", "")
             if isinstance(output, list):
                 output = " ".join(str(o) for o in output)
-            parts.append(f"[TOOL RESULT]\n{str(output)[:2000]}")
+            # Generous cap: at 2000 chars real tool results (file reads, test
+            # output) were silently cut and the model acted on incomplete data.
+            parts.append(f"[TOOL RESULT]\n{str(output)[:6000]}")
         elif role == "user":
             if isinstance(content, list):
                 for block in content:

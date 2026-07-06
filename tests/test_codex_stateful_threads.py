@@ -315,6 +315,91 @@ class TestIsGitRepo(unittest.TestCase):
             self.assertFalse(svc._is_git_repo(str(Path(d) / "child")))
 
 
+class TestContinueOnlyDelta(unittest.TestCase):
+    """The keepalive matcher must not swallow real user instructions."""
+
+    @staticmethod
+    def _user(text):
+        return {"role": "user", "content": text}
+
+    def test_exact_keepalive_matches(self):
+        from codex_engine.engine import _is_continue_only_delta
+
+        self.assertTrue(_is_continue_only_delta([self._user("Continue.")]))
+
+    def test_keepalive_with_marker_instruction_matches(self):
+        from codex_engine.engine import _is_continue_only_delta
+
+        self.assertTrue(
+            _is_continue_only_delta(
+                [self._user("Continue. End your reply with [END_OF_RESPONSE_x].")]
+            )
+        )
+
+    def test_real_user_message_starting_with_continue_does_not_match(self):
+        from codex_engine.engine import _is_continue_only_delta
+
+        self.assertFalse(
+            _is_continue_only_delta([self._user("Continue working on the game")])
+        )
+
+    def test_tool_result_never_matches(self):
+        from codex_engine.engine import _is_continue_only_delta
+
+        self.assertFalse(
+            _is_continue_only_delta(
+                [{"type": "function_call_output", "output": "ok"},
+                 self._user("Continue.")]
+            )
+        )
+
+
+class TestContinueCachedAccounting(unittest.IsolatedAsyncioTestCase):
+    """The cached Continue.-only return must consume the keepalive items —
+    otherwise they are re-sent to the browser in every later delta."""
+
+    @staticmethod
+    def _request(proxy, body):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        return SimpleNamespace(
+            headers={"Authorization": f"Bearer {proxy._bearer_token}"},
+            json=AsyncMock(return_value=body),
+        )
+
+    @staticmethod
+    def _body(last_user_text):
+        return {
+            "stream": False,
+            "input": [
+                {"role": "user", "content": "do the thing"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": last_user_text},
+            ],
+        }
+
+    async def test_cached_return_advances_sent_cursor(self):
+        proxy, provider = _proxy()
+        proxy._last_sent_count = 2
+        proxy._last_proxy_response = {"id": "cached"}
+        await proxy._handle_responses(
+            self._request(proxy, self._body("Continue."))
+        )
+        self.assertEqual(proxy._last_sent_count, 3)
+        self.assertEqual(provider.calls, [])  # cache hit — no browser send
+
+    async def test_real_followup_is_not_swallowed_by_cache(self):
+        proxy, provider = _proxy()
+        proxy._last_sent_count = 2
+        proxy._last_proxy_response = {"id": "cached"}
+        await proxy._handle_responses(
+            self._request(proxy, self._body("Continue working on the game"))
+        )
+        self.assertEqual(len(provider.calls), 1)  # reached the browser
+        self.assertEqual(proxy._last_sent_count, 3)
+
+
 class TestCompactControlTasks(unittest.TestCase):
     def test_compact_control_tasks_recognized(self):
         from orchestrator import codex_bridge_service as svc
