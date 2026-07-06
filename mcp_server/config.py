@@ -178,7 +178,7 @@ BROWSER_HEADLESS: bool = _as_bool(
 # (`use_real_browser: false`); see tests/test_config_parity.py.
 DEFAULT_USE_REAL_BROWSER: bool = False
 USE_REAL_BROWSER: bool = _as_bool(
-    _cfg.get("use_real_browser"), DEFAULT_USE_REAL_BROWSER
+    _cfg.get("use_real_browser", DEFAULT_USE_REAL_BROWSER), DEFAULT_USE_REAL_BROWSER
 )
 VOICE_ENABLED: bool = _as_bool(_cfg.get("voice_enabled"), False)
 
