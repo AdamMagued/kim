@@ -1262,6 +1262,22 @@ class TestRelayReasoningPreview(unittest.TestCase):
         out = self._capture({"content": '  {"text": "raw contract reply"}'})
         self.assertEqual(out, "")
 
+    def test_only_prose_before_code_fence_is_previewed(self):
+        # A reply that is prose + a command must preview only the prose — never
+        # dump raw "```bash printf '%s' '<!doctype…" into the status line.
+        content = (
+            "I'll drop a game in your folder and open it.\n\n"
+            "```bash\nprintf '%s' '<!doctype html>...' > index.html\n```"
+        )
+        out = self._capture({"content": content})
+        self.assertIn("drop a game", out)
+        self.assertNotIn("printf", out)
+        self.assertNotIn("```", out)
+
+    def test_pure_code_block_reply_previews_nothing(self):
+        out = self._capture({"content": "```bash\nopen index.html\n```"})
+        self.assertEqual(out, "")
+
 
 if __name__ == "__main__":
     unittest.main()

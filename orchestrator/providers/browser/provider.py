@@ -1428,7 +1428,11 @@ class BrowserProvider(BaseProvider):
               if (/^[a-z0-9+#.-]{1,15}$/.test(first)) lang = first;
             }
           }
-          const codeText = (code ? code.textContent : child.innerText) || '';
+          // innerText preserves rendered line breaks; textContent concatenates
+          // ChatGPT's per-line highlight <span>/<div>s with NO newline between
+          // them, flattening multi-line code to a single line (breaks any file
+          // whose newlines matter — Python, YAML, Makefiles).
+          const codeText = (code ? (code.innerText || code.textContent) : child.innerText) || '';
           parts.push('```' + lang + '\n' + codeText.replace(/\n+$/, '') + '\n```');
         } else {
           parts.push(child.innerText || '');

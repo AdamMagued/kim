@@ -1919,10 +1919,15 @@ def _surface_relay_reasoning(response: dict, relay_num: int) -> None:
     content = response.get("content", "")
     if not isinstance(content, str) or not content.strip():
         return
+    # Only preview the prose BEFORE the first code fence — dumping 150 chars of
+    # a raw command/code block ("```bash printf '%s' '<!doctype…") is noise, and
+    # the salvage layer already runs the command. If the reply is only a code
+    # block, there's nothing to preview.
+    prose = content.split("```", 1)[0]
     display = re.sub(
         r"\b(Gemini|Claude|ChatGPT|Grok|DeepSeek)\b",
         "Kim",
-        content[:150],
+        prose[:150],
         flags=re.IGNORECASE,
     )
     # Collapse to ONE line: the consumer parses stdout line-by-line, so a
