@@ -317,14 +317,26 @@ def test_filtered_env_strips_node_path(monkeypatch):
 
 
 def test_filtered_env_keeps_benign_vars(monkeypatch):
-    """_filtered_env() must retain benign environment variables like HOME and PATH."""
+    """_filtered_env() retains the allowlisted basics like HOME and PATH."""
     monkeypatch.setenv("HOME", "/home/testuser")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
-    monkeypatch.setenv("MY_APP_VAR", "somevalue")
     env = _filtered_env()
     assert "HOME" in env, "HOME should be preserved by _filtered_env()"
     assert "PATH" in env, "PATH should be preserved by _filtered_env()"
-    assert "MY_APP_VAR" in env, "Custom benign var should be preserved by _filtered_env()"
+
+
+def test_filtered_env_is_a_positive_allowlist(monkeypatch):
+    """S4: _filtered_env() is an allowlist now — arbitrary parent vars
+    (provider API keys, tokens, app config) must NOT reach shell children."""
+    monkeypatch.setenv("MY_APP_VAR", "somevalue")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    env = _filtered_env()
+    assert "MY_APP_VAR" not in env, "non-allowlisted parent vars must be dropped"
+    assert "OPENAI_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
 
 
 def test_filtered_env_strips_all_injection_vars(monkeypatch):

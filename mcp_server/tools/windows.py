@@ -18,7 +18,14 @@ import re
 import urllib.parse
 import webbrowser
 
-from mcp_server.os_utils import CURRENT_OS, IS_WINDOWS, IS_MACOS, IS_LINUX, check_tool_available
+from mcp_server.os_utils import (
+    CURRENT_OS,
+    IS_WINDOWS,
+    IS_MACOS,
+    IS_LINUX,
+    check_tool_available,
+    minimal_subprocess_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +99,7 @@ async def _run_osascript(script: str) -> tuple[int, str, str]:
         "osascript", "-e", script,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=minimal_subprocess_env(),  # S4: no parent-env inherit
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
@@ -202,6 +210,7 @@ async def _run_cmd(cmd: list[str]) -> tuple[int, str, str]:
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=minimal_subprocess_env(),  # S4: no parent-env inherit
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)

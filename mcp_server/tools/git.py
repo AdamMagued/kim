@@ -21,6 +21,7 @@ import logging
 from pathlib import Path
 
 from mcp_server.config import PROJECT_ROOT, SHELL_TIMEOUT, validate_path
+from mcp_server.os_utils import minimal_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,9 @@ async def _run_git(*args: str, cwd: str | None = None, timeout: int | None = Non
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=resolved_cwd,
+            # S4: never inherit the full parent env (API keys/tokens); git
+            # needs HOME (for ~/.gitconfig) + PATH, both in the allowlist.
+            env=minimal_subprocess_env(),
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=resolved_timeout

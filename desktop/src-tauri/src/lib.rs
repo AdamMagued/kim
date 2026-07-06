@@ -1182,10 +1182,11 @@ pub(crate) async fn configure_codex_direct_provider(
     }
 }
 
+pub(crate) mod hitl;
+pub(crate) use hitl::hitl_respond_approval;
 pub(crate) mod subprocess;
 pub(crate) use subprocess::{
-    cancel_task, find_python_interpreter, hitl_respond_approval, process_exists, send_signal,
-    send_task, steer_task,
+    cancel_task, find_python_interpreter, process_exists, send_signal, send_task, steer_task,
 };
 
 // ---------------------------------------------------------------------------

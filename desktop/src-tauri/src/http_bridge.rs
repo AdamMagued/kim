@@ -1563,25 +1563,13 @@ fn handle_webview_bridge_request(
                 );
                 return;
             }
-            #[derive(Deserialize)]
-            struct ApproveRequest {
-                approved: bool,
-            }
-            let parsed: ApproveRequest = match serde_json::from_str(&body) {
-                Ok(v) => v,
+            let payload = match crate::hitl::approve_line_from_body(&body) {
+                Ok(p) => p,
                 Err(e) => {
-                    respond_json(
-                        request,
-                        400,
-                        serde_json::json!({"ok": false, "error": format!("Invalid JSON: {}", e)}),
-                    );
+                    respond_json(request, 400, serde_json::json!({"ok": false, "error": e}));
                     return;
                 }
             };
-            let payload = format!(
-                "{}\n",
-                serde_json::json!({"type": "hitl_approve", "approved": parsed.approved})
-            );
             let result = tauri::async_runtime::block_on(async {
                 let mut rt = crate::task_runtime::task_runtime().lock().await;
                 rt.write_stdin_line(&payload).await

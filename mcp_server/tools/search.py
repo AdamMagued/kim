@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 
 from mcp_server.config import PROJECT_ROOT, SHELL_TIMEOUT, validate_path
-from mcp_server.os_utils import check_tool_available, IS_WINDOWS
+from mcp_server.os_utils import check_tool_available, minimal_subprocess_env, IS_WINDOWS
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ async def _run_search_cmd(cmd: list[str], cwd: str, timeout: int) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
+            env=minimal_subprocess_env(),  # S4: no parent-env inherit
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout

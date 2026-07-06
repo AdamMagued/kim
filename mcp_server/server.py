@@ -20,25 +20,15 @@ Usage (Claude Code CLI):
 """
 
 import asyncio
+import builtins
 import logging
 import sys
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Protect MCP stdio pipe from print() corruption
-# ──────────────────────────────────────────────────────────────────────────────
-import builtins
-_orig_print = builtins.print
-def _safe_print(*args, **kwargs):
-    if "file" not in kwargs or kwargs["file"] is None:
-        kwargs["file"] = sys.stderr
-    _orig_print(*args, **kwargs)
-builtins.print = _safe_print
-# ──────────────────────────────────────────────────────────────────────────────
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from mcp_server import approvals, policy
 from mcp_server.config import LOG_LEVEL, ENABLED_CONNECTOR_IDS
 from mcp_server.sites import enabled_connectors, load_builtin_connectors
 from mcp_server.tool_registry import DISPATCH, TOOLS, TIER_DISPATCH
@@ -123,8 +113,39 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     handler = _DISPATCH.get(name)
     if handler is None:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+    # ── K1 chokepoint: EVERY tool call is policy-gated before dispatch. ──
+    # policy.enforce never raises (it denies on internal errors), so nothing
+    # can slip past on an exception path.
+    args = arguments or {}
+    decision = policy.enforce(name, args)
+    if decision.action == "deny":
+        logger.warning("POLICY_DENIED %s: %s", name, decision.message)
+        return [TextContent(type="text", text=decision.message)]
+    if decision.action == "approve" and not approvals.is_session_approved(
+        decision.signature
+    ):
+        outcome = await approvals.request_approval(
+            tool=name,
+            args=args,
+            risk=decision.risk,
+            reason=decision.reason,
+            preview=decision.preview,
+        )
+        if outcome == "acceptForSession":
+            approvals.remember_session_approval(decision.signature)
+        elif outcome != "accept":
+            logger.warning("HITL_DENIED %s (%s)", name, decision.reason)
+            return [TextContent(
+                type="text",
+                text=(
+                    f"HITL_DENIED: User denied '{name}' ({decision.reason}). "
+                    "Choose a different approach or ask the user for permission."
+                ),
+            )]
+
     try:
-        result = await handler(arguments or {})  # type: ignore[operator]
+        result = await handler(args)  # type: ignore[operator]
         return [TextContent(type="text", text=str(result))]
     except PermissionError as e:
         logger.warning(f"PERMISSION_ERROR in {name}: {e}")
@@ -138,7 +159,24 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _protect_stdio_pipe() -> None:
+    """Redirect stray print() to stderr so tool handlers can't corrupt the
+    MCP stdout protocol pipe. Applied only when the server actually runs
+    (main / __main__), NOT at import — importing this module in-process
+    (tests, tooling) must not globally rebind builtins.print.
+    """
+    _orig_print = builtins.print
+
+    def _safe_print(*args, **kwargs):
+        if "file" not in kwargs or kwargs["file"] is None:
+            kwargs["file"] = sys.stderr
+        _orig_print(*args, **kwargs)
+
+    builtins.print = _safe_print
+
+
 async def main() -> None:
+    _protect_stdio_pipe()
     logger.info("Kim MCP server starting (stdio transport)")
     async with stdio_server() as (read_stream, write_stream):
         await server.run(

@@ -25,6 +25,7 @@ from mcp_server.os_utils import (
     IS_WINDOWS,
     IS_MACOS,
     IS_LINUX,
+    minimal_subprocess_env,
     translate_command,
 )
 
@@ -99,14 +100,15 @@ _SAFE_ABSOLUTE_REDIRECTS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"}
 
 
 def _filtered_env() -> dict[str, str]:
-    """Return a copy of the parent env with injection-vector variables removed.
+    """Return the minimal allowlist env for non-sandbox subprocess runs (S4).
 
-    Used for non-sandbox subprocess runs so that a poisoned parent environment
-    (e.g. LD_PRELOAD pointing at a malicious shared library) cannot affect
-    child processes even when the operator has disabled the full sandbox
-    (finding 2, part c).
+    Historically this was the full parent env minus _DANGEROUS_ENV_VARS; that
+    still leaked every provider API key and token in the parent process to
+    the child. It is now a positive allowlist (PATH/HOME/locale/display —
+    see os_utils.minimal_subprocess_env), so injection vectors AND secrets
+    are excluded by construction.
     """
-    return {k: v for k, v in os.environ.items() if k not in _DANGEROUS_ENV_VARS}
+    return minimal_subprocess_env()
 
 
 def _sandbox_enabled() -> bool:

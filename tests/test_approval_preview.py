@@ -1,8 +1,8 @@
-"""K6: approval-request preview builder."""
+"""K6: approval-request preview builder (moved server-side with the K1 gate)."""
 
-from orchestrator.agent import KimAgent
+from mcp_server.policy import build_approval_preview
 
-build = KimAgent._build_approval_preview
+build = build_approval_preview
 
 
 def test_run_command_preview_is_the_command():

@@ -21,6 +21,8 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from orchestrator.approval_broker import get_approval_broker
+
 logger = logging.getLogger(__name__)
 
 
@@ -86,7 +88,21 @@ async def mcp_session_context(config: dict):
         "KIM_WEBVIEW_BRIDGE_URL", "KIM_WEBVIEW_BRIDGE_TOKEN",
     ]
     extra_env = {k: os.environ[k] for k in _EXTRA_ENV_KEYS if k in os.environ}
-    merged_env = {**os.environ, **extra_env} if extra_env else None
+
+    # K1: start the approval broker BEFORE spawning the MCP server so the
+    # server-side HITL gate (mcp_server/approvals.py) has a channel back to
+    # this process. Without the env vars the server fail-closes approvals.
+    broker = get_approval_broker()
+    try:
+        broker_env = await broker.start()
+    except Exception as broker_err:
+        logger.warning(
+            "approval broker failed to start (%s) — server-side approvals "
+            "will default-deny", broker_err,
+        )
+        broker_env = {}
+
+    merged_env = {**os.environ, **extra_env, **broker_env}
 
     # 1. Prepare internal Kim server
     server_list = [
@@ -114,6 +130,8 @@ async def mcp_session_context(config: dict):
             ))
 
     async with AsyncExitStack() as stack:
+        if broker.is_running():
+            stack.push_async_callback(broker.stop)
         sessions = []
         internal_params = server_list[0]  # always the Kim MCP server
         internal_ok = False

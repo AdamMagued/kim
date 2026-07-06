@@ -276,7 +276,13 @@ pub async fn stream_agentic_request(
             } => {
                 let approved = prompt_hitl(&tool, &risk, &reason, &preview).await;
                 if let Some(stdin) = child_stdin.as_mut() {
-                    let payload = serde_json::json!({"type": "hitl_approve", "approved": approved});
+                    // K1 vocabulary alongside the legacy bool: the orchestrator
+                    // broker understands decision=accept/acceptForSession/decline.
+                    let payload = serde_json::json!({
+                        "type": "hitl_approve",
+                        "approved": approved,
+                        "decision": if approved { "accept" } else { "decline" },
+                    });
                     let _ = stdin.write_all(format!("{payload}\n").as_bytes()).await;
                     let _ = stdin.flush().await;
                 }

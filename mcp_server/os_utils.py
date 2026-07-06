@@ -18,6 +18,7 @@ Translation scope:
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import re
 import shlex
@@ -32,6 +33,46 @@ CURRENT_OS: str = platform.system()  # "Windows", "Darwin", or "Linux"
 IS_WINDOWS: bool = CURRENT_OS == "Windows"
 IS_MACOS: bool = CURRENT_OS == "Darwin"
 IS_LINUX: bool = CURRENT_OS == "Linux"
+
+
+# ─── Minimal subprocess environment (S4) ─────────────────────────────────────
+# NO tool subprocess inherits the full parent environment: provider API keys,
+# tokens, and injection vectors (LD_PRELOAD, PYTHONPATH, …) must never reach
+# child processes. Children get this fixed allowlist instead — locale, paths,
+# and the display plumbing GUI helpers (osascript, wmctrl, Chrome) need.
+# PATH is inherited deliberately: it lists directories, not secrets, and dev
+# tools (npm, cargo, brew installs) live outside the system dirs.
+
+_ENV_ALLOWLIST_POSIX = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR",
+    "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+    # Display plumbing for GUI-adjacent children (wmctrl, xdotool, browsers).
+    "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
+    "XDG_DATA_HOME", "XDG_CONFIG_HOME", "DBUS_SESSION_BUS_ADDRESS",
+)
+
+_ENV_ALLOWLIST_WINDOWS = (
+    "Path", "PATH", "PATHEXT", "SystemRoot", "SystemDrive", "ComSpec",
+    "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+    "ProgramFiles", "ProgramFiles(x86)", "ProgramData",
+    "NUMBER_OF_PROCESSORS", "windir",
+)
+
+
+def minimal_subprocess_env(
+    extra_keys: tuple[str, ...] = (),
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build the allowlist environment every tool subprocess runs with.
+
+    ``extra_keys`` names additional parent vars a specific tool legitimately
+    needs (e.g. GH_TOKEN for the gh CLI). ``overrides`` sets fixed values.
+    """
+    keys = (_ENV_ALLOWLIST_WINDOWS if IS_WINDOWS else _ENV_ALLOWLIST_POSIX) + extra_keys
+    env = {k: os.environ[k] for k in keys if k in os.environ}
+    if overrides:
+        env.update(overrides)
+    return env
 
 
 def get_os_info() -> dict:

@@ -167,13 +167,25 @@ class KimAgent:
         self._hitl_risk_threshold = _resolve_hitl_threshold(
             config, _os.environ.get("KIM_HITL_RISK_THRESHOLD")
         )
-        # In Tauri mode with HITL enabled, auto-wire StdinApprovalBridge so the
-        # interactive approval gate can pause the agent and wait for user input.
+        # In Tauri/CLI mode, auto-wire StdinApprovalBridge so the server-side
+        # approval gate (mcp_server policy → approval broker → this bridge)
+        # can pause the run and wait for user input. Attached regardless of
+        # the risk threshold: policy escalation rules (e.g. `python -c`,
+        # non-allowlisted binaries) request approval even in full-auto mode.
         if (not self._ui_bridge
-                and self._hitl_risk_threshold
                 and _os.environ.get("KIM_TAURI_MODE") == "1"):
             from orchestrator.ui_bridge import StdinApprovalBridge
             self._ui_bridge = StdinApprovalBridge()
+        # K1: the MCP server owns the HITL gate now; this process only answers
+        # its approval requests. Route them through the UIBridge (or decline
+        # everything when running headless without one).
+        try:
+            from orchestrator.approval_broker import get_approval_broker
+            get_approval_broker().set_resolver(
+                self._make_approval_resolver() if self._ui_bridge else None
+            )
+        except Exception as _broker_err:
+            logger.warning("approval resolver not registered: %s", _broker_err)
         # K3: mid-run steering inbox. Lines pushed by the stdin pump (runtime) or
         # add_steer() (tests) are drained into memory before each LLM call.
         self._steer_inbox: list[str] = []
@@ -1189,51 +1201,34 @@ class KimAgent:
         ]
         self._log("INFO", f"Loaded {len(self._tools)} MCP tools")
 
-    @staticmethod
-    def _build_approval_preview(name: str, args: dict) -> str:
-        """K6: human-readable preview for the approval card.
+    def _make_approval_resolver(self):
+        """Build the coroutine the ApprovalBroker calls for each server-side
+        approval request (K1). It forwards the request through the existing
+        plumbing: hitl_approval_request event on stdout, decision from the
+        UIBridge (Tauri/CLI stdin line, or the tray confirm dialog)."""
 
-        run_command → the command; write/edit → unified diff (≤40 lines); web
-        actions → URL + element label. Empty string when nothing useful.
-        """
-        args = args or {}
-        try:
-            if name in ("run_command", "shell", "execute_command"):
-                return str(args.get("command") or args.get("cmd") or "").strip()
-            if name in ("write_file", "create_file", "edit_file"):
-                path = str(args.get("path") or args.get("file_path") or "")
-                new = str(args.get("content", ""))
-                old = ""
-                try:
-                    from pathlib import Path as _P
-                    p = _P(path)
-                    if p.is_file():
-                        old = p.read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    old = ""
-                import difflib
-                diff = list(difflib.unified_diff(
-                    old.splitlines(), new.splitlines(),
-                    fromfile=f"{path} (current)", tofile=f"{path} (new)", lineterm="",
-                ))
-                if len(diff) > 40:
-                    diff = diff[:40] + ["… (diff truncated)"]
-                return "\n".join(diff) if diff else f"(no textual change to {path})"
-            if name.startswith("web_") or name in ("navigate", "click_element"):
-                url = str(args.get("url") or args.get("href") or "")
-                label = str(
-                    args.get("label")
-                    or args.get("selector")
-                    or args.get("element_id")
-                    or ""
-                )
-                parts = [url]
-                if label:
-                    parts.append(f"→ {label}")
-                return " ".join(x for x in parts if x).strip()
-        except Exception as _preview_err:
-            logger.debug("_build_approval_preview failed: %s", _preview_err)
-        return ""
+        async def _resolve(request: dict) -> str:
+            bridge = self._ui_bridge
+            if bridge is None:
+                return "decline"
+            tool = str(request.get("tool", ""))
+            risk = str(request.get("risk", ""))
+            reason = str(request.get("reason", ""))
+            preview = str(request.get("preview", ""))
+            raw_args = request.get("args")
+            tool_args = raw_args if isinstance(raw_args, dict) else {}
+            if self._is_preview_mode():
+                # Preview mode already confirms every action in run() before
+                # the tool call reaches the server — don't double-prompt.
+                return "accept"
+            emit_hitl_approval_request(tool, risk, reason, preview)
+            decision = await bridge.decide_action(tool, tool_args)
+            emit_hitl_approval_result(
+                tool, decision in ("accept", "acceptForSession")
+            )
+            return decision
+
+        return _resolve
 
     async def _execute_tool(self, name: str, args: dict) -> str:
         import time as _time
@@ -1243,36 +1238,18 @@ class KimAgent:
             level = "WARN" if not decision.allowed or "WARNING" in decision.message else "INFO"
             self._log(level, f"[POLICY] {decision.message}")
 
-        # Interactive HITL approval gate — ask the user before executing tools at or
-        # above the configured risk threshold.  Fires only when a UIBridge is attached
-        # and preview mode is not already handling confirmation.  If the user approves,
-        # a HITL hard-block from block_high_risk is bypassed so the tool actually runs.
-        _hitl_interactively_approved = False
-        if (self._hitl_risk_threshold
-                and self._ui_bridge
-                and not self._is_preview_mode()):
-            _hitl_risk = classify_tool_risk(name, args or {})
-            _ord = {"high": 2, "medium": 1, "low": 0}
-            if _ord.get(_hitl_risk["level"], 0) >= _ord.get(self._hitl_risk_threshold, 99):
-                emit_hitl_approval_request(
-                    name,
-                    _hitl_risk["level"],
-                    _hitl_risk["reason"],
-                    self._build_approval_preview(name, args or {}),
-                )
-                _hitl_interactively_approved = await self._ui_bridge.confirm_action(name, args or {})
-                emit_hitl_approval_result(name, _hitl_interactively_approved)
-                if not _hitl_interactively_approved:
-                    return (
-                        f"HITL_DENIED: User denied '{name}' ({_hitl_risk['reason']}). "
-                        "Choose a different approach or ask the user for permission."
-                    )
-
         if not decision.allowed:
-            # When interactive approval was granted above, bypass HITL hard-blocks so
-            # the tool executes.  All other policy blocks (staleness, unknown IDs…) are
-            # still enforced regardless of approval.
-            if _hitl_interactively_approved and decision.hard_block and "HITL_REQUIRED" in decision.message:
+            # HITL hard-blocks (block_high_risk mode) defer to the interactive
+            # server-side gate when one can actually fire (threshold + bridge,
+            # same conditions the old agent-side gate used): the MCP server
+            # pauses on the approval broker and the user decides. All other
+            # policy blocks (staleness, unknown IDs…) are enforced
+            # unconditionally.
+            if (decision.hard_block
+                    and "HITL_REQUIRED" in decision.message
+                    and self._hitl_risk_threshold
+                    and self._ui_bridge is not None
+                    and not self._is_preview_mode()):
                 pass
             else:
                 return decision.message
@@ -1319,16 +1296,23 @@ class KimAgent:
         t0 = _time.monotonic()
         output = ""
 
+        # The MCP server may pause this call on a human approval (K1); give
+        # gated calls room for the round-trip (150 s server backstop) plus
+        # execution. Low-risk tools keep the tight timeout.
+        _call_timeout = 120.0
+        if self._ui_bridge is not None and _risk.get("level") != "low":
+            _call_timeout = 300.0
+
         try:
             result = await asyncio.wait_for(
                 self.session.call_tool(name=name, arguments=args),
-                timeout=120.0,
+                timeout=_call_timeout,
             )
             parts = [c.text for c in result.content if hasattr(c, "text")]
             output = "\n".join(parts) if parts else "(no output)"
         except asyncio.TimeoutError:
-            logger.error(f"MCP tool '{name}' timed out after 120s")
-            output = f"ERROR calling {name}: timed out after 120s"
+            logger.error(f"MCP tool '{name}' timed out after {_call_timeout:.0f}s")
+            output = f"ERROR calling {name}: timed out after {_call_timeout:.0f}s"
         except Exception as e:
             logger.error(f"MCP tool '{name}' failed: {e}", exc_info=True)
             output = f"ERROR calling {name}: {e}"

@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp_server.config import PROJECT_ROOT, USE_REAL_BROWSER
-from mcp_server.os_utils import IS_MACOS, IS_WINDOWS, IS_LINUX
+from mcp_server.os_utils import IS_MACOS, IS_WINDOWS, IS_LINUX, minimal_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -90,10 +90,11 @@ async def _launch_real_browser() -> bool:
     cdp_arg = f"--remote-debugging-port={_REAL_BROWSER_CDP_PORT}"
 
     try:
+        _env = minimal_subprocess_env()  # S4: no parent-env (secrets) inherit
         if IS_MACOS:
-            # On macOS, simply launching with the flag is often blocked if another
-            # instance is open. We use 'open' which is cleaner.
-            subprocess.Popen(["open", "-a", "Google Chrome", "--args", cdp_arg])
+            # 'open' is cleaner than launching Chrome directly when an instance
+            # is already running with the debugging flag.
+            subprocess.Popen(["open", "-a", "Google Chrome", "--args", cdp_arg], env=_env)
             return True
         elif IS_WINDOWS:
             for p in [
@@ -101,12 +102,12 @@ async def _launch_real_browser() -> bool:
                 r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
             ]:
                 if Path(p).exists():
-                    subprocess.Popen([p, cdp_arg])
+                    subprocess.Popen([p, cdp_arg], env=_env)
                     return True
         elif IS_LINUX:
             for bin_name in ["google-chrome", "chromium-browser", "chromium"]:
                 if shutil.which(bin_name):
-                    subprocess.Popen([bin_name, cdp_arg])
+                    subprocess.Popen([bin_name, cdp_arg], env=_env)
                     return True
     except Exception as e:
         logger.warning(f"web: failed to launch real browser: {e}")
@@ -178,12 +179,11 @@ async def _launch_dedicated_browser() -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,
+            start_new_session=True, env=minimal_subprocess_env(),  # S4: minimal env
         )
         return True
     except Exception as e:
         logger.warning(f"web: failed to launch dedicated browser: {e}")
-        _last_connection_error = str(e)
         return False
 
 

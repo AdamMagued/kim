@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from mcp_server.os_utils import CURRENT_OS, IS_MACOS
+from mcp_server.os_utils import CURRENT_OS, IS_MACOS, minimal_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,7 @@ async def _run_osascript(script: str, timeout: float = 15.0) -> tuple[int, str, 
         "osascript", "-e", script,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=minimal_subprocess_env(),  # S4: no parent-env inherit
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)

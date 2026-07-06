@@ -99,6 +99,19 @@ class UIBridge:
         result[0] = confirmed
         event.set()
 
+    # ── Rich approval decisions (K1 server-side HITL gate) ────────────
+
+    async def decide_action(self, tool_name: str, args: dict) -> str:
+        """Return "accept" | "acceptForSession" | "decline" for a tool call.
+
+        Base implementation adapts the boolean confirm_action() so UIs that
+        only know approve/deny keep working. Subclasses with a richer wire
+        format (StdinApprovalBridge) override this to surface
+        acceptForSession.
+        """
+        approved = await self.confirm_action(tool_name, args)
+        return "accept" if approved else "decline"
+
     # ── Cancel ────────────────────────────────────────────────────────
 
     def cancel(self) -> None:
@@ -140,6 +153,21 @@ class UIBridgeLogHandler(logging.Handler):
             pass
 
 
+def normalize_decision(data: dict) -> str:
+    """Map a hitl_approve stdin payload to accept/acceptForSession/decline.
+
+    Understands both the generalized vocabulary ({"decision": "accept" |
+    "acceptForSession" | "decline"}) and the legacy {"approved": bool} line
+    that older Tauri/CLI builds write.
+    """
+    decision = str(data.get("decision", "")).strip()
+    if decision == "accept_for_session":
+        decision = "acceptForSession"
+    if decision in ("accept", "acceptForSession", "decline"):
+        return decision
+    return "accept" if bool(data.get("approved", False)) else "decline"
+
+
 class StdinApprovalBridge(UIBridge):
     """
     Minimal UIBridge for Tauri mode (no Tkinter).
@@ -147,9 +175,39 @@ class StdinApprovalBridge(UIBridge):
     confirm_action() pauses the agent and waits for Rust to write a JSON
     approval line to the process's stdin:
         {"type": "hitl_approve", "approved": true|false}
+    or, with the generalized K1 vocabulary:
+        {"type": "hitl_approve", "id": "…", "decision": "accept"|"acceptForSession"|"decline"}
 
     Timeout: 120 s — auto-denies if no response arrives.
     """
+
+    async def decide_action(self, tool_name: str, args: dict) -> str:
+        if self._cancelled.is_set():
+            return "decline"
+        pump = get_stdin_pump()
+        if pump.is_running():
+            try:
+                data = await pump.next_approval(timeout=120.0)
+                return normalize_decision(data)
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "HITL stdin approval failed (%s) — denying tool '%s'",
+                    exc, tool_name,
+                )
+                return "decline"
+        loop = asyncio.get_running_loop()
+        try:
+            line: str = await asyncio.wait_for(
+                loop.run_in_executor(None, sys.stdin.readline),
+                timeout=120.0,
+            )
+            return normalize_decision(json.loads(line.strip()))
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "HITL stdin approval failed (%s) — denying tool '%s'",
+                exc, tool_name,
+            )
+            return "decline"
 
     async def confirm_action(self, tool_name: str, args: dict) -> bool:
         if self._cancelled.is_set():

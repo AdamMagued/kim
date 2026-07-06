@@ -43,8 +43,10 @@ EXPECTED_POSIX_ENV_KEYS = {
 }
 
 # Vars some platforms inject into every child process — tolerated, not part
-# of the contract.
-PLATFORM_INJECTED_ENV_KEYS = {"__CF_USER_TEXT_ENCODING"}
+# of the contract. macOS injects __CF_USER_TEXT_ENCODING and, on some
+# shells/locales, LC_CTYPE into every spawned process regardless of the env
+# dict passed to exec; neither reaches the child from Kim's own allowlist.
+PLATFORM_INJECTED_ENV_KEYS = {"__CF_USER_TEXT_ENCODING", "LC_CTYPE"}
 
 # Env vars that must never influence a test unless a test sets them itself.
 _SCRUBBED_VARS = (

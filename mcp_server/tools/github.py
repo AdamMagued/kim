@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
 from typing import Any
 
+from mcp_server.os_utils import minimal_subprocess_env
 from mcp_server.tools import web
 
 logger = logging.getLogger(__name__)
@@ -94,7 +94,13 @@ def _valid_repo_name(name: str) -> bool:
 
 
 def _run_gh(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "GH_PROMPT_DISABLED": "1"}
+    # S4: minimal allowlist env, not the full parent env. gh reads its auth
+    # from ~/.config/gh (HOME is allowlisted); the token vars are passed
+    # through explicitly because handing them to the gh CLI is their purpose.
+    env = minimal_subprocess_env(
+        extra_keys=("GH_TOKEN", "GITHUB_TOKEN", "GH_HOST"),
+        overrides={"GH_PROMPT_DISABLED": "1"},
+    )
     return subprocess.run(
         ["gh", *args],
         text=True,

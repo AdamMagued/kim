@@ -155,18 +155,9 @@ pub(crate) fn forward_agent_stdout_line(
     }
 }
 
-/// Write the user's HITL approval decision to the running agent's stdin.
-/// Python's StdinApprovalBridge reads this line to unblock confirm_action().
-#[tauri::command]
-pub(crate) async fn hitl_respond_approval(approved: bool) -> Result<(), String> {
-    let msg = if approved {
-        "{\"type\":\"hitl_approve\",\"approved\":true}\n"
-    } else {
-        "{\"type\":\"hitl_approve\",\"approved\":false}\n"
-    };
-    let mut rt = crate::task_runtime::task_runtime().lock().await;
-    rt.write_stdin_line(msg).await
-}
+// HITL approval commands live in `crate::hitl` (K1). Kept out of this file so
+// the K1 approval-vocabulary work does not regrow this already-oversized
+// module ahead of its scheduled K2 decomposition.
 
 /// K3: write a mid-run steering message to the running agent's stdin. Python's
 /// stdin pump folds it into memory as a user message before the next LLM call.

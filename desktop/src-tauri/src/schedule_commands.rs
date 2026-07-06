@@ -507,7 +507,7 @@ mod tests {
     fn test_status_from_inner_reports_idle_defaults() {
         let inner = ScheduleTimerInner::default();
         let status = status_from_inner(&inner);
-        assert_eq!(status.running, false);
+        assert!(!status.running);
         assert_eq!(status.interval_seconds, 0);
         assert_eq!(status.tick_count, 0);
         assert_eq!(status.last_result, None);
@@ -516,13 +516,15 @@ mod tests {
 
     #[test]
     fn test_status_from_inner_carries_last_result_and_error() {
-        let mut inner = ScheduleTimerInner::default();
-        inner.interval_seconds = 120;
-        inner.tick_count = 3;
-        inner.last_result = Some("{\"ok\":true}".to_string());
-        inner.last_error = Some("previous failure".to_string());
+        let inner = ScheduleTimerInner {
+            interval_seconds: 120,
+            tick_count: 3,
+            last_result: Some("{\"ok\":true}".to_string()),
+            last_error: Some("previous failure".to_string()),
+            ..ScheduleTimerInner::default()
+        };
         let status = status_from_inner(&inner);
-        assert_eq!(status.running, false);
+        assert!(!status.running);
         assert_eq!(status.interval_seconds, 120);
         assert_eq!(status.tick_count, 3);
         assert_eq!(status.last_result.as_deref(), Some("{\"ok\":true}"));

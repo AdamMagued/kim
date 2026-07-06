@@ -788,7 +788,13 @@ export function useChatStream({
     flushActivityNow,
     enqueueActivityUpdate,
 
-    // HITL approval round-trip
-    hitlRespond: (approved: boolean) => invoke('hitl_respond_approval', { approved }).catch(() => {}),
+    // HITL approval round-trip. `decision` carries the K1 vocabulary
+    // (accept | acceptForSession | decline); when omitted, it is derived
+    // from `approved` so existing call sites keep working.
+    hitlRespond: (approved: boolean, decision?: 'accept' | 'acceptForSession' | 'decline') =>
+      invoke('hitl_respond_approval', {
+        approved,
+        decision: decision ?? (approved ? 'accept' : 'decline'),
+      }).catch(() => {}),
   };
 }
