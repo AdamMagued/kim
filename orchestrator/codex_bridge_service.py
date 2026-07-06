@@ -51,6 +51,11 @@ from codex_engine.thread_state import (
     reset_thread_state,
     save_thread_state,
 )
+from orchestrator.codex_appserver_transport import (
+    compact_codex_thread,
+    run_app_server_task,
+    transport_name,
+)
 from orchestrator.compact_prompt import (
     _parse_compact_json,
     build_in_thread_compact_prompt,
@@ -294,6 +299,20 @@ async def _run_compact_task(args: argparse.Namespace, config: dict) -> int:
     _status("Compacting the code-mode browser thread…")
     provider = create_provider(args.provider, config)
     ok, handoff = await _compact_browser_thread(provider, args.cwd, args.provider)
+    # App-server transport: ALSO compact codex's own transcript (two
+    # independent context budgets — parity Part 2.4). Best-effort.
+    if transport_name(config) == "app-server":
+        binary = os.environ.get("CODEX_BIN", "").strip() or CODEX_BINARY
+        binary_path = shutil.which(binary) if not os.path.isabs(binary) else binary
+        if binary_path and os.path.exists(binary_path):
+            state_after = load_thread_state(args.cwd, args.provider)
+            if await compact_codex_thread(
+                cwd=args.cwd,
+                config=config,
+                thread_state=state_after,
+                binary_path=str(binary_path),
+            ):
+                _status("Codex transcript compacted natively as well.")
     if ok:
         _status("Context compacted — the next code task starts a fresh chat seeded with the handoff.")
         # Temporary verification aid: with KIM_DEBUG_COMPACT=1 set, print the
@@ -452,6 +471,32 @@ async def _run_async(args: argparse.Namespace) -> int:
     proxy_port = await proxy.start()
 
     logger.info("Proxy started on port %d", proxy_port)
+
+    # ── App-server transport (parity Part 2) ──────────────────────────────
+    # Behind `codex_bridge: transport: app-server`: JSON-RPC codex with native
+    # per-command approvals, workspace-write sandbox, and true session resume
+    # via the sidecar codex_thread_id. The exec path below stays the default.
+    if transport_name(config) == "app-server":
+        def _register(proc: object) -> None:
+            global _active_process  # noqa: PLW0603
+            _active_process = proc  # type: ignore[assignment]
+
+        try:
+            return await run_app_server_task(
+                task=args.task,
+                cwd=args.cwd,
+                model=args.model,
+                config=config,
+                proxy=proxy,
+                thread_state=thread_state,
+                binary_path=str(binary_path),
+                register_process=_register,
+            )
+        finally:
+            _active_process = None
+            await proxy.stop()
+            _active_proxy = None
+            save_thread_state(args.cwd, args.provider, thread_state)
 
     try:
         with tempfile.TemporaryDirectory(prefix="kim-codex-config-") as config_dir:

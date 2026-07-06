@@ -16,8 +16,17 @@ State shape:
                                     # the thread's instructions described
         "burned": bool,             # thread ignored the tool protocol even
                                     # after a format nudge — never resume it
+        "codex_thread_id": str|None,  # app-server transport: codex's own
+                                    # thread id, resumed across messages
+        "codex_thread_cwd": str|None,  # cwd the codex thread was started in
+                                    # (resume only when it still matches)
         "updated_at": str,          # ISO timestamp of last write
     }
+
+The ``codex_thread_*`` keys survive ``reset_thread_state``: the browser
+thread (model transport) and the codex thread (tool/transcript state on the
+app-server transport) are independent context budgets — resetting one must
+not amnesia the other.
 """
 
 from __future__ import annotations
@@ -66,12 +75,20 @@ def save_thread_state(cwd: str, provider: str, state: dict) -> None:
 
 
 def reset_thread_state(cwd: str, provider: str, handoff: Optional[str] = None) -> dict:
-    """Reset accounting for a fresh thread, optionally carrying a handoff."""
+    """Reset accounting for a fresh browser thread, optionally carrying a handoff.
+
+    The codex-side thread identity (app-server transport) is preserved — see
+    the module docstring.
+    """
+    previous = load_thread_state(cwd, provider)
     state = {
         "sent_instructions": False,
         "turns": 0,
         "est_tokens": 0,
         "handoff": (handoff or "").strip() or None,
     }
+    for key in ("codex_thread_id", "codex_thread_cwd"):
+        if previous.get(key):
+            state[key] = previous[key]
     save_thread_state(cwd, provider, state)
     return state

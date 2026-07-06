@@ -362,6 +362,17 @@ class _CodexProxy:
         # browser session through this proxy.
         self._bearer_token: str = secrets.token_urlsafe(32)
 
+    def begin_turn(self) -> None:
+        """Reset the relay budget for a new codex turn (Rb6).
+
+        On the app-server transport one service process may host several
+        turns of one session; MAX_RELAYS is a runaway guard for a single
+        turn, not a lifetime cap — long legitimate sessions must not be cut
+        at 50. The exec transport spawns one process per turn, so calling
+        this there is a harmless no-op.
+        """
+        self._relay_count = 0
+
     def _check_auth(self, request) -> bool:
         """Return True iff the request carries the correct bearer token (#47)."""
         auth = request.headers.get("Authorization", "")
