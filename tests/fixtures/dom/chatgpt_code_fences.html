@@ -1,0 +1,17 @@
+<!-- Synthesized ChatGPT response DOM: prose interleaved with TWO fenced code
+     blocks. The first block carries its language on the <code> class
+     (language-python, hljs spans + newline text nodes); the second block has
+     NO language- class — the language must be recovered from the header div
+     ("bash"), exercising the serializer's header fallback.
+     Deliberately contains NO completion sentinel: the test completes via the
+     stop-button appeared→cleared transition. -->
+<div class="markdown prose w-full break-words dark:prose-invert light">
+<p>Here is the fix — update <code>game.py</code> and then restart:</p>
+<pre class="!overflow-visible"><div class="contain-inline-size rounded-md border-[0.5px] relative"><div class="flex items-center px-4 py-2 text-xs font-sans justify-between h-9 select-none">python<button class="flex gap-1 items-center select-none py-1" aria-label="Copy">Copy code</button></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre! language-python"><span class="hljs-keyword">def</span> <span class="hljs-title function_">move_paddle</span>(y):
+    paddle.y = clamp(y, <span class="hljs-number">0</span>, HEIGHT - PADDLE_H)
+    <span class="hljs-keyword">return</span> paddle.y</code></div></div></pre>
+<p>Then restart the server:</p>
+<pre class="!overflow-visible"><div class="contain-inline-size rounded-md border-[0.5px] relative"><div class="flex items-center px-4 py-2 text-xs font-sans justify-between h-9 select-none">bash<button class="flex gap-1 items-center select-none py-1" aria-label="Copy">Copy code</button></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre!">python -m http.server 8000 --directory .
+open http://localhost:8000/pong.html</code></div></div></pre>
+<p>The paddle will now stay inside the canvas.</p>
+</div>

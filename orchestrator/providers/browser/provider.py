@@ -80,6 +80,8 @@ if TYPE_CHECKING:
 from orchestrator.context_meter import IMAGE_TOKEN_ESTIMATE, estimate_text_tokens
 from orchestrator.providers.base import BaseProvider
 from orchestrator.providers.browser.bridge_client import complete_via_webview_bridge
+from orchestrator.providers.browser.markdown_scraper import MARKDOWN_SERIALIZER_JS
+from orchestrator.providers.browser.page_driver import PageDriver
 from orchestrator.providers.browser.prompt_builder import format_prompt
 from orchestrator.providers.browser.response_parser import parse_response, strip_transport_markers
 from orchestrator.providers.browser.site_configs import (
@@ -128,8 +130,10 @@ class BrowserProvider(BaseProvider):
         so that session cookies exist in the data directory.
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, page_driver: Optional[PageDriver] = None):
         self._config = config
+        # Injected browser-I/O seam (K3): complete() drives this instead of playwright.
+        self._page_driver = page_driver
         bp_cfg = config.get("browser_provider", {})
         cdp_url = bp_cfg.get("cdp_url", CDP_URL)
         self._cdp_url = cdp_url
@@ -344,6 +348,7 @@ class BrowserProvider(BaseProvider):
         system: str = "",
         clear_chat: bool = False,
         handoff: Optional[str] = None,
+        page_driver: Optional[PageDriver] = None,
         **kwargs,
     ) -> dict:
         # Optimize prompt payload: if resuming an existing thread (url restored),
@@ -390,7 +395,19 @@ class BrowserProvider(BaseProvider):
             )
             return self._attach_usage(result, estimated_usage)
 
+        # Injected browser-I/O seam (K3): call-site driver wins over the
+        # constructor's; when present, playwright is skipped entirely.
+        driver = page_driver if page_driver is not None else self._page_driver
+
         try:
+            if driver is not None:
+                page, site = await driver.acquire()
+                if page is None or site is None:
+                    return self._lost_chat_result()
+                return await self._run_chat_flow(
+                    page, site, prompt, attachments, tools, completion_hash, clear_chat, estimated_usage
+                )
+
             # Playwright is imported lazily (module top only imports it under
             # TYPE_CHECKING so selecting a browser provider doesn't hard-crash when
             # playwright isn't installed). Import the runtime symbol here, where the
@@ -411,46 +428,10 @@ class BrowserProvider(BaseProvider):
                         page, site = await self._find_chat_page(browser)
 
                 if page is None or site is None:
-                    return {
-                        "type": "text",
-                        "content": (
-                            "NEED_HELP: Kim lost the active browser chat during this task. "
-                            "I will not open a new provider tab because that would lose the LLM context. "
-                            "Please reopen the existing provider chat window and resend."
-                        ),
-                    }
+                    return self._lost_chat_result()
 
-                if clear_chat:
-                    logger.info(f"Clearing chat context by reloading {page.url}...")
-                    await page.goto(page.url, wait_until="domcontentloaded")
-                    await asyncio.sleep(2.0)
-                    self._sent_system_prompt = False
-
-                cfg = self._site_configs[site]
-
-                image_attachments = [
-                    a for a in attachments
-                    if str(a.get("mime_type", "")).startswith("image/") and a.get("data_base64")
-                ]
-
-                if image_attachments:
-                    logger.info(f"[STATUS] Uploading screenshot to {site}…")
-                    await self._inject_image_clipboard(
-                        page, cfg, str(image_attachments[-1]["data_base64"])
-                    )
-                    await page.wait_for_timeout(1200)
-
-                logger.info(f"[STATUS] Preparing {site}…")
-                await self._dismiss_popups(page)
-
-                logger.info(f"[STATUS] Sending message to {site}…")
-                raw_response = await self._send_and_wait(page, cfg, prompt, site, completion_hash)
-                # Pass known_tools so the parser can reject prompt-injected fake tool
-                # calls whose names aren't in the schema the agent actually has (#38).
-                known = {t["name"] for t in (tools or [])} if tools else None
-                return self._attach_usage(
-                    parse_response(raw_response, completion_hash, known_tools=known),
-                    estimated_usage,
+                return await self._run_chat_flow(
+                    page, site, prompt, attachments, tools, completion_hash, clear_chat, estimated_usage
                 )
         except (ConnectionError, OSError, RuntimeError) as e:
             # Only genuine browser-connection / IO failures are mapped to NEED_HELP;
@@ -461,6 +442,58 @@ class BrowserProvider(BaseProvider):
                 {"type": "text", "content": f"NEED_HELP: Browser connection failed — {e}"},
                 estimated_usage,
             )
+
+    @staticmethod
+    def _lost_chat_result() -> dict:
+        return {
+            "type": "text",
+            "content": (
+                "NEED_HELP: Kim lost the active browser chat during this task. "
+                "I will not open a new provider tab because that would lose the LLM context. "
+                "Please reopen the existing provider chat window and resend."
+            ),
+        }
+
+    async def _run_chat_flow(
+        self, page: Page, site: str, prompt: str, attachments: list[dict],
+        tools: list[dict] | None, completion_hash: str, clear_chat: bool,
+        estimated_usage: dict,
+    ) -> dict:
+        """Downstream chat flow — identical for the CDP path and an injected
+        PageDriver: clear/upload/popups, inject + send + two-phase wait,
+        markdown scrape, then parse into the canonical response format."""
+        if clear_chat:
+            logger.info(f"Clearing chat context by reloading {page.url}...")
+            await page.goto(page.url, wait_until="domcontentloaded")
+            await asyncio.sleep(2.0)
+            self._sent_system_prompt = False
+
+        cfg = self._site_configs[site]
+
+        image_attachments = [
+            a for a in attachments
+            if str(a.get("mime_type", "")).startswith("image/") and a.get("data_base64")
+        ]
+
+        if image_attachments:
+            logger.info(f"[STATUS] Uploading screenshot to {site}…")
+            await self._inject_image_clipboard(
+                page, cfg, str(image_attachments[-1]["data_base64"])
+            )
+            await page.wait_for_timeout(1200)
+
+        logger.info(f"[STATUS] Preparing {site}…")
+        await self._dismiss_popups(page)
+
+        logger.info(f"[STATUS] Sending message to {site}…")
+        raw_response = await self._send_and_wait(page, cfg, prompt, site, completion_hash)
+        # Pass known_tools so the parser can reject prompt-injected fake tool
+        # calls whose names aren't in the schema the agent actually has (#38).
+        known = {t["name"] for t in (tools or [])} if tools else None
+        return self._attach_usage(
+            parse_response(raw_response, completion_hash, known_tools=known),
+            estimated_usage,
+        )
 
     # ==================================================================
     # Backward-compatible method wrappers (used by tests)
@@ -1414,43 +1447,9 @@ class BrowserProvider(BaseProvider):
         )
 
     # JS: rebuild markdown from a response element, restoring ```lang fences
-    # around <pre> code blocks (which inner_text would flatten). Iterates the
-    # top-level children (ChatGPT/Gemini/Claude render <pre> as siblings of
-    # <p>/<h*>, not nested inside them) so prose keeps its innerText spacing.
-    _MARKDOWN_SERIALIZER_JS = r"""
-    (el) => {
-      const kids = el.children;
-      if (!kids || kids.length === 0) return el.innerText || '';
-      const parts = [];
-      for (const child of kids) {
-        if (child.tagName === 'PRE') {
-          const code = child.querySelector('code');
-          let lang = '';
-          if (code && code.className) {
-            const m = code.className.match(/language-([\w+#.-]+)/);
-            if (m) lang = m[1];
-          }
-          if (!lang) {
-            const hdr = child.querySelector('div');
-            if (hdr) {
-              const first = (hdr.innerText || '').trim().split('\n')[0].trim().toLowerCase();
-              if (/^[a-z0-9+#.-]{1,15}$/.test(first)) lang = first;
-            }
-          }
-          // innerText preserves rendered line breaks; textContent concatenates
-          // ChatGPT's per-line highlight <span>/<div>s with NO newline between
-          // them, flattening multi-line code to a single line (breaks any file
-          // whose newlines matter — Python, YAML, Makefiles).
-          const codeText = (code ? (code.innerText || code.textContent) : child.innerText) || '';
-          parts.push('```' + lang + '\n' + codeText.replace(/\n+$/, '') + '\n```');
-        } else {
-          parts.push(child.innerText || '');
-        }
-      }
-      const joined = parts.join('\n\n');
-      return joined.trim() ? joined : (el.innerText || '');
-    }
-    """
+    # around <pre> code blocks (which inner_text would flatten). Lives in
+    # markdown_scraper.py; kept as a class attr for test/backcompat access.
+    _MARKDOWN_SERIALIZER_JS = MARKDOWN_SERIALIZER_JS
 
     async def _scrape_markdown(self, el) -> Optional[str]:
         """Return the element's text with ```lang code fences reconstructed.
