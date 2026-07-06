@@ -92,13 +92,19 @@ class TestCodexEnvScoping(unittest.IsolatedAsyncioTestCase):
             f"http://127.0.0.1:{FAKE_PROXY_PORT}/v1",
         )
 
-    async def test_codex_home_is_an_ephemeral_config_dir(self):
-        """CODEX_HOME must be a per-run temp config dir, not the real HOME."""
+    async def test_codex_home_is_not_overridden(self):
+        """C3: Kim must NOT point CODEX_HOME at a throwaway temp dir.
+
+        The user's real codex home (config.toml, MCP servers, skills, rollout
+        files) applies: no CODEX_HOME in the child env unless the parent
+        exported one, in which case it is forwarded unchanged.
+        """
         result = await run_bridge(self.tmp)
-        child_env = result.capture["env"]
-        codex_home = child_env["CODEX_HOME"]
-        self.assertIn("kim-codex-config-", codex_home)
-        self.assertNotEqual(codex_home, child_env.get("HOME"))
+        self.assertNotIn("CODEX_HOME", result.capture["env"])
+
+    async def test_parent_codex_home_is_forwarded(self):
+        result = await run_bridge(self.tmp, env={"CODEX_HOME": "/custom/codex-home"})
+        self.assertEqual(result.capture["env"].get("CODEX_HOME"), "/custom/codex-home")
 
     async def test_path_and_home_are_forwarded_from_parent(self):
         """The allowlisted basics come from the parent env, unmodified."""
@@ -110,7 +116,7 @@ class TestCodexEnvScoping(unittest.IsolatedAsyncioTestCase):
     async def test_parent_environ_is_not_mutated(self):
         """The spawn must scope env via the env= dict, not os.environ writes."""
         result = await run_bridge(self.tmp)
-        for key in ("CODEX_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"):
+        for key in ("CODEX_API_KEY", "OPENAI_BASE_URL"):
             self.assertNotIn(
                 key,
                 result.parent_env,

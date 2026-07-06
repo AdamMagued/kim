@@ -93,9 +93,29 @@ class AppServerError(RuntimeError):
 
 
 def decline_result_for(method: str) -> dict:
-    """The safest decline payload for an unanswered server request."""
+    """The safest schema-valid decline payload for an unanswered server request.
+
+    ``{"decision": "decline"}`` is only valid for approval requests; the
+    user-input / elicitation / dynamic-tool requests each have their own
+    response schema, and answering with the wrong shape makes codex error the
+    tool instead of gracefully proceeding (C4).
+    """
     if method in _V1_APPROVAL_METHODS:
         return dict(V1_DECLINE)
+    if method == "item/tool/requestUserInput":
+        # ToolRequestUserInputResponse: required "answers" map; empty = no answer.
+        return {"answers": {}}
+    if method == "mcpServer/elicitation/request":
+        # McpServerElicitationRequestResponse: decline is a first-class action.
+        return {"action": "decline"}
+    if method == "item/tool/call":
+        # DynamicToolCallResponse: a structured failure the model can read.
+        return {
+            "success": False,
+            "contentItems": [
+                {"type": "inputText", "text": "Kim could not service this tool call."}
+            ],
+        }
     return dict(V2_DECLINE)
 
 

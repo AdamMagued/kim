@@ -100,7 +100,9 @@ async def _run_smoke(tmp: Path, replies: list[str]) -> SimpleNamespace:
     script.chmod(0o755)
 
     config_path = tmp / "config.yaml"
-    config_path.write_text("browser_provider: {}\n")
+    # This smoke drives the legacy exec transport end-to-end (the fake codex
+    # emulates `codex exec --json`); the service default is now app-server.
+    config_path.write_text("browser_provider: {}\ncodex_bridge:\n  transport: exec\n")
 
     provider = CannedProvider(replies)
 

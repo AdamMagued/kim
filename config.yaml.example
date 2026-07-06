@@ -25,10 +25,15 @@ codex_bridge:
   # are slow — a single one can take minutes — so keep this comfortably above
   # the per-relay browser waits (600s).
   task_timeout_s: 1800
-  # Codex transport: "exec" (legacy `codex exec --json` spawn, the default) or
-  # "app-server" (JSON-RPC `codex app-server`: native per-command approvals,
-  # workspace-write sandbox, true session resume via a persisted thread id).
-  transport: exec
+  # Codex transport. "app-server" (the default) speaks JSON-RPC to
+  # `codex app-server`: native per-command approvals, plan/diff/output
+  # streaming, workspace-write sandbox, and true session resume via a
+  # persisted thread id — i.e. code mode remembers the conversation.
+  # "exec" is the legacy per-message `codex exec --json` spawn, kept as a
+  # fallback for older/drifted codex binaries (Kim also degrades to it
+  # automatically for a run when the binary's protocol major version doesn't
+  # match its snapshot).
+  transport: app-server
   # App-server path only — Codex-native sandbox + approval policy.
   # sandbox_mode: read-only | workspace-write | danger-full-access
   sandbox_mode: workspace-write

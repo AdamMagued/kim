@@ -126,13 +126,15 @@ def _run(coro):
 
 class TransportFlagTest(unittest.TestCase):
     def test_transport_name_default_and_aliases(self):
-        self.assertEqual(transport_name({}), "exec")
-        self.assertEqual(transport_name({"codex_bridge": {}}), "exec")
+        # C1: the app-server transport (the real codex wrapper) is the default.
+        self.assertEqual(transport_name({}), "app-server")
+        self.assertEqual(transport_name({"codex_bridge": {}}), "app-server")
+        self.assertEqual(transport_name({"codex_bridge": {"transport": "exec"}}), "exec")
         self.assertEqual(transport_name({"codex_bridge": {"transport": "app-server"}}), "app-server")
         self.assertEqual(transport_name({"codex_bridge": {"transport": "APP_SERVER"}}), "app-server")
         self.assertEqual(transport_name({"codex_bridge": {"transport": "appserver"}}), "app-server")
-        self.assertEqual(transport_name({"codex_bridge": {"transport": "garbage"}}), "exec")
-        self.assertEqual(transport_name({"codex_bridge": {"transport": None}}), "exec")
+        self.assertEqual(transport_name({"codex_bridge": {"transport": "garbage"}}), "app-server")
+        self.assertEqual(transport_name({"codex_bridge": {"transport": None}}), "app-server")
 
 
 class PolicyMappingTest(unittest.TestCase):
@@ -319,8 +321,10 @@ class ApprovalRoundTripTest(unittest.TestCase):
         self.assertEqual(client.responses, [(5, {"decision": "decline"})])
 
     def test_unknown_server_request_is_safely_declined(self):
+        # (item/tool/requestUserInput is no longer "unknown" — C4 surfaces it;
+        # see tests/test_codex_wrapper_fixes.py. Use a genuinely unknown method.)
         client = FakeClient([
-            ServerRequest(id=3, method="item/tool/requestUserInput", params={}),
+            ServerRequest(id=3, method="totally/unknown/request", params={}),
             _turn_completed(),
         ])
         _run(_make_runner(client).run())
@@ -460,7 +464,7 @@ class SidecarPreservationTest(unittest.TestCase):
 
 
 class ServiceDispatchTest(unittest.IsolatedAsyncioTestCase):
-    """The service branches on codex_bridge.transport; exec stays the default."""
+    """The service branches on codex_bridge.transport; app-server is the default."""
 
     async def test_transport_flag_routes_to_app_server(self):
         import tempfile
@@ -486,17 +490,44 @@ class ServiceDispatchTest(unittest.IsolatedAsyncioTestCase):
         # The legacy exec binary was never spawned on this path.
         self.assertIsNone(result.capture)
 
-    async def test_default_config_stays_on_exec_path(self):
+    async def test_explicit_exec_config_uses_exec_path(self):
         import tempfile
         from pathlib import Path
         from codex_bridge_harness import run_bridge
 
         with tempfile.TemporaryDirectory() as tmpd:
-            result = await run_bridge(Path(tmpd))
+            result = await run_bridge(
+                Path(tmpd),
+                config_yaml="browser_provider: {}\ncodex_bridge:\n  transport: exec\n",
+            )
         self.assertIsNotNone(result.capture)
         argv = result.capture["argv"]
         self.assertIn("exec", argv)
         self.assertIn("--json", argv)
+
+    async def test_default_config_routes_to_app_server(self):
+        # C1: with no transport configured, the service must take the
+        # app-server path (the real codex wrapper), not legacy exec.
+        import tempfile
+        from pathlib import Path
+        from codex_bridge_harness import run_bridge
+        from orchestrator import codex_bridge_service as svc
+
+        called: dict = {}
+
+        async def fake_run(**kwargs):
+            called.update(kwargs)
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            with mock.patch.object(svc, "run_app_server_task", fake_run):
+                result = await run_bridge(
+                    Path(tmpd), config_yaml="browser_provider: {}\n"
+                )
+        self.assertEqual(result.rc, 0)
+        self.assertEqual(called["task"], "write hello.py")
+        self.assertTrue(called["version_gate_fallback"])
+        self.assertIsNone(result.capture)
 
 
 if __name__ == "__main__":

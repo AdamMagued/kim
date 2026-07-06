@@ -1,6 +1,7 @@
 """App-server transport for the codex bridge service (parity proposal Part 2).
 
-The second engine path behind ``codex_bridge:  transport: app-server``:
+The DEFAULT engine path (``codex_bridge: transport: app-server``; set
+``transport: exec`` for the legacy per-message spawn):
 instead of spawning ``codex exec --json`` per message, spawn
 ``codex app-server`` (JSON-RPC over stdio, ``codex_engine/app_server.py``),
 resume the session's persisted codex thread (sidecar ``codex_thread_id``),
@@ -58,6 +59,7 @@ from orchestrator.events_gen import (
     emit_command_approval_request,
     emit_command_output,
     emit_diff_update,
+    emit_event,
     emit_file_change_approval_request,
     emit_item_lifecycle,
     emit_plan_update,
@@ -82,12 +84,26 @@ _APPROVAL_METHODS = _V1_APPROVAL_METHODS | {
 # v1 ReviewDecision vocabulary (see appserver_schema/ExecCommandApprovalResponse).
 _V1_DECISION = {"accept": "approved", "acceptForSession": "approved_for_session", "decline": "denied"}
 
+# Server requests where codex is asking the USER something (C4). These must be
+# surfaced — silently auto-declining them makes codex guess and the user never
+# even sees the question.
+_USER_INPUT_METHOD = "item/tool/requestUserInput"
+_ELICITATION_METHOD = "mcpServer/elicitation/request"
+_DYNAMIC_TOOL_METHOD = "item/tool/call"
+
 
 def transport_name(config: dict) -> str:
-    """Normalized ``codex_bridge.transport`` value (default ``exec``)."""
-    raw = str(((config.get("codex_bridge") or {}).get("transport")) or "exec")
+    """Normalized ``codex_bridge.transport`` value (default ``app-server``).
+
+    The app-server transport is the real codex wrapper (native per-command
+    approvals, plan/diff/output streaming, true session resume via the
+    persisted thread id), so it is the default; ``exec`` remains available as
+    an explicit fallback for drifted/older codex binaries. Unknown values
+    degrade to the default.
+    """
+    raw = str(((config.get("codex_bridge") or {}).get("transport")) or "app-server")
     normalized = raw.strip().lower().replace("_", "-").replace("appserver", "app-server")
-    return normalized if normalized in ("exec", "app-server") else "exec"
+    return normalized if normalized in ("exec", "app-server") else "app-server"
 
 
 def _bridge_cfg(config: dict) -> dict:
@@ -195,6 +211,40 @@ def parse_decision_line(line: str) -> Optional[tuple[str, Optional[str]]]:
     return None
 
 
+def parse_user_input_line(line: str) -> Optional[tuple[dict, Optional[str]]]:
+    """Parse one stdin user-input answer line → (answers, request_id) or None.
+
+    Frontend hook (C4): to answer a codex ``item/tool/requestUserInput``
+    question, the supervisor writes one line to our stdin::
+
+        {"type": "user_input", "id": "<request id>",
+         "answers": {"<question id>": {"answers": ["<text>"]}}}
+
+    Question-id values may also be a bare string or list of strings; they are
+    normalized to the ToolRequestUserInputResponse shape.
+    """
+    try:
+        data = json.loads(line.strip())
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("type") != "user_input":
+        return None
+    raw_id = data.get("id")
+    req_id = str(raw_id) if raw_id is not None else None
+    raw_answers = data.get("answers")
+    if not isinstance(raw_answers, dict):
+        return None
+    answers: dict = {}
+    for qid, value in raw_answers.items():
+        if isinstance(value, dict) and isinstance(value.get("answers"), list):
+            answers[str(qid)] = {"answers": [str(v) for v in value["answers"]]}
+        elif isinstance(value, list):
+            answers[str(qid)] = {"answers": [str(v) for v in value]}
+        elif isinstance(value, str):
+            answers[str(qid)] = {"answers": [value]}
+    return answers, req_id
+
+
 class _StdinDecisionPump:
     """T1/H4: the single owned stdin reader for this process.
 
@@ -209,10 +259,10 @@ class _StdinDecisionPump:
     process keeps exactly one stdin reader.
     """
 
-    _EOF = ("__eof__", None)
+    _EOF = ("__eof__", None, None)
 
     def __init__(self) -> None:
-        self._q: "queue.Queue[tuple[str, Optional[str]]]" = queue.Queue()
+        self._q: "queue.Queue[tuple[str, Any, Optional[str]]]" = queue.Queue()
         self._started = False
         self._start_lock = threading.Lock()
         self._eof = False
@@ -229,17 +279,21 @@ class _StdinDecisionPump:
     def _read_loop(self) -> None:
         try:
             for line in sys.stdin:
-                parsed = parse_decision_line(line)
-                if parsed is not None:
-                    self._q.put(parsed)
-                # Not a decision (e.g. a steer line) — ignore, keep reading.
+                decision = parse_decision_line(line)
+                if decision is not None:
+                    self._q.put(("decision", decision[0], decision[1]))
+                    continue
+                user_input = parse_user_input_line(line)
+                if user_input is not None:
+                    self._q.put(("user_input", user_input[0], user_input[1]))
+                # Anything else (e.g. a steer line) — ignore, keep reading.
         except Exception as exc:  # noqa: BLE001
             logger.warning("approval stdin read failed (%s) — declining", exc)
         self._eof = True
         self._q.put(self._EOF)  # wake any waiter: the supervisor went away
 
     def drain(self) -> None:
-        """Drop queued (stale) decisions — none can belong to a request that
+        """Drop queued (stale) messages — none can belong to a request that
         has not started waiting yet."""
         while True:
             try:
@@ -249,7 +303,7 @@ class _StdinDecisionPump:
             if stale == self._EOF:
                 self._q.put(self._EOF)
                 return
-            logger.warning("dropping stale approval decision line: id=%r", stale[1])
+            logger.warning("dropping stale stdin %s line: id=%r", stale[0], stale[2])
 
     def _get_blocking(self, timeout: float) -> Any:
         """One bounded queue read → decision tuple | "empty" | "eof"."""
@@ -262,12 +316,12 @@ class _StdinDecisionPump:
             return "eof"
         return item
 
-    async def read_decision(self, timeout: float) -> Optional[tuple[str, Optional[str]]]:
-        """Await the next decision (or None on timeout/EOF).
+    async def read_message(self, timeout: float) -> Optional[tuple[str, Any, Optional[str]]]:
+        """Await the next stdin message tuple (kind, payload, id), or None.
 
         Polls the queue in short blocking slices so that if this coroutine is
         cancelled/abandoned, the worker thread expires within ~0.25 s instead
-        of squatting on the queue where it could swallow a later decision.
+        of squatting on the queue where it could swallow a later message.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -282,6 +336,43 @@ class _StdinDecisionPump:
                 return None
             if result != "empty":
                 return result
+
+    async def read_decision(self, timeout: float) -> Optional[tuple[str, Optional[str]]]:
+        """Await the next approval decision (or None on timeout/EOF).
+
+        A user-input answer line arriving while an approval is pending belongs
+        to no live request — it is dropped with a warning rather than blocking
+        the approval wait.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            msg = await self.read_message(remaining)
+            if msg is None:
+                return None
+            kind, payload, req_id = msg
+            if kind == "decision":
+                return payload, req_id
+            logger.warning("dropping %s line while waiting for an approval decision", kind)
+
+    async def read_user_input(self, timeout: float) -> Optional[tuple[dict, Optional[str]]]:
+        """Await the next user-input answer (or None on timeout/EOF)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            msg = await self.read_message(remaining)
+            if msg is None:
+                return None
+            kind, payload, req_id = msg
+            if kind == "user_input":
+                return payload, req_id
+            logger.warning("dropping %s line while waiting for a user-input answer", kind)
 
 
 _DECISION_PUMP: Optional[_StdinDecisionPump] = None
@@ -303,6 +394,13 @@ async def _read_stdin_decision(timeout: float) -> Optional[tuple[str, Optional[s
     pump = get_decision_pump()
     pump.start()
     return await pump.read_decision(timeout)
+
+
+async def _read_stdin_user_input(timeout: float) -> Optional[tuple[dict, Optional[str]]]:
+    """Wait for the next user-input answer line (or timeout/EOF → None)."""
+    pump = get_decision_pump()
+    pump.start()
+    return await pump.read_user_input(timeout)
 
 
 def _scrub(text: str) -> str:
@@ -334,6 +432,7 @@ class AppServerTurnRunner:
         binary_path: str,
         client: Optional[Any] = None,
         decision_reader: Optional[Callable[[float], Awaitable[Optional[tuple[str, Optional[str]]]]]] = None,
+        user_input_reader: Optional[Callable[[float], Awaitable[Optional[tuple[dict, Optional[str]]]]]] = None,
         register_process: Optional[Callable[[Any], None]] = None,
         install_signal_handler: bool = True,
     ) -> None:
@@ -348,6 +447,7 @@ class AppServerTurnRunner:
         self._binary = binary_path
         self._client = client  # injected fake in tests; real one built in run()
         self._decision_reader = decision_reader or _read_stdin_decision
+        self._user_input_reader = user_input_reader or _read_stdin_user_input
         self._register_process = register_process
         self._install_signal_handler = install_signal_handler
         self._interactive = _stdin_is_interactive()
@@ -516,15 +616,104 @@ class AppServerTurnRunner:
 
     async def _handle_server_request(self, req: ServerRequest) -> None:
         assert self._client is not None
-        if req.method not in _APPROVAL_METHODS:
-            # Unknown server request: answering wrongly is worse than the
-            # safest structured decline (codex tolerates unknown-field results
-            # poorly, but an unanswered request hangs the turn forever).
-            logger.warning("Unknown app-server request %s — declining", req.method)
+        if req.method in _APPROVAL_METHODS:
+            decision = await self._collect_decision(req)
+            await self._client.respond(req.id, self._decision_result(req.method, decision))
+            return
+        if req.method == _USER_INPUT_METHOD:
+            # Codex is asking the USER a question (C4) — surface it and wait
+            # for an answer instead of silently declining so codex guesses.
+            await self._client.respond(req.id, await self._collect_user_input(req))
+            return
+        if req.method == _ELICITATION_METHOD:
+            message = str(req.params.get("message") or "")
+            emit_event("user_input_request", id=str(req.id), kind="elicitation",
+                       message=message)
+            emit_status(
+                "An MCP server codex is using asked for input"
+                + (f": {_scrub(message)}" if message else "")
+                + " — Kim cannot fill MCP elicitation forms yet, so it was declined."
+            )
+            await self._client.respond(req.id, {"action": "decline"})
+            return
+        if req.method == _DYNAMIC_TOOL_METHOD:
+            tool = str(req.params.get("tool") or "unknown")
+            emit_status(
+                f"Codex tried to call the client-side tool '{tool}', which Kim "
+                "does not host — reporting it as unavailable."
+            )
             await self._client.respond(req.id, decline_result_for(req.method))
             return
-        decision = await self._collect_decision(req)
-        await self._client.respond(req.id, self._decision_result(req.method, decision))
+        # Unknown server request: answering wrongly is worse than the
+        # safest structured decline (codex tolerates unknown-field results
+        # poorly, but an unanswered request hangs the turn forever).
+        logger.warning("Unknown app-server request %s — declining", req.method)
+        emit_status(f"codex made an unsupported request ({req.method}) — declined.")
+        await self._client.respond(req.id, decline_result_for(req.method))
+
+    async def _collect_user_input(self, req: ServerRequest) -> dict:
+        """Surface an ``item/tool/requestUserInput`` and gather the answers.
+
+        Emits a ``user_input_request`` typed event (frontend hook: render the
+        questions and write a ``{"type":"user_input","id":…,"answers":…}``
+        line back on stdin — see ``parse_user_input_line``) plus visible
+        status lines so today's UI at least SHOWS the question. Sane default
+        when no answer arrives: respond ``{"answers": {}}`` so codex proceeds
+        knowing the user gave no answer, instead of a schema-invalid decline.
+        """
+        params = req.params
+        request_id = str(req.id)
+        questions = [q for q in (params.get("questions") or []) if isinstance(q, dict)]
+        emit_event(
+            "user_input_request",
+            id=request_id,
+            kind="questions",
+            item_id=str(params.get("itemId") or ""),
+            questions=questions,
+        )
+        for q in questions:
+            header = str(q.get("header") or "").strip()
+            question = str(q.get("question") or "").strip()
+            text = f"Codex asks: {header + ' — ' if header else ''}{question}"
+            options = q.get("options")
+            if isinstance(options, list) and options:
+                labels = ", ".join(
+                    str(o.get("label") or "") for o in options if isinstance(o, dict)
+                )
+                if labels:
+                    text += f" (options: {labels})"
+            emit_status(_scrub(text))
+        if not self._interactive:
+            emit_status(
+                "No interactive channel to answer codex's question — it will "
+                "proceed without an answer. Re-run from Kim to reply."
+            )
+            return {"answers": {}}
+        # Stale lines queued before this question started waiting cannot
+        # belong to it (same T1 rule as approvals).
+        if self._user_input_reader is _read_stdin_user_input:
+            get_decision_pump().drain()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._approval_timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            parsed = await self._user_input_reader(remaining)
+            if parsed is None:
+                break
+            answers, echo_id = parsed
+            if echo_id is None or echo_id == request_id:
+                return {"answers": answers}
+            logger.warning(
+                "discarding user-input answer for id %r — it does not match the "
+                "pending request %r", echo_id, request_id,
+            )
+        emit_status(
+            f"No answer within {int(self._approval_timeout)}s — codex proceeds "
+            "without one."
+        )
+        return {"answers": {}}
 
     def _decision_result(self, method: str, decision: str) -> dict:
         if method in _V1_APPROVAL_METHODS:
@@ -780,19 +969,28 @@ async def run_app_server_task(
     binary_path: str,
     client: Optional[Any] = None,
     decision_reader: Optional[Callable[[float], Awaitable[Optional[tuple[str, Optional[str]]]]]] = None,
+    user_input_reader: Optional[Callable[[float], Awaitable[Optional[tuple[dict, Optional[str]]]]]] = None,
     register_process: Optional[Callable[[Any], None]] = None,
     install_signal_handler: bool = True,
-) -> int:
+    version_gate_fallback: bool = False,
+) -> Optional[int]:
     """Run one code-mode message over the app-server transport.
 
     The caller (codex_bridge_service) has already: gated HITL/git, started the
     ``_CodexProxy`` and loaded the thread-state sidecar (which it saves again
     in its ``finally``).
+
+    With ``version_gate_fallback=True`` a version-gate refusal (major protocol
+    drift) returns ``None`` instead of failing, so the caller can degrade to
+    the legacy exec transport for this run — keeping the now-default
+    app-server transport safe against old/newer codex binaries.
     """
     ok, message = await check_binary_version(binary_path)
     if message:
         emit_status(message)
     if not ok:
+        if version_gate_fallback:
+            return None
         print(f"{LOG_TAG_FAILED} {message}", flush=True)
         return 1
     # Rb6: MAX_RELAYS is per-turn on this path.
@@ -809,6 +1007,7 @@ async def run_app_server_task(
         binary_path=binary_path,
         client=client,
         decision_reader=decision_reader,
+        user_input_reader=user_input_reader,
         register_process=register_process,
         install_signal_handler=install_signal_handler,
     )

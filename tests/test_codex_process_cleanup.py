@@ -65,7 +65,7 @@ class TestCodexProcessLifecycle(unittest.IsolatedAsyncioTestCase):
         result = await run_bridge(
             self.tmp,
             sleep_s=60,
-            config_yaml="codex_bridge:\n  task_timeout_s: 1\n",
+            config_yaml="codex_bridge:\n  transport: exec\n  task_timeout_s: 1\n",
         )
         self.assertEqual(result.rc, 1)
         pid_file = result.bin_dir / "pid.txt"

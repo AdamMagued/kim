@@ -36,7 +36,6 @@ EXPECTED_POSIX_ENV_KEYS = {
     "USER",
     "TMPDIR",
     "LANG",
-    "CODEX_HOME",
     "CODEX_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
@@ -56,7 +55,12 @@ _SCRUBBED_VARS = (
     "KIM_CLI_SESSION_ID",
     "KIM_PROVIDER",
     "CODEX_BIN",
+    "CODEX_HOME",
 )
+
+# The exec-path contract these harness tests pin. The service default is now
+# the app-server transport, so exec must be selected explicitly.
+_DEFAULT_CONFIG_YAML = "browser_provider: {}\ncodex_bridge:\n  transport: exec\n"
 
 
 def make_fake_codex_binary(
@@ -126,7 +130,7 @@ async def run_bridge(
     binary = make_fake_codex_binary(bin_dir, sleep_s=sleep_s, exit_code=exit_code)
 
     config_path = tmp / "config.yaml"
-    config_path.write_text(config_yaml or "browser_provider: {}\n")
+    config_path.write_text(config_yaml or _DEFAULT_CONFIG_YAML)
 
     parent_env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED_VARS}
     parent_env["CODEX_BIN"] = binary_override or str(binary)
