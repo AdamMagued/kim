@@ -1119,6 +1119,11 @@ class TestRepeatedCommandLoopGuard(unittest.IsolatedAsyncioTestCase):
         second = _json.loads((await proxy._handle_responses(self._request(proxy, 2))).text)
         self.assertIsNotNone(_tool_command_signature(first))
         self.assertIsNone(_tool_command_signature(second))
+        # The synthesized final answer must describe the REAL repeated command
+        # — never claim generic work ("the file was created") it can't verify.
+        final_text = second["output"][0]["content"][0]["text"]
+        self.assertIn("opening index.html", final_text)
+        self.assertNotIn("file was created", final_text)
 
     async def test_done_reminder_sent_to_chatgpt_on_tool_result_relay(self):
         from codex_engine.engine import _CodexProxy
