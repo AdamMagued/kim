@@ -11,8 +11,7 @@
 
 import type { KimMessage, TextBlock, ToolUseBlock, ToolResultBlock, SessionInfo } from '../../types';
 import type { ActivityItem, LivePlanParsed, TouchedFile, CodexRunGroup } from './types';
-// K5: bracket-tag vocabulary from the generated event manifest (single source of truth).
-import { LogTags } from '../../types/events.gen';
+import { LogTags } from '../../types/events.gen'; // K5: tag vocabulary from generated manifest
 
 // ── Simple helpers ────────────────────────────────────────────────────────────
 
@@ -320,8 +319,7 @@ export const HIDDEN_REGEX: RegExp[] = [
 
 export function isNoiseLine(raw: string): boolean {
   if (raw.startsWith(LogTags.STATUS) || raw.includes(LogTags.STATUS) || raw.startsWith(LogTags.ANSWER) || raw.includes(LogTags.ANSWER)) return false;
-  if (raw.includes(LogTags.SUCCESS) || raw.includes(LogTags.FAILED) || raw.includes(LogTags.ERROR)) return false;
-  if (raw.startsWith(LogTags.TOOL)) return false;
+  if (raw.includes(LogTags.SUCCESS) || raw.includes(LogTags.FAILED) || raw.includes(LogTags.ERROR) || raw.startsWith(LogTags.TOOL)) return false;
   const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
   const lower = line.toLowerCase();
   for (const sub of HIDDEN_SUBSTRINGS) {
