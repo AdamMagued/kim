@@ -1519,12 +1519,32 @@ def _parse_contract(content: object) -> Optional[dict]:
 # in ```bash fences — execute what they wrote instead of arguing.
 _SHELL_FENCE_RE = re.compile(r"```(?:bash|sh|shell|zsh)[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
+# Fallback for a leftover fence fragment: a streaming/multi-relay re-scrape can
+# catch just the tail of a code block ("open pong.html\n```", opening fence
+# lost), which matches no fenced pattern → a spurious "no runnable command"
+# nudge. If, after stripping stray ``` lines, ONE line remains and it starts
+# with a safe, expected command verb, run it. Deliberately conservative — no
+# rm/mv/dd/curl/chmod/sudo — a fragment must be an obvious build/open step.
+_SAFE_BARE_CMD_RE = re.compile(
+    r"^(?:open|printf|cat|echo|ls|pwd|mkdir|touch|cp|node|npm|npx|python3?|code|tee)\b",
+    re.IGNORECASE,
+)
+
 
 def _extract_shell_blocks(content: object) -> list:
     """Return the contents of ```bash/sh/shell/zsh fences (not html/js/etc.)."""
     if not isinstance(content, str):
         return []
-    return [block.strip() for block in _SHELL_FENCE_RE.findall(content) if block.strip()]
+    blocks = [block.strip() for block in _SHELL_FENCE_RE.findall(content) if block.strip()]
+    if blocks:
+        return blocks
+    # No clean fence — try the dangling-fragment fallback.
+    stripped = "\n".join(
+        line for line in content.splitlines() if line.strip() != "```"
+    ).strip()
+    if stripped and "\n" not in stripped and _SAFE_BARE_CMD_RE.match(stripped):
+        return [stripped]
+    return []
 
 
 # Tool calls the model wrapped in a ```json fence ("Run this in your Codex
