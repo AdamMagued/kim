@@ -535,6 +535,28 @@ class TestSandboxFingerprint(unittest.TestCase):
                 self.assertEqual(svc._sandbox_fingerprint(), "default")
 
 
+class TestCliSessionChanged(unittest.TestCase):
+    def test_new_session_id_triggers_reset(self):
+        from orchestrator import codex_bridge_service as svc
+
+        stored = {"sent_instructions": True, "cli_session": "sess-old"}
+        self.assertTrue(svc._cli_session_changed(stored, "sess-new"))
+        self.assertFalse(svc._cli_session_changed(stored, "sess-old"))
+
+    def test_no_current_session_never_resets(self):
+        from orchestrator import codex_bridge_service as svc
+
+        # Desktop app / headless: KIM_CLI_SESSION_ID unset → current "" → never
+        # falsely resets a shared thread.
+        self.assertFalse(svc._cli_session_changed({"cli_session": "sess-x"}, ""))
+
+    def test_legacy_sidecar_without_session_does_not_reset(self):
+        from orchestrator import codex_bridge_service as svc
+
+        # A sidecar from before this field existed: reuse once, then record.
+        self.assertFalse(svc._cli_session_changed({"sent_instructions": True}, "sess-new"))
+
+
 class TestThreadSandboxChanged(unittest.TestCase):
     def test_fresh_thread_never_counts_as_changed(self):
         from orchestrator import codex_bridge_service as svc

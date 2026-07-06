@@ -162,7 +162,7 @@ pub async fn stream_kim_request(
     // Browser providers intentionally stay on this path so Code mode can use
     // orchestrator.codex_bridge_service instead of the desktop chat bridge.
     if code_mode {
-        stream_codex_subprocess(config, prompt, allow_non_git, tx).await;
+        stream_codex_subprocess(config, prompt, allow_non_git, _session_id, tx).await;
         return;
     }
 
@@ -935,6 +935,7 @@ async fn stream_codex_subprocess(
     config: &KimConfig,
     prompt: &str,
     allow_non_git: bool,
+    session_id: &str,
     tx: UnboundedSender<AppEvent>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -986,6 +987,11 @@ async fn stream_codex_subprocess(
             .current_dir(&kim_root)
             .env("PYTHONPATH", &kim_root)
             .env("PROJECT_ROOT", &kim_root)
+            // Owning CLI session id. Stateful browser threads are keyed on
+            // (cwd, provider) on disk so per-message bridge spawns share them;
+            // this lets the bridge tell "next message, same session" from "user
+            // reopened kim" and start a fresh browser chat for a new session.
+            .env("KIM_CLI_SESSION_ID", session_id)
             // Signal the bridge that the user already confirmed running Codex
             // outside a git repo (see the y/N prompt in stream_repl_turn). Only
             // set when approved so the bridge's own gate stays in force otherwise.

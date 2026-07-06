@@ -162,6 +162,17 @@ def _sandbox_fingerprint() -> str:
     return "bypass" if bypass else "default"
 
 
+def _cli_session_changed(thread_state: dict, current_session: str) -> bool:
+    """True when a stored thread belongs to a DIFFERENT CLI session than the
+    current one (user quit and reopened kim). No current session id, no stored
+    session id, or a matching id all mean "not a new session" — so legacy
+    sidecars and the desktop app (which sets no id) never falsely reset."""
+    if not current_session:
+        return False
+    stored = thread_state.get("cli_session")
+    return bool(stored) and stored != current_session
+
+
 def _thread_sandbox_changed(thread_state: dict, current: str) -> bool:
     """True when a stored thread's instructions describe a different permission
     level than *current* (sidecars from before this field existed count as
@@ -384,8 +395,16 @@ async def _run_async(args: argparse.Namespace) -> int:
     stateful = bool(bp_cfg.get("stateful_threads", False))
     thread_state = load_thread_state(args.cwd, args.provider)
     current_sandbox = _sandbox_fingerprint()
+    current_session = os.environ.get("KIM_CLI_SESSION_ID", "").strip()
     if stateful and thread_state.get("sent_instructions"):
-        if thread_state.get("burned"):
+        if _cli_session_changed(thread_state, current_session):
+            # A different CLI session owns this on-disk thread — the user quit
+            # and reopened `kim` (a "new chat"). Resuming the old thread sends
+            # only the delta with no fresh system prompt, so the model drifts
+            # back to prose. Start a fresh browser chat for the new session.
+            _status("New Kim session — starting a fresh browser chat…")
+            thread_state = reset_thread_state(args.cwd, args.provider)
+        elif thread_state.get("burned"):
             # The stored thread ignored the tool protocol even after a format
             # nudge — its context argues against compliance, so resuming it
             # only compounds the refusals. Drop it (no compact: a summary
@@ -410,9 +429,12 @@ async def _run_async(args: argparse.Namespace) -> int:
                 _status("Browser thread near its limit — compacting into a fresh chat before this task…")
                 await _compact_browser_thread(provider, args.cwd, args.provider)
                 thread_state = load_thread_state(args.cwd, args.provider)
-    # Record the permission level this thread's instructions describe, so the
-    # next run can detect a change (persisted by save_thread_state below).
+    # Record the permission level + owning CLI session this thread's
+    # instructions describe, so the next run can detect a change (persisted by
+    # save_thread_state below).
     thread_state["sandbox"] = current_sandbox
+    if current_session:
+        thread_state["cli_session"] = current_session
 
     proxy = _CodexProxy(
         provider,
