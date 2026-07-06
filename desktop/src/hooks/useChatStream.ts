@@ -538,6 +538,7 @@ export function useChatStream({
         risk: e.payload.risk,
         reason: e.payload.reason,
         preview: e.payload.preview, // K6
+        id: e.payload.id, // T1: echoed back on the decision for stale-approval voiding
         approved: null,
       });
     }).then(fn => { if (!cancelled) unlistenTypedHitlRequest = fn; else fn(); });
@@ -550,6 +551,7 @@ export function useChatStream({
         // Carry the preview over so the command/diff preview doesn't vanish the moment
         // the user clicks Approve/Deny (StreamRenderer only renders it when set).
         preview: prev?.tool === e.payload.tool ? prev.preview : undefined,
+        id: prev?.tool === e.payload.tool ? prev.id : undefined,
         approved: e.payload.approved,
       }));
     }).then(fn => { if (!cancelled) unlistenTypedHitlResult = fn; else fn(); });
@@ -955,6 +957,9 @@ export function useChatStream({
       invoke('hitl_respond_approval', {
         approved,
         decision: decision ?? (approved ? 'accept' : 'decline'),
+        // T1: echo the pending request's id so Python only applies a decision
+        // matching the current prompt (a late click on a timed-out prompt is voided).
+        id: hitlApprovalStatus?.id,
       }).catch(() => {
         // M4: clicking Approve/Deny used to silently no-op when the invoke
         // rejected (dead run, IPC error) — card stayed pending, agent blocked.

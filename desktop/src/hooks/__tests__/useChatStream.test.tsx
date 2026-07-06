@@ -142,6 +142,26 @@ describe('useChatStream HITL approval flow', () => {
       decision: 'acceptForSession',
     });
   });
+
+  // T1: the correlation id from the pending request must be echoed back on the
+  // decision so Python voids a late click on an already-timed-out prompt.
+  it('hitlRespond echoes the pending request id back to hitl_respond_approval', async () => {
+    const { result } = await renderStream();
+    emit('kim:hitl-approval-request', {
+      tool: 'run_shell',
+      risk: 'high',
+      reason: 'arbitrary_code_execution',
+      preview: 'rm -rf build/',
+      id: 'req-77',
+    });
+    expect(result.current.hitlApprovalStatus?.id).toBe('req-77');
+    await act(async () => { await result.current.hitlRespond(true); });
+    expect(invokeMock).toHaveBeenCalledWith('hitl_respond_approval', {
+      approved: true,
+      decision: 'accept',
+      id: 'req-77',
+    });
+  });
 });
 
 // ── 2. Activity dedup ─────────────────────────────────────────────────────────

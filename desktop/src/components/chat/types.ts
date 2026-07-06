@@ -101,4 +101,6 @@ export interface HitlApprovalStatus {
   approved: boolean | null;
   /** K6: optional preview (command / unified diff / URL+label). */
   preview?: string;
+  /** T1: correlation id — echoed back on the decision so Python voids stale approvals. */
+  id?: string;
 }
