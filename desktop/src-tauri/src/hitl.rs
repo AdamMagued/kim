@@ -20,6 +20,12 @@ pub(crate) fn build_hitl_approve_line(
 ) -> String {
     let decision =
         decision.unwrap_or_else(|| if approved { "accept" } else { "decline" }.to_string());
+    // L-PROC-8: whitelist the decision vocabulary like build_approval_decision_line
+    // does — an unknown string can never be forwarded (and never approve).
+    let decision = match decision.as_str() {
+        "accept" | "acceptForSession" | "decline" => decision,
+        _ => "decline".to_string(),
+    };
     let approved = matches!(decision.as_str(), "accept" | "acceptForSession");
     let mut payload = serde_json::json!({
         "type": "hitl_approve",
@@ -63,8 +69,7 @@ pub(crate) async fn hitl_respond_approval(
     id: Option<String>,
 ) -> Result<(), String> {
     let msg = format!("{}\n", build_hitl_approve_line(approved, decision, id));
-    let mut rt = crate::task_runtime::task_runtime().lock().await;
-    rt.write_stdin_line(&msg).await
+    crate::task_runtime::write_stdin_line(&msg).await
 }
 
 /// Build the `approval_decision` stdin line for a NATIVE codex approval
@@ -90,8 +95,7 @@ pub(crate) fn build_approval_decision_line(id: &str, decision: &str) -> String {
 #[tauri::command]
 pub(crate) async fn respond_approval_decision(id: String, decision: String) -> Result<(), String> {
     let msg = format!("{}\n", build_approval_decision_line(&id, &decision));
-    let mut rt = crate::task_runtime::task_runtime().lock().await;
-    rt.write_stdin_line(&msg).await
+    crate::task_runtime::write_stdin_line(&msg).await
 }
 
 #[cfg(test)]
@@ -145,6 +149,16 @@ mod tests {
             assert_eq!(v["id"], "7");
             assert_eq!(v["decision"], decision);
         }
+    }
+
+    // L-PROC-8: an arbitrary decision string must never be forwarded raw to
+    // the Python stdin bridge — unknown vocabulary is downgraded to decline.
+    #[test]
+    fn test_hitl_line_unknown_decision_sanitized_to_decline() {
+        let line = build_hitl_approve_line(true, Some("yesplease\"}\n{".into()), None);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["decision"], "decline");
+        assert_eq!(v["approved"], false);
     }
 
     #[test]

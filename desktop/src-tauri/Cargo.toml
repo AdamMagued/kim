@@ -32,5 +32,10 @@ rand = "0.8"
 sha2 = "0.10"
 url = "2"
 
+[target.'cfg(unix)'.dependencies]
+# Direct kill(2)/ESRCH syscalls for process liveness checks and signalling —
+# replaces spawning a `kill` process every 100ms in cancel pollers (M-PROC-5).
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }

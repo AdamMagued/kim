@@ -1,7 +1,6 @@
 use crate::*;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tauri::State;
 
 pub(crate) fn forward_agent_stdout_line(
     app: &tauri::AppHandle,
@@ -248,8 +247,7 @@ pub(crate) fn forward_agent_stdout_line(
 pub(crate) async fn steer_task(text: String) -> Result<(), String> {
     let payload = serde_json::json!({ "type": "user_steer", "text": text }).to_string();
     let msg = format!("{payload}\n");
-    let mut rt = crate::task_runtime::task_runtime().lock().await;
-    rt.write_stdin_line(&msg).await
+    crate::task_runtime::write_stdin_line(&msg).await
 }
 
 include!("events.gen.rs");
@@ -533,7 +531,6 @@ pub(crate) async fn send_task(
     // Maps to KIM_HITL_RISK_THRESHOLD: full_auto=off, ask_risky=high, ask_always=medium
     permission_mode: Option<String>,
     app_handle: tauri::AppHandle,
-    _state: State<'_, TaskState>,
 ) -> Result<String, String> {
     use crate::task_spec;
 
@@ -644,7 +641,17 @@ pub(crate) async fn send_task(
         let _ = flash_win.close();
     }
 
-    let status = wait_result?;
+    // M-PROC-6: a wait() IO error must not strand the UI in the running
+    // state. Per the documented contract below, the frontend learns about
+    // completion/failure via kim-agent-done — emit it even on wait errors.
+    let status = match wait_result {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = app_handle.emit("kim-agent-error", format!("Task wait failed: {e}"));
+            let _ = app_handle.emit("kim-agent-done", false);
+            return Ok("Task ended".to_string());
+        }
+    };
 
     if is_codex {
         if was_claw {
@@ -878,10 +885,7 @@ async fn maybe_launch_chrome_for_cdp(kim_root: &Path, no_bridge: bool) {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub(crate) async fn cancel_task(
-    app_handle: tauri::AppHandle,
-    _state: State<'_, TaskState>,
-) -> Result<String, String> {
+pub(crate) async fn cancel_task(app_handle: tauri::AppHandle) -> Result<String, String> {
     let (pid, starting) = {
         let rt = crate::task_runtime::task_runtime().lock().await;
         (rt.pid, rt.starting)
@@ -920,9 +924,16 @@ pub(crate) async fn cancel_task(
             }
         }
         // Still alive after 2s → SIGKILL / taskkill /F.
-        let _ = send_signal(pid, true);
+        // M-PROC-3: re-check that the runtime still tracks THIS pid before
+        // escalating. If the child exited and the OS reused the pid (or a new
+        // task already occupies the slot), a blind group-SIGKILL would hit an
+        // unrelated process tree.
         let mut rt = crate::task_runtime::task_runtime().lock().await;
-        rt.clear_if_pid(pid); // #24: pid-guarded
+        if rt.pid == Some(pid) {
+            let _ = send_signal(pid, true);
+            rt.clear_if_pid(pid); // #24: pid-guarded
+        }
+        drop(rt);
         let _ = app.emit("kim-agent-cancelled", true);
     });
 
@@ -933,39 +944,33 @@ pub(crate) async fn cancel_task(
 
 #[cfg(unix)]
 pub(crate) fn send_signal(pid: u32, force: bool) -> std::io::Result<()> {
-    use std::process::Command;
-    let sig = if force { "-KILL" } else { "-TERM" };
+    // M-PROC-5: direct kill(2) syscalls instead of spawning a `kill` process —
+    // cancel pollers call this every 100ms, some while holding the runtime lock.
+    let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
     // Kill the process group (-pid) so child processes are also terminated (#64).
     // If group kill fails (e.g. the process is not a group leader), fall back
     // to killing only the parent process.
-    let neg_pid = format!("-{}", pid);
-    let status = Command::new("kill").args([sig, &neg_pid]).status();
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        _ => {
-            // Fallback: kill just the parent process
-            let status = Command::new("kill")
-                .args([sig, &pid.to_string()])
-                .status()?;
-            if !status.success() {
-                return Err(std::io::Error::other(format!(
-                    "kill {} {} failed with {}",
-                    sig, pid, status
-                )));
-            }
-            Ok(())
-        }
+    let group_ok = unsafe { libc::kill(-(pid as i32), sig) } == 0;
+    if group_ok {
+        return Ok(());
+    }
+    if unsafe { libc::kill(pid as i32, sig) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
 #[cfg(unix)]
 pub(crate) fn process_exists(pid: u32) -> bool {
-    use std::process::Command;
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // M-PROC-5: kill(pid, 0) syscall instead of spawning a `kill` process.
+    // Callers only ever pass pids of OUR children (which we can always
+    // signal), so EPERM can only mean the pid was reused by a foreign
+    // process after our child died — report that as "dead" so slot recovery
+    // still works. SIGKILL escalation paths additionally re-check identity
+    // against the runtime before signalling (M-PROC-3), so a reused pid is
+    // never group-killed.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 #[cfg(windows)]

@@ -124,10 +124,31 @@ fn write_account_atomic_inner(acct_path: &Path, account: &KimAccount) -> Result<
     let json = serde_json::to_string_pretty(account).map_err(|e| e.to_string())?;
     let tmp = acct_path.with_extension("json.tmp");
     fs::write(&tmp, &json).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, acct_path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        e.to_string()
-    })
+    match fs::rename(&tmp, acct_path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Windows rename does not overwrite an existing file on all
+            // filesystems; fall back to remove+rename (same pattern as
+            // session_store's atomic writer). Not perfectly atomic, but the
+            // ACCOUNT_SAVE_LOCK serialises writers.
+            #[cfg(target_os = "windows")]
+            {
+                let _ = &e;
+                if acct_path.exists() {
+                    fs::remove_file(acct_path).map_err(|remove_err| remove_err.to_string())?;
+                }
+                fs::rename(&tmp, acct_path).map_err(|rename_err| {
+                    let _ = fs::remove_file(&tmp);
+                    rename_err.to_string()
+                })
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = fs::remove_file(&tmp);
+                Err(e.to_string())
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -173,6 +194,25 @@ pub async fn clear_account() -> Result<(), String> {
     let path = account_path();
     if path.exists() {
         fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+
+    // H-ACCT-1: also wipe the credentials that outlive account.json — the
+    // keychain GitHub PAT and the Google OAuth refresh token. Without this,
+    // `load_account` re-attaches the PREVIOUS owner's tokens to the next
+    // account created on this machine (gist backups then write the new
+    // user's data to the old user's GitHub). Both deletes are idempotent.
+    let mut errors: Vec<String> = Vec::new();
+    if let Err(e) = crate::secrets::delete_github_token().await {
+        errors.push(format!("GitHub token: {e}"));
+    }
+    if let Err(e) = crate::google_oauth::delete_secret() {
+        errors.push(format!("Google token: {e}"));
+    }
+    if !errors.is_empty() {
+        return Err(format!(
+            "Account file removed, but stored credentials could not be deleted — remove them manually. {}",
+            errors.join("; ")
+        ));
     }
     Ok(())
 }

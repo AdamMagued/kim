@@ -249,6 +249,12 @@ pub(crate) async fn provider_check_auth(
     }
     // Timed out: report not-signed-in with an error so the UI shows the
     // re-sign-in affordance rather than blocking forever.
+    // L-AUTH-1: drop our req_id from the shared results map — if the JS
+    // callback lands after this timeout, the entry would otherwise sit in
+    // WEBVIEW_BRIDGE_RESULTS forever (nobody collects auth-… ids twice).
+    if let Ok(mut guard) = store.lock() {
+        guard.remove(&req_id);
+    }
     Ok(ProviderAuthStatus {
         provider: site,
         signed_in: false,

@@ -89,8 +89,16 @@ pub(crate) fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             }
             "privacy_pause" => {
                 // Toggle the K9 sentinel.
+                // L-TRAY-1: surface a failed toggle (e.g. ~/.kim not writable)
+                // instead of silently leaving capture in its previous state.
                 let on = crate::session_commands::get_privacy_pause();
-                let _ = crate::session_commands::set_privacy_pause(!on);
+                if let Err(e) = crate::session_commands::set_privacy_pause(!on) {
+                    eprintln!("[Kim] privacy-pause toggle failed (capture state unchanged): {e}");
+                    let _ = app.emit(
+                        "kim-agent-error",
+                        format!("Privacy pause toggle failed: {e}"),
+                    );
+                }
             }
             _ => {}
         })

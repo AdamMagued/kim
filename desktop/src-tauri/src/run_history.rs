@@ -301,25 +301,32 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        let reopened = std::process::Command::new("open")
-            .args(["-a", "Kim"])
-            .spawn()
-            .is_ok();
-        if !reopened {
-            if let Ok(exe) = std::env::current_exe() {
+        // M-UPDATE-1: running `open -a Kim` while THIS instance is still alive
+        // only ACTIVATES it (macOS never launches a second instance), so the
+        // subsequent exit() left the app closed instead of restarted. Detach a
+        // shell that waits for us to exit, then reopens the bundle.
+        let app_target: String = std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
                 let mut path = exe.as_path();
                 loop {
                     if path.extension().is_some_and(|e| e == "app") {
-                        let _ = std::process::Command::new("open").arg(path).spawn();
-                        break;
+                        return Some(path.to_string_lossy().into_owned());
                     }
                     match path.parent() {
                         Some(p) => path = p,
-                        None => break,
+                        None => return None,
                     }
                 }
-            }
-        }
+            })
+            .unwrap_or_else(|| "Kim".to_string());
+        // `open` takes either an .app path or (-a) an app name.
+        let open_cmd = if app_target.ends_with(".app") {
+            format!("sleep 1; open \"{}\"", app_target.replace('"', ""))
+        } else {
+            "sleep 1; open -a \"Kim\"".to_string()
+        };
+        let _ = std::process::Command::new("sh").arg("-c").arg(&open_cmd).spawn();
         // Use app_handle.exit() instead of std::process::exit() so that Tauri's
         // cleanup handlers and Rust Drop implementations run before the process
         // terminates.  std::process::exit() skips all of this.
