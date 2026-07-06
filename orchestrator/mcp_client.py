@@ -25,6 +25,27 @@ from orchestrator.approval_broker import get_approval_broker
 
 logger = logging.getLogger(__name__)
 
+# Non-secret env vars a third-party MCP server may legitimately need. Anything
+# outside this allowlist (API keys, OAuth tokens, the approval-socket address)
+# is withheld from external servers (finding 2.5). PYTHONPATH/PROJECT_ROOT/
+# VIRTUAL_ENV are kept because python-based extra servers commonly need them and
+# they carry no credentials.
+_EXTRA_SERVER_ENV_ALLOWLIST = (
+    "PATH", "HOME", "USER", "USERPROFILE", "SystemRoot", "SYSTEMROOT",
+    "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+    "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+    "PYTHONPATH", "PROJECT_ROOT", "VIRTUAL_ENV",
+)
+
+
+def _extra_server_env(base_env: dict, declared: Any) -> dict[str, str]:
+    """Build the env for a third-party MCP server: a non-secret allowlist from
+    the parent environment plus the server's own declared `env:` block."""
+    env = {k: base_env[k] for k in _EXTRA_SERVER_ENV_ALLOWLIST if k in base_env}
+    if isinstance(declared, dict):
+        env.update({str(k): str(v) for k, v in declared.items()})
+    return env
+
 
 class MultiMCPClient:
     """
@@ -118,6 +139,15 @@ async def mcp_session_context(config: dict):
     extra_servers = config.get("mcp_servers", {})
     if isinstance(extra_servers, dict):
         for name, s_cfg in extra_servers.items():
+            # A malformed entry (null/string instead of a mapping) must not
+            # crash the whole session bootstrap — one bad OPTIONAL server would
+            # otherwise take down the core Kim server too (finding 2.2).
+            if not isinstance(s_cfg, dict):
+                logger.warning(
+                    "MCP server '%s' config is %s (expected a mapping) — skipping",
+                    name, type(s_cfg).__name__,
+                )
+                continue
             cmd = s_cfg.get("command")
             if not cmd:
                 logger.warning(f"MCP server '{name}' missing 'command' — skipping")
@@ -126,7 +156,12 @@ async def mcp_session_context(config: dict):
                 command=cmd,
                 args=s_cfg.get("args", []),
                 cwd=s_cfg.get("cwd") or project_root,
-                env=merged_env,
+                # Third-party servers get a MINIMAL env, never the full parent
+                # environment (finding 2.5). merged_env carries ANTHROPIC_API_KEY,
+                # KIM_GOOGLE_ACCESS_TOKEN, and the approval-socket address — none
+                # of which any external binary should see. A server that needs a
+                # secret declares it in its own `env:` block in config.yaml.
+                env=_extra_server_env(merged_env, s_cfg.get("env")),
             ))
 
     async with AsyncExitStack() as stack:

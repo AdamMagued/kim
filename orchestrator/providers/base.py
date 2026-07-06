@@ -19,9 +19,54 @@ Return value (see ProviderResponse below):
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Literal, TypedDict, Union
+from typing import Any, Literal, Optional, TypedDict, Union
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Stop / finish reason handling (finding 3.1)
+# ---------------------------------------------------------------------------
+# Providers historically returned only the completion text and dropped the
+# stop/finish reason, so a max_tokens-truncated answer was presented as a
+# complete one and a safety-blocked reply came back as a silent empty string.
+# finalize_text_content() annotates the terminal text with an honest note so
+# neither failure masquerades as a finished answer. Reasons are matched
+# case-insensitively to cover Anthropic ("max_tokens"), OpenAI ("length",
+# "content_filter") and Gemini ("MAX_TOKENS", "SAFETY", …) vocabularies.
+
+_TRUNCATION_STOP_REASONS = frozenset({"max_tokens", "length", "model_length", "max_output_tokens"})
+_BLOCK_STOP_REASONS = frozenset({
+    "content_filter", "safety", "recitation", "refusal",
+    "prohibited_content", "blocklist", "spii", "other",
+})
+
+_TRUNCATION_NOTE = (
+    "[Response truncated: the model hit its output-token limit before "
+    "finishing. Ask for a shorter answer or raise max_tokens.]"
+)
+
+
+def finalize_text_content(content: str, stop_reason: Optional[str]) -> str:
+    """Annotate terminal completion text based on why generation stopped.
+
+    - Truncation (max_tokens/length): append a note so a clipped answer is not
+      mistaken for a complete one. When nothing was produced, the note stands
+      in for the empty string.
+    - Block/refusal (content_filter/safety/…): when the model produced no text,
+      return an explanatory line instead of a blank reply.
+    Normal stops ("stop", "end_turn", "tool_use", None) pass through unchanged.
+    """
+    content = content or ""
+    reason = (stop_reason or "").strip().lower()
+    if reason in _TRUNCATION_STOP_REASONS:
+        return f"{content}\n\n{_TRUNCATION_NOTE}" if content.strip() else _TRUNCATION_NOTE
+    if reason in _BLOCK_STOP_REASONS and not content.strip():
+        return (
+            f"[No answer produced: the model stopped for reason "
+            f"'{stop_reason}' (typically a safety block or filtered content).]"
+        )
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +152,16 @@ def classify_provider_error(error: Exception) -> ProviderError:
     if isinstance(error, ProviderEnvironmentError):
         return ProviderError("environment", str(error), retryable=False)
 
+    import json as _json_provider_error
     import re as _re_provider_error
+
+    # A JSONDecodeError is a ValueError subclass, so without this it falls into
+    # the invalid_request branch below and is marked non-retryable — but it
+    # almost always means a truncated or proxy-garbled response body (e.g.
+    # Gemini's REST transport doing json.loads on a mangled 200), which is a
+    # transient network failure worth retrying (finding 3.4).
+    if isinstance(error, _json_provider_error.JSONDecodeError):
+        return ProviderError("network", str(error), retryable=True)
 
     message = str(error)
     lowered = message.lower()

@@ -32,6 +32,29 @@ from mcp_server.os_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Hard upper bound on a model-supplied `timeout` argument (seconds). The tool
+# schema places no maximum, so without this a model could request an arbitrarily
+# long timeout and keep the command executing on the server long after the agent
+# client abandoned the call — the model then re-issues it and the side effect
+# happens twice (finding 2.1). The agent-side client-timeout cap
+# (orchestrator/agent.py _MAX_SHELL_EXEC_S) is kept in sync with this ceiling so
+# the client always waits strictly longer than the server can legitimately run.
+MAX_SHELL_TIMEOUT_S = 600
+
+
+def _clamp_shell_timeout(raw: object) -> int:
+    """Coerce a model-supplied timeout to a positive int within the hard cap."""
+    try:
+        val = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return SHELL_TIMEOUT
+    if val < 1:
+        return 1
+    if val > MAX_SHELL_TIMEOUT_S:
+        return MAX_SHELL_TIMEOUT_S
+    return val
+
+
 # ── Deny sets ─────────────────────────────────────────────────────────────────
 
 # Commands that are unconditionally blocked (first token after shlex.split).
@@ -422,7 +445,7 @@ def _check_blocked(cmd: str, allow_chaining: bool = False, powershell: bool = Fa
 async def handle_run_command(args: dict) -> str:
     cmd = args["cmd"]
     cwd = str(args.get("cwd", str(PROJECT_ROOT)))
-    timeout = int(args.get("timeout", SHELL_TIMEOUT))
+    timeout = _clamp_shell_timeout(args.get("timeout", SHELL_TIMEOUT))
     # allow_chaining and sandbox_mode are operator/server-config-only values —
     # never read from model-supplied args (finding 2).  Any model-injected copy
     # of these keys is silently ignored here; additionalProperties:false on the
@@ -514,7 +537,7 @@ async def handle_run_powershell(args: dict) -> str:
         the LLM use run_command with bash/zsh instead.
     """
     script = args["script"]
-    timeout = int(args.get("timeout", SHELL_TIMEOUT))
+    timeout = _clamp_shell_timeout(args.get("timeout", SHELL_TIMEOUT))
     # sandbox_mode is operator/server-config-only — never from model args (finding 2).
     sandbox_mode = _sandbox_enabled()
 

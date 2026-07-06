@@ -20,26 +20,123 @@ _CONFIG_PATH = _PROJECT_DIR / "config.yaml"
 
 
 def _load_yaml() -> dict:
-    if _CONFIG_PATH.exists():
+    """Load config.yaml into a dict.
+
+    A malformed or non-mapping config must never crash the MCP server at
+    import (finding 1.2 / 1.3): a YAML syntax error or a top-level that is not
+    a mapping falls back to an empty config with a warning, mirroring the Rust
+    loader (desktop/src-tauri/src/config.rs) which already degrades gracefully.
+    """
+    if not _CONFIG_PATH.exists():
+        return {}
+    try:
         with open(_CONFIG_PATH, "r") as f:
-            return yaml.safe_load(f) or {}
-    return {}
+            data = yaml.safe_load(f)
+    except (yaml.YAMLError, OSError) as exc:
+        logger.warning(
+            "Failed to parse %s (%s); using built-in defaults.", _CONFIG_PATH, exc
+        )
+        return {}
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        logger.warning(
+            "%s top-level is %s (expected a mapping); using built-in defaults.",
+            _CONFIG_PATH, type(data).__name__,
+        )
+        return {}
+    return data
+
+
+# ── Type-coercion helpers ──────────────────────────────────────────────────
+# A partial or hand-edited config.yaml commonly leaves a section header with no
+# body (e.g. `shell:` with every option commented out) — YAML parses that as
+# None. `None.get(...)` would raise AttributeError at import and stop the MCP
+# server from ever starting (finding 1.2). These helpers make every section
+# read and scalar coercion null-safe and type-safe instead.
+
+def _section(cfg: dict, key: str) -> dict:
+    """Return cfg[key] when it is a mapping, else an empty dict."""
+    val = cfg.get(key)
+    return val if isinstance(val, dict) else {}
+
+
+def _as_bool(val: object, default: bool) -> bool:
+    """Coerce a config value to bool without the str-is-always-truthy trap.
+
+    `bool("false")` is True, so `bool(cfg.get(...))` silently inverts a quoted
+    "false"/"no"/"off" (finding 1.4 — a privacy inversion for use_real_browser).
+    Recognise the common textual spellings; warn and fall back on anything else.
+    """
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off", ""}:
+        return False
+    logger.warning("config: expected a boolean, got %r; using %s", val, default)
+    return default
+
+
+def _as_int(val: object, default: int) -> int:
+    """Coerce a config value to int, warning and falling back on bad input."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        # bool is an int subclass; a boolean where a count/timeout is expected
+        # is almost certainly a mistake, so reject rather than silently use 0/1.
+        logger.warning("config: expected an integer, got bool %r; using %s", val, default)
+        return default
+    if isinstance(val, int):
+        return val
+    if isinstance(val, (float, str)):
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            pass
+    logger.warning("config: expected an integer, got %r; using %s", val, default)
+    return default
 
 
 _cfg = _load_yaml()
 
 # Resolve project_root relative to config.yaml's directory — NOT cwd.
 # This makes project_root: "." work correctly regardless of launch dir.
-_raw_root = os.environ.get("PROJECT_ROOT") or _cfg.get("project_root", str(_PROJECT_DIR))
-_root_path = Path(_raw_root)
+_raw_root = os.environ.get("PROJECT_ROOT") or _cfg.get("project_root") or str(_PROJECT_DIR)
+_root_path = Path(str(_raw_root))
 if not _root_path.is_absolute():
     _root_path = _PROJECT_DIR / _root_path
 PROJECT_ROOT = _root_path.resolve()
 
-# Resolve allowed_paths the same way (with ~ expansion)
+# Resolve allowed_paths the same way (with ~ expansion).
+# allowed_paths MUST be a list. A bare scalar string (e.g. `allowed_paths: ~`)
+# is a common mistake that would otherwise be iterated CHARACTER-BY-CHARACTER,
+# turning "~/x" into allowed roots "/" and "$HOME" — a full-filesystem sandbox
+# escape (finding 1.1). Coerce a lone string to a one-element list and reject
+# any other non-list shape.
 _raw_allowed = _cfg.get("allowed_paths", [str(PROJECT_ROOT)])
+if isinstance(_raw_allowed, str):
+    logger.warning(
+        "allowed_paths should be a LIST, got a bare string %r; treating it as a "
+        "single entry. Use YAML list syntax (e.g. `allowed_paths: [\"%s\"]`).",
+        _raw_allowed, _raw_allowed,
+    )
+    _raw_allowed = [_raw_allowed]
+elif not isinstance(_raw_allowed, (list, tuple)):
+    logger.warning(
+        "allowed_paths must be a list, got %s; restricting to project root only.",
+        type(_raw_allowed).__name__,
+    )
+    _raw_allowed = [str(PROJECT_ROOT)]
+
 ALLOWED_PATHS = []
 for p in _raw_allowed:
+    if not isinstance(p, str):
+        logger.warning("allowed_paths entry %r is not a string; skipping.", p)
+        continue
     pp = Path(p).expanduser()
     if not pp.is_absolute():
         pp = _PROJECT_DIR / pp
@@ -54,17 +151,17 @@ for p in _raw_allowed:
 if PROJECT_ROOT not in ALLOWED_PATHS:
     ALLOWED_PATHS.append(PROJECT_ROOT)
 
-SHELL_TIMEOUT: int = int(_cfg.get("shell", {}).get("timeout", 30))
+SHELL_TIMEOUT: int = _as_int(_section(_cfg, "shell").get("timeout"), 30)
 _shell_sandbox_env = os.environ.get("KIM_SHELL_SANDBOX_MODE")
 if _shell_sandbox_env is None:
-    SHELL_SANDBOX_MODE: bool = bool(_cfg.get("shell", {}).get("sandbox_mode", True))
+    SHELL_SANDBOX_MODE: bool = _as_bool(_section(_cfg, "shell").get("sandbox_mode"), True)
 else:
     SHELL_SANDBOX_MODE = _shell_sandbox_env.strip().lower() in {"1", "true", "yes", "on"}
-CODE_TIMEOUT: int = int(_cfg.get("code_timeout", 30))
-PREVIEW_MODE: bool = bool(_cfg.get("preview_mode", False))
-LOG_LEVEL: str = _cfg.get("logging", {}).get("level", "INFO")
-BROWSER_HEADLESS: bool = bool(
-    _cfg.get("browser_provider", {}).get("browser_headless", False)
+CODE_TIMEOUT: int = _as_int(_cfg.get("code_timeout"), 30)
+PREVIEW_MODE: bool = _as_bool(_cfg.get("preview_mode"), False)
+LOG_LEVEL: str = str(_section(_cfg, "logging").get("level") or "INFO")
+BROWSER_HEADLESS: bool = _as_bool(
+    _section(_cfg, "browser_provider").get("browser_headless"), False
 )
 # Canonical fallback for `use_real_browser` when the key is absent from
 # config.yaml. False keeps Kim on its dedicated managed Chromium instead of
@@ -72,18 +169,21 @@ BROWSER_HEADLESS: bool = bool(
 # missing key should never trigger. Mirrors the shipped `config.yaml`
 # (`use_real_browser: false`); see tests/test_config_parity.py.
 DEFAULT_USE_REAL_BROWSER: bool = False
-USE_REAL_BROWSER: bool = bool(
-    _cfg.get("use_real_browser", DEFAULT_USE_REAL_BROWSER)
+USE_REAL_BROWSER: bool = _as_bool(
+    _cfg.get("use_real_browser"), DEFAULT_USE_REAL_BROWSER
 )
-VOICE_ENABLED: bool = bool(_cfg.get("voice_enabled", False))
+VOICE_ENABLED: bool = _as_bool(_cfg.get("voice_enabled"), False)
 
 # ── Site connectors ───────────────────────────────────────────────────────
 # `connectors.enabled` is a list of connector ids (e.g. ["guc_cms",
 # "guc_mail"]). The MCP server merges those connectors' tools into its
 # dispatch map at startup, so the LLM only sees toolkits the user has
 # explicitly opted into. Unknown ids are warned about and skipped.
-_connectors_cfg = _cfg.get("connectors", {}) or {}
-ENABLED_CONNECTOR_IDS: list[str] = list(_connectors_cfg.get("enabled", []))
+_connectors_cfg = _section(_cfg, "connectors")
+_enabled_ids_raw = _connectors_cfg.get("enabled", [])
+ENABLED_CONNECTOR_IDS: list[str] = (
+    list(_enabled_ids_raw) if isinstance(_enabled_ids_raw, (list, tuple)) else []
+)
 
 # ── Sensitive path deny list (#3) ─────────────────────────────────────────────
 # Even when a path falls within ALLOWED_PATHS, these directories are always
@@ -192,4 +292,10 @@ def validate_path(path_str: str) -> Path:
 
 
 def get_config() -> dict:
-    return _cfg
+    """Return a shallow copy of the loaded config.
+
+    A copy (rather than the module-global dict) keeps callers from silently
+    mutating the shared configuration — e.g. policy.hitl_threshold() reads
+    hitl_risk_threshold from this dict on every call (finding 1.5).
+    """
+    return dict(_cfg)
