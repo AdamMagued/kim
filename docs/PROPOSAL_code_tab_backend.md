@@ -35,7 +35,7 @@ Tauri send_task  (subprocess.rs:find_code_backend)
 python -m orchestrator.run_codex_bridge
        │
        ▼
-mcp_server/tools/codex_bridge.py :: run_codex_subtask()
+orchestrator/codex_bridge_service.py :: _run_async()  (spawns codex itself)
        │  starts aiohttp proxy on ephemeral port
        ▼
 codex exec --json --dangerously-bypass-approvals-and-sandbox
