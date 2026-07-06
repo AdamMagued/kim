@@ -77,8 +77,14 @@ def annotate_screenshot(
             f"grid_cols must be between 1 and {max_cols} (got {grid_cols}). "
             f"Supported column labels: {_COL_LABELS}"
         )
-    if grid_rows < 1:
-        raise ValueError(f"grid_rows must be at least 1 (got {grid_rows}).")
+    # Cap rows like columns (L3): an unbounded model-supplied grid_rows
+    # (e.g. 100000) would draw hundreds of thousands of markers synchronously
+    # on the event loop.
+    max_rows = 100
+    if not (1 <= grid_rows <= max_rows):
+        raise ValueError(
+            f"grid_rows must be between 1 and {max_rows} (got {grid_rows})."
+        )
 
     # Work on a copy so the caller keeps the original
     annotated = img.copy()

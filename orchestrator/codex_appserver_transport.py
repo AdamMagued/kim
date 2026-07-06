@@ -639,6 +639,7 @@ class AppServerTurnRunner:
 
 async def check_binary_version(binary_path: str) -> tuple[bool, Optional[str]]:
     """Part-0 version gate: run ``codex --version``; refuse only on major drift."""
+    proc: Optional[asyncio.subprocess.Process] = None
     try:
         proc = await asyncio.create_subprocess_exec(
             binary_path, "--version",
@@ -649,6 +650,13 @@ async def check_binary_version(binary_path: str) -> tuple[bool, Optional[str]]:
         version_output = raw.decode("utf-8", errors="replace")
     except Exception as exc:  # noqa: BLE001
         logger.warning("codex --version failed (%s) — skipping the version gate", exc)
+        # wait_for cancels communicate() but leaves the child running (C3):
+        # reap it so a hung version check doesn't orphan a codex process.
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
         return True, None
     return check_schema_drift(version_output)
 

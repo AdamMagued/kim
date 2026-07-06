@@ -101,7 +101,14 @@ async def handle_list_dir(args: dict) -> str:
             if entry.is_dir():
                 entries.append(f"[DIR]  {entry.name}/")
             else:
-                entries.append(f"[FILE] {entry.name}  ({entry.stat().st_size} bytes)")
+                # A broken symlink makes stat() raise; don't fail the whole
+                # listing over one dangling entry (L1 — mirrors the guard the
+                # recursive branch already has).
+                try:
+                    size = entry.stat().st_size
+                except OSError:
+                    size = 0
+                entries.append(f"[FILE] {entry.name}  ({size} bytes)")
     logger.info(f"list_dir: {path} ({len(entries)} entries)")
     return "\n".join(entries) if entries else "(empty directory)"
 

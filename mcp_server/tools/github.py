@@ -101,13 +101,24 @@ def _run_gh(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[s
         extra_keys=("GH_TOKEN", "GITHUB_TOKEN", "GH_HOST"),
         overrides={"GH_PROMPT_DISABLED": "1"},
     )
-    return subprocess.run(
-        ["gh", *args],
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        env=env,
-    )
+    try:
+        return subprocess.run(
+            ["gh", *args],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        # A hung gh must degrade like any other gh failure (returncode != 0)
+        # so callers' browser-fallback path still engages instead of the
+        # whole tool failing hard on an uncaught exception (M5).
+        return subprocess.CompletedProcess(
+            args=["gh", *args],
+            returncode=124,
+            stdout="",
+            stderr=f"gh timed out after {timeout}s",
+        )
 
 
 async def _run_gh_async(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:

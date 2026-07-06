@@ -196,6 +196,66 @@ async def _active_browser_context() -> Any:
     return await _browser_ctx.new_context()
 
 
+async def _connect_browser_ctx() -> None:
+    """Populate ``_browser_ctx`` via CDP connect / launch / persistent-context fallback."""
+    global _browser_ctx, _is_real_browser, _last_connection_error
+    _last_connection_error = ""
+
+    if USE_REAL_BROWSER:
+        # 1. Try to connect to an existing browser on the configured port (#3).
+        _browser_ctx = await _connect_over_cdp(_REAL_BROWSER_CDP_PORT)
+        if _browser_ctx is not None:
+            _is_real_browser = True
+            logger.info(f"web: connected to existing browser via CDP on port {_REAL_BROWSER_CDP_PORT}")
+
+        if _browser_ctx is None:
+            # 2. If connection fails, try to launch the real browser with CDP flag
+            logger.info(f"web: no browser on {_REAL_BROWSER_CDP_PORT} ({_last_connection_error}), attempting launch...")
+            if await _launch_real_browser():
+                # Retry connection a few times
+                for attempt in range(1, 6):
+                    logger.info(f"web: connection attempt {attempt}/5...")
+                    await asyncio.sleep(2)
+                    _browser_ctx = await _connect_over_cdp(_REAL_BROWSER_CDP_PORT)
+                    if _browser_ctx is not None:
+                        _is_real_browser = True
+                        logger.info("web: connected to real browser via CDP after launch")
+                        break
+
+    # 3. Fallback to Kim's own persistent context if CDP failed or was disabled
+    if _browser_ctx is None:
+        _is_real_browser = False
+        _browser_ctx = await _connect_over_cdp(_DEDICATED_CDP_PORT)
+        if _browser_ctx is None:
+            logger.info(
+                f"web: launching detached dedicated Kim browser profile "
+                f"(Reason: {_last_connection_error})"
+            )
+            if await _launch_dedicated_browser():
+                for attempt in range(1, 8):
+                    logger.info(f"web: dedicated browser connection attempt {attempt}/7...")
+                    await asyncio.sleep(1)
+                    _browser_ctx = await _connect_over_cdp(_DEDICATED_CDP_PORT)
+                    if _browser_ctx is not None:
+                        break
+
+        if _browser_ctx is None:
+            logger.warning(
+                "web: detached dedicated browser failed; falling back to "
+                f"Playwright-owned persistent context ({_last_connection_error})"
+            )
+            _browser_ctx = await _playwright.chromium.launch_persistent_context(
+                user_data_dir=str(USER_DATA_DIR),
+                headless=False,
+                viewport={"width": 1280, "height": 820},
+                args=[
+                    "--no-default-browser-check",
+                    "--no-first-run",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+
+
 async def _ensure_browser() -> None:
     """Lazily start Playwright + Chromium, reuse across tool calls."""
     global _playwright, _browser_ctx, _active_page, _is_real_browser
@@ -213,68 +273,35 @@ async def _ensure_browser() -> None:
     if _playwright is None:
         _playwright = await async_playwright().start()
 
-    if _browser_ctx is None:
-        global _last_connection_error
-        _last_connection_error = ""
-
-        if USE_REAL_BROWSER:
-            # 1. Try to connect to an existing browser on the configured port (#3).
-            _browser_ctx = await _connect_over_cdp(_REAL_BROWSER_CDP_PORT)
-            if _browser_ctx is not None:
-                _is_real_browser = True
-                logger.info(f"web: connected to existing browser via CDP on port {_REAL_BROWSER_CDP_PORT}")
-
-            if _browser_ctx is None:
-                # 2. If connection fails, try to launch the real browser with CDP flag
-                logger.info(f"web: no browser on {_REAL_BROWSER_CDP_PORT} ({_last_connection_error}), attempting launch...")
-                if await _launch_real_browser():
-                    # Retry connection a few times
-                    for attempt in range(1, 6):
-                        logger.info(f"web: connection attempt {attempt}/5...")
-                        await asyncio.sleep(2)
-                        _browser_ctx = await _connect_over_cdp(_REAL_BROWSER_CDP_PORT)
-                        if _browser_ctx is not None:
-                            _is_real_browser = True
-                            logger.info("web: connected to real browser via CDP after launch")
-                        if _browser_ctx:
-                            break
-
-        # 3. Fallback to Kim's own persistent context if CDP failed or was disabled
+    for attempt in (1, 2):
         if _browser_ctx is None:
-            _is_real_browser = False
-            _browser_ctx = await _connect_over_cdp(_DEDICATED_CDP_PORT)
-            if _browser_ctx is None:
-                logger.info(
-                    f"web: launching detached dedicated Kim browser profile "
-                    f"(Reason: {_last_connection_error})"
-                )
-                if await _launch_dedicated_browser():
-                    for attempt in range(1, 8):
-                        logger.info(f"web: dedicated browser connection attempt {attempt}/7...")
-                        await asyncio.sleep(1)
-                        _browser_ctx = await _connect_over_cdp(_DEDICATED_CDP_PORT)
-                        if _browser_ctx is not None:
-                            break
-
-            if _browser_ctx is None:
-                logger.warning(
-                    "web: detached dedicated browser failed; falling back to "
-                    f"Playwright-owned persistent context ({_last_connection_error})"
-                )
-                _browser_ctx = await _playwright.chromium.launch_persistent_context(
-                    user_data_dir=str(USER_DATA_DIR),
-                    headless=False,
-                    viewport={"width": 1280, "height": 820},
-                    args=[
-                        "--no-default-browser-check",
-                        "--no-first-run",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                )
-
-    context = await _active_browser_context()
-    pages = context.pages
-    _active_page = pages[-1] if pages else await context.new_page()
+            await _connect_browser_ctx()
+        try:
+            context = await _active_browser_context()
+            pages = context.pages
+            page = pages[-1] if pages else await context.new_page()
+            # Liveness probe: a stale context happily hands back dead pages.
+            await page.evaluate("1")
+            _active_page = page
+            return
+        except Exception:
+            # The browser quit/crashed but the stale context object is not
+            # None, so the reconnect path above never ran — every web tool
+            # would raise TargetClosedError forever. Reset the context so
+            # the relaunch/reconnect path actually runs (H1).
+            logger.info(
+                "web: browser context appears dead, resetting for reconnect "
+                f"(attempt {attempt}/2)"
+            )
+            if _browser_ctx is not None:
+                try:
+                    await _browser_ctx.close()
+                except Exception:
+                    pass
+            _browser_ctx = None
+            _active_page = None
+            if attempt == 2:
+                raise
 
 
 # _on_context_closed was defined here but never wired to a context event, so it
@@ -377,6 +404,13 @@ def _is_ssrf_target(url: str) -> bool:
         host = parsed.hostname or ""
         # Strip IPv6 brackets that urlparse leaves on literal addresses.
         host = host.strip("[]")
+        # `localhost` (and RFC 6761 `*.localhost`) always resolves to loopback
+        # but is not a numeric IP, so it fell through the ValueError→allow
+        # branch below — the most obvious spelling of the exact class the
+        # numeric-loopback block (#51) exists to stop (H2).
+        lowered = host.lower().rstrip(".")
+        if lowered == "localhost" or lowered.endswith(".localhost"):
+            return True
         try:
             addr = _parse_host_as_ip(host)
         except ValueError:
@@ -444,8 +478,9 @@ async def handle_web_open(args: dict) -> str:
         _auth_route_handler = _do_auth_route
         _auth_route_pattern = f"{origin_prefix}/**"
         await page.route(_auth_route_pattern, _auth_route_handler)
-    else:
-        await page.set_extra_http_headers({})
+    # (No else branch: the old `set_extra_http_headers({})` call was leftover
+    # from the removed set_http_credentials approach (#50) — it cleared headers
+    # that were never set. L7.)
 
     _goto_error: Exception | None = None
     try:
@@ -1513,7 +1548,10 @@ async def handle_web_wait_for(args: dict) -> str:
         return "ERROR: 'text' or 'selector' is required"
     page = await _page()
     try:
-        if selector or target.startswith(("css=", "xpath=", "/")):
+        # A leading "/" only means XPath when the caller explicitly used the
+        # `selector` argument — plain page text like "/pricing" must be
+        # treated as text, not a selector (L6).
+        if selector or target.startswith(("css=", "xpath=")):
             await page.locator(target).first.wait_for(timeout=timeout, state="visible")
             return f"Selector matched: {target}"
         await page.get_by_text(target, exact=False).first.wait_for(
