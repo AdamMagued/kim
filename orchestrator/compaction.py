@@ -13,6 +13,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
+# Single source of truth for token estimation (finding 4.4): compaction reuses
+# context_meter's estimator so the compact threshold and the UI gauge agree.
+from orchestrator.context_meter import IMAGE_TOKEN_ESTIMATE, estimate_content_tokens  # noqa: F401
+
 COMPACT_PREAMBLE = (
     "This session is being continued from a previous conversation that ran out of "
     "context. The summary below covers the earlier portion of the conversation.\n\n"
@@ -26,7 +30,10 @@ COMPACT_RESUME_INSTRUCTION = (
 
 PRESERVE_RECENT_MESSAGES = 6
 MAX_ESTIMATED_TOKENS = 10_000
-IMAGE_TOKEN_ESTIMATE = 1500  # consistent with context_meter.py
+# Max chars of a tool-result body kept in the local summary timeline. Large
+# enough to carry the useful part of a web_text/read_file/get_windows result,
+# small enough that 20 timeline entries stay well under the compact threshold.
+TOOL_RESULT_SNIPPET_CHARS = 500
 
 
 # ---------------------------------------------------------------------------
@@ -117,21 +124,10 @@ def _split_existing_summary(messages: list[dict]) -> tuple[str, list[dict]]:
 
 
 def _estimate_message_tokens(msg: dict) -> int:
-    content = msg.get("content", "")
-    if isinstance(content, list):
-        total = 0
-        for item in content:
-            if isinstance(item, dict):
-                if item.get("type") == "image":
-                    total += IMAGE_TOKEN_ESTIMATE
-                else:
-                    total += len(item.get("text", "")) // 4 + 1
-            else:
-                total += len(str(item)) // 4 + 1
-        return max(1, total)
-    else:
-        text = str(content or "")
-        return max(1, len(text) // 4 + 1)
+    # Single tokenizer: delegate to context_meter's estimator so should_compact
+    # (10k threshold) and the UI gauge (200k budget) can never disagree about
+    # what a message "costs" (finding 4.4).
+    return max(1, estimate_content_tokens(msg.get("content", "")))
 
 
 def _is_tool_result(msg: dict) -> bool:
@@ -211,8 +207,14 @@ def _summarize_messages(messages: list[dict]) -> str:
 
         if role == "user":
             if text.startswith("[Tool result:"):
-                first_line = text.split("\n", 1)[0]
-                timeline.append(f"Tool result: {first_line}")
+                # Keep a content-bearing snippet of the BODY, not just the
+                # "[Tool result: <tool>]" header line — the body often carries
+                # the answer the rest of the run depends on (web_text output,
+                # file contents, window lists). Finding 4.3.
+                flattened = " ".join(text.split())
+                if len(flattened) > TOOL_RESULT_SNIPPET_CHARS:
+                    flattened = flattened[:TOOL_RESULT_SNIPPET_CHARS] + " …[truncated]"
+                timeline.append(f"Tool result: {flattened}")
             else:
                 snippet = text[:200].replace("\n", " ")
                 user_requests.append(snippet)

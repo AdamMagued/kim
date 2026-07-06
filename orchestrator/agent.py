@@ -371,8 +371,15 @@ class KimAgent:
         *,
         fallback_input_tokens: Optional[int] = None,
         fallback_source: str = "unknown",
+        accumulate: bool = False,
     ) -> None:
-        """Emit legacy [STATS] for exact usage and [CONTEXT] for the budget UI."""
+        """Emit legacy [STATS] for exact usage and [CONTEXT] for the budget UI.
+
+        ``accumulate=True`` is used for stateful browser-thread continuation
+        turns, where the provider reports only the per-turn delta: the meter
+        sums deltas (+ replies) so the gauge tracks the real in-thread fill
+        instead of flat-lining at the last delta's size.
+        """
         usage = usage or {}
         estimated = bool(
             usage.get("estimated")
@@ -409,6 +416,7 @@ class KimAgent:
             fallback_input_tokens=None if forbid_fallback else fallback_input_tokens,
             source=fallback_source,
             estimated=input_tokens is None,
+            accumulate=accumulate,
         )
         if snapshot is None:
             return
@@ -780,10 +788,24 @@ class KimAgent:
                 None if _has_exact_input
                 else estimate_request_tokens(request_messages, tools=call_tools, system=system_prompt)
             )
+            # Stateful browser continuation turns carry only the NEW delta in
+            # usage (the live thread retains prior turns), so the meter must
+            # accumulate deltas — otherwise cumulative_input flat-lines at the
+            # last delta and the ratio-based rollover never fires (finding 4.1).
+            # Only accumulate when the provider actually reported a per-turn
+            # count — the fallback estimate covers the FULL history and must
+            # keep assignment semantics or it would compound every turn.
+            _accumulate_delta = (
+                self._browser_stateful
+                and self._is_browser_provider()
+                and not clear_chat
+                and _usage_int(_usage, "input", "input_tokens", "prompt_tokens") is not None
+            )
             self._track_context_usage(
                 _usage,
                 fallback_input_tokens=request_estimate,
                 fallback_source=type(self.provider).__name__,
+                accumulate=_accumulate_delta,
             )
             if clear_chat:
                 self._clear_chat_on_next_call = False
@@ -1510,8 +1532,20 @@ class KimAgent:
                     f"LLM call failed (attempt {attempt}/{self._max_retries}): "
                     f"{type(e).__name__}: {e} ({provider_error.code}) — retrying in {delay:.1f}s",
                 )
-                # Emit typed event so the frontend can show "Rate-limited, retrying in Xs..."
-                emit_rate_limited(round(delay, 1), attempt, self._max_retries)
+                # Tell the user the TRUTH about what happened.  Only genuine
+                # rate limits emit the typed rate_limited event (the frontend
+                # renders it as "Rate-limited — retrying in Xs"); every other
+                # retryable failure (network drop, timeout, server error) gets
+                # an honest [STATUS] line instead of masquerading as a rate limit.
+                if provider_error.code == "rate_limit":
+                    emit_rate_limited(round(delay, 1), attempt, self._max_retries)
+                else:
+                    self._log(
+                        "INFO",
+                        f"[STATUS] {_retry_notice_label(provider_error.code)} — "
+                        f"retrying in {delay:.0f}s "
+                        f"(attempt {attempt}/{self._max_retries})",
+                    )
                 # Do NOT sleep on the final attempt — the raise immediately follows (#31)
                 if attempt < self._max_retries:
                     await asyncio.sleep(delay)
@@ -1922,9 +1956,15 @@ Rules:
         # Replace in-memory history with the compacted version
         self.memory.load_from_messages(compacted)
 
-        # Persist: save the summary sentinel and reset context meter
+        # Persist: save the summary sentinel and reset context meter. Seed the
+        # meter with the post-compaction message set — the next real turn
+        # re-sends summary + tail, so persisting a literal 0 would be fiction
+        # that is stale the instant the next turn runs (finding 4.5).
         compacted_at = datetime.now(timezone.utc).isoformat()
-        snapshot = self._context_meter.reset_after_compact(compacted_at=compacted_at)
+        snapshot = self._context_meter.reset_after_compact(
+            compacted_at=compacted_at,
+            new_cumulative_input=estimate_request_tokens(self.memory.get_messages()),
+        )
         self._log("INFO", snapshot.to_log_line())
         self._print_context_json(snapshot)
 
@@ -2048,6 +2088,8 @@ Rules:
                 response.get("usage", {}),
                 fallback_input_tokens=None,
                 fallback_source=f"{type(self.provider).__name__}:rollover_compact",
+                # The compact request is one more delta into the OLD thread.
+                accumulate=True,
             )
             raw = str(response.get("content", "")).strip()
             if raw:
@@ -2100,7 +2142,12 @@ Rules:
     def _arm_fresh_browser_thread(self, handoff: Optional[str]) -> None:
         """Shared tail of rollover/fallback: reset meter + flag a seeded fresh chat."""
         compacted_at = datetime.now(timezone.utc).isoformat()
-        snapshot = self._context_meter.reset_after_compact(compacted_at=compacted_at)
+        # Seed the meter with the compacted set (summary + preserved tail) that
+        # the fresh chat's first send will carry, instead of a fictional 0.
+        snapshot = self._context_meter.reset_after_compact(
+            compacted_at=compacted_at,
+            new_cumulative_input=estimate_request_tokens(self.memory.get_messages()),
+        )
         self._clear_chat_on_next_call = True
         self._pending_handoff = handoff or None
         self._browser_thread_turns = 0
@@ -2140,6 +2187,21 @@ from orchestrator.visual_task import (  # noqa: E402,F401
     _looks_visual,
     _uses_proactive_visual_context,
 )
+
+
+#: Honest user-facing labels for retryable provider-error codes.  Only
+#: "rate_limit" uses the typed rate_limited event; everything else surfaces
+#: as a [STATUS] line so a wifi drop is never reported as "Rate-limited".
+_RETRY_NOTICE_LABELS = {
+    "rate_limit": "Rate-limited by the provider",
+    "network": "Connection problem reaching the provider",
+    "timeout": "Provider timed out",
+    "server_error": "Provider server error",
+}
+
+
+def _retry_notice_label(code: str) -> str:
+    return _RETRY_NOTICE_LABELS.get(code, f"Provider error ({code})")
 
 
 def _provider_accepts_kwarg(fn: Any, name: str) -> bool:
