@@ -111,45 +111,53 @@ if not _root_path.is_absolute():
     _root_path = _PROJECT_DIR / _root_path
 PROJECT_ROOT = _root_path.resolve()
 
-# Resolve allowed_paths the same way (with ~ expansion).
-# allowed_paths MUST be a list. A bare scalar string (e.g. `allowed_paths: ~`)
-# is a common mistake that would otherwise be iterated CHARACTER-BY-CHARACTER,
-# turning "~/x" into allowed roots "/" and "$HOME" — a full-filesystem sandbox
-# escape (finding 1.1). Coerce a lone string to a one-element list and reject
-# any other non-list shape.
-_raw_allowed = _cfg.get("allowed_paths", [str(PROJECT_ROOT)])
-if isinstance(_raw_allowed, str):
-    logger.warning(
-        "allowed_paths should be a LIST, got a bare string %r; treating it as a "
-        "single entry. Use YAML list syntax (e.g. `allowed_paths: [\"%s\"]`).",
-        _raw_allowed, _raw_allowed,
-    )
-    _raw_allowed = [_raw_allowed]
-elif not isinstance(_raw_allowed, (list, tuple)):
-    logger.warning(
-        "allowed_paths must be a list, got %s; restricting to project root only.",
-        type(_raw_allowed).__name__,
-    )
-    _raw_allowed = [str(PROJECT_ROOT)]
+def _resolve_allowed_paths(raw: object, project_dir: Path, project_root: Path) -> list[Path]:
+    """Coerce and resolve the allowed_paths config value to a list of roots.
 
-ALLOWED_PATHS = []
-for p in _raw_allowed:
-    if not isinstance(p, str):
-        logger.warning("allowed_paths entry %r is not a string; skipping.", p)
-        continue
-    pp = Path(p).expanduser()
-    if not pp.is_absolute():
-        pp = _PROJECT_DIR / pp
-    resolved_pp = pp.resolve()
-    # #3: Warn when ~ grants access to entire home directory
-    if p.strip() == "~" or p.strip() == "~/":
+    allowed_paths MUST be a list. A bare scalar string (e.g. `allowed_paths: ~`)
+    is a common YAML mistake that, if iterated directly, is walked
+    CHARACTER-BY-CHARACTER — turning "~/x" into allowed roots "/" and "$HOME",
+    a full-filesystem sandbox escape (finding 1.1). Coerce a lone string to a
+    one-element list, reject any other non-list shape, and skip non-string
+    entries. project_root is always appended so the sandbox never excludes it.
+    """
+    if isinstance(raw, str):
         logger.warning(
-            "⚠ '~' in allowed_paths grants access to entire home directory; "
-            "consider scoping to '~/Projects' or '.' (project root only)."
+            "allowed_paths should be a LIST, got a bare string %r; treating it as a "
+            "single entry. Use YAML list syntax (e.g. `allowed_paths: [\"%s\"]`).",
+            raw, raw,
         )
-    ALLOWED_PATHS.append(resolved_pp)
-if PROJECT_ROOT not in ALLOWED_PATHS:
-    ALLOWED_PATHS.append(PROJECT_ROOT)
+        raw = [raw]
+    elif not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "allowed_paths must be a list, got %s; restricting to project root only.",
+            type(raw).__name__,
+        )
+        raw = [str(project_root)]
+
+    resolved: list[Path] = []
+    for p in raw:
+        if not isinstance(p, str):
+            logger.warning("allowed_paths entry %r is not a string; skipping.", p)
+            continue
+        pp = Path(p).expanduser()
+        if not pp.is_absolute():
+            pp = project_dir / pp
+        # #3: Warn when ~ grants access to entire home directory
+        if p.strip() == "~" or p.strip() == "~/":
+            logger.warning(
+                "⚠ '~' in allowed_paths grants access to entire home directory; "
+                "consider scoping to '~/Projects' or '.' (project root only)."
+            )
+        resolved.append(pp.resolve())
+    if project_root not in resolved:
+        resolved.append(project_root)
+    return resolved
+
+
+ALLOWED_PATHS = _resolve_allowed_paths(
+    _cfg.get("allowed_paths", [str(PROJECT_ROOT)]), _PROJECT_DIR, PROJECT_ROOT
+)
 
 SHELL_TIMEOUT: int = _as_int(_section(_cfg, "shell").get("timeout"), 30)
 _shell_sandbox_env = os.environ.get("KIM_SHELL_SANDBOX_MODE")
