@@ -701,6 +701,102 @@ class TestCoerceContractDict(unittest.TestCase):
         self.assertIs(_coerce_contract_dict(d), d)
 
 
+class TestShellFenceSalvage(unittest.TestCase):
+    """Protocol-refusing models (ChatGPT-web calls the JSON contract an
+    'injected format') still write the exact commands in ```bash fences —
+    execute what they wrote instead of arguing."""
+
+    # Shape of the live refusal run: prose + heredoc fence + open fence.
+    _PROSE = (
+        "I'll give you a ready-to-run Pong game.\n\n"
+        "Run this in your terminal:\n\n"
+        "```bash\ncat > index.html <<'EOF'\n<!doctype html>\n"
+        '<canvas id="game" width="800" height="400"></canvas>\nEOF\n```\n\n'
+        "Now open it:\n\n```bash\nopen index.html\n```\n\n"
+        "You'll get a playable Pong game."
+    )
+
+    def test_extracts_only_shell_fences(self):
+        from codex_engine.engine import _extract_shell_blocks
+
+        blocks = _extract_shell_blocks(self._PROSE)
+        self.assertEqual(len(blocks), 2)
+        self.assertTrue(blocks[0].startswith("cat > index.html"))
+        self.assertEqual(blocks[1], "open index.html")
+        # Non-shell fences are never executed.
+        self.assertEqual(
+            _extract_shell_blocks("```html\n<b>hi</b>\n```\n```python\nprint(1)\n```"), []
+        )
+        self.assertEqual(_extract_shell_blocks("no fences here"), [])
+
+    def test_prose_with_fences_becomes_normalized_tool_calls(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": self._PROSE},
+            relay_num=1,
+            request_tools=_CODEX_TOOLS,
+        )
+        calls = [o for o in reply["output"] if o["type"] == "function_call"]
+        self.assertEqual([c["name"] for c in calls], ["exec_command", "exec_command"])
+        self.assertIn("cat > index.html", calls[0]["arguments"])
+        self.assertIn("open index.html", calls[1]["arguments"])
+
+    def test_contract_final_answer_with_fences_also_executes(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": json.dumps(
+                {"text": "To launch it:\n```bash\nopen index.html\n```"}
+            )},
+            relay_num=1,
+            request_tools=_CODEX_TOOLS,
+        )
+        calls = [o for o in reply["output"] if o["type"] == "function_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("open index.html", calls[0]["arguments"])
+
+    def test_prose_without_fences_stays_a_text_reply(self):
+        from codex_engine.engine import _provider_response_to_responses_api
+
+        reply = _provider_response_to_responses_api(
+            {"type": "text", "content": "Here is how Pong works: paddles bounce a ball."},
+            relay_num=1,
+            request_tools=_CODEX_TOOLS,
+        )
+        self.assertEqual(reply["output"][0]["type"], "message")
+
+
+class TestShellFenceNudgeInteraction(unittest.IsolatedAsyncioTestCase):
+    async def test_prose_with_fences_skips_the_nudge(self):
+        proxy, provider = _proxy()
+        original = {"type": "text", "content": "Run:\n```bash\nopen index.html\n```"}
+        result = await proxy._nudge_contract_retry(original, relay_num=1)
+        self.assertIs(result, original)
+        self.assertEqual(provider.calls, [])  # no round trip wasted
+
+    async def test_refusal_retry_with_fences_is_used_and_not_burned(self):
+        retry = {"type": "text", "content": (
+            "I won't use that JSON format. But here you go:\n"
+            "```bash\ntouch pong.html\n```"
+        )}
+        proxy, provider = _proxy(responses=[retry])
+        original = {"type": "text", "content": "Here is the code, save it yourself."}
+        result = await proxy._nudge_contract_retry(original, relay_num=1)
+        self.assertIs(result, retry)
+        self.assertFalse(proxy._thread_state.get("burned"))
+
+    async def test_self_help_answer_with_fence_is_not_burned(self):
+        retry = {"type": "text", "content": json.dumps(
+            {"text": "Then run:\n```bash\nopen index.html\n```"}
+        )}
+        proxy, provider = _proxy(responses=[retry])
+        original = {"type": "text", "content": "Save it as index.html yourself."}
+        result = await proxy._nudge_contract_retry(original, relay_num=1)
+        self.assertIs(result, retry)
+        self.assertFalse(proxy._thread_state.get("burned"))
+
+
 class TestNormalizeToolCalls(unittest.TestCase):
     def test_exec_prefix_snaps_to_exec_command(self):
         from codex_engine.engine import _normalize_tool_calls

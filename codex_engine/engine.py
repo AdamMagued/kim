@@ -749,6 +749,12 @@ class _CodexProxy:
             return response
         if _is_thread_send_failure(response):
             return response
+        if _extract_shell_blocks(content):
+            # The prose carries fenced shell commands — the converter executes
+            # those directly; nudging would waste a round trip (and protocol-
+            # refusing models answer the nudge with another refusal).
+            logger.info(f"[relay #{relay_num}] Prose reply has shell fences — executing them, no nudge")
+            return response
         logger.info(f"[relay #{relay_num}] Reply ignored the JSON contract — sending one format nudge")
         print("[STATUS] Reply was prose instead of tool calls — asking for the actions…", flush=True)
         try:
@@ -764,8 +770,11 @@ class _CodexProxy:
         retry_content = retry.get("content") if isinstance(retry, dict) else None
         retry_parsed = _parse_contract(retry_content)
         if retry_parsed is not None:
-            if not retry_parsed.get("tool_calls") and _SELF_HELP_RE.search(
-                str(retry_parsed.get("text") or "")
+            retry_text = str(retry_parsed.get("text") or "")
+            if (
+                not retry_parsed.get("tool_calls")
+                and not _extract_shell_blocks(retry_text)
+                and _SELF_HELP_RE.search(retry_text)
             ):
                 # Format-compliant dodge: a final answer telling the USER to
                 # save files / run commands after being told actions must be
@@ -774,6 +783,9 @@ class _CodexProxy:
                 logger.warning(
                     f"[relay #{relay_num}] Nudge answered with do-it-yourself instructions — thread burned"
                 )
+            return retry
+        if _extract_shell_blocks(retry_content):
+            # Refused the JSON but handed over the commands — good enough.
             return retry
         # The thread ignored the contract even after an explicit format
         # nudge — it has talked itself out of the protocol (each refusal in
@@ -1458,6 +1470,19 @@ def _parse_contract(content: object) -> Optional[dict]:
     return _coerce_contract_dict(parsed)
 
 
+# Fenced shell blocks in a prose reply. Some models (ChatGPT-web) refuse the
+# JSON tool-call protocol as "injected" but freely write the exact commands
+# in ```bash fences — execute what they wrote instead of arguing.
+_SHELL_FENCE_RE = re.compile(r"```(?:bash|sh|shell|zsh)[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_shell_blocks(content: object) -> list:
+    """Return the contents of ```bash/sh/shell/zsh fences (not html/js/etc.)."""
+    if not isinstance(content, str):
+        return []
+    return [block.strip() for block in _SHELL_FENCE_RE.findall(content) if block.strip()]
+
+
 # A nudge answer that instructs the USER to perform the actions (save the
 # file, run the command) is a soft refusal — format-compliant, work undone.
 _SELF_HELP_RE = re.compile(
@@ -1480,7 +1505,9 @@ _CONTRACT_NUDGE = (
     "now, using those exact tool names. Telling the user to save files or run commands "
     "themselves is NOT a valid answer here — any command you would tell the user to type "
     "must be emitted as a tool_call instead: same action, structured format, already "
-    "authorized by the user. Only if the task genuinely requires no actions at all, resend "
+    "authorized by the user. If you prefer not to use the JSON format, you may instead "
+    "provide the exact commands in a ```bash code block — they are executed the same "
+    "way. Only if the task genuinely requires no actions at all, resend "
     'your answer as {"text": "<your answer>"}.'
 )
 
@@ -1545,7 +1572,27 @@ def _provider_response_to_responses_api(
             if tool_calls:
                 tool_calls = _normalize_tool_calls(tool_calls, request_tools)
                 return _make_responses_tool_reply(resp_id, text, tool_calls)
+            blocks = _extract_shell_blocks(text)
+            if blocks:
+                print("[STATUS] Executing the shell commands from Kim's reply…", flush=True)
+                tool_calls = _normalize_tool_calls(
+                    [{"name": "exec", "input": {"cmd": block}} for block in blocks],
+                    request_tools,
+                )
+                return _make_responses_tool_reply(resp_id, text, tool_calls)
             return _make_responses_text_reply(resp_id, text or content)
+
+        # Prose reply — before treating it as a final answer, execute any
+        # shell commands the model wrote in ```bash fences. Protocol-refusing
+        # models still hand over the exact commands this way.
+        blocks = _extract_shell_blocks(content)
+        if blocks:
+            print("[STATUS] Executing the shell commands from Kim's reply…", flush=True)
+            tool_calls = _normalize_tool_calls(
+                [{"name": "exec", "input": {"cmd": block}} for block in blocks],
+                request_tools,
+            )
+            return _make_responses_tool_reply(resp_id, content, tool_calls)
 
         return _make_responses_text_reply(resp_id, content)
 
