@@ -658,6 +658,16 @@ class _CodexProxy:
 
             if delta_items:
                 prompt = _extract_delta_prompt(delta_items)
+                # Terminal mode: an empty tool result reads as "nothing
+                # happened", so ChatGPT re-sends `open x` forever. Spell out
+                # the stop condition on every tool-result relay.
+                is_chatgpt = bool(self._provider_name) and "chatgpt" in self._provider_name.lower()
+                if is_chatgpt and prompt and "[TOOL RESULT]" in prompt:
+                    prompt += (
+                        "\n\n(Those commands already ran — no output means success. "
+                        "If the request is now fully complete, reply with just DONE. "
+                        "Do NOT re-send a command that already ran.)"
+                    )
                 self._last_sent_count = len(input_items)
                 logger.info(f"[relay #{relay_num}] Delta relay — {len(delta_items)} new items")
             else:
@@ -726,17 +736,22 @@ class _CodexProxy:
             response=response,
         )
 
+        # Narrate the model's prose FIRST ("I'll drop a simple click-the-box
+        # game…"), then the humanized command lines from _announce_commands —
+        # this is the visible "thinking" for a browser model whose real chain
+        # of thought can't be scraped.
+        _surface_relay_reasoning(response, relay_num)
         responses_reply = _provider_response_to_responses_api(
             response, relay_num, request_tools=body.get("tools")
         )
-        # Loop guard: if this relay's tool calls are IDENTICAL to the previous
-        # relay's, the model is repeating itself (e.g. re-sending
-        # `open game.html` every turn because an empty tool result gives it no
-        # signal to stop). Re-running the same command achieves nothing, so end
-        # the turn with a plain final answer — codex sees no tool call and
+        # Loop guard: if this relay's tool calls repeat the previous relay's —
+        # identical, or a subset of sub-commands that already ran (`open x`
+        # after `printf … && open x`) — the model is looping (an empty tool
+        # result gives it no signal to stop). Re-running achieves nothing, so
+        # end the turn with a plain final answer — codex sees no tool call and
         # finishes, which is the "it never registers as done" fix.
         cmds = _tool_command_signature(responses_reply)
-        if cmds and cmds == self._last_tool_commands:
+        if _is_repeat_of_previous(cmds, self._last_tool_commands):
             logger.info(f"[relay #{relay_num}] Repeated tool call {cmds} — ending turn (loop guard)")
             print("[STATUS] Command already ran — finishing up…", flush=True)
             responses_reply = _make_responses_text_reply(
@@ -745,11 +760,6 @@ class _CodexProxy:
             cmds = None
         self._last_tool_commands = cmds
         self._last_proxy_response = responses_reply
-        # Only narrate prose reasoning for a text answer — on a command turn the
-        # humanized activity lines already describe the work, and the model's
-        # "Run this in your terminal:" preamble is just noise.
-        if cmds is None:
-            _surface_relay_reasoning(response, relay_num)
 
         return _sse_or_json(stream, responses_reply)
 
@@ -1868,6 +1878,49 @@ def _tool_command_signature(reply: object):
     return tuple(sig) if sig else None
 
 
+def _signature_subcommands(sig: object) -> frozenset:
+    """Flatten a tool-call signature into its individual shell sub-commands.
+
+    `printf … > f.html && open f.html` followed by a bare `open f.html` is the
+    same do-nothing loop as an exact repeat — the sub-command already ran.
+    """
+    subs: set = set()
+    if not isinstance(sig, tuple):
+        return frozenset()
+    for entry in sig:
+        if not (isinstance(entry, tuple) and len(entry) == 2):
+            continue
+        arguments = entry[1]
+        cmd = ""
+        if isinstance(arguments, str):
+            try:
+                args = json.loads(arguments)
+                if isinstance(args, dict):
+                    cmd = str(args.get("cmd") or args.get("command") or "")
+            except (json.JSONDecodeError, TypeError):
+                cmd = arguments
+        for part in re.split(r"\s*(?:&&|;)\s*", cmd):
+            part = " ".join(part.split())
+            if part:
+                subs.add(part)
+    return frozenset(subs)
+
+
+def _is_repeat_of_previous(cmds: object, last_cmds: object) -> bool:
+    """True when this relay's commands add nothing over the previous relay's.
+
+    Exact repeat, or every sub-command already ran last relay (the model
+    re-sends `open index.html` because an empty tool result gave it no signal
+    to stop).
+    """
+    if not cmds or not last_cmds:
+        return False
+    if cmds == last_cmds:
+        return True
+    new_subs = _signature_subcommands(cmds)
+    return bool(new_subs) and new_subs <= _signature_subcommands(last_cmds)
+
+
 def _provider_response_to_responses_api(
     response: dict, relay_num: int, request_tools: object = None
 ) -> dict:
@@ -2032,6 +2085,16 @@ def _surface_relay_reasoning(response: dict, relay_num: int) -> None:
     # the salvage layer already runs the command. If the reply is only a code
     # block, there's nothing to preview.
     prose = content.split("```", 1)[0]
+    # Drop command-introduction lines ("Run these commands in your terminal:",
+    # "Now open it:") — the humanized activity lines already narrate those.
+    kept = [
+        ln for ln in prose.splitlines()
+        if not re.match(
+            r"\s*(?:run|paste|copy|now|then|here(?:'s| is| are)?)\b.*[:：]\s*$",
+            ln, re.IGNORECASE,
+        )
+    ]
+    prose = " ".join(kept)
     display = re.sub(
         r"\b(Gemini|Claude|ChatGPT|Grok|DeepSeek)\b",
         "Kim",

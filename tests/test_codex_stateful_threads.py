@@ -1101,6 +1101,146 @@ class TestRepeatedCommandLoopGuard(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(_tool_command_signature(first))
         self.assertIsNotNone(_tool_command_signature(second))
 
+    async def test_subset_command_ends_the_turn(self):
+        # Real run 2026-07-06: relay 1 was `printf … && open index.html`,
+        # relay 2 a bare `open index.html`. Not an exact repeat, but the
+        # sub-command already ran — must end the turn, not re-open the file.
+        from codex_engine.engine import _CodexProxy, _tool_command_signature
+
+        provider = _RecordingProvider([
+            {"type": "text", "content": "```bash\nprintf '%s' 'x' > index.html && open index.html\n```"},
+            {"type": "text", "content": "```bash\nopen index.html\n```"},
+        ])
+        proxy = _CodexProxy(
+            provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
+        )
+        import json as _json
+        first = _json.loads((await proxy._handle_responses(self._request(proxy, 1))).text)
+        second = _json.loads((await proxy._handle_responses(self._request(proxy, 2))).text)
+        self.assertIsNotNone(_tool_command_signature(first))
+        self.assertIsNone(_tool_command_signature(second))
+
+    async def test_done_reminder_sent_to_chatgpt_on_tool_result_relay(self):
+        from codex_engine.engine import _CodexProxy
+
+        provider = _RecordingProvider([
+            {"type": "text", "content": "```bash\nprintf '%s' 'x' > a.html\n```"},
+            {"type": "text", "content": "DONE"},
+        ])
+        proxy = _CodexProxy(
+            provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
+        )
+        await proxy._handle_responses(self._request(proxy, 1))
+        await proxy._handle_responses(self._request(proxy, 2))
+        # The second (delta) relay carries the tool result plus the explicit
+        # stop condition — empty output otherwise reads as "nothing happened".
+        sent = provider.calls[1]["messages"][0]["content"]
+        self.assertIn("[TOOL RESULT]", sent)
+        self.assertIn("reply with just DONE", sent)
+
+    async def test_done_reminder_not_sent_to_gemini(self):
+        from codex_engine.engine import _CodexProxy
+
+        provider = _RecordingProvider([
+            {"type": "text", "content": "```bash\nprintf '%s' 'x' > a.html\n```"},
+            {"type": "text", "content": "DONE"},
+        ])
+        proxy = _CodexProxy(
+            provider, provider_name="browser:gemini", thread_state={}, stateful=False
+        )
+        await proxy._handle_responses(self._request(proxy, 1))
+        await proxy._handle_responses(self._request(proxy, 2))
+        sent = provider.calls[1]["messages"][0]["content"]
+        # Gemini follows the JSON contract — the DONE nudge is ChatGPT-only.
+        self.assertNotIn("reply with just DONE", sent)
+
+
+class TestRepeatGuardHelpers(unittest.TestCase):
+    """Unit coverage for the subset loop-guard primitives."""
+
+    @staticmethod
+    def _sig(*cmds):
+        import json as _json
+        return tuple(("shell", _json.dumps({"cmd": c})) for c in cmds)
+
+    def test_subcommands_split_on_and_and_semicolon(self):
+        from codex_engine.engine import _signature_subcommands
+
+        subs = _signature_subcommands(self._sig("printf x > a.html && open a.html; ls"))
+        self.assertEqual(subs, frozenset({"printf x > a.html", "open a.html", "ls"}))
+
+    def test_exact_repeat_is_a_repeat(self):
+        from codex_engine.engine import _is_repeat_of_previous
+
+        sig = self._sig("open a.html")
+        self.assertTrue(_is_repeat_of_previous(sig, sig))
+
+    def test_subset_is_a_repeat(self):
+        from codex_engine.engine import _is_repeat_of_previous
+
+        prev = self._sig("printf x > a.html && open a.html")
+        new = self._sig("open a.html")
+        self.assertTrue(_is_repeat_of_previous(new, prev))
+
+    def test_new_work_is_not_a_repeat(self):
+        from codex_engine.engine import _is_repeat_of_previous
+
+        prev = self._sig("printf x > a.html")
+        new = self._sig("open a.html")
+        self.assertFalse(_is_repeat_of_previous(new, prev))
+
+    def test_none_signatures_never_trip(self):
+        from codex_engine.engine import _is_repeat_of_previous
+
+        self.assertFalse(_is_repeat_of_previous(None, self._sig("ls")))
+        self.assertFalse(_is_repeat_of_previous(self._sig("ls"), None))
+
+    def test_whitespace_variations_still_match(self):
+        from codex_engine.engine import _is_repeat_of_previous
+
+        prev = self._sig("printf x > a.html   &&   open  a.html")
+        new = self._sig("open a.html")
+        self.assertTrue(_is_repeat_of_previous(new, prev))
+
+
+class TestRelayReasoningDisplay(unittest.TestCase):
+    """The model's prose narration is the only visible 'thinking' a browser
+    model has — surface it on command turns, minus command-intro noise."""
+
+    @staticmethod
+    def _capture(content):
+        import contextlib
+        import io
+        from codex_engine.engine import _surface_relay_reasoning
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _surface_relay_reasoning({"type": "text", "content": content}, 1)
+        return buf.getvalue()
+
+    def test_prose_before_fence_is_surfaced(self):
+        out = self._capture(
+            "Alright — I'll drop a simple click-the-box game.\n"
+            "Run these commands in your terminal:\n"
+            "```bash\nprintf x > index.html\n```"
+        )
+        self.assertIn("click-the-box game", out)
+
+    def test_command_intro_lines_are_dropped(self):
+        out = self._capture(
+            "Alright — making the game.\n"
+            "Run these commands in your terminal:\n"
+            "Now open it:\n"
+            "```bash\nopen index.html\n```"
+        )
+        self.assertNotIn("Run these commands", out)
+        self.assertNotIn("Now open it", out)
+        self.assertIn("making the game", out)
+
+    def test_fence_only_reply_prints_nothing(self):
+        out = self._capture("```bash\nopen index.html\n```")
+        self.assertEqual(out, "")
+
 
 class TestDoneReply(unittest.TestCase):
     """A DONE signal ends the turn cleanly instead of salvaging trailing
