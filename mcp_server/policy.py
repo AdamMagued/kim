@@ -77,16 +77,39 @@ def _deny(risk: str, reason: str, message: str) -> PolicyDecision:
 # Read lazily so tests can monkeypatch the environment.
 # ---------------------------------------------------------------------------
 
+_warned_threshold_unset = False
+
+
 def hitl_threshold() -> str | None:
     # NOTE (G3): with neither config.yaml `hitl_risk_threshold` nor
     # KIM_HITL_RISK_THRESHOLD set, this returns None and the risk-threshold
     # arm of the gate is INERT — only argv escalation rules (and hard denies)
     # gate calls. Set the key to "high" to require approval for high-risk
     # tools (write_file, delete_file, run_python, mouse/keyboard, …).
+    #
+    # DELIBERATE DEFAULT (assessed 2026-07): the threshold arm stays OFF by
+    # default. Kim's core product promise is fast, autonomous OS/screen/web
+    # access; a default "high" threshold would put an approval prompt in
+    # front of every write_file / delete_file / run_python / mouse / keyboard
+    # call — i.e. nearly every step of a desktop task. The always-on layers
+    # (hard path denies via validate_path, the shell allowlist/deny-set,
+    # argv escalation rules incl. sudo / inline exec / non-allowlisted
+    # binaries, and the unconditional run_powershell escalation) carry the
+    # safety load regardless of this knob. Operators who want the coarse
+    # risk gate opt in via config.
     raw = get_config().get("hitl_risk_threshold") or os.environ.get(
         "KIM_HITL_RISK_THRESHOLD"
     )
     if raw is None:
+        global _warned_threshold_unset
+        if not _warned_threshold_unset:
+            _warned_threshold_unset = True
+            logger.info(
+                "policy: hitl_risk_threshold is not configured — the "
+                "risk-threshold approval arm is inert (hard denies and argv "
+                "escalation rules still gate calls). Set "
+                "`hitl_risk_threshold: high` in config.yaml to enable it."
+            )
         return None
     normalized = str(raw).strip().lower()
     return normalized if normalized in ("high", "medium", "low") else None
@@ -496,6 +519,37 @@ def _wrapped_command(tokens: list[str]) -> list[str]:
     return []
 
 
+def _scan_powershell_script(script: str) -> str | None:
+    """Best-effort sensitive-path deny scan for run_powershell scripts.
+
+    run_command gets full argv analysis (allowlist + _scan_path_tokens);
+    PowerShell grammar can't be parsed by that POSIX machinery, so PS scripts
+    always escalate to human approval (G2). But a script that references a
+    secret-sandbox or out-of-sandbox path (``Get-Content ~/.ssh/id_rsa``)
+    should be HARD-DENIED before a human ever sees an approval card — the
+    same treatment ``run_command cat ~/.ssh/id_rsa`` already gets.
+
+    Tokenization is best-effort: shlex when the script is quote-clean, plain
+    whitespace split otherwise. validate_path (via _scan_path_tokens) stays
+    the single deny authority. This scan can only ADD denials on top of the
+    unconditional escalation — it never downgrades or replaces it.
+    """
+    text = script.strip()
+    if not text:
+        return None
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+    # PS statement separators (';', '|') can leave a separator glued to a
+    # path token; split them off so each candidate is path-shaped.
+    flat: list[str] = []
+    for tok in tokens:
+        flat.extend(t for t in re.split(r"[;|]", tok) if t)
+    # _scan_path_tokens skips tokens[0] (the binary) — prepend a placeholder.
+    return _scan_path_tokens(["pwsh", *flat], None)
+
+
 _CHAIN_OPERATOR_TOKENS = frozenset({"&&", "||", ";", "|", "&"})
 
 
@@ -652,6 +706,14 @@ def _enforce(name: str, args: dict) -> PolicyDecision:
             signature = f"run_command:cmd={str(args.get('cmd', '')).strip()}"
             reason = escalations[0]
     elif name == "run_powershell":
+        # Sensitive/out-of-sandbox path arguments hard-deny first, exactly
+        # like run_command's _scan_path_tokens arm — a human should never be
+        # offered an approval card for `Get-Content ~/.ssh/id_rsa`.
+        ps_path_err = _scan_powershell_script(str(args.get("script", "")))
+        if ps_path_err:
+            return _deny(
+                risk, "sensitive_path_argument", f"POLICY_DENIED: {ps_path_err}"
+            )
         # G2: PowerShell scripts get no argv-level analysis here (the shell
         # allowlist/denylist grammar is POSIX-only), so a human always reviews
         # them instead of dispatching a whole unvetted script.

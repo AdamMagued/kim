@@ -154,17 +154,17 @@ class WebFillFormEvals(unittest.TestCase):
     def setUp(self):
         web._element_map.clear()
         web._element_data_map.clear()
-        web._last_observation = None
-        web._last_form_diagnostics = {}
-        self._orig_page = web._page
+        web.observation._last_observation = None
+        web.observation._last_form_diagnostics = {}
+        self._orig_page = web.browser._page
 
     def tearDown(self):
-        web._page = self._orig_page
+        web.browser._page = self._orig_page
 
     def _run(self, page, args):
         async def fake_page():
             return page
-        web._page = fake_page
+        web.browser._page = fake_page
         raw = asyncio.run(web.handle_web_fill_form(args))
         self.assertTrue(raw.startswith("FORM_FILL_REPORT"), raw)
         return json.loads(raw.split("\n", 1)[1])
@@ -268,7 +268,7 @@ class WebFillFormEvals(unittest.TestCase):
     def test_bad_args_rejected(self):
         async def fake_page():
             raise AssertionError("should not be called")
-        web._page = fake_page
+        web.browser._page = fake_page
         raw = asyncio.run(web.handle_web_fill_form({"fields": "not a dict"}))
         self.assertTrue(raw.startswith("ERROR"))
 

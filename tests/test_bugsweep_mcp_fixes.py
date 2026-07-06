@@ -258,15 +258,15 @@ class H1DeadContextResetTest(unittest.IsolatedAsyncioTestCase):
         good_ctx = _GoodCtx()
 
         async def fake_connect():
-            web_mod._browser_ctx = good_ctx
+            web_mod.browser._browser_ctx = good_ctx
 
-        with patch.object(web_mod, "_playwright", object()), \
-                patch.object(web_mod, "_browser_ctx", _DeadCtx()), \
-                patch.object(web_mod, "_active_page", None), \
-                patch.object(web_mod, "_connect_browser_ctx", fake_connect):
-            await web_mod._ensure_browser()
-            self.assertIs(web_mod._browser_ctx, good_ctx)
-            self.assertIsInstance(web_mod._active_page, _GoodPage)
+        with patch.object(web_mod.browser, "_playwright", object()), \
+                patch.object(web_mod.browser, "_browser_ctx", _DeadCtx()), \
+                patch.object(web_mod.browser, "_active_page", None), \
+                patch.object(web_mod.browser, "_connect_browser_ctx", fake_connect):
+            await web_mod.browser._ensure_browser()
+            self.assertIs(web_mod.browser._browser_ctx, good_ctx)
+            self.assertIsInstance(web_mod.browser._active_page, _GoodPage)
             self.assertTrue(_DeadCtx.closed)
 
 

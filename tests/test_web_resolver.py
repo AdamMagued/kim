@@ -56,9 +56,9 @@ class WebResolverTests(unittest.TestCase):
     def setUp(self):
         web._element_map.clear()
         web._element_data_map.clear()
-        web._last_observation = None
-        web._last_form_diagnostics = {}
-        web._observe_generation = 0
+        web.observation._last_observation = None
+        web.observation._last_form_diagnostics = {}
+        web.observation._observe_generation = 0
 
     def _remember(self, elements):
         result = {"url": "https://example.test", "title": "Example", "elements": elements}
@@ -164,8 +164,8 @@ class WebFormDiagnosticsTests(unittest.TestCase):
     def setUp(self):
         web._element_map.clear()
         web._element_data_map.clear()
-        web._last_form_diagnostics = {}
-        web._observe_generation = 0
+        web.observation._last_form_diagnostics = {}
+        web.observation._observe_generation = 0
 
     def test_required_textbox_detected_correctly(self):
         elements = [_el("w1", label="Repository name", required=True, value="")]
