@@ -18,6 +18,7 @@ import { useSessionScroll } from '../hooks/useSessionScroll';
 import { useSessionLoader } from '../hooks/useSessionLoader';
 import { useBrowserRestore } from '../hooks/useBrowserRestore';
 import { useTaskRunner } from '../hooks/useTaskRunner';
+import { useCodexTurn } from '../hooks/useCodexTurn';
 import { useOsNotifications } from '../hooks/useOsNotifications';
 import { StreamRenderer } from './chat/StreamRenderer';
 import { WelcomeScreen } from './chat/WelcomeScreen';
@@ -130,6 +131,8 @@ export function ChatView({
   useOsNotifications();
 
   // Hook into Tauri events and streaming state management
+  // Codex app-server transport UX (native approvals / plan / output / diff).
+  const codexTurn = useCodexTurn();
   const stream = useChatStream({
     session,
     settings,
@@ -473,6 +476,7 @@ export function ChatView({
       taskError={stream.taskError}
       hitlApprovalStatus={stream.hitlApprovalStatus}
       onHitlRespond={stream.hitlRespond}
+      codexTurn={codexTurn}
       permissionMode={permissionMode}
       onPermissionModeChange={setPermissionMode}
       runFailure={stream.runFailure}

@@ -21,6 +21,7 @@ mod codex_stream;
 mod llm_stream;
 mod responses_proxy;
 mod sse;
+mod typed_events;
 
 pub use bridge::bridge_token_source;
 

@@ -1040,6 +1040,7 @@ fn ollama_openai_base_url(base_url: Option<&str>) -> String {
 
 pub(crate) mod hitl;
 pub(crate) use hitl::hitl_respond_approval;
+pub(crate) use hitl::respond_approval_decision;
 pub(crate) mod subprocess;
 pub(crate) use subprocess::{
     cancel_task, find_python_interpreter, process_exists, send_signal, send_task, steer_task,
@@ -1142,6 +1143,7 @@ pub fn run() {
             send_task,
             cancel_task,
             hitl_respond_approval,
+            respond_approval_decision,
             steer_task,
             google_oauth::google_oauth_status,
             google_oauth::google_oauth_start,

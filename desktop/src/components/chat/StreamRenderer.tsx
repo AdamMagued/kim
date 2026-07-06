@@ -20,6 +20,8 @@ import {
 } from './utils';
 import { buildThinkingTrace, traceToWorkedFor } from './parsers';
 import { ActivityFeed } from './ActivityFeed';
+import { CodexTurnPanel, HitlStatusCard } from './CodexTurnPanel';
+import type { CodexTurnState } from '../../hooks/useCodexTurn';
 
 // ── Blobby Loader Component ──────────────────────────────────────────────────
 
@@ -79,6 +81,7 @@ export interface StreamRendererProps {
   taskError: string | null;
   hitlApprovalStatus: HitlApprovalStatus | null;
   onHitlRespond?: (approved: boolean) => void;
+  codexTurn?: CodexTurnState | null;
   permissionMode?: PermissionMode;
   onPermissionModeChange?: (mode: PermissionMode) => void;
   runFailure?: { reason: string; recoverable: boolean; suggestion: string } | null;
@@ -119,6 +122,7 @@ export function StreamRenderer({
   taskError,
   hitlApprovalStatus,
   onHitlRespond,
+  codexTurn,
   permissionMode,
   onPermissionModeChange,
   runFailure,
@@ -332,55 +336,19 @@ export function StreamRenderer({
   // ── Render Helpers ─────────────────────────────────────────────────────────
 
   function renderHitlStatus() {
-    if (!hitlApprovalStatus) return null;
-    const isPending = hitlApprovalStatus.approved === null;
-    const stateLabel =
-      isPending
-        ? 'Approval required'
-        : hitlApprovalStatus.approved
-          ? 'Approved'
-          : 'Denied';
-    const detail =
-      isPending
-        ? 'Kim paused before a high-risk action.'
-        : hitlApprovalStatus.approved
-          ? 'Kim can continue with the approved action.'
-          : 'Kim will choose another approach or ask for help.';
-
+    // Approval UI lives in CodexTurnPanel.tsx; this renders BOTH the legacy
+    // task-level HITL card and the codex app-server turn panel (native
+    // per-command approvals, plan, live output, diff).
+    if (!hitlApprovalStatus && !codexTurn) return null;
     return (
-      <div className="kim-msg-row kim-msg-row--assistant">
-        <div
-          className={`kim-hitl-status${hitlApprovalStatus.approved === false ? ' kim-hitl-status--denied' : ''}`}
-          role="status"
-          aria-live="polite"
-        >
-          <span className="kim-hitl-status__label">{stateLabel}</span>
-          <span className="kim-hitl-status__body">
-            {detail} Tool: <strong>{hitlApprovalStatus.tool}</strong>. Risk: {hitlApprovalStatus.risk} ({hitlApprovalStatus.reason}).
-          </span>
-          {hitlApprovalStatus.preview && (
-            <pre className="kim-hitl-status__preview"><code>{hitlApprovalStatus.preview}</code></pre>
-          )}
-          {isPending && onHitlRespond && (
-            <span className="kim-hitl-status__actions">
-              <button
-                className="kim-hitl-btn kim-hitl-btn--approve"
-                onClick={() => onHitlRespond(true)}
-                aria-label="Approve tool execution"
-              >
-                Approve
-              </button>
-              <button
-                className="kim-hitl-btn kim-hitl-btn--deny"
-                onClick={() => onHitlRespond(false)}
-                aria-label="Deny tool execution"
-              >
-                Deny
-              </button>
-            </span>
-          )}
-        </div>
-      </div>
+      <>
+        {hitlApprovalStatus && (
+          <div className="kim-msg-row kim-msg-row--assistant">
+            <HitlStatusCard status={hitlApprovalStatus} onRespond={onHitlRespond} />
+          </div>
+        )}
+        {codexTurn && <CodexTurnPanel turn={codexTurn} />}
+      </>
     );
   }
 

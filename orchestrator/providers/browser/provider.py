@@ -93,7 +93,9 @@ from orchestrator.providers.browser.site_configs import (
     _INJECT_MAX_RETRIES,
     _POPUP_DISMISS_LABELS,
     _VERIFY_MIN_CHARS,
+    auth_wall_response,
     detect_auth_wall,
+    lost_chat_response,
     to_list,
 )
 
@@ -404,7 +406,7 @@ class BrowserProvider(BaseProvider):
             if driver is not None:
                 page, site = await driver.acquire()
                 if page is None or site is None:
-                    return self._lost_chat_result()
+                    return lost_chat_response()
                 # cast: PageLike stands in for the concrete Page (string form: Page is TYPE_CHECKING-only).
                 return await self._run_chat_flow(
                     cast("Page", page), site, prompt, attachments, tools, completion_hash, clear_chat, estimated_usage
@@ -430,7 +432,7 @@ class BrowserProvider(BaseProvider):
                         page, site = await self._find_chat_page(browser)
 
                 if page is None or site is None:
-                    return self._lost_chat_result()
+                    return lost_chat_response()
 
                 return await self._run_chat_flow(
                     page, site, prompt, attachments, tools, completion_hash, clear_chat, estimated_usage
@@ -445,17 +447,6 @@ class BrowserProvider(BaseProvider):
                 estimated_usage,
             )
 
-    @staticmethod
-    def _lost_chat_result() -> dict:
-        return {
-            "type": "text",
-            "content": (
-                "NEED_HELP: Kim lost the active browser chat during this task. "
-                "I will not open a new provider tab because that would lose the LLM context. "
-                "Please reopen the existing provider chat window and resend."
-            ),
-        }
-
     async def _run_chat_flow(
         self, page: Page, site: str, prompt: str, attachments: list[dict],
         tools: list[dict] | None, completion_hash: str, clear_chat: bool,
@@ -465,22 +456,11 @@ class BrowserProvider(BaseProvider):
         PageDriver: clear/upload/popups, inject + send + two-phase wait,
         markdown scrape, then parse into the canonical response format."""
         # Rb3: a "chat tab" that is actually a sign-in / Cloudflare wall would
-        # swallow the send and hang for the full generation wait. Fail fast
-        # with a specific, actionable reason instead.
+        # swallow the send and hang for the full generation wait — fail fast.
         wall_reason = detect_auth_wall(getattr(page, "url", "") or "")
         if wall_reason:
             logger.warning(f"Auth wall detected on {site}: {wall_reason} ({page.url})")
-            return self._attach_usage(
-                {
-                    "type": "text",
-                    "content": (
-                        f"NEED_HELP: AUTH_REQUIRED — I can't reach the {site} chat because "
-                        f"{wall_reason}. Please finish signing in (or complete the "
-                        "verification) in that browser tab, then resend your message."
-                    ),
-                },
-                estimated_usage,
-            )
+            return self._attach_usage(auth_wall_response(site, wall_reason), estimated_usage)
         if clear_chat:
             logger.info(f"Clearing chat context by reloading {page.url}...")
             await page.goto(page.url, wait_until="domcontentloaded")

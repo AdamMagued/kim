@@ -74,6 +74,30 @@ def detect_auth_wall(url: str, title: str = "") -> str | None:
     return None
 
 
+def lost_chat_response() -> dict:
+    """NEED_HELP result when the active browser chat tab is gone mid-task."""
+    return {
+        "type": "text",
+        "content": (
+            "NEED_HELP: Kim lost the active browser chat during this task. "
+            "I will not open a new provider tab because that would lose the LLM context. "
+            "Please reopen the existing provider chat window and resend."
+        ),
+    }
+
+
+def auth_wall_response(site: str, reason: str) -> dict:
+    """The NEED_HELP result returned when a chat tab is an auth/bot wall (Rb3)."""
+    return {
+        "type": "text",
+        "content": (
+            f"NEED_HELP: AUTH_REQUIRED — I can't reach the {site} chat because "
+            f"{reason}. Please finish signing in (or complete the verification) "
+            "in that browser tab, then resend your message."
+        ),
+    }
+
+
 _POPUP_DISMISS_LABELS = [
     "I agree",
     "Got it",

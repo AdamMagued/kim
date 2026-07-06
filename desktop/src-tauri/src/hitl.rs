@@ -67,6 +67,33 @@ pub(crate) async fn hitl_respond_approval(
     rt.write_stdin_line(&msg).await
 }
 
+/// Build the `approval_decision` stdin line for a NATIVE codex approval
+/// (app-server transport, parity Part 3/5). `decision` is
+/// `accept` | `acceptForSession` | `decline`; anything unrecognized is
+/// downgraded to `decline` so a UI bug can never accidentally approve.
+pub(crate) fn build_approval_decision_line(id: &str, decision: &str) -> String {
+    let decision = match decision {
+        "accept" | "acceptForSession" | "decline" => decision,
+        _ => "decline",
+    };
+    serde_json::json!({
+        "type": "approval_decision",
+        "id": id,
+        "decision": decision,
+    })
+    .to_string()
+}
+
+/// Answer a native codex command / file-change approval request
+/// (`kim:command-approval-request` / `kim:file-change-approval-request`).
+/// The codex bridge service blocks its turn on this stdin line.
+#[tauri::command]
+pub(crate) async fn respond_approval_decision(id: String, decision: String) -> Result<(), String> {
+    let msg = format!("{}\n", build_approval_decision_line(&id, &decision));
+    let mut rt = crate::task_runtime::task_runtime().lock().await;
+    rt.write_stdin_line(&msg).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +134,23 @@ mod tests {
         let line = build_hitl_approve_line(true, Some("accept".into()), Some("req-42".into()));
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["id"], "req-42");
+    }
+
+    #[test]
+    fn test_approval_decision_line_vocabulary() {
+        for decision in ["accept", "acceptForSession", "decline"] {
+            let line = build_approval_decision_line("7", decision);
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["type"], "approval_decision");
+            assert_eq!(v["id"], "7");
+            assert_eq!(v["decision"], decision);
+        }
+    }
+
+    #[test]
+    fn test_approval_decision_line_unknown_decision_declines() {
+        let line = build_approval_decision_line("7", "yolo");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["decision"], "decline");
     }
 }
