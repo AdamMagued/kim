@@ -56,6 +56,9 @@ export interface CodexRunGroup {
 
 /** A file the user has attached to the current task input. */
 export interface AttachedFile {
+  /** L10: stable identity for React keys — index keys mis-reconciled the chip
+   *  list when an attachment was removed from the middle. */
+  id?: string;
   name: string;
   kind: 'text' | 'image' | 'binary';
   content?: string;   // text files: raw text; binary: unused

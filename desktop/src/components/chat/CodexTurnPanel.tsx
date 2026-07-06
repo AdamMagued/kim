@@ -15,7 +15,9 @@ export function HitlStatusCard({
   onRespond,
 }: {
   status: HitlApprovalStatus;
-  onRespond?: (approved: boolean) => void;
+  // M3: full decision vocabulary — hitlRespond(approved, decision?) supports
+  // acceptForSession, but the old narrowed type made it unreachable here.
+  onRespond?: (approved: boolean, decision?: 'accept' | 'acceptForSession' | 'decline') => void;
 }) {
   const isPending = status.approved === null;
   const stateLabel = isPending ? 'Approval required' : status.approved ? 'Approved' : 'Denied';
@@ -41,14 +43,22 @@ export function HitlStatusCard({
         <span className="kim-hitl-status__actions">
           <button
             className="kim-hitl-btn kim-hitl-btn--approve"
-            onClick={() => onRespond(true)}
+            onClick={() => onRespond(true, 'accept')}
             aria-label="Approve tool execution"
           >
             Approve
           </button>
+          {/* M3: mirror the codex ApprovalCard's session-wide approval */}
+          <button
+            className="kim-hitl-btn kim-hitl-btn--approve"
+            onClick={() => onRespond(true, 'acceptForSession')}
+            aria-label="Always allow this session"
+          >
+            Always this session
+          </button>
           <button
             className="kim-hitl-btn kim-hitl-btn--deny"
-            onClick={() => onRespond(false)}
+            onClick={() => onRespond(false, 'decline')}
             aria-label="Deny tool execution"
           >
             Deny

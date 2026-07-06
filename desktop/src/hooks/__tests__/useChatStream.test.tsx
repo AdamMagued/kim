@@ -310,6 +310,62 @@ describe('useChatStream typed events', () => {
       { role: 'assistant', content: 'Second answer' },
     ]);
   });
+
+  // M7: streamed assistant deltas accumulate into one bubble, flushed on the
+  // 50ms timer, then replaced by the final kim:answer (no duplicate).
+  it('kim:assistant-delta streams into one bubble that kim:answer replaces', async () => {
+    vi.useFakeTimers();
+    const { result } = await renderStream();
+    emit('kim:assistant-delta', { chunk: 'Hel' });
+    emit('kim:assistant-delta', { chunk: 'lo wor' });
+    emit('kim:assistant-delta', { chunk: 'ld' });
+    act(() => { vi.advanceTimersByTime(60); }); // flush the assistant-delta timer
+    expect(result.current.liveHistory).toEqual([
+      { role: 'assistant', content: 'Hello world' },
+    ]);
+    // Final answer replaces the streaming bubble rather than appending a dup.
+    emit('kim:answer', { text: 'Hello world!' });
+    expect(result.current.liveHistory).toEqual([
+      { role: 'assistant', content: 'Hello world!' },
+    ]);
+  });
+
+  // M7: reasoning deltas surface completed lines into the activity feed.
+  it('kim:reasoning-delta surfaces completed lines into the activity feed', async () => {
+    vi.useFakeTimers();
+    const { result } = await renderStream();
+    emit('kim:reasoning-delta', { chunk: 'first thought\nsecond th' });
+    emit('kim:reasoning-delta', { chunk: 'ought\n' });
+    act(() => { vi.advanceTimersByTime(60); }); // flush the activity timer
+    const texts = result.current.activity.map(a => a.text);
+    expect(texts).toContain('first thought');
+    expect(texts).toContain('second thought');
+  });
+
+  // M8: a [SUCCESS] activity with no prior answer becomes an assistant bubble
+  // (raw-path parity — success-without-answer must render something).
+  it('kim:activity success with no answer creates an assistant bubble', async () => {
+    const { result } = await renderStream();
+    emit('kim:activity', { kind: 'success', text: 'Booked the flight for Tuesday.' });
+    expect(result.current.liveHistory).toEqual([
+      { role: 'assistant', content: 'Booked the flight for Tuesday.' },
+    ]);
+  });
+
+  it('kim:activity generic success does NOT create a bubble', async () => {
+    const { result } = await renderStream();
+    emit('kim:activity', { kind: 'success', text: 'Task completed' });
+    expect(result.current.liveHistory).toEqual([]);
+  });
+
+  it('kim:activity success is suppressed as a bubble when an answer already arrived', async () => {
+    const { result } = await renderStream();
+    emit('kim:answer', { text: 'The real answer' });
+    emit('kim:activity', { kind: 'success', text: 'A summary line' });
+    expect(result.current.liveHistory).toEqual([
+      { role: 'assistant', content: 'The real answer' },
+    ]);
+  });
 });
 
 // ── 5. Lifecycle ──────────────────────────────────────────────────────────────

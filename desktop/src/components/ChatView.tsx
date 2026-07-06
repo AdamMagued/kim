@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
@@ -7,6 +7,7 @@ import { toast } from './Toast';
 import { ConnectorsPanel } from './kim-ui';
 import {
   friendlyError,
+  makeConversationId,
   normalizeBrowserSite,
   browserSiteFromProvider,
   providerLabel,
@@ -80,7 +81,10 @@ export function ChatView({
   }, [settings.permission_mode]);
   const [connectorsClosing, setConnectorsClosing] = useState(false);
   const [browserProvider, setBrowserProvider] = useState('claude');
-  const [conversationId] = useState(() => Math.random().toString(36).substring(7));
+  // L3: use the shared UUID helper — the old Math.random().toString(36)
+  // one-liner could produce very short, collision-prone ids that end up as
+  // resumeSessionId.
+  const [conversationId] = useState(() => makeConversationId());
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const connectorsCloseTimerRef = useRef<number | null>(null);
@@ -147,6 +151,7 @@ export function ChatView({
     loadingMessages,
     newestMsgIdx,
     codexRuns,
+    loadError,
   } = useSessionLoader({
     session,
     settings,
@@ -174,13 +179,22 @@ export function ChatView({
     messagesLength: messages.length,
   });
 
+  // H1: opening a (different) session should still land on the latest message
+  // even if the user had paused auto-follow in the previous one.
+  const setAutoFollowOutput = scroll.setAutoFollowOutput;
+  useEffect(() => {
+    setAutoFollowOutput(true);
+  }, [session?.session_id, newChatMode, setAutoFollowOutput]);
+
   const handleCancel = async () => {
     if (!stream.isRunning || stream.cancelling) return;
     stream.setCancelling(true);
-    stream.clearActivityNow();
     stream.cancelFlagRef.current = true;
     try {
       await invoke('cancel_task');
+      // M10: clear the feed only once the backend accepted the cancel — a
+      // rejected invoke used to leave a still-running run with an empty feed.
+      stream.clearActivityNow();
     } catch (err) {
       stream.setCancelling(false);
       stream.cancelFlagRef.current = false;
@@ -188,13 +202,22 @@ export function ChatView({
     }
   };
 
+  // L5: stable merged-settings object — an inline spread re-created it every
+  // render, which re-created runPendingTask and re-ran the queue-drain effect
+  // on each of the ~20/sec activity ticks.
+  const runnerSettings = useMemo(
+    () => ({ ...settings, permission_mode: permissionMode }),
+    [settings, permissionMode]
+  );
+
   const {
     queuedTasks,
     handleSubmit,
     handleRetryLast,
+    handleSteer,
   } = useTaskRunner({
     session,
-    settings: { ...settings, permission_mode: permissionMode },
+    settings: runnerSettings,
     activeTab,
     activeProjectPath,
     conversationId,
@@ -415,6 +438,7 @@ export function ChatView({
         cancelling={stream.cancelling}
         handleCancel={handleCancel}
         onSubmit={handleSubmit}
+        onSteer={handleSteer}
         activeTab={activeTab}
         activeProjectPath={activeProjectPath}
         settings={settings}
@@ -470,6 +494,7 @@ export function ChatView({
     <StreamRenderer
       messages={messages}
       loadingMessages={loadingMessages}
+      loadError={loadError}
       liveHistory={stream.liveHistory}
       runHistory={stream.runHistory}
       codexRuns={codexRuns}
@@ -488,6 +513,7 @@ export function ChatView({
       autoFollowOutput={scroll.autoFollowOutput}
       setAutoFollowOutput={scroll.setAutoFollowOutput}
       bottomRef={scroll.bottomRef}
+      outputRef={scroll.outputRef}
       newestMsgIdx={newestMsgIdx}
       queuedTasks={queuedTasks}
       lastRunTask={stream.lastRunTaskRef.current}

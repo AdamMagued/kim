@@ -12,9 +12,13 @@ export function useSessionScroll({ newChatMode, activityLength, messagesLength }
   const outputRef = useRef<HTMLDivElement>(null);
 
   // ── Scroll behavior listener (detect user scrolling up) ────────────────────
+  // H1: registered in BOTH modes (was new-chat only — and outputRef was never
+  // attached anywhere, so auto-follow was permanently forced on). StreamRenderer
+  // now attaches outputRef to `.kim-messages` in both branches; the newChatMode
+  // dep re-attaches the listener when the branch (and thus the DOM node) swaps.
   useEffect(() => {
     const scroller = outputRef.current;
-    if (!newChatMode || !scroller) return;
+    if (!scroller) return;
 
     const onScroll = () => {
       const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
@@ -33,11 +37,10 @@ export function useSessionScroll({ newChatMode, activityLength, messagesLength }
     if (newChatMode && activityLength === 0) {
       return;
     }
-    if (!newChatMode) {
-      // For existing sessions, or when newChatMode starts generating activity
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-      return;
-    }
+    // H1: gate BOTH branches on autoFollowOutput so a user who scrolled up to
+    // read is not yanked back to the bottom on every activity flush / tick.
+    // (ChatView resets autoFollowOutput to true on session switch so opening a
+    // session still jumps to the latest message.)
     if (autoFollowOutput) {
       bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
     }

@@ -125,7 +125,7 @@ export function UpdateModal({ currentVersion, latestVersion, releaseNotes, onDis
             )}
             {stage === 'done' && (
               <div style={{ color: 'var(--success, #4ade80)', marginTop: 4 }}>
-                ✓ {progress.some(l => l.includes('already up to date')) ? 'Already up to date.' : 'Restarting…'}
+                ✓ {progress.some(l => l.toLowerCase().includes('already up to date')) ? 'Already up to date.' : 'Restarting…'}
               </div>
             )}
           </div>

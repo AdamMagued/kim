@@ -523,7 +523,10 @@ export const MessageBubble = React.memo(function MessageBubble({ message, animat
 
   if (typeof content === 'string') {
     let rawToolCall = null;
-    let cleanContent = content.replace(/(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said):?\s*/ig, '').trim();
+    // L7: anchor to the START only — the old global regex stripped these
+    // phrases ANYWHERE in the text, mangling legitimate content that quotes
+    // them (the utils layer explicitly warns never to brand-scrub raw answers).
+    let cleanContent = content.replace(/^\s*(?:(?:Gemini said|Claude said|Assistant said|ChatGPT said|Grok said):?\s*)+/i, '').trim();
     
     if (cleanContent.startsWith('{')) {
       try {

@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { confirm, open as openDialog } from '@tauri-apps/plugin-dialog';
 import type { SessionInfo, KimAccount, CodexProject, Theme } from '../../types';
+import { toast } from '../Toast';
 
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_MAX_WIDTH = 520;
@@ -197,6 +198,13 @@ export function RevampSidebar({
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
+      // L13: unmounting mid-drag left document.body stuck in col-resize +
+      // userSelect:none for the rest of the app session.
+      if (resizingRef.current) {
+        resizingRef.current = false;
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+      }
     };
   }, [resizing]);
   useEffect(() => {
@@ -265,9 +273,17 @@ export function RevampSidebar({
       setCodexProjects([]);
       return;
     }
+    // H8: cancelled-flag guard so a slow response from a PREVIOUS
+    // projectPaths/nonce can't land after a newer one and overwrite it.
+    // On error, keep the last good list (don't blank to "No projects yet")
+    // and surface the failure.
+    let cancelled = false;
     invoke<CodexProject[]>('list_codex_projects', { projectPaths })
-      .then((p) => setCodexProjects(p))
-      .catch(() => setCodexProjects([]));
+      .then((p) => { if (!cancelled) setCodexProjects(p); })
+      .catch((err) => {
+        if (!cancelled) toast(`Could not load Code projects: ${String(err)}`, 'error', 4000);
+      });
+    return () => { cancelled = true; };
   }, [activeTab, projectPaths, sessionRefreshNonce]);
 
   async function handleAddProject() {
@@ -283,8 +299,11 @@ export function RevampSidebar({
       if (onAccountChange) {
         await onAccountChange({ ...account, code_projects: next });
       }
-    } catch {
-      // silently ignore — dialog cancelled or backend unavailable
+    } catch (err) {
+      // M12: a cancelled dialog returns null (handled above) — reaching here
+      // means the picker or save_account really failed; tell the user instead
+      // of silently showing nothing after they picked a folder.
+      toast(`Could not add the project: ${String(err)}`, 'error', 4000);
     }
   }
 
@@ -296,10 +315,16 @@ export function RevampSidebar({
     if (!ok) return;
 
     const next = projectPaths.filter(p => p !== path);
-    if (onAccountChange) {
-      await onAccountChange({ ...account, code_projects: next });
+    try {
+      if (onAccountChange) {
+        await onAccountChange({ ...account, code_projects: next });
+      }
+      onRemoveProject?.(path);
+    } catch (err) {
+      // M12: previously a void-invoked unguarded await — the removal silently
+      // didn't persist and the rejection was unhandled.
+      toast(`Could not remove the project: ${String(err)}`, 'error', 4000);
     }
-    onRemoveProject?.(path);
   }
 
   if (collapsed) {
@@ -666,21 +691,37 @@ export function RevampSidebar({
                           <div style={{ fontSize: 12, color: 'var(--kim-text-4)', padding: '6px 8px' }}>No sessions yet</div>
                         ) : (
                           (() => {
-                            const flat = p.branches.flatMap(b => b.sessions);
+                            // M13: apply the sidebar search to Code-tab sessions too
+                            // (the search box renders on both tabs but only filtered chats).
+                            const q = searchQuery.trim().toLowerCase();
+                            const flat = p.branches.flatMap(b => b.sessions).filter((s) => {
+                              if (!q) return true;
+                              return (
+                                (s.title ?? '').toLowerCase().includes(q) ||
+                                (s.summary ?? '').toLowerCase().includes(q) ||
+                                s.session_id.toLowerCase().includes(q)
+                              );
+                            });
                             const updatedAtById = new Map(flat.map(s => [s.session_id, s.updated_at] as const));
-                            const infos: SessionInfo[] = flat.map((s) => ({
-                              session_id: s.session_id,
-                              session_type: 'codex',
-                              // For Codex sessions, `date` must be the YYYY-MM-DD bucket so the
-                              // message loader can locate <bucket>/<id>.jsonl on disk.
-                              date: s.date || new Date().toISOString(),
-                              message_count: s.message_count,
-                              has_summary: !!s.summary,
-                              summary: s.summary ?? undefined,
-                              title: s.title,
-                              session_key: `codex:${s.date}:${s.session_id}`,
-                              project_path: p.path,
-                            }));
+                            const infos: SessionInfo[] = flat.map((s) => {
+                              // L13: the contract is a YYYY-MM-DD bucket — a full
+                              // ISO timestamp fallback broke the <bucket>/<id>.jsonl
+                              // lookup, and an empty date made session_key "codex::id".
+                              const dateBucket = s.date || new Date().toISOString().slice(0, 10);
+                              return {
+                                session_id: s.session_id,
+                                session_type: 'codex',
+                                // For Codex sessions, `date` must be the YYYY-MM-DD bucket so the
+                                // message loader can locate <bucket>/<id>.jsonl on disk.
+                                date: dateBucket,
+                                message_count: s.message_count,
+                                has_summary: !!s.summary,
+                                summary: s.summary ?? undefined,
+                                title: s.title,
+                                session_key: `codex:${dateBucket}:${s.session_id}`,
+                                project_path: p.path,
+                              };
+                            });
                             infos.sort((a, b) => {
                               const aTs = Date.parse(updatedAtById.get(a.session_id) || a.date);
                               const bTs = Date.parse(updatedAtById.get(b.session_id) || b.date);
