@@ -596,7 +596,8 @@ class _CodexProxy:
         # of thought can't be scraped.
         _surface_relay_reasoning(response, relay_num)
         responses_reply = _provider_response_to_responses_api(
-            response, relay_num, request_tools=body.get("tools")
+            response, relay_num, request_tools=body.get("tools"),
+            metrics=self._thread_state.setdefault("repairs", {}),
         )
         # Loop guard: if this relay's tool calls repeat the previous relay's —
         # identical, or a subset of sub-commands that already ran (`open x`
@@ -655,6 +656,7 @@ class _CodexProxy:
             logger.info(f"[relay #{relay_num}] Prose reply has salvageable actions — executing, no nudge")
             return response
         logger.info(f"[relay #{relay_num}] Reply had no actionable command — sending one nudge")
+        _count_repair(self._thread_state.setdefault("repairs", {}), "nudges")
         print(f"{LOG_TAG_STATUS} Reply had no runnable command — asking for it…", flush=True)
         is_chatgpt = bool(self._provider_name) and "chatgpt" in self._provider_name.lower()
         nudge = _TERMINAL_NUDGE if is_chatgpt else _CONTRACT_NUDGE
@@ -1813,8 +1815,14 @@ def _is_repeat_of_previous(cmds: object, last_cmds: object) -> bool:
     return bool(new_subs) and new_subs <= _signature_subcommands(last_cmds)
 
 
+def _count_repair(metrics: object, key: str) -> None:
+    """Rb1: bump a repair counter (persisted via the thread-state sidecar)."""
+    if isinstance(metrics, dict):
+        metrics[key] = int(metrics.get(key) or 0) + 1
+
+
 def _provider_response_to_responses_api(
-    response: dict, relay_num: int, request_tools: object = None
+    response: dict, relay_num: int, request_tools: object = None, metrics: object = None
 ) -> dict:
     """Convert a BrowserProvider response to OpenAI Responses API format."""
     resp_id = f"resp_{uuid.uuid4().hex[:16]}"
@@ -1849,6 +1857,7 @@ def _provider_response_to_responses_api(
                 # Empty message text: the humanized activity lines from
                 # _announce_commands narrate the work — passing the full reply
                 # (prose + file body) would dump it to the user as "Kim: …".
+                _count_repair(metrics, "salvages")
                 return _make_responses_tool_reply(resp_id, "", salvaged)
             return _make_responses_text_reply(resp_id, text or content)
 
@@ -1861,6 +1870,7 @@ def _provider_response_to_responses_api(
         salvaged = _salvage_action_reply(content, request_tools)
         if salvaged is not None:
             # Empty text — the humanized activity lines narrate it (see above).
+            _count_repair(metrics, "salvages")
             return _make_responses_tool_reply(resp_id, "", salvaged)
 
         return _make_responses_text_reply(resp_id, content)

@@ -20,6 +20,10 @@ State shape:
                                     # thread id, resumed across messages
         "codex_thread_cwd": str|None,  # cwd the codex thread was started in
                                     # (resume only when it still matches)
+        "repairs": dict,            # Rb1 visibility counters: how often the
+                                    # proxy salvaged prose into tool calls
+                                    # ("salvages") or re-asked for the format
+                                    # ("nudges") this thread
         "updated_at": str,          # ISO timestamp of last write
     }
 

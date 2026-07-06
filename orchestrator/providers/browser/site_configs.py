@@ -29,6 +29,51 @@ _VERIFY_MIN_CHARS = 20
 _INJECT_MAX_RETRIES = 3
 _BRIDGE_TIMEOUT_S = 720
 
+# ── Rb3: auth-wall detection ─────────────────────────────────────────────────
+# URL substrings that mean the "chat tab" is actually a sign-in or bot-check
+# wall. Sending into one of these hangs for the full generation wait (600s);
+# detecting it up front turns that into an instant, actionable AUTH_REQUIRED.
+_AUTH_WALL_URL_MARKERS = (
+    "/login",
+    "/signin",
+    "/sign-in",
+    "/auth/",
+    "accounts.google.com",
+    "auth.openai.com",
+    "auth0.com",
+    "challenges.cloudflare.com",
+    "__cf_chl",  # Cloudflare challenge query marker
+    "/cdn-cgi/challenge",
+)
+
+# Page titles of well-known interstitials (checked case-insensitively when a
+# title is available; URL detection alone already covers the common cases).
+_AUTH_WALL_TITLE_MARKERS = (
+    "just a moment",          # Cloudflare
+    "attention required",     # Cloudflare block page
+    "sign in",
+    "log in",
+)
+
+
+def detect_auth_wall(url: str, title: str = "") -> str | None:
+    """Return a short human reason when *url*/*title* is an auth/bot wall.
+
+    Pure and conservative: only well-known login and Cloudflare-challenge
+    markers match — a false positive here would block a healthy send.
+    """
+    low_url = (url or "").lower()
+    for marker in _AUTH_WALL_URL_MARKERS:
+        if marker in low_url:
+            return f"the tab is on a sign-in or verification page ({marker.strip('/')})"
+    low_title = (title or "").strip().lower()
+    if low_title:
+        for marker in _AUTH_WALL_TITLE_MARKERS:
+            if low_title.startswith(marker):
+                return f"the tab shows a '{title.strip()}' page"
+    return None
+
+
 _POPUP_DISMISS_LABELS = [
     "I agree",
     "Got it",

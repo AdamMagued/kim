@@ -93,6 +93,7 @@ from orchestrator.providers.browser.site_configs import (
     _INJECT_MAX_RETRIES,
     _POPUP_DISMISS_LABELS,
     _VERIFY_MIN_CHARS,
+    detect_auth_wall,
     to_list,
 )
 
@@ -463,6 +464,23 @@ class BrowserProvider(BaseProvider):
         """Downstream chat flow — identical for the CDP path and an injected
         PageDriver: clear/upload/popups, inject + send + two-phase wait,
         markdown scrape, then parse into the canonical response format."""
+        # Rb3: a "chat tab" that is actually a sign-in / Cloudflare wall would
+        # swallow the send and hang for the full generation wait. Fail fast
+        # with a specific, actionable reason instead.
+        wall_reason = detect_auth_wall(getattr(page, "url", "") or "")
+        if wall_reason:
+            logger.warning(f"Auth wall detected on {site}: {wall_reason} ({page.url})")
+            return self._attach_usage(
+                {
+                    "type": "text",
+                    "content": (
+                        f"NEED_HELP: AUTH_REQUIRED — I can't reach the {site} chat because "
+                        f"{wall_reason}. Please finish signing in (or complete the "
+                        "verification) in that browser tab, then resend your message."
+                    ),
+                },
+                estimated_usage,
+            )
         if clear_chat:
             logger.info(f"Clearing chat context by reloading {page.url}...")
             await page.goto(page.url, wait_until="domcontentloaded")
