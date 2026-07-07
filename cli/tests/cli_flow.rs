@@ -379,8 +379,7 @@ fn browser_provider_errors_cleanly_when_bridge_is_down() {
     // actionable env-setup message (install.bat / ./install.sh) instead of the
     // old "start the desktop" string.
     assert!(
-        all.contains("Browser provider can't run")
-            && all.contains("install.bat"),
+        all.contains("Browser provider can't run") && all.contains("install.bat"),
         "browser providers must get the actionable env-setup message; output: {all}"
     );
     // Both health endpoints were probed; the task was never submitted.
