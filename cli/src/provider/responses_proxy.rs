@@ -118,6 +118,12 @@ pub(crate) async fn start_responses_proxy(
     })
 }
 
+// Retained (with its safety tests) for reference and potential reuse, but no
+// longer wired into the live code path: the local codex run now routes through
+// Kim's proxy via `-c` overrides on the user's real codex home (C3), instead of
+// writing a config.toml into a throwaway CODEX_HOME. See
+// `codex_stream::build_codex_args_with_proxy`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_codex_config(
     proxy_port: u16,
     model: &str,
