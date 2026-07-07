@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::KimConfig;
 
-use super::responses_proxy::{start_responses_proxy, write_codex_config, ProxyHandle};
+use super::responses_proxy::{start_responses_proxy, ProxyHandle};
 use super::typed_events::emit_typed_kim_event;
 use super::{kim_root_or_error, AppEvent, CodexTurnControl};
 
@@ -25,9 +25,22 @@ pub(crate) async fn stream_codex_subprocess(
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let is_browser = config.provider.to_ascii_lowercase().starts_with("browser");
 
-    // Holds the exclusive temp dir for the codex CODEX_HOME so it outlives the
-    // if-else block and stays alive until child.wait() completes (#23).
-    let mut _codex_temp_dir: Option<tempfile::TempDir> = None;
+    // Finding 1: on the direct-API (local provider) path codex is spawned fresh
+    // for each message, so there is no persistent model-side context to compact —
+    // and forwarding a "/compact" control token to `codex exec` would send it to
+    // the model as a literal coding prompt (the UI meanwhile claims "Compacting…").
+    // The browser path already intercepts these tokens in the bridge service
+    // (_COMPACT_CONTROL_TASKS); here we handle the direct-API path honestly
+    // instead of spawning codex on a control token.
+    if !is_browser && is_compact_control_task(prompt) {
+        let _ = tx.send(AppEvent::ThoughtChunk(line_chunk(
+            "Local code mode starts a fresh Codex run for each message, so there is no \
+             accumulated model context to compact here. Nothing was sent to the model.",
+        )));
+        let _ = tx.send(AppEvent::Done(false));
+        return;
+    }
+
     // Holds the responses-proxy (local provider only) for the whole run; drop at
     // function exit kills it and removes its script (#35).
     let mut _proxy_handle: Option<ProxyHandle> = None;
@@ -108,34 +121,31 @@ pub(crate) async fn stream_codex_subprocess(
         };
         let proxy_port = proxy.port;
         _proxy_handle = Some(proxy);
-        // Use an exclusive randomized temp dir so concurrent runs don't clobber
-        // each other and the path is not pre-creatable by a local attacker (#23).
-        let kim_codex_dir = match tempfile::Builder::new().prefix("kim_codex_").tempdir() {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = tx.send(AppEvent::Err(format!(
-                    "Failed to create codex temp dir: {e}"
-                )));
-                return;
-            }
-        };
-        let kim_codex_home = kim_codex_dir.path().to_path_buf();
-        // Keep the TempDir alive until child.wait() finishes (#23).
-        _codex_temp_dir = Some(kim_codex_dir);
-        if let Err(e) = write_codex_config(proxy_port, &config.model, &kim_codex_home) {
-            let _ = tx.send(AppEvent::Err(format!("Failed to write codex config: {e}")));
-            return;
-        }
         // Gate the sandbox-bypass flag behind an explicit opt-in env var (#1).
         // Passing it unconditionally disabled the Codex approval gate for every
         // CLI user, even those who didn't need it.
         let bypass_sandbox = std::env::var("KIM_CODEX_BYPASS_SANDBOX").as_deref() == Ok("1");
         let cwd_str = cwd.to_string_lossy().into_owned();
-        let codex_args = build_codex_args(prompt, &cwd_str, bypass_sandbox, allow_non_git);
+        // C3 parity with the Python bridge (`_exec_config_overrides`): route codex
+        // at Kim's local responses proxy with `-c` overrides layered on top of the
+        // user's REAL codex home instead of pointing CODEX_HOME at a throwaway temp
+        // dir. The old temp CODEX_HOME wiped the user's ~/.codex/config.toml, MCP
+        // servers, and skills for the run; leaving CODEX_HOME unset lets codex use
+        // ~/.codex (or an exported CODEX_HOME), so all of that still applies and
+        // rollout files persist.
+        let codex_args = build_codex_args_with_proxy(
+            prompt,
+            &cwd_str,
+            bypass_sandbox,
+            allow_non_git,
+            proxy_port,
+            &config.model,
+        );
         match Command::new("codex")
             .args(&codex_args)
             .env("OPENAI_API_KEY", "ollama")
-            .env("CODEX_HOME", &kim_codex_home)
+            // No CODEX_HOME override: inherit the user's real ~/.codex (or an
+            // exported CODEX_HOME) so their config, MCP servers, and skills apply.
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -455,6 +465,80 @@ pub(crate) fn build_codex_args(
     args.push("-C".into());
     args.push(cwd.to_string());
     args.push(prompt.to_string());
+    args
+}
+
+/// Local mirror of main.rs's `is_compact_control_task`: tokens that mean
+/// "compact the context" and must never be forwarded to codex as a literal
+/// coding prompt. Kept in sync with `_COMPACT_CONTROL_TASKS` in
+/// `orchestrator/agent.py` / `codex_bridge_service.py`.
+fn is_compact_control_task(task: &str) -> bool {
+    matches!(
+        task.trim().to_ascii_lowercase().as_str(),
+        "/compact" | "compact" | "__kim_compact_context__"
+    )
+}
+
+/// Strip characters that could break the generated TOML value or inject extra
+/// config, matching the Python bridge's `_exec_config_overrides` sanitizer
+/// (`[^A-Za-z0-9_\-.:/ ]` removed, capped at 128 chars). Empty → a safe default.
+fn sanitize_proxy_model(model: &str) -> String {
+    let cleaned: String = model
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/' | ' '))
+        .take(128)
+        .collect();
+    if cleaned.is_empty() {
+        "kim-proxy-model".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// `-c key="value"` global overrides that route codex at Kim's local responses
+/// proxy (C3). Mirrors the Python bridge's `_exec_config_overrides` and the
+/// keys the old `write_codex_config` wrote — but as CLI overrides layered on the
+/// user's real codex home, so no throwaway CODEX_HOME is needed.
+pub(crate) fn codex_proxy_overrides(proxy_port: u16, model: &str) -> Vec<String> {
+    let safe_model = sanitize_proxy_model(model);
+    let base_url = format!("http://127.0.0.1:{proxy_port}/v1");
+    let pairs: [(&str, &str); 6] = [
+        ("model_provider", "kim-proxy"),
+        ("model", &safe_model),
+        ("model_providers.kim-proxy.name", "Kim Proxy"),
+        ("model_providers.kim-proxy.base_url", &base_url),
+        ("model_providers.kim-proxy.wire_api", "responses"),
+        ("model_providers.kim-proxy.env_key", "OPENAI_API_KEY"),
+    ];
+    let mut out = Vec::with_capacity(pairs.len() * 2);
+    for (key, value) in pairs {
+        out.push("-c".to_string());
+        // Quoted → parsed as a TOML string (same as the Python bridge).
+        out.push(format!("{key}=\"{value}\""));
+    }
+    out
+}
+
+/// `build_codex_args` plus the kim-proxy `-c` routing overrides inserted before
+/// the positional `-C <cwd> <prompt>` tail. Used by the local (direct-API) path
+/// so codex talks to Kim's responses proxy while still using the user's real
+/// codex home.
+pub(crate) fn build_codex_args_with_proxy(
+    prompt: &str,
+    cwd: &str,
+    bypass: bool,
+    skip_git_check: bool,
+    proxy_port: u16,
+    model: &str,
+) -> Vec<String> {
+    let mut args = build_codex_args(prompt, cwd, bypass, skip_git_check);
+    let overrides = codex_proxy_overrides(proxy_port, model);
+    // Insert before `-C` (the positional tail) so the overrides stay global
+    // flags regardless of the bypass / skip-git-check flags in front of them.
+    let insert_at = args.iter().position(|a| a == "-C").unwrap_or(args.len());
+    for (offset, item) in overrides.into_iter().enumerate() {
+        args.insert(insert_at + offset, item);
+    }
     args
 }
 
@@ -788,5 +872,122 @@ mod tests {
         assert_eq!(&on[n - 3], "-C");
         assert_eq!(&on[n - 2], cwd);
         assert_eq!(&on[n - 1], prompt);
+    }
+
+    // ── Finding 1: compact control tokens never reach codex as a prompt ──────
+
+    #[test]
+    fn compact_control_tasks_are_recognized() {
+        for t in [
+            "/compact",
+            "compact",
+            "  /COMPACT  ",
+            "__kim_compact_context__",
+        ] {
+            assert!(
+                is_compact_control_task(t),
+                "{t:?} should be a compact token"
+            );
+        }
+        for t in ["compact the report", "/compactify", "hello", "/comp"] {
+            assert!(
+                !is_compact_control_task(t),
+                "{t:?} must not be a compact token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_api_compact_does_not_spawn_codex() {
+        // Local (non-browser) provider + a compact token: the turn must report
+        // honestly and finish WITHOUT sending "/compact" to the model. Reaching
+        // codex/proxy spawn would hang or error here (no codex binary in CI), so
+        // a clean Done(false) proves the token was intercepted first.
+        let config = crate::config::KimConfig::default(); // provider = "ollama"
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        stream_codex_subprocess(&config, "/compact", false, "sess", tx, None).await;
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AppEvent::ThoughtChunk(t) if t.to_lowercase().contains("compact"))
+            ),
+            "expected an honest compact note, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AppEvent::Done(false))),
+            "expected Done(false), got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AppEvent::Err(_))),
+            "compact intercept must not error, got {events:?}"
+        );
+    }
+
+    // ── Finding 3 (C3): local codex routes via -c overrides on the real home ─
+
+    #[test]
+    fn proxy_overrides_route_at_kim_proxy_and_keep_positional_tail() {
+        let args = build_codex_args_with_proxy(
+            "fix bug",
+            "/proj",
+            false,
+            false,
+            45999,
+            "qwen2.5-coder:7b",
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains(r#"model_provider="kim-proxy""#), "{joined}");
+        assert!(
+            joined.contains(r#"model_providers.kim-proxy.base_url="http://127.0.0.1:45999/v1""#),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(r#"model_providers.kim-proxy.wire_api="responses""#),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(r#"model_providers.kim-proxy.env_key="OPENAI_API_KEY""#),
+            "{joined}"
+        );
+        assert!(joined.contains(r#"model="qwen2.5-coder:7b""#), "{joined}");
+        // Positional tail preserved: … -C /proj "fix bug".
+        let n = args.len();
+        assert_eq!(args[n - 3], "-C");
+        assert_eq!(args[n - 2], "/proj");
+        assert_eq!(args[n - 1], "fix bug");
+        // Overrides sit before the -C tail (they are global flags).
+        let dash_c = args.iter().position(|a| a == "-C").unwrap();
+        assert!(args[..dash_c].iter().any(|a| a == "-c"), "{joined}");
+    }
+
+    #[test]
+    fn proxy_overrides_sanitize_toml_breaking_model_names() {
+        // A quote / backslash / newline / semicolon in the model name must be
+        // stripped so it cannot break out of the TOML string or inject config.
+        let args = build_codex_args_with_proxy("hi", "/p", false, false, 1, "lla\"ma; x=\ny\\z");
+        let joined = args.join(" ");
+        assert_eq!(
+            joined.matches('"').count() % 2,
+            0,
+            "unbalanced TOML quotes: {joined}"
+        );
+        let model_arg = args
+            .iter()
+            .find(|a| a.starts_with("model="))
+            .expect("model override present");
+        for bad in ['"', '\\', '\n', ';', '='] {
+            // (the leading `model=` `=` is fine — check the value only)
+            let value = &model_arg["model=".len()..];
+            assert!(
+                !value.trim_matches('"').contains(bad),
+                "sanitized model still contains {bad:?}: {model_arg}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_overrides_empty_model_falls_back() {
+        let args = build_codex_args_with_proxy("hi", "/p", false, false, 1, "");
+        assert!(args.join(" ").contains(r#"model="kim-proxy-model""#));
     }
 }

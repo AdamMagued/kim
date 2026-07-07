@@ -24,7 +24,6 @@ import argparse
 import asyncio
 import atexit
 import concurrent.futures
-import json
 import logging
 import os
 import shutil
@@ -56,6 +55,7 @@ from codex_engine.thread_state import (
 )
 from orchestrator.codex_appserver_transport import (
     compact_codex_thread,
+    parse_decision_line,
     run_app_server_task,
     transport_name,
 )
@@ -296,34 +296,59 @@ def _begin_stdin_read() -> "concurrent.futures.Future[str]":
 
 
 async def _await_hitl_decision(timeout: float = 120.0) -> bool:
-    """Block on stdin for a {"approved": bool} line from the Rust supervisor.
+    """Block on stdin for an approval decision line from the Rust supervisor.
 
     The supervisor reads our stdout, shows a confirmation dialog, then writes
-    {"type": "hitl_approve", "approved": bool} to our stdin.  Returns True only
-    on an explicit approval; any error/timeout denies.
+    an approval decision to our stdin — the legacy ``{"approved": bool}`` /
+    ``{"type": "hitl_approve", "approved": bool}`` shapes or the newer
+    ``{"type": "approval_decision", "decision": …}`` shape. Returns True only
+    on an explicit approval; any error/timeout/EOF denies.
+
+    Finding 2: the same stdin also carries mid-run *steer* notes (and other
+    non-decision lines). Those must NOT be read as an approval — the old code
+    did ``bool(data.get("approved", False))``, so a steer line (no ``approved``
+    key) parsed as ``False`` and silently DENIED the pending approval. We now
+    route each line through ``parse_decision_line``: a real accept/decline is
+    honored, while a steer / user-note / unparseable line is skipped and we
+    keep waiting for the actual decision (within the remaining budget).
     """
     global _pending_stdin_read  # noqa: PLW0603
-    fut = _begin_stdin_read()
-    try:
-        # shield: a timeout must not cancel the underlying read — the parked
-        # future is what lets the NEXT prompt pick the stream back up (C2).
-        line: str = await asyncio.wait_for(
-            asyncio.shield(asyncio.wrap_future(fut)), timeout=timeout
-        )
-    except asyncio.TimeoutError:
-        logger.warning("HITL stdin read timed out — denying")
-        return False
-    except Exception as exc:  # noqa: BLE001
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.warning("HITL stdin read timed out — denying")
+            return False
+        fut = _begin_stdin_read()
+        try:
+            # shield: a timeout must not cancel the underlying read — the parked
+            # future is what lets the NEXT prompt pick the stream back up (C2).
+            line: str = await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(fut)), timeout=remaining
+            )
+        except asyncio.TimeoutError:
+            logger.warning("HITL stdin read timed out — denying")
+            return False
+        except Exception as exc:  # noqa: BLE001
+            _pending_stdin_read = None
+            logger.warning("HITL stdin read failed (%s) — denying", exc)
+            return False
         _pending_stdin_read = None
-        logger.warning("HITL stdin read failed (%s) — denying", exc)
-        return False
-    _pending_stdin_read = None
-    try:
-        data = json.loads(line.strip())
-        return bool(data.get("approved", False))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("HITL stdin decision malformed (%s) — denying", exc)
-        return False
+        if not line:
+            # EOF — the supervisor closed the pipe/went away; deny.
+            logger.warning("HITL stdin closed before a decision — denying")
+            return False
+        decision = parse_decision_line(line)
+        if decision is None:
+            # A steer note / user message / unparseable line — not an approval
+            # decision. Do not misread it as a denial (Finding 2); keep waiting.
+            logger.debug(
+                "Ignoring non-decision stdin line during approval wait: %r",
+                line.strip()[:120],
+            )
+            continue
+        return decision[0] in ("accept", "acceptForSession")
 
 
 async def _request_hitl_approval(task: str) -> bool:
