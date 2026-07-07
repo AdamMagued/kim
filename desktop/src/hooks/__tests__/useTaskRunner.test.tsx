@@ -26,6 +26,8 @@ function makeStream(isRunning: boolean) {
     currentTaskRef: ref<unknown>(null),
     lastRunTaskRef: ref<unknown>(null),
     completedCodeSessionRef: ref<unknown>(null),
+    runOwnerSessionIdRef: ref<string | null>(null), // RUN-IDENTITY
+    currentRunIdRef: ref<string | null>(null),
     activityRef: ref<unknown[]>([]),
     activityCounterRef: ref(0),
     lastFailedTask: null,

@@ -123,6 +123,12 @@ export default function App() {
   // Incremented every time the user presses New Chat — used as ChatView's key
   // so the component fully remounts (clearing all transient state) each time.
   const [chatSerial, setChatSerial] = useState(0);
+  // RUN-IDENTITY (D1/B4/B5): the single globally-active run's identity, lived
+  // ABOVE the ChatView remount boundary. Set from the `kim-run-id` event at
+  // spawn, cleared on done/cancel. A ChatView remounted mid-run (tab/session/
+  // New-Chat switch) reads this to re-derive that its session's run is still
+  // running and re-attach to the live stream instead of orphaning it.
+  const [activeRun, setActiveRun] = useState<{ runId: string; sessionId: string } | null>(null);
   const [activeTab, setActiveTab] = useState<'chat' | 'code'>('chat');
   const [activeProjectPath, setActiveProjectPath] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -212,6 +218,24 @@ export default function App() {
       }
     }).then((fn) => { if (cancelled) fn(); else unlisten = fn; }).catch(() => {});
     return () => { cancelled = true; unlisten?.(); };
+  }, []);
+
+  // RUN-IDENTITY: track the single active run across ChatView remounts.
+  useEffect(() => {
+    let cancelled = false;
+    const unlisteners: Array<() => void> = [];
+    const track = <T,>(name: string, cb: (p: T) => void) => {
+      listen<T>(name, e => cb(e.payload))
+        .then(fn => { if (cancelled) fn(); else unlisteners.push(fn); })
+        .catch(() => {});
+    };
+    track<{ run_id: string; session_id: string }>('kim-run-id', p => {
+      if (p && p.session_id) setActiveRun({ runId: p.run_id, sessionId: p.session_id });
+    });
+    // Single active run: any completion/cancel clears the active-run marker.
+    track<boolean>('kim-agent-done', () => setActiveRun(null));
+    track<boolean>('kim-agent-cancelled', () => setActiveRun(null));
+    return () => { cancelled = true; unlisteners.forEach(fn => fn()); };
   }, []);
 
   useEffect(() => {
@@ -563,6 +587,8 @@ export default function App() {
         <ChatView
           key={`chat-${activeTab}-${chatSerial}`}
           session={activeSession}
+          activeRunSessionId={activeRun?.sessionId ?? null}
+          activeRunId={activeRun?.runId ?? null}
           newChatMode={newChatMode}
           settings={settings}
           onSettingsChange={handleSettingsChange}

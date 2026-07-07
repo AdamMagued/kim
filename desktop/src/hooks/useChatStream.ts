@@ -83,6 +83,14 @@ export interface UseChatStreamProps {
   commitCurrentBrowserUrl: (preferredSite?: string | null, targetSession?: SessionInfo | null, overrideSessionId?: string | null) => Promise<void>;
   setMessageReloadNonce: React.Dispatch<React.SetStateAction<number>>;
   conversationId?: string;
+  // RUN-IDENTITY (D1/B4/B5): the single globally-active run's identity, tracked
+  // at App level (from the `kim-run-id` event) so it survives the ChatView
+  // remount that a tab/session/New-Chat switch triggers. When this view's own
+  // session owns that run, the view re-derives isRunning=true and re-attaches to
+  // the live event stream instead of orphaning it. Null when no run is active or
+  // the active run belongs to a different session.
+  activeRunSessionId?: string | null;
+  activeRunId?: string | null;
 }
 
 export function useChatStream({
@@ -92,8 +100,17 @@ export function useChatStream({
   commitCurrentBrowserUrl,
   setMessageReloadNonce,
   conversationId,
+  activeRunSessionId,
+  activeRunId,
 }: UseChatStreamProps) {
-  const [isRunning, setIsRunning] = useState(false);
+  // The session id this view represents — the identity every run-scoped event
+  // must match to be routed here (see `belongsToView`).
+  const viewSessionId = session?.session_id ?? conversationId ?? '';
+  // Does the currently-active run (if any) belong to THIS view's session?
+  const ownsActiveRun = !!activeRunSessionId && activeRunSessionId === viewSessionId;
+  // Initialize the running state from the active-run hint so a view remounted
+  // mid-run (switch-back) shows Stop, not Send, and re-attaches to the stream.
+  const [isRunning, setIsRunning] = useState(ownsActiveRun);
   const [cancelling, setCancelling] = useState(false);
   const [activity, setActivity] = useState<ActivityItem[]>([]);
   // B5: each run carries the provider it actually used so the cost chip prices
@@ -181,6 +198,23 @@ export function useChatStream({
   useEffect(() => {
     activeResumeSessionIdRef.current = session?.session_id ?? conversationId ?? '';
   }, [session, conversationId]);
+
+  // RUN-IDENTITY refs. runOwnerSessionIdRef is the session the in-flight run
+  // belongs to (captured at spawn by useTaskRunner, or re-derived on switch-back
+  // from the active-run hint). currentRunIdRef mirrors the run_id from the
+  // `kim-run-id` event. History is filed under the OWNER, never under "the
+  // session currently on screen", so a mid-run switch cannot misfile it (B5/D1).
+  const runOwnerSessionIdRef = useRef<string | null>(ownsActiveRun ? activeRunSessionId ?? null : null);
+  const currentRunIdRef = useRef<string | null>(ownsActiveRun ? activeRunId ?? null : null);
+
+  // Route guard: a run-scoped event is for THIS view iff it carries no session
+  // envelope (legacy/codex/bridge streams) or its session_id matches this view's
+  // session. Foreign-run events (a run started under a different session that is
+  // still streaming after a switch) are dropped so run A never mutates view B.
+  const belongsToView = useCallback(
+    (sid?: string | null) => !sid || sid === activeResumeSessionIdRef.current,
+    [],
+  );
 
   // Deduplication functions
   const isDuplicate = useCallback((raw: string): boolean => {
@@ -466,17 +500,20 @@ export function useChatStream({
     // Typed IPC listeners own Kim's UI state. The raw listener below remains
     // exclusively for the external Codex JSONL/text compatibility stream.
     listen<KimStatusPayload>(KimEventNames.STATUS, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       setTypedStatus(e.payload.message);
       appendTypedActivity('status', e.payload.message);
     }).then(fn => { if (!cancelled) unlistenTypedStatus = fn; else fn(); });
 
     listen<KimPlanPayload>(KimEventNames.PLAN, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       const steps = e.payload.steps.filter((step): step is string => typeof step === 'string').slice(0, 12);
       if (steps.length < 2) return;
       setTypedLivePlan({ steps, activeStep: 0, doneSteps: [], structured: true });
     }).then(fn => { if (!cancelled) unlistenTypedPlan = fn; else fn(); });
 
     listen<KimStepPayload>(KimEventNames.STEP, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       setTypedLivePlan(prev => {
         if (!prev) return prev;
         const activeStep = Math.max(0, Math.min(e.payload.n, prev.steps.length));
@@ -486,6 +523,7 @@ export function useChatStream({
     }).then(fn => { if (!cancelled) unlistenTypedStep = fn; else fn(); });
 
     listen<KimDonePayload>(KimEventNames.DONE, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       setTypedLivePlan(prev => {
         if (!prev) return prev;
         const doneSteps = prev.doneSteps.includes(e.payload.n)
@@ -498,6 +536,7 @@ export function useChatStream({
     }).then(fn => { if (!cancelled) unlistenTypedDone = fn; else fn(); });
 
     listen<KimContextPayload>(KimEventNames.CONTEXT, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       setContextState({
         cumulative_input: e.payload.cumulative_input,
         budget: e.payload.budget,
@@ -511,6 +550,7 @@ export function useChatStream({
     }).then(fn => { if (!cancelled) unlistenTypedContext = fn; else fn(); });
 
     listen<KimStatsPayload>(KimEventNames.STATS, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       setTokenStats({ input: e.payload.input, output: e.payload.output, total: e.payload.total });
     }).then(fn => { if (!cancelled) unlistenTypedStats = fn; else fn(); });
 
@@ -519,6 +559,7 @@ export function useChatStream({
     // exposing it to the UI (e.g. a termination-specific banner) is the
     // remaining Tier 2b gap documented in docs/archive/HARNESS_ROADMAP.md.
     listen<KimRunDonePayload>(KimEventNames.RUN_DONE, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       terminationReasonRef.current = e.payload.termination;
     }).then(fn => { if (!cancelled) unlistenTypedRunDone = fn; else fn(); });
 
@@ -527,12 +568,14 @@ export function useChatStream({
     // raw by StreamRenderer when !== 'agent-error'; a dedicated banner slot is
     // needed before a structured code can be shown to the user.
     listen<KimProviderErrorPayload>(KimEventNames.PROVIDER_ERROR, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       lastProviderErrorCodeRef.current = e.payload.code;
     }).then(fn => { if (!cancelled) unlistenTypedProviderError = fn; else fn(); });
 
     // HITL approval visibility. This is display-only for now; the approval
     // decision path still lives in the agent/UIBridge layer.
     listen<KimHitlApprovalRequestPayload>(KimEventNames.HITL_APPROVAL_REQUEST, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       setHitlApprovalStatus({
         tool: e.payload.tool,
         risk: e.payload.risk,
@@ -544,6 +587,7 @@ export function useChatStream({
     }).then(fn => { if (!cancelled) unlistenTypedHitlRequest = fn; else fn(); });
 
     listen<KimHitlApprovalResultPayload>(KimEventNames.HITL_APPROVAL_RESULT, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       setHitlApprovalStatus(prev => ({
         tool: e.payload.tool,
         risk: prev?.tool === e.payload.tool ? prev.risk : 'high',
@@ -556,14 +600,25 @@ export function useChatStream({
       }));
     }).then(fn => { if (!cancelled) unlistenTypedHitlResult = fn; else fn(); });
 
-    listen<string>(KIM_RUN_ID_EVENT, e => { setLastRunId(e.payload); }) // K1
+    // RUN-IDENTITY: kim-run-id now carries { run_id, session_id }. Only adopt it
+    // as THIS view's run when the session matches — otherwise it's a run started
+    // for a different session (foreign) and must not claim this view's pill/owner.
+    listen<{ run_id: string; session_id: string }>(KIM_RUN_ID_EVENT, e => {
+      const { run_id, session_id } = e.payload;
+      if (!belongsToView(session_id)) return;
+      currentRunIdRef.current = run_id;
+      runOwnerSessionIdRef.current = session_id || activeResumeSessionIdRef.current;
+      setLastRunId(run_id); // K1 (checkpoint revert)
+    })
       .then(fn => { if (!cancelled) unlistenRunId = fn; else fn(); });
 
     listen<KimRunFailedPayload>(KimEventNames.RUN_FAILED, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       setRunFailure(e.payload);
     }).then(fn => { if (!cancelled) unlistenTypedRunFailed = fn; else fn(); });
 
     listen<KimRateLimitedPayload>(KimEventNames.RATE_LIMITED, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       setRateLimitedState(e.payload);
       // B9: cancel any prior auto-clear timer before scheduling a new one.
       clearRateLimitTimer();
@@ -574,6 +629,7 @@ export function useChatStream({
     }).then(fn => { if (!cancelled) unlistenTypedRateLimited = fn; else fn(); });
 
     listen<KimUiPayload>(KimEventNames.UI, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       if (e.payload.action === 'screenshot_flash' && isRunningRef.current) {
         invoke('show_screenshot_flash').catch(() => {});
         invoke('set_task_active_mode', { active: true }).catch(() => {});
@@ -583,6 +639,7 @@ export function useChatStream({
     }).then(fn => { if (!cancelled) unlistenTypedUi = fn; else fn(); });
 
     listen<KimToolPayload>(KimEventNames.TOOL, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       const id = ++activityCounterRef.current;
       const def = TOOL_MAP[e.payload.name];
       const item: ActivityItem = {
@@ -599,6 +656,7 @@ export function useChatStream({
     }).then(fn => { if (!cancelled) unlistenTypedTool = fn; else fn(); });
 
     listen<KimAnswerPayload>(KimEventNames.ANSWER, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       const text = e.payload.text.trim();
       if (!text) return;
       answerReceivedThisRunRef.current = true;
@@ -625,6 +683,7 @@ export function useChatStream({
     // M7: streamed assistant text (codex app-server transport) — previously no
     // listener existed and these events were dropped.
     listen<KimAssistantDeltaPayload>(KimEventNames.ASSISTANT_DELTA, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       const chunk = e.payload.chunk;
       if (!chunk) return;
       streamingAnswerRef.current.text += chunk;
@@ -637,6 +696,7 @@ export function useChatStream({
     // M7: streamed reasoning — surface completed lines in the activity feed
     // (mirrors the raw path's per-line codex_reasoning handling).
     listen<KimReasoningDeltaPayload>(KimEventNames.REASONING_DELTA, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       reasoningBufRef.current += e.payload.chunk ?? '';
       let nl = reasoningBufRef.current.indexOf('\n');
       while (nl !== -1) {
@@ -654,6 +714,7 @@ export function useChatStream({
 
     // M7: item lifecycle — show started commands / file changes in the feed.
     listen<KimItemLifecyclePayload>(KimEventNames.ITEM_LIFECYCLE, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       if (e.payload.phase !== 'started') return;
       const title = (e.payload.title ?? '').trim();
       let text: string | null = null;
@@ -674,6 +735,7 @@ export function useChatStream({
     }).then(fn => { if (!cancelled) unlistenTypedItemLifecycle = fn; else fn(); });
 
     listen<KimDiffPayload>(KimEventNames.DIFF, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       enqueueActivityUpdate(prev => {
         if (prev.length === 0) return prev;
         const last = prev[prev.length - 1];
@@ -686,6 +748,7 @@ export function useChatStream({
     }).then(fn => { if (!cancelled) unlistenTypedDiff = fn; else fn(); });
 
     listen<KimActivityPayload>(KimEventNames.ACTIVITY, e => {
+      if (!belongsToView(e.payload.session_id)) return;
       if (e.payload.kind === 'error') {
         const message = friendlyError(e.payload.text);
         setTaskError(message);
@@ -722,6 +785,13 @@ export function useChatStream({
 
     listen<boolean>('kim-agent-done', event => {
       invoke('set_task_active_mode', { active: false }).catch(() => {});
+      // RUN-IDENTITY (B4/B5/D1): kim-agent-done is a global signal and only ONE
+      // run is ever active. A view that doesn't own the run (e.g. a New-Chat or
+      // other-session view mounted after the user switched away mid-run) must
+      // NOT react — otherwise it flips its own state, files the run's activity
+      // under the wrong session, or raises an error banner for a foreign run.
+      const ownsRun = isRunningRef.current || runOwnerSessionIdRef.current !== null;
+      if (!ownsRun) return;
       // M7: land any still-buffered streamed assistant text, then reset the
       // delta stream state for the next run.
       if (assistantFlushTimerRef.current !== null) {
@@ -762,7 +832,12 @@ export function useChatStream({
         const next = [...runHistoryRef.current, newRunEntry];
         setRunHistory(next);
         const completedCodeSession = completedCodeSessionRef.current;
-        const sid = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
+        // RUN-IDENTITY: file under the session the RUN belongs to (captured at
+        // spawn / re-attach), never under whatever session is on screen now.
+        const sid =
+          completedCodeSession?.session_id ??
+          runOwnerSessionIdRef.current ??
+          activeResumeSessionIdRef.current;
         if (sid) {
           invoke('save_run_history', {
             sessionId: sid,
@@ -779,7 +854,10 @@ export function useChatStream({
       setMessageReloadNonce(v => v + 1);
 
       const completedCodeSession = completedCodeSessionRef.current ?? undefined;
-      const completedSessionId = completedCodeSession?.session_id ?? activeResumeSessionIdRef.current;
+      const completedSessionId =
+        completedCodeSession?.session_id ??
+        runOwnerSessionIdRef.current ??
+        activeResumeSessionIdRef.current;
       const runProviderSite = browserSiteFromProvider(currentTaskRef.current?.provider);
       void commitCurrentBrowserUrlRef.current(runProviderSite, completedCodeSession ?? sessionRef.current, completedSessionId);
 
@@ -816,6 +894,10 @@ export function useChatStream({
         }
       }
       currentTaskRef.current = null;
+      // RUN-IDENTITY: this run is finished — release ownership so a later
+      // foreign done can't be mistaken for this view's run.
+      runOwnerSessionIdRef.current = null;
+      currentRunIdRef.current = null;
     }).then(fn => { if (!cancelled) unlistenDone = fn; else fn(); });
 
     listen<SessionInfo>('kim-agent-code-session', event => {
@@ -824,6 +906,8 @@ export function useChatStream({
 
     listen<boolean>('kim-agent-cancelled', () => {
       invoke('set_task_active_mode', { active: false }).catch(() => {});
+      // RUN-IDENTITY: only the owning view reacts to the global cancel signal.
+      if (!isRunningRef.current && runOwnerSessionIdRef.current === null) return;
       resetDeltaStreams(); // M7: drop buffered deltas from the cancelled run
       cancelFlagRef.current = true;
       setIsCancelled(true); // Fix 4: keep state in sync with ref
@@ -832,6 +916,8 @@ export function useChatStream({
       setCancelling(false);
       setHitlApprovalStatus(null);
       currentTaskRef.current = null;
+      runOwnerSessionIdRef.current = null;
+      currentRunIdRef.current = null;
     }).then(fn => { if (!cancelled) unlistenCancelled = fn; else fn(); });
 
     return () => {
@@ -873,7 +959,7 @@ export function useChatStream({
     };
     // commitCurrentBrowserUrl intentionally omitted — accessed via ref so this effect
     // registers listeners once and doesn't re-run (and leak handlers) on session switch.
-  }, [appendRaw, appendTypedActivity, enqueueActivityUpdate, flushActivityNow, clearActivityNow, isDuplicateActivityItem, setMessageReloadNonce, flushAssistantDelta, resetDeltaStreams, scheduleAssistantFlush]);
+  }, [appendRaw, appendTypedActivity, enqueueActivityUpdate, flushActivityNow, clearActivityNow, isDuplicateActivityItem, setMessageReloadNonce, flushAssistantDelta, resetDeltaStreams, scheduleAssistantFlush, belongsToView]);
 
   // Derived state to satisfy Prompt 8 explicit signature.
   // #34: prefer the typed kim:plan-driven plan, but fall back to parsing the
@@ -943,6 +1029,10 @@ export function useChatStream({
     answerReceivedThisRunRef,
     doneHandledRef,
     hasSentMessageRef,
+    // RUN-IDENTITY: owner captured at spawn by useTaskRunner so a mid-run switch
+    // files this run's output under its own session, not the on-screen one.
+    runOwnerSessionIdRef,
+    currentRunIdRef,
     terminationReasonRef,
     lastProviderErrorCodeRef,
     activityCounterRef,

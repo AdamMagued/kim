@@ -75,7 +75,19 @@ LEGACY_LOG_TAGS = {
 
 
 def emit_event(event_type: str, **payload: Any) -> None:
-    line = json.dumps({"type": event_type, **payload}, separators=(",", ":"), ensure_ascii=False)
+    # Stamp the run-identity envelope onto every event so the desktop frontend
+    # can route/file output by the run it belongs to instead of by whatever view
+    # is currently mounted. KIM_RUN_ID / KIM_SESSION_ID are exported by the Rust
+    # spawner (send_task). When unset (CLI, tests, legacy spawns) no envelope is
+    # added and the wire shape is byte-for-byte identical to before.
+    envelope = {"type": event_type, **payload}
+    _run_id = os.environ.get("KIM_RUN_ID")
+    if _run_id:
+        envelope.setdefault("run_id", _run_id)
+    _session_id = os.environ.get("KIM_SESSION_ID")
+    if _session_id:
+        envelope.setdefault("session_id", _session_id)
+    line = json.dumps(envelope, separators=(",", ":"), ensure_ascii=False)
     data = (line + "\n").encode("utf-8", errors="replace")
 
     buffer = getattr(sys.stdout, "buffer", None)

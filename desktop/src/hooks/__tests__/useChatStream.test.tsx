@@ -421,6 +421,8 @@ describe('useChatStream lifecycle', () => {
 
   it('kim-agent-done (failure) sets taskError and strips the failed run assistant output', async () => {
     const { result } = await renderStream();
+    // RUN-IDENTITY: this view owns the in-flight run (as runPendingTask would set).
+    act(() => { result.current.setIsRunning(true); });
     act(() => {
       result.current.setLiveHistory([
         { role: 'assistant', content: 'old good answer' },
@@ -441,6 +443,7 @@ describe('useChatStream lifecycle', () => {
 
   it('failure taskError prefers the typed provider-error code over the generic message', async () => {
     const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); }); // RUN-IDENTITY: view owns the run
     emit('kim:provider-error', { code: 'auth', retryable: false });
     emit('kim-agent-done', false);
     expect(result.current.taskError).toBe(
@@ -450,6 +453,7 @@ describe('useChatStream lifecycle', () => {
 
   it('failure taskError falls back to the kim:run-done termination reason', async () => {
     const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); }); // RUN-IDENTITY: view owns the run
     emit('kim:run-done', { termination: 'max_iterations', success: false });
     emit('kim-agent-done', false);
     expect(result.current.taskError).toMatch(/maximum iteration limit/);
@@ -475,7 +479,9 @@ describe('useChatStream lifecycle', () => {
   it('kim:run-failed populates runFailure and kim-run-id captures the checkpoint id', async () => {
     const { result } = await renderStream();
     emit('kim:run-failed', { reason: 'provider_auth', recoverable: true, suggestion: 'Sign in again' });
-    emit('kim-run-id', 'run-abc-123');
+    // RUN-IDENTITY: kim-run-id now carries { run_id, session_id }; session_id
+    // must match this view (conv-1) for the run to be adopted.
+    emit('kim-run-id', { run_id: 'run-abc-123', session_id: 'conv-1' });
     expect(result.current.runFailure).toEqual({
       reason: 'provider_auth',
       recoverable: true,
@@ -516,5 +522,72 @@ describe('useChatStream rate limit', () => {
     // Second timer fires at 1000 + 6000 = 7000ms.
     act(() => { vi.advanceTimersByTime(3000); });
     expect(result.current.rateLimitedState).toBeNull();
+  });
+});
+
+// ── RUN-IDENTITY (D1/B4/B5): route/file by run, not by current view ──────────
+describe('useChatStream run identity', () => {
+  it('drops run-scoped events tagged for a DIFFERENT session (run A never mutates view B)', async () => {
+    const { result } = await renderStream(); // this view = conv-1
+    // A run started under another session is still streaming after a switch.
+    emit('kim:answer', { text: 'foreign answer', session_id: 'other-session' });
+    emit('kim:status', { message: 'foreign status', session_id: 'other-session' });
+    act(() => { result.current.flushActivityNow(); });
+    expect(result.current.liveHistory).toEqual([]);
+    expect(result.current.lastStatus).toBe('');
+  });
+
+  it('accepts events for THIS view session and legacy events with no envelope', async () => {
+    const { result } = await renderStream(); // conv-1
+    emit('kim:answer', { text: 'mine', session_id: 'conv-1' });
+    emit('kim:answer', { text: 'legacy no-session' }); // undefined session_id -> allowed
+    expect(result.current.liveHistory).toEqual([
+      { role: 'assistant', content: 'mine' },
+      { role: 'assistant', content: 'legacy no-session' },
+    ]);
+  });
+
+  it('files run history under the run OWNER, not the on-screen session', async () => {
+    vi.useFakeTimers();
+    const props = makeProps();
+    const { result } = renderHook(() => useChatStream(props));
+    await act(async () => {});
+    act(() => {
+      result.current.setIsRunning(true);
+      // The run belongs to a different session than the one on screen (conv-1).
+      result.current.runOwnerSessionIdRef.current = 'owner-session-9';
+    });
+    emit('kim:status', { message: 'working' }); // legacy no-session -> counted as this run's
+    act(() => { vi.advanceTimersByTime(1000); });
+    emit('kim-agent-done', true);
+    expect(invokeMock).toHaveBeenCalledWith(
+      'save_run_history',
+      expect.objectContaining({ sessionId: 'owner-session-9' }),
+    );
+    expect(props.onTaskDone).toHaveBeenCalledWith('owner-session-9', undefined);
+  });
+
+  it('a view that never owned the run ignores a foreign kim-agent-done (no error banner)', async () => {
+    const { result } = await renderStream(); // fresh view, never started a run
+    emit('kim-agent-done', false); // a foreign run failed while this view is open
+    expect(result.current.taskError).toBeNull();
+    expect(result.current.lastFailedTask).toBeNull();
+    expect(result.current.runHistory).toHaveLength(0);
+  });
+
+  it('re-derives isRunning=true when remounted for the active run session (switch-back)', async () => {
+    const props = { ...makeProps(), activeRunSessionId: 'conv-1', activeRunId: 'conv-1-123' };
+    const { result } = renderHook(() => useChatStream(props));
+    await act(async () => {});
+    expect(result.current.isRunning).toBe(true);
+    expect(result.current.runOwnerSessionIdRef.current).toBe('conv-1');
+  });
+
+  it('does NOT claim the run when the active run belongs to another session', async () => {
+    const props = { ...makeProps(), activeRunSessionId: 'other', activeRunId: 'other-1' };
+    const { result } = renderHook(() => useChatStream(props));
+    await act(async () => {});
+    expect(result.current.isRunning).toBe(false);
+    expect(result.current.runOwnerSessionIdRef.current).toBeNull();
   });
 });

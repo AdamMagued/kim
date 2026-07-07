@@ -2,6 +2,28 @@ use crate::*;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// RUN-IDENTITY: copy the `run_id` / `session_id` envelope off a raw agent
+/// stdout line onto a curated `kim:*` payload. The typed `KimEvent` enum drops
+/// these envelope-only fields on decode, so they must be re-attached here for
+/// the frontend to route/file by run identity. Existing payload fields of the
+/// same name win; a line that carries neither id is passed through untouched
+/// (legacy/bridge streams stay byte-compatible). Pure, so it is unit-tested.
+pub(crate) fn merge_run_envelope(
+    raw_line: &str,
+    mut payload: serde_json::Value,
+) -> serde_json::Value {
+    if let Ok(env) = serde_json::from_str::<serde_json::Value>(raw_line) {
+        if let Some(obj) = payload.as_object_mut() {
+            for key in ["run_id", "session_id"] {
+                if let Some(v) = env.get(key) {
+                    obj.entry(key).or_insert_with(|| v.clone());
+                }
+            }
+        }
+    }
+    payload
+}
+
 pub(crate) fn forward_agent_stdout_line(
     app: &tauri::AppHandle,
     ipc_typed: bool,
@@ -10,18 +32,27 @@ pub(crate) fn forward_agent_stdout_line(
 ) {
     if ipc_typed {
         if let Ok(event) = serde_json::from_str::<KimEvent>(line) {
+            // RUN-IDENTITY: the typed `KimEvent` enum intentionally ignores the
+            // run/session envelope fields, so pull them straight off the raw
+            // line and re-attach them to every curated `kim:*` payload. This is
+            // what lets the frontend file a run's output under ITS session and
+            // reject a foreign run's events, instead of routing by "current
+            // view". Absent on legacy/bridge streams -> nothing is added.
+            let emit = |name: &str, payload: serde_json::Value| {
+                let _ = app.emit(name, merge_run_envelope(line, payload));
+            };
             match &event {
                 KimEvent::Status { message } => {
-                    let _ = app.emit("kim:status", serde_json::json!({"message": message}));
+                    emit("kim:status", serde_json::json!({"message": message}));
                 }
                 KimEvent::Plan { steps } => {
-                    let _ = app.emit("kim:plan", serde_json::json!({"steps": steps}));
+                    emit("kim:plan", serde_json::json!({"steps": steps}));
                 }
                 KimEvent::Step { n, data } => {
-                    let _ = app.emit("kim:step", serde_json::json!({"n": n, "data": data}));
+                    emit("kim:step", serde_json::json!({"n": n, "data": data}));
                 }
                 KimEvent::Done { n } => {
-                    let _ = app.emit("kim:done", serde_json::json!({"n": n}));
+                    emit("kim:done", serde_json::json!({"n": n}));
                 }
                 KimEvent::Context {
                     cumulative_input,
@@ -33,7 +64,7 @@ pub(crate) fn forward_agent_stdout_line(
                     source,
                     estimate,
                 } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:context",
                         serde_json::json!({
                             "cumulative_input": cumulative_input,
@@ -52,22 +83,22 @@ pub(crate) fn forward_agent_stdout_line(
                     output,
                     total,
                 } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:stats",
                         serde_json::json!({"input": input, "output": output, "total": total}),
                     );
                 }
                 KimEvent::UiScreenshotFlash => {
-                    let _ = app.emit("kim:ui", serde_json::json!({"action": "screenshot_flash"}));
+                    emit("kim:ui", serde_json::json!({"action": "screenshot_flash"}));
                 }
                 KimEvent::UiShow => {
-                    let _ = app.emit("kim:ui", serde_json::json!({"action": "show"}));
+                    emit("kim:ui", serde_json::json!({"action": "show"}));
                 }
                 KimEvent::RunDone {
                     termination,
                     success,
                 } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:run-done",
                         serde_json::json!({"termination": termination, "success": success}),
                     );
@@ -77,7 +108,7 @@ pub(crate) fn forward_agent_stdout_line(
                     recoverable,
                     suggestion,
                 } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:run-failed",
                         serde_json::json!({
                             "reason": reason,
@@ -87,7 +118,7 @@ pub(crate) fn forward_agent_stdout_line(
                     );
                 }
                 KimEvent::ProviderError { code, retryable } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:provider-error",
                         serde_json::json!({"code": code, "retryable": retryable}),
                     );
@@ -97,7 +128,7 @@ pub(crate) fn forward_agent_stdout_line(
                     attempt,
                     max_retries,
                 } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:rate-limited",
                         serde_json::json!({
                             "delay": delay,
@@ -116,35 +147,35 @@ pub(crate) fn forward_agent_stdout_line(
                     // T1: forward the request's correlation id so the UI can echo
                     // it back on the decision; Python only applies a decision whose
                     // id matches the pending request (stale decisions are voided).
-                    let _ = app.emit(
+                    emit(
                         "kim:hitl-approval-request",
                         serde_json::json!({"tool": tool, "risk": risk, "reason": reason, "preview": preview, "id": id}),
                     );
                 }
                 KimEvent::HitlApprovalResult { tool, approved } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:hitl-approval-result",
                         serde_json::json!({"tool": tool, "approved": approved}),
                     );
                 }
                 KimEvent::Tool { name, args } => {
-                    let _ = app.emit("kim:tool", serde_json::json!({"name": name, "args": args}));
+                    emit("kim:tool", serde_json::json!({"name": name, "args": args}));
                 }
                 KimEvent::Answer { text } => {
-                    let _ = app.emit("kim:answer", serde_json::json!({"text": text}));
+                    emit("kim:answer", serde_json::json!({"text": text}));
                 }
                 KimEvent::Diff {
                     path,
                     added,
                     removed,
                 } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:diff",
                         serde_json::json!({"path": path, "added": added, "removed": removed}),
                     );
                 }
                 KimEvent::Activity { kind, text } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:activity",
                         serde_json::json!({"kind": kind, "text": text}),
                     );
@@ -160,7 +191,7 @@ pub(crate) fn forward_agent_stdout_line(
                     network,
                     amendment,
                 } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:command-approval-request",
                         serde_json::json!({
                             "id": id,
@@ -174,7 +205,7 @@ pub(crate) fn forward_agent_stdout_line(
                     );
                 }
                 KimEvent::FileChangeApprovalRequest { id, files, reason } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:file-change-approval-request",
                         serde_json::json!({"id": id, "files": files, "reason": reason}),
                     );
@@ -190,7 +221,7 @@ pub(crate) fn forward_agent_stdout_line(
                     // or an MCP elicitation). Forward it so the frontend can render
                     // the card; the answer comes back via the respond_user_input
                     // command, which writes a user_input stdin line to the bridge.
-                    let _ = app.emit(
+                    emit(
                         "kim:user-input-request",
                         serde_json::json!({
                             "id": id,
@@ -202,22 +233,22 @@ pub(crate) fn forward_agent_stdout_line(
                     );
                 }
                 KimEvent::CommandOutput { item_id, chunk } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:command-output",
                         serde_json::json!({"item_id": item_id, "chunk": chunk}),
                     );
                 }
                 KimEvent::AssistantDelta { chunk } => {
-                    let _ = app.emit("kim:assistant-delta", serde_json::json!({"chunk": chunk}));
+                    emit("kim:assistant-delta", serde_json::json!({"chunk": chunk}));
                 }
                 KimEvent::ReasoningDelta { chunk } => {
-                    let _ = app.emit("kim:reasoning-delta", serde_json::json!({"chunk": chunk}));
+                    emit("kim:reasoning-delta", serde_json::json!({"chunk": chunk}));
                 }
                 KimEvent::PlanUpdate { steps } => {
-                    let _ = app.emit("kim:plan-update", serde_json::json!({"steps": steps}));
+                    emit("kim:plan-update", serde_json::json!({"steps": steps}));
                 }
                 KimEvent::DiffUpdate { unified_diff } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:diff-update",
                         serde_json::json!({"unified_diff": unified_diff}),
                     );
@@ -227,7 +258,7 @@ pub(crate) fn forward_agent_stdout_line(
                     output,
                     total,
                 } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:token-usage",
                         serde_json::json!({"input": input, "output": output, "total": total}),
                     );
@@ -238,7 +269,7 @@ pub(crate) fn forward_agent_stdout_line(
                     phase,
                     title,
                 } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:item-lifecycle",
                         serde_json::json!({
                             "item_id": item_id,
@@ -249,7 +280,7 @@ pub(crate) fn forward_agent_stdout_line(
                     );
                 }
                 KimEvent::TurnLifecycle { phase, turn_id } => {
-                    let _ = app.emit(
+                    emit(
                         "kim:turn-lifecycle",
                         serde_json::json!({"phase": phase, "turn_id": turn_id}),
                     );
@@ -638,10 +669,23 @@ pub(crate) async fn send_task(
         build_gui_codex_spec(&inputs, extra, &app_handle, &app_config).await?
     };
 
-    // K1: let the frontend associate this run's pill with its checkpoint id.
-    if let Some((_, run_id)) = spec.envs.iter().find(|(k, _)| k == "KIM_RUN_ID") {
-        let _ = app_handle.emit("kim-run-id", run_id.clone());
-    }
+    // K1 + RUN-IDENTITY: announce this run's stable identity to the frontend at
+    // spawn. run_id doubles as the checkpoint id (K1); session_id lets the App
+    // track which session owns the single active run, so a ChatView that
+    // remounts on a tab/session/New-Chat switch can re-derive "this run is still
+    // running" and re-attach to its event stream instead of orphaning it.
+    // Emitted for every spawn shape (chat + codex) so the behavior is uniform;
+    // codex specs without KIM_RUN_ID fall back to a spawn-time id.
+    let run_id = spec
+        .envs
+        .iter()
+        .find(|(k, _)| k == "KIM_RUN_ID")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| task_spec::run_id_for_session(&session_id));
+    let _ = app_handle.emit(
+        "kim-run-id",
+        serde_json::json!({ "run_id": run_id, "session_id": session_id }),
+    );
 
     // Chrome CDP launch whenever a browser provider is in play (Chat tasks
     // and Codex browser-bridge runs) and no in-app bridge is available.
@@ -1039,6 +1083,45 @@ pub(crate) fn process_exists(pid: u32) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn merge_run_envelope_reattaches_run_and_session() {
+        // The typed enum drops the envelope on decode; the forwarder must copy
+        // it back onto the curated payload so the frontend can route by run.
+        let raw = r#"{"type":"status","message":"hi","run_id":"sessA-9","session_id":"sessA"}"#;
+        let curated = serde_json::json!({"message": "hi"});
+        let out = merge_run_envelope(raw, curated);
+        assert_eq!(out["run_id"], "sessA-9");
+        assert_eq!(out["session_id"], "sessA");
+        assert_eq!(out["message"], "hi");
+    }
+
+    #[test]
+    fn merge_run_envelope_is_noop_without_ids() {
+        // Legacy / bridge streams carry no envelope: payload must be untouched.
+        let raw = r#"{"type":"answer","text":"done"}"#;
+        let curated = serde_json::json!({"text": "done"});
+        let out = merge_run_envelope(raw, curated);
+        assert!(out.get("run_id").is_none());
+        assert!(out.get("session_id").is_none());
+        assert_eq!(out["text"], "done");
+    }
+
+    #[test]
+    fn merge_run_envelope_stamps_only_present_id() {
+        let raw = r#"{"type":"status","message":"hi","session_id":"sessB"}"#;
+        let out = merge_run_envelope(raw, serde_json::json!({"message": "hi"}));
+        assert_eq!(out["session_id"], "sessB");
+        assert!(out.get("run_id").is_none());
+    }
+
+    #[test]
+    fn merge_run_envelope_does_not_override_existing_field() {
+        // Defensive: a real payload field named run_id must win over the envelope.
+        let raw = r#"{"type":"x","run_id":"envelope"}"#;
+        let out = merge_run_envelope(raw, serde_json::json!({"run_id": "payload"}));
+        assert_eq!(out["run_id"], "payload");
+    }
 
     #[test]
     fn test_parse_run_done_event() {

@@ -257,6 +257,10 @@ pub fn chat_task_spec(p: ChatSpecParams<'_>) -> TaskSpec {
 
     let envs = EnvBuilder::new()
         .set("KIM_RUN_ID", run_id_for_session(&p.session_id))
+        // RUN-IDENTITY: the session this run belongs to. Python's emit_event
+        // stamps it onto every event so the desktop files output under THIS
+        // session regardless of which view is mounted when the run completes.
+        .set("KIM_SESSION_ID", p.session_id.as_str())
         .orchestrator_base(p.kim_root, p.project_root)
         .permission_mode(p.permission_mode)
         .extend(p.extra_envs)

@@ -30,7 +30,11 @@ function wireType(event) {
 }
 
 function renderInterface(event) {
-  const lines = [`export interface ${event.typeName}Payload {`];
+  // Run-identity envelope: every run-scoped event carries the owning run_id +
+  // session_id (stamped by the Python emitter from KIM_RUN_ID / KIM_SESSION_ID
+  // and injected through Rust). Both optional so legacy/bridge streams that omit
+  // them still decode. Consumers route/file by these instead of "current view".
+  const lines = [`export interface ${event.typeName}Payload extends KimRunEnvelope {`];
   for (const [key, def] of Object.entries(event.payload)) {
     if (def.description) lines.push(`  /** ${def.description} */`);
     lines.push(`  ${key}${def.optional ? '?' : ''}: ${def.type};`);
@@ -68,6 +72,19 @@ ${tsNames}
 } as const;
 
 export type KimEventName = (typeof KimEventNames)[keyof typeof KimEventNames];
+
+/**
+ * Run-identity envelope shared by every typed payload. \`run_id\` is minted at
+ * task spawn (Rust \`send_task\`, forwarded to Python as KIM_RUN_ID); \`session_id\`
+ * is the session the run belongs to (KIM_SESSION_ID). Both are optional so
+ * events from legacy/bridge streams that predate the envelope still type-check.
+ * The frontend routes and files run output by these fields, never by which
+ * view happens to be mounted.
+ */
+export interface KimRunEnvelope {
+  run_id?: string;
+  session_id?: string;
+}
 
 /** Legacy markers retained for the uncontrolled Codex compatibility stream. */
 export const LegacyLogTags = ${JSON.stringify(Object.fromEntries(legacyTags.map(item => [item.tag, item])), null, 2)} as const;
@@ -216,7 +233,19 @@ ${pyLegacy}
 
 
 def emit_event(event_type: str, **payload: Any) -> None:
-    line = json.dumps({"type": event_type, **payload}, separators=(",", ":"), ensure_ascii=False)
+    # Stamp the run-identity envelope onto every event so the desktop frontend
+    # can route/file output by the run it belongs to instead of by whatever view
+    # is currently mounted. KIM_RUN_ID / KIM_SESSION_ID are exported by the Rust
+    # spawner (send_task). When unset (CLI, tests, legacy spawns) no envelope is
+    # added and the wire shape is byte-for-byte identical to before.
+    envelope = {"type": event_type, **payload}
+    _run_id = os.environ.get("KIM_RUN_ID")
+    if _run_id:
+        envelope.setdefault("run_id", _run_id)
+    _session_id = os.environ.get("KIM_SESSION_ID")
+    if _session_id:
+        envelope.setdefault("session_id", _session_id)
+    line = json.dumps(envelope, separators=(",", ":"), ensure_ascii=False)
     data = (line + "\\n").encode("utf-8", errors="replace")
 
     buffer = getattr(sys.stdout, "buffer", None)

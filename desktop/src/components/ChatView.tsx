@@ -28,6 +28,10 @@ import { CONNECTORS } from './chat/connectors';
 
 interface Props {
   session: SessionInfo | null;
+  /** RUN-IDENTITY: identity of the single globally-active run (from App), so a
+   *  ChatView remounted mid-run can re-attach to its own session's run. */
+  activeRunSessionId?: string | null;
+  activeRunId?: string | null;
   newChatMode: boolean;
   settings: Settings;
   onSettingsChange?: (next: Settings) => void;
@@ -50,6 +54,8 @@ interface Props {
 
 export function ChatView({
   session,
+  activeRunSessionId,
+  activeRunId,
   newChatMode,
   settings,
   onSettingsChange,
@@ -144,6 +150,8 @@ export function ChatView({
     commitCurrentBrowserUrl,
     setMessageReloadNonce,
     conversationId,
+    activeRunSessionId,
+    activeRunId,
   });
 
   const {

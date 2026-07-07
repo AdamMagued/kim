@@ -100,6 +100,10 @@ export function useTaskRunner({
       try {
         const resolvedSessionId =
           stream.completedCodeSessionRef.current?.session_id ?? (session?.session_id || conversationId);
+        // RUN-IDENTITY: capture the session this run belongs to at spawn. Rust
+        // stamps the same id (KIM_SESSION_ID) onto every event; the done handler
+        // files history under THIS owner even if the user has switched views.
+        stream.runOwnerSessionIdRef.current = resolvedSessionId;
         const pendingBrowserSite = browserSiteFromProvider(pending.provider);
         const pendingProvider = pending.provider.trim().toLowerCase();
         if (pendingProvider === 'browser' || pendingProvider.startsWith('browser:')) {
