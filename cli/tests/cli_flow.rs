@@ -374,9 +374,14 @@ fn browser_provider_errors_cleanly_when_bridge_is_down() {
 
     assert!(!output.status.success(), "downed bridge must exit non-zero");
     let all = combined_output(&output);
+    // With no Kim repo root in this isolated cwd the local Playwright agent path
+    // is unavailable, so a browser provider with a downed bridge now reports the
+    // actionable env-setup message (install.bat / ./install.sh) instead of the
+    // old "start the desktop" string.
     assert!(
-        all.contains("Kim desktop app is not running"),
-        "browser providers must get the actionable bridge-down message; output: {all}"
+        all.contains("Browser provider can't run")
+            && all.contains("install.bat"),
+        "browser providers must get the actionable env-setup message; output: {all}"
     );
     // Both health endpoints were probed; the task was never submitted.
     let requests = server.requests();

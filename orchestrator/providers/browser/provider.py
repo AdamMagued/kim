@@ -619,9 +619,24 @@ class BrowserProvider(BaseProvider):
                 "/Applications/Chromium.app/Contents/MacOS/Chromium",
             ]
         elif sys_name == "Windows":
-            candidates = [
+            # Per-user installs (the common case) land in %LOCALAPPDATA%, not
+            # Program Files — check that first so auto-launch works without an
+            # admin/system-wide Chrome. Fall back to Program Files, then Edge
+            # (Chromium-based, also CDP-capable) as a last resort.
+            local_appdata = os.environ.get("LOCALAPPDATA", "")
+            candidates = []
+            if local_appdata:
+                candidates.append(
+                    os.path.join(
+                        local_appdata,
+                        r"Google\Chrome\Application\chrome.exe",
+                    )
+                )
+            candidates += [
                 r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                 r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
             ]
         else:  # Linux / other POSIX
             candidates = [
