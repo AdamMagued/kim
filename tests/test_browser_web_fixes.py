@@ -97,6 +97,17 @@ class TestPromptTrimKeepsTransportMarker(unittest.TestCase):
         self.assertIn(task, prompt)
         self.assertIn(transport_marker_instruction(completion_hash), prompt)
 
+    def test_tiny_budget_preserves_complete_multiline_task(self):
+        task = "FIRST_REQUIRED_STEP\nSECOND_REQUIRED_STEP\nFINAL_REQUIRED_STEP"
+        prompt, _atts, completion_hash, _sent = format_prompt(
+            [{"role": "user", "content": task}], [], "x" * 5000,
+            sent_system_prompt=False,
+            max_inject_chars=32,
+            use_webview_bridge=False,
+        )
+        self.assertIn(task, prompt)
+        self.assertIn(transport_marker_instruction(completion_hash), prompt)
+
 
 # ---------------------------------------------------------------------------
 # 3.2 — auth route exact-URL scoping + surfaced unroute failure

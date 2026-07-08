@@ -155,11 +155,21 @@ fn parse_typed(v: &serde_json::Value) -> AgentLine {
 /// uses. Callers that prefer a running desktop bridge should probe it first
 /// (see run_turn). Returns (repo_root, python) when usable.
 pub fn agentic_available(provider: &str) -> Option<(PathBuf, PathBuf)> {
+    let root = crate::sessions::find_kim_repo_root()?;
+    agentic_available_at(provider, root)
+}
+
+/// Resolve agentic execution against an explicit Kim root. Keeping root
+/// validation separate makes the no-desktop fallback testable without relying
+/// on the developer machine's environment or a running browser.
+pub(crate) fn agentic_available_at(
+    provider: &str,
+    root: PathBuf,
+) -> Option<(PathBuf, PathBuf)> {
     let p = provider.trim().to_lowercase();
     if p == "desktop" {
         return None; // the desktop provider always routes through the bridge
     }
-    let root = crate::sessions::find_kim_repo_root()?;
     if !root.join("orchestrator").join("agent.py").is_file() {
         return None;
     }
@@ -497,6 +507,26 @@ mod tests {
             agentic_available("browser:claude").is_some(),
             agentic_available("ollama").is_some(),
         );
+    }
+
+    #[test]
+    fn browser_agentic_route_resolves_from_fake_repo_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("orchestrator")).unwrap();
+        std::fs::write(root.path().join("orchestrator").join("agent.py"), "").unwrap();
+        let python = if cfg!(windows) {
+            root.path().join("venv").join("Scripts").join("python.exe")
+        } else {
+            root.path().join("venv").join("bin").join("python")
+        };
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(&python, "fake interpreter").unwrap();
+
+        let resolved = agentic_available_at("browser:chatgpt", root.path().to_path_buf())
+            .expect("browser provider should resolve through the fake local Kim root");
+        assert_eq!(resolved.0, root.path());
+        assert_eq!(resolved.1, python);
+        assert!(agentic_available_at("desktop", root.path().to_path_buf()).is_none());
     }
 
     // ── new regression guards ────────────────────────────────────────────────

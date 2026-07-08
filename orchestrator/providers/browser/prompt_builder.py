@@ -479,7 +479,16 @@ def format_prompt(
             "",
         )
         if task_tail and task_tail not in trimmed:
-            essential = task_tail + "\n\n" + marker_instr
+            # Below the size of the transport scaffolding itself, the limit is
+            # already necessarily a soft cap. Preserve the complete user turn
+            # in that pathological case rather than silently reducing a
+            # multi-line request to only its final line.
+            essential_task = (
+                last_text
+                if max_inject_chars < len(marker_instr) + len(notice)
+                else task_tail
+            )
+            essential = essential_task + "\n\n" + marker_instr
             if (preferred_site or "").lower() == "chatgpt":
                 essential += "\n\n" + direct_contract
             trimmed = essential

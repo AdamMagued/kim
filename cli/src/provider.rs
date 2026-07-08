@@ -198,6 +198,26 @@ pub fn is_browser_provider(name: &str) -> bool {
     n.eq_ignore_ascii_case("browser") || n.to_ascii_lowercase().starts_with("browser:")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalAgentRoute {
+    root: PathBuf,
+    python: PathBuf,
+    session_dir: PathBuf,
+    resume_session_id: String,
+}
+
+fn build_local_agent_route(
+    available: Option<(PathBuf, PathBuf)>,
+    session_id: &str,
+) -> Option<LocalAgentRoute> {
+    available.map(|(root, python)| LocalAgentRoute {
+        session_dir: root.join("kim_sessions"),
+        root,
+        python,
+        resume_session_id: session_id.to_string(),
+    })
+}
+
 /// Public wrapper over the internal bridge health probe so the REPL can decide,
 /// for a chat-mode browser provider, whether to reuse a running desktop bridge
 /// or fall through to the local Playwright agent. 400ms timeout per the probe.
@@ -277,21 +297,23 @@ pub async fn stream_kim_request(
             // gap before this second probe (TOCTOU). Resolve the local route
             // again here so that race degrades to Playwright rather than an
             // incorrect "can't run" error.
-            if let Some((root, python)) = crate::agentic::agentic_available(&config.provider) {
+            if let Some(route) = build_local_agent_route(
+                crate::agentic::agentic_available(&config.provider),
+                session_id,
+            ) {
                 let prompt = messages
                     .iter()
                     .rev()
                     .find(|m| m.role == "user")
                     .map(|m| m.content.as_str())
                     .unwrap_or_default();
-                let session_dir = root.join("kim_sessions");
                 crate::agentic::stream_agentic_request(
-                    &root,
-                    &python,
+                    &route.root,
+                    &route.python,
                     prompt,
                     &config.provider,
-                    &session_dir,
-                    Some(session_id),
+                    &route.session_dir,
+                    Some(&route.resume_session_id),
                     tx,
                 )
                 .await;
@@ -542,6 +564,23 @@ mod tests {
         assert!(!is_browser_provider("claude"));
         assert!(!is_browser_provider("openai"));
         assert!(!is_browser_provider("desktop"));
+    }
+
+    #[test]
+    fn local_browser_fallback_preserves_session_and_session_dir() {
+        let root = PathBuf::from("C:/fake/kim");
+        let python = root.join("venv/Scripts/python.exe");
+        let route = build_local_agent_route(
+            Some((root.clone(), python.clone())),
+            "session-from-repl",
+        )
+        .expect("available local agent should produce a fallback route");
+
+        assert_eq!(route.root, root);
+        assert_eq!(route.python, python);
+        assert_eq!(route.session_dir, PathBuf::from("C:/fake/kim/kim_sessions"));
+        assert_eq!(route.resume_session_id, "session-from-repl");
+        assert!(build_local_agent_route(None, "session-from-repl").is_none());
     }
 
     // ── A12: KIM.md project context loading ─────────────────────────────────
