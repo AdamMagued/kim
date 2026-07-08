@@ -1152,6 +1152,17 @@ async fn stream_repl_turn(
     // + Python are available; otherwise fall back to plain LLM chat with a note.
     let agentic = if code_mode {
         None
+    } else if provider::is_browser_provider(&config.provider) {
+        // Chat-mode browser provider: if the Kim desktop bridge is already
+        // running, reuse it (keeps the in-app webview experience and avoids a
+        // second Chrome). Otherwise drive ChatGPT/Gemini/Claude directly via the
+        // local Playwright agent — same mechanism code mode uses, so a bare
+        // `kim` works without launching the desktop app.
+        if provider::bridge_is_available(&config.desktop_bridge_url).await {
+            None
+        } else {
+            crate::agentic::agentic_available(&config.provider)
+        }
     } else {
         crate::agentic::agentic_available(&config.provider)
     };

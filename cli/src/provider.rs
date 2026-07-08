@@ -198,6 +198,13 @@ pub fn is_browser_provider(name: &str) -> bool {
     n.eq_ignore_ascii_case("browser") || n.to_ascii_lowercase().starts_with("browser:")
 }
 
+/// Public wrapper over the internal bridge health probe so the REPL can decide,
+/// for a chat-mode browser provider, whether to reuse a running desktop bridge
+/// or fall through to the local Playwright agent. 400ms timeout per the probe.
+pub async fn bridge_is_available(base_url: &str) -> bool {
+    is_bridge_available(base_url).await
+}
+
 /// True if `dir` (or any ancestor) is inside a git working tree — the same
 /// check Codex performs before `codex exec`. Walks up looking for a `.git`
 /// marker (a directory in a normal clone, a file in a worktree/submodule).
@@ -266,7 +273,15 @@ pub async fn stream_kim_request(
             stream_via_bridge(config, messages, tx).await;
         } else {
             let _ = tx.send(AppEvent::Err(if is_browser_provider(&config.provider) {
-                "Kim desktop app is not running. Start Kim desktop to use browser providers, or switch with /provider ollama.".to_string()
+                // We only reach here for a browser provider when the local
+                // Playwright agent path was unavailable (no Kim source root or
+                // no Python env) AND the desktop bridge is down. Point at the
+                // env setup that unlocks the no-desktop path, then the fallback.
+                "Browser provider can't run: no Python environment for the local browser agent, \
+                 and the Kim desktop bridge isn't running.\n\
+                 Fix (recommended): from the Kim repo run the installer to build the venv and \
+                 Playwright browser — Windows: install.bat, macOS/Linux: ./install.sh — then rerun kim.\n\
+                 Or: start the Kim desktop app, or switch with /provider ollama.".to_string()
             } else {
                 "Kim desktop bridge is not running. Start Kim desktop, or switch provider with /provider ollama.".to_string()
             }));

@@ -133,12 +133,16 @@ fn parse_typed(v: &serde_json::Value) -> AgentLine {
 }
 
 /// Decide whether `kim chat` can run agentically: needs a Kim source root with
-/// the orchestrator, a Python interpreter, and a real (non-browser/desktop)
-/// provider. Returns (repo_root, python) when usable.
+/// the orchestrator and a Python interpreter. The `desktop` provider always
+/// routes through the bridge, so it is excluded. Browser providers are allowed:
+/// orchestrator.agent drives ChatGPT/Gemini/Claude over Playwright/CDP
+/// (auto-launching Chrome) with no desktop app — the same mechanism code mode
+/// uses. Callers that prefer a running desktop bridge should probe it first
+/// (see run_turn). Returns (repo_root, python) when usable.
 pub fn agentic_available(provider: &str) -> Option<(PathBuf, PathBuf)> {
     let p = provider.trim().to_lowercase();
-    if p == "desktop" || p.starts_with("browser") {
-        return None; // those route through the bridge, not the local agent
+    if p == "desktop" {
+        return None; // the desktop provider always routes through the bridge
     }
     let root = crate::sessions::find_kim_repo_root()?;
     if !root.join("orchestrator").join("agent.py").is_file() {
@@ -460,9 +464,17 @@ mod tests {
     }
 
     #[test]
-    fn agentic_unavailable_for_browser_providers() {
-        assert!(agentic_available("browser:claude").is_none());
+    fn agentic_available_treats_browser_like_a_real_provider() {
+        // The `desktop` provider always routes through the bridge, never the
+        // local agent.
         assert!(agentic_available("desktop").is_none());
+        // Browser providers are no longer force-excluded: they resolve to the
+        // local Playwright agent exactly like a normal provider (ollama), so
+        // both must agree on availability in whatever environment the test runs.
+        assert_eq!(
+            agentic_available("browser:claude").is_some(),
+            agentic_available("ollama").is_some(),
+        );
     }
 
     // ── new regression guards ────────────────────────────────────────────────
