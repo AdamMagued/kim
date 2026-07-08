@@ -78,11 +78,18 @@ def save_thread_state(cwd: str, provider: str, state: dict) -> None:
         logger.warning("Could not write codex thread state %s: %s", path, e)
 
 
-def reset_thread_state(cwd: str, provider: str, handoff: Optional[str] = None) -> dict:
+def reset_thread_state(
+    cwd: str,
+    provider: str,
+    handoff: Optional[str] = None,
+    *,
+    preserve_codex_thread: bool = True,
+) -> dict:
     """Reset accounting for a fresh browser thread, optionally carrying a handoff.
 
-    The codex-side thread identity (app-server transport) is preserved — see
-    the module docstring.
+    The codex-side thread identity (app-server transport) is preserved by
+    default. A genuinely new CLI session passes ``preserve_codex_thread=False``
+    so neither side can resurrect the previous conversation.
     """
     previous = load_thread_state(cwd, provider)
     state = {
@@ -91,8 +98,9 @@ def reset_thread_state(cwd: str, provider: str, handoff: Optional[str] = None) -
         "est_tokens": 0,
         "handoff": (handoff or "").strip() or None,
     }
-    for key in ("codex_thread_id", "codex_thread_cwd"):
-        if previous.get(key):
-            state[key] = previous[key]
+    if preserve_codex_thread:
+        for key in ("codex_thread_id", "codex_thread_cwd"):
+            if previous.get(key):
+                state[key] = previous[key]
     save_thread_state(cwd, provider, state)
     return state

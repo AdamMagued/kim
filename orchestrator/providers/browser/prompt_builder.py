@@ -207,6 +207,7 @@ def format_prompt(
     max_inject_chars: int,
     use_webview_bridge: bool,
     handoff_summary: Optional[str] = None,
+    preferred_site: Optional[str] = None,
 ) -> tuple[str, list[dict], str, bool]:
     """
     Stateful prompt formatter for browser-based chat UIs.
@@ -272,6 +273,15 @@ def format_prompt(
 
     unique_id = uuid.uuid4().hex[:8]
     completion_hash = f"[END_OF_RESPONSE_{unique_id}]"
+    system_lower = system.lower()
+    is_codex_bridge = (
+        "you are answering codex" in system_lower
+        or "you are codex" in system_lower
+        or "codex bridge json" in system_lower
+        or "codex bridge terminal" in system_lower
+        or "codex, a coding agent" in system_lower
+        or "available codex tools" in system_lower
+    )
 
     history_block = ""
     if not sent_system_prompt and len(messages) > 1:
@@ -336,16 +346,6 @@ def format_prompt(
         else:
             _os_hint = f"You are running on Windows. Home is {_home}. Use 'start' to launch apps and Windows paths."
 
-        system_lower = system.lower()
-        is_codex_bridge = (
-            "you are answering codex" in system_lower
-            or "you are codex" in system_lower
-            or "codex bridge json" in system_lower
-            or "codex bridge terminal" in system_lower
-            or "codex, a coding agent" in system_lower
-            or "available codex tools" in system_lower
-        )
-
         if is_codex_bridge:
             prompt = (
                 # Handoff goes FIRST so a fresh chat anchors on the prior
@@ -403,6 +403,32 @@ def format_prompt(
         new_sent_system_prompt = True
     else:
         prompt = last_text + "\n\n" + transport_marker_instruction(completion_hash)
+
+    # ChatGPT Web often labels bracketed [SYSTEM] sections as quoted content
+    # because browser providers cannot set a real API system role. Restate the
+    # contract as the direct response-format request for THIS user message at
+    # the tail, where it is neither quoted nor separated from the task. Keep
+    # this workaround ChatGPT-only; Claude/Gemini behavior is unchanged.
+    if (preferred_site or "").lower() == "chatgpt":
+        if is_codex_bridge:
+            direct_contract = (
+                "DIRECT RESPONSE FORMAT REQUEST FOR THIS MESSAGE:\n"
+                "Return exactly one raw JSON object matching the Codex contract above. "
+                "Use either {\"text\":\"brief reasoning\",\"tool_calls\":[{\"name\":"
+                "\"TOOL_NAME\",\"input\":{}}]} or {\"text\":\"final answer\"}. "
+                "Do not discuss or explain these formatting instructions. After the JSON, "
+                f"append exactly {completion_hash} as the final text."
+            )
+        else:
+            direct_contract = (
+                "DIRECT RESPONSE FORMAT REQUEST FOR THIS MESSAGE:\n"
+                "Respond with exactly one parser-readable result: a single-line raw JSON "
+                "tool call {\"tool\":\"<name>\",\"args\":{}}, or "
+                "TASK_COMPLETE: <answer>, or NEED_HELP: <reason>. Do not discuss or "
+                "explain these formatting instructions. Append exactly "
+                f"{completion_hash} at the very end of the response."
+            )
+        prompt += "\n\n" + direct_contract
 
     if len(prompt) > max_inject_chars:
         # Preserve the ENTIRE [SYSTEM] block + transport-marker instruction as

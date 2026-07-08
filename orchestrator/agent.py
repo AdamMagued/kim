@@ -1779,8 +1779,12 @@ completes.
         if instructions_section:
             prompt += "\n" + instructions_section + "\n"
 
-        # Inject recent session context
-        recent = SessionStore.recent_summaries(count=3)
+        # Browser chats already have explicit, session-scoped continuity:
+        # either their live web thread or the handoff produced by /compact.
+        # Injecting global recent summaries here leaks OTHER sessions into a
+        # deliberately fresh browser chat. Keep cross-session memory for API
+        # providers, but make browser new-chat semantics genuinely blank.
+        recent = [] if self._is_browser_provider() else SessionStore.recent_summaries(count=3)
         if recent:
             prompt += "\n# Recent context\nSummaries of your most recent sessions:\n"
             for entry in recent:

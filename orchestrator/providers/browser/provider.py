@@ -64,8 +64,11 @@ import platform
 import re
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING, cast
+
+import httpx
 
 # Playwright is only needed for the CDP fallback path (driving an external
 # Chrome). The primary desktop path is the in-app webview bridge (httpx), which
@@ -242,6 +245,57 @@ class BrowserProvider(BaseProvider):
         heuristic, which only covers restored-thread spawns."""
         self._sent_system_prompt = True
 
+    async def start_fresh_chat(self) -> bool:
+        """Open a blank provider conversation without sending a message.
+
+        Compaction needs a real rollover at compact time, not a promise to
+        clear the old chat on some later user turn.  The compact handoff stays
+        in the sidecar and is injected with the next actual task.
+        """
+        self.reset_session()
+        if self._use_webview_bridge:
+            if not self._bridge_url or not self._bridge_token:
+                return False
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    response = await client.post(
+                        f"{self._bridge_url}/v1/browser/new-chat",
+                        headers={"X-Kim-Token": self._bridge_token},
+                    )
+                return response.status_code < 400 and bool(
+                    response.json().get("ok", False)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not open fresh provider chat via bridge: %s", exc)
+                return False
+
+        try:
+            if self._page_driver is not None:
+                page, site = await self._page_driver.acquire()
+                if page is None or site is None:
+                    return False
+                await page.goto(
+                    self._fresh_chat_url(site) or page.url,
+                    wait_until="domcontentloaded",
+                )
+                return True
+
+            from playwright.async_api import async_playwright
+
+            async with async_playwright() as pw:
+                browser = await self._connect(pw)
+                page, site = await self._find_chat_page(browser)
+                if page is None or site is None:
+                    return False
+                await page.goto(
+                    self._fresh_chat_url(site) or page.url,
+                    wait_until="domcontentloaded",
+                )
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not open fresh provider chat after compaction: %s", exc)
+            return False
+
     def _estimate_prompt_usage(self, prompt: str, attachments: list[dict]) -> dict:
         image_count = sum(
             1 for a in attachments
@@ -356,6 +410,56 @@ class BrowserProvider(BaseProvider):
                 return
         self._sent_system_prompt = new_sent
 
+    @staticmethod
+    def _needs_chatgpt_contract_repair(
+        result: object,
+        *,
+        preferred_site: Optional[str],
+        has_agent_tools: bool,
+    ) -> bool:
+        """True when ChatGPT chat-mode returned unparseable plain prose.
+
+        Codex bridge calls carry no BrowserProvider tools and use their own
+        JSON contract, so this repair is intentionally limited to Kim's normal
+        browser-agent route.
+        """
+        if (preferred_site or "").lower() != "chatgpt" or not has_agent_tools:
+            return False
+        if not isinstance(result, dict) or result.get("type") != "text":
+            return False
+        content = str(result.get("content") or "").lstrip().upper()
+        return not (
+            content.startswith("TASK_COMPLETE:")
+            or content.startswith("NEED_HELP:")
+        )
+
+    @staticmethod
+    def _needs_chatgpt_capability_repair(
+        result: object,
+        *,
+        preferred_site: Optional[str],
+        has_agent_tools: bool,
+    ) -> bool:
+        """Detect ChatGPT falsely denying Kim's supplied local tools."""
+        if (preferred_site or "").lower() != "chatgpt" or not has_agent_tools:
+            return False
+        if not isinstance(result, dict) or result.get("type") != "text":
+            return False
+        content = str(result.get("content") or "").lower()
+        if not content.lstrip().startswith("need_help:"):
+            return False
+        denial_phrases = (
+            "don't have access",
+            "do not have access",
+            "no access to",
+            "cannot access the local",
+            "can't access the local",
+            "no tools available",
+            "upload the repository",
+            "upload the files",
+        )
+        return any(phrase in content for phrase in denial_phrases)
+
     async def complete(  # type: ignore[override]
         self,
         messages: list[dict],
@@ -385,6 +489,7 @@ class BrowserProvider(BaseProvider):
             max_inject_chars=self._max_inject_chars,
             use_webview_bridge=self._use_webview_bridge,
             handoff_summary=handoff,
+            preferred_site=self._preferred_site,
         )
         # H5: do NOT commit _sent_system_prompt yet — if the send below fails
         # (bridge error, injection-verify failure, timeout), the retry must
@@ -398,6 +503,8 @@ class BrowserProvider(BaseProvider):
         )
 
         if self._use_webview_bridge:
+            known_tools = {t["name"] for t in (tools or []) if "name" in t}
+            capability_repair_attempted = False
             result = await complete_via_webview_bridge(
                 bridge_url=self._bridge_url,
                 bridge_token=self._bridge_token,
@@ -407,10 +514,101 @@ class BrowserProvider(BaseProvider):
                 prompt=prompt,
                 attachments=attachments,
                 completion_hash=completion_hash,
-                known_tools={t["name"] for t in (tools or []) if "name" in t},
+                known_tools=known_tools,
                 clear_chat=clear_chat,
                 site_configs=getattr(self, "_site_configs", None),
             )
+            if self._needs_chatgpt_capability_repair(
+                result,
+                preferred_site=self._preferred_site,
+                has_agent_tools=bool(tools),
+            ):
+                capability_repair_attempted = True
+                repair_hash = f"[END_OF_RESPONSE_{uuid.uuid4().hex[:8]}]"
+                first_tool = next(iter(known_tools), "list_dir")
+                capability_prompt = (
+                    "That NEED_HELP response is incorrect: this chat is connected to Kim's "
+                    "local runtime, and every tool listed in [AVAILABLE TOOLS] is real and "
+                    "will be executed for you. Do not ask for uploads or tell the user to run "
+                    "commands. Continue the original task now by returning one raw JSON tool "
+                    "call using an available read-only tool. For this repository inspection, "
+                    "start with list_dir if available. Required shape: "
+                    '{"tool":"list_dir","args":{"path":"."}}. '
+                    f"Append exactly {repair_hash} at the very end."
+                )
+                logger.info(
+                    "ChatGPT falsely denied Kim tool access — retrying once (first=%s)",
+                    first_tool,
+                )
+                result = await complete_via_webview_bridge(
+                    bridge_url=self._bridge_url,
+                    bridge_token=self._bridge_token,
+                    preferred_site=self._preferred_site,
+                    model_tier=self._model_tier,
+                    gemini_authuser=self._gemini_authuser,
+                    prompt=capability_prompt,
+                    attachments=[],
+                    completion_hash=repair_hash,
+                    known_tools=known_tools,
+                    clear_chat=False,
+                    site_configs=getattr(self, "_site_configs", None),
+                )
+            if capability_repair_attempted and self._needs_chatgpt_contract_repair(
+                result,
+                preferred_site=self._preferred_site,
+                has_agent_tools=True,
+            ):
+                # Do not turn "I'm locating the files" into TASK_COMPLETE.
+                # After an explicit capability correction, only a real parsed
+                # tool call or a correctly formatted terminal response is safe.
+                result = {
+                    "type": "text",
+                    "content": (
+                        "NEED_HELP: ChatGPT acknowledged Kim's local tools but did not "
+                        "emit a runnable tool call after one capability repair attempt."
+                    ),
+                }
+            if self._needs_chatgpt_contract_repair(
+                result,
+                preferred_site=self._preferred_site,
+                has_agent_tools=bool(tools),
+            ):
+                repair_hash = f"[END_OF_RESPONSE_{uuid.uuid4().hex[:8]}]"
+                repair_prompt = (
+                    "Your previous reply was not readable by the caller because it omitted "
+                    "the required response prefix. Resend the SAME answer now in exactly one "
+                    "of these forms:\n"
+                    "TASK_COMPLETE: <your answer>\n"
+                    "NEED_HELP: <reason>\n"
+                    "Do not discuss this correction and do not add text before the prefix. "
+                    f"Append exactly {repair_hash} at the very end."
+                )
+                logger.info("ChatGPT omitted Kim's response contract — retrying once")
+                result = await complete_via_webview_bridge(
+                    bridge_url=self._bridge_url,
+                    bridge_token=self._bridge_token,
+                    preferred_site=self._preferred_site,
+                    model_tier=self._model_tier,
+                    gemini_authuser=self._gemini_authuser,
+                    prompt=repair_prompt,
+                    attachments=[],
+                    completion_hash=repair_hash,
+                    known_tools=known_tools,
+                    clear_chat=False,
+                    site_configs=getattr(self, "_site_configs", None),
+                )
+                if self._needs_chatgpt_contract_repair(
+                    result,
+                    preferred_site=self._preferred_site,
+                    has_agent_tools=True,
+                ):
+                    result = {
+                        "type": "text",
+                        "content": (
+                            "NEED_HELP: ChatGPT ignored Kim's required response format "
+                            "after one repair attempt."
+                        ),
+                    }
             self._commit_sent_system_prompt(result, new_sent)
             return self._attach_usage(result, estimated_usage)
 
@@ -558,6 +756,7 @@ class BrowserProvider(BaseProvider):
             sent_system_prompt=self._sent_system_prompt,
             max_inject_chars=self._max_inject_chars,
             use_webview_bridge=self._use_webview_bridge,
+            preferred_site=self._preferred_site,
         )
         self._sent_system_prompt = new_sent
         return prompt, attachments, completion_hash

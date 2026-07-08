@@ -44,10 +44,15 @@ class _RecordingProvider:
         self._i = 0
         self.calls = []
         self.continuation_marks = 0
+        self.fresh_chat_starts = 0
         self._sent_system_prompt = True
 
     def mark_thread_continuation(self):
         self.continuation_marks += 1
+
+    async def start_fresh_chat(self):
+        self.fresh_chat_starts += 1
+        return True
 
     async def complete(self, messages, tools, system, **kwargs):
         self.calls.append({"messages": messages, "kwargs": kwargs})
@@ -250,6 +255,7 @@ class TestCompactBrowserThread(unittest.IsolatedAsyncioTestCase):
         self.assertIn("wire the login route", handoff)
         # Delta-only compact: it must not re-inject the system prompt.
         self.assertEqual(provider.continuation_marks, 1)
+        self.assertEqual(provider.fresh_chat_starts, 1)
         # State reset with the handoff carried for the next fresh chat.
         saved = ts.load_thread_state("/proj/a", "browser:gemini")
         self.assertFalse(saved["sent_instructions"])
@@ -1197,15 +1203,17 @@ class TestRepeatedCommandLoopGuard(unittest.IsolatedAsyncioTestCase):
     async def test_format_reminder_appended_to_chatgpt_first_relay(self):
         from codex_engine.engine import _CodexProxy
 
-        # ChatGPT weighs the END of the prompt — turn 1 ignored the terminal
-        # rules buried above codex's schemas ("save this as game.html" prose).
+        # ChatGPT weighs the END of the prompt, so repeat the parser's JSON
+        # contract there without introducing a competing terminal protocol.
         provider = _RecordingProvider([{"type": "text", "content": "DONE"}])
         proxy = _CodexProxy(
             provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
         )
         await proxy._handle_responses(self._request(proxy, 1))
         sent = provider.calls[0]["messages"][0]["content"]
-        self.assertTrue(sent.rstrip().endswith("never paste code for me to save myself.)"))
+        self.assertIn("FORMAT REMINDER", sent)
+        self.assertIn('"tool_calls"', sent)
+        self.assertTrue(sent.rstrip().endswith("prose outside JSON.)"))
 
     async def test_format_reminder_not_appended_for_gemini(self):
         from codex_engine.engine import _CodexProxy
@@ -1472,9 +1480,9 @@ class TestDoneReply(unittest.TestCase):
         self.assertFalse(_is_done_reply("Done, but first run this:"))
 
 
-class TestChatgptTerminalNudge(unittest.IsolatedAsyncioTestCase):
-    async def test_chatgpt_gets_terminal_nudge_not_json_nudge(self):
-        from codex_engine.engine import _CodexProxy, _TERMINAL_NUDGE
+class TestChatgptContractNudge(unittest.IsolatedAsyncioTestCase):
+    async def test_chatgpt_gets_same_json_nudge_as_parser_contract(self):
+        from codex_engine.engine import _CodexProxy, _CONTRACT_NUDGE
 
         provider = _RecordingProvider([{"type": "text", "content": "still just chatting"}])
         proxy = _CodexProxy(
@@ -1483,7 +1491,7 @@ class TestChatgptTerminalNudge(unittest.IsolatedAsyncioTestCase):
         original = {"type": "text", "content": "Here's how you'd do it, in theory."}
         await proxy._nudge_contract_retry(original, relay_num=1)
         self.assertEqual(len(provider.calls), 1)
-        self.assertEqual(provider.calls[0]["messages"][0]["content"], _TERMINAL_NUDGE)
+        self.assertEqual(provider.calls[0]["messages"][0]["content"], _CONTRACT_NUDGE)
 
     async def test_gemini_still_gets_json_nudge(self):
         from codex_engine.engine import _CodexProxy, _CONTRACT_NUDGE

@@ -16,7 +16,19 @@ pub(crate) fn open_browser_signin_window_impl(
     provider_name: Option<String>,
     app_handle: &tauri::AppHandle,
 ) -> Result<String, String> {
-    open_browser_signin_window_with_visibility(url, provider_name, true, app_handle)
+    open_browser_signin_window_inner(url, provider_name, true, false, app_handle)
+}
+
+/// Create the provider webview on behalf of the active bridge send itself.
+/// `/v1/task` reserves the task slot before Python calls `/v1/send`, so the
+/// normal user-navigation guard would otherwise make the first CLI request
+/// incapable of creating its own missing transport window.
+pub(crate) fn open_browser_signin_window_for_bridge_send(
+    url: &str,
+    provider_name: Option<String>,
+    app_handle: &tauri::AppHandle,
+) -> Result<String, String> {
+    open_browser_signin_window_inner(url, provider_name, true, true, app_handle)
 }
 
 /// Underlying implementation that lets callers create the window in a hidden
@@ -28,6 +40,16 @@ pub(crate) fn open_browser_signin_window_with_visibility(
     url: &str,
     provider_name: Option<String>,
     initially_visible: bool,
+    app_handle: &tauri::AppHandle,
+) -> Result<String, String> {
+    open_browser_signin_window_inner(url, provider_name, initially_visible, false, app_handle)
+}
+
+fn open_browser_signin_window_inner(
+    url: &str,
+    provider_name: Option<String>,
+    initially_visible: bool,
+    allow_create_during_task: bool,
     app_handle: &tauri::AppHandle,
 ) -> Result<String, String> {
     let trimmed = url.trim();
@@ -69,7 +91,7 @@ pub(crate) fn open_browser_signin_window_with_visibility(
         return Ok("Navigated existing Kim browser window".to_string());
     }
 
-    if is_bridge_task_running() {
+    if !allow_create_during_task && is_bridge_task_running() {
         return Err(
             "Cannot open the provider browser while Kim is running a task; this would lose LLM context."
                 .to_string(),

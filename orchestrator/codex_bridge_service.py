@@ -410,6 +410,13 @@ async def _compact_browser_thread(provider, cwd: str, provider_name: str) -> tup
 
     state = reset_thread_state(cwd, provider_name, handoff=handoff or None)
     _stamp_thread_owner(cwd, provider_name, state)
+    # Rollover now, while handling /compact. Previously the old chat remained
+    # visibly active and the fresh chat was deferred until the next user task.
+    # Keep the handoff pending; the next real task seeds it into this blank chat.
+    if hasattr(provider, "start_fresh_chat"):
+        opened = await provider.start_fresh_chat()
+        if not opened:
+            logger.warning("Compaction handoff saved, but fresh browser chat could not be opened")
     return bool(handoff), handoff
 
 
@@ -564,7 +571,15 @@ async def _run_async(args: argparse.Namespace) -> int:
             # only the delta with no fresh system prompt, so the model drifts
             # back to prose. Start a fresh browser chat for the new session.
             _status("New Kim session — starting a fresh browser chat…")
-            thread_state = reset_thread_state(args.cwd, args.provider)
+            # A new CLI launch is a genuinely new conversation on BOTH sides
+            # of the bridge. Keeping codex_thread_id here resumed Codex's old
+            # transcript, which could immediately compact and re-seed the new
+            # browser chat with the conversation the user just left.
+            thread_state = reset_thread_state(
+                args.cwd,
+                args.provider,
+                preserve_codex_thread=False,
+            )
         elif thread_state.get("burned"):
             # The stored thread ignored the tool protocol even after a format
             # nudge — its context argues against compliance, so resuming it

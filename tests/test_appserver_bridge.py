@@ -462,6 +462,24 @@ class SidecarPreservationTest(unittest.TestCase):
                 state = reset_thread_state("/proj", "browser:gemini")
                 self.assertNotIn("codex_thread_id", state)
 
+    def test_new_cli_session_can_drop_codex_thread_identity(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("codex_engine.thread_state._STATE_DIR", Path(tmp)):
+                save_thread_state("/proj", "browser:chatgpt", {
+                    "sent_instructions": True,
+                    "codex_thread_id": "th_old_cli",
+                    "codex_thread_cwd": "/proj",
+                })
+                state = reset_thread_state(
+                    "/proj",
+                    "browser:chatgpt",
+                    preserve_codex_thread=False,
+                )
+                self.assertNotIn("codex_thread_id", state)
+                self.assertNotIn("codex_thread_cwd", state)
+
 
 class ServiceDispatchTest(unittest.IsolatedAsyncioTestCase):
     """The service branches on codex_bridge.transport; app-server is the default."""

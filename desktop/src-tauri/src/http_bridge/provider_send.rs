@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 use tauri::Manager;
 use tiny_http::Request;
 
-use crate::browser_bridge::{open_browser_signin_window_impl, run_bridge_completion_once};
+use crate::browser_bridge::{
+    open_browser_signin_window_for_bridge_send, open_browser_signin_window_impl,
+    run_bridge_completion_once,
+};
 use crate::http_util::{agent_debug_log, respond_json};
 use crate::provider_url::{default_site_url, gemini_site_url, normalize_site};
 use crate::{
@@ -134,7 +137,7 @@ pub(super) fn complete(mut request: Request, app_handle: tauri::AppHandle, token
             default_site_url(&site).to_string()
         };
         let open_result =
-            open_browser_signin_window_impl(&open_url, Some(site.clone()), &app_handle);
+            open_browser_signin_window_for_bridge_send(&open_url, Some(site.clone()), &app_handle);
         if let Err(e) = open_result {
             respond_json(
                 request,
@@ -374,7 +377,7 @@ pub(super) fn send(mut request: Request, app_handle: tauri::AppHandle) {
             default_site_url(&site).to_string()
         };
         let open_result =
-            open_browser_signin_window_impl(&open_url, Some(site.clone()), &app_handle);
+            open_browser_signin_window_for_bridge_send(&open_url, Some(site.clone()), &app_handle);
         if let Err(e) = open_result {
             respond_json(
                 request,

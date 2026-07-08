@@ -493,15 +493,15 @@ class _CodexProxy:
                 if hasattr(self._provider, '_sent_system_prompt'):
                     self._provider._sent_system_prompt = False
                 logger.info(f"[relay #{relay_num}] First relay — sending full context")
-            # ChatGPT weighs the END of a long prompt far more than the top —
-            # codex's forwarded schemas bury the terminal rules, and turn 1
-            # comes back as "save this as game.html" prose. A compact reminder
-            # at the tail fixes the recency bias.
+            # ChatGPT weighs the END of a long prompt far more than the top.
+            # Repeat the same JSON contract the Responses parser expects; do
+            # not introduce a second, terminal-only response format here.
             if bool(self._provider_name) and "chatgpt" in self._provider_name.lower():
                 prompt += (
-                    "\n\n(Format reminder: reply with ONE short narration line, then "
-                    "EXACTLY ONE shell command in a single ```bash block — create files "
-                    "with a command, never paste code for me to save myself.)"
+                    "\n\n(FORMAT REMINDER: Your entire reply must be ONE raw JSON object: "
+                    '{"text":"brief reasoning","tool_calls":[{"name":"TOOL_NAME",'
+                    '"input":{}}]}. For a final answer use only {"text":"answer"}. '
+                    "No markdown, code fences, shell-only format, or prose outside JSON.)"
                 )
             self._last_sent_count = len(input_items) if isinstance(input_items, list) else 0
         else:
@@ -668,8 +668,7 @@ class _CodexProxy:
         logger.info(f"[relay #{relay_num}] Reply had no actionable command — sending one nudge")
         _count_repair(self._thread_state.setdefault("repairs", {}), "nudges")
         print(f"{LOG_TAG_STATUS} Reply had no runnable command — asking for it…", flush=True)
-        is_chatgpt = bool(self._provider_name) and "chatgpt" in self._provider_name.lower()
-        nudge = _TERMINAL_NUDGE if is_chatgpt else _CONTRACT_NUDGE
+        nudge = _CONTRACT_NUDGE
         try:
             retry = await self._provider.complete(
                 messages=[{"role": "user", "content": nudge}],
@@ -1728,10 +1727,13 @@ def _chatgpt_terminal_system_prompt() -> str:
 
 
 def _system_prompt_for(provider_name: str) -> str:
-    """ChatGPT gets the terminal-helper prompt; every other provider keeps the
-    JSON tool-call prompt (which Gemini/others honor natively)."""
-    if provider_name and "chatgpt" in provider_name.lower():
-        return _chatgpt_terminal_system_prompt()
+    """Return the exact Codex bridge contract for every browser provider.
+
+    The Responses proxy and its parser speak the JSON tool-call protocol.  A
+    provider-specific terminal prompt here creates two incompatible protocols:
+    ChatGPT emits bash while Codex is waiting for structured tool calls.  Keep
+    one stateful contract end-to-end instead.
+    """
     return _codex_browser_system_prompt()
 
 
