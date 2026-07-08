@@ -39,6 +39,7 @@ _DATA_URI_BASE64_MARKER = ";base64,"
 # "metadata: 2026") pairs with a LATER real ";base64," and swallows all the
 # prompt text in between as a bogus "mime type".
 _DATA_URI_MIME_RE = re.compile(r"[a-z0-9.+-]+/[a-z0-9.+-]+\Z")
+_DATA_URI_PARAM_RE = re.compile(r"[a-z0-9!#$&^_.+-]+=[^;\s,]+\Z")
 
 
 def ext_for_mime(mime_type: str) -> str:
@@ -111,14 +112,20 @@ def strip_data_uris(text: str, attachments_out: list[dict]) -> str:
             out_parts.append(text[i:])
             break
 
-        mime_type = text[start + len(prefix):marker_pos].strip().lower()
+        media_header = text[start + len(prefix):marker_pos].strip().lower()
+        header_parts = [part.strip() for part in media_header.split(";")]
+        mime_type = header_parts[0] if header_parts else ""
+        valid_header = bool(
+            _DATA_URI_MIME_RE.fullmatch(mime_type)
+            and all(_DATA_URI_PARAM_RE.fullmatch(part) for part in header_parts[1:])
+        )
         payload_start = marker_pos + len(marker)
         end = payload_start
         while end < len(text) and text[end] not in " \t\n\r\"'<>)],;":
             end += 1
 
         payload = text[payload_start:end]
-        if payload and _DATA_URI_MIME_RE.fullmatch(mime_type):
+        if payload and valid_header:
             out_parts.append(text[i:start])
             append_attachment(attachments_out, mime_type, payload)
             if mime_type.startswith("image/"):
@@ -463,6 +470,19 @@ def format_prompt(
             tail_len = max(0, budget - head_end - len(notice))
             tail = prompt[-tail_len:] if tail_len else ""
             trimmed = prompt[:head_end] + notice + tail + suffix
+
+        # A pathological tiny budget can otherwise preserve only transport
+        # instructions and discard the user's task. The task and marker are
+        # the irreducible payload, so in this case the limit is a soft cap.
+        task_tail = next(
+            (line.strip() for line in reversed(last_text.splitlines()) if line.strip()),
+            "",
+        )
+        if task_tail and task_tail not in trimmed:
+            essential = task_tail + "\n\n" + marker_instr
+            if (preferred_site or "").lower() == "chatgpt":
+                essential += "\n\n" + direct_contract
+            trimmed = essential
         prompt = trimmed
 
     return prompt, attachments, completion_hash, new_sent_system_prompt

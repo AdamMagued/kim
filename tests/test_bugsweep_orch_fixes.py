@@ -202,6 +202,31 @@ def test_m1_strip_data_uris_extracts_real_uri():
     assert "[Screenshot attached]" in result
 
 
+def test_strip_data_uris_extracts_parameterized_uri():
+    from orchestrator.providers.browser.prompt_builder import strip_data_uris
+
+    text = "icon: data:image/svg+xml;charset=utf-8;base64,PHN2Zz4= done"
+    out: list = []
+    result = strip_data_uris(text, out)
+
+    assert len(out) == 1
+    assert out[0]["mime_type"] == "image/svg+xml"
+    assert out[0]["data_base64"] == "PHN2Zz4="
+    assert "PHN2Zz4=" not in result
+    assert "[Screenshot attached]" in result
+
+
+def test_strip_data_uris_rejects_malformed_parameter():
+    from orchestrator.providers.browser.prompt_builder import strip_data_uris
+
+    text = "keep data:image/png;not-a-param;base64,QUJD intact"
+    out: list = []
+    result = strip_data_uris(text, out)
+
+    assert out == []
+    assert text in result
+
+
 # ── L6: strip_transport_markers anchors on the LAST hash occurrence ──────────
 
 def test_l6_strip_transport_markers_uses_last_hash():

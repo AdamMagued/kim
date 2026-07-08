@@ -233,7 +233,7 @@ pub async fn stream_kim_request(
     config: &KimConfig,
     messages: &[ChatMessage],
     code_mode: bool,
-    _session_id: &str,
+    session_id: &str,
     allow_non_git: bool,
     tx: UnboundedSender<AppEvent>,
     codex_control: Option<CodexTurnControl>,
@@ -257,7 +257,7 @@ pub async fn stream_kim_request(
             config,
             prompt,
             allow_non_git,
-            _session_id,
+            session_id,
             tx,
             codex_control,
         )
@@ -271,20 +271,45 @@ pub async fn stream_kim_request(
     if config.provider == "desktop" || is_browser_provider(&config.provider) {
         if is_bridge_available(&config.desktop_bridge_url).await {
             stream_via_bridge(config, messages, tx).await;
-        } else {
-            let _ = tx.send(AppEvent::Err(if is_browser_provider(&config.provider) {
-                // We only reach here for a browser provider when the local
-                // Playwright agent path was unavailable (no Kim source root or
-                // no Python env) AND the desktop bridge is down. Point at the
-                // env setup that unlocks the no-desktop path, then the fallback.
-                "Browser provider can't run: no Python environment for the local browser agent, \
-                 and the Kim desktop bridge isn't running.\n\
-                 Fix (recommended): from the Kim repo run the installer to build the venv and \
-                 Playwright browser — Windows: install.bat, macOS/Linux: ./install.sh — then rerun kim.\n\
-                 Or: start the Kim desktop app, or switch with /provider ollama.".to_string()
+        } else if is_browser_provider(&config.provider) {
+            // The REPL already probes bridge health while choosing between the
+            // desktop and local-agent routes. The desktop can disappear in the
+            // gap before this second probe (TOCTOU). Resolve the local route
+            // again here so that race degrades to Playwright rather than an
+            // incorrect "can't run" error.
+            if let Some((root, python)) = crate::agentic::agentic_available(&config.provider) {
+                let prompt = messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.as_str())
+                    .unwrap_or_default();
+                let session_dir = root.join("kim_sessions");
+                crate::agentic::stream_agentic_request(
+                    &root,
+                    &python,
+                    prompt,
+                    &config.provider,
+                    &session_dir,
+                    Some(session_id),
+                    tx,
+                )
+                .await;
             } else {
-                "Kim desktop bridge is not running. Start Kim desktop, or switch provider with /provider ollama.".to_string()
-            }));
+                let _ = tx.send(AppEvent::Err(
+                    "Browser provider can't run: no Python environment for the local browser agent, \
+                     and the Kim desktop bridge isn't running.\n\
+                     Fix (recommended): from the Kim repo run the installer to build the venv and \
+                     Playwright browser — Windows: install.bat, macOS/Linux: ./install.sh — then rerun kim.\n\
+                     Or: start the Kim desktop app, or switch with /provider ollama."
+                        .to_string(),
+                ));
+            }
+        } else {
+            let _ = tx.send(AppEvent::Err(
+                "Kim desktop bridge is not running. Start Kim desktop, or switch provider with /provider ollama."
+                    .to_string(),
+            ));
         }
         return;
     }

@@ -95,7 +95,10 @@ _COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
 #   _MAX_SHELL_EXEC_S mirrors mcp_server/tools/shell.py MAX_SHELL_TIMEOUT_S.
 _APPROVAL_BACKSTOP_S = float(os.environ.get("KIM_APPROVAL_TIMEOUT_S", "150"))
 _MAX_SHELL_EXEC_S = 600.0
-_DEFAULT_TOOL_EXEC_S = 120.0
+# A client timeout does not prove that the MCP server stopped executing. Use
+# the conservative ceiling for every tool so a slow call is not abandoned and
+# then duplicated by a model retry. Individual tools may enforce shorter caps.
+_DEFAULT_TOOL_EXEC_S = 600.0
 _CLIENT_TIMEOUT_MARGIN_S = 60.0
 
 # Deterministic bridge.js failure signatures for a follow-up send that never
@@ -1367,7 +1370,10 @@ class KimAgent:
             output = "\n".join(parts) if parts else "(no output)"
         except asyncio.TimeoutError:
             logger.error(f"MCP tool '{name}' timed out after {_call_timeout:.0f}s")
-            output = f"ERROR calling {name}: timed out after {_call_timeout:.0f}s"
+            output = (
+                f"ERROR calling {name}: timed out after {_call_timeout:.0f}s; "
+                "execution status is unknown. Do not retry this action automatically."
+            )
         except Exception as e:
             logger.error(f"MCP tool '{name}' failed: {e}", exc_info=True)
             output = f"ERROR calling {name}: {e}"

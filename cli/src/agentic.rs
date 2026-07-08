@@ -38,6 +38,21 @@ pub enum AgentLine {
     Ignore,
 }
 
+fn child_failure_detail(exit_ok: bool, had_output: bool, stderr_tail: String) -> Option<String> {
+    if exit_ok && had_output {
+        return None;
+    }
+    Some(if stderr_tail.is_empty() {
+        if !exit_ok {
+            "process exited unsuccessfully without an error message".to_string()
+        } else {
+            "process exited without producing output".to_string()
+        }
+    } else {
+        stderr_tail
+    })
+}
+
 /// Parse a single stdout line from the orchestrator into an `AgentLine`.
 pub fn parse_agent_line(line: &str) -> AgentLine {
     let line = line.trim_end_matches(['\r', '\n']);
@@ -349,8 +364,8 @@ pub async fn stream_agentic_request(
             )));
             return;
         }
-        if (!exit_ok || !had_output) && !tail.is_empty() {
-            let _ = tx.send(AppEvent::Err(format!("Kim agent: {tail}")));
+        if let Some(detail) = child_failure_detail(exit_ok, had_output, tail) {
+            let _ = tx.send(AppEvent::Err(format!("Kim agent: {detail}")));
             return;
         }
     }
@@ -461,6 +476,13 @@ mod tests {
         assert_eq!(parse_agent_line(""), AgentLine::Ignore);
         assert_eq!(parse_agent_line("   "), AgentLine::Ignore);
         assert_eq!(parse_agent_line("random text"), AgentLine::Ignore);
+    }
+
+    #[test]
+    fn failed_child_without_stderr_is_not_silent() {
+        let detail = child_failure_detail(false, true, String::new()).unwrap();
+        assert!(detail.contains("exited unsuccessfully"));
+        assert!(child_failure_detail(true, true, String::new()).is_none());
     }
 
     #[test]
