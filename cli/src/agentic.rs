@@ -162,10 +162,7 @@ pub fn agentic_available(provider: &str) -> Option<(PathBuf, PathBuf)> {
 /// Resolve agentic execution against an explicit Kim root. Keeping root
 /// validation separate makes the no-desktop fallback testable without relying
 /// on the developer machine's environment or a running browser.
-pub(crate) fn agentic_available_at(
-    provider: &str,
-    root: PathBuf,
-) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn agentic_available_at(provider: &str, root: PathBuf) -> Option<(PathBuf, PathBuf)> {
     let p = provider.trim().to_lowercase();
     if p == "desktop" {
         return None; // the desktop provider always routes through the bridge

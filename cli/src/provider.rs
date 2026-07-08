@@ -273,15 +273,7 @@ pub async fn stream_kim_request(
     // Browser providers intentionally stay on this path so Code mode can use
     // orchestrator.codex_bridge_service instead of the desktop chat bridge.
     if code_mode {
-        stream_codex_subprocess(
-            config,
-            prompt,
-            allow_non_git,
-            session_id,
-            tx,
-            codex_control,
-        )
-        .await;
+        stream_codex_subprocess(config, prompt, allow_non_git, session_id, tx, codex_control).await;
         return;
     }
 
@@ -290,7 +282,7 @@ pub async fn stream_kim_request(
     // the desktop app can route to the correct browser tab.
     if config.provider == "desktop" || is_browser_provider(&config.provider) {
         if is_bridge_available(&config.desktop_bridge_url).await {
-            stream_via_bridge(config, messages, tx).await;
+            stream_via_bridge(config, messages, session_id, tx).await;
         } else if is_browser_provider(&config.provider) {
             // The REPL already probes bridge health while choosing between the
             // desktop and local-agent routes. The desktop can disappear in the
@@ -570,11 +562,9 @@ mod tests {
     fn local_browser_fallback_preserves_session_and_session_dir() {
         let root = PathBuf::from("C:/fake/kim");
         let python = root.join("venv/Scripts/python.exe");
-        let route = build_local_agent_route(
-            Some((root.clone(), python.clone())),
-            "session-from-repl",
-        )
-        .expect("available local agent should produce a fallback route");
+        let route =
+            build_local_agent_route(Some((root.clone(), python.clone())), "session-from-repl")
+                .expect("available local agent should produce a fallback route");
 
         assert_eq!(route.root, root);
         assert_eq!(route.python, python);

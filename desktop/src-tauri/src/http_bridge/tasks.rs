@@ -4,6 +4,7 @@
 //! Extracted verbatim from the monolithic `http_bridge.rs` route match —
 //! behavior unchanged.
 
+use std::path::Path;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
@@ -19,6 +20,38 @@ use crate::subprocess::{find_python_interpreter, process_exists, send_signal};
 use crate::{google_oauth, KIM_PREFERRED_SITE, WEBVIEW_BRIDGE_CFG};
 
 use super::read_body_capped;
+
+fn count_run_results(session_dir: &Path, session_id: &str) -> usize {
+    let direct = session_dir.join(format!("{session_id}.jsonl"));
+    let path = if direct.is_file() {
+        Some(direct)
+    } else {
+        std::fs::read_dir(session_dir).ok().and_then(|entries| {
+            entries.flatten().find_map(|entry| {
+                let candidate = entry.path().join(format!("{session_id}.jsonl"));
+                candidate.is_file().then_some(candidate)
+            })
+        })
+    };
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|text| {
+            text.lines()
+                .filter(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned)
+                        })
+                        .as_deref()
+                        == Some("run_result")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
 
 /// `GET /v1/status` — report task-runtime and browser-window state.
 pub(super) fn status(request: Request, app_handle: tauri::AppHandle) {
@@ -151,6 +184,7 @@ pub(super) fn start_task(mut request: Request, app_handle: tauri::AppHandle) {
             format!("{:x}-{:08x}", ts, rand::thread_rng().gen::<u32>())
         });
     let session_dir = kim_root.join("kim_sessions");
+    let prior_run_results = count_run_results(&session_dir, &session_id);
     let provider = parsed
         .provider
         .filter(|s| !s.trim().is_empty() && s != "desktop")
@@ -257,6 +291,7 @@ pub(super) fn start_task(mut request: Request, app_handle: tauri::AppHandle) {
                     "ok": true,
                     "session_id": session_id,
                     "sessions_dir": session_dir.to_string_lossy(),
+                    "prior_run_results": prior_run_results,
                 }),
             );
         }
@@ -393,6 +428,27 @@ pub(super) fn approve(mut request: Request) {
 
 #[cfg(test)]
 mod tests {
+    use super::count_run_results;
+
+    #[test]
+    fn counts_only_completed_runs_for_reused_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "session-reused";
+        let path = dir.path().join(format!("{session_id}.jsonl"));
+        std::fs::write(
+            path,
+            concat!(
+                "{\"type\":\"run_started\"}\n",
+                "{\"type\":\"run_result\",\"summary\":\"one\"}\n",
+                "not json\n",
+                "{\"type\":\"run_result\",\"summary\":\"two\"}\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(count_run_results(dir.path(), session_id), 2);
+    }
+
     /// K2: build the REAL argv the `/v1/task` handler produces, by calling the
     /// shared `task_spec::chat_task_spec` builder exactly like the handler
     /// does (no more hand-mirrored logic that could drift).

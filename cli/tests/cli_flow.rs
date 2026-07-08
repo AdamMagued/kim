@@ -350,6 +350,12 @@ fn browser_provider_routes_task_through_bridge_with_token() {
     );
     let body = task.json_body();
     assert_eq!(body["task"], "summarize this repo");
+    assert!(
+        body["session_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("session-")),
+        "the CLI conversation id must be forwarded so /new resets the desktop browser thread; body: {body}"
+    );
     assert_eq!(
         body["provider"], "browser:claude",
         "provider name must be forwarded so desktop routes to the right browser tab"

@@ -72,6 +72,7 @@ fn bridge_token_from_file() -> Option<String> {
 pub(crate) async fn stream_via_bridge(
     config: &KimConfig,
     messages: &[super::ChatMessage],
+    session_id: &str,
     tx: UnboundedSender<AppEvent>,
 ) {
     let prompt = messages
@@ -121,6 +122,11 @@ pub(crate) async fn stream_via_bridge(
             "task": prompt,
             "provider": config.provider,
             "model": config.model,
+            // Preserve the CLI conversation identity across desktop-backed
+            // turns. `/new` creates a new id, allowing the desktop
+            // orchestrator to reset the browser thread instead of silently
+            // continuing the previous ChatGPT conversation.
+            "session_id": session_id,
         }));
     if let Some(token) = bridge_token() {
         request = request.header("X-Kim-Token", token);
@@ -164,7 +170,18 @@ pub(crate) async fn stream_via_bridge(
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        match poll_bridge_session_answer(&sessions_dir, session_id, &tx).await {
+                        let prior_run_results = value
+                            .get("prior_run_results")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize;
+                        match poll_bridge_session_answer(
+                            &sessions_dir,
+                            session_id,
+                            prior_run_results,
+                            &tx,
+                        )
+                        .await
+                        {
                             Some((answer, _success)) if !answer.trim().is_empty() => {
                                 let _ = tx.send(AppEvent::TextChunk(
                                     crate::markdown::render_markdown(answer.trim()),
@@ -203,6 +220,7 @@ pub(crate) async fn stream_via_bridge(
 async fn poll_bridge_session_answer(
     sessions_dir: &str,
     session_id: &str,
+    prior_run_results: usize,
     tx: &UnboundedSender<AppEvent>,
 ) -> Option<(String, bool)> {
     use std::time::{Duration, Instant};
@@ -213,7 +231,7 @@ async fn poll_bridge_session_answer(
     let mut last_beat = Instant::now();
     loop {
         if let Some(path) = find_session_file(sessions_dir, session_id) {
-            if let Some(res) = read_run_result(&path) {
+            if let Some(res) = read_run_result_after(&path, prior_run_results) {
                 return Some(res);
             }
         }
@@ -250,15 +268,20 @@ fn find_session_file(sessions_dir: &str, session_id: &str) -> Option<PathBuf> {
 }
 
 /// Read the trailing `run_result` line; returns `(summary, success)` once present.
-fn read_run_result(path: &Path) -> Option<(String, bool)> {
+fn read_run_result_after(path: &Path, prior_run_results: usize) -> Option<(String, bool)> {
     let text = std::fs::read_to_string(path).ok()?;
-    for line in text.lines().rev() {
+    let mut seen = 0usize;
+    for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || !line.contains("\"run_result\"") {
             continue;
         }
         if let Ok(v) = serde_json::from_str::<Value>(line) {
             if v.get("type").and_then(Value::as_str) == Some("run_result") {
+                seen += 1;
+                if seen <= prior_run_results {
+                    continue;
+                }
                 let summary = v
                     .get("summary")
                     .and_then(Value::as_str)
@@ -297,9 +320,31 @@ mod tests {
         tmp.flush().unwrap();
 
         let (summary, success) =
-            read_run_result(tmp.path()).expect("should parse the trailing run_result line");
+            read_run_result_after(tmp.path(), 0).expect("should parse the trailing run_result line");
         assert_eq!(summary, "task complete");
         assert!(success, "success flag should be true");
+    }
+
+    #[test]
+    fn read_run_result_after_ignores_stale_completed_turns() {
+        use std::io::Write as _;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(
+            concat!(
+                "{\"type\":\"run_result\",\"summary\":\"stale\",\"success\":true}\n",
+                "{\"type\":\"run_started\"}\n",
+                "{\"type\":\"run_result\",\"summary\":\"current\",\"success\":true}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        tmp.flush().unwrap();
+
+        assert_eq!(
+            read_run_result_after(tmp.path(), 1),
+            Some(("current".to_string(), true))
+        );
+        assert!(read_run_result_after(tmp.path(), 2).is_none());
     }
 
     // ── find_session_file_direct_and_dated ───────────────────────────────────
