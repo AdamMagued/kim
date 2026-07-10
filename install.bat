@@ -89,6 +89,17 @@ REM ── Create required directories ─────────────�
 if not exist "logs" mkdir logs
 if not exist "sessions\chrome_data" mkdir sessions\chrome_data
 
+REM ── Write project root for Kim.exe discovery ────────────────────────────
+REM Guard: only record a directory that actually looks like the Kim repo so a
+REM stray run from an unrelated directory can't poison Kim.exe discovery.
+if exist "orchestrator\agent.py" (
+    >"%USERPROFILE%\.kim_root" echo %CD%
+    echo   Saved project root to %%USERPROFILE%%\.kim_root ^(used by Kim.exe^)
+) else (
+    echo   [WARN] %CD% does not look like the Kim repo ^(no orchestrator\agent.py^);
+    echo          not writing %%USERPROFILE%%\.kim_root.
+)
+
 echo.
 echo  ╔═══════════════════════════════════════════════════════╗
 echo  ║           Setup complete!                             ║

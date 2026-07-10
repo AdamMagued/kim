@@ -42,6 +42,7 @@ EXIT_TRANSPORT = 3
 # Config resolution
 # ---------------------------------------------------------------------------
 
+
 def _kim_root() -> Path:
     """Best-effort Kim project root (where kim_sessions/ lives)."""
     # Walk up from this file: kimctl/__main__.py → kim/
@@ -292,7 +293,7 @@ def cmd_status(args):
         running = "✅ Yes" if data.get("has_running_task") else "❌ No"
         browser = "👁 Visible" if data.get("browser_visible") else "🔒 Hidden"
         session = data.get("active_session_id") or "—"
-        print(f"Kim Status:")
+        print("Kim Status:")
         print(f"  Running task:  {running}")
         print(f"  Session:       {session}")
         print(f"  Browser:       {browser}")
@@ -366,7 +367,7 @@ def cmd_send(args):
     if not args.json:
         print(f"Task started (session: {session_id}). Waiting for completion...")
 
-    timeout = args.timeout or 300
+    timeout = args.timeout
     deadline = time.time() + timeout
     poll_interval = 0.5
     last_offset = 0
@@ -456,7 +457,7 @@ def cmd_send(args):
         _print_json({"ok": False, "status": "timeout", "session_id": session_id})
     else:
         print(f"\n⏰ Timeout after {timeout}s. Task may still be running.", file=sys.stderr)
-        print(f"   Check with: python -m kimctl status")
+        print("   Check with: python -m kimctl status")
         print(f"   View logs:  python -m kimctl show {session_id}")
     sys.exit(EXIT_TIMEOUT)
 
@@ -1095,8 +1096,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # browser
     sp = sub.add_parser("browser", help="Control the in-app browser")
-    sp.add_argument("browser_action", choices=["show", "hide", "click", "new-chat"],
-                     help="Browser action")
+    sp.add_argument(
+        "browser_action",
+        choices=["show", "hide", "click", "new-chat"],
+        help="Browser action",
+    )
     sp.add_argument("selector", nargs="?", help="CSS selector (for click)")
     sp.add_argument("--json", action="store_true", help="Machine-readable output")
 
