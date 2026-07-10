@@ -201,6 +201,26 @@ async def _install_ssrf_guard(page: Any) -> None:
 
 # Module-level singletons. The MCP server is a single subprocess, so these
 # survive across tool calls within a session.
+#
+# `_lock` (LOW #5): only guards `_ensure_browser()` inside `_page()` — it is
+# released BEFORE `_page()` returns the page object to its caller. Every web
+# tool handler then uses that page reference for the rest of its own async
+# function body with the lock no longer held. This is safe ONLY because the
+# MCP server serializes tool calls (one call's handler runs to completion —
+# including every `await` inside it — before the next one starts), which is
+# the documented single-run-per-process invariant for this whole package. If
+# that invariant is ever violated (e.g. a future change dispatches multiple
+# tool calls concurrently within one MCP server process), two overlapping
+# handlers could interleave like: A calls `_page()` and gets page P; B calls
+# `_page()` concurrently, finds P dead, resets `_browser_ctx`/`_active_page`
+# and swaps in a new page Q; A continues operating on its now-stale local
+# reference to P instead of Q. This is NOT reachable today — do not "fix" it
+# by holding `_lock` across each handler's full page-use span (that would
+# require turning every `await browser._page()` call site in navigation.py /
+# actions.py / observation.py / resolution.py into a context-manager pattern
+# for a currently-impossible scenario). If concurrent dispatch is ever added,
+# revisit this by having `_page()` return a lock-holding context manager
+# instead of a bare page reference.
 _lock = asyncio.Lock()
 _playwright: Any = None
 _browser_ctx: Any = None
@@ -527,6 +547,12 @@ async def _ensure_browser() -> None:
 
 
 async def _page():
+    """Return the current live page, lazily starting the browser if needed.
+
+    `_lock` is held only for `_ensure_browser()`, not for the caller's
+    subsequent use of the returned page — see the invariant documented on
+    `_lock`'s definition above (#5).
+    """
     async with _lock:
         await _ensure_browser()
     return _active_page
