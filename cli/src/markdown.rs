@@ -8,12 +8,35 @@ const DIM: &str = "\x1b[2m";
 const REVERSE: &str = "\x1b[7m";
 
 /// Render Markdown to an ANSI-decorated string for the terminal.
+///
+/// #8: both call sites (agentic.rs, bridge.rs) pass the WHOLE final answer
+/// text in one call — never a partial streaming chunk — so a fence line only
+/// gets to toggle code-mode rendering when it has a matching partner
+/// somewhere else in this same `input`. An odd, unterminated trailing fence
+/// (a cut-off answer, or a stray ``` typed as normal text) previously
+/// flipped `in_code` on for good, recoloring every line after it — including
+/// content that was never inside a code block — with no closing border ever
+/// appearing. Pre-scan fence line indices and drop a trailing unpaired one
+/// from the toggle set so it renders as a literal line instead.
 pub fn render_markdown(input: &str) -> String {
+    let lines: Vec<&str> = input.split('\n').collect();
+    let mut fence_lines: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with("```"))
+        .map(|(index, _)| index)
+        .collect();
+    if fence_lines.len() % 2 == 1 {
+        // Unbalanced: the last fence in the text never closes. Don't let it
+        // toggle code-mode at all — treat it as ordinary text instead.
+        fence_lines.pop();
+    }
+    let toggles: std::collections::HashSet<usize> = fence_lines.into_iter().collect();
+
     let mut out: Vec<String> = Vec::new();
     let mut in_code = false;
-    for raw in input.split('\n') {
-        let line = raw;
-        if line.trim_start().starts_with("```") {
+    for (index, line) in lines.iter().enumerate() {
+        if toggles.contains(&index) {
             // Toggle fenced code block.
             in_code = !in_code;
             // Render the fence itself as a faint rule, dropping the language tag.
@@ -118,6 +141,50 @@ mod tests {
         assert!(out.contains("│")); // border line
         assert!(out.contains("let x = 1;"));
         // No inline parsing inside code: backticks-free content stays verbatim.
+    }
+
+    // ── #8: unbalanced code fence must not recolor the rest of the message ──
+
+    #[test]
+    fn unterminated_fence_does_not_recolor_trailing_lines() {
+        // Only ONE fence — it never closes (e.g. a cut-off streamed answer).
+        let md = "before\n```rust\nlet x = 1;\nafter line one\nafter line two";
+        let out = render_markdown(md);
+        // The unmatched fence must not have entered code mode: lines after
+        // it must render as plain text, not with the dim code-border prefix.
+        assert!(
+            !out.contains(&format!("{DIM}│{RESET} after line one")),
+            "text after an unbalanced fence must not be rendered as code: {out}"
+        );
+        assert!(
+            !out.contains(&format!("{DIM}│{RESET} after line two")),
+            "text after an unbalanced fence must not be rendered as code: {out}"
+        );
+        assert!(out.contains("after line one"));
+        assert!(out.contains("after line two"));
+    }
+
+    #[test]
+    fn balanced_fences_still_render_as_code() {
+        let md = "before\n```\ncode line\n```\nafter";
+        let out = render_markdown(md);
+        assert!(
+            out.contains(&format!("{DIM}│{RESET} code line")),
+            "a properly closed fence must still render its content as code: {out}"
+        );
+        assert!(out.contains("after"));
+    }
+
+    #[test]
+    fn two_separate_balanced_fence_blocks_both_render_as_code() {
+        let md = "```\nfirst\n```\nplain text between\n```\nsecond\n```";
+        let out = render_markdown(md);
+        assert!(out.contains(&format!("{DIM}│{RESET} first")));
+        assert!(out.contains(&format!("{DIM}│{RESET} second")));
+        assert!(
+            !out.contains(&format!("{DIM}│{RESET} plain text between")),
+            "text between two closed fence pairs must not be treated as code: {out}"
+        );
     }
 
     #[test]

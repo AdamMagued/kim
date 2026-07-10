@@ -110,6 +110,18 @@ pub(crate) fn save_session_messages_in(
     let safe_id = sanitize_session_id(session_id);
     let path = root.join(format!("{safe_id}.jsonl"));
 
+    // #7: two processes resuming the same session id (e.g. `kim --resume
+    // <id>` run twice) previously raced this whole tempfile+rename cycle
+    // with no coordination — "last renamer wins" non-deterministically, and
+    // a slower process holding stale in-memory messages could clobber a
+    // faster process's newer save. Hold an advisory cross-process lock (an
+    // OS `flock` on a `.lock` sentinel file, scoped to this session id) for
+    // the entire write cycle below so concurrent saves serialize instead.
+    let mut session_lock = lock_session_file(root, &safe_id)?;
+    let _lock_guard = session_lock
+        .write()
+        .map_err(|e| format!("Could not lock session {safe_id} for saving: {e}"))?;
+
     let (mut tmp_file, tmp_path, nanos) = create_temp_session_file(root, &safe_id)?;
 
     let now_ms = nanos / 1_000_000;
@@ -157,6 +169,29 @@ pub(crate) fn save_session_messages_in(
         format!("Could not commit session {}: {e}", path.display())
     })?;
     Ok(path)
+}
+
+/// #7: acquire an exclusive advisory lock on `<root>/<safe_id>.lock`,
+/// creating the sentinel file if needed. Blocks until acquired — two
+/// processes saving the same session id serialize rather than racing the
+/// tempfile+rename cycle. The returned guard holds the lock (and keeps the
+/// underlying file descriptor open) until dropped; the sentinel file itself
+/// is intentionally never cleaned up (same pattern as the Python side's
+/// flock-style `cron_store.py` locking) since re-creating it is free and
+/// deleting a lock file out from under another lock-holder is a classic
+/// TOCTOU bug.
+fn lock_session_file(
+    root: &Path,
+    safe_id: &str,
+) -> Result<fd_lock::RwLock<fs::File>, String> {
+    let lock_path = root.join(format!("{safe_id}.lock"));
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("Could not open lock file {}: {e}", lock_path.display()))?;
+    Ok(fd_lock::RwLock::new(lock_file))
 }
 
 fn create_temp_session_file(
@@ -729,6 +764,72 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert_eq!(messages.len(), 1, "internal JSON record must be filtered");
         assert_eq!(messages[0].content, "real text");
+    }
+
+    // ── #7: cross-process save locking ────────────────────────────────────
+
+    #[test]
+    fn save_creates_a_lock_sentinel_file() {
+        let dir = unique_test_dir();
+        let messages = vec![UiMessage {
+            role: MessageRole::User,
+            content: "hi".to_string(),
+        }];
+        super::save_session_messages_in(&dir, "lock-sentinel-test", &messages)
+            .expect("save should succeed");
+        let lock_path = dir.join("lock-sentinel-test.lock");
+        assert!(
+            lock_path.exists(),
+            "expected a .lock sentinel file after saving"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_save_blocks_while_another_holder_has_the_lock() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = unique_test_dir();
+        let safe_id = "lock-blocks-test";
+
+        // Simulate another process already mid-save (holding the lock).
+        let mut held_lock = super::lock_session_file(&dir, safe_id).expect("open lock file");
+        let guard = held_lock.write().expect("acquire lock");
+
+        let (tx, rx) = mpsc::channel();
+        let dir_clone = dir.clone();
+        let handle = thread::spawn(move || {
+            let messages = vec![UiMessage {
+                role: MessageRole::User,
+                content: "blocked writer".to_string(),
+            }];
+            let result = super::save_session_messages_in(&dir_clone, safe_id, &messages);
+            let _ = tx.send(());
+            result
+        });
+
+        // Must NOT complete while another holder still has the lock — this is
+        // the "serialize instead of clobbering" guarantee (#7).
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "save_session_messages_in must block while another lock holder is active"
+        );
+
+        // Releasing the lock lets the blocked save proceed promptly.
+        drop(guard);
+        drop(held_lock);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "save_session_messages_in should complete once the lock is released"
+        );
+        handle
+            .join()
+            .expect("writer thread panicked")
+            .expect("save should succeed after the lock is released");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

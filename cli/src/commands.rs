@@ -66,6 +66,16 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
 
 const KEY_PROVIDERS: &[&str] = &["claude", "openai", "gemini", "deepseek"];
 
+/// #5: is `command` (the first whitespace-delimited token of a line starting
+/// with `/`) one Kim actually recognizes? Single source of truth shared by
+/// `handle_command`'s "is this really a slash-command" gate below and by
+/// `SUPPORTED_COMMANDS` (also used for tab completion in main.rs) — no
+/// second list to keep in sync. `/` alone is the bare-help alias, matched in
+/// `handle_command` but not itself listed in `SUPPORTED_COMMANDS`.
+fn is_known_command(command: &str) -> bool {
+    command == "/" || SUPPORTED_COMMANDS.contains(&command)
+}
+
 pub async fn handle_command(input: &str, config: &mut KimConfig) -> CommandOutcome {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
@@ -74,6 +84,15 @@ pub async fn handle_command(input: &str, config: &mut KimConfig) -> CommandOutco
     let mut parts = trimmed.splitn(2, char::is_whitespace);
     let command = parts.next().unwrap_or_default();
     let args = parts.next().unwrap_or_default().trim();
+
+    // #5: a leading '/' is common in ordinary chat text too ("/etc/passwd",
+    // "explain 24/7 coverage", "/foo bar" as a literal question). Only treat
+    // the line as a slash-command when it matches a KNOWN command name —
+    // otherwise it must reach the model like any other prompt, not vanish
+    // into a silent "Unknown Kim command" note.
+    if !is_known_command(command) {
+        return CommandOutcome::SendPrompt(trimmed.to_string());
+    }
 
     match command {
         "/" | "/help" | "/commands" => CommandOutcome::Message(commands_menu(args)),
@@ -1226,8 +1245,52 @@ fn config_notice(config: &KimConfig, message: String) -> CommandOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_command, CommandOutcome, SUPPORTED_COMMANDS};
+    use super::{handle_command, is_known_command, CommandOutcome, SUPPORTED_COMMANDS};
     use crate::config::{KimConfig, ThemeName};
+
+    // ── #5: unrecognized leading-slash text falls through to chat ───────────
+
+    #[tokio::test]
+    async fn unknown_slash_command_falls_through_to_send_prompt() {
+        let mut config = KimConfig::default();
+        let outcome = handle_command("/etc/passwd is a file", &mut config).await;
+        assert_eq!(
+            outcome,
+            CommandOutcome::SendPrompt("/etc/passwd is a file".to_string()),
+            "an unrecognized leading-slash line must reach the model as chat text, \
+             not vanish into an 'Unknown Kim command' note"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_bare_slash_word_falls_through_to_send_prompt() {
+        let mut config = KimConfig::default();
+        let outcome = handle_command("/nonexistent", &mut config).await;
+        assert_eq!(
+            outcome,
+            CommandOutcome::SendPrompt("/nonexistent".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn known_command_is_still_dispatched_not_sent_as_prompt() {
+        let mut config = KimConfig::default();
+        let outcome = handle_command("/exit", &mut config).await;
+        assert_eq!(outcome, CommandOutcome::Exit);
+    }
+
+    #[test]
+    fn is_known_command_covers_bare_slash_and_supported_list() {
+        assert!(is_known_command("/"));
+        for command in SUPPORTED_COMMANDS {
+            assert!(
+                is_known_command(command),
+                "{command} is in SUPPORTED_COMMANDS but is_known_command rejected it"
+            );
+        }
+        assert!(!is_known_command("/nonexistent"));
+        assert!(!is_known_command("/etc"));
+    }
 
     #[tokio::test]
     async fn parses_theme_command() {

@@ -76,6 +76,10 @@ enum CliCommand {
     Repl {
         resume_id: Option<String>,
     },
+    /// #6: a CLI flag was given but is malformed (currently only a bare
+    /// trailing `--resume`). Carries the message to print to stderr before
+    /// exiting non-zero — never silently falls through to a fresh session.
+    UsageError(String),
 }
 
 fn parse_cli_args(args: &[String]) -> CliCommand {
@@ -105,10 +109,24 @@ fn parse_cli_args(args: &[String]) -> CliCommand {
             CliCommand::Oneshot { mode, prompt }
         }
         _ => {
-            let resume_id = args
-                .windows(2)
-                .find_map(|w| (w[0] == "--resume").then_some(w[1].clone()));
-            CliCommand::Repl { resume_id }
+            // #6: `args.windows(2).find_map(...)` silently yields None when
+            // `--resume` is the LAST arg (no following window contains it as
+            // the first element) — that used to fall through to `resume_id:
+            // None` and quietly start a brand-new session instead of erroring.
+            // Distinguish "no --resume flag at all" from "--resume with no
+            // value" explicitly.
+            match args.iter().position(|a| a == "--resume") {
+                None => CliCommand::Repl { resume_id: None },
+                Some(index) => match args.get(index + 1) {
+                    Some(value) => CliCommand::Repl {
+                        resume_id: Some(value.clone()),
+                    },
+                    None => CliCommand::UsageError(
+                        "kim --resume: missing session id. Usage: kim --resume <id|latest>"
+                            .to_string(),
+                    ),
+                },
+            }
         }
     }
 }
@@ -264,6 +282,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match parse_cli_args(&args) {
         CliCommand::ShowHelp => println!("{}", help_text()),
         CliCommand::ShowVersion => println!("kim {}", env!("CARGO_PKG_VERSION")),
+        CliCommand::UsageError(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
         CliCommand::Doctor => {
             let mut config = KimConfig::load();
             match handle_command("/doctor", &mut config).await {
@@ -2019,6 +2041,29 @@ mod tests {
     #[test]
     fn parse_args_unknown_arg_falls_through_to_repl() {
         let cmd = parse_cli_args(&args(&["--unknown-flag"]));
+        assert!(matches!(cmd, CliCommand::Repl { resume_id: None }));
+    }
+
+    // ── #6: trailing `--resume` with no value is a usage error, not a silent
+    // new session ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_args_resume_with_no_value_is_usage_error() {
+        let cmd = parse_cli_args(&args(&["--resume"]));
+        match cmd {
+            CliCommand::UsageError(message) => {
+                assert!(
+                    message.contains("--resume"),
+                    "usage error should mention --resume, got: {message}"
+                );
+            }
+            other => panic!("expected UsageError for trailing --resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_args_no_resume_flag_is_still_a_plain_repl() {
+        let cmd = parse_cli_args(&args(&[]));
         assert!(matches!(cmd, CliCommand::Repl { resume_id: None }));
     }
 
