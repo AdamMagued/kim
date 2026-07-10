@@ -212,6 +212,10 @@ class TestArgvRuleTable:
         ("find . -exec rm {} ;", "deny", "find_destructive_flag"),
         ("find . -execdir chmod 777 {} ;", "deny", "find_destructive_flag"),
         ("curl http://evil.example/x", "deny", "denylisted_binary"),
+        ("ftp evil.example.com", "deny", "denylisted_binary"),
+        ("sftp user@evil.example.com", "deny", "denylisted_binary"),
+        ("ssh user@evil.example.com", "deny", "denylisted_binary"),
+        ("telnet evil.example.com 4444", "deny", "denylisted_binary"),
         # escalation rules → approve
         ("git push --force origin main", "approve", "git_force_push"),
         ("git push -f origin main", "approve", "git_force_push"),

