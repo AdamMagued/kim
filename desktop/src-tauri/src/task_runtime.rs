@@ -124,20 +124,46 @@ impl TaskRuntime {
     }
 }
 
-/// Write a HITL/steer JSON line to the running child's stdin.
-/// Called by both the Tauri command path (GUI) and the HTTP bridge path
-/// (CLI) so that cross-path approval always works.
+/// Sentinel returned when no child stdin handle is registered at all (no
+/// task running). Retrying cannot help this case, unlike a write timeout.
+const NO_STDIN_ERR: &str = "No agent stdin available";
+
+/// AUDIT FIX #4: bounded retries for a stdin write that times out.
 ///
-/// H-PROC-2 (theme T1): the global runtime lock is held only long enough to
-/// clone the `Arc` stdin handle — NEVER across the `write_all().await`. The
-/// write itself is bounded by a timeout so even a child that stopped draining
-/// stdin (full OS pipe buffer) only stalls this one writer, and only briefly;
-/// task control (cancel, reserve, supervisor cleanup) stays responsive.
-/// Approval correlation stays by unique `id` inside the JSON line itself
-/// (`hitl_approve.id` / `approval_decision.id`), which Python matches against
-/// the pending request and discards when stale — a timed-out write here can
-/// never cause a decision to be applied to the wrong tool.
-pub(crate) async fn write_stdin_line(msg: &str) -> Result<(), String> {
+/// Before this, a single `WRITE_TIMEOUT` (10s) attempt that timed out just
+/// returned an error the frontend saw as a rejected promise -- the user's
+/// approval/steer click was silently dropped with no retry, even though the
+/// timeout is commonly transient (the child was mid-tool-call and hadn't
+/// gotten back to draining stdin yet, not permanently stuck). `MAX_ATTEMPTS`
+/// total attempts are made, each bounded by the same `WRITE_TIMEOUT`, with a
+/// short `RETRY_BACKOFF` pause between attempts so a still-busy child gets a
+/// little more time to start draining before the next try. Chosen over a
+/// queue-and-retry-on-writable design because there's no existing "stdin
+/// became writable" signal to hook in this architecture (the tokio
+/// `ChildStdin` API doesn't expose readiness polling the way raw fds do) --
+/// bounded retry is the smallest change that fits `write_stdin_line`'s
+/// existing single-shot shape.
+const MAX_ATTEMPTS: u32 = 3;
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Whether a `write_stdin_line_once` failure is worth retrying. Split out as
+/// a pure function so the retry-eligibility rule is unit-testable without
+/// needing a real (slow, 10s-timeout-bound) stdin write.
+fn is_retryable_stdin_error(err: &str) -> bool {
+    // NO_STDIN_ERR means there is no running child at all -- nothing can
+    // become available between attempts, so retrying only wastes time.
+    // Every other error from write_stdin_line_once is a timeout (either
+    // waiting for the stdin mutex or waiting for the write/flush itself),
+    // both of which can plausibly resolve on the next attempt if the child
+    // catches up on draining stdin.
+    err != NO_STDIN_ERR
+}
+
+/// One write attempt: clone the stdin handle out from under the runtime
+/// lock, then bound the lock-acquire and the write+flush each by
+/// `WRITE_TIMEOUT`. Never holds the runtime lock across the stdin await
+/// (H-PROC-2) -- see `write_stdin_line`'s doc comment for why that matters.
+async fn write_stdin_line_once(msg: &str) -> Result<(), String> {
     use tokio::io::AsyncWriteExt as _;
 
     const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -146,7 +172,7 @@ pub(crate) async fn write_stdin_line(msg: &str) -> Result<(), String> {
         let rt = task_runtime().lock().await;
         match rt.stdin.as_ref() {
             Some(handle) => Arc::clone(handle),
-            None => return Err("No agent stdin available".to_string()),
+            None => return Err(NO_STDIN_ERR.to_string()),
         }
         // runtime lock released here — before any stdin await
     };
@@ -163,6 +189,44 @@ pub(crate) async fn write_stdin_line(msg: &str) -> Result<(), String> {
     })
     .await
     .map_err(|_| "Timed out writing to agent stdin (child not reading).".to_string())?
+}
+
+/// Write a HITL/steer JSON line to the running child's stdin.
+/// Called by both the Tauri command path (GUI) and the HTTP bridge path
+/// (CLI) so that cross-path approval always works.
+///
+/// H-PROC-2 (theme T1): the global runtime lock is held only long enough to
+/// clone the `Arc` stdin handle — NEVER across the `write_all().await`. The
+/// write itself is bounded by a timeout so even a child that stopped draining
+/// stdin (full OS pipe buffer) only stalls this one writer, and only briefly;
+/// task control (cancel, reserve, supervisor cleanup) stays responsive.
+/// Approval correlation stays by unique `id` inside the JSON line itself
+/// (`hitl_approve.id` / `approval_decision.id`), which Python matches against
+/// the pending request and discards when stale — a timed-out write here can
+/// never cause a decision to be applied to the wrong tool.
+///
+/// AUDIT FIX #4: retries up to `MAX_ATTEMPTS` times (with `RETRY_BACKOFF`
+/// between attempts) when an attempt times out, instead of giving up after
+/// the first 10s timeout and silently dropping the user's decision. The
+/// `NO_STDIN_ERR` case (no task running at all) is NOT retried -- there is
+/// nothing that could become available between attempts.
+pub(crate) async fn write_stdin_line(msg: &str) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        match write_stdin_line_once(msg).await {
+            Ok(()) => return Ok(()),
+            Err(e) if !is_retryable_stdin_error(&e) => return Err(e),
+            Err(e) => {
+                last_err = e;
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(RETRY_BACKOFF).await;
+                }
+            }
+        }
+    }
+    Err(format!(
+        "{last_err} Gave up after {MAX_ATTEMPTS} attempts."
+    ))
 }
 
 /// The global async-safe `TaskRuntime` handle.
@@ -332,5 +396,47 @@ mod tests {
         }
         let _ = child.kill().await;
         let _ = child.wait().await;
+    }
+
+    // AUDIT FIX #4: retry-eligibility rule, tested in isolation (pure logic,
+    // no need for a real 10s-timeout-bound write to exercise this).
+    #[test]
+    fn no_stdin_error_is_not_retried() {
+        assert!(!is_retryable_stdin_error(NO_STDIN_ERR));
+    }
+
+    #[test]
+    fn stdin_mutex_timeout_is_retried() {
+        assert!(is_retryable_stdin_error(
+            "Timed out waiting for agent stdin (another write is stuck)."
+        ));
+    }
+
+    #[test]
+    fn write_timeout_is_retried() {
+        assert!(is_retryable_stdin_error(
+            "Timed out writing to agent stdin (child not reading)."
+        ));
+    }
+
+    #[test]
+    fn arbitrary_other_errors_are_retried() {
+        // Anything that isn't the exact NO_STDIN_ERR sentinel is treated as
+        // transient and retried -- conservative default (retrying a few
+        // times costs at most MAX_ATTEMPTS * WRITE_TIMEOUT, which is bounded
+        // and still better than dropping a user's decision on one hiccup).
+        assert!(is_retryable_stdin_error("some unexpected io error"));
+    }
+
+    // MAX_ATTEMPTS is referenced in write_stdin_line's error message
+    // ("Gave up after N attempts") and drives the retry budget -- pin its
+    // value so a silent change doesn't quietly alter behavior.
+    #[test]
+    fn max_attempts_is_small_and_bounded() {
+        assert!(MAX_ATTEMPTS >= 2, "must actually retry at least once");
+        assert!(
+            MAX_ATTEMPTS <= 5,
+            "keep the total worst-case wait (MAX_ATTEMPTS * WRITE_TIMEOUT) bounded"
+        );
     }
 }
