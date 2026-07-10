@@ -2290,6 +2290,7 @@ dependencies = [
  "base64 0.22.1",
  "crossterm",
  "dirs 5.0.1",
+ "fd-lock",
  "futures-util",
  "reqwest 0.12.28",
  "rpassword",

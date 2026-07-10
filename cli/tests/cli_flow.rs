@@ -78,6 +78,51 @@ impl FakeServer {
     fn requests(&self) -> Vec<RecordedRequest> {
         self.requests.lock().unwrap().clone()
     }
+
+    /// Like `start`, but the caller controls exactly how the SSE response
+    /// body is chunked onto the wire: each returned piece is written with
+    /// its own `flush()` and a short delay before the next. Used to prove an
+    /// SSE event survives being split across a REAL network read boundary —
+    /// `llm_stream.rs`'s `SseLineBuffer` already has synthetic in-memory
+    /// `Vec<u8>` split coverage; this closes the gap at the actual streaming
+    /// path the CLI binary runs (finding #1's "nice to have" test).
+    fn start_streaming<F>(chunks: F) -> Self
+    where
+        F: Fn(&RecordedRequest) -> Vec<String> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
+        let port = listener.local_addr().unwrap().port();
+        let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Some(request) = read_http_request(&mut stream) else {
+                    continue;
+                };
+                let pieces = chunks(&request);
+                recorded.lock().unwrap().push(request);
+                let total_len: usize = pieces.iter().map(String::len).sum();
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     Content-Length: {total_len}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.flush();
+                for piece in pieces {
+                    let _ = stream.write_all(piece.as_bytes());
+                    let _ = stream.flush();
+                    // Force separate reads on the client side rather than
+                    // letting the OS coalesce back-to-back writes into one.
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://127.0.0.1:{port}"),
+            requests,
+        }
+    }
 }
 
 /// Parse one HTTP request (request line, headers, Content-Length body).
@@ -250,6 +295,42 @@ fn chat_oneshot_streams_reply_and_sends_correct_request() {
     let last = messages.last().unwrap();
     assert_eq!(last["role"], "user");
     assert_eq!(last["content"], "integration test ping");
+}
+
+// #1 "nice to have": an SSE event split across two REAL network reads (not
+// just a synthetic in-memory Vec<u8> split) must still assemble correctly —
+// exercises the actual streaming path (`stream_openai_compatible` →
+// `SseLineBuffer::push_chunk`) end to end through the real `kim` binary.
+#[test]
+fn chat_oneshot_survives_sse_event_split_across_two_network_reads() {
+    let full = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from a split chunk.\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    // Split mid-value, so neither network write on its own contains a
+    // complete SSE line — the assembler must buffer across the boundary.
+    let split_at = full.find("Hel").expect("marker present") + 3;
+    let (first, second) = full.split_at(split_at);
+    let pieces = vec![first.to_string(), second.to_string()];
+
+    let server = FakeServer::start_streaming(move |req| {
+        assert_eq!(req.path, "/v1/chat/completions", "unexpected path");
+        pieces.clone()
+    });
+    let home = temp_home_with_config(&ollama_config(&server.base_url));
+
+    let output = run_kim_chat(&home, "split chunk test", &[]);
+
+    assert!(
+        output.status.success(),
+        "kim chat should exit 0 even when the SSE event is split across network reads; output: {}",
+        combined_output(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Hello from a split chunk."),
+        "the full streamed answer must survive a real network-level SSE line split; stdout: {stdout}"
+    );
 }
 
 #[test]

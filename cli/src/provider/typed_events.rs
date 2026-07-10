@@ -105,9 +105,89 @@ pub(crate) fn emit_typed_kim_event(
             true
         }
         Some("token_usage") => {
-            let _ = tx.send(AppEvent::TokenUsage {
-                input: json.get("input").and_then(Value::as_u64).unwrap_or(0),
-                output: json.get("output").and_then(Value::as_u64).unwrap_or(0),
+            // #9: a field that is PRESENT but not a valid u64 (a string, a
+            // negative number, a float) must not silently coerce to 0 via
+            // `unwrap_or(0)` — that reports a real-looking but false token
+            // count. A genuinely absent (or null) field defaults to 0; an
+            // invalid-but-present field skips the whole update instead.
+            let numeric_field = |key: &str| -> Result<u64, ()> {
+                match json.get(key) {
+                    None | Some(Value::Null) => Ok(0),
+                    Some(v) => v.as_u64().ok_or(()),
+                }
+            };
+            match (numeric_field("input"), numeric_field("output")) {
+                (Ok(input), Ok(output)) => {
+                    let _ = tx.send(AppEvent::TokenUsage { input, output });
+                }
+                _ => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "kim: dropping token_usage event with a non-numeric input/output field: {json}"
+                    );
+                }
+            }
+            true
+        }
+        Some("user_input_request") => {
+            // #2: Codex is asking the user a question via
+            // `item/tool/requestUserInput` (kind == "questions") or an MCP
+            // elicitation form (kind == "elicitation", which the Python side
+            // already auto-declines without waiting — see
+            // codex_appserver_transport.py's `_handle_server_request`). Parse
+            // the full shape here; repl_turn.rs decides what to do with it.
+            let kind = text("kind");
+            let item_id = text("item_id");
+            let message = text("message");
+            let questions = json
+                .get("questions")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, q)| {
+                            let id = q
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| index.to_string());
+                            let header = q
+                                .get("header")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let question = q
+                                .get("question")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let options = q
+                                .get("options")
+                                .and_then(Value::as_array)
+                                .map(|opts| {
+                                    opts.iter()
+                                        .filter_map(|o| o.get("label").and_then(Value::as_str))
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            super::UserInputQuestion {
+                                id,
+                                header,
+                                question,
+                                options,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let _ = tx.send(AppEvent::UserInputRequest {
+                id: text("id"),
+                kind,
+                item_id,
+                message,
+                questions,
             });
             true
         }

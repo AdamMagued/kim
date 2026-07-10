@@ -7,7 +7,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use crate::provider::AppEvent;
+use crate::provider::{AppEvent, UserInputQuestion};
 use crate::{
     format_repl_elapsed, kim_accent_color, paint_bold, paint_dim, paint_text, print_message,
     print_note, stdout, App, MessageRole, UiMessage,
@@ -72,6 +72,60 @@ fn build_decision_line(id: &str, decision: &str) -> String {
     .to_string()
 }
 
+/// #2: format one `item/tool/requestUserInput` question for the terminal.
+/// `index`/`total` add a `[n/N]` prefix only when there's more than one
+/// question in the same request.
+fn format_user_input_question(index: usize, total: usize, q: &UserInputQuestion) -> String {
+    let mut out = String::new();
+    if total > 1 {
+        out.push_str(&format!("[{}/{total}] ", index + 1));
+    }
+    out.push_str("Codex asks: ");
+    if !q.header.is_empty() {
+        out.push_str(&q.header);
+        out.push_str(" — ");
+    }
+    out.push_str(&q.question);
+    if !q.options.is_empty() {
+        out.push_str(&format!(" (options: {})", q.options.join(", ")));
+    }
+    out.push_str("\n> ");
+    out
+}
+
+/// #2/#4: prompt each question and read its answer from the terminal.
+/// Intended to run inside a spawned producer task (never called directly
+/// from the consumer's own cancel-polling loop) so a blocking stdin read
+/// here can never suppress Ctrl-C — mirrors agentic.rs's `prompt_hitl`.
+async fn collect_user_input_answers(questions: &[UserInputQuestion]) -> Vec<(String, String)> {
+    let mut answers = Vec::with_capacity(questions.len());
+    for (index, q) in questions.iter().enumerate() {
+        print!("{}", format_user_input_question(index, questions.len(), q));
+        let _ = stdout().flush();
+        let line = crate::stdin_reader::read_stdin_line()
+            .await
+            .unwrap_or_default();
+        answers.push((q.id.clone(), line.trim().to_string()));
+    }
+    answers
+}
+
+/// The stdin `user_input` reply line the app-server transport expects
+/// (mirrors `build_decision_line` / Python's `parse_user_input_line`):
+/// `{"type":"user_input","id":<id>,"answers":{"<qid>":{"answers":["<text>"]}}}`.
+fn build_user_input_line(id: &str, answers: &[(String, String)]) -> String {
+    let map: serde_json::Map<String, serde_json::Value> = answers
+        .iter()
+        .map(|(qid, text)| (qid.clone(), serde_json::json!({ "answers": [text] })))
+        .collect();
+    serde_json::json!({
+        "type": "user_input",
+        "id": id,
+        "answers": serde_json::Value::Object(map),
+    })
+    .to_string()
+}
+
 /// Best-effort SIGTERM so the bridge service can map it to `turn/interrupt`.
 /// (tokio's kill_on_drop is SIGKILL — that skips the graceful path.)
 fn send_sigterm(pid: u32) {
@@ -84,6 +138,57 @@ fn send_sigterm(pid: u32) {
     #[cfg(not(unix))]
     {
         let _ = pid; // Windows: no SIGTERM — the kill_on_drop path handles it.
+    }
+}
+
+/// Shared interrupt sequence for a Ctrl-C received mid-turn (A6), or while
+/// waiting on a user's approval/user-input answer (#4). SIGTERMs the child
+/// (if any) via `child_pid`, drains its stdout for up to 5s waiting for a
+/// clean `turn/interrupt` acknowledgement, then persists whatever partial
+/// answer already streamed. Callers must `return Ok(false)` immediately
+/// after — this does not return a value itself, only performs the sequence.
+async fn run_cancel_interrupt<S>(
+    app: &mut App,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    assistant: &mut String,
+    printed_answer_label: bool,
+    spinner_active: bool,
+    child_pid: Option<&std::sync::Arc<std::sync::Mutex<Option<u32>>>>,
+    save: &mut S,
+) where
+    S: FnMut(&App),
+{
+    // A6: cancel mid-stream — keep whatever already streamed, drop back to
+    // the prompt instead of killing the whole CLI.
+    clear_spinner_line(spinner_active);
+    if printed_answer_label && !assistant.ends_with('\n') {
+        println!();
+    }
+    // Parity Part 4: interrupt, don't kill. SIGTERM lets the bridge service
+    // map it to a graceful turn/interrupt; the caller's handle.abort()
+    // (SIGKILL via kill_on_drop) stays the hard fallback after a 5s grace
+    // drain.
+    let pid = child_pid.and_then(|slot| slot.lock().ok().and_then(|p| *p));
+    if let Some(pid) = pid {
+        print_note("⏹ interrupting…");
+        send_sigterm(pid);
+        let grace = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(grace);
+        loop {
+            tokio::select! {
+                maybe = rx.recv() => match maybe {
+                    Some(AppEvent::TurnPhase(phase)) if phase == "interrupted" => break,
+                    Some(_) => continue,   // drain quietly
+                    None => break,          // child exited
+                },
+                _ = &mut grace => break,
+            }
+        }
+    }
+    print_note("(cancelled)");
+    if !assistant.trim().is_empty() {
+        app.push(MessageRole::Assistant, std::mem::take(assistant));
+        save(app);
     }
 }
 
@@ -129,40 +234,16 @@ where
                 None => break,
             },
             _ = &mut cancel => {
-                // A6: cancel mid-stream — keep whatever already streamed, drop
-                // back to the prompt instead of killing the whole CLI.
-                clear_spinner_line(spinner_active);
-                if printed_answer_label && !assistant.ends_with('\n') {
-                    println!();
-                }
-                // Parity Part 4: interrupt, don't kill. SIGTERM lets the
-                // bridge service map it to a graceful turn/interrupt; the
-                // caller's handle.abort() (SIGKILL via kill_on_drop) stays
-                // the hard fallback after a 5s grace drain.
-                let pid = child_pid
-                    .as_ref()
-                    .and_then(|slot| slot.lock().ok().and_then(|p| *p));
-                if let Some(pid) = pid {
-                    print_note("⏹ interrupting…");
-                    send_sigterm(pid);
-                    let grace = tokio::time::sleep(Duration::from_secs(5));
-                    tokio::pin!(grace);
-                    loop {
-                        tokio::select! {
-                            maybe = rx.recv() => match maybe {
-                                Some(AppEvent::TurnPhase(phase)) if phase == "interrupted" => break,
-                                Some(_) => continue,   // drain quietly
-                                None => break,          // child exited
-                            },
-                            _ = &mut grace => break,
-                        }
-                    }
-                }
-                print_note("(cancelled)");
-                if !assistant.trim().is_empty() {
-                    app.push(MessageRole::Assistant, std::mem::take(&mut assistant));
-                    save(app);
-                }
+                run_cancel_interrupt(
+                    app,
+                    &mut rx,
+                    &mut assistant,
+                    printed_answer_label,
+                    spinner_active,
+                    child_pid.as_ref(),
+                    &mut save,
+                )
+                .await;
                 return Ok(false);
             }
             _ = spinner.tick(), if show_spinner && !produced_output => {
@@ -230,20 +311,46 @@ where
                 if printed_answer_label && !assistant.ends_with('\n') {
                     println!();
                 }
-                print!("{}", format_approval_prompt(&command, &cwd, &reason, &risk));
-                stdout().flush()?;
-                // F5/F6: read via the single owned stdin reader (a leaked
+                // F5/F6/#4: read via the single owned stdin reader (a leaked
                 // blocking read can no longer swallow later input, and a stale
                 // answer is discarded, never applied to the next prompt). When
                 // stdin is not a terminal, queued lines are prompts — deny
-                // instead of stealing one as the answer.
-                let input = if io::stdin().is_terminal() {
-                    crate::stdin_reader::read_stdin_line()
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    println!();
-                    String::new() // maps to "decline"
+                // instead of stealing one as the answer. The read runs in a
+                // spawned producer task (not inline in this consumer loop) so
+                // it can be raced against `cancel` below — a blocking read
+                // executed directly here would swallow Ctrl-C for as long as
+                // the user takes to answer. Mirrors agentic.rs's `prompt_hitl`.
+                let is_tty = io::stdin().is_terminal();
+                let prompt = format_approval_prompt(&command, &cwd, &reason, &risk);
+                let mut read_task = tokio::spawn(async move {
+                    if is_tty {
+                        print!("{prompt}");
+                        let _ = stdout().flush();
+                        crate::stdin_reader::read_stdin_line()
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        println!();
+                        String::new() // maps to "decline"
+                    }
+                });
+                let input = tokio::select! {
+                    biased;
+                    res = &mut read_task => res.unwrap_or_default(),
+                    _ = &mut cancel => {
+                        read_task.abort();
+                        run_cancel_interrupt(
+                            app,
+                            &mut rx,
+                            &mut assistant,
+                            printed_answer_label,
+                            spinner_active,
+                            child_pid.as_ref(),
+                            &mut save,
+                        )
+                        .await;
+                        return Ok(false);
+                    }
                 };
                 let decision = map_approval_input(&input);
                 if let Some(dtx) = decision_tx.as_ref() {
@@ -255,6 +362,70 @@ where
                     _ => "denied",
                 };
                 print_note(&format!("({verdict})"));
+            }
+            AppEvent::UserInputRequest {
+                id,
+                kind,
+                item_id: _,
+                message,
+                questions,
+            } => {
+                produced_output = true;
+                if printed_answer_label && !assistant.ends_with('\n') {
+                    println!();
+                }
+                if kind != "questions" {
+                    // e.g. "elicitation" (MCP form) — the Python transport
+                    // already auto-declines this kind without waiting for a
+                    // reply; just surface what it asked for.
+                    if !message.is_empty() {
+                        print_note(&format!(
+                            "Codex asked an MCP server for input: {message} (declined — not supported yet)"
+                        ));
+                    }
+                    continue;
+                }
+                if questions.is_empty() {
+                    if let Some(dtx) = decision_tx.as_ref() {
+                        let _ = dtx.send(build_user_input_line(&id, &[]));
+                    }
+                    continue;
+                }
+                // #2/#4: same cancel-aware spawned-producer-task pattern as
+                // ApprovalRequest above — see the comment there.
+                let is_tty = io::stdin().is_terminal();
+                let mut read_task = tokio::spawn(async move {
+                    if is_tty {
+                        collect_user_input_answers(&questions).await
+                    } else {
+                        // Queued lines are prompts, not answers — never
+                        // consume one.
+                        println!();
+                        Vec::new()
+                    }
+                });
+                let answers = tokio::select! {
+                    biased;
+                    res = &mut read_task => res.unwrap_or_default(),
+                    _ = &mut cancel => {
+                        read_task.abort();
+                        run_cancel_interrupt(
+                            app,
+                            &mut rx,
+                            &mut assistant,
+                            printed_answer_label,
+                            spinner_active,
+                            child_pid.as_ref(),
+                            &mut save,
+                        )
+                        .await;
+                        return Ok(false);
+                    }
+                };
+                if let Some(dtx) = decision_tx.as_ref() {
+                    let _ = dtx.send(build_user_input_line(&id, &answers));
+                }
+                print_note("(answered)");
             }
             AppEvent::CommandOutput(chunk) => {
                 produced_output = true;
