@@ -26,6 +26,7 @@ import atexit
 import concurrent.futures
 import logging
 import os
+import secrets
 import shutil
 import signal
 import subprocess
@@ -275,9 +276,16 @@ def _is_git_repo(cwd: str) -> bool:
 # reused by the next prompt; a decision that arrives AFTER its prompt already
 # timed out is discarded, never applied to a later approval.
 _pending_stdin_read: Optional["concurrent.futures.Future[str]"] = None
+# Guards the check-then-set on _pending_stdin_read (finding 7): without it,
+# two concurrent callers could both observe "no pending read" and each start
+# its own daemon reader thread on the same stdin, breaking the "one owned
+# stdin read at a time" invariant the comment above already claims. Not
+# currently reachable (single-pending-approval call graph) but this makes
+# the invariant enforced in code rather than merely assumed.
+_pending_stdin_read_lock = asyncio.Lock()
 
 
-def _begin_stdin_read() -> "concurrent.futures.Future[str]":
+async def _begin_stdin_read() -> "concurrent.futures.Future[str]":
     """Return the future for the single in-flight stdin readline.
 
     Reuses a still-pending read left behind by a timed-out prompt (so the
@@ -285,31 +293,32 @@ def _begin_stdin_read() -> "concurrent.futures.Future[str]":
     late decision belonging to the previous, timed-out approval).
     """
     global _pending_stdin_read  # noqa: PLW0603
-    fut = _pending_stdin_read
-    if fut is not None and fut.done():
-        logger.warning("Discarding stale HITL decision from a timed-out prompt")
-        _pending_stdin_read = None
-        fut = None
-    if fut is None:
-        fut = concurrent.futures.Future()
+    async with _pending_stdin_read_lock:
+        fut = _pending_stdin_read
+        if fut is not None and fut.done():
+            logger.warning("Discarding stale HITL decision from a timed-out prompt")
+            _pending_stdin_read = None
+            fut = None
+        if fut is None:
+            fut = concurrent.futures.Future()
 
-        def _read(target: "concurrent.futures.Future[str]" = fut) -> None:
-            try:
-                line = sys.stdin.readline()
-            except Exception as exc:  # noqa: BLE001
+            def _read(target: "concurrent.futures.Future[str]" = fut) -> None:
+                try:
+                    line = sys.stdin.readline()
+                except Exception as exc:  # noqa: BLE001
+                    if not target.cancelled():
+                        target.set_exception(exc)
+                    return
                 if not target.cancelled():
-                    target.set_exception(exc)
-                return
-            if not target.cancelled():
-                target.set_result(line)
+                    target.set_result(line)
 
-        # Daemon thread: a read that never completes must not block exit.
-        threading.Thread(target=_read, name="kim-hitl-stdin", daemon=True).start()
-        _pending_stdin_read = fut
-    return fut
+            # Daemon thread: a read that never completes must not block exit.
+            threading.Thread(target=_read, name="kim-hitl-stdin", daemon=True).start()
+            _pending_stdin_read = fut
+        return fut
 
 
-async def _await_hitl_decision(timeout: float = 120.0) -> bool:
+async def _await_hitl_decision(timeout: float = 120.0, *, request_id: Optional[str] = None) -> bool:
     """Block on stdin for an approval decision line from the Rust supervisor.
 
     The supervisor reads our stdout, shows a confirmation dialog, then writes
@@ -325,6 +334,16 @@ async def _await_hitl_decision(timeout: float = 120.0) -> bool:
     route each line through ``parse_decision_line``: a real accept/decline is
     honored, while a steer / user-note / unparseable line is skipped and we
     keep waiting for the actual decision (within the remaining budget).
+
+    Finding 5: when *request_id* is given, a decision line whose echoed id
+    doesn't match is discarded (kept waiting) instead of being applied — the
+    same T1 contract codex_appserver_transport.py's ``_collect_decision``
+    uses, so a late decision for an earlier, already-timed-out prompt can
+    never authorize a different pending request. An id-less decision line
+    (``echo_id is None``, e.g. a legacy writer) is still accepted, matching
+    the transport's own backward-compatibility rule. When *request_id* is
+    None (caller opted out), matching is skipped entirely — today's only
+    callers always pass one, so this only matters for future callers.
     """
     global _pending_stdin_read  # noqa: PLW0603
     loop = asyncio.get_running_loop()
@@ -334,7 +353,7 @@ async def _await_hitl_decision(timeout: float = 120.0) -> bool:
         if remaining <= 0:
             logger.warning("HITL stdin read timed out — denying")
             return False
-        fut = _begin_stdin_read()
+        fut = await _begin_stdin_read()
         try:
             # shield: a timeout must not cancel the underlying read — the parked
             # future is what lets the NEXT prompt pick the stream back up (C2).
@@ -362,7 +381,14 @@ async def _await_hitl_decision(timeout: float = 120.0) -> bool:
                 line.strip()[:120],
             )
             continue
-        return decision[0] in ("accept", "acceptForSession")
+        decision_value, echo_id = decision
+        if request_id is not None and echo_id is not None and echo_id != request_id:
+            logger.warning(
+                "discarding HITL decision for id %r — it does not match the "
+                "pending request %r", echo_id, request_id,
+            )
+            continue
+        return decision_value in ("accept", "acceptForSession")
 
 
 async def _request_hitl_approval(task: str) -> bool:
@@ -370,13 +396,15 @@ async def _request_hitl_approval(task: str) -> bool:
 
     Returns True if approved, False if denied or timed out.
     """
+    request_id = secrets.token_hex(8)
     emit_hitl_approval_request(
         "codex_bridge",
         "high",
         "Codex can execute arbitrary shell commands in your project directory.",
         task[:200],
+        id=request_id,
     )
-    return await _await_hitl_decision()
+    return await _await_hitl_decision(request_id=request_id)
 
 
 async def _request_git_check_approval(cwd: str) -> bool:
@@ -386,14 +414,16 @@ async def _request_git_check_approval(cwd: str) -> bool:
     trackable/undoable.  When the user opts in we pass ``--skip-git-repo-check``;
     this gate makes that opt-in explicit rather than silent.
     """
+    request_id = secrets.token_hex(8)
     emit_hitl_approval_request(
         "codex_bridge_git_check",
         "high",
         "This folder is not a git repository, so Codex cannot track or undo its "
         "edits here. Run Codex in this directory anyway?",
         cwd[:200],
+        id=request_id,
     )
-    return await _await_hitl_decision()
+    return await _await_hitl_decision(request_id=request_id)
 
 
 async def _compact_browser_thread(provider, cwd: str, provider_name: str) -> tuple[bool, str]:
