@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type { SessionInfo, Settings, KimAccount, PermissionMode } from '../types';
 import { toast } from './Toast';
+import { ErrorBoundary } from './ErrorBoundary';
 import { ConnectorsPanel } from './kim-ui';
 import {
   friendlyError,
@@ -25,6 +26,94 @@ import { StreamRenderer } from './chat/StreamRenderer';
 import { WelcomeScreen } from './chat/WelcomeScreen';
 import { ChatComposer } from './chat/ChatComposer';
 import { CONNECTORS } from './chat/connectors';
+
+// V-audit #7: fallback for the chat/message-rendering ErrorBoundary below.
+// Scoped to "this conversation failed to render" — the sidebar, topbar, and
+// session navigation stay alive around it (they're outside this boundary),
+// so a render crash in one conversation's messages doesn't blank the app.
+function ChatRenderErrorFallback({
+  message,
+  onReset,
+  onNewChat,
+}: {
+  message: string;
+  onReset: () => void;
+  onNewChat?: () => void;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flex: 1,
+        gap: 12,
+        padding: 24,
+        textAlign: 'center',
+        color: 'var(--kim-text)',
+      }}
+    >
+      <svg
+        width="32"
+        height="32"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+        style={{ color: 'var(--kim-text-3)' }}
+      >
+        <circle cx="12" cy="12" r="10" />
+        <path d="M12 8v4M12 16h.01" />
+      </svg>
+      <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>
+        This conversation failed to render
+      </h3>
+      {message && (
+        <p style={{ margin: 0, fontSize: 12.5, opacity: 0.6, maxWidth: 360, wordBreak: 'break-word' }}>
+          {message}
+        </p>
+      )}
+      <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+        <button
+          type="button"
+          onClick={onReset}
+          style={{
+            padding: '7px 16px',
+            borderRadius: 6,
+            border: '1px solid var(--kim-border, rgba(255,255,255,0.12))',
+            background: 'var(--kim-surface, rgba(255,255,255,0.06))',
+            color: 'inherit',
+            fontSize: 13,
+            cursor: 'pointer',
+          }}
+        >
+          Try again
+        </button>
+        {onNewChat && (
+          <button
+            type="button"
+            onClick={onNewChat}
+            style={{
+              padding: '7px 16px',
+              borderRadius: 6,
+              border: '1px solid var(--kim-accent-line)',
+              background: 'transparent',
+              color: 'var(--kim-accent)',
+              fontSize: 13,
+              cursor: 'pointer',
+            }}
+          >
+            Start a new chat
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
 
 interface Props {
   session: SessionInfo | null;
@@ -499,46 +588,62 @@ export function ChatView({
   const empty = !stream.hasSentMessageRef.current && messages.length === 0 && liveHistory.length === 0 && activity.length === 0;
 
   return (
-    <StreamRenderer
-      messages={messages}
-      loadingMessages={loadingMessages}
-      loadError={loadError}
-      liveHistory={stream.liveHistory}
-      runHistory={stream.runHistory}
-      codexRuns={codexRuns}
-      taskError={stream.taskError}
-      hitlApprovalStatus={stream.hitlApprovalStatus}
-      onHitlRespond={stream.hitlRespond}
-      codexTurn={codexTurn}
-      permissionMode={permissionMode}
-      onPermissionModeChange={setPermissionMode}
-      runFailure={stream.runFailure}
-      rateLimitedState={stream.rateLimitedState}
-      settings={settings}
-      newChatMode={newChatMode}
-      activity={stream.activity}
-      isRunning={stream.isRunning}
-      autoFollowOutput={scroll.autoFollowOutput}
-      setAutoFollowOutput={scroll.setAutoFollowOutput}
-      bottomRef={scroll.bottomRef}
-      outputRef={scroll.outputRef}
-      newestMsgIdx={newestMsgIdx}
-      queuedTasks={queuedTasks}
-      lastRunTask={stream.lastRunTaskRef.current}
-      elapsed={stream.elapsed}
-      handleRetryLast={handleRetryLast}
-      handleEditLiveMessage={handleEditLiveMessage}
-      empty={empty}
-      renderComposer={renderComposer}
-      renderConnectorsChrome={renderConnectorsChrome}
-      account={account}
-      activeTab={activeTab}
-      activeProjectPath={activeProjectPath}
-      textareaRef={textareaRef}
-      setTaskInput={setTaskInput}
-      resolveProvider={resolveProvider}
-      tokenStats={stream.tokenStats}
-      contextState={stream.contextState}
-    />
+    // V-audit #7: a render exception anywhere in the message-rendering subtree
+    // (StreamRenderer, MessageBubble, etc.) used to bubble up to the single
+    // app-wide boundary in main.tsx and blank the whole app — sidebar, topbar,
+    // and session navigation included. This narrower boundary catches it here
+    // instead, so only this conversation's content is replaced; the outer
+    // boundary in main.tsx remains as the final backstop for anything above
+    // ChatView. resetKey clears a stale crash automatically when the app
+    // navigates to a different session/new-chat without remounting ChatView
+    // (see handleTaskDone in App.tsx, which can update `session` in place).
+    <ErrorBoundary
+      resetKey={session?.session_id ?? (newChatMode ? 'new-chat' : null)}
+      fallback={(message, reset) => (
+        <ChatRenderErrorFallback message={message} onReset={reset} onNewChat={onNewChat} />
+      )}
+    >
+      <StreamRenderer
+        messages={messages}
+        loadingMessages={loadingMessages}
+        loadError={loadError}
+        liveHistory={stream.liveHistory}
+        runHistory={stream.runHistory}
+        codexRuns={codexRuns}
+        taskError={stream.taskError}
+        hitlApprovalStatus={stream.hitlApprovalStatus}
+        onHitlRespond={stream.hitlRespond}
+        codexTurn={codexTurn}
+        permissionMode={permissionMode}
+        onPermissionModeChange={setPermissionMode}
+        runFailure={stream.runFailure}
+        rateLimitedState={stream.rateLimitedState}
+        settings={settings}
+        newChatMode={newChatMode}
+        activity={stream.activity}
+        isRunning={stream.isRunning}
+        autoFollowOutput={scroll.autoFollowOutput}
+        setAutoFollowOutput={scroll.setAutoFollowOutput}
+        bottomRef={scroll.bottomRef}
+        outputRef={scroll.outputRef}
+        newestMsgIdx={newestMsgIdx}
+        queuedTasks={queuedTasks}
+        lastRunTask={stream.lastRunTaskRef.current}
+        elapsed={stream.elapsed}
+        handleRetryLast={handleRetryLast}
+        handleEditLiveMessage={handleEditLiveMessage}
+        empty={empty}
+        renderComposer={renderComposer}
+        renderConnectorsChrome={renderConnectorsChrome}
+        account={account}
+        activeTab={activeTab}
+        activeProjectPath={activeProjectPath}
+        textareaRef={textareaRef}
+        setTaskInput={setTaskInput}
+        resolveProvider={resolveProvider}
+        tokenStats={stream.tokenStats}
+        contextState={stream.contextState}
+      />
+    </ErrorBoundary>
   );
 }
