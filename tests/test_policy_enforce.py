@@ -302,6 +302,50 @@ class TestArgvRuleTable:
         assert d.action == "approve"
         assert d.reason == "powershell_script_unanalyzed"
 
+    def test_run_python_always_requires_approval_even_without_threshold(self):
+        """The audit's headline finding: hitl_risk_threshold is unset by
+        default, so run_python's inline `code` argument must be gated by an
+        unconditional escalation, not the (inert) threshold arm."""
+        d = enforce("run_python", {"code": "print('hi')"})
+        assert d.action == "approve"
+        assert "mandatory_code_execution_approval" in d.escalations
+
+    def test_run_node_always_requires_approval_even_without_threshold(self):
+        d = enforce("run_node", {"code": "console.log('hi')"})
+        assert d.action == "approve"
+        assert "mandatory_code_execution_approval" in d.escalations
+
+    def test_run_python_inline_code_bypassing_blocklist_still_gated(self):
+        """A hardcoded absolute path trivially bypasses the code.py string
+        blocklist (no `os`/`subprocess` token at all) — policy must still
+        gate it, since the blocklist is not the real control."""
+        d = enforce(
+            "run_python",
+            {"code": "open('/Users/x/.ssh/id_rsa').read()"},
+        )
+        assert d.action == "approve"
+        assert "mandatory_code_execution_approval" in d.escalations
+
+    def test_run_python_approval_signature_scoped_to_code_not_bare_tool_name(self):
+        """Approving one run_python call must not silently pre-approve a
+        DIFFERENT run_python call via 'accept for session' (G5 regression)."""
+        d1 = enforce("run_python", {"code": "print(1)"})
+        d2 = enforce("run_python", {"code": "print(2)"})
+        assert d1.signature != d2.signature
+
+    def test_run_python_file_arg_also_requires_approval(self):
+        """Unconditional escalation covers the whole tool, not just inline
+        code -- a .py file path is validated by S3 but still needs a human."""
+        d = enforce("run_python", {"file": "scripts/gen.py"})
+        assert d.action == "approve"
+        assert "mandatory_code_execution_approval" in d.escalations
+
+    def test_run_python_sensitive_path_still_denied_before_approval(self):
+        """S3 deny still wins over the unconditional-approve escalation."""
+        d = enforce("run_python", {"file": "~/.ssh/id_rsa"})
+        assert d.action == "deny"
+        assert d.reason == "sensitive_path_argument"
+
     def test_policy_never_raises_it_denies(self):
         """Fail-closed: garbage input yields deny, not an exception."""
         d = enforce("run_command", {"cmd": 'cat "unterminated'})
