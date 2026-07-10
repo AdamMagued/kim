@@ -108,6 +108,33 @@ class TestCodexProcessLifecycle(unittest.IsolatedAsyncioTestCase):
         pid = int((result.bin_dir / "pid.txt").read_text().strip())
         self.assertTrue(_wait_for_death(pid))
 
+    async def test_timeout_kills_grandchild_shell_subprocess_too(self):
+        """A timeout must reap the WHOLE process tree, not just codex-exec.
+
+        The fake codex binary spawns its own grandchild (standing in for a
+        shell/tool subprocess codex itself launches) and never waits on it.
+        Before finding 3 was fixed, process.kill() only signalled the direct
+        codex-exec PID, orphaning this grandchild forever.
+        """
+        result = await run_bridge(
+            self.tmp,
+            sleep_s=60,
+            spawn_child=True,
+            # A larger budget than the other timeout tests: this fake binary
+            # does extra work (spawning + recording a grandchild pid) before
+            # it can be killed, and a tight budget races interpreter startup
+            # under a loaded machine.
+            config_yaml="codex_bridge:\n  transport: exec\n  task_timeout_s: 8\n",
+        )
+        self.assertEqual(result.rc, 1)
+        child_pid_file = result.bin_dir / "child_pid.txt"
+        self.assertTrue(child_pid_file.exists(), "fake codex never spawned its grandchild")
+        child_pid = int(child_pid_file.read_text().strip())
+        self.assertTrue(
+            _wait_for_death(child_pid),
+            f"grandchild subprocess (pid {child_pid}) survived the timeout kill — orphan",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
