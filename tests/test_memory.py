@@ -207,6 +207,44 @@ def test_trim_keeps_at_least_last_message_non_summary_path():
     assert mem._messages[0]["content"] == "final response"
 
 
+def test_trim_walks_back_through_multiple_consecutive_tool_results_non_summary_path():
+    """When the trim window's first user message is the LATER of several
+    consecutive tool-result messages, a single-step walk-back only reaches
+    the earlier tool-result — still orphaning it from its assistant
+    tool_call. _fix_tool_boundary must loop back through the whole stacked
+    run of tool-result messages to the actual tool_call (finding 6; ports
+    compaction.py's _fix_tool_boundary while-loop)."""
+    mem = ConversationMemory(max_messages=4)
+    tool_call_msg = {"role": "assistant", "content": [{"type": "tool_call", "tool": "batch", "args": {}}]}
+    result_a = {"role": "user", "content": "[Tool result: part A]"}
+    result_b = {"role": "user", "content": "[Tool result: part B]"}
+    mem._messages = [
+        {"role": "user", "content": "turn0"},
+        tool_call_msg,
+        result_a,
+        result_b,
+        {"role": "user", "content": "follow-up"},
+        {"role": "assistant", "content": "some reply"},
+    ]
+    # Append a 7th message and trim directly (avoids intermediate trims).
+    mem._messages.append({"role": "user", "content": "trigger"})
+    mem._enforce_limits()
+
+    # excess = 7 - 4 = 3 → scan starts at index 3 (result_b, the LATER of the
+    # two stacked tool results). A single-step walk-back (the old behavior)
+    # would land on result_a — still orphaning it from tool_call_msg. The
+    # while-loop walk-back must continue past BOTH tool-result messages back
+    # to the assistant tool_call.
+    assert mem._messages[0]["role"] == "assistant", (
+        "First preserved message must be the assistant tool_call — the old "
+        "single-step walk-back stopped one message short and orphaned "
+        "result_a from its tool_call"
+    )
+    assert mem._messages[0] is tool_call_msg
+    assert mem._messages[1] is result_a
+    assert mem._messages[2] is result_b
+
+
 def test_trim_keeps_at_least_last_message_summary_path():
     """Summary path: if the rest slice contains no user messages,
     `[summary] + rest[-1:]` is used — the summary is pinned and the last rest message kept."""

@@ -15,6 +15,7 @@ native API format internally.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from typing import Union
 
@@ -137,11 +138,11 @@ class ConversationMemory:
             excess = len(rest) - max_rest
             for i in range(excess, len(rest)):
                 if rest[i]["role"] == "user":
-                    # If this user message is a tool result, include the
-                    # preceding assistant tool_call to avoid orphaning it.
-                    start = i
-                    if self._is_tool_result(rest[i]) and i > 0:
-                        start = i - 1
+                    # If this user message is a tool result, walk back to
+                    # include the preceding assistant tool_call (and any
+                    # further stacked tool-result messages) so we never
+                    # orphan a result from its call.
+                    start = self._fix_tool_boundary(rest, i)
                     self._messages = [summary] + rest[start:]
                     return
             self._messages = [summary] + rest[-1:]
@@ -151,11 +152,11 @@ class ConversationMemory:
         # Find the first user message within the allowed window
         for i in range(excess, len(self._messages)):
             if self._messages[i]["role"] == "user":
-                # If this user message is a tool result, include the
-                # preceding assistant tool_call to avoid orphaning it.
-                start = i
-                if self._is_tool_result(self._messages[i]) and i > 0:
-                    start = i - 1
+                # If this user message is a tool result, walk back to
+                # include the preceding assistant tool_call (and any further
+                # stacked tool-result messages) so we never orphan a result
+                # from its call.
+                start = self._fix_tool_boundary(self._messages, i)
                 self._messages = self._messages[start:]
                 return
 
@@ -179,6 +180,47 @@ class ConversationMemory:
                     if item.get("text", "").startswith("[Tool result:"):
                         return True
         return False
+
+    def _is_tool_call(self, msg: dict) -> bool:
+        """Return True if *msg* is an assistant message containing a JSON tool call.
+
+        Mirrors compaction.py's ``_is_tool_call`` so both trim algorithms
+        agree on what counts as the call paired with a tool-result message.
+        """
+        if msg.get("role") != "assistant":
+            return False
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            return any(
+                isinstance(item, dict) and item.get("type") == "tool_call"
+                for item in content
+            )
+        text = content if isinstance(content, str) else str(content)
+        try:
+            parsed = json.loads(text)
+            return isinstance(parsed, dict) and parsed.get("type") == "tool_call"
+        except (json.JSONDecodeError, ValueError):
+            return False
+
+    def _fix_tool_boundary(self, history: list[dict], start: int) -> int:
+        """Walk *start* back if the first preserved message is an orphaned tool result.
+
+        Ports compaction.py's ``_fix_tool_boundary`` while-loop: a single
+        decrement only handles ONE preceding tool-result message. When
+        several tool-result messages are stacked in a row (e.g. multi-part
+        results), a single-step walk-back still orphans the earlier ones —
+        this loops back through all of them, matching compaction.py's
+        boundary-fixing behavior exactly.
+        """
+        if start <= 0 or start >= len(history):
+            return start
+        if not self._is_tool_result(history[start]):
+            return start
+        if start > 0 and self._is_tool_call(history[start - 1]):
+            start -= 1
+        while start > 0 and self._is_tool_result(history[start]):
+            start -= 1
+        return max(0, start)
 
     def _apply_screenshot_policy(self) -> list[dict]:
         """
