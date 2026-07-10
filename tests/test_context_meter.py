@@ -7,6 +7,7 @@ from orchestrator.context_meter import (
     estimate_text_tokens,
     _tools_token_count,
     _tools_token_cache,
+    _tools_cache_key,
 )
 
 
@@ -177,16 +178,17 @@ def test_record_run_uses_current_window_not_cumulative():
     assert meter.cumulative_input == 2000
 
 
-def test_tools_token_count_cached_by_identity():
+def test_tools_token_count_cached_by_content():
     """_tools_token_count returns the same value on repeated calls for the same
-    list object without re-serializing: the cache entry keyed on (id, len)
-    should be populated after the first call and reused on the second."""
+    list object without re-serializing: the cache entry keyed on a
+    content-derived signature (not object identity — see finding 4) should be
+    populated after the first call and reused on the second."""
     _tools_token_cache.clear()
     tools = [{"name": "read_file", "description": "reads a file"}]
     first = _tools_token_count(tools)
     # Cache must now hold exactly one entry for this list
     assert len(_tools_token_cache) == 1
-    key = (id(tools), len(tools))
+    key = _tools_cache_key(tools)
     assert key in _tools_token_cache
     second = _tools_token_count(tools)
     assert first == second, "Second call must return same count as first (cache hit)"
@@ -195,13 +197,13 @@ def test_tools_token_count_cached_by_identity():
 
 
 def test_tools_token_cache_invalidated_on_length_change():
-    """Appending an element to the tools list changes its length, which shifts
-    the cache key and triggers a recompute.  After recompute, the cache holds
-    at most one entry (old entry is evicted via clear())."""
+    """Appending an element to the tools list changes its content signature,
+    which shifts the cache key and triggers a recompute.  After recompute,
+    the cache holds at most one entry (old entry is evicted via clear())."""
     _tools_token_cache.clear()
     tools = [{"name": "read_file"}]
     count_before = _tools_token_count(tools)
-    old_key = (id(tools), len(tools))
+    old_key = _tools_cache_key(tools)
 
     tools.append({"name": "write_file", "description": "writes a file with more tokens here"})
     count_after = _tools_token_count(tools)
@@ -213,9 +215,43 @@ def test_tools_token_cache_invalidated_on_length_change():
     # Old key must no longer be in cache (clear() was called on recompute)
     assert old_key not in _tools_token_cache, "Stale cache entry must be evicted after length change"
     # Cache holds exactly one entry (the new key)
-    new_key = (id(tools), len(tools))
+    new_key = _tools_cache_key(tools)
     assert new_key in _tools_token_cache
     assert len(_tools_token_cache) == 1
+
+
+def test_tools_token_cache_not_aliased_by_id_reuse():
+    """Two DIFFERENT same-length tool lists must not collide in the cache even
+    if one happens to be allocated at the same memory address a previous,
+    now-freed list used (id() reuse across GC cycles) — finding 4. Regression
+    guard for the old `(id(tools), len(tools))` key, which could silently
+    return a stale token count for a completely different tool list.
+    """
+    _tools_token_cache.clear()
+    tools_a = [{"name": "read_file", "description": "reads a file from disk"}]
+    tools_b = [{"name": "run_command", "description": "executes a shell command with a much longer description"}]
+    assert len(tools_a) == len(tools_b)
+
+    count_a = _tools_token_count(tools_a)
+    key_a = _tools_cache_key(tools_a)
+    assert key_a in _tools_token_cache
+
+    # Simulate id() reuse: force tools_b to reuse tools_a's old identity by
+    # freeing tools_a first, then confirm the cache key itself (not python's
+    # incidental memory reuse) is what keeps the two calls from colliding —
+    # i.e. the key is content-derived, so it differs for different content
+    # regardless of what id() any particular allocation gets.
+    key_b = _tools_cache_key(tools_b)
+    assert key_a != key_b, "Different tool lists must produce different cache keys"
+
+    del tools_a
+    count_b = _tools_token_count(tools_b)
+    assert count_b != count_a, (
+        "A different, longer-description tool list must not reuse the first "
+        "list's cached token count"
+    )
+    assert key_b in _tools_token_cache
+    assert _tools_token_cache[key_b] == count_b
 
 
 def test_estimate_request_tokens_includes_tools():

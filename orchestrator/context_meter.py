@@ -254,16 +254,44 @@ def estimate_content_tokens(content: Any) -> int:
 
 # Cache the tools-schema token count between iterations.
 # The tools list rarely changes within a run so we avoid re-serializing it
-# (~50 schemas, ~8 KB) on every iteration.  The cache is keyed by the
-# object identity and length of the list; any list replacement or length
-# change invalidates the entry.  A single entry suffices because the agent
-# uses one tools list per run.
-_tools_token_cache: dict[tuple[int, int], int] = {}
+# (~50 schemas, ~8 KB) on every iteration.  The cache is keyed by a
+# content-derived signature of the list (see _tools_cache_key), not object
+# identity — id() can be recycled across GC cycles for a same-sized list
+# allocated shortly after the previous one was freed, and self._tools is
+# rebuilt fresh on every _refresh_tools() call, so an identity-based key
+# could silently return a stale token count for an unrelated tool list
+# (finding 4). A single entry suffices because the agent uses one tools
+# list per run.
+_tools_token_cache: dict[tuple, int] = {}
+
+
+def _tools_cache_key(tools: list[dict]) -> tuple:
+    """Cheap content-derived signature for a tools list.
+
+    Hashes each tool's name, description length, and parameter-schema keys —
+    enough to distinguish different tool lists (including same-length lists
+    with different tools, or a tool whose schema changed independently of its
+    name) without paying for a full JSON serialization on every call.
+    """
+    try:
+        return tuple(
+            (
+                t.get("name"),
+                len(str(t.get("description") or "")),
+                tuple(sorted(t.get("parameters").keys()))
+                if isinstance(t.get("parameters"), dict) else None,
+            )
+            for t in tools
+        )
+    except (TypeError, AttributeError):
+        # Malformed tool entries (non-dict items etc.) — fall back to a key
+        # that at least distinguishes lengths rather than crashing.
+        return ("__fallback__", len(tools))
 
 
 def _tools_token_count(tools: list[dict]) -> int:
     """Return the serialized token count for a tools list, with caching."""
-    key = (id(tools), len(tools))
+    key = _tools_cache_key(tools)
     cached = _tools_token_cache.get(key)
     if cached is not None:
         return cached
