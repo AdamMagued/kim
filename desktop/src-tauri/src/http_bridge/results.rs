@@ -12,7 +12,7 @@ use std::time::Duration;
 use tauri::Manager;
 use tiny_http::Request;
 
-use crate::browser_bridge::{collect_bridge_payload, notify_bridge_result};
+use crate::browser_bridge::{collect_bridge_payload, mark_bridge_entry_seen, notify_bridge_result};
 use crate::http_util::{agent_debug_log, respond_json};
 use crate::{
     hide_browser_window_offscreen, BridgeCallbackRequest, WEBVIEW_BRIDGE_RESULTS,
@@ -53,6 +53,11 @@ pub(super) fn callback(mut request: Request) {
             "error": parsed.payload.error,
         }),
     );
+
+    // AUDIT FIX #3: timestamp this req_id so the periodic GC sweep
+    // (browser_bridge::sweep_stale_bridge_entries) can evict it if the
+    // caller dies before ever polling /v1/result.
+    mark_bridge_entry_seen(&parsed.req_id);
 
     let store = WEBVIEW_BRIDGE_RESULTS.get_or_init(|| StdMutex::new(HashMap::new()));
     match store.lock() {

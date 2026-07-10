@@ -15,8 +15,8 @@ use tauri::Manager;
 use tiny_http::Request;
 
 use crate::browser_bridge::{
-    open_browser_signin_window_for_bridge_send, open_browser_signin_window_impl,
-    run_bridge_completion_once,
+    mark_bridge_entry_seen, open_browser_signin_window_for_bridge_send,
+    open_browser_signin_window_impl, run_bridge_completion_once,
 };
 use crate::http_util::{agent_debug_log, respond_json};
 use crate::provider_url::{default_site_url, gemini_site_url, normalize_site};
@@ -430,6 +430,10 @@ pub(super) fn send(mut request: Request, app_handle: tauri::AppHandle) {
         std::process::id(),
         WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
+    // AUDIT FIX #3: timestamp this req_id so the periodic GC sweep
+    // (browser_bridge::sweep_stale_bridge_entries) can evict it if the
+    // caller dies before ever polling /v1/result.
+    mark_bridge_entry_seen(&req_id);
 
     // Clear old req_id and sentinel marker
     if let Ok(mut guard) = WEBVIEW_BRIDGE_RESULTS

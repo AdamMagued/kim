@@ -159,3 +159,68 @@ pub(crate) async fn supervise(
 
     wait_result.map_err(|e| e.to_string())
 }
+
+// AUDIT FIX #6: send_task now reserves the slot via `reserve_slot()` as the
+// very first thing it does (before any async I/O, including the Google
+// OAuth refresh build_gui_chat_spec/build_gui_codex_spec can trigger),
+// closing the gap where two near-simultaneous callers could both pass an
+// earlier "is it occupied?" check and both run that expensive work before
+// only one of them was ultimately allowed to spawn. These tests exercise
+// the primitive that guarantee rests on: `reserve_slot()`'s check-and-set
+// happens atomically under a single lock acquisition, so there is no window
+// for a second concurrent caller to observe "free" after the first caller
+// has already claimed the slot.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These are the only tests in the crate that exercise the GLOBAL
+    // `task_runtime()` singleton (every other test builds a local
+    // `TaskRuntime`/`TokioMutex` instance to avoid cross-test interference).
+    // cargo test runs tests in parallel by default, and both tests below
+    // clear/reserve/release the SAME global singleton, so without
+    // serialization they race each other (observed flaky in practice: one
+    // test's `clear()` can land between the other's reserve and assert).
+    // A module-local async lock keeps them from interleaving without
+    // affecting any other test's parallelism.
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn concurrent_reserve_slot_calls_yield_exactly_one_winner() {
+        let _guard = TEST_LOCK.lock().await;
+        task_runtime().lock().await.clear();
+
+        // tokio::join! polls both futures concurrently on this task; each
+        // reserve_slot() call contends on the same runtime lock, so this
+        // reproduces the "two near-simultaneous send_task calls" race the
+        // fix closes. Exactly one must observe the slot as free.
+        let (a, b) = tokio::join!(reserve_slot(), reserve_slot());
+        let ok_count = [a.is_ok(), b.is_ok()].into_iter().filter(|ok| *ok).count();
+        assert_eq!(
+            ok_count, 1,
+            "exactly one of two concurrent reserve_slot() calls must win (a={a:?}, b={b:?})"
+        );
+
+        task_runtime().lock().await.clear();
+    }
+
+    #[tokio::test]
+    async fn release_slot_frees_the_reservation_for_a_later_caller() {
+        let _guard = TEST_LOCK.lock().await;
+        task_runtime().lock().await.clear();
+
+        reserve_slot().await.expect("first reserve must succeed");
+        assert!(
+            reserve_slot().await.is_err(),
+            "slot must be held while reserved"
+        );
+
+        release_slot().await;
+        assert!(
+            reserve_slot().await.is_ok(),
+            "slot must be reservable again once released"
+        );
+
+        task_runtime().lock().await.clear();
+    }
+}

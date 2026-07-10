@@ -11,7 +11,10 @@
 //!   `delete_scheduled_task`   -- schedule delete <id> --json
 //!   `run_due_scheduled_task`  -- schedule run-due [--dry-run] --json
 
-use crate::{default_project_root, subprocess::find_python_interpreter};
+use crate::{
+    default_project_root,
+    subprocess::{find_python_interpreter, is_bundled_orchestrator},
+};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,10 +25,47 @@ use tokio::sync::Mutex;
 // Shared subprocess helper
 // ---------------------------------------------------------------------------
 
+/// AUDIT FIX #1: `find_python_interpreter()` can resolve to the bundled
+/// `kim-orchestrator` PyInstaller sidecar instead of a real Python
+/// interpreter (see `is_bundled_orchestrator`). That sidecar's entry point
+/// is `orchestrator.agent`'s flat CLI (`--task/--provider/...` via
+/// `orchestrator/cli.py::_build_arg_parser`) -- it has no `schedule` verb,
+/// and the `kimctl` package itself is not bundled into it (see
+/// `kim-orchestrator.spec`'s `datas`, which lists `orchestrator`,
+/// `mcp_server`, `codex_engine` but not `kimctl`). So unlike the chat-spec
+/// call sites (subprocess.rs `build_gui_chat_spec`, http_bridge/tasks.rs),
+/// which just drop the `-m orchestrator.agent` prefix and pass flags the
+/// sidecar's own entry point understands, there is no argv this Rust code
+/// can build that the current sidecar would understand for `schedule`
+/// subcommands -- a real fix requires bundling `kimctl` and adding argv
+/// dispatch on the Python side, which is out of scope for desktop/src-tauri.
+///
+/// Rather than exec the sidecar with `-m kimctl ...` (which fails opaquely --
+/// the sidecar is not a Python interpreter and cannot parse `-m`), fail fast
+/// with an actionable message before spawning anything. NOTE: this is
+/// currently a LATENT bug, not yet reachable: `tauri.conf.json`'s `bundle`
+/// section has no `externalBin` entry, so `find_bundled_orchestrator()`
+/// returns `None` in every build today and this branch is dead. It will
+/// start firing the moment the sidecar is wired into the bundle (per the
+/// TODO comment atop `kim-orchestrator.spec`), so we guard it now rather
+/// than shipping a silent failure once that lands.
+const BUNDLED_SCHEDULE_UNSUPPORTED: &str =
+    "Scheduled Tasks are not available in this packaged build (the bundled \
+     kim-orchestrator sidecar does not yet support kimctl schedule commands). \
+     Install Python 3 and create a project venv (venv/.venv), or run Kim from \
+     a source/dev build, to use Scheduled Tasks.";
+
 /// Run a kimctl subcommand given a pre-built args vec (args[0] = interpreter).
 /// Returns stdout on success, or a structured Err preferring stderr then stdout
 /// then a generic fallback (kimctl writes JSON errors to stdout with exit 1).
+/// Errors immediately (no spawn attempt) when `args[0]` is the bundled sidecar
+/// -- see `BUNDLED_SCHEDULE_UNSUPPORTED`.
 fn run_kimctl(args: &[String], kim_root: &PathBuf) -> Result<String, String> {
+    if let Some(interpreter) = args.first() {
+        if is_bundled_orchestrator(interpreter) {
+            return Err(BUNDLED_SCHEDULE_UNSUPPORTED.to_string());
+        }
+    }
     let mut cmd = std::process::Command::new(&args[0]);
     for arg in &args[1..] {
         cmd.arg(arg);
@@ -726,6 +766,41 @@ mod tests {
             let args = build_run_due_args("python3", dry);
             assert!(args.contains(&"--json".to_string()), "dry_run={dry}");
         }
+    }
+
+    // -- AUDIT FIX #1: run_kimctl guards the bundled-sidecar interpreter --
+
+    #[test]
+    fn test_run_kimctl_rejects_bundled_sidecar_before_spawning() {
+        // args built exactly as build_list_args/build_add_args/etc. would,
+        // but with a bundled-sidecar "interpreter" in slot 0. Must error
+        // immediately (no process spawn attempt, no "-m kimctl" exec).
+        let args = build_list_args("/Applications/Kim.app/Contents/MacOS/kim-orchestrator", false);
+        let kim_root = PathBuf::from("/tmp/does-not-matter");
+        let err = run_kimctl(&args, &kim_root).expect_err("bundled sidecar must be rejected");
+        assert_eq!(err, BUNDLED_SCHEDULE_UNSUPPORTED);
+    }
+
+    #[test]
+    fn test_run_kimctl_rejects_bundled_sidecar_suffixed_variant() {
+        let args = build_run_due_args(
+            "/opt/Kim/kim-orchestrator-aarch64-apple-darwin",
+            false,
+        );
+        let kim_root = PathBuf::from("/tmp/does-not-matter");
+        let err = run_kimctl(&args, &kim_root).expect_err("suffixed sidecar must be rejected");
+        assert_eq!(err, BUNDLED_SCHEDULE_UNSUPPORTED);
+    }
+
+    #[test]
+    fn test_run_kimctl_allows_real_python_path_to_reach_spawn() {
+        // A real interpreter path must NOT be rejected by the bundled-sidecar
+        // guard -- it should proceed to spawn (and fail there instead, e.g.
+        // with a "No such file" spawn error, never BUNDLED_SCHEDULE_UNSUPPORTED).
+        let args = build_delete_args("/usr/bin/python3-does-not-exist-xyz", "id1");
+        let kim_root = PathBuf::from("/tmp/does-not-matter");
+        let err = run_kimctl(&args, &kim_root).expect_err("nonexistent interpreter still errors");
+        assert_ne!(err, BUNDLED_SCHEDULE_UNSUPPORTED);
     }
 
     // -- ASCII cleanliness --

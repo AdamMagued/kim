@@ -265,6 +265,10 @@ pub(crate) fn handle_bridge_ipc_event(ipc_event: BridgeIpcEvent, app_handle: &ta
         }),
     );
 
+    // AUDIT FIX #3: timestamp every req_id this bridge sees, so the periodic
+    // GC sweep can evict it later if nothing ever polls /v1/result.
+    mark_bridge_entry_seen(&ipc_event.req_id);
+
     match ipc_event.event.as_str() {
         "sent" => {
             // Prompt was injected and Enter pressed. Store a "sent" marker
@@ -379,6 +383,141 @@ pub(crate) fn notify_bridge_result() {
     condvar.notify_all();
 }
 
+// ---------------------------------------------------------------------------
+// AUDIT FIX #3: bounded lifetime for WEBVIEW_BRIDGE_RESULTS/PROGRESS/WAS_HIDDEN
+// ---------------------------------------------------------------------------
+//
+// Every entry in those maps is normally cleaned up by `collect_bridge_payload`
+// (on success or its own request timeout), which runs inside the HTTP thread
+// handling `GET /v1/result/{req_id}`. If the caller that would have polled
+// that endpoint dies first -- a task force-killed via subprocess.rs's cancel
+// escalation, an HTTP client that crashed, a kimctl invocation that was
+// Ctrl-C'd -- nothing ever calls `/v1/result` for that req_id, so its entries
+// (which can hold full LLM response text) sit in these maps for the app's
+// entire remaining lifetime.
+//
+// There is no existing req_id <-> task-pid mapping to hook eviction directly
+// into task cancellation, so this uses a TTL sweep as the backstop the audit
+// finding calls out as acceptable: every insertion is timestamped in
+// WEBVIEW_BRIDGE_ENTRY_TIMES, and a periodic sweep (started by
+// `start_bridge_gc_sweeper`) evicts entries older than the TTL from all three
+// maps regardless of whether anyone ever polled for them.
+
+/// Default time-to-live for an unclaimed bridge req_id before the periodic
+/// sweep evicts it. Generous relative to `bridge_timeout_secs` (the
+/// /v1/result collector's own timeout, which is always much shorter) so this
+/// never races a legitimate slow-but-in-flight request.
+pub(crate) const BRIDGE_ENTRY_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// How often the sweeper runs.
+const BRIDGE_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Record (or refresh, if not already tracked) the first-seen time for a
+/// bridge req_id. Idempotent -- call this at every insertion site
+/// (`/v1/send`, the persistent-bridge IPC handler, `/v1/callback`) without
+/// worrying about resetting an existing entry's clock.
+pub(crate) fn mark_bridge_entry_seen(req_id: &str) {
+    if let Ok(mut guard) = WEBVIEW_BRIDGE_ENTRY_TIMES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        guard.entry(req_id.to_string()).or_insert_with(Instant::now);
+    }
+}
+
+/// Remove a req_id's tracked timestamp. Called from the normal (non-stale)
+/// cleanup paths in `collect_bridge_payload` so WEBVIEW_BRIDGE_ENTRY_TIMES
+/// itself does not grow unbounded with timestamps for requests that were
+/// already cleaned up the fast way.
+fn forget_bridge_entry_time(req_id: &str) {
+    if let Ok(mut guard) = WEBVIEW_BRIDGE_ENTRY_TIMES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        guard.remove(req_id);
+    }
+}
+
+/// Evict every bridge req_id whose first-seen timestamp is older than `ttl`
+/// from WEBVIEW_BRIDGE_RESULTS (+ its `{id}_sent` companion key),
+/// WEBVIEW_BRIDGE_PROGRESS, and WEBVIEW_WAS_HIDDEN. Returns the evicted ids
+/// (empty if nothing was stale) so callers can log/assert on it.
+pub(crate) fn sweep_stale_bridge_entries(ttl: Duration) -> Vec<String> {
+    let now = Instant::now();
+    let stale_ids: Vec<String> = {
+        let times = WEBVIEW_BRIDGE_ENTRY_TIMES.get_or_init(|| StdMutex::new(HashMap::new()));
+        match times.lock() {
+            Ok(guard) => guard
+                .iter()
+                .filter(|(_, seen)| now.duration_since(**seen) >= ttl)
+                .map(|(id, _)| id.clone())
+                .collect(),
+            Err(_) => return Vec::new(),
+        }
+    };
+
+    if stale_ids.is_empty() {
+        return stale_ids;
+    }
+
+    if let Ok(mut guard) = WEBVIEW_BRIDGE_ENTRY_TIMES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        for id in &stale_ids {
+            guard.remove(id);
+        }
+    }
+    if let Ok(mut guard) = WEBVIEW_BRIDGE_RESULTS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        for id in &stale_ids {
+            guard.remove(id);
+            guard.remove(&format!("{id}_sent"));
+        }
+    }
+    if let Ok(mut guard) = WEBVIEW_BRIDGE_PROGRESS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+    {
+        for id in &stale_ids {
+            guard.remove(id);
+        }
+    }
+    if let Ok(mut guard) = WEBVIEW_WAS_HIDDEN
+        .get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+        .lock()
+    {
+        for id in &stale_ids {
+            guard.remove(id);
+        }
+    }
+
+    agent_debug_log(
+        "H1",
+        "bridge GC sweep evicted stale entries",
+        serde_json::json!({ "count": stale_ids.len(), "ttlSecs": ttl.as_secs() }),
+    );
+
+    stale_ids
+}
+
+/// Start the periodic background sweep. Idempotent to call once from app
+/// setup alongside `scheduler::start_scheduler`; spawns a tokio task that
+/// loops for the life of the app.
+pub(crate) fn start_bridge_gc_sweeper(app_handle: tauri::AppHandle) {
+    let _ = app_handle; // reserved for future emit-on-sweep telemetry
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(BRIDGE_GC_INTERVAL);
+        interval.tick().await; // consume the immediate first tick
+        loop {
+            interval.tick().await;
+            sweep_stale_bridge_entries(BRIDGE_ENTRY_TTL);
+        }
+    });
+}
+
 // build_bridge_complete_script deleted (#22): the persistent bridge (bridge.js) is
 // always loaded via initialization_script so the ~1000-line legacy inline-script
 // fallback was dead code.
@@ -426,6 +565,7 @@ pub(crate) fn collect_bridge_payload(
                     {
                         hg.remove(req_id);
                     }
+                    forget_bridge_entry_time(req_id);
                     return Ok(payload);
                 }
             }
@@ -457,6 +597,7 @@ pub(crate) fn collect_bridge_payload(
             {
                 hg.remove(req_id);
             }
+            forget_bridge_entry_time(req_id);
             agent_debug_log(
                 "H3",
                 "collect timeout waiting payload",
@@ -489,6 +630,7 @@ pub(crate) fn collect_bridge_payload(
                     "collect: result found via title-pull",
                     serde_json::json!({ "reqId": req_id, "loops": ipc_wait_loops }),
                 );
+                forget_bridge_entry_time(req_id);
                 return Ok(payload);
             }
             Ok(None) => {}
@@ -617,6 +759,8 @@ pub(crate) fn run_bridge_completion_once(
         std::process::id(),
         WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
+    // AUDIT FIX #3: see mark_bridge_entry_seen doc comment.
+    mark_bridge_entry_seen(&req_id);
     agent_debug_log(
         "H1",
         "run_bridge_completion_once start",
@@ -795,5 +939,180 @@ mod title_pull_tests {
         let payload = sample("x");
         let title = format!("r-1-71|{}", encode(&payload));
         assert!(decode_title_pull_payload("r-1-7", &title).is_none());
+    }
+}
+
+// AUDIT FIX #3: sweep_stale_bridge_entries / mark_bridge_entry_seen.
+//
+// Every test uses a req_id unique to that test (these statics are process-
+// global and shared across the whole test binary, which runs tests in
+// parallel by default) so tests cannot interfere with each other's entries.
+#[cfg(test)]
+mod gc_sweep_tests {
+    use super::*;
+
+    // These tests share process-global statics (WEBVIEW_BRIDGE_RESULTS etc.)
+    // with EACH OTHER, and `sweep_stale_bridge_entries` operates on the
+    // *entire* map, not just one test's ids -- a ttl=0 sweep in one test
+    // would otherwise race and evict entries a concurrently-running sibling
+    // test just inserted (cargo test runs tests in parallel by default).
+    // Serialize this module's tests against each other with a local lock;
+    // other test modules in this crate don't touch these statics (verified:
+    // only browser_bridge.rs itself does), so this doesn't need to be
+    // crate-wide.
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn lock_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn sample_response() -> BridgeCompleteResponse {
+        BridgeCompleteResponse {
+            ok: true,
+            response: Some("hi".to_string()),
+            error: None,
+            site: Some("claude".to_string()),
+            attachments_uploaded: None,
+        }
+    }
+
+    #[test]
+    fn sweep_evicts_orphaned_entry_across_all_three_maps() {
+        let _guard = lock_guard();
+        let id = "gc-test-evict-all-maps";
+
+        mark_bridge_entry_seen(id);
+        WEBVIEW_BRIDGE_RESULTS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), sample_response());
+        WEBVIEW_BRIDGE_PROGRESS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), "working...".to_string());
+        WEBVIEW_WAS_HIDDEN
+            .get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert(id.to_string());
+
+        // ttl=0: anything with a recorded timestamp is immediately "stale"
+        // (elapsed >= 0 is always true), so this deterministically evicts
+        // without needing a real sleep.
+        let evicted = sweep_stale_bridge_entries(Duration::ZERO);
+        assert!(
+            evicted.contains(&id.to_string()),
+            "orphaned entry must be evicted by the sweep"
+        );
+
+        assert!(!WEBVIEW_BRIDGE_RESULTS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .contains_key(id));
+        assert!(!WEBVIEW_BRIDGE_PROGRESS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .contains_key(id));
+        assert!(!WEBVIEW_WAS_HIDDEN
+            .get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap()
+            .contains(id));
+    }
+
+    #[test]
+    fn sweep_removes_sent_companion_key() {
+        let _guard = lock_guard();
+        let id = "gc-test-sent-companion";
+        let sent_key = format!("{id}_sent");
+
+        mark_bridge_entry_seen(id);
+        WEBVIEW_BRIDGE_RESULTS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(sent_key.clone(), sample_response());
+
+        sweep_stale_bridge_entries(Duration::ZERO);
+
+        assert!(!WEBVIEW_BRIDGE_RESULTS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .contains_key(&sent_key));
+    }
+
+    #[test]
+    fn sweep_does_not_evict_entries_within_ttl() {
+        let _guard = lock_guard();
+        let id = "gc-test-fresh-entry";
+
+        mark_bridge_entry_seen(id);
+        WEBVIEW_BRIDGE_RESULTS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), sample_response());
+
+        // A generous ttl must not evict something marked moments ago.
+        let evicted = sweep_stale_bridge_entries(Duration::from_secs(600));
+        assert!(
+            !evicted.contains(&id.to_string()),
+            "fresh entry must not be evicted while within its TTL"
+        );
+        assert!(WEBVIEW_BRIDGE_RESULTS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .contains_key(id));
+
+        // Clean up so this entry doesn't linger for the rest of the test binary.
+        forget_bridge_entry_time(id);
+        WEBVIEW_BRIDGE_RESULTS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(id);
+    }
+
+    #[test]
+    fn sweep_is_a_noop_for_untracked_ids() {
+        let _guard = lock_guard();
+        // An id with no WEBVIEW_BRIDGE_ENTRY_TIMES entry (never marked) must
+        // never appear in the sweep's eviction list, and calling the sweep
+        // must not panic even if the map entry is absent from RESULTS too.
+        let evicted = sweep_stale_bridge_entries(Duration::ZERO);
+        assert!(!evicted.contains(&"gc-test-never-marked".to_string()));
+    }
+
+    #[test]
+    fn forget_bridge_entry_time_prevents_future_eviction() {
+        let _guard = lock_guard();
+        let id = "gc-test-forgotten";
+
+        mark_bridge_entry_seen(id);
+        forget_bridge_entry_time(id);
+        WEBVIEW_BRIDGE_RESULTS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), sample_response());
+
+        // No timestamp is tracked anymore, so ttl=0 must not touch this key
+        // (mirrors what happens on the normal collect_bridge_payload success
+        // path: forget happens right before/alongside removal from RESULTS).
+        let evicted = sweep_stale_bridge_entries(Duration::ZERO);
+        assert!(!evicted.contains(&id.to_string()));
+
+        // Cleanup.
+        WEBVIEW_BRIDGE_RESULTS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(id);
     }
 }

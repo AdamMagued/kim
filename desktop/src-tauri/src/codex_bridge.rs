@@ -6,25 +6,58 @@ use crate::screenshot_flash::show_screenshot_flash_impl;
 use crate::*;
 use tauri::Manager;
 
+/// Pure path-resolution half of `codex_bridge_dir`, split out so the
+/// "no home dir -> Err, never /tmp" rule is unit-testable without touching
+/// the real filesystem or the test process's actual home directory.
+fn build_codex_bridge_path(home: Option<std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
+    home.map(|h| h.join(".kim").join("codex_bridge")).ok_or_else(|| {
+        "Could not resolve the user's home directory; refusing to fall back to a \
+         world-writable shared path for the codex bridge directory."
+            .to_string()
+    })
+}
+
 /// Return the per-user, 0700 bridge directory (#14).
 /// Uses `$HOME/.kim/codex_bridge` instead of the world-readable `/tmp/codex_bridge`
 /// so other local users cannot inject commands or read bridge status.
-fn codex_bridge_dir() -> std::path::PathBuf {
-    let dir = dirs::home_dir()
-        .map(|h| h.join(".kim").join("codex_bridge"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/codex_bridge"));
-    // Best-effort: create with 0700 on Unix so other users cannot read/write.
+///
+/// AUDIT FIX #5:
+///   - `dirs::home_dir()` returning `None` (rare: no HOME/USERPROFILE, no
+///     passwd entry, etc.) previously fell back to the world-writable
+///     `/tmp/codex_bridge` — silently trading away the per-user isolation
+///     this function exists to provide. Now returns `Err` instead; the one
+///     caller (`start_bridge_file_watcher`) logs it and skips starting the
+///     watcher rather than running it against an insecure shared directory.
+///   - The `0o700` permission was previously only (re-)applied inside the
+///     `!dir.exists()` branch, i.e. only on first creation. If the directory
+///     already existed with looser permissions (pre-existing installs,
+///     manual tampering, a restore from a backup with different perms), it
+///     was never corrected on subsequent runs. The chmod now runs every
+///     time this function is called, regardless of whether the directory
+///     was just created or already existed.
+fn codex_bridge_dir() -> Result<std::path::PathBuf, String> {
+    let dir = build_codex_bridge_path(dirs::home_dir())?;
+
     if !dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("[Kim] codex_bridge_dir: create_dir_all failed: {}", e);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            format!("codex_bridge_dir: create_dir_all({}) failed: {e}", dir.display())
+        })?;
+    }
+
+    // Re-verified/re-applied on every call, not just on first creation, so a
+    // directory that pre-existed with looser permissions gets corrected too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+            eprintln!(
+                "[Kim] codex_bridge_dir: set_permissions(0700) failed for {}: {e}",
+                dir.display()
+            );
         }
     }
-    dir
+
+    Ok(dir)
 }
 
 /// Spawn a background thread that:
@@ -34,7 +67,15 @@ fn codex_bridge_dir() -> std::path::PathBuf {
 ///    `/browser status` command can report the current bridge state.
 pub(crate) fn start_bridge_file_watcher(app_handle: tauri::AppHandle) {
     std::thread::spawn(move || {
-        let bridge_dir = codex_bridge_dir();
+        let bridge_dir = match codex_bridge_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                // AUDIT FIX #5: no insecure /tmp fallback — skip starting the
+                // watcher entirely rather than run it against a shared path.
+                eprintln!("[Kim] codex bridge file watcher disabled: {e}");
+                return;
+            }
+        };
         let cmd_path = bridge_dir.join("browser_cmd.json");
         let status_path = bridge_dir.join("bridge_status.json");
 
@@ -168,6 +209,25 @@ fn url_to_site(url: &str) -> &'static str {
 #[cfg(test)]
 mod codex_bridge_tests {
     use super::*;
+
+    // AUDIT FIX #5: build_codex_bridge_path must never produce a /tmp (or
+    // any other shared-location) fallback -- a missing home dir is an Err,
+    // full stop.
+    #[test]
+    fn no_home_dir_is_an_error_not_a_tmp_fallback() {
+        let err = build_codex_bridge_path(None).expect_err("None home must be Err");
+        assert!(
+            !err.to_ascii_lowercase().contains("/tmp"),
+            "error message must not suggest a /tmp fallback path: {err}"
+        );
+    }
+
+    #[test]
+    fn home_dir_resolves_to_dot_kim_codex_bridge() {
+        let home = std::path::PathBuf::from("/Users/someone");
+        let dir = build_codex_bridge_path(Some(home.clone())).expect("Some(home) must be Ok");
+        assert_eq!(dir, home.join(".kim").join("codex_bridge"));
+    }
 
     // L-BRIDGE-9: signed-in heuristic must not trip on slugs merely containing
     // auth-ish substrings, but must catch real login/auth pages.
