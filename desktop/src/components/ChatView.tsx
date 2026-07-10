@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { Dispatch, SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type { SessionInfo, Settings, KimAccount, PermissionMode } from '../types';
+import type { PendingTask } from './chat/types';
 import { toast } from './Toast';
 import { ErrorBoundary } from './ErrorBoundary';
 import { ConnectorsPanel } from './kim-ui';
@@ -139,6 +141,11 @@ interface Props {
   /** Mutable ref written by App; ChatView stores its openConnectors callback here
    *  so App can trigger the panel without a global CustomEvent bus. */
   openConnectorsRef?: { current: (() => void) | null };
+  /** V-audit #1: queued-follow-up store lifted to App.tsx so it survives a
+   *  ChatView remount (New Chat / session switch) instead of being silently
+   *  dropped. See useTaskRunner's queueKeyRef for how a bucket is chosen. */
+  queuedTasksStore?: Record<string, PendingTask[]>;
+  setQueuedTasksStore?: Dispatch<SetStateAction<Record<string, PendingTask[]>>>;
 }
 
 export function ChatView({
@@ -160,6 +167,8 @@ export function ChatView({
   onSelectSession,
   onSelectProject,
   openConnectorsRef,
+  queuedTasksStore,
+  setQueuedTasksStore,
 }: Props) {
   const [localProvider, setLocalProvider] = useState<string | null>(null);
   const [messageReloadNonce, setMessageReloadNonce] = useState(0);
@@ -323,6 +332,8 @@ export function ChatView({
     browserCommandArgs,
     stream,
     scroll,
+    queuedTasksStore,
+    setQueuedTasksStore,
   });
 
   // ── Reset state when entering a new chat ─────────────────────────────────────

@@ -17,6 +17,7 @@ import { ToastProvider, toast } from './components/Toast';
 
 import type { SessionInfo, Settings, AccentTheme, KimAccount } from './types';
 import { DEFAULT_SETTINGS } from './types';
+import type { PendingTask } from './components/chat/types';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -129,6 +130,14 @@ export default function App() {
   // New-Chat switch) reads this to re-derive that its session's run is still
   // running and re-attach to the live stream instead of orphaning it.
   const [activeRun, setActiveRun] = useState<{ runId: string; sessionId: string } | null>(null);
+  // V-audit #1: queued follow-up messages, lived ABOVE the ChatView remount
+  // boundary for the same reason as activeRun above — a full ChatView remount
+  // (New Chat / session switch) used to silently drop any queued messages,
+  // breaking the UI's own promise ("Kim will run it automatically next").
+  // Keyed by session id (see useTaskRunner's queueKeyRef); ChatView reads any
+  // pre-existing queue for its session on mount instead of always starting
+  // empty.
+  const [queuedTasksStore, setQueuedTasksStore] = useState<Record<string, PendingTask[]>>({});
   const [activeTab, setActiveTab] = useState<'chat' | 'code'>('chat');
   const [activeProjectPath, setActiveProjectPath] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -608,6 +617,8 @@ export default function App() {
           recentSessions={activeTab === 'code' ? codexSessions : kimSessions}
           onSelectSession={handleSelectSession}
           openConnectorsRef={openConnectorsRef}
+          queuedTasksStore={queuedTasksStore}
+          setQueuedTasksStore={setQueuedTasksStore}
         />
       </main>
 
