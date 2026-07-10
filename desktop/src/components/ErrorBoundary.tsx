@@ -2,6 +2,22 @@ import React from "react";
 
 interface Props {
   children: React.ReactNode;
+  /**
+   * V-audit #7: optional scoped fallback. When provided, it replaces the
+   * default app-wide "Something went wrong" / Reload screen with a narrower
+   * one (e.g. "this conversation failed to render") that doesn't blank the
+   * rest of the app (sidebar, session navigation, etc). Receives the caught
+   * error's message and a `reset` callback that clears the boundary's error
+   * state in place, without a full `window.location.reload()`.
+   */
+  fallback?: (message: string, reset: () => void) => React.ReactNode;
+  /**
+   * When this value changes while the boundary is showing an error, the
+   * boundary automatically resets — e.g. pass the active session id so
+   * navigating to a different conversation clears a stale crash instead of
+   * leaving the fallback stuck on screen for content that's no longer shown.
+   */
+  resetKey?: string | number | null;
 }
 
 interface State {
@@ -36,12 +52,28 @@ export class ErrorBoundary extends React.Component<Props, State> {
     }
   }
 
+  override componentDidUpdate(prevProps: Props) {
+    // V-audit #7: auto-clear a stale crash when the caller signals the
+    // underlying content changed (e.g. the user navigated to a different
+    // session) rather than leaving the scoped fallback stuck on screen.
+    if (this.state.hasError && prevProps.resetKey !== this.props.resetKey) {
+      this.reset();
+    }
+  }
+
+  private reset = () => {
+    this.setState({ hasError: false, message: "" });
+  };
+
   private handleReload = () => {
     window.location.reload();
   };
 
   override render() {
     if (this.state.hasError) {
+      if (this.props.fallback) {
+        return this.props.fallback(this.state.message, this.reset);
+      }
       return (
         <div
           style={{

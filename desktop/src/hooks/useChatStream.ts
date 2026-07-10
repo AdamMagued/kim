@@ -6,7 +6,7 @@ import type { ActivityItem, PendingTask, HitlApprovalStatus, LivePlanParsed } fr
 import type { SessionInfo, Settings } from '../types';
 import { parseAgentLine, buildThinkingTrace } from '../components/chat/parsers';
 import { browserSiteFromProvider, friendlyError, parsePlanFromActivity, TOOL_MAP } from '../components/chat/utils';
-import {
+import { parkOrphanedRunSnapshotIfOwned, flushOrphanedRunSnapshots, useCappedState } from './runSnapshotStore'; import {
   KimEventNames,
   type KimActivityPayload,
   type KimAnswerPayload,
@@ -121,7 +121,7 @@ export function useChatStream({
   const [elapsed, setElapsed] = useState(0);
   const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
   const [contextState, setContextState] = useState<{ cumulative_input: number; budget: number; phase: string; percent: number; last_input: number; last_output: number; source: string; estimate: boolean } | null>(null);
-  const [liveHistory, setLiveHistory] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const [liveHistory, setLiveHistory] = useCappedState<{ role: 'user' | 'assistant'; content: string }>(MAX_ACTIVITY_ITEMS);
   const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
   const [hitlApprovalStatus, setHitlApprovalStatus] = useState<HitlApprovalStatus | null>(null);
   const [runFailure, setRunFailure] = useState<{ reason: string; recoverable: boolean; suggestion: string } | null>(null);
@@ -212,7 +212,7 @@ export function useChatStream({
   // session. Foreign-run events (a run started under a different session that is
   // still streaming after a switch) are dropped so run A never mutates view B.
   const belongsToView = useCallback(
-    (sid?: string | null) => !sid || sid === activeResumeSessionIdRef.current,
+    (sid?: string | null) => sid === undefined || sid === null || sid === activeResumeSessionIdRef.current,
     [],
   );
 
@@ -784,7 +784,7 @@ export function useChatStream({
     }).then(fn => { if (!cancelled) unlistenError = fn; else fn(); });
 
     listen<boolean>('kim-agent-done', event => {
-      invoke('set_task_active_mode', { active: false }).catch(() => {});
+      invoke('set_task_active_mode', { active: false }).catch(() => {}); flushOrphanedRunSnapshots(activeResumeSessionIdRef.current);
       // RUN-IDENTITY (B4/B5/D1): kim-agent-done is a global signal and only ONE
       // run is ever active. A view that doesn't own the run (e.g. a New-Chat or
       // other-session view mounted after the user switched away mid-run) must
@@ -920,7 +920,7 @@ export function useChatStream({
       currentRunIdRef.current = null;
     }).then(fn => { if (!cancelled) unlistenCancelled = fn; else fn(); });
 
-    return () => {
+    return () => { parkOrphanedRunSnapshotIfOwned({ isRunning: isRunningRef.current, runOwnerSessionId: runOwnerSessionIdRef.current, fallbackSessionId: activeResumeSessionIdRef.current, activity: activityRef.current, priorRuns: runHistoryRef.current, startedAt: startTimeRef.current, provider: currentTaskRef.current?.provider ?? null, completedCodeSession: completedCodeSessionRef.current, fallbackSessionDate: sessionRef.current?.date ?? null, kimSessionsDir: settingsRef.current.kim_sessions_dir || null, codexSessionsDir: settingsRef.current.codex_sessions_dir || null });
       // Fix 2: mark this effect instance as dead so any in-flight listen() promises
       // that resolve after this cleanup immediately call their unlisten fn.
       cancelled = true;
