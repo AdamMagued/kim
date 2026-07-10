@@ -367,7 +367,7 @@ def cmd_send(args):
     if not args.json:
         print(f"Task started (session: {session_id}). Waiting for completion...")
 
-    timeout = args.timeout or 300
+    timeout = args.timeout
     deadline = time.time() + timeout
     poll_interval = 0.5
     last_offset = 0
