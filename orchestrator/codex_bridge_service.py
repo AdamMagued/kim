@@ -28,6 +28,7 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -53,6 +54,11 @@ from codex_engine.thread_state import (
     reset_thread_state,
     save_thread_state,
 )
+# Reuse scheduled_runner's process-tree kill helper (finding 3) instead of a
+# bare process.kill(), which only signals the single codex-exec PID and
+# orphans any shell/tool subprocess codex itself spawned. scheduled_runner
+# already solved this exact problem for its own child agents.
+from orchestrator.scheduled_runner import _kill_process_tree
 from orchestrator.codex_appserver_transport import (
     compact_codex_thread,
     parse_decision_line,
@@ -124,11 +130,19 @@ _active_proxy: Optional[_CodexProxy] = None
 
 
 def _cleanup_sync() -> None:
-    """Kill the active Codex process. Called from atexit and SIGTERM handler."""
+    """Kill the active Codex process (and its process group). Called from
+    atexit and SIGTERM handler.
+
+    A bare proc.kill() only signals the codex-exec PID, orphaning any
+    shell/tool subprocess codex itself spawned (finding 3) — the same class
+    of bug the timeout handling below fixes. The process is spawned with
+    start_new_session=True (POSIX) / CREATE_NEW_PROCESS_GROUP (Windows), so
+    _kill_process_tree can reap the whole group here too.
+    """
     proc = _active_process
     if proc is not None:
         try:
-            proc.kill()
+            _kill_process_tree(proc.pid)
         except Exception:
             pass
     # The aiohttp proxy lives in the same process — it shuts down with us.
@@ -755,6 +769,18 @@ async def _run_exec_task(
         cmd.append("--skip-git-repo-check")
     cmd += ["-C", args.cwd, args.task]
 
+    # Spawn as a session/process-group leader so a timeout or cancellation can
+    # kill codex AND every shell/tool subprocess it spawned, not just the
+    # single codex-exec PID (finding 3). Mirrors scheduled_runner.py's own
+    # spawn — POSIX gets start_new_session (pgid == pid, killed via
+    # os.killpg in _kill_process_tree); Windows gets a new process group
+    # (killed via `taskkill /T`).
+    _group_kwargs: dict = {}
+    if sys.platform == "win32":
+        _group_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        _group_kwargs["start_new_session"] = True
+
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -763,6 +789,7 @@ async def _run_exec_task(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=_STREAM_LIMIT,
+            **_group_kwargs,
         )
         _active_process = process
 
@@ -803,7 +830,10 @@ async def _run_exec_task(
         except asyncio.TimeoutError:
             logger.error("Codex subprocess timed out after %ds", task_timeout)
             try:
-                process.kill()
+                # Kill the whole process group, not just codex-exec itself —
+                # a bare process.kill() orphaned any shell/tool subprocess
+                # codex had spawned (finding 3).
+                _kill_process_tree(process.pid)
                 await asyncio.wait_for(process.wait(), timeout=5)
             except Exception:
                 pass
@@ -821,7 +851,8 @@ async def _run_exec_task(
         except asyncio.TimeoutError:
             logger.error("Codex subprocess did not exit after its pipes closed — killing it")
             try:
-                process.kill()
+                # Same process-group kill as above (finding 3).
+                _kill_process_tree(process.pid)
                 exit_code = await asyncio.wait_for(process.wait(), timeout=5)
             except Exception:
                 print(

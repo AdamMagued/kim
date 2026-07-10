@@ -64,19 +64,36 @@ _DEFAULT_CONFIG_YAML = "browser_provider: {}\ncodex_bridge:\n  transport: exec\n
 
 
 def make_fake_codex_binary(
-    dir_path: Path, *, sleep_s: float = 0.0, exit_code: int = 0
+    dir_path: Path, *, sleep_s: float = 0.0, exit_code: int = 0, spawn_child: bool = False
 ) -> Path:
-    """Write an executable script that records its argv+env+pid, then exits."""
+    """Write an executable script that records its argv+env+pid, then exits.
+
+    spawn_child=True additionally forks off a long-sleeping grandchild
+    process (its pid recorded to child_pid.txt) and does NOT wait for it —
+    mirroring a shell/tool subprocess codex exec itself launches. Used to
+    prove a timeout kill reaps the whole process tree, not just the direct
+    codex-exec PID (finding 3).
+    """
     dir_path.mkdir(parents=True, exist_ok=True)
     script = dir_path / "fake-codex"
+    child_spawn_code = (
+        """
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+with open(os.path.join(base, "child_pid.txt"), "w") as f:
+    f.write(str(child.pid))
+"""
+        if spawn_child
+        else ""
+    )
     script.write_text(
         f"""#!{sys.executable}
-import json, os, sys, time
+import json, os, subprocess, sys, time
 base = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(base, "pid.txt"), "w") as f:
     f.write(str(os.getpid()))
 with open(os.path.join(base, "capture.json"), "w") as f:
     json.dump({{"argv": sys.argv[1:], "env": dict(os.environ)}}, f)
+{child_spawn_code}
 time.sleep({sleep_s})
 sys.exit({exit_code})
 """
@@ -106,6 +123,7 @@ async def run_bridge(
     exit_code: int = 0,
     config_yaml: str | None = None,
     binary_override: str | None = None,
+    spawn_child: bool = False,
 ):
     """Run _run_async end-to-end against a real fake codex binary.
 
@@ -127,7 +145,9 @@ async def run_bridge(
         (project / ".git").mkdir(exist_ok=True)
 
     bin_dir = tmp / "bin"
-    binary = make_fake_codex_binary(bin_dir, sleep_s=sleep_s, exit_code=exit_code)
+    binary = make_fake_codex_binary(
+        bin_dir, sleep_s=sleep_s, exit_code=exit_code, spawn_child=spawn_child
+    )
 
     config_path = tmp / "config.yaml"
     config_path.write_text(config_yaml or _DEFAULT_CONFIG_YAML)
