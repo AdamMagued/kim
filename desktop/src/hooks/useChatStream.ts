@@ -211,8 +211,14 @@ export function useChatStream({
   // envelope (legacy/codex/bridge streams) or its session_id matches this view's
   // session. Foreign-run events (a run started under a different session that is
   // still streaming after a switch) are dropped so run A never mutates view B.
+  // V-audit #3: "no envelope" must mean the field is genuinely absent
+  // (undefined/null), not merely falsy — `!sid` also matched an empty string,
+  // which would treat a real (if degenerate) foreign session_id of "" as "no
+  // session" and let it through. Compare against absence explicitly so an
+  // empty-string session_id is routed like any other non-matching id.
   const belongsToView = useCallback(
-    (sid?: string | null) => !sid || sid === activeResumeSessionIdRef.current,
+    (sid?: string | null) =>
+      sid === undefined || sid === null || sid === activeResumeSessionIdRef.current,
     [],
   );
 

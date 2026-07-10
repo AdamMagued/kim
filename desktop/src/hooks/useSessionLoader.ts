@@ -40,14 +40,12 @@ export function useSessionLoader({
 
     const isCodexContinuation =
       isSessionChange && prevId !== null && session.session_type === 'codex' && stream.hasSentMessageRef.current;
-    // L6 (documented, not changed): this compares a backend session id against
-    // the numeric task counter (PendingTask.id is 1,2,3…), so it is almost
-    // certainly never true. Left as-is because changing the comparison would
-    // alter session-transition semantics; the isCodexContinuation branch above
-    // covers the real seamless-transition case.
-    const isSelfTransition =
-      isSessionChange && prevId === null && session.session_id === stream.currentTaskRef.current?.id.toString();
-    const isSeamlessTransition = isSelfTransition || isCodexContinuation;
+    // V-audit #5: a former `isSelfTransition` check here compared a backend
+    // session UUID against `PendingTask.id` (a small monotonic in-memory
+    // counter) — two unrelated id spaces that can never coincide, so the
+    // branch was dead code. Removed; isCodexContinuation covers the real
+    // seamless-transition case.
+    const isSeamlessTransition = isCodexContinuation;
     lastLoadedSessionIdRef.current = session.session_id;
     setLoadError(null);
 

@@ -236,6 +236,18 @@ export function useTaskRunner({
     if (!failed) return;
 
     if (stream.isRunning) {
+      // V-audit #2: handleSubmit already refuses to auto-queue when the user
+      // has turned off "Queue messages while Kim is working" (D-C1 above) —
+      // Retry silently queued anyway, bypassing that setting. Apply the same
+      // guard here so Retry can't queue when Send wouldn't.
+      if (settings.allow_message_queue === false) {
+        toast(
+          'Kim is still working. Turn on "Queue messages" in Settings to line this up, or use Steer to fold it into the current task.',
+          'warning',
+          5000
+        );
+        return;
+      }
       setQueuedTasks(prev => [...prev, failed]);
       toast('Retry queued. It will run after the current task.', 'info', 3000);
       return;
