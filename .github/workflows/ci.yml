@@ -226,14 +226,14 @@ jobs:
           print('pyright: 0 errors')
           "
 
-      - name: flake8 lint (orchestrator)
+      - name: flake8 lint (orchestrator, kimctl)
         run: |
           # agent.py contains long single-line system-prompt literals that are
           # deliberately on one source line so they read as one paragraph to
           # the LLM. Breaking them would change the prompt content; instead
           # exempt that single file from line-length checks. Every other file
           # (incl. run_claw_bridge.py and providers/*) stays strict at 120.
-          flake8 orchestrator/ \
+          flake8 orchestrator/ kimctl/ \
             --max-line-length=120 \
             --extend-ignore=E203,W503 \
             --per-file-ignores=orchestrator/agent.py:E501 \
@@ -261,5 +261,6 @@ jobs:
             --cov=orchestrator \
             --cov=mcp_server \
             --cov=codex_engine \
+            --cov=kimctl \
             --cov-report=term \
             --cov-fail-under=60

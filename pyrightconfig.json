@@ -2,7 +2,8 @@
   "include": [
     "orchestrator",
     "mcp_server",
-    "codex_engine"
+    "codex_engine",
+    "kimctl"
   ],
   "pythonVersion": "3.11",
   "typeCheckingMode": "basic",
