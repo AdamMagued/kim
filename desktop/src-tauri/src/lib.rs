@@ -164,6 +164,18 @@ static WEBVIEW_BRIDGE_NOTIFY: OnceLock<(StdMutex<()>, Condvar)> = OnceLock::new(
 static WEBVIEW_NAV_READY: OnceLock<(StdMutex<bool>, Condvar)> = OnceLock::new();
 /// Tracks whether the browser window was hidden before a specific /v1/send request, so /v1/result knows to hide it after.
 static WEBVIEW_WAS_HIDDEN: OnceLock<StdMutex<std::collections::HashSet<String>>> = OnceLock::new();
+/// AUDIT FIX #3: first-seen timestamp for every bridge req_id tracked in
+/// WEBVIEW_BRIDGE_RESULTS/PROGRESS/WAS_HIDDEN. A caller that dies (task
+/// force-killed, HTTP client crashed) before ever polling /v1/result leaves
+/// its entries in those maps forever, since the only cleanup paths today
+/// run inside `collect_bridge_payload` (on success or its own timeout) --
+/// which never runs unless something actually calls /v1/result. This map
+/// backs a periodic sweep (`browser_bridge::sweep_stale_bridge_entries`,
+/// started by `browser_bridge::start_bridge_gc_sweeper`) that evicts
+/// orphaned entries after a bound (default 15 min) regardless of whether
+/// anyone ever polls for them.
+static WEBVIEW_BRIDGE_ENTRY_TIMES: OnceLock<StdMutex<HashMap<String, std::time::Instant>>> =
+    OnceLock::new();
 /// Debug/testing mode: keep the provider webview visible while sending.
 static WEBVIEW_KEEP_VISIBLE: OnceLock<StdMutex<bool>> = OnceLock::new();
 /// The site selected via /v1/provider, to be passed to the next agent spawn.
@@ -1129,6 +1141,10 @@ pub fn run() {
             start_bridge_file_watcher(app.handle().clone());
             // D6: start the 60s in-app scheduler tick loop.
             scheduler::start_scheduler(app.handle().clone());
+            // AUDIT FIX #3: periodic sweep evicting orphaned bridge
+            // result/progress entries left behind when a caller dies before
+            // polling /v1/result.
+            browser_bridge::start_bridge_gc_sweeper(app.handle().clone());
             Ok(())
         })
         .manage(schedule_timer_state)
