@@ -274,12 +274,15 @@ def _tools_cache_key(tools: list[dict]) -> tuple:
     name) without paying for a full JSON serialization on every call.
     """
     try:
+        def _param_keys(tool: dict) -> tuple | None:
+            params = tool.get("parameters")
+            return tuple(sorted(params.keys())) if isinstance(params, dict) else None
+
         return tuple(
             (
                 t.get("name"),
                 len(str(t.get("description") or "")),
-                tuple(sorted(t.get("parameters").keys()))
-                if isinstance(t.get("parameters"), dict) else None,
+                _param_keys(t),
             )
             for t in tools
         )
