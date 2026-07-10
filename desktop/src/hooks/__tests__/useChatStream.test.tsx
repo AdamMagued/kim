@@ -591,3 +591,27 @@ describe('useChatStream run identity', () => {
     expect(result.current.runOwnerSessionIdRef.current).toBeNull();
   });
 });
+
+// ── V-audit #6: liveHistory size cap (mirrors the 300-item activity cap) ──────
+describe('useChatStream liveHistory cap', () => {
+  it('caps liveHistory at 300 entries, dropping the oldest first', async () => {
+    const { result } = await renderStream();
+    act(() => {
+      for (let i = 0; i < 305; i++) {
+        result.current.setLiveHistory(prev => [...prev, { role: 'user', content: `msg ${i}` }]);
+      }
+    });
+    expect(result.current.liveHistory).toHaveLength(300);
+    // The 5 oldest (msg 0..4) were trimmed; the newest (msg 304) survives.
+    expect(result.current.liveHistory[0].content).toBe('msg 5');
+    expect(result.current.liveHistory[299].content).toBe('msg 304');
+  });
+
+  it('a direct (non-updater) setLiveHistory call is also capped', async () => {
+    const { result } = await renderStream();
+    const many = Array.from({ length: 320 }, (_, i) => ({ role: 'user' as const, content: `m${i}` }));
+    act(() => { result.current.setLiveHistory(many); });
+    expect(result.current.liveHistory).toHaveLength(300);
+    expect(result.current.liveHistory[0].content).toBe('m20');
+  });
+});

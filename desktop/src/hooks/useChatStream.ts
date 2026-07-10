@@ -31,6 +31,12 @@ import {
 } from '../types/events.gen';
 
 const MAX_ACTIVITY_ITEMS = 300;
+// V-audit #6: liveHistory (the rendered chat bubbles for the in-progress /
+// current-mount conversation) had no size cap, unlike the 300-item activity
+// feed above it. A very long-running session could grow this array without
+// bound. Mirror the activity cap's threshold and "keep the newest N" trim
+// behavior.
+const MAX_LIVE_HISTORY_ITEMS = MAX_ACTIVITY_ITEMS;
 
 // L4: named constant for the one non-generated event this hook listens to
 // (kim-run-id is emitted straight from Rust and isn't in KimEventNames).
@@ -121,7 +127,7 @@ export function useChatStream({
   const [elapsed, setElapsed] = useState(0);
   const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
   const [contextState, setContextState] = useState<{ cumulative_input: number; budget: number; phase: string; percent: number; last_input: number; last_output: number; source: string; estimate: boolean } | null>(null);
-  const [liveHistory, setLiveHistory] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const [liveHistory, setLiveHistoryRaw] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
   const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
   const [hitlApprovalStatus, setHitlApprovalStatus] = useState<HitlApprovalStatus | null>(null);
   const [runFailure, setRunFailure] = useState<{ reason: string; recoverable: boolean; suggestion: string } | null>(null);
@@ -132,6 +138,25 @@ export function useChatStream({
   const [typedLivePlan, setTypedLivePlan] = useState<LivePlanParsed | null>(null);
   // Fix 4: promote to state so consumers re-render when cancel status changes
   const [isCancelled, setIsCancelled] = useState(false);
+
+  // V-audit #6: single choke point for every liveHistory update (inside this
+  // hook AND from external callers like useTaskRunner/ChatView, which receive
+  // this same function via the hook's return value) so the 300-item cap
+  // applies everywhere liveHistory grows, not just at hand-picked call sites.
+  // Mirrors the activity feed's MAX_ACTIVITY_ITEMS trim-oldest behavior.
+  const setLiveHistory = useCallback(
+    (updater: React.SetStateAction<{ role: 'user' | 'assistant'; content: string }[]>) => {
+      setLiveHistoryRaw(prev => {
+        const next = typeof updater === 'function'
+          ? (updater as (p: typeof prev) => typeof prev)(prev)
+          : updater;
+        return next.length > MAX_LIVE_HISTORY_ITEMS
+          ? next.slice(next.length - MAX_LIVE_HISTORY_ITEMS)
+          : next;
+      });
+    },
+    []
+  );
 
   // Refs for tracking streams
   // Fix 3: mirror runHistory in a ref so the IPC persist call can live outside the state updater
