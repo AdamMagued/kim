@@ -69,6 +69,35 @@ pub enum AppEvent {
     },
     /// Turn lifecycle phase: started | completed | interrupted | failed.
     TurnPhase(String),
+    /// #2: Codex asked the user a question via `item/tool/requestUserInput`
+    /// (`kind == "questions"`) or an MCP elicitation form (`kind ==
+    /// "elicitation"` — the Python transport already auto-declines this one
+    /// without waiting, so the REPL only needs to show `message` for it).
+    /// Only the "questions" kind expects a `user_input` reply written back
+    /// to the child's stdin (mirrors how `ApprovalRequest` round-trips an
+    /// `approval_decision`).
+    UserInputRequest {
+        id: String,
+        kind: String,
+        // Parsed for wire-format parity with the app-server transport event
+        // (see typed_events.rs); not yet rendered anywhere in the terminal UI.
+        #[allow(dead_code)]
+        item_id: String,
+        message: String,
+        questions: Vec<UserInputQuestion>,
+    },
+}
+
+/// One question from a Codex `item/tool/requestUserInput` request (#2).
+#[derive(Debug, Clone)]
+pub struct UserInputQuestion {
+    /// Question id — echoed back as the key in the `answers` map. Falls back
+    /// to the question's array index when the event carries no `id`.
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    /// Suggested answer labels, if the question offered a closed set.
+    pub options: Vec<String>,
 }
 
 /// Control plumbing for one code-mode turn on the app-server transport

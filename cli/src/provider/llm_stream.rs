@@ -18,6 +18,25 @@ use super::{
 /// Formerly hardcoded inline as the slightly-wrong magic number 8096.
 const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 
+/// #3: request-wide deadline for direct-provider streaming calls (connect +
+/// headers + full body read). Mirrors `bridge.rs`'s `stream_via_bridge` 300s
+/// timeout — without one, a server that accepts the connection and then never
+/// sends more bytes hangs the turn forever.
+const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// #3: heartbeat cadence between SSE chunks. Mirrors `bridge.rs`'s 5s
+/// heartbeat so a mid-stream stall shows *something* instead of silence.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Finding #1 (HIGH): without a cap, a remote server that never terminates a
+/// line with `\n` would let `SseLineBuffer::buf` grow without bound (memory
+/// DoS). 512 KiB is generous for any legitimate single SSE line (even a huge
+/// streamed code block) while still bounding a pathological/hostile stream.
+/// Mirrors the existing bounded-buffer pattern elsewhere in this crate:
+/// `drain_stderr_tail`'s `MAX_TAIL_BYTES` (provider.rs) and `commands.rs`'s
+/// `MAX_OUTPUT_CHARS`.
+const MAX_BUFFER_BYTES: usize = 512 * 1024;
+
 /// F2/F16: byte-level SSE line assembler. Network chunks split multi-byte
 /// UTF-8 sequences at arbitrary offsets; decoding each chunk independently
 /// (the old `String::from_utf8_lossy` per chunk) corrupted any CJK/emoji/dash
@@ -35,8 +54,10 @@ impl SseLineBuffer {
     }
 
     /// Feed one network chunk; invokes `on_line` for each complete
-    /// (trimmed) line.
-    fn push_chunk(&mut self, bytes: &[u8], mut on_line: impl FnMut(&str)) {
+    /// (trimmed) line. Returns `Err` instead of growing `buf` past
+    /// `MAX_BUFFER_BYTES` when no line terminator has been found yet (#1) —
+    /// callers should propagate this as a clean stream error, not panic.
+    fn push_chunk(&mut self, bytes: &[u8], mut on_line: impl FnMut(&str)) -> Result<(), String> {
         self.buf.extend_from_slice(bytes);
         let mut start = 0usize;
         while let Some(rel) = self.buf[start..].iter().position(|&b| b == b'\n') {
@@ -48,6 +69,13 @@ impl SseLineBuffer {
         if start > 0 {
             self.buf.drain(..start);
         }
+        if self.buf.len() > MAX_BUFFER_BYTES {
+            return Err(format!(
+                "SSE line exceeded {MAX_BUFFER_BYTES} bytes without a line terminator \
+                 — aborting the stream to avoid unbounded memory growth"
+            ));
+        }
+        Ok(())
     }
 
     /// Flush any trailing line left after the stream ends.
@@ -116,6 +144,10 @@ pub(crate) async fn stream_openai_compatible(
             "messages": request_messages,
             "stream": true,
         }))
+        // #3: bound the whole request (connect + headers + full body read) so
+        // a stalled server can't hang the turn forever. Mirrors bridge.rs's
+        // `stream_via_bridge` 300s deadline.
+        .timeout(STREAM_TIMEOUT)
         .send()
         .await;
 
@@ -136,8 +168,21 @@ pub(crate) async fn stream_openai_compatible(
     let mut stream = resp.bytes_stream();
     let mut line_buf = SseLineBuffer::new();
     let mut parser = ThinkParser::new();
+    // #3: heartbeat between chunks so a mid-stream stall doesn't read as a
+    // silent hang — mirrors bridge.rs's `stream_via_bridge` heartbeat.
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.tick().await; // consume the immediate first tick
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            c = stream.next() => c,
+            _ = heartbeat.tick() => {
+                let _ = tx.send(AppEvent::ThoughtChunk(".".to_string()));
+                continue;
+            }
+        };
+        let Some(chunk) = chunk else { break };
         let bytes = match chunk {
             Err(e) => {
                 let _ = tx.send(AppEvent::Err(format!("Stream error: {e}")));
@@ -145,9 +190,12 @@ pub(crate) async fn stream_openai_compatible(
             }
             Ok(b) => b,
         };
-        line_buf.push_chunk(&bytes, |line| {
+        if let Err(e) = line_buf.push_chunk(&bytes, |line| {
             process_openai_sse_line(line, &mut parser, &tx);
-        });
+        }) {
+            let _ = tx.send(AppEvent::Err(e));
+            return;
+        }
     }
     line_buf.finish(|line| {
         process_openai_sse_line(line, &mut parser, &tx);
@@ -199,6 +247,8 @@ pub(crate) async fn stream_anthropic(
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .json(&body)
+        // #3: same 300s request-wide deadline as the OpenAI-compatible path.
+        .timeout(STREAM_TIMEOUT)
         .send()
         .await;
 
@@ -219,8 +269,20 @@ pub(crate) async fn stream_anthropic(
     let mut stream = resp.bytes_stream();
     let mut line_buf = SseLineBuffer::new();
     let mut parser = ThinkParser::new();
+    // #3: same heartbeat-between-chunks approach as the OpenAI-compatible path.
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.tick().await; // consume the immediate first tick
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            c = stream.next() => c,
+            _ = heartbeat.tick() => {
+                let _ = tx.send(AppEvent::ThoughtChunk(".".to_string()));
+                continue;
+            }
+        };
+        let Some(chunk) = chunk else { break };
         let bytes = match chunk {
             Err(e) => {
                 let _ = tx.send(AppEvent::Err(format!("Claude stream error: {e}")));
@@ -228,9 +290,12 @@ pub(crate) async fn stream_anthropic(
             }
             Ok(b) => b,
         };
-        line_buf.push_chunk(&bytes, |line| {
+        if let Err(e) = line_buf.push_chunk(&bytes, |line| {
             process_anthropic_sse_line(line, &mut parser, &tx);
-        });
+        }) {
+            let _ = tx.send(AppEvent::Err(e));
+            return;
+        }
     }
     line_buf.finish(|line| {
         process_anthropic_sse_line(line, &mut parser, &tx);
@@ -249,10 +314,46 @@ mod tests {
         let mut out = Vec::new();
         let mut buf = SseLineBuffer::new();
         for chunk in chunks {
-            buf.push_chunk(chunk, |line| out.push(line.to_string()));
+            buf.push_chunk(chunk, |line| out.push(line.to_string()))
+                .expect("test chunks stay under the cap");
         }
         buf.finish(|line| out.push(line.to_string()));
         out
+    }
+
+    // ── #1: unbounded SSE buffer growth is capped, not silently allowed ─────
+
+    #[test]
+    fn sse_line_buffer_errors_instead_of_growing_unbounded_past_cap() {
+        let mut buf = SseLineBuffer::new();
+        // Feed chunks well past MAX_BUFFER_BYTES with no '\n' anywhere — a
+        // hostile/broken server that never terminates a line. Before the fix
+        // this grew `buf` without bound; now it must return a clean error
+        // once the cap is exceeded, rather than continuing to allocate.
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut result = Ok(());
+        let mut fed = 0usize;
+        for _ in 0..(MAX_BUFFER_BYTES / chunk.len() + 4) {
+            result = buf.push_chunk(&chunk, |_| {});
+            fed += chunk.len();
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(
+            result.is_err(),
+            "expected an error once the buffer exceeded the cap"
+        );
+        assert!(
+            fed <= MAX_BUFFER_BYTES + chunk.len(),
+            "buffer must error out at or shortly after the cap, not keep growing silently \
+             (fed {fed} bytes before erroring, cap is {MAX_BUFFER_BYTES})"
+        );
+        assert!(
+            buf.buf.len() <= MAX_BUFFER_BYTES + chunk.len(),
+            "internal buffer must not keep growing past the cap: len={}",
+            buf.buf.len()
+        );
     }
 
     #[test]
