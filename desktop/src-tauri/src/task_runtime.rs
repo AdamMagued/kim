@@ -430,7 +430,13 @@ mod tests {
 
     // MAX_ATTEMPTS is referenced in write_stdin_line's error message
     // ("Gave up after N attempts") and drives the retry budget -- pin its
-    // value so a silent change doesn't quietly alter behavior.
+    // value so a silent change doesn't quietly alter behavior. clippy flags
+    // asserting on a const as pointless (it's evaluated at compile time),
+    // but the point here is regression protection: this is deliberately a
+    // `const` so a future edit that widens/narrows the retry budget trips
+    // this test (and its intent-documenting message) rather than silently
+    // changing behavior unnoticed.
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn max_attempts_is_small_and_bounded() {
         assert!(MAX_ATTEMPTS >= 2, "must actually retry at least once");
