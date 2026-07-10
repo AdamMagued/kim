@@ -6,7 +6,7 @@ import type { ActivityItem, PendingTask, HitlApprovalStatus, LivePlanParsed } fr
 import type { SessionInfo, Settings } from '../types';
 import { parseAgentLine, buildThinkingTrace } from '../components/chat/parsers';
 import { browserSiteFromProvider, friendlyError, parsePlanFromActivity, TOOL_MAP } from '../components/chat/utils';
-import {
+import { parkOrphanedRunSnapshotIfOwned, flushOrphanedRunSnapshots, useCappedState } from './runSnapshotStore'; import {
   KimEventNames,
   type KimActivityPayload,
   type KimAnswerPayload,
@@ -31,49 +31,10 @@ import {
 } from '../types/events.gen';
 
 const MAX_ACTIVITY_ITEMS = 300;
-// V-audit #6: liveHistory (the rendered chat bubbles for the in-progress /
-// current-mount conversation) had no size cap, unlike the 300-item activity
-// feed above it. A very long-running session could grow this array without
-// bound. Mirror the activity cap's threshold and "keep the newest N" trim
-// behavior.
-const MAX_LIVE_HISTORY_ITEMS = MAX_ACTIVITY_ITEMS;
 
 // L4: named constant for the one non-generated event this hook listens to
 // (kim-run-id is emitted straight from Rust and isn't in KimEventNames).
 const KIM_RUN_ID_EVENT = 'kim-run-id';
-
-// V-audit #4: a run that outlives its view never got its trace persisted.
-// `kim-agent-done` is a bare boolean with no session envelope, so only the
-// view that still "owns" the run (per RUN-IDENTITY) can react to it — a view
-// that unmounted mid-run (New Chat / session switch while a run is active)
-// loses its accumulated `activity`/`runHistory` refs entirely on unmount,
-// and no other view was ever listening for that session's events (belongsToView
-// filters them out), so there is nothing left to persist once `kim-agent-done`
-// finally arrives for a session nothing is displaying anymore.
-//
-// Fix: park a lightweight snapshot of "what this view had accumulated so far"
-// here — a plain module-level map, not React state, so it survives the
-// unmount that destroys the owning view's hooks/refs — keyed by the run's
-// owning session id. Since `belongsToView` already drops every further
-// session-scoped event for a foreign session app-wide, nothing new accrues
-// for that session after unmount anyway, so the snapshot captured right at
-// unmount time is exactly what the eventual `kim-agent-done` handler would
-// have persisted had the view stayed mounted. Whichever ChatView happens to
-// be mounted when `kim-agent-done` next fires (there is always exactly one)
-// flushes any snapshot that isn't its own session before running its normal
-// ownsRun-gated logic — see the kim-agent-done listener below.
-interface PendingRunSnapshot {
-  sessionId: string;
-  sessionDate: string | null;
-  kimDir: string | null;
-  codexDir: string | null;
-  runs: { activity: ActivityItem[]; durationSec: number; provider?: string | null }[];
-}
-const pendingRunSnapshots = new Map<string, PendingRunSnapshot>();
-// Exported so tests can reset module-level state between cases (this map
-// otherwise persists across every renderHook() in the same test file/run).
-// Not used by production code paths.
-export const __testOnlyPendingRunSnapshots = pendingRunSnapshots;
 
 function providerErrorMessage(code: string | null): string | null {
   if (!code) return null;
@@ -160,7 +121,7 @@ export function useChatStream({
   const [elapsed, setElapsed] = useState(0);
   const [tokenStats, setTokenStats] = useState<{ input: number; output: number; total: number } | null>(null);
   const [contextState, setContextState] = useState<{ cumulative_input: number; budget: number; phase: string; percent: number; last_input: number; last_output: number; source: string; estimate: boolean } | null>(null);
-  const [liveHistory, setLiveHistoryRaw] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const [liveHistory, setLiveHistory] = useCappedState<{ role: 'user' | 'assistant'; content: string }>(MAX_ACTIVITY_ITEMS);
   const [lastFailedTask, setLastFailedTask] = useState<PendingTask | null>(null);
   const [hitlApprovalStatus, setHitlApprovalStatus] = useState<HitlApprovalStatus | null>(null);
   const [runFailure, setRunFailure] = useState<{ reason: string; recoverable: boolean; suggestion: string } | null>(null);
@@ -171,25 +132,6 @@ export function useChatStream({
   const [typedLivePlan, setTypedLivePlan] = useState<LivePlanParsed | null>(null);
   // Fix 4: promote to state so consumers re-render when cancel status changes
   const [isCancelled, setIsCancelled] = useState(false);
-
-  // V-audit #6: single choke point for every liveHistory update (inside this
-  // hook AND from external callers like useTaskRunner/ChatView, which receive
-  // this same function via the hook's return value) so the 300-item cap
-  // applies everywhere liveHistory grows, not just at hand-picked call sites.
-  // Mirrors the activity feed's MAX_ACTIVITY_ITEMS trim-oldest behavior.
-  const setLiveHistory = useCallback(
-    (updater: React.SetStateAction<{ role: 'user' | 'assistant'; content: string }[]>) => {
-      setLiveHistoryRaw(prev => {
-        const next = typeof updater === 'function'
-          ? (updater as (p: typeof prev) => typeof prev)(prev)
-          : updater;
-        return next.length > MAX_LIVE_HISTORY_ITEMS
-          ? next.slice(next.length - MAX_LIVE_HISTORY_ITEMS)
-          : next;
-      });
-    },
-    []
-  );
 
   // Refs for tracking streams
   // Fix 3: mirror runHistory in a ref so the IPC persist call can live outside the state updater
@@ -269,14 +211,8 @@ export function useChatStream({
   // envelope (legacy/codex/bridge streams) or its session_id matches this view's
   // session. Foreign-run events (a run started under a different session that is
   // still streaming after a switch) are dropped so run A never mutates view B.
-  // V-audit #3: "no envelope" must mean the field is genuinely absent
-  // (undefined/null), not merely falsy — `!sid` also matched an empty string,
-  // which would treat a real (if degenerate) foreign session_id of "" as "no
-  // session" and let it through. Compare against absence explicitly so an
-  // empty-string session_id is routed like any other non-matching id.
   const belongsToView = useCallback(
-    (sid?: string | null) =>
-      sid === undefined || sid === null || sid === activeResumeSessionIdRef.current,
+    (sid?: string | null) => sid === undefined || sid === null || sid === activeResumeSessionIdRef.current,
     [],
   );
 
@@ -848,32 +784,7 @@ export function useChatStream({
     }).then(fn => { if (!cancelled) unlistenError = fn; else fn(); });
 
     listen<boolean>('kim-agent-done', event => {
-      invoke('set_task_active_mode', { active: false }).catch(() => {});
-
-      // V-audit #4: flush any run snapshot orphaned by a view that unmounted
-      // mid-run (see pendingRunSnapshots above). This runs unconditionally —
-      // independent of whether THIS view owns the run that just completed —
-      // because the trace, if any, was parked under the ORPHANED session's id,
-      // not this view's. A snapshot matching THIS view's own session is left
-      // alone (just dropped) so the normal ownsRun-gated save below — which has
-      // fresher, more complete data — is the one that persists it; flushing it
-      // here too would race two save_run_history calls for the same session
-      // (save_run_history overwrites the file, so the loser would clobber).
-      if (pendingRunSnapshots.size > 0) {
-        const thisViewSessionId = activeResumeSessionIdRef.current;
-        for (const [sid, snap] of pendingRunSnapshots) {
-          pendingRunSnapshots.delete(sid);
-          if (sid === thisViewSessionId) continue;
-          invoke('save_run_history', {
-            sessionId: snap.sessionId,
-            sessionDate: snap.sessionDate,
-            kimDir: snap.kimDir,
-            codexDir: snap.codexDir,
-            runs: snap.runs,
-          }).catch(() => {});
-        }
-      }
-
+      invoke('set_task_active_mode', { active: false }).catch(() => {}); flushOrphanedRunSnapshots(activeResumeSessionIdRef.current);
       // RUN-IDENTITY (B4/B5/D1): kim-agent-done is a global signal and only ONE
       // run is ever active. A view that doesn't own the run (e.g. a New-Chat or
       // other-session view mounted after the user switched away mid-run) must
@@ -1009,36 +920,7 @@ export function useChatStream({
       currentRunIdRef.current = null;
     }).then(fn => { if (!cancelled) unlistenCancelled = fn; else fn(); });
 
-    return () => {
-      // V-audit #4: this view is unmounting (New Chat / session switch / tab
-      // change). If it still owns an in-flight run, park what it has
-      // accumulated so far into pendingRunSnapshots (module scope, see above)
-      // so the eventual kim-agent-done for this session doesn't lose it. No
-      // further session-scoped event will land for this session anywhere in
-      // the app once this cleanup runs (every listener's belongsToView check
-      // is keyed to whichever view is CURRENTLY mounted), so this snapshot is
-      // already the final one for this run.
-      if (isRunningRef.current || runOwnerSessionIdRef.current) {
-        const sid = runOwnerSessionIdRef.current ?? activeResumeSessionIdRef.current;
-        const activitySnapshot = activityRef.current;
-        if (sid && activitySnapshot.length > 0) {
-          const startedAt = startTimeRef.current;
-          const durationSec = startedAt ? Math.max(1, Math.round((Date.now() - startedAt) / 1000)) : 0;
-          const completedCodeSession = completedCodeSessionRef.current;
-          pendingRunSnapshots.set(sid, {
-            sessionId: sid,
-            sessionDate: completedCodeSession?.date ?? sessionRef.current?.date ?? null,
-            kimDir: settingsRef.current.kim_sessions_dir || null,
-            codexDir: completedCodeSession?.project_path
-              ? `${completedCodeSession.project_path}/.codex/sessions`
-              : settingsRef.current.codex_sessions_dir || null,
-            runs: [
-              ...runHistoryRef.current,
-              { activity: activitySnapshot, durationSec, provider: currentTaskRef.current?.provider ?? null },
-            ],
-          });
-        }
-      }
+    return () => { parkOrphanedRunSnapshotIfOwned({ isRunning: isRunningRef.current, runOwnerSessionId: runOwnerSessionIdRef.current, fallbackSessionId: activeResumeSessionIdRef.current, activity: activityRef.current, priorRuns: runHistoryRef.current, startedAt: startTimeRef.current, provider: currentTaskRef.current?.provider ?? null, completedCodeSession: completedCodeSessionRef.current, fallbackSessionDate: sessionRef.current?.date ?? null, kimSessionsDir: settingsRef.current.kim_sessions_dir || null, codexSessionsDir: settingsRef.current.codex_sessions_dir || null });
       // Fix 2: mark this effect instance as dead so any in-flight listen() promises
       // that resolve after this cleanup immediately call their unlisten fn.
       cancelled = true;

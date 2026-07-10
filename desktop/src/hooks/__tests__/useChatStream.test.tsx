@@ -1,6 +1,7 @@
 import { renderHook, act } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { useChatStream, __testOnlyPendingRunSnapshots } from '../useChatStream';
+import { useChatStream } from '../useChatStream';
+import { __testOnlyPendingRunSnapshots } from '../runSnapshotStore';
 import { DEFAULT_SETTINGS } from '../../types';
 import type { TraceItem } from '../../components/kim-ui/ThinkingWithPlan';
 
