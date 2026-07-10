@@ -1,6 +1,6 @@
 import { renderHook, act } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { useChatStream } from '../useChatStream';
+import { useChatStream, __testOnlyPendingRunSnapshots } from '../useChatStream';
 import { DEFAULT_SETTINGS } from '../../types';
 import type { TraceItem } from '../../components/kim-ui/ThinkingWithPlan';
 
@@ -63,6 +63,7 @@ beforeEach(() => {
   listeners.clear();
   invokeMock.mockClear();
   invokeMock.mockResolvedValue(undefined);
+  __testOnlyPendingRunSnapshots.clear();
 });
 
 afterEach(() => {
@@ -613,5 +614,78 @@ describe('useChatStream liveHistory cap', () => {
     act(() => { result.current.setLiveHistory(many); });
     expect(result.current.liveHistory).toHaveLength(300);
     expect(result.current.liveHistory[0].content).toBe('m20');
+  });
+});
+
+// ── V-audit #4: a run that outlives its view still gets persisted ────────────
+describe('useChatStream orphaned-run persistence (V-audit #4)', () => {
+  it('a view that unmounts mid-run parks a snapshot that a LATER view flushes on kim-agent-done', async () => {
+    // View A owns an in-flight run for its session (conv-1).
+    const propsA = makeProps(); // conversationId: 'conv-1'
+    const viewA = renderHook(() => useChatStream(propsA));
+    await act(async () => {});
+    act(() => { viewA.result.current.setIsRunning(true); });
+    emit('kim:status', { message: 'working' }); // accumulate activity for the run
+    act(() => { viewA.result.current.flushActivityNow(); });
+    expect(viewA.result.current.activity.length).toBeGreaterThan(0);
+
+    // User switches away (New Chat) — view A unmounts mid-run. In the real
+    // app this destroys A's hook instance entirely; the run is still going
+    // in the backend.
+    viewA.unmount();
+    expect(__testOnlyPendingRunSnapshots.has('conv-1')).toBe(true);
+
+    // A different view (conv-2) is now mounted — e.g. the user started a new
+    // chat, or switched to another existing session. It never touched conv-1.
+    const propsB = { ...makeProps(), conversationId: 'conv-2' };
+    const viewB = renderHook(() => useChatStream(propsB));
+    await act(async () => {});
+
+    // The backend's run for conv-1 finishes. Only view B is mounted, so only
+    // its listener fires — but the orphaned conv-1 snapshot must still reach
+    // save_run_history instead of being silently dropped.
+    emit('kim-agent-done', true);
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      'save_run_history',
+      expect.objectContaining({ sessionId: 'conv-1' }),
+    );
+    // View B itself never owned a run — its own state must stay untouched
+    // (no error banner, no history entry filed under conv-2).
+    expect(viewB.result.current.taskError).toBeNull();
+    expect(viewB.result.current.runHistory).toHaveLength(0);
+    expect(__testOnlyPendingRunSnapshots.size).toBe(0);
+  });
+
+  it('does NOT double-save when the SAME session remounts and finishes normally (no race)', async () => {
+    const propsA = makeProps(); // conv-1
+    const viewA = renderHook(() => useChatStream(propsA));
+    await act(async () => {});
+    act(() => { viewA.result.current.setIsRunning(true); });
+    emit('kim:status', { message: 'working' });
+    act(() => { viewA.result.current.flushActivityNow(); });
+    viewA.unmount();
+    expect(__testOnlyPendingRunSnapshots.has('conv-1')).toBe(true);
+
+    // Same session remounts before the run finishes (switch-back / re-attach).
+    const propsA2 = { ...makeProps(), activeRunSessionId: 'conv-1', activeRunId: 'run-1' };
+    const viewA2 = renderHook(() => useChatStream(propsA2));
+    await act(async () => {});
+    expect(viewA2.result.current.isRunning).toBe(true); // re-derived via RUN-IDENTITY
+
+    // The re-attached view starts receiving this session's events again (the
+    // ones that happened while unmounted are gone, but new ones flow fine).
+    emit('kim:status', { message: 'still working' });
+    act(() => { viewA2.result.current.flushActivityNow(); });
+
+    emit('kim-agent-done', true);
+
+    // Exactly one save_run_history call for conv-1 (the normal ownsRun path),
+    // not two (which would race against the stale orphan snapshot).
+    const conv1Saves = invokeMock.mock.calls.filter(
+      ([name, args]) => name === 'save_run_history' && (args as { sessionId?: string })?.sessionId === 'conv-1'
+    );
+    expect(conv1Saves).toHaveLength(1);
+    expect(__testOnlyPendingRunSnapshots.size).toBe(0);
   });
 });
