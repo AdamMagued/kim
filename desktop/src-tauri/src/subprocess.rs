@@ -591,14 +591,27 @@ pub(crate) async fn send_task(
 ) -> Result<String, String> {
     use crate::task_spec;
 
-    // Refuse to start a second task if one is already running or spawning.
-    if crate::task_runtime::task_runtime()
-        .lock()
+    // AUDIT FIX #6: reserve the runner slot HERE, as the very first thing
+    // this function does, instead of merely checking occupancy here and
+    // reserving only right before spawn() much further down. The old
+    // "check-then-later-reserve" gap let two near-simultaneous send_task
+    // calls both pass this initial check and both run the async work below
+    // (build_gui_chat_spec / build_gui_codex_spec, which for Gemini
+    // triggers a live Google OAuth token refresh) before the second call's
+    // reserve finally rejected it -- wasting a real OAuth round-trip (and
+    // risking whatever side effects a concurrent refresh has) on a request
+    // that was always going to be refused. reserve_slot() performs the same
+    // occupancy check under the same lock and atomically reserves in one
+    // step, so there is no gap between "found free" and "marked occupied"
+    // for a second caller to race into.
+    //
+    // Every fallible step between this point and the eventual spawn() call
+    // must release the slot on its error path (spawn() already does this
+    // internally per its own doc comment; the spec-builder failure path
+    // below does it explicitly).
+    crate::spawn_supervisor::reserve_slot()
         .await
-        .is_occupied()
-    {
-        return Err("A task is already running. Stop it before starting a new one.".to_string());
-    }
+        .map_err(|_| "A task is already running. Stop it before starting a new one.".to_string())?;
     let app_config = app_handle.state::<config::AppConfig>();
 
     // The Kim repo root (interpreter, PYTHONPATH, cwd) vs the target project
@@ -663,10 +676,21 @@ pub(crate) async fn send_task(
         ollama_context_limit_override,
         context_budget_tokens,
     };
-    let (spec, was_claw) = if !is_codex {
-        (build_gui_chat_spec(&inputs, extra).await?, false)
+    // AUDIT FIX #6: the slot is already reserved (see top of function), so a
+    // failure building the spec here must release it explicitly -- unlike
+    // spawn() below, these builders have no reservation to release
+    // internally.
+    let spec_result = if !is_codex {
+        build_gui_chat_spec(&inputs, extra).await.map(|s| (s, false))
     } else {
-        build_gui_codex_spec(&inputs, extra, &app_handle, &app_config).await?
+        build_gui_codex_spec(&inputs, extra, &app_handle, &app_config).await
+    };
+    let (spec, was_claw) = match spec_result {
+        Ok(v) => v,
+        Err(e) => {
+            crate::spawn_supervisor::release_slot().await;
+            return Err(e);
+        }
     };
 
     // K1 + RUN-IDENTITY: announce this run's stable identity to the frontend at
@@ -693,11 +717,12 @@ pub(crate) async fn send_task(
         maybe_launch_chrome_for_cdp(&kim_root, bridge_cfg.is_none()).await;
     }
 
-    // Reserve the runner slot immediately before spawning, then hand the
-    // whole process lifecycle to the supervisor.
-    crate::spawn_supervisor::reserve_slot()
-        .await
-        .map_err(|_| "A task is already running. Stop it before starting a new one.".to_string())?;
+    // AUDIT FIX #6: the runner slot was already reserved at the very top of
+    // this function (before any async I/O), so no second reserve_slot()
+    // call belongs here anymore -- calling it again would spuriously fail
+    // ("already starting") against our own still-held reservation. Hand the
+    // whole process lifecycle to the supervisor directly; spawn() consumes
+    // the existing reservation and releases it internally on failure.
     let sup = crate::spawn_supervisor::spawn(spec).await?;
     // K7: reflect the running task in the tray status line.
     crate::speed_access::set_tray_status(&app_handle, Some(task.as_str()));
