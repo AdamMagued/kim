@@ -251,5 +251,99 @@ class ApprovalResolverTests(unittest.TestCase):
         self.assertTrue(result["approved"])
 
 
+# ---------------------------------------------------------------------------
+# _execute_tool's hard-block enforcement (finding 2)
+# ---------------------------------------------------------------------------
+#
+# Previously, when the client-side InteractionPolicy hard-blocked a tool
+# (hitl_block_high_risk / KIM_HITL_BLOCK_HIGH_RISK), _execute_tool fell
+# through un-executed WITHOUT ever calling the UI bridge, on the assumption
+# that the MCP server's own, separately-configured gate (a different config
+# key: mcp_server hitl_risk_threshold) would independently also classify
+# this tool+args as needing approval and pause on the ApprovalBroker. That
+# assumption doesn't hold in general, so a "hard-blocked" tool could execute
+# with a human never actually asked. These tests pin the fixed behavior:
+# _execute_tool now always resolves the hard-block itself through the same
+# resolver _make_approval_resolver() builds for server-originated requests.
+
+
+class ExecuteToolHardBlockTests(unittest.TestCase):
+
+    def test_hard_block_asks_the_ui_bridge_and_executes_on_accept(self):
+        agent = _make_agent(block_high_risk=True)
+        agent._ui_bridge.decide_action = AsyncMock(return_value="accept")
+        result = _run(agent._execute_tool("run_command", {"cmd": "echo hi"}))
+        self.assertEqual(result, "tool_output")
+        agent._ui_bridge.decide_action.assert_called_once()
+        call_args, _ = agent._ui_bridge.decide_action.call_args
+        self.assertEqual(call_args[0], "run_command")
+        agent.session.call_tool.assert_called_once()
+
+    def test_hard_block_denies_execution_on_decline(self):
+        agent = _make_agent(block_high_risk=True)
+        agent._ui_bridge.decide_action = AsyncMock(return_value="decline")
+        result = _run(agent._execute_tool("run_command", {"cmd": "echo hi"}))
+        self.assertIn("HITL_REQUIRED", result)
+        agent._ui_bridge.decide_action.assert_called_once()
+        agent.session.call_tool.assert_not_called()
+
+    def test_hard_block_accept_for_session_also_executes(self):
+        agent = _make_agent(block_high_risk=True)
+        agent._ui_bridge.decide_action = AsyncMock(return_value="acceptForSession")
+        result = _run(agent._execute_tool("run_command", {"cmd": "echo hi"}))
+        self.assertEqual(result, "tool_output")
+        agent.session.call_tool.assert_called_once()
+
+    def test_hard_block_without_ui_bridge_fails_closed(self):
+        # No UI bridge means nothing can ask a human — the resolver declines
+        # (bridge is None) and the tool must NOT execute.
+        agent = _make_agent(block_high_risk=True, has_bridge=False)
+        result = _run(agent._execute_tool("run_command", {"cmd": "echo hi"}))
+        self.assertIn("HITL_REQUIRED", result)
+        agent.session.call_tool.assert_not_called()
+
+    def test_hard_block_fires_regardless_of_hitl_risk_threshold(self):
+        # THE regression this finding is about: the old fallthrough also
+        # required self._hitl_risk_threshold to be truthy — an unrelated,
+        # separately-configured value (the MCP server's OWN gate) that has
+        # nothing to do with whether this client-side hard-block should ask
+        # for approval. With it unset (None), the tool must still go
+        # through the approval gate — and be blocked on decline — instead
+        # of silently executing.
+        agent = _make_agent(block_high_risk=True, hitl_threshold=None)
+        agent._ui_bridge.decide_action = AsyncMock(return_value="decline")
+        result = _run(agent._execute_tool("run_command", {"cmd": "echo hi"}))
+        self.assertIn("HITL_REQUIRED", result)
+        agent._ui_bridge.decide_action.assert_called_once()
+        agent.session.call_tool.assert_not_called()
+
+    def test_hard_block_preview_mode_auto_accepts_without_double_prompt(self):
+        # Preview mode's blanket confirm_action already asked about this
+        # exact call before _execute_tool was reached; the shared resolver's
+        # own preview auto-accept (same as the server-originated path) must
+        # let it through without asking a second time.
+        agent = _make_agent(block_high_risk=True, preview_mode=True)
+        agent._ui_bridge.decide_action = AsyncMock(return_value="decline")
+        result = _run(agent._execute_tool("run_command", {"cmd": "echo hi"}))
+        self.assertEqual(result, "tool_output")
+        agent._ui_bridge.decide_action.assert_not_called()
+        agent.session.call_tool.assert_called_once()
+
+    def test_non_hard_block_policy_denial_still_returns_message_unconditionally(self):
+        # Non-HITL hard blocks (e.g. InteractionPolicy's stale/unknown
+        # element_id POLICY_BLOCK for web_click) are NOT approval requests
+        # and must keep being enforced unconditionally, with no detour
+        # through the UI bridge — the "HITL_REQUIRED" in decision.message
+        # check keeps this path (hard_block=True, but a different message)
+        # from being routed through the new approval-resolver detour.
+        agent = _make_agent(block_high_risk=False)
+        agent._ui_bridge.decide_action = AsyncMock(return_value="accept")
+        agent._interaction_policy.web_generation = 1  # simulate a prior web_observe
+        result = _run(agent._execute_tool("web_click", {"element_id": "w99"}))
+        self.assertIn("POLICY_BLOCK", result)
+        agent._ui_bridge.decide_action.assert_not_called()
+        agent.session.call_tool.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

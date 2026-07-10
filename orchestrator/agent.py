@@ -1307,18 +1307,43 @@ class KimAgent:
             self._log(level, f"[POLICY] {decision.message}")
 
         if not decision.allowed:
-            # HITL hard-blocks (block_high_risk mode) defer to the interactive
-            # server-side gate when one can actually fire (threshold + bridge,
-            # same conditions the old agent-side gate used): the MCP server
-            # pauses on the approval broker and the user decides. All other
-            # policy blocks (staleness, unknown IDs…) are enforced
-            # unconditionally.
-            if (decision.hard_block
-                    and "HITL_REQUIRED" in decision.message
-                    and self._hitl_risk_threshold
-                    and self._ui_bridge is not None
-                    and not self._is_preview_mode()):
-                pass
+            if decision.hard_block and "HITL_REQUIRED" in decision.message:
+                # Client-side hard-block (hitl_block_high_risk /
+                # KIM_HITL_BLOCK_HIGH_RISK). This used to fall through
+                # un-executed on the ASSUMPTION that the MCP server's own,
+                # separately-configured policy (mcp_server/policy.py, its
+                # own hitl_risk_threshold / KIM_HITL_RISK_THRESHOLD) would
+                # independently also classify this exact tool+args as
+                # needing approval and pause on the ApprovalBroker — but
+                # that server-side gate can disagree with this client-side
+                # one (different config key, different classification), so
+                # a tool the user believed was hard-blocked could execute
+                # with a human never actually asked (finding 2).
+                #
+                # This side now enforces its own block unconditionally: it
+                # invokes the SAME resolver _make_approval_resolver() builds
+                # for server-originated HITL requests (K1) — the identical
+                # id generation, hitl_approval_request/result events,
+                # preview-mode auto-accept (preview's blanket
+                # confirm_action already asked the user about this exact
+                # call before _execute_tool was reached — see the call
+                # sites above), and "no bridge → decline" fail-closed
+                # behavior — so there is exactly one approval mechanism in
+                # this process, not two that can disagree. Only a decision
+                # of "accept"/"acceptForSession" lets execution continue
+                # below; anything else (decline, no bridge) returns the
+                # blocking message like every other policy block.
+                resolver = self._make_approval_resolver()
+                hitl_decision = await resolver({
+                    "tool": name,
+                    "risk": "high",
+                    "reason": decision.message,
+                    "preview": json.dumps(args or {}, default=str)[:200],
+                    "args": args or {},
+                })
+                if hitl_decision not in ("accept", "acceptForSession"):
+                    return decision.message
+                # Approved — fall through and execute the tool below.
             else:
                 return decision.message
 
