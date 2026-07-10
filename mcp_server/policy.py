@@ -148,6 +148,24 @@ _SAFE_DEV_PATHS = frozenset({
     "/dev/tty", "/dev/urandom", "/dev/zero",
 })
 
+# ---------------------------------------------------------------------------
+# Tools that ALWAYS require human approval, independent of hitl_risk_threshold.
+#
+# run_python / run_node accept an inline `code` string that is never routed
+# through validate_path, and the only other control on that string is a
+# regex/token blocklist in mcp_server/tools/code.py — trivially bypassed
+# (e.g. a hardcoded absolute path to a secret file, or importlib-based
+# indirection around the `import os` check). Because hitl_risk_threshold is
+# unset by default (see hitl_threshold() above), the configurable
+# risk-threshold arm alone would leave inline code execution completely
+# unguarded out of the box. These tools are therefore hard-escalated to a
+# human decision unconditionally — the same unconditional-escalation pattern
+# already used for run_powershell (whose grammar can't be argv-analysed
+# either). This is a structural gate, not an extension of the blocklist: no
+# threshold setting, misconfiguration, or blocklist gap can allow one of
+# these calls to dispatch without a human in the loop.
+_ALWAYS_APPROVE_TOOLS = frozenset({"run_python", "run_node"})
+
 
 def _check_one_path(value: str) -> str | None:
     """validate_path with ~ expansion. Returns an error string or None."""
@@ -720,6 +738,18 @@ def _enforce(name: str, args: dict) -> PolicyDecision:
         escalations = ("powershell_script_unanalyzed",)
         reason = escalations[0]
         signature = f"run_powershell:script={str(args.get('script', '')).strip()}"
+    elif name in _ALWAYS_APPROVE_TOOLS:
+        # Unconditional escalation (see _ALWAYS_APPROVE_TOOLS docstring above):
+        # fires regardless of hitl_risk_threshold, including when the
+        # threshold arm is inert (unset/invalid). The session-cache signature
+        # is scoped to the exact code/file payload — NOT just the tool name —
+        # so approving one run_python(code="…") call can never pre-approve a
+        # later call with different code (the same "accept for session" trap
+        # G5 already fixes for write_file/run_command/run_powershell above).
+        escalations = ("mandatory_code_execution_approval",)
+        reason = escalations[0]
+        payload = str(args.get("code") or args.get("file") or "").strip()
+        signature = f"{name}:payload={payload}"
 
     threshold = hitl_threshold()
     over_threshold = bool(
