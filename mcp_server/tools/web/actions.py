@@ -26,10 +26,14 @@ async def handle_web_click(args: dict) -> str:
     el_id = str(args.get("element_id", "")).strip()
     if not el_id:
         return "ERROR: element_id is required"
-    selector, err = await resolution._resolve_selector(el_id)
+    page = await browser._page()
+    # Pass `page` so a selector that no longer uniquely identifies one element
+    # (cssPath()'s 6-level ancestor truncation can collide on repetitive
+    # markup) is disambiguated or rejected instead of silently acting on
+    # `.first` — see resolution._resolve_selector (#4).
+    selector, err = await resolution._resolve_selector(el_id, page)
     if not selector:
         return err
-    page = await browser._page()
     try:
         locator = page.locator(selector).first
         await locator.scroll_into_view_if_needed(timeout=6000)
@@ -45,10 +49,10 @@ async def handle_web_fill(args: dict) -> str:
     text = str(args.get("text", ""))
     if not el_id:
         return "ERROR: element_id is required"
-    selector, err = await resolution._resolve_selector(el_id)
+    page = await browser._page()
+    selector, err = await resolution._resolve_selector(el_id, page)
     if not selector:
         return err
-    page = await browser._page()
     try:
         await page.locator(selector).first.fill(text, timeout=6000)
     except Exception as e:
@@ -79,9 +83,9 @@ def _coerce_bool(value: Any) -> bool | None:
 
 async def _act_on_element(page, element_id: str, action: str, value: Any = None) -> str | None:
     """Perform click/fill/select on a mapped element. Returns error text or None."""
-    selector = observation._element_map.get(element_id)
+    selector, err = await resolution._resolve_selector(element_id, page)
     if not selector:
-        return f"no selector mapped for {element_id}"
+        return err or f"no selector mapped for {element_id}"
     locator = page.locator(selector).first
     try:
         await locator.scroll_into_view_if_needed(timeout=6000)

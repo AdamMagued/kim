@@ -15,12 +15,15 @@ Other web submodules must access the mutable globals through this module
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import ipaddress
 import logging
 import os
 import shutil
 import socket
 import subprocess
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +32,195 @@ from mcp_server.os_utils import IS_MACOS, IS_WINDOWS, IS_LINUX, minimal_subproce
 
 logger = logging.getLogger(__name__)
 
+
+# ── SSRF target detection (#51) ──────────────────────────────────────────────
+#
+# Lives here (not navigation.py) so _install_ssrf_guard below — and any other
+# page-lifecycle code — can call it without a circular import (navigation.py
+# already depends on this module for browser._page()). navigation.py
+# re-exports these names for backward compatibility (web_open's own
+# pre-goto check, __init__.py's facade, and the test suite).
+
+def _whatwg_ipv4_part(tok: str) -> int:
+    """Parse one IPv4 host part the way the WHATWG URL parser does.
+
+    Base is selected by prefix: ``0x``/``0X`` -> hex, a leading ``0`` (len>1)
+    -> octal, otherwise decimal. (Plain ``int(tok, 0)`` rejects leading-zero
+    octal like ``0177`` — the gap that let ``0177.0.0.1`` slip past the old
+    SSRF check — so the base is chosen explicitly here.)
+
+    Raises ValueError if the token is not a valid numeric part.
+    """
+    if not tok:
+        raise ValueError("empty IPv4 part")
+    if tok[:2] in ("0x", "0X"):
+        return int(tok, 16)
+    if tok[0] == "0" and len(tok) > 1:
+        return int(tok, 8)
+    return int(tok, 10)
+
+
+def _parse_host_as_ip(host: str):
+    """Try to parse *host* as a numeric IP address in any encoding browsers accept.
+
+    Mirrors the WHATWG URL IPv4 parser so the SSRF check sees the SAME address
+    Chromium will actually dial. Covers:
+    - Standard dotted-decimal IPv4 / IPv6 literals ('127.0.0.1', '::1').
+    - Bare integer in decimal/hex/octal ('2130706433', '0x7f000001', '017700000001').
+    - Dotted notation with non-decimal octets ('0177.0.0.1', '0x7f.0.0.1').
+    - Short dotted forms where the final part absorbs the remaining bytes
+      ('127.1' -> 127.0.0.1, '127.0.1' -> 127.0.0.1, '10.1' -> 10.0.0.1).
+
+    Returns an ipaddress.IPv4Address or IPv6Address on success.
+    Raises ValueError if the host cannot be interpreted as any numeric IP literal
+    (i.e. it is a DNS domain name).
+    """
+    # Fast path: standard dotted-decimal IPv4 or IPv6 literal.
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+
+    # WHATWG IPv4: 1-4 dot-separated parts, each in any base; a single trailing
+    # empty part (host ending in '.') is tolerated. The last part absorbs all
+    # remaining low-order bytes, so fewer than 4 parts is valid.
+    parts = host.split(".")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    if not (1 <= len(parts) <= 4):
+        raise ValueError(f"Not a numeric IP literal: {host!r}")
+    try:
+        nums = [_whatwg_ipv4_part(p) for p in parts]
+    except ValueError:
+        raise ValueError(f"Not a numeric IP literal: {host!r}")
+
+    n = len(nums)
+    # Every part except the last is a single octet (<256); the last part holds
+    # the remaining (4 - (n-1)) bytes.
+    if any(x < 0 or x > 255 for x in nums[:-1]):
+        raise ValueError(f"Not a numeric IP literal: {host!r}")
+    last_max = 256 ** (4 - (n - 1))
+    if not (0 <= nums[-1] < last_max):
+        raise ValueError(f"Not a numeric IP literal: {host!r}")
+
+    value = nums[-1]
+    for i, octet in enumerate(nums[:-1]):
+        value += octet << (8 * (3 - i))
+    if not (0 <= value <= 0xFFFFFFFF):
+        raise ValueError(f"Not a numeric IP literal: {host!r}")
+    return ipaddress.ip_address(value)
+
+
+def _is_ssrf_target(url: str) -> bool:
+    """Return True if the URL resolves to a loopback/private/link-local address (#51).
+
+    Closes the bypass where integer/hex/octal IP encodings (e.g. 2130706433,
+    0x7f000001, 0177.0.0.1) were passed through because ipaddress.ip_address()
+    raised ValueError on them, causing the except branch to classify them as
+    safe domain names.  _parse_host_as_ip() normalises all browser-accepted
+    numeric forms before the loopback/private checks run.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or ""
+        # Strip IPv6 brackets that urlparse leaves on literal addresses.
+        host = host.strip("[]")
+        # `localhost` (and RFC 6761 `*.localhost`) always resolves to loopback
+        # but is not a numeric IP, so it fell through the ValueError→allow
+        # branch below — the most obvious spelling of the exact class the
+        # numeric-loopback block (#51) exists to stop (H2).
+        lowered = host.lower().rstrip(".")
+        if lowered == "localhost" or lowered.endswith(".localhost"):
+            return True
+        try:
+            addr = _parse_host_as_ip(host)
+        except ValueError:
+            # Host is a DNS domain name — allow it (DNS-rebind is out of scope here).
+            return False
+        return (
+            addr.is_loopback
+            or addr.is_private
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_multicast
+        )
+    except Exception:
+        # Malformed URL: default-deny to be safe.
+        return True
+
+
+async def _install_ssrf_guard(page: Any) -> None:
+    """Validate EVERY top-level navigation on *page*, not just the one
+    ``web_open`` makes before its own ``page.goto()`` (HIGH audit finding #1).
+
+    The old guard was a single call site: it checked the URL once, before the
+    initial navigation, and was never re-checked on redirects (a public URL
+    that 302s to ``http://169.254.169.254/`` sailed through) nor on
+    click-driven navigation (``web_click`` never called it at all). That is
+    architectural, not a missing call — so the fix hooks Playwright's request
+    interception at the page level instead of sprinkling more one-time checks
+    at each call site: a route handler installed once per page inspects every
+    outgoing *navigation* request (``request.is_navigation_request()``) on the
+    main frame and aborts it before the browser ever dials the target if
+    ``_is_ssrf_target`` flags it. This covers goto(), redirect hops (each hop
+    is its own navigation request through the same route), and link/button
+    driven navigation from ``web_click`` — all for free, with no per-call-site
+    plumbing.
+    """
+
+    async def _guard(route, request) -> None:
+        try:
+            is_nav = request.is_navigation_request()
+        except Exception:
+            is_nav = False
+        if is_nav:
+            try:
+                is_main_frame = request.frame == page.main_frame
+            except Exception:
+                is_main_frame = True
+            if is_main_frame:
+                try:
+                    blocked = _is_ssrf_target(request.url)
+                except Exception:
+                    blocked = True  # malformed URL: default-deny, matches _is_ssrf_target
+                if blocked:
+                    logger.warning(
+                        "web: blocked navigation to internal/loopback address "
+                        f"{request.url!r} (SSRF guard, #1)"
+                    )
+                    with contextlib.suppress(Exception):
+                        await route.abort("blockedbyclient")
+                    return
+        with contextlib.suppress(Exception):
+            await route.continue_()
+
+    try:
+        await page.route("**/*", _guard)
+    except Exception as e:
+        logger.warning(f"web: failed to install SSRF navigation guard: {e}")
+
 # Module-level singletons. The MCP server is a single subprocess, so these
 # survive across tool calls within a session.
+#
+# `_lock` (LOW #5): only guards `_ensure_browser()` inside `_page()` — it is
+# released BEFORE `_page()` returns the page object to its caller. Every web
+# tool handler then uses that page reference for the rest of its own async
+# function body with the lock no longer held. This is safe ONLY because the
+# MCP server serializes tool calls (one call's handler runs to completion —
+# including every `await` inside it — before the next one starts), which is
+# the documented single-run-per-process invariant for this whole package. If
+# that invariant is ever violated (e.g. a future change dispatches multiple
+# tool calls concurrently within one MCP server process), two overlapping
+# handlers could interleave like: A calls `_page()` and gets page P; B calls
+# `_page()` concurrently, finds P dead, resets `_browser_ctx`/`_active_page`
+# and swaps in a new page Q; A continues operating on its now-stale local
+# reference to P instead of Q. This is NOT reachable today — do not "fix" it
+# by holding `_lock` across each handler's full page-use span (that would
+# require turning every `await browser._page()` call site in navigation.py /
+# actions.py / observation.py / resolution.py into a context-manager pattern
+# for a currently-impossible scenario). If concurrent dispatch is ever added,
+# revisit this by having `_page()` return a lock-holding context manager
+# instead of a bare page reference.
 _lock = asyncio.Lock()
 _playwright: Any = None
 _browser_ctx: Any = None
@@ -325,6 +515,11 @@ async def _ensure_browser() -> None:
             page = pages[-1] if pages else await context.new_page()
             # Liveness probe: a stale context happily hands back dead pages.
             await page.evaluate("1")
+            # SSRF guard (#1): installed once per adopted page (not on the
+            # fast liveness-check path above, which reuses an already-guarded
+            # _active_page), so it covers redirects and click-driven
+            # navigation on this page for its whole lifetime.
+            await _install_ssrf_guard(page)
             _active_page = page
             return
         except Exception:
@@ -352,6 +547,12 @@ async def _ensure_browser() -> None:
 
 
 async def _page():
+    """Return the current live page, lazily starting the browser if needed.
+
+    `_lock` is held only for `_ensure_browser()`, not for the caller's
+    subsequent use of the returned page — see the invariant documented on
+    `_lock`'s definition above (#5).
+    """
     async with _lock:
         await _ensure_browser()
     return _active_page

@@ -130,6 +130,97 @@ class TestThreadStateSidecar(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# thread_state.py — cross-process locking (#7)
+# ---------------------------------------------------------------------------
+
+class TestThreadStateLocking(unittest.TestCase):
+    """A caller doing load -> mutate -> save must not lose an update to a
+    concurrent load -> mutate -> save for the SAME (cwd, provider) sidecar."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self._patch = patch.object(ts, "_STATE_DIR", Path(self._tmp.name))
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def test_lock_is_reentrant_within_one_thread(self):
+        # load_thread_state()/save_thread_state() take the same lock
+        # internally; nesting them inside an outer thread_state_lock() must
+        # not self-deadlock. Run on a background thread with a hard timeout
+        # so a regression fails the test instead of hanging the suite.
+        import threading as _threading
+
+        finished = _threading.Event()
+        error: list[BaseException] = []
+
+        def _run():
+            try:
+                with ts.thread_state_lock("/proj/reentrant", "browser:gemini"):
+                    state = ts.load_thread_state("/proj/reentrant", "browser:gemini")
+                    state["turns"] = state.get("turns", 0) + 1
+                    ts.save_thread_state("/proj/reentrant", "browser:gemini", state)
+            except BaseException as e:  # noqa: BLE001 — surfaced via `error`
+                error.append(e)
+            finally:
+                finished.set()
+
+        t = _threading.Thread(target=_run, daemon=True)
+        t.start()
+        completed = finished.wait(timeout=5.0)
+        self.assertTrue(completed, "reentrant lock acquisition deadlocked")
+        self.assertEqual(error, [])
+        self.assertEqual(
+            ts.load_thread_state("/proj/reentrant", "browser:gemini")["turns"], 1
+        )
+
+    def test_concurrent_increments_under_lock_do_not_lose_updates(self):
+        import threading as _threading
+
+        cwd, provider = "/proj/concurrent", "browser:gemini"
+        ts.save_thread_state(cwd, provider, {"turns": 0})
+
+        iterations = 25
+        n_threads = 4
+        errors: list[BaseException] = []
+
+        def _worker():
+            try:
+                for _ in range(iterations):
+                    with ts.thread_state_lock(cwd, provider):
+                        state = ts.load_thread_state(cwd, provider)
+                        state["turns"] = state.get("turns", 0) + 1
+                        ts.save_thread_state(cwd, provider, state)
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [_threading.Thread(target=_worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30.0)
+            self.assertFalse(t.is_alive(), "worker thread did not finish — possible deadlock")
+
+        self.assertEqual(errors, [])
+        final = ts.load_thread_state(cwd, provider)
+        self.assertEqual(
+            final["turns"],
+            n_threads * iterations,
+            "a concurrent load-modify-save cycle lost an update",
+        )
+
+    def test_unlocked_standalone_calls_remain_unaffected(self):
+        # Callers that don't use thread_state_lock() still get plain,
+        # working load/save (each self-locks around its own operation).
+        ts.save_thread_state("/proj/plain", "browser:gemini", {"turns": 5})
+        self.assertEqual(
+            ts.load_thread_state("/proj/plain", "browser:gemini")["turns"], 5
+        )
+
+
+# ---------------------------------------------------------------------------
 # _CodexProxy._note_relay_result — per-relay accounting
 # ---------------------------------------------------------------------------
 

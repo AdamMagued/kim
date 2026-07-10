@@ -310,9 +310,86 @@ async def handle_web_resolve(args: dict) -> str:
     return json.dumps(result, indent=2)
 
 
-async def _resolve_selector(element_id: str) -> tuple[str | None, str]:
-    selector = observation._element_map.get(element_id.strip())
+async def _resolve_selector(element_id: str, page: Any = None) -> tuple[str | None, str]:
+    """Element-id -> CSS selector, disambiguated against the live DOM.
+
+    ``cssPath()`` (web_observe_js.py) truncates the ancestor chain at 6
+    levels for readability. On deeply nested, repetitive markup (e.g. a list
+    of otherwise-identical cards) two different elements can legitimately
+    produce the SAME truncated selector — the id is unique, the selector
+    string is not. Acting on ``page.locator(selector).first`` in that case
+    silently clicks/fills whichever matching element happens to sort first,
+    which may not be the one the id actually pointed at (#4).
+
+    When *page* is supplied, cross-check the selector against the live page:
+    a single match is unambiguous and returned as-is. More than one match is
+    disambiguated using the bounding box recorded for this element_id at
+    observation time (matched against each live candidate's current
+    bounding box) — a `:nth-match(selector, n)` selector pinned to the
+    closest-matching box is returned. If no live candidate's box is a close
+    match (the page changed since observation, or bbox metadata is
+    missing), resolving silently would be a guess, not a disambiguation —
+    an explicit "ambiguous element" error is returned instead.
+    """
+    key = element_id.strip()
+    selector = observation._element_map.get(key)
     if not selector:
-        return None, (f"ERROR: unknown element_id {element_id!r}. "
+        return None, (f"ERROR: unknown element_id {key!r}. "
                       "Call web_observe first to (re)discover element IDs.")
-    return selector, ""
+    if page is None:
+        return selector, ""
+
+    try:
+        count = await page.locator(selector).count()
+    except Exception:
+        # Live DOM check itself failed (detached page, invalid selector after
+        # a navigation, etc.) — fall back to the unchecked selector rather
+        # than blocking the caller on a diagnostic-only step.
+        return selector, ""
+    if count <= 1:
+        return selector, ""
+
+    el = observation._element_data_map.get(key) or {}
+    bbox = el.get("bbox")
+    if isinstance(bbox, list) and len(bbox) == 4:
+        try:
+            boxes = await page.eval_on_selector_all(
+                selector,
+                "els => els.map(e => { const r = e.getBoundingClientRect(); "
+                "return [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]; })",
+            )
+        except Exception:
+            boxes = None
+        if isinstance(boxes, list):
+            best_idx, best_dist = None, None
+            for idx, box in enumerate(boxes):
+                if not isinstance(box, list) or len(box) != 4:
+                    continue
+                try:
+                    dist = sum((float(a) - float(b)) ** 2 for a, b in zip(box, bbox))
+                except (TypeError, ValueError):
+                    continue
+                if best_dist is None or dist < best_dist:
+                    best_idx, best_dist = idx, dist
+            # A tight tolerance: sub-pixel rounding differences are fine,
+            # anything larger means the "closest" candidate is still a guess.
+            if best_idx is not None and best_dist is not None and best_dist <= 4.0:
+                logger.info(
+                    "web_resolve_selector disambiguated element_id=%r "
+                    "selector=%r matches=%d -> nth=%d (bbox dist=%.2f)",
+                    key, selector, count, best_idx, best_dist,
+                )
+                return f":nth-match({selector}, {best_idx + 1})", ""
+
+    logger.warning(
+        "web_resolve_selector ambiguous element_id=%r selector=%r matches=%d "
+        "— could not disambiguate via bbox",
+        key, selector, count,
+    )
+    return None, (
+        f"ERROR: element_id {key!r} matches {count} elements on the page "
+        f"(selector {selector!r} is not unique) and could not be safely "
+        "disambiguated. Call web_observe again and retry — the page layout "
+        "may have changed, or the element is one of several structurally "
+        "identical siblings."
+    )

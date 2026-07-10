@@ -195,6 +195,22 @@ class TestAuthRouteScoping(unittest.TestCase):
         self.assertEqual(page.unroute_all_called, 1)
         self.assertNotIn("WARNING", result)
 
+    def test_unroute_all_recovery_reinstalls_ssrf_guard(self):
+        # unroute_all() strips EVERY page.route() handler, including the
+        # persistent SSRF navigation guard installed once per page by
+        # _ensure_browser — not just the stuck auth route. Without
+        # reinstating it, this recovery path would silently reopen #1 for
+        # the rest of the page's lifetime.
+        page = _FakePage(unroute_raises=True)
+        self._open(page)
+        self.assertEqual(page.unroute_all_called, 1)
+        # After recovery, the LAST route registered on the page must be the
+        # SSRF guard ("**/*"), not just the (now-cleared) auth route.
+        self.assertTrue(page.routes, "expected at least one route re-registered")
+        last_pattern, last_handler = page.routes[-1]
+        self.assertEqual(last_pattern, "**/*")
+        self.assertTrue(asyncio.iscoroutinefunction(last_handler))
+
     def test_no_credentials_installs_no_route(self):
         page = _FakePage()
 
@@ -203,6 +219,145 @@ class TestAuthRouteScoping(unittest.TestCase):
         with mock.patch.object(web_navigation.browser, "_page", fake_page):
             asyncio.run(web_navigation.handle_web_open({"url": self.URL}))
         self.assertEqual(page.routes, [])
+
+
+# ---------------------------------------------------------------------------
+# H1 (#1) — SSRF guard hooked into every navigation, not just the initial
+# web_open call. Simulates what a redirect or web_click-driven navigation
+# looks like at the Playwright request-interception layer.
+# ---------------------------------------------------------------------------
+
+class _FakeFrame:
+    """Distinguishable sentinel: identity, not structure, is what matters."""
+
+
+class _FakeRequest:
+    def __init__(self, url: str, frame, is_navigation: bool = True):
+        self.url = url
+        self.frame = frame
+        self._is_navigation = is_navigation
+
+    def is_navigation_request(self) -> bool:
+        return self._is_navigation
+
+
+class _FakeRoute:
+    def __init__(self):
+        self.aborted = False
+        self.abort_reason = None
+        self.continued = False
+
+    async def abort(self, reason=None):
+        self.aborted = True
+        self.abort_reason = reason
+
+    async def continue_(self):
+        self.continued = True
+
+
+class _FakeGuardPage:
+    """Minimal Playwright-page stand-in for _install_ssrf_guard."""
+
+    def __init__(self):
+        self.main_frame = _FakeFrame()
+        self._route_handler = None
+        self.route_pattern = None
+
+    async def route(self, pattern, handler):
+        self.route_pattern = pattern
+        self._route_handler = handler
+
+    async def fire(self, request: _FakeRequest) -> _FakeRoute:
+        """Simulate Playwright invoking the installed handler for *request*."""
+        route = _FakeRoute()
+        await self._route_handler(route, request)
+        return route
+
+
+class TestSsrfNavigationGuard(unittest.TestCase):
+    """browser._install_ssrf_guard must catch redirects and click-driven
+    navigation, not just the one-shot check web_open makes before goto()."""
+
+    def _install(self) -> _FakeGuardPage:
+        page = _FakeGuardPage()
+        asyncio.run(web_browser._install_ssrf_guard(page))
+        self.assertIsNotNone(page._route_handler, "guard must register a route handler")
+        self.assertEqual(page.route_pattern, "**/*")
+        return page
+
+    def test_blocks_redirect_to_private_ip(self):
+        # This is the scenario the one-time pre-goto check could never catch:
+        # the initial URL (https://example.com) is public, but the server
+        # 302s the SAME navigation to a link-local metadata endpoint.
+        page = self._install()
+        req = _FakeRequest("http://169.254.169.254/latest/meta-data/", page.main_frame)
+        route = asyncio.run(page.fire(req))
+        self.assertTrue(route.aborted, "redirect to a link-local address must be aborted")
+        self.assertFalse(route.continued)
+
+    def test_blocks_redirect_to_loopback(self):
+        page = self._install()
+        req = _FakeRequest("http://127.0.0.1:6379/", page.main_frame)
+        route = asyncio.run(page.fire(req))
+        self.assertTrue(route.aborted)
+
+    def test_blocks_click_driven_navigation_to_private_ip(self):
+        # web_click never called _is_ssrf_target at all — the guard is the
+        # only thing that can catch a same-page link to an internal host.
+        page = self._install()
+        req = _FakeRequest("http://10.0.0.5/admin", page.main_frame)
+        route = asyncio.run(page.fire(req))
+        self.assertTrue(route.aborted)
+
+    def test_allows_navigation_to_public_url(self):
+        page = self._install()
+        req = _FakeRequest("https://example.com/page", page.main_frame)
+        route = asyncio.run(page.fire(req))
+        self.assertFalse(route.aborted)
+        self.assertTrue(route.continued)
+
+    def test_ignores_non_navigation_requests(self):
+        # Subresource requests (images, XHR, etc.) are out of this guard's
+        # scope (#1 is specifically about *navigation*); it must not stall
+        # or abort ordinary page traffic.
+        page = self._install()
+        req = _FakeRequest("http://169.254.169.254/", page.main_frame, is_navigation=False)
+        route = asyncio.run(page.fire(req))
+        self.assertFalse(route.aborted)
+        self.assertTrue(route.continued)
+
+    def test_ignores_non_main_frame_navigation(self):
+        page = self._install()
+        other_frame = _FakeFrame()
+        req = _FakeRequest("http://127.0.0.1/", other_frame, is_navigation=True)
+        route = asyncio.run(page.fire(req))
+        self.assertFalse(route.aborted)
+        self.assertTrue(route.continued)
+
+    def test_ensure_browser_installs_guard_on_newly_adopted_page(self):
+        # The guard must be wired up automatically when a page is adopted —
+        # nothing web_open-specific should be required to get protection.
+        fake_page = mock.AsyncMock()
+        fake_page.evaluate = mock.AsyncMock(return_value="1")
+        fake_ctx = mock.Mock()
+        fake_ctx.pages = []
+        fake_ctx.new_page = mock.AsyncMock(return_value=fake_page)
+
+        web_browser._active_page = None
+        web_browser._browser_ctx = object()  # non-None so _connect_browser_ctx is skipped
+        web_browser._playwright = mock.Mock()
+        try:
+            with mock.patch.object(
+                web_browser, "_active_browser_context", mock.AsyncMock(return_value=fake_ctx)
+            ), mock.patch.object(
+                web_browser, "_install_ssrf_guard", mock.AsyncMock()
+            ) as install_guard:
+                asyncio.run(web_browser._ensure_browser())
+            install_guard.assert_awaited_once_with(fake_page)
+        finally:
+            web_browser._active_page = None
+            web_browser._browser_ctx = None
+            web_browser._playwright = None
 
 
 # ---------------------------------------------------------------------------

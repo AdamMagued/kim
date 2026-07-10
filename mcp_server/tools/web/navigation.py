@@ -7,7 +7,6 @@ Basic-auth), ``web_back``, ``web_close`` and the two wait tools.
 from __future__ import annotations
 
 import base64
-import ipaddress
 import logging
 import re
 import urllib.parse
@@ -16,120 +15,20 @@ from typing import Any
 from mcp_server.config import USE_REAL_BROWSER
 
 from . import browser
+# _is_ssrf_target (+ its WHATWG-IP-literal helpers) now lives in browser.py
+# so the page-level navigation-event guard installed by _ensure_browser can
+# call it without a circular import (#1: SSRF validation used to be a single
+# call site here; it is now ALSO enforced structurally on every navigation —
+# see browser._install_ssrf_guard). Re-exported here for backward
+# compatibility: this module's own pre-goto check below, web/__init__.py's
+# facade, and the test suite all reach for `navigation._is_ssrf_target`.
+from .browser import _is_ssrf_target, _parse_host_as_ip, _whatwg_ipv4_part  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
 
 def _default_port(scheme: str) -> int | None:
     return {"http": 80, "https": 443}.get((scheme or "").lower())
-
-
-def _whatwg_ipv4_part(tok: str) -> int:
-    """Parse one IPv4 host part the way the WHATWG URL parser does.
-
-    Base is selected by prefix: ``0x``/``0X`` -> hex, a leading ``0`` (len>1)
-    -> octal, otherwise decimal. (Plain ``int(tok, 0)`` rejects leading-zero
-    octal like ``0177`` — the gap that let ``0177.0.0.1`` slip past the old
-    SSRF check — so the base is chosen explicitly here.)
-
-    Raises ValueError if the token is not a valid numeric part.
-    """
-    if not tok:
-        raise ValueError("empty IPv4 part")
-    if tok[:2] in ("0x", "0X"):
-        return int(tok, 16)
-    if tok[0] == "0" and len(tok) > 1:
-        return int(tok, 8)
-    return int(tok, 10)
-
-
-def _parse_host_as_ip(host: str):
-    """Try to parse *host* as a numeric IP address in any encoding browsers accept.
-
-    Mirrors the WHATWG URL IPv4 parser so the SSRF check sees the SAME address
-    Chromium will actually dial. Covers:
-    - Standard dotted-decimal IPv4 / IPv6 literals ('127.0.0.1', '::1').
-    - Bare integer in decimal/hex/octal ('2130706433', '0x7f000001', '017700000001').
-    - Dotted notation with non-decimal octets ('0177.0.0.1', '0x7f.0.0.1').
-    - Short dotted forms where the final part absorbs the remaining bytes
-      ('127.1' -> 127.0.0.1, '127.0.1' -> 127.0.0.1, '10.1' -> 10.0.0.1).
-
-    Returns an ipaddress.IPv4Address or IPv6Address on success.
-    Raises ValueError if the host cannot be interpreted as any numeric IP literal
-    (i.e. it is a DNS domain name).
-    """
-    # Fast path: standard dotted-decimal IPv4 or IPv6 literal.
-    try:
-        return ipaddress.ip_address(host)
-    except ValueError:
-        pass
-
-    # WHATWG IPv4: 1-4 dot-separated parts, each in any base; a single trailing
-    # empty part (host ending in '.') is tolerated. The last part absorbs all
-    # remaining low-order bytes, so fewer than 4 parts is valid.
-    parts = host.split(".")
-    if parts and parts[-1] == "":
-        parts = parts[:-1]
-    if not (1 <= len(parts) <= 4):
-        raise ValueError(f"Not a numeric IP literal: {host!r}")
-    try:
-        nums = [_whatwg_ipv4_part(p) for p in parts]
-    except ValueError:
-        raise ValueError(f"Not a numeric IP literal: {host!r}")
-
-    n = len(nums)
-    # Every part except the last is a single octet (<256); the last part holds
-    # the remaining (4 - (n-1)) bytes.
-    if any(x < 0 or x > 255 for x in nums[:-1]):
-        raise ValueError(f"Not a numeric IP literal: {host!r}")
-    last_max = 256 ** (4 - (n - 1))
-    if not (0 <= nums[-1] < last_max):
-        raise ValueError(f"Not a numeric IP literal: {host!r}")
-
-    value = nums[-1]
-    for i, octet in enumerate(nums[:-1]):
-        value += octet << (8 * (3 - i))
-    if not (0 <= value <= 0xFFFFFFFF):
-        raise ValueError(f"Not a numeric IP literal: {host!r}")
-    return ipaddress.ip_address(value)
-
-
-def _is_ssrf_target(url: str) -> bool:
-    """Return True if the URL resolves to a loopback/private/link-local address (#51).
-
-    Closes the bypass where integer/hex/octal IP encodings (e.g. 2130706433,
-    0x7f000001, 0177.0.0.1) were passed through because ipaddress.ip_address()
-    raised ValueError on them, causing the except branch to classify them as
-    safe domain names.  _parse_host_as_ip() normalises all browser-accepted
-    numeric forms before the loopback/private checks run.
-    """
-    try:
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.hostname or ""
-        # Strip IPv6 brackets that urlparse leaves on literal addresses.
-        host = host.strip("[]")
-        # `localhost` (and RFC 6761 `*.localhost`) always resolves to loopback
-        # but is not a numeric IP, so it fell through the ValueError→allow
-        # branch below — the most obvious spelling of the exact class the
-        # numeric-loopback block (#51) exists to stop (H2).
-        lowered = host.lower().rstrip(".")
-        if lowered == "localhost" or lowered.endswith(".localhost"):
-            return True
-        try:
-            addr = _parse_host_as_ip(host)
-        except ValueError:
-            # Host is a DNS domain name — allow it (DNS-rebind is out of scope here).
-            return False
-        return (
-            addr.is_loopback
-            or addr.is_private
-            or addr.is_link_local
-            or addr.is_reserved
-            or addr.is_multicast
-        )
-    except Exception:
-        # Malformed URL: default-deny to be safe.
-        return True
 
 
 async def handle_web_open(args: dict) -> str:
@@ -153,6 +52,13 @@ async def handle_web_open(args: dict) -> str:
         url = "https://" + url
 
     # Block SSRF: refuse requests to loopback/private/link-local IP ranges (#51).
+    # This is a fast, friendly rejection for the common case (bad URL typed or
+    # passed directly to web_open) so the caller gets a clear error without a
+    # wasted navigation attempt. It is deliberately NOT the only guard: the
+    # page-level route installed by browser._install_ssrf_guard (#1) is what
+    # actually enforces this on every navigation — including redirects away
+    # from a URL that passed this check, and link/button-driven navigation
+    # from web_click, neither of which go through handle_web_open at all.
     if _is_ssrf_target(url):
         return (
             "ERROR: refusing to open an internal/loopback address. "
@@ -225,9 +131,22 @@ async def handle_web_open(args: dict) -> str:
                 )
                 _auth_unroute_failed = True
                 try:
+                    # unroute_all() removes EVERY page.route() handler, not
+                    # just the stuck auth one — including the persistent SSRF
+                    # navigation guard installed once per page in
+                    # _ensure_browser (#1). Without reinstating it here, this
+                    # recovery path would silently strip SSRF protection for
+                    # the rest of this page's lifetime (_ensure_browser's
+                    # fast liveness-check path never re-installs it for an
+                    # already-live page), reopening exactly the redirect/
+                    # click-driven-navigation hole #1 exists to close.
                     await page.unroute_all()
+                    await browser._install_ssrf_guard(page)
                     _auth_unroute_failed = False
-                    logger.info("web_open: unroute_all() cleared the stuck auth route")
+                    logger.info(
+                        "web_open: unroute_all() cleared the stuck auth route "
+                        "(SSRF guard reinstalled)"
+                    )
                 except Exception:
                     pass
 
