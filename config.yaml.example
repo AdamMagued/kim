@@ -19,7 +19,20 @@ browser_provider:
   stateful_threads: false
   compact_at_ratio: 0.8
   max_thread_turns: 40
+  # Force the browser provider to launch headless Chromium directly, bypassing
+  # the CDP auto-launch/connect flow. Optional; defaults to false.
+  browser_force_headless: false
 custom_sites: {}
+# Optional map of user-defined third-party MCP servers to merge alongside
+# Kim's own MCP server (name -> {command, args, cwd, env, ...}). Defaults to
+# empty (no extra servers).
+mcp_servers: {}
+# Site-connector allowlist. `enabled` is a list of connector ids (e.g.
+# ["guc_cms", "guc_mail"]) whose tools get merged into the MCP dispatch map
+# at startup, so the LLM only sees toolkits you've explicitly opted into.
+# Optional; defaults to an empty list (no connectors enabled).
+connectors:
+  enabled: []
 codex_bridge:
   # Whole-run budget for one Codex code-mode task (seconds). Browser relays
   # are slow — a single one can take minutes — so keep this comfortably above
