@@ -84,6 +84,36 @@ class SensitiveFileGlobTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(PermissionError):
                 validate_path(path)
 
+    def test_credentials_prefixed_variants_denied(self):
+        """`credentials*` is prefix-anchored and misses these -- the common
+        naming convention prefixes 'credentials' rather than starting with
+        it (google_credentials.json, aws_credentials.json, a service
+        account export). `*credentials*` (substring, anywhere) closes the
+        gap."""
+        for path in (
+            "google_credentials.json",
+            "aws_credentials.json",
+            "service_account_credentials.json",
+            "config/my_credentials.yaml",
+        ):
+            with self.subTest(path=path), self.assertRaises(PermissionError):
+                validate_path(path)
+
+    def test_oauth_cache_filenames_denied(self):
+        """token.json / authorized_user.json are the literal filenames
+        Google's OAuth client libraries cache credentials to on disk."""
+        for path in ("token.json", "authorized_user.json", "creds/token.json"):
+            with self.subTest(path=path), self.assertRaises(PermissionError):
+                validate_path(path)
+
+    def test_token_as_ordinary_identifier_not_overmatched(self):
+        """The fix must NOT introduce a bare `*token*` substring glob --
+        that would block ordinary, non-secret source files that merely
+        have 'token' in their name (tokenizer/parser code, tests, etc)."""
+        for path in ("tokenizer.py", "auth_token_test.py", "token_bucket.py"):
+            p = validate_path(path)
+            self.assertEqual(p.name, path.split("/")[-1])
+
     def test_npmrc_denied(self):
         with self.assertRaises(PermissionError):
             validate_path(".npmrc")

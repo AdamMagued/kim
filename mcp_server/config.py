@@ -234,6 +234,18 @@ _SENSITIVE_PATHS: list[Path] = [
 ]
 # Secret-file name patterns denied at ANY depth inside an allowed root (G1).
 # Matched case-by-case against `p.name` via fnmatch in validate_path().
+#
+# "credentials*" is prefix-anchored: it only matches filenames STARTING WITH
+# "credentials", missing the far more common naming convention of a prefixed
+# credential file (google_credentials.json, aws_credentials.json,
+# service_account_credentials.json). "*credentials*" (substring, anywhere in
+# the filename) closes that gap. "credentials" is specific enough as a
+# substring that it doesn't collide with ordinary source filenames the way a
+# bare "*token*" would (tokenizer.py, auth_token_test.py, token_bucket.py are
+# all legitimate, non-secret source files) -- so "token" secrets are matched
+# by exact/narrow filenames instead of a substring glob: `token.json` and
+# `authorized_user.json` are the literal filenames Google's OAuth client
+# libraries write to disk for cached credentials, not generic identifiers.
 _SENSITIVE_GLOBS = [
     ".env",
     ".env.*",
@@ -241,9 +253,12 @@ _SENSITIVE_GLOBS = [
     "*.key",
     "id_rsa*",
     "id_ed25519*",
-    "credentials*",
+    "*credentials*",
+    "*_credentials.json",
     "client_secret*",
     "*.credentials",
+    "token.json",
+    "authorized_user.json",
     ".npmrc",
     ".pypirc",
 ]
