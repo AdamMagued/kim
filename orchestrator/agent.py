@@ -290,9 +290,15 @@ class KimAgent:
         """Detect PLAN: / STEP n: markers in an assistant text turn and forward
         them to the UI as structured [STATUS] events.
 
-        The frontend (parseLogLine + parsePlanFromActivity in ChatView.tsx)
-        understands the `[PLAN]{json}` and `[STEP]{json}` envelopes and renders
-        a live checklist that crosses off each step as it completes.
+        The primary path is the typed `kim:plan`/`kim:step` events emitted
+        below (emit_plan/emit_step) — that's what the live checklist actually
+        renders from. The bracket-tag `[PLAN]{json}`/`[STEP]{json}` envelope
+        logged alongside them (via self._log) is a fallback for legacy or
+        uncontrolled text streams whose parser (parseLogLine +
+        parsePlanFromActivity in ChatView.tsx) can still pick it out of plain
+        log text; in this code path it's normally unreachable because _log()
+        suppresses [PLAN]/[STEP]-prefixed status lines from the emit_status
+        text stream (see the check at the top of _log()).
         """
         if not content:
             return
