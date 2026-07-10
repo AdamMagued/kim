@@ -1204,6 +1204,18 @@ class KimAgent:
                 ann_image_b64 = ann_image_b64[len("data:image/png;base64,"):]
             self._run_screenshot_b64 = ann_image_b64
 
+            # Stuck detection — mirrors the take_screenshot branch above so
+            # take_annotated_screenshot calls contribute to (and are caught
+            # by) the same perceptual-stuck history instead of silently
+            # bypassing it (finding 1).
+            if ann_image_b64 and self._is_stuck(ann_image_b64) and iteration > 3:
+                self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
+                return self._complete_run(make_run_result(
+                    AgentTermination.STUCK,
+                    "STUCK: Screen not changing after repeated actions.",
+                    ann_image_b64,
+                ))
+
             grid_map = ann_data.get("grid", {})
             instructions = ann_data.get("instructions", "")
             screen_w = ann_data.get("screen_width", "?")
