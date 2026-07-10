@@ -344,11 +344,24 @@ class AppServerClient:
                 try:
                     raw = await proc.stdout.readline()
                 except ValueError:
-                    # One line exceeded STREAM_LIMIT. The reader keeps the
-                    # buffered data, so subsequent readline() calls drain the
-                    # oversized line in fragments — each fails JSON parsing and
-                    # is skipped. Degrade gracefully instead of killing the
-                    # turn (C1).
+                    # One line exceeded STREAM_LIMIT. Per CPython's
+                    # StreamReader.readline() docs: "if newline was found,
+                    # complete line including newline will be removed from
+                    # internal buffer. Else, internal buffer will be
+                    # cleared." I.e. on overrun the buffer is NOT preserved
+                    # for us to drain in fragments — it is either trimmed up
+                    # to (and including) the next '\n' it already contains
+                    # (oversized line fully discarded, next readline() starts
+                    # clean on whatever follows), or wiped entirely if no
+                    # '\n' had arrived yet (the remaining tail of that same
+                    # line, still incoming from the child process, gets
+                    # re-accumulated from scratch and returned as a short
+                    # fragment on a later readline() — which fails JSON
+                    # parsing below and is skipped same as any other bad
+                    # line). Either way this ValueError handler doesn't need
+                    # to do any draining itself; `continue` and the normal
+                    # per-line JSONDecodeError handling take care of it.
+                    # Degrade gracefully instead of killing the turn (C1).
                     logger.warning(
                         "app-server emitted a line longer than %d bytes; skipping it",
                         STREAM_LIMIT,
@@ -392,7 +405,20 @@ class AppServerClient:
             try:
                 key = int(raw_id)
             except (TypeError, ValueError):
-                logger.debug("app-server response with non-numeric id ignored: %r", raw_id)
+                # Every id we send is one of our own ints (self._next_id), so
+                # a non-numeric id here means the server echoed something we
+                # never sent — non-conformant behavior worth knowing about,
+                # not routine tracing noise (LOW-MEDIUM #6). Left unresolved
+                # rather than guessed at: forcibly resolving "the" pending
+                # future (even when exactly one is in flight) risks failing
+                # an unrelated in-flight request if this message turns out to
+                # be unrelated noise rather than a mangled response to it —
+                # the pending future still resolves via its own 60s timeout.
+                logger.warning(
+                    "app-server response with non-numeric id ignored (protocol "
+                    "mismatch): %r",
+                    raw_id,
+                )
                 return
             fut = self._pending.pop(key, None)
             if fut is None or fut.done():

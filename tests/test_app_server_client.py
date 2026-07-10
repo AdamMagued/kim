@@ -194,5 +194,30 @@ class HelpersTest(unittest.TestCase):
         self.assertIsNone(msg)
 
 
+class DispatchNonNumericIdTest(unittest.TestCase):
+    """LOW-MEDIUM #6: a response with a non-numeric id is protocol-nonconformant
+    (every id we send is one of our own ints) and must be logged loudly enough
+    to notice, not buried at debug level."""
+
+    def test_non_numeric_response_id_logs_at_warning(self):
+        client = AppServerClient(_fake_argv())
+        with self.assertLogs("kim.app_server", level="WARNING") as cm:
+            client._dispatch({"jsonrpc": "2.0", "id": "not-a-number", "result": {}})
+        self.assertTrue(
+            any("non-numeric id" in line for line in cm.output),
+            cm.output,
+        )
+
+    def test_non_numeric_response_id_does_not_touch_pending(self):
+        # Must not guess which pending future this belongs to — an
+        # unrelated in-flight request should still resolve normally via its
+        # own matching response (or its own timeout), not be hijacked.
+        client = AppServerClient(_fake_argv())
+        client._pending[1] = "sentinel"  # type: ignore[assignment]
+        with self.assertLogs("kim.app_server", level="WARNING"):
+            client._dispatch({"jsonrpc": "2.0", "id": "abc", "result": {}})
+        self.assertEqual(client._pending[1], "sentinel")
+
+
 if __name__ == "__main__":
     unittest.main()
