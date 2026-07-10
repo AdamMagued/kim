@@ -131,9 +131,22 @@ async def handle_web_open(args: dict) -> str:
                 )
                 _auth_unroute_failed = True
                 try:
+                    # unroute_all() removes EVERY page.route() handler, not
+                    # just the stuck auth one — including the persistent SSRF
+                    # navigation guard installed once per page in
+                    # _ensure_browser (#1). Without reinstating it here, this
+                    # recovery path would silently strip SSRF protection for
+                    # the rest of this page's lifetime (_ensure_browser's
+                    # fast liveness-check path never re-installs it for an
+                    # already-live page), reopening exactly the redirect/
+                    # click-driven-navigation hole #1 exists to close.
                     await page.unroute_all()
+                    await browser._install_ssrf_guard(page)
                     _auth_unroute_failed = False
-                    logger.info("web_open: unroute_all() cleared the stuck auth route")
+                    logger.info(
+                        "web_open: unroute_all() cleared the stuck auth route "
+                        "(SSRF guard reinstalled)"
+                    )
                 except Exception:
                     pass
 

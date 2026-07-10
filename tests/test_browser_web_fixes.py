@@ -195,6 +195,22 @@ class TestAuthRouteScoping(unittest.TestCase):
         self.assertEqual(page.unroute_all_called, 1)
         self.assertNotIn("WARNING", result)
 
+    def test_unroute_all_recovery_reinstalls_ssrf_guard(self):
+        # unroute_all() strips EVERY page.route() handler, including the
+        # persistent SSRF navigation guard installed once per page by
+        # _ensure_browser — not just the stuck auth route. Without
+        # reinstating it, this recovery path would silently reopen #1 for
+        # the rest of the page's lifetime.
+        page = _FakePage(unroute_raises=True)
+        self._open(page)
+        self.assertEqual(page.unroute_all_called, 1)
+        # After recovery, the LAST route registered on the page must be the
+        # SSRF guard ("**/*"), not just the (now-cleared) auth route.
+        self.assertTrue(page.routes, "expected at least one route re-registered")
+        last_pattern, last_handler = page.routes[-1]
+        self.assertEqual(last_pattern, "**/*")
+        self.assertTrue(asyncio.iscoroutinefunction(last_handler))
+
     def test_no_credentials_installs_no_route(self):
         page = _FakePage()
 
