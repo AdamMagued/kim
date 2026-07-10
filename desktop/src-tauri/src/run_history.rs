@@ -157,6 +157,63 @@ pub fn get_platform_info() -> String {
 /// guarding against a tampered local git config pointing at a rogue mirror.
 const EXPECTED_REMOTE_HOST: &str = "github.com";
 
+/// AUDIT FIX #2: extract the actual host component from a git remote URL,
+/// rather than relying on a substring match (`remote_url.contains("github.com")`),
+/// which a lookalike host like `https://github.com.evil.example/...` or
+/// `https://evil.example/x?host=github.com` would also satisfy.
+///
+/// Handles the two URL shapes `git remote get-url` can return:
+///   - Standard URL form: `https://github.com/owner/repo.git`,
+///     `ssh://git@github.com/owner/repo.git`, `git://github.com/owner/repo.git`
+///   - SCP-like SSH shorthand (not a URI `url` can parse): `git@github.com:owner/repo.git`
+///
+/// Returns `None` if no host could be extracted (malformed remote).
+fn extract_remote_host(remote_url: &str) -> Option<String> {
+    let trimmed = remote_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // SCP-like syntax has no "://" scheme separator: `[user@]host:path`.
+    // Guard against Windows-style absolute paths (`C:\...`) being misread as
+    // scp syntax by requiring the part before ':' to contain no path
+    // separators and, if it has an '@', to look like user@host.
+    if !trimmed.contains("://") {
+        if let Some(colon_idx) = trimmed.find(':') {
+            let before_colon = &trimmed[..colon_idx];
+            if !before_colon.is_empty()
+                && !before_colon.contains('/')
+                && !before_colon.contains('\\')
+            {
+                let host_part = before_colon.rsplit('@').next().unwrap_or(before_colon);
+                if !host_part.is_empty() {
+                    return Some(host_part.to_ascii_lowercase());
+                }
+            }
+        }
+        return None;
+    }
+
+    // Standard URL form: parse properly and take the host component only
+    // (never the path/query, which is what made the old substring check
+    // spoofable).
+    url::Url::parse(trimmed)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+}
+
+/// True when `remote_url`'s host is exactly the expected host (or a direct
+/// subdomain of it), never merely a substring match anywhere in the URL.
+fn remote_host_is_expected(remote_url: &str) -> bool {
+    match extract_remote_host(remote_url) {
+        Some(host) => {
+            host == EXPECTED_REMOTE_HOST
+                || host.ends_with(&format!(".{EXPECTED_REMOTE_HOST}"))
+        }
+        None => false,
+    }
+}
+
 #[tauri::command]
 pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     let kim_root = crate::default_project_root();
@@ -180,21 +237,33 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     let remote_url = String::from_utf8_lossy(&remote_out.stdout)
         .trim()
         .to_string();
-    if remote_out.status.success() {
-        // Accept https://github.com/... and git@github.com:...
-        let host_ok = remote_url.contains(EXPECTED_REMOTE_HOST);
-        if !host_ok {
-            return Err(format!(
-                "Update aborted: remote origin '{remote_url}' does not match expected host '{EXPECTED_REMOTE_HOST}'. \
-                 Verify your git remote configuration before updating."
-            ));
-        }
-    } else {
-        // Could not read remote (detached HEAD, no remote, etc.); proceed with warning.
-        let _ = app_handle.emit(
-            "kim-update-progress",
-            "Warning: could not verify remote URL — proceeding with caution.",
-        );
+    if !remote_out.status.success() {
+        // AUDIT FIX #2: `git remote get-url origin` failing means the remote
+        // cannot be verified at all (detached HEAD, no remote configured,
+        // corrupted repo, ...). Previously this warned and proceeded straight
+        // to `git pull` anyway -- an update against an *unverified* remote is
+        // exactly the supply-chain risk this check exists to prevent. Abort
+        // instead.
+        let stderr = String::from_utf8_lossy(&remote_out.stderr).trim().to_string();
+        return Err(format!(
+            "Update aborted: could not read the 'origin' remote URL ({}). \
+             Configure a git remote pointing at {EXPECTED_REMOTE_HOST} before updating.",
+            if stderr.is_empty() { "no output".to_string() } else { stderr }
+        ));
+    }
+    // AUDIT FIX #2: compare the parsed host component exactly, not a
+    // substring match. `remote_url.contains("github.com")` previously
+    // accepted lookalike hosts such as `https://github.com.evil.example/...`
+    // or any URL that merely embedded the string "github.com" in its path
+    // or query. `remote_host_is_expected` parses both the standard URL form
+    // (https://github.com/..., ssh://git@github.com/...) and the SCP-like
+    // SSH shorthand (git@github.com:owner/repo.git) and checks the actual
+    // host component.
+    if !remote_host_is_expected(&remote_url) {
+        return Err(format!(
+            "Update aborted: remote origin '{remote_url}' does not match expected host '{EXPECTED_REMOTE_HOST}'. \
+             Verify your git remote configuration before updating."
+        ));
     }
 
     let _ = app_handle.emit("kim-update-progress", "Pulling latest source from GitHub…");
@@ -342,5 +411,127 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
         app_handle.restart();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- extract_remote_host --
+
+    #[test]
+    fn test_extract_host_https() {
+        assert_eq!(
+            extract_remote_host("https://github.com/AdamMagued/kim.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_https_no_dot_git_suffix() {
+        assert_eq!(
+            extract_remote_host("https://github.com/AdamMagued/kim"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_ssh_url_form() {
+        assert_eq!(
+            extract_remote_host("ssh://git@github.com/AdamMagued/kim.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_scp_like_ssh_shorthand() {
+        assert_eq!(
+            extract_remote_host("git@github.com:AdamMagued/kim.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_is_case_insensitive() {
+        assert_eq!(
+            extract_remote_host("https://GitHub.COM/AdamMagued/kim.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_empty_or_malformed() {
+        assert_eq!(extract_remote_host(""), None);
+        assert_eq!(extract_remote_host("   "), None);
+        assert_eq!(extract_remote_host("not a url at all"), None);
+    }
+
+    // -- remote_host_is_expected: the security-relevant assertions --
+
+    #[test]
+    fn test_rejects_lookalike_subdomain_suffix_attack() {
+        // github.com.evil.example -- old `.contains("github.com")` check
+        // would have wrongly accepted this.
+        assert!(!remote_host_is_expected(
+            "https://github.com.evil.example/AdamMagued/kim.git"
+        ));
+    }
+
+    #[test]
+    fn test_rejects_github_com_embedded_in_path() {
+        // "github.com" appears in the URL, but not as the host.
+        assert!(!remote_host_is_expected(
+            "https://evil.example/github.com/AdamMagued/kim.git"
+        ));
+    }
+
+    #[test]
+    fn test_rejects_github_com_embedded_in_query_string() {
+        assert!(!remote_host_is_expected(
+            "https://evil.example/repo.git?x=github.com"
+        ));
+    }
+
+    #[test]
+    fn test_rejects_userinfo_spoof() {
+        // A URL with "github.com" stuffed into userinfo before the real
+        // (malicious) host -- host_str() must still resolve to evil.example.
+        assert!(!remote_host_is_expected(
+            "https://github.com@evil.example/AdamMagued/kim.git"
+        ));
+    }
+
+    #[test]
+    fn test_accepts_https_github() {
+        assert!(remote_host_is_expected(
+            "https://github.com/AdamMagued/kim.git"
+        ));
+    }
+
+    #[test]
+    fn test_accepts_ssh_scp_like_github() {
+        assert!(remote_host_is_expected("git@github.com:AdamMagued/kim.git"));
+    }
+
+    #[test]
+    fn test_accepts_ssh_url_form_github() {
+        assert!(remote_host_is_expected(
+            "ssh://git@github.com/AdamMagued/kim.git"
+        ));
+    }
+
+    #[test]
+    fn test_rejects_unrelated_host() {
+        assert!(!remote_host_is_expected("https://gitlab.com/foo/bar.git"));
+    }
+
+    #[test]
+    fn test_rejects_empty_remote() {
+        assert!(!remote_host_is_expected(""));
     }
 }
