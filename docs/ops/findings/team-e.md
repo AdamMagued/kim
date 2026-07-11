@@ -1,8 +1,10 @@
 # TEAM E — Wave 1 findings (Rust CLI `cli/` + `kimctl/`)
 
 Baseline: `integration/audit-fixes`. Read-only hunt. Format per OPERATION_GOOGLE_LEVEL §3.
-Status: IN PROGRESS — preliminary batch committed early for resilience; findings are
-appended (and re-severity-sorted at final pass) as the hunt proceeds.
+Status: COMPLETE — 15 findings (2 High, 7 Medium, 6 Low). Findings appear in
+discovery order; see the "Severity index (final)" table at the bottom for the
+severity-sorted view, and "CLI vs kimctl vs desktop: verdict" for the
+charter-required split verdict and drift enumeration.
 
 ## F-E-1: `kim doctor` always exits 0, even when every check fails
 - **File:** cli/src/main.rs:289-297, cli/src/commands.rs:385-458
