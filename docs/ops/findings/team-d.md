@@ -68,3 +68,38 @@ residue after those passes.
 - **Fix sketch:** either drop the health route or keep it but document that it is intentional
   local-only liveness; consider binding the probe behind the token too.
 - **Cross-territory?** no.
+
+## F-D-4: the loopback bridge token is injected into third-party provider webviews — a compromised/monkeypatched provider page can steal it and drive the local bridge
+- **File:** desktop/src-tauri/src/provider_auth.rs:61-89 (`build_auth_probe_js`); browser_bridge.rs (PERSISTENT_BRIDGE_JS injection); http_bridge/mod.rs token gate
+- **Severity:** Medium
+- **Class:** security
+- **Evidence:** auth-probe/send bridge JS embeds the live bridge token (`const token = {token_js}`)
+  and injects it into the provider page (claude.ai, chatgpt.com, gemini.google.com, grok.com,
+  chat.deepseek.com — see capabilities/browser-bridge.json). The token is closure-scoped, but the
+  injected code calls the page's global `window.fetch`; a provider page that has monkeypatched
+  `fetch` (or any main-world script running before injection) captures the token and the
+  `baseUrl`. With the token, that script can then call every authenticated bridge route from
+  inside the webview — most dangerously `/v1/task` (spawn an arbitrary agent run on the user's
+  machine) and `/v1/open` (F-D-1 SSRF). This turns any provider-page compromise/XSS, or a user
+  being navigated onto a lookalike page in the webview, into local bridge takeover. The bridge
+  auth model implicitly trusts every loaded provider origin with a machine-local capability token.
+- **Fix sketch:** run bridge JS in an isolated content world (WKWebView `WKContentWorld`/Tauri
+  isolation) so page scripts can't observe injected globals or hook the `fetch` it uses; and/or
+  scope tokens per-capability (a read-only auth-probe token that cannot reach `/v1/task`/`/v1/open`).
+- **Cross-territory?** partial — token minting/routing is Team D; the isolation-world plumbing may
+  touch the webview init that Team C/frontend also handles.
+
+## F-D-5: agent stdout forwarder has no per-line size cap or event back-pressure — a runaway/oversized-line child can balloon memory
+- **File:** desktop/src-tauri/src/spawn_supervisor.rs:124-132 (stdout pump) → subprocess.rs:27-42 (`forward_agent_stdout_line`, `app.emit`)
+- **Severity:** Low
+- **Class:** leak
+- **Evidence:** the pump uses `BufReader::lines().next_line()`, which accumulates an entire line
+  (no newline ⇒ unbounded String) before yielding, and then `app.emit`s each line to the webview
+  with no size cap or rate limit. A child that emits a single multi-GB line, or floods stdout
+  faster than the webview consumes events, grows Rust-side memory unboundedly (the request-body
+  path already has M-BRIDGE-3's 32 MB cap; the stdout path has no equivalent). Trusted-input today
+  (our own orchestrator), so robustness rather than security — but a malformed provider dump or a
+  buggy tool can trigger it.
+- **Fix sketch:** cap `next_line` accumulation (read fixed-size chunks, truncate over-long lines
+  with a marker) and/or coalesce/drop emits under back-pressure.
+- **Cross-territory?** no.
