@@ -121,4 +121,32 @@ config, tool_registry, tools/, sites/). Format mirrors §3 / inherited.md: most 
   its own secret store defeats the filename-based sandbox.
 - **Cross-territory?** Team H (sandbox trust-model doc).
 
+## F-C-4: SSRF guard only inspects top-level navigations — subresource/XHR/fetch to cloud-metadata & private IPs is unguarded
+- **File:** mcp_server/tools/web/browser.py:152-200 (`_install_ssrf_guard._guard`)
+- **Severity:** MEDIUM
+- **Class:** security / SSRF
+- **Evidence:** the page route handler aborts a request only when
+  `request.is_navigation_request()` is true AND it is the main frame; every other
+  request falls straight through to `route.continue_()` (browser.py:194-195). So once
+  `web_open` lands on any public page, that page's own JavaScript can
+  `fetch("http://169.254.169.254/latest/meta-data/iam/security-credentials/…")`,
+  `new Image().src="http://127.0.0.1:…"`, or XHR to any RFC-1918 host — none are
+  navigation requests, so `_is_ssrf_target` never runs on them. The `web_open`
+  pre-goto check (navigation.py:62) and the nav-request guard both only cover the
+  *top-level URL*; the far more common cloud-metadata SSRF vector (attacker page
+  exfiltrating IMDS creds via a background request) is wide open. The browser has full
+  host network access (no `--unshare-net` equivalent), so the request actually reaches
+  the internal address.
+- **Attack path:** agent is induced (prompt injection in page content, or a task) to
+  `web_open` an attacker page → page JS reads `169.254.169.254` metadata / internal
+  admin panel → exfil via a normal outbound request. No approval gate on `web_open`
+  by default.
+- **Fix sketch:** in `_guard`, run `_is_ssrf_target(request.url)` on ALL requests
+  (drop the `is_nav`/main-frame narrowing), or maintain the nav-only fast-path but add
+  a second check that blocks non-nav requests whose host is loopback/private/
+  link-local. Watch performance (route handler runs per request) — cache the verdict
+  per host.
+- **Cross-territory?** partial — Team D (if Tauri owns any browser network policy),
+  else Team C-owned.
+
 <!-- more findings appended below -->
