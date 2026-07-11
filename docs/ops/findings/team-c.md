@@ -198,4 +198,84 @@ config, tool_registry, tools/, sites/). Format mirrors §3 / inherited.md: most 
   remove them; don't ship a callable no-op tool.
 - **Cross-territory?** no — Team C (or Team H hygiene).
 
-<!-- more findings appended below -->
+---
+
+# Tool trust model (as-built)
+
+How `mcp_server/` actually gates a tool call today, and where the trust boundaries
+really sit (as observed, not as documented).
+
+**The chokepoint.** `server.py:call_tool` runs `policy.enforce(name, args)` before
+dispatch for EVERY tool (built-in and connector). `enforce` never raises — internal
+errors fail *closed* (deny). Decisions: `deny` (never dispatches), `approve` (blocks on
+`approvals.request_approval`, default-deny on timeout/error), `allow`. This part is
+sound and correctly universal.
+
+**Layer 1 — path sandbox (S3, always on).** `_validate_path_args` runs
+`config.validate_path` on every declared path-typed arg. `validate_path` resolves
+symlinks and `..` (`Path.resolve()`) THEN checks `relative_to(ALLOWED_PATHS)`, so
+symlink-escape and traversal are genuinely closed; sensitive dirs + secret-file globs
+are matched case-insensitively at any depth. Solid for *declared path arguments*. The
+gap is everything that reaches a file WITHOUT a path argument (below).
+
+**Layer 2 — shell allowlist (S2, always on) is the weakest real boundary.** For
+`run_command`, `policy._analyze_shell` segments on chaining operators, recurses into
+`sh -c`/wrappers, denies the `_DENY_COMMANDS` binaries (rm/curl/ssh/…) on the resolved
+realpath (symlink-rename-proof), denies sensitive path *tokens*, and escalates
+inline-interpreter exec, sudo, non-allowlisted/untrusted-location binaries, and a few
+destructive git flags. shell.py re-checks as defense-in-depth. **The model's fatal
+assumption: that an allowlisted binary only does its nominal job.** It does not hold —
+`git -c`, `awk`, `tar`, `sed`, `make`, `gh auth token` are all allowlisted yet can
+exec arbitrary commands or read arbitrary/secret files from *inside their own argument
+grammar*, which `_scan_path_tokens` (token-shape based) cannot see. See F-C-1/2/3.
+This is the headline structural weakness: a positive allowlist of program *names*
+cannot bound behaviour when allowed programs are themselves command runners.
+
+**Layer 3 — mandatory approval for opaque executors.** `run_python`/`run_node`
+(`_ALWAYS_APPROVE_TOOLS`) and `run_powershell` escalate to a human UNCONDITIONALLY,
+independent of `hitl_risk_threshold`, with the session-cache signature scoped to the
+exact payload (no "accept for session" over-approval). This is the one place the design
+correctly assumes it cannot analyse the grammar and hands to a human. It is also why
+F-C-1/2/3 matter so much: the SAME "can run arbitrary code" property, when it hides
+inside an *allowlisted* binary via `run_command`, gets NONE of this treatment and
+dispatches on `allow`.
+
+**The default-off risk threshold.** `hitl_risk_threshold` is unset by default
+(deliberate, documented at policy.py:83-115), so the risk-level approval arm is INERT
+out of the box: only hard denies + argv escalation rules + the unconditional
+code-exec/powershell escalations gate calls. Consequence: a `run_command` that policy
+rates `risk=high` but attaches NO escalation (e.g. the git/awk/tar escapes) **dispatches
+with no human in the loop** in the shipped config. The safety load therefore rests
+entirely on Layers 1–2 being complete — and Layer 2 is not (F-C-1..3).
+
+**Code-exec sandbox (run_python/run_node).** minimal allowlist env (strips API keys),
+optional OS sandbox (`sandbox-exec`/`bwrap`, network-denied) that is **fail-open** if
+the binary is absent, and a bypassable inline blocklist (documented DiD-only). The
+blocklist is NOT applied to `file` execution at all (documented M4), so an approved
+`run_python(file=…)` in ALLOWED_PATHS runs unrestricted Python that can read any
+absolute path (sandbox-exec allows filesystem, only denies network). Mitigated only by
+the mandatory human approval (Layer 3) — the human sees the file path, not its
+behaviour.
+
+**Browser.** SSRF is guarded on top-level navigations (numeric-IP/`localhost`
+normalized, redirects + click-nav covered via a per-page route) but NOT on
+subresource/XHR/fetch (F-C-4). `file:`/`chrome:`/`about:` schemes are refused;
+`data:` allowed. HTTP-auth creds are exactly-URL-scoped and unrouted after nav (with a
+loud warning + SSRF-guard reinstatement if unroute fails). Playwright launch is
+single-flight (no zombie-Chrome storms); the dedicated-browser Popen handle is tracked
+and reaped.
+
+**git.py MCP tools (NOT the run_command path).** The structured git tools
+(`git_status/diff/add/commit/log/checkout`) are safe: fixed subcommands via
+`create_subprocess_exec` (no shell), `--` pathspec separators, `-`-prefixed tokens
+skipped for path-validation but never used to inject config, checkout target rejects
+`..`/absolute/`-` prefixes, minimal env. The F-C-1 RCE is purely the `run_command`
+`git` allowlisting — git.py itself is clean.
+
+**Bottom line.** Denies (paths, binary denylist, find/redirect rules) and the
+unconditional code-exec/powershell approvals are strong. The soft underbelly is the
+positive shell allowlist admitting general-purpose command-runner binaries while the
+risk-threshold arm is default-off — turning "allowlisted `git`/`awk`/`tar`/`gh`" into
+un-approved arbitrary execution and secret disclosure (F-C-1/2/3), and the
+navigation-only SSRF scope (F-C-4).
+
