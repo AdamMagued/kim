@@ -113,3 +113,104 @@ Status: IN PROGRESS — findings banked incrementally (session-limit resilience)
 - **Fix sketch:** pass `env={**os.environ, "OLLAMA_HOST": self._base_url}` to the subprocess, or skip the `ps`
   path entirely when base_url != localhost and rely on `/api/show`.
 - **Cross-territory?** no — Team B.
+
+## F-B-7: Sentinel echo terminates the generation wait instantly — the prompt itself contains the literal completion hash, and Claude/Grok response selectors match user turns
+- **File:** orchestrator/providers/browser/provider.py:1602-1604 (`_wait_for_generation_complete` hash check), 1487-1488 (`new_element_index`); orchestrator/providers/browser/prompt_builder.py:200-205,412 (literal hash in every prompt); orchestrator/providers/browser/site_configs.py:127-130,220-224 (selectors)
+- **Severity:** High
+- **Class:** bug (sentinel protocol / selector drift)
+- **Evidence:** Charter question "what if the model echoes the sentinel early" — answered: it terminates the
+  wait, and worse, the *user's own message* does it too. (1) `transport_marker_instruction` embeds the literal
+  `[END_OF_RESPONSE_<id>]` in every injected prompt ("Always append the exact string …"). (2) Claude's primary
+  response selector `[data-testid^="conversation-turn"]` (and Grok's `article`) matches USER turns as well as
+  assistant turns. After submit, the user bubble appears first: `_wait_for_new_response` returns on the count
+  increase, `new_element_index` points at the user bubble, and the first poll of
+  `_wait_for_generation_complete` scrapes it — the echoed prompt CONTAINS the hash, so
+  `norm_hash in _normalize_for_marker(current_text)` returns True immediately (this check bypasses
+  `min_generation_time`). The scraped "response" is the user's own prompt: `parse_response` then matches the
+  echoed "2. TASK_COMPLETE: <one-line summary>" from the [INSTRUCTIONS] block (first turn) or, when the last
+  message was a tool result whose payload contains registered-tool-shaped JSON (reading Kim's own tests/docs),
+  dispatches a spurious tool call — the known_tools guard does not help because the name IS registered.
+  (3) Assistant-side echo is also terminal: a model that says "I'll end with `[END_OF_RESPONSE_x]`" before
+  answering trips the same any-occurrence check mid-generation; `_normalize_for_marker` strips
+  backticks/italics so styled echoes match MORE easily, and `strip_transport_markers` rsplits on the LAST hash
+  occurrence — the early echo — discarding the whole in-flight answer. Applies to the Playwright/CDP path
+  (bare CLI, headless, and the unified-Playwright chat path); the in-app bridge waits in bridge.js instead
+  (same class of check worth auditing — Team D/E).
+- **Fix sketch:** accept the hash only at the (normalized) TAIL of the scraped text; never accept it before
+  `min_generation_time`; give Claude/Grok assistant-only primary selectors (`.font-claude-message` first) or
+  filter candidate elements that contain the marker-instruction sentence verbatim.
+- **Cross-territory?** partially — same-audit handoff to Team D/E for bridge.js's completion detection.
+
+## F-B-8: Browser send is retried non-idempotently — a timeout after a delivered send re-injects the whole prompt into the same chat
+- **File:** orchestrator/providers/browser/provider.py:658-663 (H6 re-raise), 1479-1485 (`TimeoutError` after submit); orchestrator/agent.py:1496-1621 (`_call_with_retry`)
+- **Severity:** Medium
+- **Class:** bug (retry-on-non-idempotent)
+- **Evidence:** The H6 fix deliberately re-raises `TimeoutError` from the browser flow so
+  `classify_provider_error` marks it retryable. But the timeout at provider.py:1483 ("No new response appeared
+  after 60s") fires AFTER the prompt was successfully injected and submitted — the message is already in the
+  site thread. `_call_with_retry` then calls `complete()` again (up to `max_retries`=5), which re-formats and
+  re-sends the SAME content with a NEW completion hash into the SAME conversation. The site may still be
+  answering the first copy: duplicate prompts pile up, responses interleave, and the count-based
+  `_wait_for_new_response` baseline from the retry can latch onto the FIRST send's late answer — which carries
+  the OLD hash, so the new-hash wait never resolves. Same pattern for the agent's outer
+  `asyncio.wait_for(1260s)` cancellation. The bridge path has the same shape in miniature: bridge_client.py:199
+  acknowledges "prompt may already be injected" on send timeout but returns NEED_HELP (safe, non-retried) — the
+  CDP path instead retries automatically.
+- **Fix sketch:** make post-send timeouts non-retryable for the browser provider (return a NEED_HELP that names
+  the thread state), or track "delivered" state so a retry only re-polls/scrapes instead of re-sending.
+- **Cross-territory?** no — Team B (agent wrapper unchanged).
+
+## F-B-9: Auth-wall detection: title heuristics are dead code, and no re-check after the clear_chat navigation
+- **File:** orchestrator/providers/browser/site_configs.py:59-74 (`detect_auth_wall(url, title="")`); orchestrator/providers/browser/provider.py:684-687 (sole call site), 695-702 (clear_chat goto)
+- **Severity:** Low
+- **Class:** bug / dead-code
+- **Evidence:** `detect_auth_wall` accepts a `title` parameter with four `_AUTH_WALL_TITLE_MARKERS`
+  ("just a moment", "attention required", …) but the only production call passes the URL alone — every
+  title-based Cloudflare/interstitial detection branch is unreachable. And the check runs once at flow start:
+  when `clear_chat` then navigates to the site root and the (signed-out) site redirects to its login page, the
+  walled state is not re-detected; the flow proceeds to `_find_selector` and fails with the generic
+  "Could not locate chat input box" RuntimeError instead of the actionable AUTH_REQUIRED message. The bridge
+  path has no python-side wall check at all (relies on the Rust 409).
+- **Fix sketch:** re-run `detect_auth_wall(page.url, await page.title())` after any goto and before injection.
+- **Cross-territory?** no — Team B.
+
+## F-B-10: CDP path uploads only the LAST image and clobbers the user's system clipboard every turn
+- **File:** orchestrator/providers/browser/provider.py:711-716 (`image_attachments[-1]`), 1242-1252 + 1274-1281 (clipboard writes)
+- **Severity:** Low
+- **Class:** bug
+- **Evidence:** (1) `_run_chat_flow` pastes only `image_attachments[-1]`; earlier screenshots in the same turn
+  are silently dropped while the prompt text still says "[Screenshot attached]" for each — the bridge path
+  supports 8 attachments, the CDP path 1, an undocumented behavioral fork of the same provider. (2) Both text
+  injection and image injection write through `navigator.clipboard` on the user's REAL Chrome (CDP attach) —
+  every agent turn silently overwrites whatever the user had on their system clipboard (potentially something
+  they were about to paste elsewhere). No save/restore attempted.
+- **Fix sketch:** loop over image attachments; note the clipboard side-effect in docs or restore the prior
+  clipboard text afterwards (image restore is not feasible; a doc note may be the honest fix).
+- **Cross-territory?** no — Team B.
+
+## F-B-11: Bridge result long-poll is one-shot — a transient GET failure abandons a delivered request's answer
+- **File:** orchestrator/providers/browser/bridge_client.py:213-233
+- **Severity:** Low
+- **Class:** bug
+- **Evidence:** After a successful `/v1/send` (message delivered to the site), the `/v1/result/{req_id}` GET is
+  attempted exactly once with a 720 s client timeout. Any transient failure — connection reset, bridge busy
+  blip — returns a terminal NEED_HELP even though the Rust side still holds/completes the result for that
+  `req_id`. The user's resend then duplicates the message into the provider thread (same non-idempotency class
+  as F-B-8, but user-driven).
+- **Fix sketch:** retry the GET a few times on transport errors (the send is NOT re-issued; re-polling an
+  existing req_id is idempotent) before giving up.
+- **Cross-territory?** no — Team B (protocol seam doc → Team H).
+
+## F-B-12: OpenAI-compatible endpoints with a missing API key silently get "placeholder" — cryptic 401 instead of the actionable EnvironmentError
+- **File:** orchestrator/providers/openai_provider.py:48-57
+- **Severity:** Low
+- **Class:** bug (error quality)
+- **Evidence:** The missing-key guard raises only when `base_url is None`. A user who configures
+  `openai_base_url` (Cerebras/Groq/Together per the class docstring) but forgets the key env gets
+  `api_key="placeholder"` and a first-call HTTP 401 whose SDK message may not name the env var — versus the
+  official-OpenAI path's precise "`{key_env}` is not set. Set it in .env …". Auth classification still lands
+  non-retryable, but the actionable fix is hidden. (Deliberate for token-less LOCAL proxies, but that intent is
+  undocumented and unconditional for remote hosts too.)
+- **Fix sketch:** warn loudly at init when base_url is remote (non-localhost) and no key was found; keep the
+  placeholder path for localhost proxies.
+- **Cross-territory?** no — Team B.
