@@ -67,6 +67,9 @@ scratch_test_json.py
 .DS_Store
 Thumbs.db
 Desktop.ini
+# macOS system python (Xcode CLT) drops a com.apple.python pyc-cache tree named
+# Library/ at cwd when run from the repo root — pure junk, safe to delete anytime.
+/Library/
 
 # ── Editor / IDE ──────────────────────────────────────────────────────────────
 .vscode/
