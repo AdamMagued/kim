@@ -32,18 +32,29 @@ residue after those passes.
 - **Cross-territory?** partial — the webview network-policy fix lives in Team D (browser_bridge.rs),
   but it shares root cause with Team C's F-C-4. Coordinate one guard covering both nav + subresource.
 
-## F-D-2: `/v1/browser/restore` navigates the webview to a URL read from an on-disk session-meta file — second SSRF/redirect entry point
-- **File:** desktop/src-tauri/src/http_bridge/session_meta.rs (restore) → provider_url.rs:89 `browser_url_allowed_for_restore`
-- **Severity:** Medium (pending confirm of the restore allowlist strictness)
-- **Class:** security
-- **Evidence:** restore path pulls a previously-committed URL from session metadata (a JSON
-  file under the sessions dir, writable by any user-level process) and re-navigates the
-  webview. `browser_url_allowed_for_restore` is described as "stricter than same-host"; needs
-  a concrete check that it cannot be coerced to a private-IP/metadata host. If the allowlist
-  is host-prefix based it may be bypassable via `https://gemini.google.com.evil.example`.
-- **Fix sketch:** confirm restore uses exact-origin equality against the provider allowlist,
-  not `starts_with`/substring; add the same private-range block as F-D-1.
-- **Cross-territory?** no (Team D owns provider_url.rs + session_meta.rs).
+## F-D-2: `KIM_PROJECT_ROOT` env override is documented as "wins" but is silently overridden by the compile-time baked root and `~/.kim_root`
+- **File:** desktop/src-tauri/src/paths.rs:24-57 (`default_project_root`)
+- **Severity:** Medium
+- **Class:** bug | contract
+- **Evidence:** resolution order is 0a `KIM_COMPILE_TIME_ROOT` (baked by build.rs) → 0b
+  `~/.kim_root` → 1 `KIM_PROJECT_ROOT` env → 2 exe walk → 3 `~/.kim`. Step 1's own comment says
+  "Environment override wins (explicit user intent)", but it does NOT win: if the baked dev-tree
+  path still exists on the machine (0a checks only `p.exists() && orchestrator/agent.py exists`)
+  or `~/.kim_root` resolves, `KIM_PROJECT_ROOT` is never consulted. Concrete failure: a developer
+  who built the `.app` then sets `KIM_PROJECT_ROOT` to point at a second checkout still gets the
+  original baked tree — the orchestrator, config.yaml, and sessions all load from the wrong root
+  with no error. Same hazard if a distributed build's baked path happens to exist on a target
+  machine. The baked root taking precedence over an explicit env override is a genuine
+  least-surprise violation, not just a stale comment.
+- **Fix sketch:** move the `KIM_PROJECT_ROOT` check above 0a/0b (explicit env should win), or
+  fix the comment and document the true precedence. Verifying `agent.py` under the env root
+  before accepting it keeps it safe.
+- **Cross-territory?** no.
+- **Note (checked, NOT a finding):** `/v1/browser/restore` (session_meta.rs:321-337) was audited
+  as a possible second SSRF vector but is safe — it gates the stored URL through
+  `browser_url_allowed_for_restore` → `browser_url_is_bad_for_commit`, which requires exact
+  equality to a hardcoded provider origin (provider_url.rs:76-86); a spoofed
+  `gemini.google.com.evil` host fails the exact match and falls back to `fresh_site_url`.
 
 ## F-D-3: `/v1/health` is unauthenticated and confirms the bridge port + liveness to any local process
 - **File:** desktop/src-tauri/src/http_bridge/mod.rs:74,103-105
