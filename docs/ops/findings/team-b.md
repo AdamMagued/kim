@@ -4,7 +4,9 @@ Territory: `orchestrator/providers/` (base.py, claude.py, openai_provider.py, ge
 deepseek.py, ollama.py, browser_provider.py, browser/ package). Baseline: `integration/audit-fixes` @ HEAD.
 Read-only hunt. Inherited findings (`inherited.md`) not re-reported; F-INH-1/2/3/4 remain valid as filed.
 
-Status: IN PROGRESS — findings banked incrementally (session-limit resilience). Browser package deep-dive follows.
+Severity counts: High 3 · Medium 4 · Low 7. Includes the V-3 provider conformance matrix (end of file).
+Recovered leads from the lost prior run: all three verified and filed (F-B-3, F-B-4, F-B-6).
+Team A handoff (F-A-2 provider-side guard): filed as F-B-2.
 
 ---
 
@@ -214,3 +216,80 @@ Status: IN PROGRESS — findings banked incrementally (session-limit resilience)
 - **Fix sketch:** warn loudly at init when base_url is remote (non-localhost) and no key was found; keep the
   placeholder path for localhost proxies.
 - **Cross-territory?** no — Team B.
+
+## F-B-13: Dead config knobs: `browser_provider.max_history_messages` is read but never used; the `relay:` section is read by nothing at all
+- **File:** orchestrator/providers/browser/provider.py:146; config.yaml (`browser_provider.max_history_messages`, `relay:` with `pc_api_key`/`poll_interval`/`url`)
+- **Severity:** Low
+- **Class:** dead-code
+- **Evidence:** `self._max_history_messages` is assigned at init and referenced nowhere else in the repo —
+  `format_prompt`/`build_history_recap` bound the recap by characters (`max_recap`), not message count, so a
+  user tuning `max_history_messages: 6` changes nothing. Separately, the shipped config.yaml carries a `relay:`
+  section (`pc_api_key`, `poll_interval`, `url`); repo-wide grep finds no reader in orchestrator/, mcp_server/,
+  desktop, or cli — an empty-string "api key" field in the default config that feeds nothing (invites
+  confusion about where a secret would go).
+- **Fix sketch:** delete both (or wire `max_history_messages` into `build_history_recap` as a message cap).
+- **Cross-territory?** relay section: Team A/W2 config cleanup; max_history_messages: Team B.
+
+## F-B-14: base.py's typed contract (`ToolCallResponse`/`TextResponse`) omits half the fields every provider actually returns
+- **File:** orchestrator/providers/base.py:76-92
+- **Severity:** Low
+- **Class:** contract / docs
+- **Evidence:** `ToolCallResponse` declares only `type/tool/args`, but all six providers attach `content`
+  (narration — the agent's PLAN/STEP stream depends on it per the H2 fixes), and API providers attach
+  `stop_reason` and `usage`. `TextResponse` omits `stop_reason`. Ollama returns `usage` keys (`provider`,
+  `forbid_fallback`, `billing`, optional `input`/`output`) that no other provider has and the TypedDict doesn't
+  mention. The declared contract is therefore not what the agent consumes (it reads `response["content"]` on
+  tool calls) — the V-3 conformance matrix below is the ground truth; the TypedDicts should be updated to match
+  and become the doc of record (feeds Team H's CONTRACTS.md).
+- **Fix sketch:** add `content`, `stop_reason`, `usage` as optional fields on both TypedDicts; document the
+  ollama usage extension keys.
+- **Cross-territory?** yes — pairs with Team H (CONTRACTS.md).
+
+---
+
+# V-3 — Provider response-shape conformance matrix (ground truth, this audit)
+
+Legend: ✓ conforms to the de-facto richest shape · — field absent · n/a not applicable.
+De-facto canonical shapes (what agent.py consumes):
+`{"type":"text","content",stop_reason?,usage?}` ·
+`{"type":"tool_call","tool","args","content"(narration),stop_reason?,usage?}` ·
+multi-call → `{"tool":"batch","args":{"calls":[{tool,args},…]}}`.
+
+| Aspect | claude | openai / deepseek | gemini | ollama | browser | fake |
+|---|---|---|---|---|---|---|
+| text: `stop_reason` | ✓ | ✓ (`finish_reason`) | ✓ (missing on the no-candidates path, gemini.py:470) | — (F-B-3) | — (no signal from DOM) | — |
+| text: truncation honesty (`finalize_text_content`) | ✓ | ✓ | ✓ | ✗ never called (F-B-3) | n/a | n/a |
+| tool_call: narration `content` | ✓ | ✓ | ✓ | ✓ | ✓ (prose around JSON) | — |
+| tool_call: `stop_reason` | ✓ | ✓ | — (gemini.py:488-505) | — | — | — |
+| tool_call: `usage` | ✓ | ✓ | ✓ | ✓ (divergent keys) | ✓ (estimated) | — |
+| multi tool_call → `batch` | ✓ (claude.py:150) | ✓ (:190) | ✓ (:496) | ✓ (:225) | ✗ — protocol says "EXACTLY ONE"; extra JSON objects in one reply become prose `content` (first balanced match wins, response_parser.py:101) | n/a |
+| malformed tool args | n/a (native dict) | `{}` + warn (F-INH-3) | n/a (native dict) | `{}` + warn (F-INH-3) | non-dict coerced `{}` (L3); unparseable → falls through to text | n/a |
+| empty response | `""` / block note | `""` / block note | NEED_HELP w/ blockReason (M2) or `""` | `""` | NEED_HELP text | n/a |
+| errors | raise SDK exc (timeout re-wrapped ✓) | raise SDK exc (timeout re-wrapped ✓) | raise RuntimeError — OAuth label poisons classification (F-B-1) | raise mixed; raw httpx timeouts misclassified (F-B-5) | **returns** NEED_HELP text for connect/IO failures; raises only TimeoutError (retry non-idempotent, F-B-8) | scripted |
+| usage key set | input/output/cache_creation/cache_read (additive cache) | same (cache_read subset; DeepSeek cache always 0 — known) | same (cache_read subset) | provider/source/model/mode/usage_available/forbid_fallback/billing/input?/output?/durations | input/estimated/source/output | — |
+| auth failure surface | raise 401 → "auth" | raise 401 → "auth" | EnvironmentError w/ actionable text ✓ (but see F-INH-1) | PermissionError "Sign in to Ollama…" ✓ | NEED_HELP AUTH_REQUIRED (Rb3) / bridge 409 | n/a |
+
+**Cross-cutting contract facts:** (1) The browser provider is the only one whose *errors are in-band text*
+(`NEED_HELP:` strings) rather than exceptions — the agent must string-match; this is load-bearing and
+undocumented (→ Team H). (2) `usage` consumers all use `.get()` so the ollama/browser divergence is tolerated,
+not validated. (3) `stop_reason` has NO consumer in agent.py — it is only meaningful via
+`finalize_text_content` inside providers, which is exactly why ollama skipping it (F-B-3) is invisible today.
+(4) Model-ID drift-watch (unverifiable offline): default `gemini: gemini-2.0-flash` is the oldest configured
+default and the likeliest to be retired; claude/openai/deepseek defaults look current.
+
+# Checked and clean (no finding)
+
+- base.py `classify_provider_error` ordering (auth-before-OSError, digit-bounded 400/429/5xx, JSONDecodeError
+  → retryable) — sound except the F-B-1 label collision; agent-side asyncio.TimeoutError normalization present.
+- `create_provider` factory: KIM_FAKE gate, `browser:<site>[:tier]` parsing, unknown-name error — clean.
+- Agent `_call_with_retry`: bounded (5), exponential with jitter, no sleep after final attempt, honest
+  rate-limit vs other-retry status lines — clean (except the F-B-8 idempotency interaction).
+- ollama #38 (delta accumulator slots) and #40 (FIFO pending tool-call pairing) — correct for same-name
+  interleaving; only the image-branch bypass (F-B-4) breaks pairing.
+- response_parser known_tools prompt-injection guard (#38) applied to fenced AND bare JSON — clean;
+  `strip_transport_markers` last-occurrence anchoring (L6) correct given F-B-7 is fixed upstream.
+- prompt_builder trim ladder (4.2): marker instruction and task survive pathological budgets — clean.
+- markdown_scraper fence reconstruction — covered by DOM-fixture contract tests.
+- bridge_client attachment-honesty gating (`attachments_uploaded`) and oversize/8-cap limits — clean.
+- Secrets: no provider logs key material; gemini truncates/extracts Google error bodies; bridge token only in
+  headers — clean.
