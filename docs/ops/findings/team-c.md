@@ -149,4 +149,53 @@ config, tool_registry, tools/, sites/). Format mirrors §3 / inherited.md: most 
 - **Cross-territory?** partial — Team D (if Tauri owns any browser network policy),
   else Team C-owned.
 
+## F-C-5: Model-supplied `timeout` is unclamped for run_python/run_node/web_wait_* — the shell `MAX_SHELL_TIMEOUT_S` clamp (finding 2.1 fix) was never mirrored
+- **Files:** mcp_server/tools/code.py:222,285,350 (`timeout = int(args.get("timeout", CODE_TIMEOUT))`, `resolved_timeout = timeout or CODE_TIMEOUT`); mcp_server/tools/web/navigation.py:215,237 (`int(args.get("timeout_ms", 10000))`)
+- **Severity:** LOW (Medium for the DoS-pin angle)
+- **Class:** contract / DoS
+- **Evidence:** shell.py clamps a model-supplied timeout to `[1, 600]` via
+  `_clamp_shell_timeout` specifically so a model can't request an arbitrarily long
+  server-side execution that outlives the client's wait and gets re-issued (the
+  finding-2.1 double-execution fix; agent-side `_MAX_SHELL_EXEC_S` is kept in sync).
+  `code.py` and the web wait tools apply NO such clamp: `run_python(timeout=999999)`
+  runs the (approved) subprocess for ~11.5 days server-side, and `web_wait_for(
+  timeout_ms=10**12)` blocks inside `page.locator(...).wait_for`. Because the MCP
+  server **serializes** tool calls (documented single-run-per-process invariant, see
+  browser.py:204-223), one such call pins the entire server — no other tool call for
+  any session can run until it returns. The exact client/server desync that
+  `MAX_SHELL_TIMEOUT_S` closes for shell is reopened for code exec.
+- **Fix sketch:** add a shared clamp (reuse `MAX_SHELL_TIMEOUT_S` or a code-specific
+  cap) in `code.py` and a sane ceiling on `timeout_ms` in navigation.py; keep the
+  agent-side cap in sync as shell.py already documents.
+- **Cross-territory?** Team A (agent-side client timeout cap must match).
+
+## F-C-6: code-exec subprocesses aren't in their own process group — a timeout kill leaks grandchildren (shell.py's L4 fix never reached code.py)
+- **File:** mcp_server/tools/code.py:230-247 (`create_subprocess_exec` without `start_new_session`; timeout path calls bare `proc.kill()`)
+- **Severity:** LOW
+- **Class:** bug / resource-leak
+- **Evidence:** shell.py spawns with `start_new_session=not IS_WINDOWS` and kills the
+  whole process group on timeout (`_kill_process_tree`, the L4 fix) so grandchildren
+  don't survive. code.py's `_run_exec` spawns without `start_new_session` and on
+  timeout calls only `proc.kill()` — the immediate interpreter dies but any
+  subprocess it spawned (a `run_python` *file*, which is exempt from the inline
+  `subprocess` blocklist, can `Popen` freely) keeps running orphaned. Over a session
+  these accumulate.
+- **Fix sketch:** mirror shell.py — `start_new_session=not IS_WINDOWS` +
+  process-group kill in the `TimeoutError` branch.
+- **Cross-territory?** no — Team C.
+
+## F-C-7: `guc_cms` / `guc_mail` connectors are dead stubs shipped in the dispatch path
+- **Files:** mcp_server/sites/guc_cms.py (only `guc_cms_ping` → placeholder string), mcp_server/sites/guc_mail.py
+- **Severity:** LOW
+- **Class:** dead-code / hygiene
+- **Evidence:** both connectors register real MCP tools whose handlers return a
+  "not implemented yet" string (`_guc_cms_placeholder`). They are `default_enabled=
+  False`, so off unless a user opts in, and hold NO credentials (they rely on the
+  shared `web_open` Playwright session — grep of `sites/` for
+  password/token/secret/credential/environ is clean, so no unsafe secret handling).
+  Still: a user who toggles the connector on gets a tool the agent can call that only
+  ever returns boilerplate, wasting a turn and confusing the loop. Either finish or
+  remove them; don't ship a callable no-op tool.
+- **Cross-territory?** no — Team C (or Team H hygiene).
+
 <!-- more findings appended below -->
