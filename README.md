@@ -112,6 +112,8 @@ See [HOW_TO.md](HOW_TO.md) for minimal file sets to:
 - Add a settings pane (3 files)
 - Run a targeted test pass
 
+Quality campaign: [docs/OPERATION_GOOGLE_LEVEL.md](docs/OPERATION_GOOGLE_LEVEL.md) (plan) · [docs/ops/](docs/ops/) (findings, triage, baseline).
+
 ---
 
 ## Provider setup
