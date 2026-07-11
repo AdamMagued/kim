@@ -71,4 +71,54 @@ config, tool_registry, tools/, sites/). Format mirrors §3 / inherited.md: most 
   (S2/S3 invariant docs — the allowlist "trust model" must state that allowlisting a
   program that can exec other programs is itself an escape).
 
+## F-C-2: Allowlisted `awk` / `tar` (and class) execute arbitrary commands via their own exec features — same allowlist escape as F-C-1
+- **Files:** mcp_server/policy.py:219-229 (`_ALLOWED_MUTATING` includes `awk`, `tar`, `sed`, `make`, `zip`, `unzip`), policy.py:493-513 (only `python/node/perl/ruby/sh…` get `_INLINE_EXEC_FLAGS` escalation); mcp_server/tools/shell.py:64-95 (`_DENY_COMMANDS`/`_DENY_PATTERNS` don't cover these)
+- **Severity:** CRITICAL (same blast radius as F-C-1; separate root binaries)
+- **Class:** security / allowlist-escape
+- **Evidence (against the real policy module):**
+  - `run_command {cmd: "awk 'BEGIN{system(\"id\")}'"}` → `_check_blocked`=None,
+    `policy.enforce`=**allow**. `awk`'s `system()` / `"cmd"|getline` run arbitrary
+    shell; `awk` is allowlisted and gets no inline-exec escalation. Also reads any
+    file via `getline < "/abs/secret"` inside the program string (never a path token,
+    so `_scan_path_tokens` can't see it).
+  - `run_command {cmd: "tar -cf /dev/null --checkpoint=1 --checkpoint-action=exec=id ."}`
+    → **allow**. GNU/bsd tar runs `--checkpoint-action=exec=<cmd>` as a shell command.
+    The glued option value (`exec=id`) is not path-shaped, so no gate fires.
+  - Same family, not all exhaustively fired but same mechanism: `make` (runs Makefile
+    recipes), `zip -T --unzip-command`, `sed` GNU `e`/`s///e` (the `e` form is only
+    incidentally denied when it *also* carries an absolute path arg), `find -fprintf`.
+  - Contrast — the gate that DOES work: `perl -e 'system("id")'` → **approve**
+    (`inline_interpreter_exec`). The interpreter escalation list is correct as far as
+    it goes; the defect is that it enumerates interpreters by name and misses every
+    other allowlisted binary that can spawn a shell.
+- **Root cause:** the S2 allowlist assumes an allowlisted binary only does its
+  nominal job. Several allowlisted "local-dev" binaries are general-purpose command
+  runners. A positive allowlist of *program names* cannot by itself bound behaviour
+  when the allowed programs can exec other programs.
+- **Fix sketch:** add argv escalation rules for the known exec-capable allowlisted
+  binaries (`awk` program strings containing `system`/`|getline`/`|& `; `tar
+  --checkpoint-action`/`--to-command`/`--use-compress-program`; `sed` `-e`/`-f`
+  scripts with `e`/`W`/`s///e`; `find -fprintf`; `zip/unzip -T/-TT/--*-command`), OR
+  invert to a much smaller allowlist and route power tools through approve. Document
+  the trust boundary either way.
+- **Cross-territory?** Team A (mirror in agent gate) + Team H (allowlist trust-model doc).
+
+## F-C-3: `gh auth token` / `gh auth status --show-token` exfiltrates the stored GitHub token via an allowlisted binary — bypasses the `~/.config/gh` sandbox
+- **File:** mcp_server/policy.py:219-229 (`gh` in `_ALLOWED_MUTATING`); config.py:207 (`~/.config/gh` is in `_SENSITIVE_PATHS`, but only guards *path arguments*)
+- **Severity:** HIGH
+- **Class:** security / secret-disclosure
+- **Evidence:** `run_command {cmd: "gh auth token"}` → `_check_blocked`=None,
+  `policy.enforce`=**allow**. `gh auth token` prints the user's GitHub OAuth/PAT to
+  stdout, and `gh auth status --show-token` does the same. The token lives in
+  `~/.config/gh/hosts.yml` — which `validate_path` correctly denies as a path — but
+  the `gh` binary reads it internally, so no path argument is ever inspected and the
+  sandbox is bypassed. The agent (or a prompt-injected task) can read the token and
+  then use it (or exfil it via a second allowed channel).
+- **Fix sketch:** deny/escalate `gh auth token` and `gh auth status --show-token`
+  (and `gh auth login`) as argv rules; more generally, credential-printing
+  subcommands of allowlisted tools (`aws configure get`, `docker …`, `npm token`,
+  `heroku auth:token`, …) are the same class as F-C-2/F-C-3 — a binary that can read
+  its own secret store defeats the filename-based sandbox.
+- **Cross-territory?** Team H (sandbox trust-model doc).
+
 <!-- more findings appended below -->
