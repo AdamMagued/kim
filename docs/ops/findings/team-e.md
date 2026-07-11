@@ -200,3 +200,129 @@ appended (and re-severity-sorted at final pass) as the hunt proceeds.
 - **Fix sketch:** `sys.exit(EXIT_TRANSPORT)` on `ok:false`/connection error in
   both; wrap `cmd_browser`'s requests in the same try/except as `cmd_status`.
 - **Cross-territory?** no
+
+## F-E-13: kimctl never reads `~/.kim/bridge_token` — on default installs every kimctl bridge command 401s while `kim` works
+- **File:** kimctl/__main__.py:55-143 (`_get_fallback_token`/`_resolve_bridge`) vs desktop/src-tauri/src/http_bridge/mod.rs:156-244, cli/src/provider/bridge.rs:32-70
+- **Severity:** Medium
+- **Class:** bug | contract
+- **Evidence:** since D2 the desktop persists the active bridge token ONLY to
+  `~/.kim/bridge_token` (0600, rewritten every start) and actively DELETES the
+  legacy `kim_sessions/.bridge_token`. The `kim` CLI was updated to read it
+  (bridge.rs `bridge_token_from_file`). kimctl was not: its ladder is
+  `KIM_WEBVIEW_BRIDGE_TOKEN` env → `KIM_API_KEY` env → mcp_server config
+  `api_key` → the (now always-deleted) legacy `.bridge_token` → config.yaml.
+  On a fresh install with no `KIM_API_KEY`/.env key the desktop generates a
+  random token, so kimctl sends no/stale `X-Kim-Token` and `kimctl status`,
+  `send`, `cancel`, `browser` all 401 while `kim` pairs fine. Two token
+  ladders for the same product surface.
+- **Fix sketch:** add `~/.kim/bridge_token` to kimctl's ladder (right after the
+  env vars), mirroring bridge.rs.
+- **Cross-territory?** no (kimctl is Team E territory; desktop side unchanged)
+
+## F-E-14: CLI code mode with claude/gemini/deepseek silently routes codex to OLLAMA with a non-ollama model name
+- **File:** cli/src/main.rs:989-1015 (only `openai` blocked), cli/src/provider/codex_stream.rs:113-162, cli/src/provider/responses_proxy.rs:64
+- **Severity:** Medium
+- **Class:** bug
+- **Evidence:** the code-mode provider gate rejects only `provider == "openai"`.
+  Any other non-browser provider (claude, gemini, deepseek) falls into the
+  local-codex branch, which unconditionally starts the responses proxy against
+  `config.ollama_base_url` and passes `config.model` — e.g.
+  `model="claude-sonnet-4-6"` — to an ollama endpoint. Concrete: `/provider
+  claude` → `/code` → any task → ollama 404s the model and the user sees
+  "codex produced no output. Check that ollama is running and the model name is
+  correct." — no hint that their provider choice was silently ignored.
+  Desktop drift: the desktop's Code tab constrains provider choice up front.
+- **Fix sketch:** extend the code-mode gate to allow only ollama + browser:*
+  (matching the scheduled-runner allowlist), with an explicit message for
+  everything else.
+- **Cross-territory?** no
+
+## F-E-15: god-file split proposal for main.rs (2,155) and commands.rs (1,684) — PROPOSAL ONLY
+- **File:** cli/src/main.rs, cli/src/commands.rs
+- **Severity:** Low
+- **Class:** docs
+- **Evidence:** main.rs mixes six concerns; commands.rs mixes dispatch with
+  provider/network plumbing. Both are still coherent, but each new feature
+  lands in one of these two files (repl_turn.rs was already split out for the
+  same reason). Natural seams, in extraction order (lowest risk first):
+  1. `cli/src/pickers.rs` — raw-mode model/session pickers + RawModeGuard +
+     render/rerender/clear helpers (main.rs ~640-915, ~280 LOC, no async).
+  2. `cli/src/paint.rs` — colors_enabled/paint*/kim_*_color/print_message/
+     print_note (~90 LOC; used by repl_turn via `crate::` already).
+  3. `cli/src/file_refs.rs` — prompt_with_file_references/
+     normalize_existing_path/split_shellish_tokens (+ their tests, ~110 LOC).
+  4. `cli/src/oneshot.rs` — run_oneshot + parse_cli_args + help_text (+ arg
+     tests) leaving main() a thin dispatcher.
+  5. commands.rs → `commands/providers.rs` (login/logout/validate_api_key/
+     model_options/ollama_*/openai_models, ~450 LOC) and `commands/doctor.rs`
+     (doctor + *_status helpers, ~200 LOC); keep dispatch + COMMAND_SPECS in
+     commands.rs.
+  Test-only movement; each step compiles independently; no behavior change.
+- **Cross-territory?** no
+
+---
+
+# CLI vs kimctl vs desktop: verdict
+
+**Are these two CLIs?** Yes — and both should stay, but they are different
+products and the split must be documented (currently no doc says which to use):
+
+- **`cli/` (`kim`, Rust)** — the *interactive/user* surface. Spawns the
+  orchestrator (chat) or codex/bridge service (code) itself; works without the
+  desktop app; owns its own session store (`~/.kim/sessions/*.jsonl`, flattened
+  `type:"message"` records) and its own config (`~/.kim/cli-config.json`).
+- **`kimctl/` (Python)** — the *automation/control* surface for a RUNNING
+  desktop app (status/send/cancel/browser via the HTTP bridge) plus local
+  schedule CRUD and compare/trace. It is NOT legacy/dead code: the desktop
+  Rust backend itself shells out to `python -m kimctl schedule …`
+  (desktop/src-tauri/src/schedule_commands.rs) — deleting kimctl breaks the
+  desktop Schedule pane. Verdict: **KEEP both; document the split** (suggest a
+  short `cli/README.md` + `kimctl/README.md` cross-reference in Wave 3).
+
+**Enumerated CLI↔desktop drift for the same task** (beyond the F-findings):
+1. HITL permission modes: desktop offers full_auto/ask_risky/ask_always
+   (KIM_HITL_RISK_THRESHOLD off/high/medium via task_spec.rs); `kim` hard-codes
+   `high` with no flag to widen or narrow it.
+2. Failure surfacing: desktop renders run_done{success:false} as a failure
+   banner; `kim` renders `[FAILED]` as a normal answer and exits 0 (F-E-4).
+3. Session stores differ in shape and location; `kim` flattens roles and
+   clobbers timestamps (F-E-3); typed events (plan/stats/context/ui_*) are
+   dropped by the CLI renderer by design.
+4. /compact: desktop/orchestrator does LLM summarization; `kim` chat mode does
+   a local count-based trim (keep-last-6) with no summary.
+5. Chat context: `kim` plain-chat caps history at 24 messages / ~48k chars;
+   the orchestrator uses its context meter + compaction.
+6. Bridge token pairing ladders differ between `kim` and `kimctl` (F-E-13).
+7. Code-mode provider gates differ: desktop constrains Code tab to
+   ollama/browser up front; `kim` blocks only "openai" (F-E-14) — note the V-1
+   invariant (Codex text protocol) is respected by both paths today.
+
+---
+
+# Severity index (final)
+
+| ID | Severity | One-liner |
+|----|----------|-----------|
+| F-E-4 | High | one-shot kim exits 0 on FAILED runs / Ctrl-C / no-response |
+| F-E-7 | High | kimctl send --session matches STALE TASK_COMPLETE instantly |
+| F-E-1 | Medium | kim doctor always exits 0 |
+| F-E-2 | Medium | unknown flags silently start a fresh REPL |
+| F-E-5 | Medium | chat-mode Ctrl-C is SIGKILL-only (no graceful agent shutdown) |
+| F-E-8 | Medium | kimctl poll can skip a partially-written completion line |
+| F-E-9 | Medium | corrupt cli-config silently reset, API keys clobbered |
+| F-E-13 | Medium | kimctl never reads ~/.kim/bridge_token → 401s on default installs |
+| F-E-14 | Medium | code mode with claude/gemini/deepseek silently targets ollama |
+| F-E-3 | Low | session save rewrites all timestamps to now |
+| F-E-6 | Low | unbounded subprocess line reads |
+| F-E-10 | Low | /login ollama ignores ollama_base_url |
+| F-E-11 | Low | /login key validation has no HTTP timeout |
+| F-E-12 | Low | kimctl cancel/browser exit 0 on failure; browser tracebacks |
+| F-E-15 | Low | god-file split proposal (main.rs / commands.rs) |
+
+Notes: `cargo clippy --all-targets` in cli/ is clean (0 warnings). The
+hardening density in this crate is high (F1-F19, A1-A20, #1-#48 annotations all
+verified present); the findings above are the residual gaps, concentrated in
+exit-code contracts, cancellation, and the kimctl pairing seam.
+
+Cross-territory handoffs: none require another team's files to fix; Team A may
+want F-E-4's orchestrator-side context (cli.py emit order is already correct).
