@@ -113,3 +113,90 @@ appended (and re-severity-sorted at final pass) as the hunt proceeds.
 - **Fix sketch:** read via a length-capped line reader (e.g. `read_until` with a
   cap, discarding/truncating past ~4 MiB) and surface "line too long" as an Err.
 - **Cross-territory?** no
+
+## F-E-7: `kimctl send --session <id>` reports instant success from a STALE `TASK_COMPLETE` in the session history
+- **File:** kimctl/__main__.py:366-439 (`cmd_send` blocking poll)
+- **Severity:** High
+- **Class:** bug
+- **Evidence:** the completion poll starts with `last_offset = 0` and scans the
+  WHOLE session JSONL from the beginning. When `--session` resumes an existing
+  session whose previous task already ended with `TASK_COMPLETE: …`, the very
+  first poll (0.5s after POST /v1/task) matches the OLD completion line and
+  exits 0 with the OLD summary — the new task has barely started. Every
+  scripted "send follow-up task to the same session and wait" flow gets a wrong
+  result. Same poll also matches `NEED_HELP:` from history → spurious exit 1.
+- **Fix sketch:** initialize `last_offset` to the file's current size before
+  (or right after) POSTing the task; only scan records appended afterwards.
+- **Cross-territory?** no
+
+## F-E-8: `kimctl send` poll advances the read offset past partially-written JSONL lines — completion can be permanently missed
+- **File:** kimctl/__main__.py:399-414
+- **Severity:** Medium
+- **Class:** race
+- **Evidence:** each poll does `f.seek(last_offset); new_data = f.read();
+  last_offset = f.tell()`. If the read lands mid-write (the orchestrator's
+  line is half-flushed), the partial line fails `json.loads` and is skipped —
+  but `last_offset` already points past it. The next poll reads only the second
+  half of the line, which also fails to parse. If that line was the
+  `TASK_COMPLETE` record, the poll spins until `--timeout` and exits 2 for a
+  task that succeeded.
+- **Fix sketch:** only advance `last_offset` past the last newline-terminated
+  line (`new_data.rfind('\n')`); keep the tail for the next poll.
+- **Cross-territory?** no
+
+## F-E-9: corrupt `cli-config.json` is silently reset to defaults, then clobbered — stored API keys destroyed without warning
+- **File:** cli/src/config.rs:74-79 (`load_from`)
+- **Severity:** Medium
+- **Class:** bug
+- **Evidence:** any parse failure (hand-edit typo, truncated write from an old
+  version, disk corruption) returns `Self::default()` with no message. The user
+  now silently runs provider=ollama, and the next config save — `/theme`,
+  `/model`, any login — atomically overwrites the corrupt file, permanently
+  discarding every stored API key that was still recoverable in it. The user
+  discovers this only when a later request fails auth.
+- **Fix sketch:** on parse failure, rename the corrupt file to
+  `cli-config.json.bak-<ts>` and print a one-line warning before using defaults.
+- **Cross-territory?** no
+
+## F-E-10: `/login ollama` and the model picker ignore `ollama_base_url` — remote-Ollama configs probe the wrong host
+- **File:** cli/src/commands.rs:592-612 (`ollama_models` via `ollama list`), 785-808 (`ollama_server_models` hardcodes `http://127.0.0.1:11434`)
+- **Severity:** Low
+- **Class:** bug
+- **Evidence:** config has `ollama_base_url` and doctor was fixed (A8,
+  `ollama_models_at(base)`) to respect it — but the login path still probes the
+  hardcoded localhost URL, and the `/model` picker shells out to the local
+  `ollama list` daemon. A user pointing Kim at a remote/nonstandard-port Ollama
+  gets "server is not running" from `/login ollama` and an empty/wrong model
+  list, while doctor and actual chat requests work.
+- **Fix sketch:** thread `config.ollama_base_url` into `ollama_server_models`
+  and replace the `ollama list` shell-out with `ollama_models_at(base)`.
+- **Cross-territory?** no
+
+## F-E-11: `/login <provider>` key validation has no HTTP timeout — REPL hangs indefinitely on a stalled connection
+- **File:** cli/src/commands.rs:984-1029 (`validate_api_key`)
+- **Severity:** Low
+- **Class:** bug
+- **Evidence:** every other HTTP call in the file sets `.timeout(...)`
+  (800ms–3s), but the four validation requests in `validate_api_key` set none,
+  and the default reqwest client has no total timeout. A blackholed connection
+  (captive portal, firewalled egress) leaves the user stuck after typing their
+  key, with no spinner and no Ctrl-C-friendly path (rpassword prompt already
+  returned; the await blocks the command).
+- **Fix sketch:** add `.timeout(Duration::from_secs(10))` to the four requests;
+  treat timeout as "validation skipped", not key-rejected.
+- **Cross-territory?** no
+
+## F-E-12: kimctl failure exits inconsistently — `cancel`/`browser` report ❌ but exit 0; `browser` with bridge down shows a raw traceback
+- **File:** kimctl/__main__.py:465-477 (`cmd_cancel`), 944-971 (`cmd_browser`)
+- **Severity:** Low
+- **Class:** bug | contract
+- **Evidence:** kimctl defines a real exit-code vocabulary (OK/NEED_HELP/
+  TIMEOUT/TRANSPORT) and `send`/`status` honor it, but: (1) `cmd_cancel` prints
+  `❌ <message>` on `ok:false` and falls off the end → exit 0; (2) `cmd_browser`
+  does the same on `ok:false`, and unlike every other bridge command it has no
+  try/except around `_bridge_request`, so `kimctl browser show` with the
+  desktop closed dumps an httpx `ConnectError` traceback instead of the
+  friendly transport error.
+- **Fix sketch:** `sys.exit(EXIT_TRANSPORT)` on `ok:false`/connection error in
+  both; wrap `cmd_browser`'s requests in the same try/except as `cmd_status`.
+- **Cross-territory?** no
