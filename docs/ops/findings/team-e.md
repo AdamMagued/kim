@@ -48,3 +48,68 @@ appended (and re-severity-sorted at final pass) as the hunt proceeds.
 - **Fix sketch:** carry an optional `timestamp_ms` on `UiMessage`, set at push time,
   preserved on load and re-save; only stamp `now` for messages that lack one.
 - **Cross-territory?** no
+
+## F-E-4: one-shot `kim chat`/`kim code` exits 0 on FAILED agent runs and on Ctrl-C
+- **File:** cli/src/main.rs:365-371 (`run_oneshot`), cli/src/agentic.rs:75-80,116,333-343, cli/src/repl_turn.rs:150-193
+- **Severity:** High
+- **Class:** bug | contract
+- **Evidence:** three converging holes in the one-shot exit-code contract
+  (`run_oneshot` only exits 1 when the LAST message has `MessageRole::Error`):
+  1. The orchestrator ends a failed run with `{"type":"run_done","success":false}`
+     then `[FAILED] <summary>` (orchestrator/cli.py:113-140). `parse_agent_line`
+     maps `[FAILED] …` to `AgentLine::Answer` — identical to `[SUCCESS]` — so it
+     becomes a normal Assistant `TextChunk`. The `success:false` in `run_done` is
+     parsed and then explicitly discarded (`AgentLine::Done(_success)`,
+     `let _ = saw_done;`). The python process exits 0, so no `Err` is emitted
+     anywhere → `kim chat "do X"` on a run the agent itself declared FAILED
+     exits 0.
+  2. Ctrl-C during a one-shot run: `run_cancel_interrupt` keeps the partial
+     answer, prints "(cancelled)", pushes NO Error message → exit 0 for an
+     interrupted, incomplete run. (The F5 fix added an Error push for the
+     git-decline cancel; the Ctrl-C cancel path was missed.)
+  3. A child that dies after emitting output with exit 0 but no answer prints
+     "Kim: (no response)" and exits 0.
+  Desktop drift: the desktop uses the same `run_done` event to drive its
+  kim:run-failed banner, so the SAME run shows as failed in the app and as
+  success (exit 0) in scripts/CI using the CLI.
+- **Fix sketch:** thread `run_done.success` into an `AppEvent` (e.g.
+  `Done{success}`); have `run_oneshot` exit non-zero on `success=false`, on
+  cancellation, and on no-response. Render `[FAILED]` answers with the Error role.
+- **Cross-territory?** no (orchestrator emit side already correct)
+
+## F-E-5: Ctrl-C in chat-mode agentic runs is SIGKILL-only — no graceful shutdown, session state and child cleanup skipped
+- **File:** cli/src/main.rs:1194-1207 (pid slot is code-mode only), cli/src/repl_turn.rs:171-187, cli/src/agentic.rs:250 (`kill_on_drop`)
+- **Severity:** Medium
+- **Class:** bug | leak
+- **Evidence:** the graceful interrupt ladder (SIGTERM → 5s drain →
+  kill_on_drop SIGKILL) exists only for code mode: `stream_repl_turn` creates
+  the `child_pid` slot only when `code_mode` is true. Chat-mode agentic runs
+  (`python -m orchestrator.agent`) have `child_pid = None`, so Ctrl-C goes
+  straight to `handle.abort()` → tokio `kill_on_drop` → SIGKILL. SIGKILL is
+  untrappable: the orchestrator cannot flush its own session JSONL/checkpoint,
+  cannot run provider cleanup, and its own children (MCP server subprocess,
+  Playwright-launched Chrome for browser providers) are orphaned rather than
+  shut down (stdio MCP servers exit on stdin EOF; a Playwright Chrome does not).
+  Charter checklist item: "Ctrl-C mid-run must clean up child processes and
+  write session state" — the CLI-side transcript is saved, the agent-side state
+  is not.
+- **Fix sketch:** populate the pid slot for the agentic path too and reuse
+  `run_cancel_interrupt`'s SIGTERM+grace ladder (the orchestrator already
+  handles SIGTERM as cancel — termination "cancelled").
+- **Cross-territory?** no
+
+## F-E-6: subprocess stdout line reads are unbounded — one oversized line buffers fully into RAM
+- **File:** cli/src/provider/codex_stream.rs:200, cli/src/agentic.rs:272
+- **Severity:** Low
+- **Class:** perf | bug
+- **Evidence:** both streaming loops use `BufReader::lines()` with no
+  max-line-length cap. A single newline-less line from the child — e.g. a typed
+  event carrying a base64 screenshot, a runaway tool output, or a corrupted
+  stream — is accumulated entirely in memory before `next_line()` returns.
+  There is no backpressure or truncation; a multi-hundred-MB line stalls the
+  turn (no spinner-visible progress) while memory grows. Contrast:
+  `preview_for_session` (sessions.rs) was already fixed to cap reads at 64 KiB
+  for exactly this class of problem (F17).
+- **Fix sketch:** read via a length-capped line reader (e.g. `read_until` with a
+  cap, discarding/truncating past ~4 MiB) and surface "line too long" as an Err.
+- **Cross-territory?** no
