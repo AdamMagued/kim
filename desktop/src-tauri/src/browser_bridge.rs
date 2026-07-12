@@ -63,6 +63,25 @@ fn open_browser_signin_window_inner(
         _ => return Err("Only http:// or https:// URLs are allowed.".to_string()),
     }
 
+    // F-D-1 / F-C-4 (desktop half): reject navigation to link-local /
+    // RFC-1918 / loopback / cloud-metadata targets BEFORE creating or
+    // navigating the webview. Without this, a local process holding the bridge
+    // token (F-D-4) could `POST /v1/open {"url":"http://169.254.169.254/…"}`
+    // and the app's own webview would dial the internal address, then run the
+    // persistent bridge JS + title-pull channel over the fetched content. This
+    // is the top-level-navigation sibling of Team C's subresource SSRF guard;
+    // we mirror the same classification (numeric-IP encodings included). All
+    // legitimate callers navigate to PUBLIC provider / OAuth hosts, so this
+    // never fires on the real flows (the Google OAuth loopback redirect is
+    // caught by a local TcpListener, not by navigating this webview).
+    let host = parsed.host_str().unwrap_or("");
+    if crate::ssrf::host_is_ssrf_target(host) {
+        return Err(format!(
+            "Refusing to open an internal/loopback/link-local address: {}",
+            if host.is_empty() { trimmed } else { host }
+        ));
+    }
+
     let label = "kim-browser-signin";
     if let Some(existing) = app_handle.get_webview_window(label) {
         let task_running = is_bridge_task_running();
