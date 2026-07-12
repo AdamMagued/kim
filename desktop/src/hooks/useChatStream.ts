@@ -775,11 +775,24 @@ export function useChatStream({
       }
     }).then(fn => { if (!cancelled) unlistenTypedActivity = fn; else fn(); });
 
+    // F-F-2: the raw Codex/legacy compatibility stream carries NO session
+    // envelope, so belongsToView can't route it. When the user switches session
+    // mid-run, a run started under session A keeps emitting these un-enveloped
+    // raw lines; without a guard they append to whatever view is mounted (B's
+    // activity feed fills with A's reasoning/shell/[err] lines, and an [err]
+    // line raises a Retry banner for a task B never ran). Gate on run ownership:
+    // only append when THIS view owns the active run (it is running, or it holds
+    // the run-identity captured at spawn / re-attach). A foreign run's raw lines
+    // are dropped instead of bleeding across the session switch.
+    const ownsActiveRunNow = () => isRunningRef.current || runOwnerSessionIdRef.current !== null;
+
     listen<string>('kim-agent-output', event => {
+      if (!ownsActiveRunNow()) return;
       appendRaw(event.payload);
     }).then(fn => { if (!cancelled) unlistenOutput = fn; else fn(); });
 
     listen<string>('kim-agent-error', event => {
+      if (!ownsActiveRunNow()) return;
       appendRaw(`[err] ${event.payload}`);
     }).then(fn => { if (!cancelled) unlistenError = fn; else fn(); });
 

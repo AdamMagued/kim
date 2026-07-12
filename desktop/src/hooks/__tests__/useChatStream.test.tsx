@@ -177,6 +177,8 @@ describe('useChatStream activity dedup', () => {
   it('drops identical raw lines within the 800ms window; distinct lines pass', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
+    // F-F-2: raw lines only append while THIS view owns the active run.
+    act(() => { result.current.setIsRunning(true); });
 
     emit('kim-agent-output', '[TOOL] read_file({"path":"a.txt"})');
     emit('kim-agent-output', '[TOOL] read_file({"path":"a.txt"})'); // duplicate raw within 800ms
@@ -192,6 +194,8 @@ describe('useChatStream activity dedup', () => {
   it('canonicalizes the [err] prefix so a stderr echo of a stdout line is deduped', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
+    // F-F-2: raw lines only append while THIS view owns the active run.
+    act(() => { result.current.setIsRunning(true); });
 
     emit('kim-agent-output', '[TOOL] read_file({"path":"a.txt"})');
     // kim-agent-error prepends "[err] " before appendRaw; isDuplicate strips it.
@@ -204,6 +208,8 @@ describe('useChatStream activity dedup', () => {
   it('after 800ms the raw window expires but the 2000ms activity-item dedup still drops it', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
+    // F-F-2: raw lines only append while THIS view owns the active run.
+    act(() => { result.current.setIsRunning(true); });
     const line = '[TOOL] read_file({"path":"a.txt"})';
 
     emit('kim-agent-output', line);
@@ -221,6 +227,8 @@ describe('useChatStream activity dedup', () => {
   it('dedups different raw lines that parse to the same activity item (2000ms window)', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
+    // F-F-2: raw lines only append while THIS view owns the active run.
+    act(() => { result.current.setIsRunning(true); });
 
     // Same parsed item ("Reading `a.txt`") from two different raw strings — the
     // timestamp prefix is stripped by parseLogLine, so only the activity-item
@@ -235,11 +243,44 @@ describe('useChatStream activity dedup', () => {
   it('batches activity flushes on a 50ms timer', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
+    // F-F-2: raw lines only append while THIS view owns the active run.
+    act(() => { result.current.setIsRunning(true); });
 
     emit('kim-agent-output', '[TOOL] read_file({"path":"a.txt"})');
     expect(result.current.activity).toHaveLength(0); // not flushed yet
     act(() => { vi.advanceTimersByTime(50); });
     expect(result.current.activity).toHaveLength(1);
+  });
+});
+
+// ── 2b. Cross-session raw-stream bleed (F-F-2) ────────────────────────────────
+describe('useChatStream raw-stream ownership guard (F-F-2)', () => {
+  it('a view that does NOT own the active run ignores un-enveloped raw output/error', async () => {
+    vi.useFakeTimers();
+    const { result } = await renderStream(); // conv-1, not running, owns no run
+
+    // A run started under a DIFFERENT session keeps streaming un-enveloped raw
+    // lines after the user switched to this view. They must not bleed in.
+    emit('kim-agent-output', '[TOOL] read_file({"path":"secret.txt"})');
+    emit('kim-agent-error', 'boom: something failed in the other run');
+    act(() => { result.current.flushActivityNow(); });
+
+    expect(result.current.activity).toHaveLength(0);
+    // …and the foreign [err] line must NOT raise a Retry banner for a task
+    // this view never ran.
+    expect(result.current.taskError).toBeNull();
+    expect(result.current.lastFailedTask).toBeNull();
+  });
+
+  it('a view that owns the run still receives its raw output', async () => {
+    vi.useFakeTimers();
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); }); // this view owns the run
+
+    emit('kim-agent-output', '[TOOL] read_file({"path":"mine.txt"})');
+    act(() => { result.current.flushActivityNow(); });
+
+    expect(result.current.activity.map(a => a.text)).toEqual(['Reading `mine.txt`']);
   });
 });
 
