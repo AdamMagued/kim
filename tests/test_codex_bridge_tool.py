@@ -76,6 +76,15 @@ class TestCodexArgvContract(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(BYPASS_FLAG, result.capture["argv"])
 
+    async def test_bypass_flag_rejected_for_web_derived_task(self):
+        result = await run_bridge(
+            self.tmp,
+            task="scrape http://example.com/api",
+            env={"KIM_CODEX_BYPASS_SANDBOX": "1"},
+        )
+        self.assertEqual(result.rc, 1)
+        self.assertIsNone(result.capture)
+
     # -- git-repo gate --------------------------------------------------------
 
     async def test_non_git_dir_refuses_to_spawn_without_optin(self):

@@ -542,6 +542,27 @@ async def _run_async(args: argparse.Namespace) -> int:
     config["provider"] = args.provider
     os.environ["PROJECT_ROOT"] = args.cwd
 
+    # WARNING: KIM_CODEX_BYPASS_SANDBOX=1 enables full RCE with NO sandbox and NO approvals.
+    # This must only be run in containerized or disposable environments.
+    bypass = os.environ.get("KIM_CODEX_BYPASS_SANDBOX", "").strip() == "1"
+    if bypass:
+        print(
+            "WARNING: KIM_CODEX_BYPASS_SANDBOX=1 is active. This runs codex-exec with "
+            "full RCE capabilities and disables all approvals. Ensure this is running "
+            "in a containerized/disposable workspace.",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Refuse to combine bypass with browser-provider tasks from scraped web content
+        is_web_derived = any(k in args.task.lower() for k in ("http", "www", "url", "scrape", "fetch", "web", "download", "scraped"))
+        if is_web_derived:
+            print(
+                f"{LOG_TAG_ERROR} Refusing to run in bypass sandbox mode: task string contains web keywords or URLs which pose prompt-injection RCE risks.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+
     # /compact control task: compact the browser thread instead of running
     # Codex. No HITL gate — nothing executes in the user's project.
     if args.task.strip().lower() in _COMPACT_CONTROL_TASKS:
