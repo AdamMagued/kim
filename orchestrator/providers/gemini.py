@@ -44,6 +44,13 @@ logger = logging.getLogger(__name__)
 GEMINI_OAUTH_SCOPE = "https://www.googleapis.com/auth/generative-language.retriever"
 OAUTH_TOKEN_ENV = "KIM_GOOGLE_ACCESS_TOKEN"
 OAUTH_TOKEN_EXPIRY_ENV = "KIM_GOOGLE_ACCESS_TOKEN_EXPIRES_AT"
+# F-INH-1: a token FILE the desktop shell can rewrite in place. A running
+# process's os.environ is frozen at spawn, so a token injected only via the env
+# var above cannot be refreshed for a long-lived session. When this points at a
+# readable JSON file ({"access_token":..., "expires_at":...}) the provider
+# re-reads it every call, so the shell can rotate the token without respawning
+# Python. (Desktop write/refresh half is owned by D'.)
+OAUTH_TOKEN_FILE_ENV = "KIM_GOOGLE_ACCESS_TOKEN_FILE"
 OAUTH_QUOTA_PROJECT_ENV = "KIM_GOOGLE_CLOUD_PROJECT"
 OAUTH_REQUEST_TIMEOUT_S = 180
 
@@ -62,24 +69,66 @@ class EnvOAuthAccessTokenProvider:
     """Reads the short-lived OAuth access token injected by the desktop shell."""
 
     def __call__(self) -> _OAuthAccessToken:
-        token = os.environ.get(OAUTH_TOKEN_ENV, "").strip()
+        # F-INH-1: prefer a token FILE the desktop shell can rewrite in place so
+        # a long-lived session survives token rotation (os.environ is frozen at
+        # spawn). Fall back to the spawn-time env var when no file is provided.
+        token, expires_at = self._read_token_from_file()
+        if token is None:
+            token = os.environ.get(OAUTH_TOKEN_ENV, "").strip()
+            expires_at = self._parse_env_expiry()
+
         if not token:
             raise EnvironmentError(
                 "Google for Kim is not connected. Sign in with Google in Settings, "
                 f"then retry. Missing {OAUTH_TOKEN_ENV}."
             )
 
-        expires_raw = os.environ.get(OAUTH_TOKEN_EXPIRY_ENV, "").strip()
-        expires_at: float | None = None
-        if expires_raw:
-            try:
-                expires_at = float(expires_raw)
-            except ValueError as exc:
-                raise EnvironmentError(f"Invalid {OAUTH_TOKEN_EXPIRY_ENV}; expected epoch seconds.") from exc
-            if expires_at <= time.time() + 60:
-                raise EnvironmentError("Google access token is expired or too close to expiry. Please reconnect Google for Kim.")  # noqa: E501
+        if expires_at is not None and expires_at <= time.time() + 60:
+            raise EnvironmentError(
+                "Google access token is expired or too close to expiry. Please reconnect Google for Kim."
+            )
 
         return _OAuthAccessToken(token=token, expires_at=expires_at)
+
+    @staticmethod
+    def _parse_env_expiry() -> float | None:
+        expires_raw = os.environ.get(OAUTH_TOKEN_EXPIRY_ENV, "").strip()
+        if not expires_raw:
+            return None
+        try:
+            return float(expires_raw)
+        except ValueError as exc:
+            raise EnvironmentError(f"Invalid {OAUTH_TOKEN_EXPIRY_ENV}; expected epoch seconds.") from exc
+
+    @staticmethod
+    def _read_token_from_file() -> tuple[str | None, float | None]:
+        """Read a fresh (token, expires_at) from the desktop-managed token file.
+
+        Returns (None, None) when no file path is configured OR the file does
+        not exist yet (initial spawn) so the caller falls back to the env var.
+        Raises EnvironmentError only when the file exists but is unusable.
+        """
+        path = os.environ.get(OAUTH_TOKEN_FILE_ENV, "").strip()
+        if not path:
+            return None, None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = fh.read()
+        except OSError:
+            # Not written yet — fall back to the env var.
+            return None, None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise EnvironmentError(f"{OAUTH_TOKEN_FILE_ENV} does not contain valid JSON.") from exc
+        if not isinstance(data, dict):
+            raise EnvironmentError(f"{OAUTH_TOKEN_FILE_ENV} must be a JSON object.")
+        token = str(data.get("access_token") or data.get("token") or "").strip()
+        if not token:
+            raise EnvironmentError(
+                "Google access token file has no access_token. Please reconnect Google for Kim."
+            )
+        return token, _parse_optional_expiry(data.get("expires_at"))
 
 
 class GeminiProvider(BaseProvider):

@@ -209,3 +209,60 @@ def test_oauth_403_still_classifies_as_auth(monkeypatch):
         provider._post_rest({}, {"Authorization": "Bearer x"}, "Gemini OAuth API")
     classified = classify_provider_error(ei.value)
     assert classified.code == "auth" and classified.retryable is False
+
+
+# ── F-INH-1: the OAuth token provider must re-read a desktop-managed token
+# FILE every call, so a long-lived session survives token rotation (os.environ
+# is frozen at process spawn). ──
+
+def test_env_token_provider_reads_refreshable_file(monkeypatch, tmp_path):
+    import json as _json
+    import time as _time
+
+    gemini = load_module(monkeypatch)
+    token_file = tmp_path / "google_token.json"
+    token_file.write_text(_json.dumps({
+        "access_token": "ya29.first",
+        "expires_at": _time.time() + 3600,
+    }))
+    monkeypatch.setenv("KIM_GOOGLE_ACCESS_TOKEN_FILE", str(token_file))
+    # A stale/expired env token must NOT win over the fresh file token.
+    monkeypatch.setenv("KIM_GOOGLE_ACCESS_TOKEN", "ya29.stale-env")
+
+    provider = gemini.EnvOAuthAccessTokenProvider()
+    assert provider().token == "ya29.first"
+
+    # Desktop rotates the token in place — the SAME provider picks it up with
+    # no respawn (the frozen-env bug this fixes would keep returning the old).
+    token_file.write_text(_json.dumps({
+        "access_token": "ya29.rotated",
+        "expires_at": _time.time() + 3600,
+    }))
+    assert provider().token == "ya29.rotated"
+
+
+def test_env_token_provider_falls_back_to_env_when_file_absent(monkeypatch, tmp_path):
+    gemini = load_module(monkeypatch)
+    missing = tmp_path / "not_written_yet.json"
+    monkeypatch.setenv("KIM_GOOGLE_ACCESS_TOKEN_FILE", str(missing))
+    monkeypatch.setenv("KIM_GOOGLE_ACCESS_TOKEN", "ya29.env-fallback")
+
+    provider = gemini.EnvOAuthAccessTokenProvider()
+    assert provider().token == "ya29.env-fallback"
+
+
+def test_env_token_provider_file_expiry_still_enforced(monkeypatch, tmp_path):
+    import json as _json
+    import time as _time
+
+    gemini = load_module(monkeypatch)
+    token_file = tmp_path / "google_token.json"
+    token_file.write_text(_json.dumps({
+        "access_token": "ya29.almost-dead",
+        "expires_at": _time.time() + 10,  # inside the 60s guard band
+    }))
+    monkeypatch.setenv("KIM_GOOGLE_ACCESS_TOKEN_FILE", str(token_file))
+
+    provider = gemini.EnvOAuthAccessTokenProvider()
+    with pytest.raises(EnvironmentError, match="expired or too close"):
+        provider()
