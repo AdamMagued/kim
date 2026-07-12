@@ -62,4 +62,28 @@ within each batch; batches are append-only so numbering is stable across commits
 - **Fix sketch:** Move rates to config the backend already knows (or fetch), add a visible "≈ est." qualifier, and add a test asserting the model IDs in comments match the providers actually dispatched.
 - **Cross-territory?** no
 
+## F-F-8: Optional `session_id` in the run envelope defeats the route guard for ALL typed bridge/legacy events (not just raw lines)
+- **File:** desktop/src/types/events.gen.ts:42-50 (`KimRunEnvelope` — both fields optional "so events from legacy/bridge streams that predate the envelope still type-check"); desktop/src/hooks/useChatStream.ts:214-217 (`belongsToView` returns true for null/undefined)
+- **Severity:** Medium (compounds F-F-2)
+- **Class:** contract | race
+- **Evidence:** The generated envelope's own docstring states the design intent: "The frontend routes and files run output by these fields, never by which view happens to be mounted." But `session_id` is optional by design for bridge/legacy streams, and `belongsToView(undefined) === true` routes exactly those un-enveloped typed events (kim:status, kim:answer, kim:tool, kim:activity, …) to whatever view is currently mounted. So the codex/kimctl-bridge path — the one that emits typed events WITHOUT a session envelope — violates the stated routing guarantee on a mid-run session switch: its status/answer/tool events land in the wrong view. The type system actively encodes the hole (`session_id?`) rather than catching it.
+- **Fix sketch:** Make the bridge stamp the envelope (Team H contract) so `session_id` can become required; until then, route un-enveloped typed events only when `runOwnerSessionIdRef.current === viewSessionId`, not unconditionally.
+- **Cross-territory?** yes — envelope emission is Team D/H; the guard is Team F.
+
+## F-F-9: `ToolResultBlock` type omits the `output` field the runtime actually sends — worked around by `as unknown as {output}` casts in three places
+- **File:** desktop/src/types/index.ts:51-55 (`ToolResultBlock` has only `content`); desktop/src/components/chat/utils.ts:161-162, :620 (`(trb as unknown as { output?: string }).output`)
+- **Severity:** Low
+- **Class:** contract | dead-code
+- **Evidence:** The declared `ToolResultBlock` is `{ type, tool_use_id, content }`, but `extractTouchedFiles` and `synthesizeActivityFromMessages` both fall back to reading `.output` off the same block via a double `as unknown as` cast — meaning the real serialized shape (from Python/Rust session JSONL) carries an `output` field the type doesn't model. A double-unknown cast is the exact pattern that hides a genuine schema mismatch from the compiler; if the backend ever renames `output`, tsc stays green and file-diff attribution silently breaks. Pairs with Team H's Frontend⇄Rust contract table.
+- **Fix sketch:** Model the actual union (`content` OR `output`) in `ToolResultBlock` and delete the casts; add a golden-transcript fixture asserting the field name.
+- **Cross-territory?** yes — canonical shape is Team H; the type + cast removal is Team F.
+
+## F-F-10: Meaningful `invoke()` rejections silently swallowed at several call sites (delete-token, save-run-history)
+- **File:** desktop/src/components/kim-ui/settings-panes/PaneAccount.tsx:250 (`delete_github_token`), :175 (`show_browser_window`); desktop/src/hooks/useChatStream.ts:842-850 (`save_run_history`); desktop/src/hooks/runSnapshotStore.ts:104 (snapshot persist)
+- **Severity:** Medium
+- **Class:** bug (error-UX)
+- **Evidence:** Inventory of the 23 `.catch(() => {})` sites: most (set_task_active_mode, show_main_window, show_screenshot_flash, stop_schedule_timer) are legitimately fire-and-forget UI toggles. But a few swallow user-consequential failures with zero surfacing: (1) `delete_github_token` — the user clicks "Disconnect GitHub"; if the invoke rejects, the UI proceeds as if disconnected while the token persists on disk (a security-relevant false confirmation). (2) `save_run_history` and the orphaned-run snapshot persist — a rejection means the completed run's activity/cost is silently lost from session history with no toast, so the user sees an empty "worked for" pill and assumes nothing ran. Contrast `handleSteer` (useTaskRunner.ts:318-320) and `hitlRespond` (useChatStream.ts:1067-1072), which DO toast on rejection — the pattern exists, it's just not applied consistently.
+- **Fix sketch:** Toast on rejection for the security-/data-relevant invokes (delete_github_token, save_run_history); keep silent-catch only for idempotent UI-mode toggles, and add a short comment at each intentionally-silent site.
+- **Cross-territory?** no
+
 *(hunt in progress — further findings appended below as confirmed)*
