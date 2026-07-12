@@ -390,3 +390,293 @@ JavaScript* (ChatGPT PoW/Arkose, Gemini `SNlM0e`, Grok transaction-id). A cookie
 jar cannot manufacture those tokens; only a JS runtime (a browser engine) can.
 **Only Claude.ai** authorizes the completion call with a plain session cookie,
 and even it is gated by Cloudflare fingerprinting.
+
+---
+
+## 3. The middle-ground options — separating the literal ask from the real goal
+
+The owner said "HTTP instead of a browser," but the *motivating* goal is almost
+certainly **"no window pops up on screen"** (plus the security smell of an
+orphaned, unauthenticated CDP Chrome). Those are not the same requirement, and
+they have very different feasibility. Four options:
+
+### (a) Pure HTTP client reusing a persisted cookie jar — *no browser process ever*
+
+- **Satisfies:** the literal "HTTP only" ask, and the real "no window" goal, and
+  removes the CDP Chrome entirely.
+- **Feasible for:** Claude.ai only (fragile). **Infeasible for ChatGPT / Gemini /
+  Grok** because of page-JS-minted per-request tokens (Section 2).
+- **Cost:** must solve cookie extraction/refresh + Cloudflare fingerprint
+  matching; per-provider endpoint reverse-engineering; breaks on the provider's
+  schedule. Highest engineering + maintenance cost, lowest coverage.
+
+### (b) HEADLESS browser / headless CDP — *a real browser engine runs, but no visible window*
+
+- **Satisfies:** the real "no window pops up" goal **completely**, and closes
+  F-J-3 / F-I-4 (see Section 5.3). Does **not** satisfy the literal "no browser
+  engine" reading.
+- **Feasible for:** **all four providers** — because a real browser executes the
+  page JS, every anti-bot token (PoW, `SNlM0e`, transaction-id) is minted
+  naturally. No arms race.
+- **Cost:** ~zero new protocol work — **Kim already has this.** The provider's
+  headless mode exists (`browser_headless` / `browser_force_headless`,
+  `launch_persistent_context(headless=True)`), reusing `sessions/chrome_data`.
+  What's missing is (i) making it the default/first-class path, (ii) killing the
+  visible-Chrome auto-launch + the external `:9222` CDP dependency, (iii) a clean
+  one-time visible login to seed cookies. This is a *hardening + defaulting*
+  task, not a new transport.
+- **Caveat:** headless Chrome is itself sometimes fingerprinted (headless UA,
+  `navigator.webdriver`). The code already passes
+  `--disable-blink-features=AutomationControlled` and strips `--enable-automation`;
+  modern headless (`--headless=new`) is much closer to headful. This is a known,
+  bounded problem with known mitigations — unlike the pure-HTTP arms race.
+
+### (c) Keep a browser but hide / move it offscreen
+
+- **Satisfies:** "no window in the way" cosmetically; does **not** remove the
+  process or the CDP security surface. Strictly worse than (b) on every axis
+  except that a visible-but-offscreen window can still be manually rescued if
+  login expires. Not recommended as the primary design.
+
+### (d) Hybrid: HTTP where stable, browser fallback elsewhere
+
+- **Satisfies:** the real goal for the one provider where HTTP is viable
+  (Claude.ai), with headless-browser as the universal fallback.
+- **Feasible:** yes, *given* (b) is built first as the fallback. The HTTP
+  fast-path is then a pure optimization: try HTTP → on 401/403/challenge/parse-
+  failure, transparently fall back to the headless browser transport for that
+  turn (and mark the HTTP path unhealthy for a cooldown).
+- **Cost:** (b) + a Claude-only HTTP transport + a fallback controller. Most
+  engineering, but degrades gracefully and never leaves the user stuck.
+
+### Which option actually serves the owner
+
+| Goal | (a) pure HTTP | (b) headless | (c) hidden | (d) hybrid |
+|---|---|---|---|---|
+| "No window pops up" | ✅ (Claude only) | ✅ all | ✅ all | ✅ all |
+| "Literally HTTP, no browser" | ✅ (Claude only) | ❌ | ❌ | ⚠️ Claude only |
+| Works for all 4 providers | ❌ | ✅ | ✅ | ✅ |
+| Closes F-J-3 / F-I-4 | ✅ | ✅ | ⚠️ partial | ✅ |
+| Low maintenance / no arms race | ❌ | ✅ | ✅ | ⚠️ mixed |
+| Already ~built in Kim | ❌ | ✅ | ⚠️ | ❌ |
+
+**Headless (b) is the 80/20.** It delivers the owner's real goal for *every*
+provider, at near-zero new-protocol cost, and closes the two CDP security
+findings — without fighting a single anti-bot system. The pure-HTTP ask is only
+achievable for Claude.ai, and only as a fragile optimization on top of (b).
+
+---
+
+## 4. Maintainability, fragility & ToS risk
+
+### 4.1 Pure-HTTP maintenance cost is structurally higher than browser-scraping
+
+Both approaches are fragile, but in *different* and unequal ways:
+
+- **Browser-scraping fragility = CSS selector drift.** When claude.ai renames a
+  `data-testid`, a *selector* in `site_configs.py` breaks. This is real (see
+  F-B-7 below), but it is: shallow (one string per site), diagnosable (the scrape
+  returns empty/wrong text), and fixable by anyone who can read the DOM in
+  DevTools. The blast radius is one selector.
+- **Pure-HTTP fragility = private-API + anti-bot drift.** When OpenAI rotates the
+  Sentinel PoW algorithm, or Google changes the `batchexecute` RPC id or the
+  `SNlM0e` extraction, or Cloudflare tightens JA3 checks, the transport returns
+  401/403/garbage and the fix requires **re-reverse-engineering an obfuscated,
+  deliberately-hostile mechanism**. The provider is *actively working against
+  you* and ships changes on their cadence with zero notice. This is a
+  fundamentally worse maintenance posture than selector drift.
+
+So "the browser path is already fragile, so HTTP isn't worse" is **false**: HTTP
+is fragile *plus* adversarial *plus* deeper to fix. The one exception is
+Claude.ai's completion SSE, which is stable enough to be worth a spike.
+
+### 4.2 The sentinel bug (F-B-7) is an argument *for* a cleaner transport, not against
+
+Team B's **F-B-7** (High) documents that the `[END_OF_RESPONSE_<id>]` sentinel
+is echoed by the *user's own injected prompt* and by Claude/Grok response
+selectors that match user turns — terminating the generation wait instantly and
+sometimes scraping the user's prompt as if it were the answer. This whole class
+of bug **exists only because scraping has no real end-of-stream signal**, so Kim
+had to invent the sentinel. A transport with genuine SSE (headless CDP reading
+the network response, or a real HTTP client) **gets end-of-stream for free and
+can delete the sentinel machinery** — removing F-B-7's root cause. This is a
+point in favor of investing in a cleaner transport (HTTP *or* a CDP-network-read
+headless path), independent of the "no window" goal.
+
+### 4.3 ToS risk — stated plainly, not as legal advice
+
+These are **private, undocumented endpoints** intended for the vendors' own
+first-party web clients. Automating them by replaying a logged-in session
+generally **violates the provider's Terms of Service** (OpenAI, Google, Anthropic,
+and x.com all have terms restricting automated/programmatic access to consumer
+web properties and/or circumventing technical measures). Consequences the owner
+should weigh:
+
+- **Account risk:** the account whose cookies are replayed can be rate-limited,
+  challenged, suspended, or banned — especially for ChatGPT/Gemini/Grok, whose
+  anti-bot systems are explicitly looking for this.
+- **Circumvention concern:** defeating Cloudflare/Arkose/PoW is arguably
+  circumventing a technical protection measure, which carries more weight than
+  ordinary ToS breach.
+- **Note:** *the existing browser provider already automates these same web UIs*
+  and carries the same ToS exposure — but it does so through a real browser,
+  which is far less likely to be flagged than raw HTTP replay. So **pure-HTTP
+  raises the account-risk profile** relative to today, while **headless keeps it
+  roughly the same** as today.
+
+I am not a lawyer and this is not legal advice; this is a factual risk the owner
+should weigh (and, ideally, confine to their own account with eyes open). It is a
+decisive reason to prefer the lowest-detectability option (headless real browser)
+over raw HTTP for anything but a personal, opt-in Claude fast-path.
+
+---
+
+## 5. Recommendation & architecture sketch
+
+### 5.1 Decisive recommendation
+
+1. **Do NOT pursue pure HTTP as a general replacement.** It is infeasible for
+   ChatGPT, Gemini, and Grok (page-JS-minted per-request tokens) and only
+   fragile-feasible for Claude.ai. It would raise ToS/account risk and impose the
+   worst maintenance burden.
+2. **Make HEADLESS the first-class transport.** This is the correct answer to the
+   owner's real goal ("no window"), works for all four providers, requires no
+   anti-bot warfare, and closes F-J-3 + F-I-4. Kim already has the machinery;
+   the work is *defaulting + hardening*, not *inventing*.
+3. **Optionally, spike a Claude.ai-only HTTP fast-path behind a flag**, as a
+   hybrid optimization with automatic headless fallback — only if the owner wants
+   the extra speed and accepts the personal-account risk. Time-box it; kill it if
+   the spike shows Cloudflare fingerprinting is unmanageable.
+
+### 5.2 Architecture sketch — if the Claude HTTP fast-path is built
+
+A new transport as a **sibling to the existing two** (webview bridge / Playwright)
+inside `BrowserProvider.complete()`, *not* a new top-level provider — so it
+reuses all of `format_prompt` / `parse_response` / statefulness for free.
+
+```
+orchestrator/providers/browser/
+  http_transport.py   # NEW — direct HTTP to claude.ai private API
+```
+
+```python
+# http_transport.py  (sketch)
+class ClaudeHttpTransport:
+    """Replay a logged-in claude.ai session over HTTP. Claude-only."""
+    def __init__(self, cookie_jar, org_uuid_cache): ...
+
+    async def complete_via_http(self, *, prompt, attachments, completion_hash,
+                                known_tools, clear_chat, conversation_id) -> dict:
+        # 1. ensure org uuid (GET /api/organizations, cached)
+        # 2. ensure conversation (create if clear_chat or none; else reuse id)
+        # 3. POST .../completion  with the flattened `prompt`
+        #    - client: curl_cffi / httpx with Chrome-matched UA (+JA3 if needed)
+        #    - cookies: sessionKey (+ cf_clearance) from the jar
+        # 4. read SSE deltas → accumulate final text (NO sentinel needed)
+        # 5. return parse_response(text, completion_hash, known_tools=known_tools)
+        #    — REUSED unchanged; tool-JSON / TASK_COMPLETE / NEED_HELP contract identical
+```
+
+**Wiring into `complete()`** (mirrors the existing `if self._use_webview_bridge:`
+branch at provider.py:505):
+
+```python
+# after format_prompt(...), before the webview-bridge branch:
+if self._use_http_fastpath and self._preferred_site == "claude":
+    try:
+        result = await self._http_transport.complete_via_http(
+            prompt=prompt, attachments=attachments,
+            completion_hash=completion_hash, known_tools=known_tools,
+            clear_chat=clear_chat, conversation_id=self._http_conv_id,
+        )
+        if not _is_auth_or_challenge_failure(result):
+            self._commit_sent_system_prompt(result, new_sent)
+            return self._attach_usage(result, estimated_usage)
+        logger.info("HTTP fast-path hit auth/challenge — falling back to headless browser")
+    except Exception as e:
+        logger.info("HTTP fast-path failed (%s) — falling back to headless browser", e)
+    # fall through to the existing webview-bridge / Playwright path unchanged
+```
+
+**Cookie reuse (no new CDP surface):** seed the jar from the profile Kim already
+maintains. The cleanest source is a **one-time headless Playwright read** of
+`context.cookies()` — reusing the *same* `sessions/chrome_data` the headless path
+uses — persisted to a Kim-owned jar and refreshed on 401. This deliberately does
+**not** introduce a new `:9222` listener.
+
+**Streaming adaptation:** the transport consumes claude.ai's SSE internally and
+returns the final dict — the agent-loop contract (`complete()` returns one dict)
+is unchanged, so no streaming needs to be plumbed upward.
+
+**Sentinel mapping:** **dropped.** SSE terminal event = end-of-stream, so the
+`[END_OF_RESPONSE]` instruction can be omitted from the prompt for the HTTP path
+(`format_prompt` already takes `use_webview_bridge`; add an analogous
+`transport="http"` that skips `transport_marker_instruction`). This removes
+F-B-7's root cause on the HTTP path. `parse_response` still handles the
+`TASK_COMPLETE:` / `NEED_HELP:` / tool-JSON contract, which is unchanged.
+
+**Factory:** no change to `create_provider` names needed — the fast-path is an
+internal branch of `BrowserProvider` toggled by config
+(`browser_provider.http_fastpath: true`) + `preferred_site == "claude"`. The
+codex bridge (`create_provider("browser:claude", …)`) then gets it for free.
+
+### 5.3 Effect on the live Wave-1 security findings
+
+| Finding | What it is | Effect of **headless-first** | Effect of **HTTP fast-path** |
+|---|---|---|---|
+| **F-J-3** (orphan CDP Chrome, no kill path) | Auto-launched visible Chrome with `--remote-debugging-port` is detached and never reaped | **Resolved** — headless `launch_persistent_context` is owned by the Playwright context and closed with it; no detached external Chrome, no `_chrome_proc` orphan | **Resolved** for Claude turns that stay on HTTP (no browser launched at all) |
+| **F-I-4** (unauthenticated CDP :9222) | Any local process can drive the authenticated Chrome over the open debug port | **Resolved** — no `:9222` listener when Kim owns an in-process headless context instead of connecting to an external CDP Chrome | **Resolved** on the HTTP path (no CDP at all) |
+| **F-D-4** (bridge token injected into 3rd-party provider webviews) | A compromised provider page can steal the loopback bridge token | **Unchanged/irrelevant** — F-D-4 is about the *in-app webview bridge*, a different transport; headless CDP doesn't use that token | **Improved slightly** — HTTP path doesn't load a provider page into the app webview, so it doesn't expose the token, but only for Claude turns |
+| **F-B-7** (sentinel echo terminates wait / scrapes user turn) | Scraping has no end-of-stream, so the sentinel hack misfires | **Partially mitigated** (still scrapes DOM, but a network-read variant could drop it); needs the selector/`min_index` fix regardless | **Resolved on HTTP path** — real SSE end-of-stream, sentinel dropped entirely |
+
+**Net:** headless-first is a *security win* (closes F-J-3 + F-I-4 outright). The
+HTTP fast-path additionally neutralizes F-B-7 for Claude and touches F-D-4
+marginally — but note pure-HTTP introduces a **new** sensitive surface: a
+Kim-owned cookie jar containing `sessionKey`/`cf_clearance` must be stored with
+the same care as any credential (respect CLAUDE.md's secret-file sandbox; do not
+write it where the sandbox denies, and treat it as a secret at rest).
+
+### 5.4 Phased build plan
+
+- **Phase 0 — Headless-first (do this regardless; it is the actual answer).**
+  Make headless the default browser-provider mode; remove/deprecate the visible
+  auto-launch of external CDP Chrome; provide a single explicit **one-time
+  visible login** to seed `sessions/chrome_data`; ensure the headless context is
+  always closed (kills F-J-3); drop the `:9222` external dependency (kills
+  F-I-4). Verify all four providers still complete headlessly. Also land the
+  F-B-7 `min_index`/selector fix here. *This alone satisfies the owner.*
+- **Phase 1 — Spike (time-boxed, throwaway).** Manually (DevTools) capture the
+  live claude.ai `completion` request; from Python, replay it with a
+  Chrome-matched UA + the browser-minted `sessionKey`/`cf_clearance`; confirm the
+  SSE stream parses and Cloudflare doesn't re-challenge across ~an hour of normal
+  cadence. **Decision gate:** if Cloudflare fingerprinting blocks a plain client,
+  evaluate `curl_cffi` (JA3 match); if still blocked, **stop — HTTP is not worth
+  it**, ship Phase 0 only.
+- **Phase 2 — Claude HTTP transport PoC.** Implement `http_transport.py` behind
+  `browser_provider.http_fastpath`, cookie jar seeded from a one-time headless
+  cookie read, SSE→dict, `parse_response` reused, sentinel dropped. Prove parity
+  with the browser path on a battery of real tasks (tool calls, `TASK_COMPLETE`,
+  `NEED_HELP`, multi-turn thread reuse, compaction rollover).
+- **Phase 3 — Hybrid fallback controller.** Wire the fast-path into
+  `BrowserProvider.complete()` with transparent fallback to the headless browser
+  on any auth/challenge/parse failure, plus a health/cooldown flag so a
+  challenged HTTP path doesn't retry-storm. Keep ChatGPT/Gemini/Grok on headless
+  permanently.
+- **Phase 4 — (optional, only if desired) revisit other providers.** Only if a
+  provider ever ships a stable session-cookie API. Not expected.
+
+### 5.5 One-paragraph answer to the owner
+
+You can get **exactly what you want — no window ever popping up — today, for all
+four providers, by running the browser headless** (Kim already has the code; it
+needs to be made the default and hardened, which also fixes the orphaned-Chrome
+and open-debug-port security findings). What you *can't* reliably get is "pure
+HTTP, no browser at all," because ChatGPT, Gemini, and Grok each mint a
+single-use security token **inside the page's JavaScript** on every message
+(OpenAI's proof-of-work/Arkose, Google's `SNlM0e`, X's client-transaction-id) —
+a cookie jar can't manufacture those, so only a running browser engine can.
+**Claude.ai is the sole exception** (a plain session cookie authorizes its
+streaming completion endpoint), so if you want a faster, truly window-free path
+for Claude specifically, it's worth a small, time-boxed spike with an automatic
+fall-back to the headless browser — but don't build pure-HTTP for the other
+three.
