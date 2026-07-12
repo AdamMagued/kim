@@ -1204,3 +1204,32 @@ def test_session_store_atomic_id_claiming():
         store2 = SessionStore(base_dir=base_path)
         assert store2.session_file.exists()
         assert store2.session_id != store.session_id
+
+
+def test_session_store_permissions_tightened():
+    import sys
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        base_path = Path(tmp_dir)
+        store = SessionStore(base_dir=base_path, session_id="test-perms")
+        
+        # Verify base_dir and session_dir mode is 0o700
+        if sys.platform != "win32":
+            assert (store.base_dir.stat().st_mode & 0o777) == 0o700
+            assert (store.session_dir.stat().st_mode & 0o777) == 0o700
+            
+        # Write files
+        store.append_message({"role": "user", "content": "hi"})
+        store.save_summary("summary")
+        store.save_context_state({"foo": "bar"})
+        store.save_compact_artifact({"artifact": "data"})
+        
+        if sys.platform != "win32":
+            # Verify files mode is 0o600
+            assert (store.session_file.stat().st_mode & 0o777) == 0o600
+            assert (store.summary_file.stat().st_mode & 0o777) == 0o600
+            assert (store.context_file.stat().st_mode & 0o777) == 0o600
+            
+            # Find the compact artifact and check its mode
+            compact_files = list(store.session_dir.glob("*.compact.*.json"))
+            assert len(compact_files) == 1
+            assert (compact_files[0].stat().st_mode & 0o777) == 0o600

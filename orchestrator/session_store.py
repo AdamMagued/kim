@@ -83,7 +83,7 @@ class SessionStore:
                 candidate = uuid4().hex[:8]
                 candidate_file = self.session_dir / f"{candidate}.jsonl"
                 try:
-                    fd = os.open(candidate_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    fd = os.open(candidate_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                     os.close(fd)
                     self.session_id = candidate
                     claimed = True
@@ -95,7 +95,7 @@ class SessionStore:
                 self.session_id = uuid4().hex
                 candidate_file = self.session_dir / f"{self.session_id}.jsonl"
                 try:
-                    fd = os.open(candidate_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    fd = os.open(candidate_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                     os.close(fd)
                 except FileExistsError:
                     pass
@@ -107,8 +107,17 @@ class SessionStore:
         # Lock that serialises all append writes within this process (finding 3)
         self._lock: threading.Lock = threading.Lock()
 
-        # Create directory on first use
-        self.session_dir.mkdir(parents=True, exist_ok=True)
+        # Create directories and tighten permissions to 0o700 (F-I-3)
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            self.base_dir.chmod(0o700)
+        except OSError:
+            pass
+        try:
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+            self.session_dir.chmod(0o700)
+        except OSError:
+            pass
         logger.info(
             f"SessionStore initialized: {self.session_file} "
             f"(id={self.session_id})"
@@ -143,6 +152,14 @@ class SessionStore:
                 except OSError as exc:
                     logger.warning("Could not rotate session file %s: %s", self.session_file, exc)
 
+            try:
+                if not self.session_file.exists():
+                    fd = os.open(self.session_file, os.O_CREAT | os.O_WRONLY, 0o600)
+                    os.close(fd)
+                else:
+                    self.session_file.chmod(0o600)
+            except OSError:
+                pass
             with open(self.session_file, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
                 fh.flush()
@@ -404,6 +421,10 @@ class SessionStore:
         """Write a human-readable summary alongside the JSONL file (atomic)."""
         tmp = self.summary_file.with_suffix(self.summary_file.suffix + ".tmp")
         tmp.write_text(summary.strip() + "\n", encoding="utf-8")
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
         os.replace(tmp, self.summary_file)
         logger.info(f"Session summary saved: {self.summary_file}")
 
@@ -421,7 +442,11 @@ class SessionStore:
         """Atomically write this session's context-meter sidecar."""
         if not isinstance(state, dict):
             raise TypeError("context state must be a dict")
-        self.session_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+            self.session_dir.chmod(0o700)
+        except OSError:
+            pass
         tmp = self.context_file.with_suffix(self.context_file.suffix + ".tmp")
         payload = dict(state)
         payload.setdefault("session_id", self.session_id)
@@ -430,6 +455,10 @@ class SessionStore:
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
         os.replace(tmp, self.context_file)
 
     def save_compact_artifact(self, artifact: dict) -> Path:
@@ -441,7 +470,11 @@ class SessionStore:
         """
         if not isinstance(artifact, dict):
             raise TypeError("compact artifact must be a dict")
-        self.session_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+            self.session_dir.chmod(0o700)
+        except OSError:
+            pass
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         path = self.session_dir / f"{self.session_id}.compact.{stamp}.json"
         payload = dict(artifact)
@@ -451,6 +484,10 @@ class SessionStore:
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
         logger.info(f"Compact artifact saved: {path}")
         return path
 
