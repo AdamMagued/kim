@@ -382,10 +382,47 @@ fn status(config: &KimConfig) -> String {
     )
 }
 
+/// F-E-1: the outcome of a `kim doctor` run — the human-readable text plus two
+/// health bits so `kim doctor` (and CI / install scripts calling it) can gate
+/// on the exit code instead of always seeing 0.
+///
+/// - `required_ok` covers the universal prerequisites Kim cannot run without
+///   (a Python interpreter for the orchestrator/agent; a home directory for
+///   config + sessions). A required failure ALWAYS exits non-zero.
+/// - `all_ok` additionally covers optional, provider-specific checks (Ollama
+///   server/model, desktop bridge, API key, model-in-list). These gate the
+///   exit code only under `--strict`.
+pub struct DoctorReport {
+    pub text: String,
+    pub required_ok: bool,
+    pub all_ok: bool,
+}
+
+/// F-E-1: should `kim doctor` exit non-zero? Required failures always gate;
+/// optional/provider-specific failures gate only under `--strict`. Pure so it
+/// is unit-testable without probing anything.
+#[must_use]
+pub fn doctor_should_fail(required_ok: bool, all_ok: bool, strict: bool) -> bool {
+    !required_ok || (strict && !all_ok)
+}
+
 async fn doctor(config: &KimConfig) -> CommandOutcome {
+    // The REPL `/doctor` command only surfaces the text; the process exit-code
+    // gating lives in main()'s `kim doctor` arm, which calls doctor_report.
+    CommandOutcome::Message(doctor_report(config).await.text)
+}
+
+pub async fn doctor_report(config: &KimConfig) -> DoctorReport {
+    let root =
+        crate::sessions::find_kim_repo_root().unwrap_or_else(|| std::path::PathBuf::from("."));
+    // Required: the interpreter chat/code mode actually run (find_python: repo
+    // venv first, then python3/python). This is the check CI must gate on.
+    let python_found = crate::agentic::find_python(&root).is_some();
+    let config_ok = config_path().is_some();
+
     let mut lines = vec![
         "KimCLI doctor".to_string(),
-        format!("Mode support: chat + code"),
+        "Mode support: chat + code".to_string(),
         format!("Provider: {}", config.provider),
         format!("Model: {}", config.model),
         format!(
@@ -406,8 +443,14 @@ async fn doctor(config: &KimConfig) -> CommandOutcome {
         format!("cargo: {}", command_status("cargo", &["--version"]).await),
     ];
 
+    // required_ok gates the exit code unconditionally; all_ok also folds in the
+    // optional provider-specific checks below (only consulted under --strict).
+    let mut required_ok = python_found && config_ok;
+    let mut all_ok = required_ok;
+
     if config.provider == "ollama" {
         let base = crate::provider::normalize_base_url(&config.ollama_base_url);
+        let server = ollama_models_at(&base).await;
         lines.push(format!(
             "Ollama server: {}",
             http_status(&base, "/api/tags").await
@@ -418,12 +461,20 @@ async fn doctor(config: &KimConfig) -> CommandOutcome {
             "Ollama model: {}",
             ollama_model_status(&base, &config.model).await
         ));
+        let ollama_ok = known_ollama_cloud_models().contains(&config.model.as_str())
+            || matches!(&server, Some(models) if models.iter().any(|m| m == &config.model));
+        if !ollama_ok {
+            all_ok = false;
+        }
     }
     if config.provider == "desktop" || is_browser_provider(&config.provider) {
-        lines.push(format!(
-            "Kim desktop bridge: {}",
-            desktop_bridge_status(&config.desktop_bridge_url).await
-        ));
+        let status = desktop_bridge_status(&config.desktop_bridge_url).await;
+        // The bridge is optional (browser code mode can run via local
+        // Playwright), so it only affects --strict.
+        if !status.starts_with("ok") {
+            all_ok = false;
+        }
+        lines.push(format!("Kim desktop bridge: {status}"));
     }
     if is_browser_provider(&config.provider) {
         lines.push(
@@ -435,26 +486,53 @@ async fn doctor(config: &KimConfig) -> CommandOutcome {
         let key_env = p.key_env.unwrap();
         let env_val = std::env::var(key_env).ok();
         let stored = config.api_keys.get(&config.provider).map(String::as_str);
+        let key_present = env_val
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty())
+            || stored.map(str::trim).is_some_and(|v| !v.is_empty());
         lines.push(format!(
             "API key: {}",
             api_key_status(key_env, env_val, stored, &config.provider)
         ));
+        if !key_present {
+            all_ok = false;
+        }
         // A8: note whether the configured model appears in the known list.
         let opts = model_options(config).await;
         if !opts.is_empty() {
+            let model_known = opts.iter().any(|m| m == &config.model);
             lines.push(format!(
                 "Model '{}': {}",
                 config.model,
-                if opts.iter().any(|m| m == &config.model) {
+                if model_known {
                     "in the known model list".to_string()
                 } else {
                     format!("not in the known list (known: {})", opts.join(", "))
                 }
             ));
+            if !model_known {
+                all_ok = false;
+            }
         }
     }
 
-    CommandOutcome::Message(lines.join("\n"))
+    if !python_found {
+        // Belt-and-braces: python_status() already prints "not found", but make
+        // the gating reason explicit at the end of the report.
+        lines.push(
+            "FAIL: no Python interpreter found — install Python 3.11+ (Kim's orchestrator runtime)."
+                .to_string(),
+        );
+        required_ok = false;
+        all_ok = false;
+    }
+
+    DoctorReport {
+        text: lines.join("\n"),
+        required_ok,
+        all_ok,
+    }
 }
 
 fn set_provider(args: &str, config: &mut KimConfig) -> CommandOutcome {
@@ -1680,5 +1758,48 @@ mod tests {
         let s = super::api_key_status("OPENAI_API_KEY", None, None, "openai");
         assert!(s.contains("missing"), "{s}");
         assert!(s.contains("openai"), "{s}");
+    }
+
+    // ── F-E-1: doctor exit-code gating ──────────────────────────────────────
+
+    /// Required failures always gate the exit code; optional/provider-specific
+    /// failures gate only under --strict.
+    #[test]
+    fn doctor_should_fail_gating_matrix() {
+        use super::doctor_should_fail;
+        // All green.
+        assert!(!doctor_should_fail(true, true, false));
+        assert!(!doctor_should_fail(true, true, true));
+        // Optional failure: gated only by --strict.
+        assert!(!doctor_should_fail(true, false, false));
+        assert!(doctor_should_fail(true, false, true));
+        // Required failure: always gates, regardless of --strict.
+        assert!(doctor_should_fail(false, false, false));
+        assert!(doctor_should_fail(false, false, true));
+    }
+
+    /// A provider-specific failure (Ollama server unreachable + configured model
+    /// not installed / not a known cloud tag) must clear `all_ok` — so `kim
+    /// doctor --strict` exits non-zero — while the required Python interpreter
+    /// present on the test host keeps `required_ok` true (plain `kim doctor`
+    /// stays 0). 127.0.0.1:1 refuses instantly, so the probe is deterministic.
+    #[tokio::test]
+    async fn doctor_report_flags_unreachable_ollama_without_gating_required() {
+        let config = KimConfig {
+            provider: "ollama".to_string(),
+            model: "definitely-not-a-real-model-xyz".to_string(),
+            ollama_base_url: "http://127.0.0.1:1".to_string(),
+            ..KimConfig::default()
+        };
+        let report = super::doctor_report(&config).await;
+        assert!(
+            !report.all_ok,
+            "unreachable Ollama + unknown model must clear all_ok; text:\n{}",
+            report.text
+        );
+        assert!(
+            report.text.contains("Ollama"),
+            "the human-readable report must still surface the Ollama status"
+        );
     }
 }

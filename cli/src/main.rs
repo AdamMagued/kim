@@ -68,7 +68,11 @@ pub enum ViewState {
 enum CliCommand {
     ShowHelp,
     ShowVersion,
-    Doctor,
+    /// `kim doctor` health check. `strict` (from `--strict`) makes optional,
+    /// provider-specific check failures gate the exit code too. (F-E-1)
+    Doctor {
+        strict: bool,
+    },
     Oneshot {
         mode: AppMode,
         prompt: Option<String>,
@@ -95,16 +99,24 @@ fn parse_cli_args(args: &[String]) -> CliCommand {
     match args.first().map(String::as_str) {
         // Bare `kim` opens the interactive REPL.
         None => CliCommand::Repl { resume_id: None },
-        Some("doctor") => {
-            // doctor takes no further arguments; an extra token is a typo, not
-            // a silent no-op. (F-E-2)
-            if let Some(extra) = args.get(1) {
-                return CliCommand::UsageError(format!(
-                    "kim doctor: unexpected argument '{extra}'. Usage: kim doctor"
-                ));
+        Some("doctor") => match args.get(1).map(String::as_str) {
+            None => CliCommand::Doctor { strict: false },
+            // F-E-1: `--strict` gates the exit code on provider-specific checks
+            // too (for CI / install scripts).
+            Some("--strict") => {
+                if let Some(extra) = args.get(2) {
+                    return CliCommand::UsageError(format!(
+                        "kim doctor: unexpected argument '{extra}'. Usage: kim doctor [--strict]"
+                    ));
+                }
+                CliCommand::Doctor { strict: true }
             }
-            CliCommand::Doctor
-        }
+            // doctor takes no other arguments; an extra token is a typo, not a
+            // silent no-op. (F-E-2)
+            Some(extra) => CliCommand::UsageError(format!(
+                "kim doctor: unexpected argument '{extra}'. Usage: kim doctor [--strict]"
+            )),
+        },
         Some(sub @ "chat") | Some(sub @ "code") => {
             let rest = &args[1..];
             // F-E-2: `kim chat --resume abc` used to treat `--resume abc` as
@@ -316,13 +328,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("{message}");
             std::process::exit(2);
         }
-        CliCommand::Doctor => {
-            let mut config = KimConfig::load();
-            match handle_command("/doctor", &mut config).await {
-                CommandOutcome::Message(message) | CommandOutcome::Info(message) => {
-                    println!("{message}")
-                }
-                other => eprintln!("kim doctor returned unexpected outcome: {other:?}"),
+        CliCommand::Doctor { strict } => {
+            // F-E-1: `kim doctor` must exit non-zero when a required check fails
+            // (and, under --strict, when any provider-specific check fails) so
+            // install scripts and CI can gate on it. The old path built the
+            // report via handle_command and always fell through to Ok(()) → 0.
+            let config = KimConfig::load();
+            let report = commands::doctor_report(&config).await;
+            println!("{}", report.text);
+            if commands::doctor_should_fail(report.required_ok, report.all_ok, strict) {
+                std::process::exit(1);
             }
         }
         CliCommand::Oneshot { mode, prompt } => {
@@ -1583,7 +1598,7 @@ misc helpers
 =========================================================== */
 
 fn help_text() -> &'static str {
-    "Kim terminal CLI\n\nUsage:\n  kim                      Launch the interactive chat/code REPL\n  kim chat <prompt...>     Send one prompt in chat mode and exit\n  kim code <prompt...>     Send one prompt in code-agent mode and exit\n  kim doctor               Check install, providers, desktop bridge, and code mode\n  kim --resume <id>        Resume a Kim session in the REPL\n  kim --resume latest      Resume the newest saved session\n  kim --help               Show this help\n  kim --version            Show the version\n\nPipe a prompt via stdin:\n  echo 'explain this' | kim chat\n  echo 'fix the build' | kim code\n\nInside Kim, type /help for commands and /login to connect a provider."
+    "Kim terminal CLI\n\nUsage:\n  kim                      Launch the interactive chat/code REPL\n  kim chat <prompt...>     Send one prompt in chat mode and exit\n  kim code <prompt...>     Send one prompt in code-agent mode and exit\n  kim doctor               Check install, providers, desktop bridge, and code mode\n  kim doctor --strict      Same, but exit non-zero on any failed check (CI)\n  kim --resume <id>        Resume a Kim session in the REPL\n  kim --resume latest      Resume the newest saved session\n  kim --help               Show this help\n  kim --version            Show the version\n\nPipe a prompt via stdin:\n  echo 'explain this' | kim chat\n  echo 'fix the build' | kim code\n\nInside Kim, type /help for commands and /login to connect a provider."
 }
 
 fn new_session_id() -> String {
@@ -1995,7 +2010,14 @@ mod tests {
     #[test]
     fn parse_args_doctor() {
         let cmd = parse_cli_args(&args(&["doctor"]));
-        assert!(matches!(cmd, CliCommand::Doctor));
+        assert!(matches!(cmd, CliCommand::Doctor { strict: false }));
+    }
+
+    // F-E-1: `kim doctor --strict` parses to the strict health check.
+    #[test]
+    fn parse_args_doctor_strict() {
+        let cmd = parse_cli_args(&args(&["doctor", "--strict"]));
+        assert!(matches!(cmd, CliCommand::Doctor { strict: true }));
     }
 
     #[test]

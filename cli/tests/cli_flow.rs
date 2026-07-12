@@ -221,6 +221,32 @@ fn run_kim_chat(home: &tempfile::TempDir, prompt: &str, extra_env: &[(&str, &str
     cmd.output().expect("kim binary should run")
 }
 
+/// Run `kim <args...>` with the same isolation as `run_kim_chat` (fresh HOME +
+/// temp cwd + clean proxy env), for subcommands other than `chat`.
+fn run_kim(home: &tempfile::TempDir, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    let cwd = tempfile::tempdir().expect("temp cwd");
+    let kim_bin = cwd.path().join("kim");
+    std::fs::copy(env!("CARGO_BIN_EXE_kim"), &kim_bin).expect("copy kim binary");
+    let mut cmd = Command::new(&kim_bin);
+    cmd.args(args)
+        .current_dir(cwd.path())
+        .env("HOME", home.path())
+        .env_remove("KIM_PROJECT_ROOT")
+        .env_remove("KIM_API_KEY")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("kim binary should run")
+}
+
 fn combined_output(output: &Output) -> String {
     format!(
         "{}{}",
@@ -477,4 +503,42 @@ fn browser_provider_errors_cleanly_when_bridge_is_down() {
             && requests.iter().any(|r| r.path == "/v1/health"),
         "both health endpoints should be tried; got {requests:?}"
     );
+}
+
+// ── F-E-1: `kim doctor` exit-code gating ────────────────────────────────────
+
+// A closed Ollama endpoint plus a bogus model is a provider-specific (optional)
+// failure. `kim doctor --strict` must exit non-zero (CI/install-script gate);
+// plain `kim doctor` keeps exit 0 because the only failing checks are optional.
+// Before the fix, `kim doctor` always exited 0 and `--strict` was ignored.
+#[test]
+fn doctor_strict_exits_nonzero_on_provider_failure_but_plain_stays_zero() {
+    // 127.0.0.1:1 refuses instantly — no network, fully deterministic.
+    let config = serde_json::json!({
+        "provider": "ollama",
+        "model": "definitely-not-a-real-model-xyz",
+        "theme": "dark-neovim",
+        "ollama_base_url": "http://127.0.0.1:1",
+        "desktop_bridge_url": "http://127.0.0.1:1",
+        "api_keys": {}
+    });
+    let home = temp_home_with_config(&config);
+
+    let strict = run_kim(&home, &["doctor", "--strict"], &[]);
+    assert!(
+        !strict.status.success(),
+        "kim doctor --strict must exit non-zero when a provider check fails; output:\n{}",
+        combined_output(&strict)
+    );
+
+    let plain = run_kim(&home, &["doctor"], &[]);
+    // Plain doctor only gates on required checks (a Python interpreter, present
+    // on the host); provider-specific failures do not gate it.
+    assert!(
+        plain.status.success(),
+        "plain kim doctor must stay exit 0 when only provider-specific checks fail; output:\n{}",
+        combined_output(&plain)
+    );
+    // Both still print the human-readable report.
+    assert!(combined_output(&plain).contains("KimCLI doctor"));
 }
