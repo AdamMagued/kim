@@ -60,6 +60,47 @@ fn read_body_capped(request: &mut Request) -> Result<String, String> {
     read_capped_string(request.as_reader(), MAX_BODY_BYTES)
 }
 
+/// Constant-time byte-equality (no early return on the first mismatch) so the
+/// token compare cannot leak length/position via timing (#19).
+fn tokens_match(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
+/// Decide whether a presented `X-Kim-Token` authorizes `(method, path)`.
+///
+/// F-D-4: the full bridge token authorizes every route; the webview-scoped
+/// token — the ONLY token injected into third-party provider pages — authorizes
+/// solely `POST /v1/callback` (the one route the injected auth-probe JS calls),
+/// so a page compromise that steals it cannot reach `/v1/task` (spawn an agent
+/// run) or `/v1/open` (SSRF). `GET /v1/health` is unauthenticated loopback
+/// liveness by design (F-D-3).
+fn bridge_request_authorized(
+    method: &Method,
+    path: &str,
+    presented: &str,
+    full_token: &str,
+    webview_token: &str,
+) -> bool {
+    if *method == Method::Get && path == "/v1/health" {
+        return true;
+    }
+    if !full_token.is_empty() && tokens_match(presented.as_bytes(), full_token.as_bytes()) {
+        return true;
+    }
+    if *method == Method::Post
+        && path == "/v1/callback"
+        && !webview_token.is_empty()
+        && tokens_match(presented.as_bytes(), webview_token.as_bytes())
+    {
+        return true;
+    }
+    false
+}
+
 fn handle_webview_bridge_request(request: Request, app_handle: tauri::AppHandle, token: String) {
     let method = request.method().clone();
     let path = request.url().split('?').next().unwrap_or("/").to_string();
@@ -69,27 +110,22 @@ fn handle_webview_bridge_request(request: Request, app_handle: tauri::AppHandle,
         return;
     }
 
-    // /v1/health stays unauthenticated (Railway prober, uptime checks).
-    // /v1/status now requires the token to avoid unauthenticated local info disclosure (#12).
-    if !(method == Method::Get && path == "/v1/health") {
-        let auth = header_value(&request, "X-Kim-Token").unwrap_or_default();
-        // Use constant-time comparison to prevent timing side-channels (#19).
-        let token_bytes = token.as_bytes();
-        let auth_bytes = auth.as_bytes();
-        let tokens_match = token_bytes.len() == auth_bytes.len()
-            && token_bytes
-                .iter()
-                .zip(auth_bytes.iter())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0;
-        if !tokens_match {
-            respond_json(
-                request,
-                401,
-                serde_json::json!({"ok": false, "error": "Unauthorized bridge token."}),
-            );
-            return;
-        }
+    // Auth gate. The full `token` authorizes every route; the F-D-4
+    // webview-scoped token (injected into provider pages) authorizes only POST
+    // /v1/callback; GET /v1/health is unauthenticated loopback liveness by
+    // design (F-D-3). Constant-time compares prevent timing side-channels (#19).
+    let auth = header_value(&request, "X-Kim-Token").unwrap_or_default();
+    let webview_token = WEBVIEW_BRIDGE_CFG
+        .get()
+        .map(|c| c.webview_token.clone())
+        .unwrap_or_default();
+    if !bridge_request_authorized(&method, &path, &auth, &token, &webview_token) {
+        respond_json(
+            request,
+            401,
+            serde_json::json!({"ok": false, "error": "Unauthorized bridge token."}),
+        );
+        return;
     }
 
     // Handle /v1/result/{reqId} before the match, since it has a dynamic path
@@ -225,9 +261,21 @@ pub(crate) fn start_webview_bridge_server(app_handle: tauri::AppHandle) -> Resul
 
     let base_url = format!("http://127.0.0.1:{}", port);
 
+    // F-D-4: mint a distinct, always-random webview token. This is the only
+    // token injected into third-party provider pages (the auth-probe JS); it
+    // authorizes ONLY POST /v1/callback, never /v1/task or /v1/open. Kept
+    // separate from `token` (the full-capability CLI/orchestrator credential)
+    // and never written to disk.
+    let webview_token: String = {
+        use rand::Rng;
+        let random_bytes: [u8; 32] = rand::thread_rng().gen();
+        random_bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    };
+
     let _ = WEBVIEW_BRIDGE_CFG.set(WebviewBridgeConfig {
         base_url: base_url.clone(),
         token: token.clone(),
+        webview_token,
     });
 
     // Write only base_url to kim_sessions/.bridge_url (no cleartext tokens here)
@@ -315,5 +363,77 @@ mod tests {
         let exact = vec![b'a'; 2048];
         let body = super::read_capped_string(std::io::Cursor::new(exact), 2048).unwrap();
         assert_eq!(body.len(), 2048);
+    }
+
+    // ── F-D-4: capability-scoped webview token ──────────────────────────────
+    use super::bridge_request_authorized;
+    use tiny_http::Method;
+
+    const FULL: &str = "full-secret-token";
+    const WV: &str = "webview-scoped-token";
+
+    #[test]
+    fn full_token_authorizes_every_route() {
+        for (m, p) in [
+            (Method::Post, "/v1/task"),
+            (Method::Post, "/v1/open"),
+            (Method::Post, "/v1/callback"),
+            (Method::Get, "/v1/status"),
+        ] {
+            assert!(
+                bridge_request_authorized(&m, p, FULL, FULL, WV),
+                "full token should authorize {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn webview_token_authorizes_only_callback() {
+        // The scoped token reaches /v1/callback...
+        assert!(bridge_request_authorized(
+            &Method::Post,
+            "/v1/callback",
+            WV,
+            FULL,
+            WV
+        ));
+        // ...but NOTHING else — a stolen page token cannot spawn a run or SSRF.
+        for (m, p) in [
+            (Method::Post, "/v1/task"),
+            (Method::Post, "/v1/open"),
+            (Method::Get, "/v1/status"),
+            (Method::Get, "/v1/callback"), // wrong method
+        ] {
+            assert!(
+                !bridge_request_authorized(&m, p, WV, FULL, WV),
+                "webview token must NOT authorize {m:?} {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn health_is_unauthenticated_and_bad_tokens_rejected() {
+        assert!(bridge_request_authorized(
+            &Method::Get,
+            "/v1/health",
+            "",
+            FULL,
+            WV
+        ));
+        // A wrong/empty token authorizes nothing but health.
+        assert!(!bridge_request_authorized(
+            &Method::Post,
+            "/v1/task",
+            "wrong",
+            FULL,
+            WV
+        ));
+        assert!(!bridge_request_authorized(
+            &Method::Post,
+            "/v1/callback",
+            "",
+            FULL,
+            WV
+        ));
     }
 }

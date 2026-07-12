@@ -81,13 +81,23 @@ pub(crate) fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     TrayIconBuilder::with_id("kim-tray")
         .tooltip("Kim")
         .menu(&menu)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "quick_ask" => toggle_quick_ask(app),
-            "cancel_run" => {
-                // Frontend owns the TaskState; ask it to cancel.
-                let _ = app.emit("kim-tray-cancel", ());
+        .on_menu_event(|app, event| match tray_action_for(event.id.as_ref()) {
+            TrayAction::QuickAsk => toggle_quick_ask(app),
+            TrayAction::CancelRun => {
+                // F-H-5: cancel the running task DIRECTLY in Rust. The previous
+                // `kim-tray-cancel` event had NO frontend listener, so the menu
+                // item was dead. cancel_task performs the same SIGTERM->SIGKILL
+                // the UI cancel button triggers (ChatView/CancelWidget invoke
+                // it), and the UI still updates via the kim-agent-cancelled /
+                // kim-agent-done events cancel_task emits — no JS listener needed.
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = crate::subprocess::cancel_task(app).await {
+                        eprintln!("[Kim] tray cancel: {e}");
+                    }
+                });
             }
-            "privacy_pause" => {
+            TrayAction::PrivacyPause => {
                 // Toggle the K9 sentinel.
                 // L-TRAY-1: surface a failed toggle (e.g. ~/.kim not writable)
                 // instead of silently leaving capture in its previous state.
@@ -100,10 +110,29 @@ pub(crate) fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                     );
                 }
             }
-            _ => {}
+            TrayAction::Unknown => {}
         })
         .build(app)?;
     Ok(())
+}
+
+/// Tray menu actions. F-H-5: extracted from the `on_menu_event` closure so the
+/// id→action wiring is unit-testable (the closure itself needs a live app).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TrayAction {
+    QuickAsk,
+    CancelRun,
+    PrivacyPause,
+    Unknown,
+}
+
+pub(crate) fn tray_action_for(id: &str) -> TrayAction {
+    match id {
+        "quick_ask" => TrayAction::QuickAsk,
+        "cancel_run" => TrayAction::CancelRun,
+        "privacy_pause" => TrayAction::PrivacyPause,
+        _ => TrayAction::Unknown,
+    }
 }
 
 /// K7: update the tray status line. Called from the running-task tracking.
@@ -120,5 +149,20 @@ pub(crate) fn set_tray_status(app: &AppHandle, running_task: Option<&str>) {
             None => "Kim — idle".to_string(),
         };
         let _ = tray.set_tooltip(Some(&label));
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    use super::*;
+
+    #[test]
+    fn tray_cancel_maps_to_direct_cancel_action() {
+        // F-H-5: the "Cancel run" tray item must resolve to the direct-cancel
+        // action (cancel_task), not the removed orphaned kim-tray-cancel event.
+        assert_eq!(tray_action_for("cancel_run"), TrayAction::CancelRun);
+        assert_eq!(tray_action_for("quick_ask"), TrayAction::QuickAsk);
+        assert_eq!(tray_action_for("privacy_pause"), TrayAction::PrivacyPause);
+        assert_eq!(tray_action_for("something_else"), TrayAction::Unknown);
     }
 }

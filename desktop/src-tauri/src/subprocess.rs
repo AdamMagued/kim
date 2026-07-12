@@ -1,6 +1,6 @@
 use crate::*;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// RUN-IDENTITY: copy the `run_id` / `session_id` envelope off a raw agent
 /// stdout line onto a curated `kim:*` payload. The typed `KimEvent` enum drops
@@ -24,10 +24,208 @@ pub(crate) fn merge_run_envelope(
     payload
 }
 
+/// Maximum bytes buffered for a single stdout/stderr line before Kim truncates
+/// it. F-D-5: `BufReader::lines().next_line()` accumulates an entire line (a
+/// child that emits a single multi-GB line, or floods with no newline, grows
+/// Rust-side memory unboundedly) before yielding, and the request-body path
+/// already has M-BRIDGE-3's 32 MB cap while the stdout path had none. 8 MiB is
+/// far above any legitimate typed event or narration line.
+pub(crate) const MAX_STDOUT_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// A bounded, chunk-fed line splitter. F-D-5: feed it whatever bytes a child's
+/// stdout/stderr read returns; it yields completed newline-delimited lines but
+/// never buffers more than `cap` bytes for any single line — an over-cap line
+/// is truncated (with a marker) and the physical overflow is drained without
+/// buffering. This is what bounds peak memory instead of `next_line()`'s
+/// unbounded `String` growth. Pure (no I/O), so it is unit-tested directly.
+pub(crate) struct CappedLineSplitter {
+    cap: usize,
+    line: Vec<u8>,
+    overflowing: bool,
+}
+
+impl CappedLineSplitter {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            line: Vec::new(),
+            overflowing: false,
+        }
+    }
+
+    /// Feed one read chunk, invoking `emit` for each completed line.
+    pub(crate) fn push(&mut self, mut chunk: &[u8], mut emit: impl FnMut(String)) {
+        while let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            if !self.overflowing {
+                self.append_capped(&chunk[..pos]);
+            }
+            emit(self.take_line());
+            chunk = &chunk[pos + 1..];
+        }
+        if !chunk.is_empty() && !self.overflowing {
+            self.append_capped(chunk);
+        }
+    }
+
+    /// Flush a trailing partial line (input that ended without a newline),
+    /// matching `BufReader::lines()`, which yields the final unterminated line.
+    pub(crate) fn finish(&mut self, mut emit: impl FnMut(String)) {
+        if !self.line.is_empty() || self.overflowing {
+            emit(self.take_line());
+        }
+    }
+
+    fn append_capped(&mut self, seg: &[u8]) {
+        if self.line.len() >= self.cap {
+            self.overflowing = true;
+            return;
+        }
+        let room = self.cap - self.line.len();
+        let take = room.min(seg.len());
+        self.line.extend_from_slice(&seg[..take]);
+        if self.line.len() >= self.cap {
+            self.overflowing = true;
+        }
+    }
+
+    fn take_line(&mut self) -> String {
+        // Match BufReader::lines() CRLF handling: drop a trailing '\r'.
+        if self.line.last() == Some(&b'\r') {
+            self.line.pop();
+        }
+        let mut out = String::from_utf8_lossy(&self.line).into_owned();
+        if self.overflowing {
+            out.push_str(" …[Kim truncated an oversized stdout line]");
+        }
+        self.line.clear();
+        self.overflowing = false;
+        out
+    }
+}
+
+/// F-H-3: flood-protection budget for forwarding undecodable CHAT stdout lines.
+/// A burst of this many is forwarded to the UI immediately; the token bucket
+/// then refills one token every `PROTOCOL_ERROR_REFILL_MS`. Sized so genuine
+/// anomalies (version skew, a stray `print()`, a partial JSON line from a killed
+/// process) surface, but a runaway spew can't repaint the UI thousands of
+/// times a second.
+pub(crate) const PROTOCOL_ERROR_BURST: u32 = 20;
+pub(crate) const PROTOCOL_ERROR_REFILL_MS: u64 = 250;
+
+/// F-H-3: a per-run token-bucket rate limiter + decode-failure counter for the
+/// typed-mode stdout path. Chat runs previously DROPPED SILENTLY any stdout line
+/// that failed `KimEvent` decode; those lines are now forwarded raw, but through
+/// this limiter so a flood cannot spam the UI. Pure (time is injected via
+/// `record_at`), so the bucket/counter behavior is unit-tested directly; the
+/// production path reads a monotonic clock through `uptime_ms`.
+pub(crate) struct ProtocolErrorLimiter {
+    capacity: u32,
+    tokens: u32,
+    refill_ms: u64,
+    last_refill_ms: u64,
+    total_failures: u64,
+    suppressed: u64,
+    start: Instant,
+}
+
+impl ProtocolErrorLimiter {
+    pub(crate) fn new(capacity: u32, refill_ms: u64) -> Self {
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_ms,
+            last_refill_ms: 0,
+            total_failures: 0,
+            suppressed: 0,
+            start: Instant::now(),
+        }
+    }
+
+    /// The default per-run limiter used by the stdout pump.
+    pub(crate) fn for_stdout() -> Self {
+        Self::new(PROTOCOL_ERROR_BURST, PROTOCOL_ERROR_REFILL_MS)
+    }
+
+    /// Milliseconds since this limiter was constructed (monotonic). Used by the
+    /// production path to feed `record_at` a real clock; tests inject `now_ms`
+    /// directly instead.
+    pub(crate) fn uptime_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    /// Record one decode failure at `now_ms` and decide whether its raw line may
+    /// be forwarded to the UI. Every call increments `total_failures`; a call
+    /// that finds no token increments `suppressed` and returns `false` (the line
+    /// is counted but withheld — flood protection, NOT the old silent drop).
+    pub(crate) fn record_at(&mut self, now_ms: u64) -> bool {
+        self.total_failures = self.total_failures.saturating_add(1);
+        // Refill: one token per `refill_ms` elapsed, capped at `capacity`.
+        if self.refill_ms > 0 {
+            let elapsed = now_ms.saturating_sub(self.last_refill_ms);
+            let refilled = (elapsed / self.refill_ms) as u32;
+            if refilled > 0 {
+                self.tokens = self.tokens.saturating_add(refilled).min(self.capacity);
+                // Advance by the consumed whole intervals so fractional time is
+                // not lost (prevents drift under steady input).
+                self.last_refill_ms = self
+                    .last_refill_ms
+                    .saturating_add(refilled as u64 * self.refill_ms);
+            }
+        }
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            false
+        }
+    }
+
+    pub(crate) fn total_failures(&self) -> u64 {
+        self.total_failures
+    }
+
+    pub(crate) fn suppressed(&self) -> u64 {
+        self.suppressed
+    }
+}
+
+/// F-H-3: how a typed-mode stdout line that FAILED `KimEvent` decode is handled.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DecodeFailureAction {
+    /// Forward the raw line on `kim-agent-output` — codex passthrough (always),
+    /// or a chat line the rate limiter still has budget for.
+    ForwardRaw,
+    /// Chat flood protection engaged: the line is counted but withheld from the
+    /// UI. (Distinct from the pre-F-H-3 SILENT drop, which never counted.)
+    Suppress,
+}
+
+/// Decide the fate of an undecodable typed-mode stdout line. Codex forwards
+/// unconditionally (preserving the pre-F-H-3 passthrough and never consuming the
+/// chat budget); chat runs — which USED TO SILENTLY DROP the line — now forward
+/// through the token-bucket limiter, degrading to `Suppress` only under a
+/// genuine flood.
+pub(crate) fn route_decode_failure(
+    is_codex: bool,
+    limiter: &mut ProtocolErrorLimiter,
+    now_ms: u64,
+) -> DecodeFailureAction {
+    if is_codex {
+        return DecodeFailureAction::ForwardRaw;
+    }
+    if limiter.record_at(now_ms) {
+        DecodeFailureAction::ForwardRaw
+    } else {
+        DecodeFailureAction::Suppress
+    }
+}
+
 pub(crate) fn forward_agent_stdout_line(
     app: &tauri::AppHandle,
     ipc_typed: bool,
     is_codex: bool,
+    limiter: &mut ProtocolErrorLimiter,
     line: &str,
 ) {
     if ipc_typed {
@@ -286,8 +484,32 @@ pub(crate) fn forward_agent_stdout_line(
                     );
                 }
             }
-        } else if is_codex {
-            let _ = app.emit("kim-agent-output", line);
+        } else {
+            // F-H-3: the line failed `KimEvent` decode. Codex forwards it raw
+            // (unchanged passthrough). A CHAT run used to SILENTLY DROP it — no
+            // log, no counter — so a version-skewed / partial-JSON / stray-print
+            // line just vanished and the run looked like it produced nothing.
+            // Now forward it too, rate-limited via a per-run token bucket so a
+            // flood cannot spam the UI; the withheld overflow is still counted.
+            let now_ms = limiter.uptime_ms();
+            match route_decode_failure(is_codex, limiter, now_ms) {
+                DecodeFailureAction::ForwardRaw => {
+                    let _ = app.emit("kim-agent-output", line);
+                }
+                DecodeFailureAction::Suppress => {
+                    // One-time process-log note the first time flood protection
+                    // trips this run — the lines are counted (total_failures) but
+                    // withheld from the UI to avoid a repaint storm.
+                    if limiter.suppressed() == 1 {
+                        eprintln!(
+                            "[Kim] flood protection: withholding undecodable chat stdout \
+                             from the UI ({} decode failures so far this run). Check the \
+                             orchestrator version / ipc_protocol if this persists.",
+                            limiter.total_failures()
+                        );
+                    }
+                }
+            }
         }
     } else {
         let _ = app.emit("kim-agent-output", line);
@@ -315,10 +537,15 @@ include!("events.gen.rs");
 ///   1. Bundled `kim-orchestrator` sidecar adjacent to the Tauri executable
 ///      (set when running as a packaged .app; Tauri places sidecars in the
 ///      same MacOS/ directory as the main binary).
-///   2. `.kim_root/venv` or `.kim/venv` under the user's home directory
-///      (created by the install script).
+///   2. `~/.kim/venv` (or `.venv`) under the user's home directory (created by
+///      the install script).
 ///   3. Project-local `venv/` or `.venv/` under `project_root`.
 ///   4. System-level `python3` / `python` on PATH.
+///
+/// F-L-9: the former `~/.kim_root/venv` candidates were dead — install.sh
+/// writes `~/.kim_root` as a *file* (`echo "$PWD" > ~/.kim_root`, read as a
+/// file by paths.rs), so a `~/.kim_root/venv/bin/python` directory-join could
+/// never match anything the install script produced. Removed.
 ///
 /// When the sidecar is found, the caller should invoke it directly (as a
 /// standalone executable) rather than as `<interpreter> -m orchestrator.agent`.
@@ -330,21 +557,9 @@ pub(crate) fn find_python_interpreter(project_root: &Path) -> Result<String, Str
         return Ok(sidecar);
     }
 
-    // ── 2. Install-script venv in ~/.kim_root or ~/.kim ───────────────────────
+    // ── 2. Install-script venv in ~/.kim ──────────────────────────────────────
     if let Some(home) = dirs_home() {
-        let install_candidates = [
-            home.join(".kim_root")
-                .join("venv")
-                .join("bin")
-                .join("python"),
-            home.join(".kim_root")
-                .join(".venv")
-                .join("bin")
-                .join("python"),
-            home.join(".kim").join("venv").join("bin").join("python"),
-            home.join(".kim").join(".venv").join("bin").join("python"),
-        ];
-        for c in install_candidates {
+        for c in install_script_venv_candidates(&home) {
             if c.exists() {
                 return Ok(c.to_string_lossy().to_string());
             }
@@ -454,45 +669,61 @@ fn dirs_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CodeBackendKind {
-    Codex,
-    Claw,
+/// Interpreter candidates for an install-script-created venv under the user's
+/// home directory. F-L-9: only `~/.kim/...` — the former `~/.kim_root/...`
+/// candidates were dead (install.sh writes `~/.kim_root` as a file, so a
+/// `~/.kim_root/venv/bin/python` directory path never existed).
+fn install_script_venv_candidates(home: &Path) -> [PathBuf; 2] {
+    [
+        home.join(".kim").join("venv").join("bin").join("python"),
+        home.join(".kim").join(".venv").join("bin").join("python"),
+    ]
 }
 
-impl CodeBackendKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Codex => "Codex",
-            Self::Claw => "Claw compatibility",
-        }
+/// F-L-2: actionable message when Kim is about to spawn against a bare system
+/// python that is missing its dependencies.
+pub(crate) const PYTHON_DEPS_MISSING_MESSAGE: &str = "Kim's Python dependencies are not installed. Kim fell back to your system Python, which does not have Kim's packages. Run ./install.sh, or create the project venv:  python3 -m venv venv && ./venv/bin/pip install -r requirements.txt";
+
+/// True when `interp` is a bare system `python`/`python3`/`py` command (no path
+/// separator) rather than a resolved venv / bundled-sidecar interpreter.
+/// F-L-2: the bare system python is the last-resort fallback that is the one
+/// most likely to be missing Kim's dependencies.
+fn is_bare_system_python(interp: &str) -> bool {
+    !interp.contains('/') && !interp.contains('\\') && !is_bundled_orchestrator(interp)
+}
+
+/// F-L-2: when the interpreter search falls through to a bare system python
+/// (every Mac has one), a missing/broken project venv means the orchestrator
+/// spawns without its deps and dies instantly with a raw `ModuleNotFoundError:
+/// No module named 'anthropic'` in the task stream — a long-known gotcha that
+/// was neither detected nor translated. Run a cheap import preflight and, on
+/// failure, return an actionable message. The caller surfaces it as the
+/// spec-build error (shown in the UI, releases the runner slot). Venv / sidecar
+/// interpreters skip the probe (their deps are assumed present).
+async fn preflight_python_deps(interpreter: &str) -> Result<(), String> {
+    if !is_bare_system_python(interpreter) {
+        return Ok(());
     }
-
-    fn binary_label(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Claw => "claw",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct CodeBackend {
-    kind: CodeBackendKind,
-    binary: PathBuf,
-}
-
-fn executable_from_env(key: &str, kind: CodeBackendKind) -> Option<CodeBackend> {
-    let path = PathBuf::from(std::env::var(key).ok()?);
-    if path.is_file() {
-        Some(CodeBackend { kind, binary: path })
+    let interp = interpreter.to_string();
+    let ok = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&interp)
+            .args(["-c", "import mcp, anthropic"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+    if ok {
+        Ok(())
     } else {
-        None
+        Err(PYTHON_DEPS_MISSING_MESSAGE.to_string())
     }
 }
 
-fn executable_on_path(name: &str, kind: CodeBackendKind) -> Option<CodeBackend> {
-    // Use the platform-appropriate PATH search command (#20).
+/// Search PATH for an executable, returning its resolved path. (#20: uses the
+/// platform-appropriate lookup command.)
+fn executable_on_path(name: &str) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let search_cmd = ("where", name);
     #[cfg(not(target_os = "windows"))]
@@ -515,58 +746,25 @@ fn executable_on_path(name: &str, kind: CodeBackendKind) -> Option<CodeBackend> 
     if s.is_empty() {
         None
     } else {
-        Some(CodeBackend {
-            kind,
-            binary: PathBuf::from(s),
-        })
+        Some(PathBuf::from(s))
     }
 }
 
-fn bundled_code_backend(kim_root: &Path, kind: CodeBackendKind) -> Option<CodeBackend> {
-    let mut roots: Vec<PathBuf> = vec![kim_root.to_path_buf()];
-    if let Some(parent) = kim_root.parent() {
-        roots.push(parent.to_path_buf());
-    }
-    let relative = match kind {
-        CodeBackendKind::Codex => "pythonExperimentTool/codex-code/rust/target",
-        CodeBackendKind::Claw => "pythonExperimentTool/claw-code/rust/target",
-    };
-    let binary_name = kind.binary_label();
-    for root in &roots {
-        for sub in &["release", "debug"] {
-            let p = root.join(relative).join(sub).join(binary_name);
-            if p.is_file() {
-                return Some(CodeBackend { kind, binary: p });
-            }
-        }
-    }
-    None
-}
-
-/// Locate the code-agent binary. Prefer the post-migration `codex` binary,
-/// but fall back to the bundled `claw` binary while this branch still carries
-/// the old Rust workspace layout.
-fn find_code_backend(kim_root: &Path) -> Option<CodeBackend> {
+/// Locate the `codex` binary for the Code tab.
+///
+/// F-G-1: the bundled-Codex / bundled-Claw arms (`pythonExperimentTool/…`) and
+/// the `CLAW_BIN` env / `claw`-on-PATH fallbacks were removed — the vendored
+/// `pythonExperimentTool/` tree is deleted, so those arms were dead hooks that
+/// could only ever produce a misleading "Build pythonExperimentTool/…" error.
+/// Resolution is now simply: `CODEX_BIN` env → `codex` on PATH.
+fn find_code_backend(_kim_root: &Path) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CODEX_BIN") {
         let path = PathBuf::from(p);
         if path.is_file() {
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            let kind = if filename == "claw" {
-                CodeBackendKind::Claw
-            } else {
-                CodeBackendKind::Codex
-            };
-            return Some(CodeBackend { kind, binary: path });
+            return Some(path);
         }
     }
-    executable_from_env("CLAW_BIN", CodeBackendKind::Claw)
-        .or_else(|| bundled_code_backend(kim_root, CodeBackendKind::Codex))
-        .or_else(|| executable_on_path("codex", CodeBackendKind::Codex))
-        .or_else(|| bundled_code_backend(kim_root, CodeBackendKind::Claw))
-        .or_else(|| executable_on_path("claw", CodeBackendKind::Claw))
+    executable_on_path("codex")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -681,11 +879,11 @@ pub(crate) async fn send_task(
     // spawn() below, these builders have no reservation to release
     // internally.
     let spec_result = if !is_codex {
-        build_gui_chat_spec(&inputs, extra).await.map(|s| (s, false))
+        build_gui_chat_spec(&inputs, extra).await
     } else {
         build_gui_codex_spec(&inputs, extra, &app_handle, &app_config).await
     };
-    let (spec, was_claw) = match spec_result {
+    let spec = match spec_result {
         Ok(v) => v,
         Err(e) => {
             crate::spawn_supervisor::release_slot().await;
@@ -749,9 +947,6 @@ pub(crate) async fn send_task(
     };
 
     if is_codex {
-        if was_claw {
-            let _ = mirror_latest_claw_session_to_codex(&target_root);
-        }
         if let Some(session) = newest_codex_session(&target_root) {
             let _ = app_handle.emit("kim-agent-code-session", session);
         }
@@ -824,6 +1019,7 @@ async fn build_gui_chat_spec(
         extra = extra.set("KIM_CONTEXT_BUDGET_TOKENS", budget.to_string());
     }
     let python = find_python_interpreter(p.kim_root)?;
+    preflight_python_deps(&python).await?;
     Ok(task_spec::chat_task_spec(task_spec::ChatSpecParams {
         bundled_sidecar: is_bundled_orchestrator(&python),
         python: &python,
@@ -841,28 +1037,25 @@ async fn build_gui_chat_spec(
 }
 
 /// Code-tab spec: either the Codex browser-bridge (`codex_bridge_service`
-/// relaying through Kim's BrowserProvider) or the direct codex/claw CLI.
-/// Returns the spec plus whether the Claw compatibility backend was used
-/// (the caller mirrors Claw sessions after exit).
+/// relaying through Kim's BrowserProvider) or the direct Codex CLI.
 async fn build_gui_codex_spec(
     p: &GuiSpawnInputs<'_>,
     extra: crate::task_spec::EnvBuilder,
     app_handle: &tauri::AppHandle,
     app_config: &config::AppConfig,
-) -> Result<(crate::task_spec::TaskSpec, bool), String> {
+) -> Result<crate::task_spec::TaskSpec, String> {
     use crate::task_spec;
 
-    let backend = find_code_backend(p.kim_root).ok_or_else(|| {
-        "Code agent binary not found. Build `pythonExperimentTool/codex-code/rust` for Codex, build `pythonExperimentTool/claw-code/rust` for the bundled compatibility backend, or set CODEX_BIN/CLAW_BIN to the binary path.".to_string()
-    })?;
+    // F-G-1: the vendored bundled-Codex/bundled-Claw backends are gone, so the
+    // only resolution is CODEX_BIN or `codex` on PATH.
+    let codex_bin = find_code_backend(p.kim_root)
+        .ok_or_else(|| "Code agent binary not found. Install codex or set CODEX_BIN to the binary path.".to_string())?;
 
     if task_spec::is_browser_provider(p.provider_arg) {
         // Browser-bridge mode: codex_bridge_service relays each LLM request
         // through Kim's BrowserProvider. No Anthropic key needed.
-        if backend.kind == CodeBackendKind::Claw {
-            return Err("Browser-backed Code mode needs the Codex binary. This checkout only has the bundled Claw compatibility binary, so switch the provider to Ollama/OpenAI or build/set CODEX_BIN.".to_string());
-        }
         let python = find_python_interpreter(p.kim_root)?;
+        preflight_python_deps(&python).await?;
         let _ = app_handle.emit(
             "kim-agent-output",
             format!(
@@ -872,7 +1065,7 @@ async fn build_gui_codex_spec(
         );
         let _ = app_handle.emit(
             "kim-agent-output",
-            format!("[STATUS] codex binary: {}", backend.binary.display()),
+            format!("[STATUS] codex binary: {}", codex_bin.display()),
         );
         let spec = task_spec::codex_browser_spec(task_spec::CodexBridgeSpecParams {
             python: &python,
@@ -880,17 +1073,16 @@ async fn build_gui_codex_spec(
             target_root: p.target_root,
             task: p.task,
             provider: p.provider_arg,
-            codex_bin: &backend.binary,
+            codex_bin: &codex_bin,
             session_id: p.session_id.to_string(),
             permission_mode: p.permission,
             extra_envs: extra.build(),
         });
-        return Ok((spec, false));
+        return Ok(spec);
     }
 
-    // Direct API mode: run the codex/claw binary itself.
-    let was_claw = backend.kind == CodeBackendKind::Claw;
-    let route = if !was_claw && p.provider_arg.trim().eq_ignore_ascii_case("ollama") {
+    // Direct API mode: run the Codex CLI itself.
+    let route = if p.provider_arg.trim().eq_ignore_ascii_case("ollama") {
         // Codex bypasses its ChatGPT auth entirely via --oss.
         let model = selected_ollama_codex_model(
             p.ollama_mode,
@@ -923,24 +1115,16 @@ async fn build_gui_codex_spec(
         )
         .await?
     };
-    let status_line = if was_claw {
-        format!(
-            "[STATUS] Routing code task to {} via {}: {}",
-            backend.kind.label(),
-            route.label,
-            backend.binary.display(),
-        )
-    } else {
+    let _ = app_handle.emit(
+        "kim-agent-output",
         format!(
             "[STATUS] ✓ Using Codex CLI via {}: {}",
             route.label,
-            backend.binary.display(),
-        )
-    };
-    let _ = app_handle.emit("kim-agent-output", status_line);
+            codex_bin.display(),
+        ),
+    );
     let spec = task_spec::codex_direct_spec(task_spec::CodexDirectSpecParams {
-        code_bin: &backend.binary,
-        is_claw: was_claw,
+        code_bin: &codex_bin,
         target_root: p.target_root,
         task: p.task,
         // Gated behind an explicit opt-in env var (#1). Default: sandboxed +
@@ -949,7 +1133,7 @@ async fn build_gui_codex_spec(
         route,
         session_id: p.session_id.to_string(),
     });
-    Ok((spec, was_claw))
+    Ok(spec)
 }
 
 /// Launch Chrome for CDP if no in-app webview bridge is configured, waiting
@@ -1108,6 +1292,205 @@ pub(crate) fn process_exists(pid: u32) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    // -- F-D-5: bounded stdout line splitter --
+
+    fn split_all(cap: usize, chunks: &[&[u8]]) -> Vec<String> {
+        let mut s = CappedLineSplitter::new(cap);
+        let mut out = Vec::new();
+        for c in chunks {
+            s.push(c, |line| out.push(line));
+        }
+        s.finish(|line| out.push(line));
+        out
+    }
+
+    #[test]
+    fn splitter_yields_lines_like_bufreader() {
+        // Multiple lines in one chunk, split across chunk boundaries, CRLF, and
+        // a trailing unterminated line all behave like BufReader::lines().
+        let out = split_all(1024, &[b"alpha\nbeta\r\n", b"gam", b"ma\ndelta"]);
+        assert_eq!(out, vec!["alpha", "beta", "gamma", "delta"]);
+    }
+
+    #[test]
+    fn splitter_empty_lines_preserved() {
+        let out = split_all(1024, &[b"\n\nx\n"]);
+        assert_eq!(out, vec!["", "", "x"]);
+    }
+
+    #[test]
+    fn splitter_truncates_oversized_line() {
+        // A single line far larger than the cap is truncated to ~cap bytes with
+        // a marker — never buffered whole.
+        let cap = 16;
+        let big = vec![b'A'; 10_000];
+        let mut chunks: Vec<&[u8]> = vec![&big];
+        let nl = b"\ntail\n";
+        chunks.push(nl);
+        let out = split_all(cap, &chunks);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].starts_with("AAAA"), "got {:?}", out[0]);
+        assert!(out[0].contains("truncated"), "expected marker: {:?}", out[0]);
+        // The capped prefix stays within cap + the marker (no 10k buffering).
+        assert!(out[0].len() < cap + 64);
+        // The line AFTER the oversized one is unaffected.
+        assert_eq!(out[1], "tail");
+    }
+
+    #[test]
+    fn splitter_no_newline_flood_is_bounded_at_eof() {
+        // A child that emits a huge run with no newline at all still yields a
+        // single bounded, truncated line at EOF (finish()).
+        let cap = 8;
+        let big = vec![b'x'; 5000];
+        let out = split_all(cap, &[&big]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("truncated"));
+        assert!(out[0].len() < cap + 64);
+    }
+
+    // -- F-H-3: undecodable chat stdout is forwarded (not silently dropped) --
+
+    #[test]
+    fn chat_decode_failure_is_forwarded_not_dropped() {
+        // Regression for the finding: pre-fix, a CHAT run (is_codex == false)
+        // whose stdout line failed KimEvent decode was SILENTLY DROPPED. It must
+        // now route to ForwardRaw so version-skew / partial-JSON / stray-print
+        // lines reach the UI instead of vanishing — and be counted.
+        let mut lim = ProtocolErrorLimiter::for_stdout();
+        assert_eq!(
+            route_decode_failure(false, &mut lim, 0),
+            DecodeFailureAction::ForwardRaw
+        );
+        assert_eq!(lim.total_failures(), 1);
+        assert_eq!(lim.suppressed(), 0);
+    }
+
+    #[test]
+    fn codex_decode_failure_forwards_unbounded_and_off_chat_budget() {
+        // Preserve the existing codex raw-emit behavior: codex always forwards,
+        // is never rate-limited, and never consumes the chat token budget.
+        let mut lim = ProtocolErrorLimiter::new(1, 1_000_000);
+        for _ in 0..1000 {
+            assert_eq!(
+                route_decode_failure(true, &mut lim, 0),
+                DecodeFailureAction::ForwardRaw
+            );
+        }
+        assert_eq!(
+            lim.total_failures(),
+            0,
+            "codex passthrough must not touch the chat decode-failure counter"
+        );
+        assert_eq!(lim.suppressed(), 0);
+    }
+
+    #[test]
+    fn chat_flood_is_rate_limited_but_every_failure_counted() {
+        // A burst up to capacity is forwarded; the flood beyond it is Suppressed
+        // (withheld from the UI) yet still counted — nothing is silently lost.
+        let mut lim = ProtocolErrorLimiter::new(3, 1000);
+        for _ in 0..3 {
+            assert_eq!(
+                route_decode_failure(false, &mut lim, 0),
+                DecodeFailureAction::ForwardRaw
+            );
+        }
+        // 4th and 5th within the same instant have no token → suppressed.
+        assert_eq!(
+            route_decode_failure(false, &mut lim, 0),
+            DecodeFailureAction::Suppress
+        );
+        assert_eq!(
+            route_decode_failure(false, &mut lim, 0),
+            DecodeFailureAction::Suppress
+        );
+        assert_eq!(lim.total_failures(), 5, "every decode failure is counted");
+        assert_eq!(lim.suppressed(), 2, "the two over-budget lines are counted");
+    }
+
+    #[test]
+    fn chat_budget_refills_over_time_and_is_capped() {
+        let mut lim = ProtocolErrorLimiter::new(2, 500);
+        // Drain the burst at t=0.
+        assert!(lim.record_at(0));
+        assert!(lim.record_at(0));
+        assert!(!lim.record_at(0));
+        // One token back after one refill interval.
+        assert!(lim.record_at(500));
+        assert!(!lim.record_at(500));
+        // A long idle gap refills to capacity but NOT beyond (no unbounded
+        // accrual → the next burst is still bounded by capacity).
+        assert!(lim.record_at(100_000));
+        assert!(lim.record_at(100_000));
+        assert!(!lim.record_at(100_000));
+    }
+
+    #[test]
+    fn limiter_never_refills_when_interval_zero() {
+        // Defensive: a zero refill interval must not divide-by-zero; the bucket
+        // simply never refills.
+        let mut lim = ProtocolErrorLimiter::new(1, 0);
+        assert!(lim.record_at(0));
+        assert!(!lim.record_at(1_000_000));
+        assert_eq!(lim.suppressed(), 1);
+    }
+
+    #[test]
+    fn bare_system_python_is_classified() {
+        // F-L-2: only bare command names (no path separator) are the
+        // dependency-risk system fallback.
+        assert!(is_bare_system_python("python3"));
+        assert!(is_bare_system_python("python"));
+        assert!(is_bare_system_python("py"));
+        // Venv / absolute interpreters and the bundled sidecar are NOT bare.
+        assert!(!is_bare_system_python("/proj/venv/bin/python"));
+        assert!(!is_bare_system_python("/Users/x/.kim/venv/bin/python"));
+        assert!(!is_bare_system_python(r"C:\proj\venv\Scripts\python.exe"));
+        assert!(!is_bare_system_python(
+            "/Applications/Kim.app/Contents/MacOS/kim-orchestrator"
+        ));
+    }
+
+    #[tokio::test]
+    async fn preflight_skips_venv_interpreters() {
+        // A resolved venv/absolute interpreter never triggers the probe, so this
+        // returns Ok even though the path does not exist.
+        assert!(preflight_python_deps("/nonexistent/venv/bin/python")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn preflight_bare_python_missing_deps_is_friendly() {
+        // A bare command that cannot import Kim's deps yields the actionable
+        // message rather than a raw ModuleNotFoundError. Use a command name that
+        // does not exist so the probe fails deterministically.
+        let err = preflight_python_deps("kim-nonexistent-python-xyz")
+            .await
+            .unwrap_err();
+        assert_eq!(err, PYTHON_DEPS_MISSING_MESSAGE);
+        assert!(err.contains("install.sh"));
+    }
+
+    #[test]
+    fn install_venv_candidates_drop_dead_kim_root_arm() {
+        // F-L-9: the interpreter search must not probe ~/.kim_root as a
+        // directory — install.sh writes it as a FILE, so those candidates
+        // could never match. Only ~/.kim venvs remain.
+        let home = Path::new("/home/tester");
+        let cands = install_script_venv_candidates(home);
+        for c in &cands {
+            let s = c.to_string_lossy();
+            assert!(
+                !s.contains(".kim_root"),
+                "dead ~/.kim_root venv candidate must be gone: {s}"
+            );
+            assert!(s.contains("/.kim/"), "expected a ~/.kim venv candidate: {s}");
+        }
+        assert_eq!(cands.len(), 2);
+    }
 
     #[test]
     fn merge_run_envelope_reattaches_run_and_session() {

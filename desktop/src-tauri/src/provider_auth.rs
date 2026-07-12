@@ -232,7 +232,11 @@ pub(crate) async fn provider_check_auth(
         site,
         WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    let probe_js = build_auth_probe_js(&site, &req_id, &cfg.base_url, &cfg.token);
+    // F-D-4: inject the capability-scoped webview token (callback-only), NEVER
+    // the full-capability `cfg.token`. A monkeypatched `fetch` on the provider
+    // page can still capture whatever we inject, but the scoped token cannot
+    // reach /v1/task or /v1/open.
+    let probe_js = build_auth_probe_js(&site, &req_id, &cfg.base_url, &cfg.webview_token);
     webview
         .eval(&probe_js)
         .map_err(|e| format!("eval failed: {}", e))?;

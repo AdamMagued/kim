@@ -214,6 +214,57 @@ fn remote_host_is_expected(remote_url: &str) -> bool {
     }
 }
 
+/// F-J-5: `git pull` argv with a low-speed network timeout so a black-hole
+/// network (dropped packets, captive portal) aborts the transfer after ~30s of
+/// near-zero throughput instead of wedging the update indefinitely. The `-c`
+/// overrides are per-invocation, so they never touch the user's git config.
+fn git_pull_argv() -> Vec<&'static str> {
+    vec![
+        "-c",
+        "http.lowSpeedLimit=1000",
+        "-c",
+        "http.lowSpeedTime=30",
+        "pull",
+        "--ff-only",
+    ]
+}
+
+/// F-J-5: `pip install` argv with a per-operation network timeout so a slow /
+/// black-hole index cannot wedge the update forever.
+fn pip_install_argv() -> Vec<&'static str> {
+    vec![
+        "-m",
+        "pip",
+        "install",
+        "-r",
+        "requirements.txt",
+        "--timeout",
+        "30",
+        "-q",
+        "--disable-pip-version-check",
+    ]
+}
+
+/// F-J-5: run a blocking `Command::output()` off the async runtime.
+/// `run_update` is an `async fn`, but `std::process::Command::output()` parks
+/// the calling tokio worker for the whole git/pip duration — under Tauri's
+/// multi-thread runtime that starves other async work. Running it on the
+/// dedicated blocking pool keeps the async workers free.
+async fn command_output_blocking(
+    program: String,
+    args: Vec<String>,
+    cwd: PathBuf,
+) -> std::io::Result<std::process::Output> {
+    tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&program)
+            .args(&args)
+            .current_dir(&cwd)
+            .output()
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("update command task panicked: {e}")))?
+}
+
 #[tauri::command]
 pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     let kim_root = crate::default_project_root();
@@ -228,11 +279,13 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     // Reject the update if the configured 'origin' remote does not point at the
     // expected host.  This prevents a tampered local git config (or a poisoned
     // DNS entry) from silently substituting a rogue upstream.
-    let remote_out = std::process::Command::new(git_cmd)
-        .args(["remote", "get-url", "origin"])
-        .current_dir(&kim_root)
-        .output()
-        .map_err(|e| format!("git not found — make sure Git is installed: {e}"))?;
+    let remote_out = command_output_blocking(
+        git_cmd.to_string(),
+        vec!["remote".into(), "get-url".into(), "origin".into()],
+        kim_root.clone(),
+    )
+    .await
+    .map_err(|e| format!("git not found — make sure Git is installed: {e}"))?;
 
     let remote_url = String::from_utf8_lossy(&remote_out.stdout)
         .trim()
@@ -268,11 +321,13 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
 
     let _ = app_handle.emit("kim-update-progress", "Pulling latest source from GitHub…");
 
-    let git_out = std::process::Command::new(git_cmd)
-        .args(["pull", "--ff-only"])
-        .current_dir(&kim_root)
-        .output()
-        .map_err(|e| format!("git pull failed to spawn: {e}"))?;
+    let git_out = command_output_blocking(
+        git_cmd.to_string(),
+        git_pull_argv().into_iter().map(String::from).collect(),
+        kim_root.clone(),
+    )
+    .await
+    .map_err(|e| format!("git pull failed to spawn: {e}"))?;
 
     if !git_out.status.success() {
         let stderr = String::from_utf8_lossy(&git_out.stderr);
@@ -304,10 +359,12 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     // deployments do not have a signing key imported.  Operators who want to
     // enforce signed commits should set `commit.gpgSign` and import the project
     // key; in that case `git pull --ff-only` itself will refuse unsigned commits.
-    let verify_out = std::process::Command::new(git_cmd)
-        .args(["verify-commit", "HEAD"])
-        .current_dir(&kim_root)
-        .output();
+    let verify_out = command_output_blocking(
+        git_cmd.to_string(),
+        vec!["verify-commit".into(), "HEAD".into()],
+        kim_root.clone(),
+    )
+    .await;
 
     match verify_out {
         Ok(out) if out.status.success() => {
@@ -336,18 +393,12 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     let python =
         crate::find_python_interpreter(&kim_root).map_err(|e| format!("Python not found: {e}"))?;
 
-    let pip_out = std::process::Command::new(&python)
-        .args([
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            "requirements.txt",
-            "-q",
-            "--disable-pip-version-check",
-        ])
-        .current_dir(&kim_root)
-        .output();
+    let pip_out = command_output_blocking(
+        python.clone(),
+        pip_install_argv().into_iter().map(String::from).collect(),
+        kim_root.clone(),
+    )
+    .await;
 
     match pip_out {
         Ok(out) if out.status.success() => {
@@ -421,6 +472,29 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- F-J-5: update commands carry a network timeout --
+
+    #[test]
+    fn git_pull_argv_has_low_speed_timeout() {
+        let argv = git_pull_argv();
+        // A black-hole network must abort the pull, not hang it forever.
+        assert!(argv.contains(&"http.lowSpeedLimit=1000"));
+        assert!(argv.contains(&"http.lowSpeedTime=30"));
+        assert!(argv.contains(&"pull"));
+        assert!(argv.contains(&"--ff-only"));
+        // The overrides are per-invocation `-c` flags (never persisted).
+        assert_eq!(argv.iter().filter(|a| **a == "-c").count(), 2);
+    }
+
+    #[test]
+    fn pip_install_argv_has_network_timeout() {
+        let argv = pip_install_argv();
+        assert!(argv.contains(&"--timeout"));
+        assert!(argv.contains(&"30"));
+        assert!(argv.contains(&"install"));
+        assert!(argv.contains(&"requirements.txt"));
+    }
 
     // -- extract_remote_host --
 
