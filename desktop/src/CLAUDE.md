@@ -18,7 +18,7 @@ The React 19 + TypeScript frontend (Tauri webview).
 ## Local invariants
 - **CSS import order** in `index.css` is cascade-dependent. Changing order breaks themes. The order is: design-tokens → base → components → overrides.
 - **`events.gen.ts` is generated**: edit `events.schema.json` + run `npm run gen:events`, never hand-edit.
-- **No new `any`**: ESLint warns on new `any` types in this directory. Use proper types.
+- **No new `any`**: ESLint enforces this. `npm run lint` (flat config at `desktop/eslint.config.js`) makes `@typescript-eslint/no-explicit-any` a hard **error** in non-test source (a warning in tests, for mock plumbing). Use proper types. The lint also runs `react-hooks` (rules-of-hooks = error) and carries a small documented warn-baseline (exhaustive-deps, fast-refresh boundaries) — see the config header.
 - **IPC events**: listen on `kim:*` typed events (not the legacy `[STATUS]` text protocol). Both are currently emitted (dual-emit debt); prefer the typed path for new code.
 - **Code tab provider constraint**: the Code tab must never construct an OpenAI auth flow or reference gpt-5.5.
 
