@@ -517,6 +517,55 @@ def test_send_detects_new_completion_after_baseline(monkeypatch, tmp_path, capsy
 
 
 # ---------------------------------------------------------------------------
+# F-E-8: cmd_send poll must not lose a completion record that is flushed across
+# two writes (a partial line, then the remainder + newline) straddling a poll.
+# ---------------------------------------------------------------------------
+
+def test_send_does_not_lose_partial_completion_line(monkeypatch, tmp_path, capsys):
+    session_id = "sessPartial"
+    date_dir = tmp_path / "2026-07-13"
+    date_dir.mkdir(parents=True)
+    sfile = date_dir / f"{session_id}.jsonl"
+    sfile.write_bytes(
+        json.dumps({"role": "user", "content": "old"}).encode() + b"\n"
+    )
+
+    monkeypatch.setenv("KIM_SESSIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _fake_bridge(
+            {"ok": True, "session_id": session_id, "sessions_dir": str(tmp_path)}
+        ),
+    )
+
+    complete_line = json.dumps(
+        {"role": "assistant", "content": "TASK_COMPLETE: done"}
+    )
+    split = len(complete_line) - 4
+    part1 = complete_line[:split].encode("utf-8")          # no trailing newline
+    part2 = complete_line[split:].encode("utf-8") + b"\n"  # completes the line
+    real_sleep = time.sleep
+    state = {"n": 0}
+
+    def fake_sleep(_s):
+        state["n"] += 1
+        if state["n"] == 1:
+            with open(sfile, "ab") as f:
+                f.write(part1)
+        elif state["n"] == 2:
+            with open(sfile, "ab") as f:
+                f.write(part2)
+        real_sleep(0.002)
+
+    monkeypatch.setattr("kimctl.__main__.time.sleep", fake_sleep)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_send(_send_ns(session_id, timeout=5))
+    assert exc_info.value.code == EXIT_OK
+    assert "done" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # F-E-13: kimctl must read the desktop's ~/.kim/bridge_token pairing file.
 # ---------------------------------------------------------------------------
 

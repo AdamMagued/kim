@@ -446,13 +446,27 @@ def cmd_send(args):
     # Poll for TASK_COMPLETE / NEED_HELP
     while time.time() < deadline:
         try:
-            with open(session_file, "r", encoding="utf-8") as f:
+            # F-E-8: read in binary and only advance past the last *newline-
+            # terminated* line. The orchestrator appends records with a
+            # buffered write; a poll that lands mid-write would otherwise
+            # consume a half-flushed line, advance the offset past it, and never
+            # see the completed record — spinning until timeout on a task that
+            # actually succeeded. Keep the partial tail for the next poll.
+            with open(session_file, "rb") as f:
                 f.seek(last_offset)
-                new_data = f.read()
-                last_offset = f.tell()
+                chunk = f.read()
         except FileNotFoundError:
             time.sleep(poll_interval)
             continue
+
+        nl = chunk.rfind(b"\n")
+        if nl == -1:
+            # No complete line appended yet — wait without advancing.
+            time.sleep(poll_interval)
+            continue
+        consumed = chunk[: nl + 1]
+        last_offset += len(consumed)
+        new_data = consumed.decode("utf-8", errors="replace")
 
         if new_data.strip():
             for line in new_data.strip().splitlines():
