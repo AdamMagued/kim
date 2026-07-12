@@ -375,7 +375,7 @@
   left: auto;
   right: 0;
   min-width: 268px;
-  z-index: 200;
+  z-index: var(--z-overlay);
   background: var(--kim-surface, var(--bg-secondary, #1a1a1a));
   border: 1px solid var(--kim-border, var(--border));
   border-radius: 12px;
@@ -591,7 +591,7 @@
   border-radius: 10px;
   box-shadow: 0 14px 36px rgba(0,0,0,0.5);
   padding: 6px;
-  z-index: 50;
+  z-index: var(--z-popover);
   display: flex;
   flex-direction: column;
 }

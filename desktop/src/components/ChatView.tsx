@@ -123,6 +123,9 @@ interface Props {
    *  ChatView remounted mid-run can re-attach to its own session's run. */
   activeRunSessionId?: string | null;
   activeRunId?: string | null;
+  /** F-F-3: wall-clock start of the active run (from App), so a mid-run
+   *  re-attach restores the original elapsed instead of resetting to 0. */
+  activeRunStartedAt?: number | null;
   newChatMode: boolean;
   settings: Settings;
   onSettingsChange?: (next: Settings) => void;
@@ -152,6 +155,7 @@ export function ChatView({
   session,
   activeRunSessionId,
   activeRunId,
+  activeRunStartedAt,
   newChatMode,
   settings,
   onSettingsChange,
@@ -250,6 +254,7 @@ export function ChatView({
     conversationId,
     activeRunSessionId,
     activeRunId,
+    activeRunStartedAt,
   });
 
   const {

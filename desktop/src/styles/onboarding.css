@@ -7,7 +7,7 @@
   inset: 0;
   background: #0e0c0a;
   overflow: hidden;
-  z-index: 3000;
+  z-index: var(--z-onboarding);
   -webkit-app-region: drag;
 }
 

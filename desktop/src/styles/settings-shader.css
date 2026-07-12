@@ -6,7 +6,7 @@
 .kim-settings-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 1000;
+  z-index: var(--z-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -29,7 +29,7 @@
 /* Glass settings panel — floats over the shader */
 .kim-settings-panel {
   position: relative;
-  z-index: 1;
+  z-index: var(--z-raised);
   width: min(860px, 96vw);
   height: min(620px, 92vh);
   border-radius: 16px;
@@ -148,7 +148,7 @@
   justify-content: center;
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
-  z-index: 2;
+  z-index: var(--z-above);
 }
 .kim-settings-close:hover {
   background: rgba(232, 223, 214, 0.12);

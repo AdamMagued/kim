@@ -1,6 +1,6 @@
 import { renderHook, act } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { useChatStream } from '../useChatStream';
+import { useChatStream, MAX_RUN_HISTORY } from '../useChatStream';
 import { __testOnlyPendingRunSnapshots } from '../runSnapshotStore';
 import { DEFAULT_SETTINGS } from '../../types';
 import type { TraceItem } from '../../components/kim-ui/ThinkingWithPlan';
@@ -27,6 +27,11 @@ vi.mock('@tauri-apps/api/event', () => ({
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(() => Promise.resolve()) }));
 
+// F-F-10: spy on Toast so we can assert the hook surfaces a save_run_history
+// failure instead of silently swallowing it.
+const toastMock = vi.fn();
+vi.mock('../../components/Toast', () => ({ toast: (...a: unknown[]) => toastMock(...a) }));
+
 import { invoke } from '@tauri-apps/api/core';
 const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
 
@@ -36,7 +41,7 @@ function emit(event: string, payload?: unknown) {
   });
 }
 
-function makeProps() {
+function makeProps(overrides: Record<string, unknown> = {}) {
   return {
     session: null,
     settings: DEFAULT_SETTINGS,
@@ -44,11 +49,12 @@ function makeProps() {
     commitCurrentBrowserUrl: vi.fn(() => Promise.resolve()),
     setMessageReloadNonce: vi.fn(),
     conversationId: 'conv-1',
+    ...overrides,
   };
 }
 
-async function renderStream() {
-  const props = makeProps();
+async function renderStream(overrides: Record<string, unknown> = {}) {
+  const props = makeProps(overrides);
   const utils = renderHook(() => useChatStream(props));
   // Listener registration happens synchronously inside the wiring effect, but
   // flush microtasks so the listen().then(unlisten) assignments settle too.
@@ -64,6 +70,7 @@ beforeEach(() => {
   listeners.clear();
   invokeMock.mockClear();
   invokeMock.mockResolvedValue(undefined);
+  toastMock.mockClear();
   __testOnlyPendingRunSnapshots.clear();
 });
 
@@ -171,6 +178,8 @@ describe('useChatStream activity dedup', () => {
   it('drops identical raw lines within the 800ms window; distinct lines pass', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
+    // F-F-2: raw lines only append while THIS view owns the active run.
+    act(() => { result.current.setIsRunning(true); });
 
     emit('kim-agent-output', '[TOOL] read_file({"path":"a.txt"})');
     emit('kim-agent-output', '[TOOL] read_file({"path":"a.txt"})'); // duplicate raw within 800ms
@@ -186,6 +195,8 @@ describe('useChatStream activity dedup', () => {
   it('canonicalizes the [err] prefix so a stderr echo of a stdout line is deduped', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
+    // F-F-2: raw lines only append while THIS view owns the active run.
+    act(() => { result.current.setIsRunning(true); });
 
     emit('kim-agent-output', '[TOOL] read_file({"path":"a.txt"})');
     // kim-agent-error prepends "[err] " before appendRaw; isDuplicate strips it.
@@ -195,26 +206,37 @@ describe('useChatStream activity dedup', () => {
     expect(result.current.activity).toHaveLength(1);
   });
 
-  it('after 800ms the raw window expires but the 2000ms activity-item dedup still drops it', async () => {
+  it('merges a same-item repeat within the dual-emit window but shows a genuine later repeat (F-F-12)', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
-    const line = '[TOOL] read_file({"path":"a.txt"})';
+    // F-F-2: raw lines only append while THIS view owns the active run.
+    act(() => { result.current.setIsRunning(true); });
 
-    emit('kim-agent-output', line);
-    act(() => { vi.advanceTimersByTime(900); }); // raw window (800ms) expired
-    emit('kim-agent-output', line); // passes recentRawRef, caught by recentActivityItemRef
+    // Two raw strings that PARSE to the same activity item ("Reading `a.txt`").
+    // Distinct raw strings sidestep the 800ms raw-line dedup so we isolate the
+    // activity-item (dual-emit) window.
+    const a = '[TOOL] read_file({"path":"a.txt"})';
+    const b = '2026-07-06 10:00:00 [TOOL] read_file({"path":"a.txt"})';
+
+    emit('kim-agent-output', a);
+    act(() => { vi.advanceTimersByTime(200); }); // within the dual-emit window
+    emit('kim-agent-output', b); // same event on the other channel → merged
     act(() => { result.current.flushActivityNow(); });
     expect(result.current.activity).toHaveLength(1);
 
-    act(() => { vi.advanceTimersByTime(2100); }); // both windows expired
-    emit('kim-agent-output', line);
+    // A genuine repeat a full second later (agent re-reads the file) must now be
+    // SHOWN — the old 2000ms window silently swallowed it (F-F-12).
+    act(() => { vi.advanceTimersByTime(1000); });
+    emit('kim-agent-output', a);
     act(() => { result.current.flushActivityNow(); });
     expect(result.current.activity).toHaveLength(2);
   });
 
-  it('dedups different raw lines that parse to the same activity item (2000ms window)', async () => {
+  it('merges two channels of the same item emitted near-simultaneously (dual-emit)', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
+    // F-F-2: raw lines only append while THIS view owns the active run.
+    act(() => { result.current.setIsRunning(true); });
 
     // Same parsed item ("Reading `a.txt`") from two different raw strings — the
     // timestamp prefix is stripped by parseLogLine, so only the activity-item
@@ -229,11 +251,83 @@ describe('useChatStream activity dedup', () => {
   it('batches activity flushes on a 50ms timer', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
+    // F-F-2: raw lines only append while THIS view owns the active run.
+    act(() => { result.current.setIsRunning(true); });
 
     emit('kim-agent-output', '[TOOL] read_file({"path":"a.txt"})');
     expect(result.current.activity).toHaveLength(0); // not flushed yet
     act(() => { vi.advanceTimersByTime(50); });
     expect(result.current.activity).toHaveLength(1);
+  });
+});
+
+// ── 2b. Cross-session raw-stream bleed (F-F-2) ────────────────────────────────
+describe('useChatStream raw-stream ownership guard (F-F-2)', () => {
+  it('a view that does NOT own the active run ignores un-enveloped raw output/error', async () => {
+    vi.useFakeTimers();
+    const { result } = await renderStream(); // conv-1, not running, owns no run
+
+    // A run started under a DIFFERENT session keeps streaming un-enveloped raw
+    // lines after the user switched to this view. They must not bleed in.
+    emit('kim-agent-output', '[TOOL] read_file({"path":"secret.txt"})');
+    emit('kim-agent-error', 'boom: something failed in the other run');
+    act(() => { result.current.flushActivityNow(); });
+
+    expect(result.current.activity).toHaveLength(0);
+    // …and the foreign [err] line must NOT raise a Retry banner for a task
+    // this view never ran.
+    expect(result.current.taskError).toBeNull();
+    expect(result.current.lastFailedTask).toBeNull();
+  });
+
+  it('a view that owns the run still receives its raw output', async () => {
+    vi.useFakeTimers();
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); }); // this view owns the run
+
+    emit('kim-agent-output', '[TOOL] read_file({"path":"mine.txt"})');
+    act(() => { result.current.flushActivityNow(); });
+
+    expect(result.current.activity.map(a => a.text)).toEqual(['Reading `mine.txt`']);
+  });
+});
+
+// ── 2c. Cross-session TYPED-event bleed (F-F-8) ───────────────────────────────
+// The raw guard (F-F-2) only covered kim-agent-output/error. Typed events
+// (kim:status/plan/tool/answer/…) from the bridge/codex/legacy path carry no
+// session envelope either, and belongsToView used to route a null session_id to
+// whatever view was mounted — so a foreign run's typed events bled across a
+// mid-run session switch. They must route only when NO foreign session owns the
+// active run.
+describe('useChatStream typed-event ownership guard (F-F-8)', () => {
+  it('drops an un-enveloped typed event while a DIFFERENT session owns the active run', async () => {
+    // A run is active app-wide under session "other-session"; this view is
+    // conv-1 (the user switched away mid-run). The foreign run keeps emitting
+    // un-enveloped typed events — they must not land in this view.
+    const { result } = await renderStream({ activeRunSessionId: 'other-session' });
+
+    emit('kim:status', { message: 'foreign run reasoning' });
+    emit('kim:plan', { steps: ['foreign step one', 'foreign step two'] });
+    emit('kim:answer', { text: 'foreign answer that belongs to session B' });
+    act(() => { result.current.flushActivityNow(); });
+
+    expect(result.current.lastStatus).toBe('');
+    expect(result.current.planSteps).toEqual([]);
+    expect(result.current.activity).toHaveLength(0);
+    expect(result.current.liveHistory).toHaveLength(0);
+  });
+
+  it('routes un-enveloped typed events when this view owns the active run', async () => {
+    // activeRunSessionId matches this view's session (conv-1) → it owns the run.
+    const { result } = await renderStream({ activeRunSessionId: 'conv-1' });
+
+    emit('kim:status', { message: 'my own run reasoning' });
+    act(() => { result.current.flushActivityNow(); });
+
+    expect(result.current.lastStatus).toBe('my own run reasoning');
+    expect(result.current.activity).toEqual([
+      expect.objectContaining({ kind: 'status', text: 'my own run reasoning' }),
+    ]);
   });
 });
 
@@ -302,6 +396,48 @@ describe('useChatStream typed events', () => {
     emit('kim:done', { n: 2 });
     plan = planTrace(result.current.traceItems)!;
     expect(plan.items[1].status).toBe('done');
+  });
+
+  it('a second PLAN replaces the previous plan and resets progress (F-F-4)', async () => {
+    const { result } = await renderStream();
+    emit('kim:plan', { steps: ['one', 'two', 'three'] });
+    emit('kim:step', { n: 2, data: {} });
+    emit('kim:done', { n: 1 });
+    expect(planTrace(result.current.traceItems)!.items.map(i => i.status)).toEqual(['done', 'active', 'pending']);
+
+    // Re-plan with new steps: the stale card must NOT persist — the new plan
+    // starts fresh with all steps pending.
+    emit('kim:plan', { steps: ['alpha', 'beta'] });
+    const plan = planTrace(result.current.traceItems)!;
+    expect(result.current.planSteps).toEqual(['alpha', 'beta']);
+    expect(plan.items.map(i => i.status)).toEqual(['pending', 'pending']);
+  });
+
+  it('a <2-step re-PLAN clears the previous plan instead of leaving a stale card (F-F-4)', async () => {
+    const { result } = await renderStream();
+    emit('kim:plan', { steps: ['one', 'two', 'three'] });
+    expect(result.current.planSteps).toHaveLength(3);
+
+    emit('kim:plan', { steps: ['just one'] }); // too few to render
+    expect(result.current.planSteps).toEqual([]);
+    expect(planTrace(result.current.traceItems)).toBeUndefined();
+  });
+
+  it('STEP/DONE indices beyond steps.length are rejected, not clamped (F-F-4)', async () => {
+    const { result } = await renderStream();
+    emit('kim:plan', { steps: ['one', 'two', 'three'] });
+
+    // n=9 (> 3 steps): must be ignored, not clamped to the last step.
+    emit('kim:step', { n: 9, data: {} });
+    expect(planTrace(result.current.traceItems)!.items.map(i => i.status)).toEqual(['pending', 'pending', 'pending']);
+
+    // DONE n=9 must not mark any step complete.
+    emit('kim:done', { n: 9 });
+    expect(planTrace(result.current.traceItems)!.items.every(i => i.status !== 'done')).toBe(true);
+
+    // n=0 (below 1-based range) is likewise ignored.
+    emit('kim:step', { n: 0, data: {} });
+    expect(planTrace(result.current.traceItems)!.items.map(i => i.status)).toEqual(['pending', 'pending', 'pending']);
   });
 
   it('kim:stats sets tokenStats', async () => {
@@ -421,6 +557,30 @@ describe('useChatStream lifecycle', () => {
     expect(result.current.lastFailedTask).toBeNull();
   });
 
+  it('toasts when save_run_history rejects instead of silently losing the run (F-F-10)', async () => {
+    vi.useFakeTimers();
+    invokeMock.mockImplementation((name: string) =>
+      name === 'save_run_history'
+        ? Promise.reject(new Error('disk full'))
+        : Promise.resolve(undefined),
+    );
+    const { result } = await renderStream();
+
+    act(() => { result.current.setIsRunning(true); });
+    emit('kim:status', { message: 'working' }); // activity so the run is persisted
+    act(() => { vi.advanceTimersByTime(1000); });
+
+    emit('kim-agent-done', true);
+    // Let the rejected save_run_history promise settle.
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(invokeMock).toHaveBeenCalledWith('save_run_history', expect.objectContaining({ sessionId: 'conv-1' }));
+    const surfaced = toastMock.mock.calls.some(
+      ([msg, kind]) => typeof msg === 'string' && /history/i.test(msg) && kind === 'error',
+    );
+    expect(surfaced).toBe(true);
+  });
+
   it('kim-agent-done (failure) sets taskError and strips the failed run assistant output', async () => {
     const { result } = await renderStream();
     // RUN-IDENTITY: this view owns the in-flight run (as runPendingTask would set).
@@ -491,6 +651,72 @@ describe('useChatStream lifecycle', () => {
     });
     expect(result.current.lastRunId).toBe('run-abc-123');
   });
+
+  it('kim:run-failed is terminal: clears the spinner so the recovery banner shows (F-F-5)', async () => {
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); }); // this view owns a running run
+    expect(result.current.isRunning).toBe(true);
+
+    // Backend signals failure but (simulating a subprocess kill / bridge crash)
+    // never emits the terminal bare-bool kim-agent-done.
+    emit('kim:run-failed', {
+      reason: 'provider_failed',
+      recoverable: true,
+      suggestion: 'Retry',
+      session_id: 'conv-1',
+    });
+
+    // Spinner + Stop must clear (no infinite "thinking…"), and isDone flips true
+    // so StreamRenderer stops returning null for the failure card.
+    expect(result.current.isRunning).toBe(false);
+    expect(result.current.isDone).toBe(true);
+    expect(result.current.cancelling).toBe(false);
+    expect(result.current.runFailure).toMatchObject({ reason: 'provider_failed', recoverable: true });
+  });
+});
+
+// ── 5b. Typed enveloped lifecycle CLEAR events (F-H-1) ────────────────────────
+describe('useChatStream typed lifecycle CLEAR events (F-H-1)', () => {
+  it('typed kim:agent-error clears the spinner and surfaces the error attributably', async () => {
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); });
+
+    emit('kim:agent-error', { error: 'orchestrator process crashed', session_id: 'conv-1' });
+
+    expect(result.current.isRunning).toBe(false);
+    expect(result.current.taskError).toBeTruthy();
+  });
+
+  it('typed kim:agent-done clears isRunning attributably (safety net for a missing bare done)', async () => {
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); });
+
+    emit('kim:agent-done', { success: true, session_id: 'conv-1' });
+
+    expect(result.current.isRunning).toBe(false);
+    expect(result.current.cancelling).toBe(false);
+  });
+
+  it('typed kim:agent-cancelled sets cancel flags attributably', async () => {
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); });
+
+    emit('kim:agent-cancelled', { success: false, session_id: 'conv-1' });
+
+    expect(result.current.isRunning).toBe(false);
+    expect(result.current.isCancelled).toBe(true);
+  });
+
+  it('a foreign-session typed lifecycle event does NOT clear this view', async () => {
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); });
+
+    // A run owned by a different session terminates while this view is mounted.
+    emit('kim:agent-error', { error: 'the other run failed', session_id: 'a-different-session' });
+
+    expect(result.current.isRunning).toBe(true); // untouched — not our run
+    expect(result.current.taskError).toBeNull();
+  });
 });
 
 // ── 6. Rate limit ─────────────────────────────────────────────────────────────
@@ -524,6 +750,53 @@ describe('useChatStream rate limit', () => {
     // Second timer fires at 1000 + 6000 = 7000ms.
     act(() => { vi.advanceTimersByTime(3000); });
     expect(result.current.rateLimitedState).toBeNull();
+  });
+});
+
+// ── Elapsed timer survives mid-run re-attach (F-F-3) ──────────────────────────
+describe('useChatStream elapsed timer on re-attach (F-F-3)', () => {
+  it('restores the original run start instead of resetting elapsed/duration to 0', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-13T00:00:00Z'));
+    const startedAt = Date.now() - 5000; // the run began 5s before this remount
+
+    // Simulate the ChatView remount that a mid-run session switch triggers: the
+    // view mounts already owning the active run, with the App-tracked start.
+    const props = {
+      session: null,
+      settings: DEFAULT_SETTINGS,
+      onTaskDone: vi.fn(),
+      commitCurrentBrowserUrl: vi.fn(() => Promise.resolve()),
+      setMessageReloadNonce: vi.fn(),
+      conversationId: 'conv-1',
+      activeRunSessionId: 'conv-1',
+      activeRunId: 'run-1',
+      activeRunStartedAt: startedAt,
+    };
+    const { result } = renderHook(() => useChatStream(props));
+    await act(async () => {});
+
+    expect(result.current.isRunning).toBe(true); // re-attached to the owned run
+    // Elapsed reflects the ORIGINAL start (~5s), not 0.
+    expect(result.current.elapsed).toBe(5);
+
+    // And the persisted run duration must capture the full elapsed, not just the
+    // time since re-attach.
+    emit('kim:status', { message: 'still working', session_id: 'conv-1' });
+    emit('kim-agent-done', true);
+    const save = [...invokeMock.mock.calls].reverse().find(([n]) => n === 'save_run_history');
+    expect(save).toBeDefined();
+    expect((save![1] as { runs: { durationSec: number }[] }).runs[0].durationSec).toBe(5);
+  });
+
+  it('a fresh run started in this mount still stamps from now (elapsed starts at 0)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-13T00:00:00Z'));
+    const { result } = await renderStream(); // no active run at mount
+    act(() => { result.current.setIsRunning(true); });
+    expect(result.current.elapsed).toBe(0);
+    act(() => { vi.advanceTimersByTime(3000); });
+    expect(result.current.elapsed).toBe(3);
   });
 });
 
@@ -615,6 +888,33 @@ describe('useChatStream liveHistory cap', () => {
     act(() => { result.current.setLiveHistory(many); });
     expect(result.current.liveHistory).toHaveLength(300);
     expect(result.current.liveHistory[0].content).toBe('m20');
+  });
+});
+
+// ── runHistory cap (F-J-2) ────────────────────────────────────────────────────
+describe('useChatStream runHistory cap (F-J-2)', () => {
+  it('caps runHistory at MAX_RUN_HISTORY across many completed runs', async () => {
+    const { result } = await renderStream();
+    const total = MAX_RUN_HISTORY + 8;
+    for (let i = 0; i < total; i++) {
+      act(() => { result.current.setIsRunning(true); });
+      emit('kim:status', { message: `run ${i} did something`, session_id: 'conv-1' });
+      emit('kim-agent-done', true);
+    }
+    // Unbounded before the fix (would be `total`); now capped, keeping newest.
+    expect(result.current.runHistory).toHaveLength(MAX_RUN_HISTORY);
+  });
+
+  it('the bounded array is also what crosses the save_run_history IPC boundary', async () => {
+    const { result } = await renderStream();
+    for (let i = 0; i < MAX_RUN_HISTORY + 3; i++) {
+      act(() => { result.current.setIsRunning(true); });
+      emit('kim:status', { message: `run ${i} did something`, session_id: 'conv-1' });
+      emit('kim-agent-done', true);
+    }
+    const lastSave = [...invokeMock.mock.calls].reverse().find(([name]) => name === 'save_run_history');
+    expect(lastSave).toBeDefined();
+    expect((lastSave![1] as { runs: unknown[] }).runs).toHaveLength(MAX_RUN_HISTORY);
   });
 });
 

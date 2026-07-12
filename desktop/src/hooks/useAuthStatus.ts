@@ -113,13 +113,9 @@ export function useAuthStatus(provider: string | null | undefined) {
 
   const signIn = useCallback(async () => {
     if (!supported) return;
-    try {
-      await invoke('provider_signin', { provider: normalized });
-    } catch (err) {
-      // The popup may already be open or task may be running; let the caller
-      // surface the error via a toast.
-      throw err;
-    }
+    // The popup may already be open or a task may be running; let the rejection
+    // propagate so the caller can surface it via a toast (no local handling).
+    await invoke('provider_signin', { provider: normalized });
   }, [normalized, supported]);
 
   const signOut = useCallback(async () => {

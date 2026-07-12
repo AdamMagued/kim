@@ -1,4 +1,10 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap');
+/* F-F-6: the render-blocking Google-Fonts CDN @import was removed — a local
+   Tauri desktop app must not make a cross-origin network fetch (privacy: leaks
+   the user's IP + a load signal to Google on every launch; perf: blocks all
+   subsequent CSS; correctness: fails offline and would break under a strict
+   Tauri CSP). The typography stack in styles/tokens.css already degrades to
+   the platform's UI font (-apple-system / BlinkMacSystemFont / Segoe UI) when
+   Inter is not installed, so no CDN font is needed. */
 @import "tailwindcss";
 
 /* Split from the former 6,790-line index.css — import order preserves the

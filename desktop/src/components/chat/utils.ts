@@ -158,8 +158,7 @@ export function extractTouchedFiles(messages: KimMessage[]): TouchedFile[] {
       if (block.type === 'tool_result') {
         const trb = block as ToolResultBlock;
         const raw = typeof trb.content === 'string' ? trb.content
-          : (trb as unknown as { output?: string }).output
-            ? String((trb as unknown as { output: string }).output) : '';
+          : trb.output ? String(trb.output) : '';
         if (!raw.trim()) continue;
         const parsed = parseMaybeNestedJson(raw);
         if (!parsed) continue;
@@ -439,6 +438,12 @@ export const TOOL_MAP: Record<string, { icon: string; label: (args: Record<strin
   get_screen_info:    { icon: '›', label: _a => 'Reading screen info' },
 };
 
+// F-H-6: the canonical grammar for the legacy `[TAG]` text protocol this parser
+// implements is written down in docs/CONTRACTS.md "Seam 2" (tag-line /
+// plan-envelope-line / diff-line / tool-line). The vocabulary's single source of
+// truth is LogTags (events.gen.ts) ← events.schema.json "legacyTags". Keep this
+// parser in sync with that grammar; the golden fixture in
+// __tests__/tagGrammar.test.ts pins the representative shapes so a drift fails CI.
 export function parseLogLine(raw: string, id: number): ActivityItem | null {
   if (!raw.trim()) return null;
 
@@ -616,8 +621,9 @@ export function synthesizeActivityFromMessages(messages: KimMessage[], toolMap: 
         const args = (tb.input && typeof tb.input === 'object') ? tb.input as Record<string, unknown> : {};
         items.push({ id: ++id, kind: 'tool', icon: def?.icon ?? '›', text: def ? def.label(args) : `Using tool: \`${tb.name}\`` });
       } else if (block.type === 'tool_result') {
-        const raw = typeof (block as ToolResultBlock).content === 'string' ? (block as ToolResultBlock).content as string
-          : String((block as unknown as { output?: string }).output ?? '');
+        const trb = block as ToolResultBlock;
+        const raw = typeof trb.content === 'string' ? trb.content
+          : String(trb.output ?? '');
         if (!raw.trim()) continue;
         const parsed = parseMaybeNestedJson(raw);
         if (parsed?.filePath) {
@@ -934,17 +940,39 @@ export function projectLabel(path?: string): string {
 
 // ── Cost estimation ───────────────────────────────────────────────────────────
 
-// USD cost per 1M tokens { input, output }. Zero for free/local providers.
-// Rates are approximate; see provider docs for exact pricing.
-// Last refreshed: 2025-Q2. Update when provider pricing changes.
-const PRICE_PER_1M: Record<string, { input: number; output: number }> = {
-  claude:   { input: 3.00,  output: 15.00  }, // claude-sonnet-4.x (Anthropic)
-  openai:   { input: 2.50,  output: 10.00  }, // gpt-4o (OpenAI)
-  gemini:   { input: 1.25,  output: 5.00   }, // gemini-1.5-pro (Google)
-  deepseek: { input: 0.27,  output: 1.10   }, // deepseek-chat V3 (cache-miss)
-  ollama:   { input: 0,     output: 0      }, // local
-  browser:  { input: 0,     output: 0      }, // local browser session
+// F-F-7: the month these rates + the model each is based on were last verified.
+// The cost chip is always shown with a "~" prefix and an "estimated" tooltip
+// (see costBasisLabel) so a user never mistakes it for a billed figure; keep
+// this current when provider pricing changes.
+export const PRICE_LAST_REFRESHED = '2026-07';
+
+// USD cost per 1M tokens { input, output }, plus the model the rate is based on
+// (surfaced in the cost-chip tooltip). Zero for free/local providers. Approximate
+// — always presented as an estimate, never a billed amount.
+const PRICE_PER_1M: Record<string, { input: number; output: number; model: string }> = {
+  claude:   { input: 3.00,  output: 15.00, model: 'claude-sonnet-4.5' },
+  openai:   { input: 2.50,  output: 10.00, model: 'gpt-4o-class' },
+  gemini:   { input: 1.25,  output: 5.00,  model: 'gemini-2.5-pro' },
+  deepseek: { input: 0.27,  output: 1.10,  model: 'deepseek-chat (cache-miss)' },
+  ollama:   { input: 0,     output: 0,     model: 'local' },
+  browser:  { input: 0,     output: 0,     model: 'browser session' },
 };
+
+/**
+ * The model + estimate qualifier a cost chip should show for `provider`, or
+ * null when the provider has no price basis (so the UI shows no cost rather
+ * than a fabricated one). Normalizes `browser:*` to the local zero-cost basis.
+ */
+export function costBasisLabel(provider: string): string | null {
+  const normalized = provider.trim().toLowerCase().startsWith('browser')
+    ? 'browser'
+    : provider.trim().toLowerCase();
+  const rates = PRICE_PER_1M[normalized];
+  if (!rates) return null;
+  return rates.input === 0 && rates.output === 0
+    ? `${rates.model} · $0`
+    : `est. · ${rates.model} rates (${PRICE_LAST_REFRESHED})`;
+}
 
 /**
  * Returns the estimated USD cost for the given token counts, or `null` when the

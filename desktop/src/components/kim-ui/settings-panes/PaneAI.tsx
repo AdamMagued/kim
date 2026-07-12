@@ -201,7 +201,6 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
       unlistenProgress?.();
       unlistenFinished?.();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const selectedModel = settings.ollama.mode === 'cloud' ? settings.ollama.cloud_model : settings.ollama.local_model;

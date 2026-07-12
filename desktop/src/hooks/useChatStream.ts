@@ -9,6 +9,9 @@ import { browserSiteFromProvider, friendlyError, parsePlanFromActivity, TOOL_MAP
 import { parkOrphanedRunSnapshotIfOwned, flushOrphanedRunSnapshots, useCappedState } from './runSnapshotStore'; import {
   KimEventNames,
   type KimActivityPayload,
+  type KimAgentDonePayload,
+  type KimAgentCancelledPayload,
+  type KimAgentErrorPayload,
   type KimAnswerPayload,
   type KimAssistantDeltaPayload,
   type KimItemLifecyclePayload,
@@ -31,6 +34,23 @@ import { parkOrphanedRunSnapshotIfOwned, flushOrphanedRunSnapshots, useCappedSta
 } from '../types/events.gen';
 
 const MAX_ACTIVITY_ITEMS = 300;
+
+// F-J-2: cap the in-session run history. It was a plain unbounded useState array
+// (unlike liveHistory, which is capped), and the FULL cumulative array is both
+// re-serialized across the Tauri IPC boundary AND rewritten to disk after every
+// run (save_run_history) — cumulative O(n²) on a long working session, with each
+// entry holding up to 300 activity items incl. full tool output. Keep only the
+// most recent runs in memory. NOTE: this bounds memory + the per-run IPC/render
+// payload, but the on-disk file still grows until the persist path is made
+// append-only. HANDOFF -> D': make save_run_history append the single new run
+// (or persist a delta) instead of receiving+rewriting the whole array.
+export const MAX_RUN_HISTORY = 50;
+
+// F-F-12: how long two identical activity items are treated as the same
+// dual-emitted event (typed + raw channel of one backend flush) rather than two
+// distinct actions. Kept just above dual-emit latency and well below the
+// seconds-apart cadence of a genuine agent repeat.
+const DUAL_EMIT_DEDUP_MS = 400;
 
 // L4: named constant for the one non-generated event this hook listens to
 // (kim-run-id is emitted straight from Rust and isn't in KimEventNames).
@@ -91,6 +111,10 @@ export interface UseChatStreamProps {
   // the active run belongs to a different session.
   activeRunSessionId?: string | null;
   activeRunId?: string | null;
+  // F-F-3: wall-clock start of the globally-active run (tracked at App level so
+  // it survives the ChatView remount a tab/session/New-Chat switch triggers).
+  // On re-attach the timer restores this instead of resetting elapsed to 0.
+  activeRunStartedAt?: number | null;
 }
 
 export function useChatStream({
@@ -102,6 +126,7 @@ export function useChatStream({
   conversationId,
   activeRunSessionId,
   activeRunId,
+  activeRunStartedAt,
 }: UseChatStreamProps) {
   // The session id this view represents — the identity every run-scoped event
   // must match to be routed here (see `belongsToView`).
@@ -199,6 +224,15 @@ export function useChatStream({
     activeResumeSessionIdRef.current = session?.session_id ?? conversationId ?? '';
   }, [session, conversationId]);
 
+  // F-F-8: the session that owns the globally-active run (App tracks a single
+  // active run app-wide). Held in a ref so belongsToView can read the latest
+  // value to route UN-enveloped bridge/codex/legacy events, which carry no
+  // session to route by.
+  const activeRunSessionIdRef = useRef<string | null>(activeRunSessionId ?? null);
+  useEffect(() => {
+    activeRunSessionIdRef.current = activeRunSessionId ?? null;
+  }, [activeRunSessionId]);
+
   // RUN-IDENTITY refs. runOwnerSessionIdRef is the session the in-flight run
   // belongs to (captured at spawn by useTaskRunner, or re-derived on switch-back
   // from the active-run hint). currentRunIdRef mirrors the run_id from the
@@ -207,14 +241,23 @@ export function useChatStream({
   const runOwnerSessionIdRef = useRef<string | null>(ownsActiveRun ? activeRunSessionId ?? null : null);
   const currentRunIdRef = useRef<string | null>(ownsActiveRun ? activeRunId ?? null : null);
 
-  // Route guard: a run-scoped event is for THIS view iff it carries no session
-  // envelope (legacy/codex/bridge streams) or its session_id matches this view's
-  // session. Foreign-run events (a run started under a different session that is
-  // still streaming after a switch) are dropped so run A never mutates view B.
-  const belongsToView = useCallback(
-    (sid?: string | null) => sid === undefined || sid === null || sid === activeResumeSessionIdRef.current,
-    [],
-  );
+  // Route guard: a run-scoped event is for THIS view iff its session_id matches
+  // this view's session. An UN-enveloped event (session_id null/undefined —
+  // legacy/codex/bridge streams that predate the envelope) carries no session to
+  // route by. F-F-8: routing those UNCONDITIONALLY to whatever view is mounted
+  // let a foreign run's typed events (kim:status/plan/tool/answer/…) bleed across
+  // a mid-run session switch — the exact hole F-F-2 closed for the raw stream but
+  // left open for typed events. Only ONE run is ever active app-wide, so an
+  // un-enveloped event belongs to that active run: route it only when NO foreign
+  // session owns it (no active run, or this view owns it); when a different
+  // session's run is streaming, drop it so run A never mutates view B.
+  const belongsToView = useCallback((sid?: string | null) => {
+    if (sid === undefined || sid === null) {
+      const runOwner = activeRunSessionIdRef.current;
+      return !runOwner || runOwner === activeResumeSessionIdRef.current;
+    }
+    return sid === activeResumeSessionIdRef.current;
+  }, []);
 
   // Deduplication functions
   const isDuplicate = useCallback((raw: string): boolean => {
@@ -236,10 +279,21 @@ export function useChatStream({
     const now = Date.now();
     const key = `${item.kind}:${item.text}`;
     const last = map.get(key);
-    if (last !== undefined && now - last < 2000) return true;
+    // F-F-12: this dedup exists to merge DUAL-EMIT — the same event arriving on
+    // both the typed (kim:*) and raw ([TOOL]/[STATUS]) channels near-instantly
+    // from one backend flush. The old 2000ms window was far wider than dual-emit
+    // latency, so it also silently swallowed LEGITIMATE repeats (an agent that
+    // re-reads a file or retries the identical shell command a second or two
+    // later — a real action the activity feed simply never showed). Narrow the
+    // window to the dual-emit timescale so same-instant double-emits still merge
+    // but a genuine repeat surfaces. Proper fix is a per-event sequence id from
+    // the backend (a full model round-trip separates real repeats anyway).
+    // HANDOFF -> D'/H: stamp typed events with a monotonic emit/seq id so the
+    // frontend can dedup on identity instead of on text+time.
+    if (last !== undefined && now - last < DUAL_EMIT_DEDUP_MS) return true;
     map.set(key, now);
     if (map.size > 200) {
-      const cutoff = now - 4000;
+      const cutoff = now - DUAL_EMIT_DEDUP_MS * 2;
       for (const [k, v] of map) if (v < cutoff) map.delete(k);
     }
     return false;
@@ -338,13 +392,22 @@ export function useChatStream({
   // ── Timer Effect ───────────────────────────────────────────────────────────
   useEffect(() => {
     if (!isRunning) return;
-    startTimeRef.current = Date.now();
-    setElapsed(0);
+    // F-F-3: on a mid-run re-attach (this view remounted after a session switch),
+    // restore the ORIGINAL run start so the elapsed pill — and the durationSec
+    // persisted at kim-agent-done — don't reset to 0 / under-report. startTimeRef
+    // is null at the start of each run (reset when the previous run ended), so:
+    //   • fresh run started in this mount → stamp now (activeRunStartedAt is not
+    //     yet known / this view doesn't own an active run at that instant);
+    //   • re-attach to an already-running owned run → use the App-tracked start.
+    if (startTimeRef.current === null) {
+      startTimeRef.current = ownsActiveRun && activeRunStartedAt ? activeRunStartedAt : Date.now();
+    }
+    setElapsed(Math.max(0, Math.floor((Date.now() - startTimeRef.current) / 1000)));
     const id = setInterval(() => {
-      setElapsed(Math.floor((Date.now() - (startTimeRef.current ?? Date.now())) / 1000));
+      setElapsed(Math.max(0, Math.floor((Date.now() - (startTimeRef.current ?? Date.now())) / 1000)));
     }, 1000);
     return () => clearInterval(id);
-  }, [isRunning]);
+  }, [isRunning, ownsActiveRun, activeRunStartedAt]);
 
   // Defensive isRunning guard
   useEffect(() => {
@@ -495,6 +558,9 @@ export function useChatStream({
     let unlistenTypedAssistantDelta: (() => void) | undefined;
     let unlistenTypedReasoningDelta: (() => void) | undefined;
     let unlistenTypedItemLifecycle: (() => void) | undefined;
+    let unlistenTypedAgentDone: (() => void) | undefined;
+    let unlistenTypedAgentCancelled: (() => void) | undefined;
+    let unlistenTypedAgentError: (() => void) | undefined;
     let unlistenRunId: (() => void) | undefined;
 
     // Typed IPC listeners own Kim's UI state. The raw listener below remains
@@ -507,18 +573,26 @@ export function useChatStream({
 
     listen<KimPlanPayload>(KimEventNames.PLAN, e => {
       if (!belongsToView(e.payload.session_id)) return;
+      // Steps are truncated to 12 for display; STEP/DONE indices beyond that are
+      // rejected below (they'd otherwise clamp to the wrong step).
       const steps = e.payload.steps.filter((step): step is string => typeof step === 'string').slice(0, 12);
-      if (steps.length < 2) return;
-      setTypedLivePlan({ steps, activeStep: 0, doneSteps: [], structured: true });
+      // F-F-4: a re-plan (or a spurious <2-step PLAN) must REPLACE the live plan,
+      // never leave the previous plan card standing — otherwise subsequent STEP/
+      // DONE events for the new plan mutate the stale card's steps by index. When
+      // the new plan has too few steps to render (<2), clear it rather than
+      // leaving a stale card that later STEP/DONE would silently corrupt.
+      setTypedLivePlan(steps.length < 2 ? null : { steps, activeStep: 0, doneSteps: [], structured: true });
     }).then(fn => { if (!cancelled) unlistenTypedPlan = fn; else fn(); });
 
     listen<KimStepPayload>(KimEventNames.STEP, e => {
       if (!belongsToView(e.payload.session_id)) return;
       setTypedLivePlan(prev => {
         if (!prev) return prev;
-        const activeStep = Math.max(0, Math.min(e.payload.n, prev.steps.length));
-        if (activeStep === prev.activeStep) return prev;
-        return { ...prev, activeStep };
+        // F-F-4: reject an out-of-range step index instead of clamping it to
+        // steps.length (which marked the wrong — usually the last — step active).
+        if (e.payload.n < 1 || e.payload.n > prev.steps.length) return prev;
+        if (e.payload.n === prev.activeStep) return prev;
+        return { ...prev, activeStep: e.payload.n };
       });
     }).then(fn => { if (!cancelled) unlistenTypedStep = fn; else fn(); });
 
@@ -526,6 +600,9 @@ export function useChatStream({
       if (!belongsToView(e.payload.session_id)) return;
       setTypedLivePlan(prev => {
         if (!prev) return prev;
+        // F-F-4: reject an out-of-range done index instead of pushing an
+        // unbounded n into doneSteps (which marked a nonexistent step complete).
+        if (e.payload.n < 1 || e.payload.n > prev.steps.length) return prev;
         const doneSteps = prev.doneSteps.includes(e.payload.n)
           ? prev.doneSteps
           : [...prev.doneSteps, e.payload.n].sort((a, b) => a - b);
@@ -615,7 +692,59 @@ export function useChatStream({
     listen<KimRunFailedPayload>(KimEventNames.RUN_FAILED, e => {
       if (!belongsToView(e.payload.session_id)) return;
       setRunFailure(e.payload);
+      // F-F-5: kim:run-failed is TERMINAL. Previously it only set runFailure and
+      // left isRunning stuck true forever when the backend died before emitting
+      // the bare-bool kim-agent-done (subprocess kill, bridge crash, panic). That
+      // both froze the "thinking…" spinner + Stop button AND actively hid the
+      // recovery banner (StreamRenderer returns null for the failure card while
+      // isRunning). Clear the running/cancel state here so the run terminates and
+      // the banner shows. runOwnerSessionIdRef stays set so a later bare
+      // kim-agent-done can still run its full finalize (persist / onTaskDone).
+      if (isRunningRef.current || runOwnerSessionIdRef.current !== null) {
+        setIsRunning(false);
+        setCancelling(false);
+      }
     }).then(fn => { if (!cancelled) unlistenTypedRunFailed = fn; else fn(); });
+
+    // F-H-1 / F-F-2: schema-typed, ENVELOPED run-lifecycle CLEAR events (A'
+    // emitter, commit a61ffb4). Unlike the bare-bool kim-agent-done/-cancelled
+    // and the raw kim-agent-error string — none of which carry a run/session
+    // envelope — these route through belongsToView, so a stale session's
+    // termination can no longer clear the wrong view. They are the ATTRIBUTABLE
+    // CLEAR half only: the full persist/notify finalize stays on the bare
+    // kim-agent-done path (which holds the complete run context). Each no-ops
+    // once that path has released ownership (isRunning false AND owner null), so
+    // the happy path never double-finalizes; their value is guaranteeing the
+    // spinner clears when the legacy bare-bool terminal signal never arrives.
+    const ownsForClear = () => isRunningRef.current || runOwnerSessionIdRef.current !== null;
+
+    listen<KimAgentDonePayload>(KimEventNames.AGENT_DONE, e => {
+      if (!belongsToView(e.payload.session_id)) return;
+      if (!ownsForClear()) return;
+      setIsRunning(false);
+      setCancelling(false);
+    }).then(fn => { if (!cancelled) unlistenTypedAgentDone = fn; else fn(); });
+
+    listen<KimAgentCancelledPayload>(KimEventNames.AGENT_CANCELLED, e => {
+      if (!belongsToView(e.payload.session_id)) return;
+      if (!ownsForClear()) return;
+      cancelFlagRef.current = true;
+      setIsCancelled(true);
+      setIsRunning(false);
+      setCancelling(false);
+    }).then(fn => { if (!cancelled) unlistenTypedAgentCancelled = fn; else fn(); });
+
+    listen<KimAgentErrorPayload>(KimEventNames.AGENT_ERROR, e => {
+      if (!belongsToView(e.payload.session_id)) return;
+      if (!ownsForClear()) return;
+      // Attributable terminal failure: clear the spinner and reveal the recovery
+      // UI even when no bare kim-agent-done follows.
+      setIsRunning(false);
+      setCancelling(false);
+      const message = friendlyError(e.payload.error);
+      setTaskError(message);
+      if (lastRunTaskRef.current) setLastFailedTask(lastRunTaskRef.current);
+    }).then(fn => { if (!cancelled) unlistenTypedAgentError = fn; else fn(); });
 
     listen<KimRateLimitedPayload>(KimEventNames.RATE_LIMITED, e => {
       if (!belongsToView(e.payload.session_id)) return;
@@ -775,11 +904,24 @@ export function useChatStream({
       }
     }).then(fn => { if (!cancelled) unlistenTypedActivity = fn; else fn(); });
 
+    // F-F-2: the raw Codex/legacy compatibility stream carries NO session
+    // envelope, so belongsToView can't route it. When the user switches session
+    // mid-run, a run started under session A keeps emitting these un-enveloped
+    // raw lines; without a guard they append to whatever view is mounted (B's
+    // activity feed fills with A's reasoning/shell/[err] lines, and an [err]
+    // line raises a Retry banner for a task B never ran). Gate on run ownership:
+    // only append when THIS view owns the active run (it is running, or it holds
+    // the run-identity captured at spawn / re-attach). A foreign run's raw lines
+    // are dropped instead of bleeding across the session switch.
+    const ownsActiveRunNow = () => isRunningRef.current || runOwnerSessionIdRef.current !== null;
+
     listen<string>('kim-agent-output', event => {
+      if (!ownsActiveRunNow()) return;
       appendRaw(event.payload);
     }).then(fn => { if (!cancelled) unlistenOutput = fn; else fn(); });
 
     listen<string>('kim-agent-error', event => {
+      if (!ownsActiveRunNow()) return;
       appendRaw(`[err] ${event.payload}`);
     }).then(fn => { if (!cancelled) unlistenError = fn; else fn(); });
 
@@ -829,7 +971,10 @@ export function useChatStream({
         // Fix 3: compute next outside the updater so React's StrictMode/concurrent
         // double-invocation of updater functions cannot trigger duplicate IPC writes.
         const newRunEntry = { activity: activitySnapshot, durationSec, provider: currentTaskRef.current?.provider ?? null };
-        const next = [...runHistoryRef.current, newRunEntry];
+        // F-J-2: cap so neither React state, the render map, nor the IPC/disk
+        // payload grows without bound over a long working session.
+        const appended = [...runHistoryRef.current, newRunEntry];
+        const next = appended.length > MAX_RUN_HISTORY ? appended.slice(appended.length - MAX_RUN_HISTORY) : appended;
         setRunHistory(next);
         const completedCodeSession = completedCodeSessionRef.current;
         // RUN-IDENTITY: file under the session the RUN belongs to (captured at
@@ -847,7 +992,12 @@ export function useChatStream({
               ? `${completedCodeSession.project_path}/.codex/sessions`
               : settingsRef.current.codex_sessions_dir || null,
             runs: next,
-          }).catch(() => {});
+          }).catch(() => {
+            // F-F-10: a save failure silently lost the completed run's activity
+            // + cost from session history (empty "worked for" pill, user assumes
+            // nothing ran). Surface it so the loss is at least visible.
+            toast('Could not save this run to history — it may not appear when you reopen the session.', 'error', 4000);
+          });
         }
       }
       clearActivityNow();
@@ -898,6 +1048,9 @@ export function useChatStream({
       // foreign done can't be mistaken for this view's run.
       runOwnerSessionIdRef.current = null;
       currentRunIdRef.current = null;
+      // F-F-3: clear the run start so the NEXT run in this mount stamps fresh
+      // (the timer effect only stamps when startTimeRef is null).
+      startTimeRef.current = null;
     }).then(fn => { if (!cancelled) unlistenDone = fn; else fn(); });
 
     listen<SessionInfo>('kim-agent-code-session', event => {
@@ -918,6 +1071,7 @@ export function useChatStream({
       currentTaskRef.current = null;
       runOwnerSessionIdRef.current = null;
       currentRunIdRef.current = null;
+      startTimeRef.current = null; // F-F-3: next run stamps a fresh start
     }).then(fn => { if (!cancelled) unlistenCancelled = fn; else fn(); });
 
     return () => { parkOrphanedRunSnapshotIfOwned({ isRunning: isRunningRef.current, runOwnerSessionId: runOwnerSessionIdRef.current, fallbackSessionId: activeResumeSessionIdRef.current, activity: activityRef.current, priorRuns: runHistoryRef.current, startedAt: startTimeRef.current, provider: currentTaskRef.current?.provider ?? null, completedCodeSession: completedCodeSessionRef.current, fallbackSessionDate: sessionRef.current?.date ?? null, kimSessionsDir: settingsRef.current.kim_sessions_dir || null, codexSessionsDir: settingsRef.current.codex_sessions_dir || null });
@@ -950,6 +1104,9 @@ export function useChatStream({
       unlistenTypedAssistantDelta?.();
       unlistenTypedReasoningDelta?.();
       unlistenTypedItemLifecycle?.();
+      unlistenTypedAgentDone?.();
+      unlistenTypedAgentCancelled?.();
+      unlistenTypedAgentError?.();
       unlistenRunId?.();
       // M7: cancel a pending assistant-delta flush on teardown.
       if (assistantFlushTimerRef.current !== null) {

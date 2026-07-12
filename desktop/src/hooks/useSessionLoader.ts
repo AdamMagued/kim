@@ -4,7 +4,7 @@ import type { SessionInfo, KimMessage, Settings } from '../types';
 import type { CodexRunGroup, ActivityItem } from '../components/chat/types';
 import { collapseMessages, groupCodexMessages, isIntermediateToolCall } from '../components/chat/utils';
 import { toast } from '../components/Toast';
-import type { useChatStream } from './useChatStream';
+import { type useChatStream, MAX_RUN_HISTORY } from './useChatStream';
 
 interface UseSessionLoaderProps {
   session: SessionInfo | null;
@@ -74,8 +74,11 @@ export function useSessionLoader({
         .then(runs => {
           if (lastLoadedSessionIdRef.current !== session.session_id) return;
           if (runs && Array.isArray(runs)) {
-            stream.setRunHistory(runs);
-            capturedCodexRuns = runs;
+            // F-J-2: a legacy on-disk history can be arbitrarily long; cap what
+            // we hold in memory / render to the most recent runs.
+            const capped = runs.length > MAX_RUN_HISTORY ? runs.slice(runs.length - MAX_RUN_HISTORY) : runs;
+            stream.setRunHistory(capped);
+            capturedCodexRuns = capped;
             if (runs.length > 0) {
               setCodexRuns(prev =>
                 prev.map((run, i) =>
