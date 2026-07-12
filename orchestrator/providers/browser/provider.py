@@ -120,6 +120,34 @@ def _normalize_for_marker(text: str) -> str:
     return re.sub(r"[\s`*_]+", "", text or "")
 
 
+# F-B-7: the injected prompt itself contains the literal completion hash inside
+# the "always append the exact string …" instruction, so the echoed USER bubble
+# (which Claude/Grok response selectors also match) contains the sentinel in the
+# MIDDLE of the marker instruction. A verbatim signature of that instruction
+# marks a scraped candidate as the prompt echo rather than the model's answer.
+# (Kept lowercase; compared against the lowercased scrape.)
+_MARKER_INSTRUCTION_SIGNATURE = "always append the exact string"
+
+# How many normalized trailing chars beyond the sentinel still count as "at the
+# tail". The prompt-echo instruction that follows the hash ("at the very end of
+# your entire response…") is far longer than this, so it never sneaks in.
+_HASH_TAIL_TOLERANCE = 12
+
+
+def _hash_at_tail(normalized_text: str, normalized_hash: str) -> bool:
+    """True only when the completion sentinel sits at (or within a few chars of)
+    the END of the scraped text (F-B-7).
+
+    A sentinel found mid-text is the echoed prompt instruction (or an assistant
+    that named the marker before answering), NOT a finished response — accepting
+    it there scrapes the user's own prompt or truncates an in-flight answer.
+    """
+    if not normalized_hash:
+        return False
+    tail = normalized_text[-(len(normalized_hash) + _HASH_TAIL_TOLERANCE):]
+    return normalized_hash in tail
+
+
 class BrowserProvider(BaseProvider):
     """
     Provider that drives a locally-open browser chat session.
@@ -1594,13 +1622,27 @@ class BrowserProvider(BaseProvider):
 
         while loop.time() < deadline:
             current_text = ""
+            hash_at_tail = False
             try:
                 current_text = await self._scrape_last_response(page, response_selectors, min_index=min_index)
                 logger.debug(
                     f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}"
                 )
-                if norm_hash and norm_hash in _normalize_for_marker(current_text):
-                    logger.debug("Generation complete (completion hash found)")
+                # F-B-7: the sentinel is only a real completion signal when it
+                # sits at the TAIL of the model's OWN answer — never when the
+                # scrape is the echoed prompt (which embeds the hash inside the
+                # marker instruction), and never before min_generation_time.
+                # This preserves the [END_OF_RESPONSE_{id}] protocol; it only
+                # tightens WHEN the sentinel is accepted, killing the race where
+                # the first poll scrapes the user bubble and exits instantly.
+                is_prompt_echo = _MARKER_INSTRUCTION_SIGNATURE in current_text.lower()
+                hash_at_tail = (
+                    bool(norm_hash)
+                    and not is_prompt_echo
+                    and _hash_at_tail(_normalize_for_marker(current_text), norm_hash)
+                )
+                if hash_at_tail and loop.time() >= min_generation_time:
+                    logger.debug("Generation complete (completion hash at tail)")
                     return True
             except Exception as e:
                 logger.debug(f"[DEBUG] _scrape_last_response failed: {e}")
@@ -1659,7 +1701,9 @@ class BrowserProvider(BaseProvider):
                 # exact bug where a reply was cut off mid-sentence). So stay patient
                 # while the hash is pending and only fall back to the text-settled
                 # heuristic after a much longer idle.
-                hash_pending = bool(norm_hash) and norm_hash not in _normalize_for_marker(current_text)
+                # F-B-7: "pending" means the sentinel is not yet at the tail of
+                # the model's answer (a mid-text echo does not count as arrived).
+                hash_pending = bool(norm_hash) and not hash_at_tail
                 idle_needed = 20 if hash_pending else 8  # ~15s vs ~6s of stable text
                 if idle_count > idle_needed and loop.time() > min_generation_time:
                     if hash_pending:

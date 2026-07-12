@@ -237,6 +237,36 @@ class TestWaitForGenerationComplete(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
         self.assertEqual(scrape.await_count, 2)
 
+    async def test_prompt_echo_containing_hash_is_not_definitive(self):
+        # F-B-7: the injected prompt embeds the literal completion hash inside
+        # the "Always append the exact string …" instruction. When the echoed
+        # USER bubble is scraped first, its mid-text hash must NOT terminate the
+        # wait — only the model's OWN answer, whose hash sits at the tail, does.
+        p = _provider()
+        echo = (
+            "List the files. IMPORTANT: Always append the exact string "
+            "[END_OF_RESPONSE_abc] at the very end of your entire response."
+        )
+        answer = "Here are the files: a.txt, b.txt. [END_OF_RESPONSE_abc]"
+        result, scrape = await self._wait(
+            p, [echo, echo, answer] + ["x"] * 50, "[END_OF_RESPONSE_abc]"
+        )
+        self.assertTrue(result)
+        # Did NOT exit on the two echoed polls; only on the real answer (poll 3).
+        self.assertEqual(scrape.await_count, 3)
+
+    async def test_assistant_early_hash_echo_mid_text_is_not_definitive(self):
+        # F-B-7: a model that names the sentinel before answering ("I'll end
+        # with …") must not trip the wait mid-generation; only a tail hash does.
+        p = _provider()
+        early = "Sure, I'll end with [END_OF_RESPONSE_abc]. Working on it now, one moment."
+        done = "The answer is 42. [END_OF_RESPONSE_abc]"
+        result, scrape = await self._wait(
+            p, [early, done] + ["x"] * 50, "[END_OF_RESPONSE_abc]"
+        )
+        self.assertTrue(result)
+        self.assertEqual(scrape.await_count, 2)
+
     async def test_shrinking_text_does_not_freeze_idle_counter(self):
         # A long "thinking" text collapses into a shorter final answer. The
         # idle counter must resync to the new (shorter) baseline and exit via
