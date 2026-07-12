@@ -56,6 +56,15 @@ def _clamp_shell_timeout(raw: object) -> int:
 
 
 # ── Deny sets ─────────────────────────────────────────────────────────────────
+#
+# CODE-OWNED (F-G-4): the deny sets below are deliberately NOT config-driven.
+# There is no `shell.blocked_commands` (or similar) config key, and none may
+# be added — config must never be able to weaken or replace a code-owned
+# safety gate, and a config key that *claims* to extend blocking while being
+# read by nothing (as the old `blocked_commands` key was) is worse than none
+# at all. Config can only ADD allowed binaries (`shell.allowlist_extra` /
+# `shell.safe_extra`, read in policy.py); anything denied here stays denied
+# regardless of config.
 
 # Commands that are unconditionally blocked (first token after shlex.split).
 # Includes network-transfer tools that can exfiltrate secret files in a single

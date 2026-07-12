@@ -192,3 +192,44 @@ class TestModelMapParity:
         assert m.group(1) == yaml_claude, (
             f"config.rs claude default={m.group(1)!r} != config.yaml model.claude={yaml_claude!r}"
         )
+
+
+class TestNoDeadSecurityConfigKeys:
+    """F-G-4: `shell.blocked_commands` was shipped in the canonical config but
+    read by NOTHING — an operator who added a command to it reasonably believed
+    it was now blocked, and it was silently ignored (false security). The key
+    was deleted, and the deny-list is documented as CODE-OWNED in
+    mcp_server/tools/shell.py (_DENY_COMMANDS / _DENY_PATTERNS). Per the
+    standing invariant, config must never be able to weaken (or pretend to
+    extend) a code-owned safety gate, so the key must not come back — neither
+    as a dead key nor as a live one.
+    """
+
+    def test_canonical_config_has_no_blocked_commands_key(self):
+        cfg = _load_canonical_yaml()
+        shell_cfg = cfg.get("shell") or {}
+        assert "blocked_commands" not in shell_cfg, (
+            "config.yaml.example reintroduces shell.blocked_commands — the "
+            "deny-list is code-owned (mcp_server/tools/shell.py); a config "
+            "key here is either dead (false security, F-G-4) or a gate "
+            "weakener. Remove it."
+        )
+        # Belt-and-braces: not anywhere else in the file either.
+        assert "blocked_commands" not in _CANONICAL_YAML.read_text()
+
+    def test_no_python_runtime_reads_blocked_commands(self):
+        # If someone wires a reader, they wired config into a code-owned gate.
+        for pkg in ("mcp_server", "orchestrator"):
+            for path in sorted((_REPO / pkg).rglob("*.py")):
+                src = path.read_text(errors="replace")
+                assert "blocked_commands" not in src, (
+                    f"{path.relative_to(_REPO)} references blocked_commands — "
+                    "the shell deny-list must stay code-owned (F-G-4)"
+                )
+
+    def test_deny_list_is_code_owned_in_shell_py(self):
+        src = (_REPO / "mcp_server" / "tools" / "shell.py").read_text()
+        assert "_DENY_COMMANDS" in src and "_DENY_PATTERNS" in src
+        assert "CODE-OWNED" in src, (
+            "shell.py must document the deny sets as CODE-OWNED (F-G-4)"
+        )

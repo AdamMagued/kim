@@ -27,9 +27,9 @@ custom_sites: {}
 # Kim's own MCP server (name -> {command, args, cwd, env, ...}). Defaults to
 # empty (no extra servers).
 mcp_servers: {}
-# Site-connector allowlist. `enabled` is a list of connector ids (e.g.
-# ["guc_cms", "guc_mail"]) whose tools get merged into the MCP dispatch map
-# at startup, so the LLM only sees toolkits you've explicitly opted into.
+# Site-connector allowlist. `enabled` is a list of connector ids whose
+# tools get merged into the MCP dispatch map at startup, so the LLM only
+# sees toolkits you've explicitly opted into.
 # Optional; defaults to an empty list (no connectors enabled).
 connectors:
   enabled: []
@@ -82,10 +82,13 @@ preview_mode: false
 project_root: .
 provider: ollama
 screenshot_scale: 0.75
+# The shell command deny-list is CODE-OWNED and is NOT configurable here.
+# It lives in mcp_server/tools/shell.py (_DENY_COMMANDS / _DENY_PATTERNS),
+# mirrored at the policy chokepoint (mcp_server/policy.py). Config must never
+# be able to weaken a code-owned safety gate, so there is deliberately no
+# `blocked_commands` key — a previous one existed but was read by nothing
+# (F-G-4), giving operators false confidence. Config can only ADD allowed
+# binaries via `shell.allowlist_extra` / `shell.safe_extra`; denied commands
+# stay denied regardless of config.
 shell:
-  blocked_commands:
-  - rm -rf /
-  - 'format c:'
-  - del /S /Q C:\
-  - rd /S /Q C:\
   timeout: 30
