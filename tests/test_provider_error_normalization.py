@@ -60,6 +60,28 @@ class ProviderErrorClassificationTests(unittest.TestCase):
         self.assertEqual(result.code, "unknown")
         self.assertFalse(result.retryable)
 
+    def test_httpx_read_timeout_is_retryable_timeout(self):
+        # F-B-5: httpx.ReadTimeout is not a builtin TimeoutError and its str()
+        # is "timed out" (no "timeout" substring) — the classifier must still
+        # mark it a retryable timeout via the exception class name.
+        import httpx
+        result = classify_provider_error(httpx.ReadTimeout("timed out"))
+        self.assertEqual(result.code, "timeout")
+        self.assertTrue(result.retryable)
+
+    def test_httpx_connect_timeout_empty_message_is_retryable(self):
+        # F-B-5: httpx.ConnectTimeout often has an empty str(); rely on the
+        # class name ("connecttimeout") so it is not misfiled as "unknown".
+        import httpx
+        result = classify_provider_error(httpx.ConnectTimeout(""))
+        self.assertEqual(result.code, "timeout")
+        self.assertTrue(result.retryable)
+
+    def test_timed_out_wording_is_retryable_timeout(self):
+        result = classify_provider_error(RuntimeError("the operation timed out"))
+        self.assertEqual(result.code, "timeout")
+        self.assertTrue(result.retryable)
+
     def test_existing_provider_error_is_preserved(self):
         original = ProviderError("quota_project", "quota project missing", retryable=False)
         self.assertIs(classify_provider_error(original), original)

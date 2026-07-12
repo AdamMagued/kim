@@ -69,7 +69,7 @@ class AuthWallThroughProviderTest(unittest.TestCase):
 
         provider = BrowserProvider(
             {"project_root": ".", "browser_provider": {}},
-            page_driver=_WallDriver("https://chatgpt.com/auth/login"),
+            page_driver=_WallDriver("https://chatgpt.com/auth/login"),  # pyright: ignore[reportArgumentType]  # test PageDriver stub
         )
         result = asyncio.run(provider.complete(
             messages=[{"role": "user", "content": "hi"}], tools=[], system="s",
@@ -77,6 +77,64 @@ class AuthWallThroughProviderTest(unittest.TestCase):
         content = str(result.get("content", ""))
         self.assertIn("NEED_HELP: AUTH_REQUIRED", content)
         self.assertIn("sign", content.lower())
+
+
+class _FakePage:
+    """PageLike with url + async title() + a goto that can simulate a redirect."""
+
+    def __init__(self, url: str, title: str = "", goto_url: str | None = None) -> None:
+        self.url = url
+        self._title = title
+        self._goto_url = goto_url
+
+    async def title(self) -> str:
+        return self._title
+
+    async def goto(self, url: str, **_kwargs) -> None:
+        self.url = self._goto_url if self._goto_url is not None else url
+
+
+class _PageDriver:
+    def __init__(self, page, site: str = "chatgpt") -> None:
+        self._page, self._site = page, site
+
+    async def acquire(self):
+        return self._page, self._site
+
+
+class AuthWallTitleAndRecheckTest(unittest.TestCase):
+    """F-B-9: title markers are reachable, and the wall is re-checked after the
+    clear_chat navigation."""
+
+    def _provider(self, driver):
+        from orchestrator.providers.browser_provider import BrowserProvider
+        return BrowserProvider({"project_root": ".", "browser_provider": {}}, page_driver=driver)
+
+    def test_title_interstitial_detected_through_provider(self):
+        # Healthy URL but a Cloudflare "Just a moment..." title — previously
+        # dead code (the title arg was never passed at the call site).
+        page = _FakePage("https://chatgpt.com/", title="Just a moment...")
+        provider = self._provider(_PageDriver(page))
+        result = asyncio.run(provider.complete(
+            messages=[{"role": "user", "content": "hi"}], tools=[], system="s",
+        ))
+        self.assertIn("AUTH_REQUIRED", str(result.get("content", "")))
+
+    def test_clear_chat_redirect_to_login_is_rechecked(self):
+        from unittest.mock import AsyncMock, patch
+        from orchestrator.providers.browser import provider as bp
+        # Healthy at first; the fresh-chat nav redirects a signed-out user to login.
+        page = _FakePage(
+            "https://chatgpt.com/c/abc", title="",
+            goto_url="https://chatgpt.com/auth/login",
+        )
+        provider = self._provider(_PageDriver(page))
+        with patch.object(bp.asyncio, "sleep", AsyncMock()):
+            result = asyncio.run(provider.complete(
+                messages=[{"role": "user", "content": "hi"}], tools=[], system="s",
+                clear_chat=True,
+            ))
+        self.assertIn("AUTH_REQUIRED", str(result.get("content", "")))
 
 
 class RepairMetricsTest(unittest.TestCase):

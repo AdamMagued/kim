@@ -47,6 +47,23 @@ _TRUNCATION_NOTE = (
 )
 
 
+def malformed_tool_args_text(tool_name: str) -> str:
+    """Re-emit nudge for a tool call whose arguments were not valid JSON (F-INH-3).
+
+    The providers used to coerce unparseable arguments to ``{}`` and dispatch
+    the tool anyway — for an all-optional schema that silently runs with
+    defaults and the model gets no signal. Returning this as the assistant text
+    turn (instead of a tool_call) surfaces the failure so the model re-emits a
+    valid call on the next turn.
+    """
+    name = tool_name or "the requested"
+    return (
+        f"[Kim: the arguments for the `{name}` tool were not valid JSON, so the "
+        f"call was not run. Re-issue the `{name}` call with a single valid JSON "
+        "object as its arguments.]"
+    )
+
+
 def finalize_text_content(content: str, stop_reason: Optional[str]) -> str:
     """Annotate terminal completion text based on why generation stopped.
 
@@ -73,17 +90,28 @@ def finalize_text_content(content: str, stop_reason: Optional[str]) -> str:
 # Typed contracts — providers return one of these; agent consumes typed fields
 # ---------------------------------------------------------------------------
 
-class ToolCallResponse(TypedDict):
-    """Provider response requesting a tool call."""
-    type: Literal["tool_call"]
-    tool: str
-    args: dict[str, Any]
+class ToolCallResponse(TypedDict, total=False):
+    """Provider response requesting a tool call.
+
+    `type`, `tool`, and `args` are always present. `content`, `stop_reason`,
+    and `usage` are attached by the providers that have them and consumed by
+    the agent loop, so they are part of the real contract even though they were
+    historically undeclared (F-B-14). `total=False` lets a provider omit the
+    optional fields; the three required keys are noted inline.
+    """
+    type: Literal["tool_call"]  # required
+    tool: str                   # required
+    args: dict[str, Any]        # required
+    content: str                # optional — narration (PLAN/STEP) preceding the call
+    stop_reason: Optional[str]  # optional — API providers report why generation stopped
+    usage: dict[str, Any]       # optional — token counts (ollama uses extended keys)
 
 
 class TextResponse(TypedDict, total=False):
     """Provider response with a text completion."""
     type: Literal["text"]       # required
     content: str                # required
+    stop_reason: Optional[str]  # optional — why generation stopped (max_tokens/safety/…)
     usage: dict[str, Any]       # optional — token counts from the provider
 
 
@@ -212,7 +240,18 @@ def classify_provider_error(error: Exception) -> ProviderError:
     if "overloaded" in lowered:
         return ProviderError("server_error", message, retryable=True)
 
-    if isinstance(error, TimeoutError) or "timeout" in lowered:
+    # F-B-5: httpx's transport timeouts (ReadTimeout/ConnectTimeout/PoolTimeout/
+    # TimeoutException) are NOT builtin TimeoutError, and their str() is often
+    # empty or the phrase "timed out" — which does not contain the substring
+    # "timeout". Match the exception class name ("...timeout...") and the
+    # "timed out" wording so a mid-generation transport timeout (Ollama's most
+    # common transient failure) is retried instead of dying as "unknown".
+    if (
+        isinstance(error, TimeoutError)
+        or "timeout" in lowered
+        or "timed out" in lowered
+        or "timeout" in error_type
+    ):
         return ProviderError("timeout", message, retryable=True)
     if isinstance(error, (ConnectionError, OSError)) or "connection" in lowered:
         return ProviderError("network", message, retryable=True)

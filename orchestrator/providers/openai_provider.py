@@ -14,7 +14,7 @@ from typing import Any
 
 import openai
 
-from orchestrator.providers.base import BaseProvider, finalize_text_content
+from orchestrator.providers.base import BaseProvider, finalize_text_content, malformed_tool_args_text
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,18 @@ class OpenAIProvider(BaseProvider):
                 "Set it in .env or use openai_api_key_env in config.yaml."
             )
 
+        # F-B-12: a REMOTE OpenAI-compatible endpoint (Cerebras/Groq/Together)
+        # with no key still gets api_key="placeholder", turning a fixable config
+        # gap into a cryptic first-call 401. Only token-less LOCAL proxies are a
+        # legitimate placeholder case, so warn loudly when the host is remote.
+        if not api_key and base_url is not None and not _is_localhost_url(base_url):
+            logger.warning(
+                "%s is not set and openai_base_url=%s is remote — using a placeholder "
+                "key. If that host needs authentication you will get an HTTP 401; set "
+                "%s in .env (or openai_api_key_env in config.yaml).",
+                key_env, base_url, key_env,
+            )
+
         kwargs: dict = {"api_key": api_key or "placeholder"}
         if base_url:
             kwargs["base_url"] = base_url
@@ -61,6 +73,11 @@ class OpenAIProvider(BaseProvider):
         models = config.get("model", {})
         self._model = models.get("openai", "gpt-4o")
         self._max_tokens = int(config.get("max_tokens", 4096))
+        # F-INH-2: o-series reasoning models and the GPT-5 family reject the
+        # legacy `max_tokens` field and require `max_completion_tokens`. Pick the
+        # right field up front for known families; complete() also self-corrects
+        # once on the specific 400 so an unknown future model still works.
+        self._token_param = _default_token_param(self._model)
         logger.info(f"OpenAIProvider: model={self._model} base_url={base_url or 'openai'}")
 
     async def complete(
@@ -72,17 +89,17 @@ class OpenAIProvider(BaseProvider):
         oai_messages = [{"role": "system", "content": system}] + self._to_oai_messages(messages)
         oai_tools = self._to_oai_tools(tools)
 
-        try:
-            kwargs: dict = dict(
-                model=self._model,
-                messages=oai_messages,
-                max_tokens=self._max_tokens,
-            )
-            if oai_tools:
-                kwargs["tools"] = oai_tools
-                kwargs["tool_choice"] = "auto"
-            kwargs["timeout"] = 180.0
+        kwargs: dict = dict(
+            model=self._model,
+            messages=oai_messages,
+        )
+        kwargs[self._token_param] = self._max_tokens
+        if oai_tools:
+            kwargs["tools"] = oai_tools
+            kwargs["tool_choice"] = "auto"
+        kwargs["timeout"] = 180.0
 
+        try:
             response = await self._client.chat.completions.create(**kwargs)
         except openai.RateLimitError:
             raise
@@ -94,6 +111,22 @@ class OpenAIProvider(BaseProvider):
             # Re-raise as builtin TimeoutError so classify_provider_error marks it
             # retryable regardless of Python version (isinstance check works on all).
             raise TimeoutError(str(e) or "OpenAI API timed out") from e
+        except openai.BadRequestError as e:
+            # F-INH-2: a model that requires max_completion_tokens 400s on
+            # max_tokens. Swap the field and retry once, remembering the choice
+            # for the rest of the session so the wasted call happens at most once.
+            if self._token_param == "max_tokens" and _is_max_tokens_param_error(e):
+                logger.info(
+                    "OpenAI model %s rejected max_tokens; retrying with max_completion_tokens",
+                    self._model,
+                )
+                self._token_param = "max_completion_tokens"
+                kwargs.pop("max_tokens", None)
+                kwargs["max_completion_tokens"] = self._max_tokens
+                response = await self._client.chat.completions.create(**kwargs)
+            else:
+                logger.error(f"OpenAI API error: {e}")
+                raise
         except openai.APIError as e:
             logger.error(f"OpenAI API error: {e}")
             raise
@@ -172,6 +205,7 @@ class OpenAIProvider(BaseProvider):
             def _parse_one(tc):
                 try:
                     args = json.loads(tc.function.arguments)
+                    arg_error = False
                 except json.JSONDecodeError:
                     # M9: never silently swap malformed args for {} — log what
                     # the model actually produced so the confusing downstream
@@ -181,7 +215,8 @@ class OpenAIProvider(BaseProvider):
                         tc.function.name, str(tc.function.arguments)[:200],
                     )
                     args = {}
-                return {"tool": tc.function.name, "args": args}
+                    arg_error = True
+                return {"tool": tc.function.name, "args": args, "arg_error": arg_error}
 
             # H2: keep any assistant narration that accompanies the tool call —
             # the agent reads response["content"] for PLAN/STEP markers.
@@ -194,7 +229,10 @@ class OpenAIProvider(BaseProvider):
                 return {
                     "type": "tool_call",
                     "tool": "batch",
-                    "args": {"calls": [_parse_one(tc) for tc in msg.tool_calls]},
+                    "args": {"calls": [
+                        {"tool": p["tool"], "args": p["args"]}
+                        for p in (_parse_one(tc) for tc in msg.tool_calls)
+                    ]},
                     "content": narration,
                     "stop_reason": finish_reason,
                     "usage": usage,
@@ -202,6 +240,17 @@ class OpenAIProvider(BaseProvider):
 
             tc = msg.tool_calls[0]
             parsed = _parse_one(tc)
+            if parsed["arg_error"]:
+                # F-INH-3: rather than dispatching the tool with silently-emptied
+                # args (an all-optional schema would run with defaults and the
+                # model would never learn), surface a re-emit nudge as the text
+                # turn so the model resends a valid JSON call.
+                return {
+                    "type": "text",
+                    "content": malformed_tool_args_text(parsed["tool"]),
+                    "stop_reason": finish_reason,
+                    "usage": usage,
+                }
             return {
                 "type": "tool_call",
                 "tool": parsed["tool"],
@@ -217,3 +266,37 @@ class OpenAIProvider(BaseProvider):
             "stop_reason": finish_reason,
             "usage": usage,
         }
+
+
+def _is_localhost_url(url: str) -> bool:
+    """True for loopback hosts (token-less local proxies are a valid no-key case)."""
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or host.endswith(".localhost")
+
+
+def _default_token_param(model: str) -> str:
+    """Field name for the output-token limit (F-INH-2).
+
+    o-series reasoning models (o1/o3/o4/…) and the GPT-5 family require
+    ``max_completion_tokens``; everything else still takes ``max_tokens``.
+    An unknown model defaults to max_tokens and complete() self-corrects on the
+    specific 400.
+    """
+    m = (model or "").lower().strip()
+    # Strip a provider prefix some proxies use, e.g. "openai/o3-mini".
+    m = m.rsplit("/", 1)[-1]
+    if m.startswith(("o1", "o3", "o4", "o5")) or m.startswith("gpt-5"):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
+def _is_max_tokens_param_error(exc: Exception) -> bool:
+    """True when a 400 says max_tokens is unsupported / to use max_completion_tokens."""
+    msg = str(exc).lower()
+    return "max_completion_tokens" in msg or (
+        "max_tokens" in msg and ("unsupported" in msg or "not supported" in msg)
+    )

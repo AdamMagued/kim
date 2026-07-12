@@ -126,7 +126,9 @@ class _FakePage:
         self._unroute_raises = unroute_raises
         self._unroute_all_raises = unroute_all_raises
         if not has_unroute_all:
-            self.unroute_all = None  # type: ignore[assignment]
+            # Intentionally shadow the method with None to simulate a page whose
+            # unroute_all attribute exists but isn't callable.
+            self.unroute_all = None  # pyright: ignore[reportAttributeAccessIssue]
 
     async def route(self, matcher, handler):
         self.routes.append((matcher, handler))
@@ -271,6 +273,7 @@ class _FakeGuardPage:
     async def fire(self, request: _FakeRequest) -> _FakeRoute:
         """Simulate Playwright invoking the installed handler for *request*."""
         route = _FakeRoute()
+        assert self._route_handler is not None  # route() installs it before fire()
         await self._route_handler(route, request)
         return route
 
@@ -588,3 +591,14 @@ class TestInjectImageClipboardReturnsSuccess(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_max_history_messages_config_knob_is_inert_and_removed():
+    # F-B-13: the dead browser_provider.max_history_messages read is gone, so
+    # setting it neither creates a live attribute nor affects behavior.
+    from orchestrator.providers.browser_provider import BrowserProvider
+    provider = BrowserProvider({
+        "project_root": ".",
+        "browser_provider": {"max_history_messages": 99},
+    })
+    assert not hasattr(provider, "_max_history_messages")

@@ -57,12 +57,14 @@ SETUP (visible mode):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import uuid
 from pathlib import Path
@@ -109,6 +111,60 @@ _MOD_KEY = MOD_KEY
 _to_list = to_list
 
 
+# F-J-3: where the auto-launched detached CDP Chrome's PID is recorded so the
+# desktop shell can reap the orphan on app quit.
+_CDP_CHROME_REGISTRY_NAME = ".kim_cdp_chrome.json"
+
+
+def reap_launched_cdp_chrome(project_root) -> bool:
+    """Reap the Kim-launched CDP Chrome recorded under ``project_root`` (F-J-3).
+
+    The browser provider deliberately outlives its own (short-lived) process so
+    the signed-in Chrome is reused across turns, so it cannot reap that Chrome
+    itself. This reads the PID registry and SIGTERMs the recorded process if it
+    is still alive, then clears the registry. Intended to be called by the
+    desktop shell on app quit (HANDOFF -> D').
+
+    Returns True when a live process was signalled.
+    """
+    from pathlib import Path as _Path
+    path = _Path(project_root) / "sessions" / _CDP_CHROME_REGISTRY_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    pid = data.get("pid")
+    killed = False
+    if isinstance(pid, int):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed = True
+        except (OSError, ProcessLookupError):
+            killed = False
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return killed
+
+
+class _DeliveredNoResponse(Exception):
+    """Raised when the prompt was already SUBMITTED into the site thread but no
+    response appeared in time (F-B-8).
+
+    This must NOT be retried: the message is already in the conversation, so a
+    retry (H6 re-raised the old TimeoutError as retryable) re-injects the whole
+    prompt with a NEW completion hash into the SAME chat — duplicate prompts,
+    interleaved answers, and a new-hash wait that latches onto the first send's
+    late reply. complete() converts it into an in-band NEED_HELP instead.
+    """
+
+    def __init__(self, site: str, waited_s: int):
+        self.site = site
+        self.waited_s = waited_s
+        super().__init__(f"No response from {site} after {waited_s}s (prompt already delivered)")
+
+
 def _normalize_for_marker(text: str) -> str:
     """Collapse whitespace and markdown styling characters for marker matching.
 
@@ -118,6 +174,34 @@ def _normalize_for_marker(text: str) -> str:
     text against the normalized marker survives that styling.
     """
     return re.sub(r"[\s`*_]+", "", text or "")
+
+
+# F-B-7: the injected prompt itself contains the literal completion hash inside
+# the "always append the exact string …" instruction, so the echoed USER bubble
+# (which Claude/Grok response selectors also match) contains the sentinel in the
+# MIDDLE of the marker instruction. A verbatim signature of that instruction
+# marks a scraped candidate as the prompt echo rather than the model's answer.
+# (Kept lowercase; compared against the lowercased scrape.)
+_MARKER_INSTRUCTION_SIGNATURE = "always append the exact string"
+
+# How many normalized trailing chars beyond the sentinel still count as "at the
+# tail". The prompt-echo instruction that follows the hash ("at the very end of
+# your entire response…") is far longer than this, so it never sneaks in.
+_HASH_TAIL_TOLERANCE = 12
+
+
+def _hash_at_tail(normalized_text: str, normalized_hash: str) -> bool:
+    """True only when the completion sentinel sits at (or within a few chars of)
+    the END of the scraped text (F-B-7).
+
+    A sentinel found mid-text is the echoed prompt instruction (or an assistant
+    that named the marker before answering), NOT a finished response — accepting
+    it there scrapes the user's own prompt or truncates an in-flight answer.
+    """
+    if not normalized_hash:
+        return False
+    tail = normalized_text[-(len(normalized_hash) + _HASH_TAIL_TOLERANCE):]
+    return normalized_hash in tail
 
 
 class BrowserProvider(BaseProvider):
@@ -143,7 +227,12 @@ class BrowserProvider(BaseProvider):
         bp_cfg = config.get("browser_provider", {})
         cdp_url = bp_cfg.get("cdp_url", CDP_URL)
         self._cdp_url = cdp_url
-        self._max_history_messages = int(bp_cfg.get("max_history_messages", 6))
+        # F-B-13: browser_provider.max_history_messages was read here but used
+        # nowhere — the recap in prompt_builder.build_history_recap is bounded by
+        # CHARACTERS (max_recap), not a message count, so the knob changed
+        # nothing. Removed rather than wired, to avoid silently altering recap
+        # length for anyone who had set it. (config.yaml key removal + the dead
+        # relay: section are config territory — see the HANDOFF in the commit.)
         self._max_inject_chars = int(bp_cfg.get("max_inject_chars", 120000))
         self._headless = bool(bp_cfg.get("browser_headless", False))
         self._force_headless = bool(bp_cfg.get("browser_force_headless", False))
@@ -186,7 +275,16 @@ class BrowserProvider(BaseProvider):
             Path(bp_cfg.get("user_data_dir", default_data_dir)).resolve()
         )
         self._project_root = project_root
-        Path(self._user_data_dir).mkdir(parents=True, exist_ok=True)
+        _sess_dir = Path(self._user_data_dir)
+        _sess_dir.mkdir(parents=True, exist_ok=True)
+        # SECURITY (F-I-4): this profile holds live auth cookies for the user's
+        # AI logins. Lock it to owner-only (0o700) so other local users can't
+        # read the cookie jar. Best-effort — chmod is a no-op/behaves
+        # differently on Windows, and a perms hiccup must not abort startup.
+        try:
+            os.chmod(_sess_dir, 0o700)
+        except OSError:
+            pass
         logger.info(
             f"BrowserProvider: session dir = {self._user_data_dir}  "
             f"headless = {self._headless}  preferred_site = {self._preferred_site!r} "
@@ -655,6 +753,28 @@ class BrowserProvider(BaseProvider):
                 )
                 self._commit_sent_system_prompt(result, new_sent)
                 return result
+        except _DeliveredNoResponse as e:
+            # F-B-8: prompt already delivered — return a NEED_HELP that names the
+            # thread state (non-retryable, in-band) instead of re-raising a
+            # retryable TimeoutError that would re-inject the whole prompt.
+            logger.warning(
+                "No response from %s after %ss; prompt already delivered — not retrying.",
+                e.site, e.waited_s,
+            )
+            # The send reached the thread, so the system prompt is committed.
+            self._sent_system_prompt = new_sent
+            return self._attach_usage(
+                {
+                    "type": "text",
+                    "content": (
+                        f"NEED_HELP: The message was delivered to the {e.site} chat but no "
+                        f"response appeared within {e.waited_s}s. The prompt is already in that "
+                        "thread — do not resend it. Check the browser window; if it is still "
+                        'generating, wait and send "continue" to read the reply.'
+                    ),
+                },
+                estimated_usage,
+            )
         except TimeoutError:
             # H6: TimeoutError is an OSError subclass, but a slow generation /
             # response wait is transient — re-raise so the agent's retry path
@@ -681,7 +801,11 @@ class BrowserProvider(BaseProvider):
         markdown scrape, then parse into the canonical response format."""
         # Rb3: a "chat tab" that is actually a sign-in / Cloudflare wall would
         # swallow the send and hang for the full generation wait — fail fast.
-        wall_reason = detect_auth_wall(getattr(page, "url", "") or "")
+        # F-B-9: pass the page title too so the title-based interstitial markers
+        # (Cloudflare "Just a moment", "Sign in to …") are actually reachable —
+        # the sole prior call passed the URL alone, making them dead code.
+        wall_title = await self._safe_page_title(page)
+        wall_reason = detect_auth_wall(getattr(page, "url", "") or "", wall_title)
         if wall_reason:
             logger.warning(f"Auth wall detected on {site}: {wall_reason} ({page.url})")
             return self._attach_usage(auth_wall_response(site, wall_reason), estimated_usage)
@@ -698,6 +822,18 @@ class BrowserProvider(BaseProvider):
             )
             await page.goto(fresh_url, wait_until="domcontentloaded")
             await asyncio.sleep(2.0)
+            # F-B-9: a signed-out site redirects the fresh-chat navigation to its
+            # login page. Re-detect the wall AFTER the goto so we fail fast with
+            # an actionable AUTH_REQUIRED instead of proceeding to _find_selector
+            # and dying with the generic "could not locate chat input box".
+            post_nav_reason = detect_auth_wall(
+                getattr(page, "url", "") or "", await self._safe_page_title(page)
+            )
+            if post_nav_reason:
+                logger.warning(
+                    f"Auth wall after fresh-chat nav on {site}: {post_nav_reason} ({page.url})"
+                )
+                return self._attach_usage(auth_wall_response(site, post_nav_reason), estimated_usage)
             self._sent_system_prompt = False
             self._last_chat_page_url = page.url
 
@@ -709,27 +845,46 @@ class BrowserProvider(BaseProvider):
         ]
 
         if image_attachments:
-            logger.info(f"[STATUS] Uploading screenshot to {site}…")
-            image_delivered = await self._inject_image_clipboard(
-                page, cfg, str(image_attachments[-1]["data_base64"])
-            )
-            await page.wait_for_timeout(1200)
-            if not image_delivered:
+            # F-B-10: upload EVERY image, not just image_attachments[-1]. The
+            # prompt says "[Screenshot attached]" for each one, so pasting only
+            # the last silently dropped the earlier screenshots (the bridge path
+            # already supports 8). Clipboard side-effect note: on a CDP-attached
+            # real Chrome each paste writes the user's system clipboard via
+            # navigator.clipboard; the prior clipboard is not restored (an image
+            # write cannot be reliably undone). This is a documented trade-off
+            # of CDP mode — see F-I-4 / SECURITY.
+            total_images = len(image_attachments)
+            logger.info(f"[STATUS] Uploading {total_images} screenshot(s) to {site}…")
+            delivered_count = 0
+            for img in image_attachments:
+                if await self._inject_image_clipboard(page, cfg, str(img["data_base64"])):
+                    delivered_count += 1
+                await page.wait_for_timeout(1200)
+            if delivered_count < total_images:
                 # Screenshot-honesty (7.2/7.3): the prompt says "[Screenshot
-                # attached]" but the paste failed — make the missing image
-                # structurally known to the site model instead of letting it
-                # confabulate a screen description from no pixels.
+                # attached]" but one or more pastes failed — make the missing
+                # image(s) structurally known to the site model instead of
+                # letting it confabulate a screen description from no pixels.
+                missing = total_images - delivered_count
                 logger.warning(
-                    f"Screenshot paste failed on {site} — appending "
-                    "not-attached note to the prompt."
+                    f"{missing}/{total_images} screenshot paste(s) failed on {site} — "
+                    "appending not-attached note to the prompt."
                 )
-                prompt = (
-                    f"{prompt}\n\n"
-                    "[System note: The screenshot mentioned above could NOT "
-                    "be attached. You have NOT seen the image. Do not claim "
-                    "to see the screen; answer from the text context only, "
-                    "or say the screenshot was unavailable.]"
-                )
+                if delivered_count == 0:
+                    prompt = (
+                        f"{prompt}\n\n"
+                        "[System note: The screenshot(s) mentioned above could NOT "
+                        "be attached. You have NOT seen the image. Do not claim "
+                        "to see the screen; answer from the text context only, "
+                        "or say the screenshot was unavailable.]"
+                    )
+                else:
+                    prompt = (
+                        f"{prompt}\n\n"
+                        f"[System note: {missing} of {total_images} screenshot(s) could NOT "
+                        "be attached. Do not describe any image that was not provided; "
+                        "answer those from the text context only.]"
+                    )
 
         logger.info(f"[STATUS] Preparing {site}…")
         await self._dismiss_popups(page)
@@ -885,33 +1040,55 @@ class BrowserProvider(BaseProvider):
             logger.warning("Auto-launch: no Chrome/Chromium binary found")
             return None
 
-        args = [
-            chrome,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={self._user_data_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ]
-        launch_url = self._site_launch_url()
-        if launch_url:
-            args.append(launch_url)
+        # F-J-3: poll the previously-launched handle before spawning again — a
+        # second detached Chrome on the same profile/port just stacks orphans.
+        if self._chrome_proc is not None and self._chrome_proc.poll() is None:
+            logger.info("Auto-launch: a previously-launched Chrome is still alive; reusing it")
+        else:
+            args = [
+                chrome,
+                f"--remote-debugging-port={port}",
+                # F-I-4: bind the debug port to loopback explicitly so it is
+                # never exposed on 0.0.0.0. The CDP endpoint is UNAUTHENTICATED —
+                # any local process running as the user can attach, read cookies,
+                # and drive the logged-in browser — so keep it strictly local.
+                "--remote-debugging-address=127.0.0.1",
+                f"--user-data-dir={self._user_data_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ]
+            launch_url = self._site_launch_url()
+            if launch_url:
+                args.append(launch_url)
 
-        logger.info(
-            "[STATUS] Chrome isn't running — opening it so you can sign in…"
-        )
-        try:
-            # start_new_session detaches Chrome from this (short-lived) process so
-            # it keeps running after the task/bridge exits and is reused next turn.
-            popen_kwargs: dict = {
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.DEVNULL,
-            }
-            if platform.system() != "Windows":
-                popen_kwargs["start_new_session"] = True
-            self._chrome_proc = subprocess.Popen(args, **popen_kwargs)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Auto-launch: failed to start Chrome: {e}")
-            return None
+            logger.warning(
+                "Auto-launching Chrome with an UNAUTHENTICATED CDP port %d (bound to "
+                "127.0.0.1). Any local process running as you can drive this logged-in "
+                "browser — see SECURITY (CDP mode).",
+                port,
+            )
+            logger.info(
+                "[STATUS] Chrome isn't running — opening it so you can sign in…"
+            )
+            try:
+                # start_new_session detaches Chrome from this (short-lived) process
+                # so it keeps running after the task/bridge exits and is reused next
+                # turn.
+                popen_kwargs: dict = {
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                }
+                if platform.system() != "Windows":
+                    popen_kwargs["start_new_session"] = True
+                self._chrome_proc = subprocess.Popen(args, **popen_kwargs)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Auto-launch: failed to start Chrome: {e}")
+                return None
+
+            # F-J-3: record the PID so the desktop shell can reap this detached
+            # orphan on app quit — the provider process is short-lived and cannot
+            # reap the Chrome it deliberately outlives.
+            self._record_launched_chrome(self._chrome_proc.pid, port)
 
         # Poll the debugging port until Chrome is ready (~15s).
         last_err: Optional[Exception] = None
@@ -930,6 +1107,19 @@ class BrowserProvider(BaseProvider):
             f"Auto-launch: Chrome started but CDP port {port} did not come up: {last_err}"
         )
         return None
+
+    def _cdp_chrome_registry_path(self) -> Path:
+        return self._project_root / "sessions" / _CDP_CHROME_REGISTRY_NAME
+
+    def _record_launched_chrome(self, pid: int, port: int) -> None:
+        """Persist the launched Chrome's PID so the desktop shell can reap it on
+        app quit (F-J-3). Best-effort — a write failure is non-fatal."""
+        try:
+            path = self._cdp_chrome_registry_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"pid": int(pid), "port": int(port)}), encoding="utf-8")
+        except OSError as e:  # noqa: BLE001
+            logger.debug("Could not record CDP Chrome pid: %s", e)
 
     async def _auto_launch(self, pw: Playwright) -> Browser:
         session_path = Path(self._user_data_dir)
@@ -1480,9 +1670,11 @@ class BrowserProvider(BaseProvider):
             page, response_sel, initial_count
         )
         if not started:
-            raise TimeoutError(
-                f"No new response appeared after {RESPONSE_WAIT_S}s"
-            )
+            # F-B-8: the prompt was already injected + submitted above, so this
+            # timeout is POST-delivery. Signal a non-retryable delivered state
+            # instead of a retryable TimeoutError, so the agent does not re-send
+            # the same content (with a new hash) into the same live thread.
+            raise _DeliveredNoResponse(site, RESPONSE_WAIT_S)
 
         new_count = await page.locator(response_sel).count()
         new_element_index = max(new_count - 1, 0)
@@ -1507,6 +1699,24 @@ class BrowserProvider(BaseProvider):
         return await self._scrape_last_response(
             page, cfg["response_selectors"], min_index=new_element_index, as_markdown=True
         )
+
+    @staticmethod
+    async def _safe_page_title(page) -> str:
+        """Best-effort page title for auth-wall detection (F-B-9).
+
+        Returns "" when the page-like object exposes no title() (injected fakes,
+        older drivers) or the call fails — the URL-based markers still apply.
+        """
+        getter = getattr(page, "title", None)
+        if getter is None:
+            return ""
+        try:
+            result = getter()
+            if inspect.isawaitable(result):
+                result = await result
+            return str(result or "")
+        except Exception:  # noqa: BLE001
+            return ""
 
     async def _find_selector(
         self, page: Page, selectors: list[str]
@@ -1594,13 +1804,27 @@ class BrowserProvider(BaseProvider):
 
         while loop.time() < deadline:
             current_text = ""
+            hash_at_tail = False
             try:
                 current_text = await self._scrape_last_response(page, response_selectors, min_index=min_index)
                 logger.debug(
                     f"[DEBUG] _wait_for_generation_complete text (len={len(current_text)}): {current_text[-100:]!r}"
                 )
-                if norm_hash and norm_hash in _normalize_for_marker(current_text):
-                    logger.debug("Generation complete (completion hash found)")
+                # F-B-7: the sentinel is only a real completion signal when it
+                # sits at the TAIL of the model's OWN answer — never when the
+                # scrape is the echoed prompt (which embeds the hash inside the
+                # marker instruction), and never before min_generation_time.
+                # This preserves the [END_OF_RESPONSE_{id}] protocol; it only
+                # tightens WHEN the sentinel is accepted, killing the race where
+                # the first poll scrapes the user bubble and exits instantly.
+                is_prompt_echo = _MARKER_INSTRUCTION_SIGNATURE in current_text.lower()
+                hash_at_tail = (
+                    bool(norm_hash)
+                    and not is_prompt_echo
+                    and _hash_at_tail(_normalize_for_marker(current_text), norm_hash)
+                )
+                if hash_at_tail and loop.time() >= min_generation_time:
+                    logger.debug("Generation complete (completion hash at tail)")
                     return True
             except Exception as e:
                 logger.debug(f"[DEBUG] _scrape_last_response failed: {e}")
@@ -1659,7 +1883,9 @@ class BrowserProvider(BaseProvider):
                 # exact bug where a reply was cut off mid-sentence). So stay patient
                 # while the hash is pending and only fall back to the text-settled
                 # heuristic after a much longer idle.
-                hash_pending = bool(norm_hash) and norm_hash not in _normalize_for_marker(current_text)
+                # F-B-7: "pending" means the sentinel is not yet at the tail of
+                # the model's answer (a mid-text echo does not count as arrived).
+                hash_pending = bool(norm_hash) and not hash_at_tail
                 idle_needed = 20 if hash_pending else 8  # ~15s vs ~6s of stable text
                 if idle_count > idle_needed and loop.time() > min_generation_time:
                     if hash_pending:

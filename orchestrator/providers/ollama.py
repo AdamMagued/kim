@@ -17,7 +17,12 @@ from typing import Any
 
 import httpx
 
-from orchestrator.providers.base import BaseProvider, ProviderEnvironmentError
+from orchestrator.providers.base import (
+    BaseProvider,
+    finalize_text_content,
+    malformed_tool_args_text,
+    ProviderEnvironmentError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +160,14 @@ class OllamaProvider(BaseProvider):
         # M13: per-model context-limit cache so every completion doesn't shell
         # out to `ollama ps` (and POST /api/show) again.
         self._context_limit_cache: dict[str, tuple[int | None, str | None]] = {}
+        # F-INH-4: cache the per-turn liveness probe (/api/version) and tag list
+        # (/api/tags) for the session so every turn doesn't pay two extra HTTP
+        # round-trips. Both are invalidated on a transport error (re-probe so a
+        # stopped daemon still surfaces the friendly message) and the tag cache
+        # is refetched once if a model is unexpectedly reported missing (pulled
+        # or removed mid-session).
+        self._daemon_alive = False
+        self._session_tags: list[dict] | None = None
         logger.info(
             "OllamaProvider: base_url=%s mode=%s local_model=%s cloud_model=%s",
             self._base_url,
@@ -176,12 +189,23 @@ class OllamaProvider(BaseProvider):
         await self._ensure_daemon_running()
         # Fetch tags once for local mode; both _resolve_selected_model and
         # _validate_model need the tag list and would otherwise each make a
-        # separate HTTP round-trip.
+        # separate HTTP round-trip. F-INH-4: reuse the session tag cache across
+        # turns, refetching once if the selected model looks missing (stale
+        # cache after a mid-session pull/remove).
         cached_tags: list[dict] | None = None
         if self._mode == "local":
-            cached_tags = await self._fetch_tags()
-        model = await self._resolve_selected_model(tags=cached_tags)
-        await self._validate_model(model, tags=cached_tags)
+            cached_tags = await self._fetch_tags_cached()
+        try:
+            model = await self._resolve_selected_model(tags=cached_tags)
+            await self._validate_model(model, tags=cached_tags)
+        except ProviderEnvironmentError:
+            if self._mode == "local" and self._session_tags is not None:
+                self._session_tags = None
+                cached_tags = await self._fetch_tags_cached()
+                model = await self._resolve_selected_model(tags=cached_tags)
+                await self._validate_model(model, tags=cached_tags)
+            else:
+                raise
 
         # Proactively strip images for models we know don't support vision.
         if self._vision_cache.get(model) is False:
@@ -212,8 +236,22 @@ class OllamaProvider(BaseProvider):
                 final_obj, content, tool_calls = await self._stream_chat(_build_payload(messages))
             else:
                 raise
+        except (httpx.HTTPError, TimeoutError, ConnectionError):
+            # F-INH-4: a transport failure means our cached liveness/tag beliefs
+            # may be wrong — re-probe next turn so a stopped daemon surfaces the
+            # friendly "not running" message instead of a raw transport error.
+            self._daemon_alive = False
+            self._session_tags = None
+            raise
 
         usage = await self._usage_from_final(final_obj, model)
+
+        # F-B-3: Ollama's final chunk carries done_reason ("stop"|"length"|
+        # "load"). Ollama was the only API provider that never surfaced it, so
+        # a num_ctx-clipped / output-limited answer reached the agent as a
+        # complete reply. Thread it through finalize_text_content (which maps
+        # "length" → a truncation note) and expose stop_reason on every shape.
+        done_reason = str(final_obj.get("done_reason") or "").strip() or None
 
         def _parse_one(tc):
             fn = tc.get("function") if isinstance(tc, dict) else None
@@ -231,21 +269,37 @@ class OllamaProvider(BaseProvider):
                     "tool": "batch",
                     "args": {"calls": [_parse_one(tc) for tc in tool_calls]},
                     "content": content,
+                    "stop_reason": done_reason,
                     "usage": usage,
                 }
 
-            parsed = _parse_one(tool_calls[0])
+            tc0 = tool_calls[0]
+            fn0 = tc0.get("function") if isinstance(tc0, dict) else None
+            name0 = str((fn0 or {}).get("name") or tc0.get("name") or "").strip()
+            args0, arg_error = _normalize_tool_arguments_checked((fn0 or {}).get("arguments"))
+            if arg_error:
+                # F-INH-3: don't dispatch with silently-emptied args (an
+                # all-optional schema would run with defaults and the model
+                # never learns). Surface a re-emit nudge as the text turn.
+                return {
+                    "type": "text",
+                    "content": malformed_tool_args_text(name0),
+                    "stop_reason": done_reason,
+                    "usage": usage,
+                }
             return {
                 "type": "tool_call",
-                "tool": parsed["tool"],
-                "args": parsed["args"],
+                "tool": name0,
+                "args": args0,
                 "content": content,
+                "stop_reason": done_reason,
                 "usage": usage,
             }
 
         return {
             "type": "text",
-            "content": content,
+            "content": finalize_text_content(content, done_reason),
+            "stop_reason": done_reason,
             "usage": usage,
         }
 
@@ -279,6 +333,11 @@ class OllamaProvider(BaseProvider):
         return cleaned
 
     async def _ensure_daemon_running(self) -> None:
+        # F-INH-4: probe /api/version once per session; a transport failure
+        # elsewhere resets this flag so a daemon that dies mid-session is
+        # re-probed and yields the friendly message again.
+        if self._daemon_alive:
+            return
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 resp = await client.get(f"{self._base_url}/api/version")
@@ -287,6 +346,14 @@ class OllamaProvider(BaseProvider):
                 raise ProviderEnvironmentError(
                     "Ollama is installed but not running. Start Ollama, then try again."
                 ) from exc
+        self._daemon_alive = True
+
+    async def _fetch_tags_cached(self) -> list[dict]:
+        """Session-cached /api/tags (F-INH-4). Invalidated on transport error
+        and on a stale-model miss (see complete())."""
+        if self._session_tags is None:
+            self._session_tags = await self._fetch_tags()
+        return self._session_tags
 
     async def _resolve_selected_model(self, tags: list[dict] | None = None) -> str:
         if self._mode == "cloud":
@@ -402,26 +469,39 @@ class OllamaProvider(BaseProvider):
                             text_parts.append(str(text))
                     else:
                         text_parts.append(str(item))
-                converted: dict[str, Any] = {
-                    "role": role,
-                    "content": "\n".join([p for p in text_parts if p]).strip(),
-                }
-                if images:
-                    converted["images"] = images
-                else:
-                    matched = _match_pending(converted["content"])
-                    tool_result = _tool_result_message(role, converted["content"], pending=matched)
+                text_content = "\n".join([p for p in text_parts if p]).strip()
+
+                # F-B-4: detect a tool result INDEPENDENT of whether it carries
+                # an image. A screenshot tool result (text + image) previously
+                # skipped pairing entirely — the assistant tool_call it answered
+                # stayed pending forever (strict-server 400 on an unanswered
+                # tool_call, plus an off-by-one id cascade as the stale entry
+                # was popped by the next same-named result). Only convert when a
+                # pending call of that name exists; an unmatched [Tool result: x]
+                # (user-pasted transcript, or a trimmed-history orphan) stays a
+                # plain message. Ollama accepts images on any message, so attach
+                # them to the role:"tool" message.
+                matched = _match_pending(text_content)
+                if matched is not None:
+                    tool_result = _tool_result_message(role, text_content, pending=matched)
                     if tool_result:
+                        if images:
+                            tool_result["images"] = images
                         out.append(tool_result)
                         continue
+
+                converted: dict[str, Any] = {"role": role, "content": text_content}
+                if images:
+                    converted["images"] = images
                 out.append(converted)
             else:
                 text = str(content or "")
                 matched = _match_pending(text)
-                tool_result = _tool_result_message(role, text, pending=matched)
-                if tool_result:
-                    out.append(tool_result)
-                    continue
+                if matched is not None:
+                    tool_result = _tool_result_message(role, text, pending=matched)
+                    if tool_result:
+                        out.append(tool_result)
+                        continue
                 out.append({"role": role, "content": text})
         return out
 
@@ -441,6 +521,19 @@ class OllamaProvider(BaseProvider):
         return converted
 
     async def _stream_chat(self, payload: dict[str, Any]) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+        try:
+            return await self._stream_chat_inner(payload)
+        except httpx.TimeoutException as exc:
+            # F-B-5: re-raise httpx transport timeouts as a builtin TimeoutError
+            # (mirroring claude.py/openai_provider.py) so classify_provider_error
+            # marks the single most transient failure a local daemon has —
+            # model cold-load exceeding the connect window, or the 600s read
+            # ceiling — retryable instead of a non-retryable "unknown".
+            raise TimeoutError(
+                f"Ollama request to {self._base_url} timed out: {exc or type(exc).__name__}"
+            ) from exc
+
+    async def _stream_chat_inner(self, payload: dict[str, Any]) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
         pieces: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         final_obj: dict[str, Any] | None = None
@@ -583,6 +676,13 @@ class OllamaProvider(BaseProvider):
         return None, None
 
     def _context_limit_from_ps_sync(self, model: str) -> int | None:
+        # F-B-6: point the `ollama` CLI at the CONFIGURED daemon. Without
+        # OLLAMA_HOST the CLI always queries localhost, so with a remote
+        # base_url (KIM_OLLAMA_BASE_URL / ollama.base_url) the reported
+        # context_limit could describe a different daemon's loaded model — or
+        # the CLI errors when nothing runs locally while the remote is healthy.
+        # If the CLI isn't installed we fall back to /api/show against base_url.
+        env = {**os.environ, "OLLAMA_HOST": self._base_url}
         try:
             proc = subprocess.run(
                 ["ollama", "ps"],
@@ -590,6 +690,7 @@ class OllamaProvider(BaseProvider):
                 text=True,
                 check=False,
                 timeout=10,
+                env=env,
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -687,6 +788,32 @@ def _normalize_tool_arguments(raw: Any) -> dict[str, Any]:
             )
             return {}
     return {}
+
+
+def _normalize_tool_arguments_checked(raw: Any) -> tuple[dict[str, Any], bool]:
+    """Like _normalize_tool_arguments, but reports a genuine JSON parse failure.
+
+    Returns (args, arg_error). arg_error is True only when a string payload is
+    unparseable JSON (F-INH-3) — a valid-JSON-but-non-object value still coerces
+    to {} without signalling, matching the pre-existing lenient behavior.
+    """
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Ollama tool-call arguments are not valid JSON (%r) — signalling re-emit",
+                raw[:200],
+            )
+            return {}, True
+        if not isinstance(parsed, dict):
+            logger.warning(
+                "Ollama tool-call arguments are not an object (%r) — using {}",
+                raw[:200],
+            )
+            return {}, False
+        return parsed, False
+    return _normalize_tool_arguments(raw), False
 
 
 def _assistant_tool_call_message(raw_content: str, call_id: str | None = None) -> dict[str, Any] | None:

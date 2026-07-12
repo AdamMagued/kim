@@ -90,6 +90,16 @@ class AnthropicProvider(BaseProvider):
             else:
                 result.append({"role": role, "content": str(content)})
 
+        # F-B-2: Anthropic rejects a message list whose first turn is not a user
+        # turn ("first message must use the user role", HTTP 400 → non-retryable
+        # invalid_request). A memory trim that walks the resume boundary back to
+        # include an assistant tool-call turn yields [assistant, user, …], which
+        # bricks the whole resumed session. Every other provider tolerates this
+        # shape; prepend a synthetic user turn so claude.py does too. (Root fix
+        # is memory.py — Team A; this is the provider-side belt-and-suspenders.)
+        if result and result[0]["role"] == "assistant":
+            result.insert(0, {"role": "user", "content": "[Conversation resumed mid-exchange.]"})
+
         return result
 
     def _to_claude_tools(self, tools: list[dict]) -> list[dict]:
