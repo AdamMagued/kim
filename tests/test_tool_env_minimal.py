@@ -122,6 +122,6 @@ class TestFullStackEnvThroughServer:
         monkeypatch.delenv("KIM_HITL_RISK_THRESHOLD", raising=False)
         from mcp_server import server as srv
         result = asyncio.run(srv.call_tool("run_command", {"cmd": "env"}))
-        text = result[0].text
+        text = result.content[0].text
         assert "exit_code: 0" in text
         _assert_no_secrets(text)

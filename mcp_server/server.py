@@ -26,7 +26,7 @@ import sys
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, TextContent, Tool
 
 from mcp_server import approvals, policy
 from mcp_server.config import LOG_LEVEL, ENABLED_CONNECTOR_IDS
@@ -98,6 +98,55 @@ if _ACTIVE_CONNECTORS:
         [c.id for c in _ACTIVE_CONNECTORS],
     )
 
+# ---------------------------------------------------------------------------
+# F-H-4: required-argument contract, enforced at the JSON-RPC seam.
+# Each tool's inputSchema declares `required: [...]`, but nothing validated the
+# arguments against it before dispatch — a call missing a required field hit
+# `args["path"]` and surfaced as a one-word `ERROR: 'path'` (KeyError), which the
+# agent could not distinguish from a real runtime failure. We build a name→
+# required map once from the merged tool list (built-ins + connectors) and check
+# it below, returning a distinct `BAD_ARGS:` error instead.
+# ---------------------------------------------------------------------------
+_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {}
+for _t in _TOOLS:
+    _schema = getattr(_t, "inputSchema", None) or {}
+    _req = _schema.get("required") if isinstance(_schema, dict) else None
+    if isinstance(_req, (list, tuple)):
+        _REQUIRED_ARGS[_t.name] = tuple(str(k) for k in _req)
+
+
+def _missing_required(name: str, args: dict) -> list[str]:
+    """Required argument keys that are absent or None for this call."""
+    return [
+        key
+        for key in _REQUIRED_ARGS.get(name, ())
+        if args.get(key) is None
+    ]
+
+
+# ---------------------------------------------------------------------------
+# F-INH-6: at the MCP protocol level a tool error and ordinary tool output were
+# indistinguishable — unknown tools, policy denials, bad-args and handler
+# exceptions all came back as plain `TextContent` with `isError` unset, so the
+# agent had to rely purely on string prefixes (`ERROR:`, `PERMISSION_ERROR:`,
+# `POLICY_DENIED:`, `HITL_DENIED:`, `BAD_ARGS:`). We now ALSO set the protocol
+# `isError` flag on every error result while KEEPING the string prefixes for
+# back-compat (both signals aligned). Success returns isError=False. Handoff to
+# Team A: orchestrator/tool_errors.py should recognize the `BAD_ARGS:`,
+# `POLICY_DENIED:` and `HITL_DENIED:` prefixes so both ends of the seam agree.
+# ---------------------------------------------------------------------------
+
+def _ok(text: str) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)], isError=False
+    )
+
+
+def _err(text: str) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)], isError=True
+    )
+
 
 # ---------------------------------------------------------------------------
 # MCP handlers
@@ -109,19 +158,34 @@ async def list_tools() -> list[Tool]:
 
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> CallToolResult:
     handler = _DISPATCH.get(name)
     if handler is None:
-        return [TextContent(type="text", text=f"Unknown tool: {name}")]
+        return _err(f"Unknown tool: {name}")
+
+    args = arguments or {}
 
     # ── K1 chokepoint: EVERY tool call is policy-gated before dispatch. ──
     # policy.enforce never raises (it denies on internal errors), so nothing
-    # can slip past on an exception path.
-    args = arguments or {}
+    # can slip past on an exception path. The security gate runs BEFORE the
+    # required-arg check so a denied tool stays denied regardless of arg
+    # validity (no "your args are wrong" leak for a call you may not make).
     decision = policy.enforce(name, args)
     if decision.action == "deny":
         logger.warning("POLICY_DENIED %s: %s", name, decision.message)
-        return [TextContent(type="text", text=decision.message)]
+        return _err(decision.message)
+
+    # F-H-4: enforce the declared required-argument contract before dispatch so
+    # a malformed (but allowed) call gets a typed, actionable error instead of a
+    # KeyError leak (`ERROR: 'path'`). Runs before the approval prompt so a human
+    # is not asked to approve a structurally-invalid call.
+    missing = _missing_required(name, args)
+    if missing:
+        joined = ", ".join(repr(k) for k in missing)
+        return _err(
+            f"BAD_ARGS: {name} missing required argument(s): {joined}"
+        )
+
     if decision.action == "approve" and not approvals.is_session_approved(
         decision.signature
     ):
@@ -136,23 +200,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             approvals.remember_session_approval(decision.signature)
         elif outcome != "accept":
             logger.warning("HITL_DENIED %s (%s)", name, decision.reason)
-            return [TextContent(
-                type="text",
-                text=(
-                    f"HITL_DENIED: User denied '{name}' ({decision.reason}). "
-                    "Choose a different approach or ask the user for permission."
-                ),
-            )]
+            return _err(
+                f"HITL_DENIED: User denied '{name}' ({decision.reason}). "
+                "Choose a different approach or ask the user for permission."
+            )
 
     try:
         result = await handler(args)  # type: ignore[operator]
-        return [TextContent(type="text", text=str(result))]
+        return _ok(str(result))
     except PermissionError as e:
         logger.warning(f"PERMISSION_ERROR in {name}: {e}")
-        return [TextContent(type="text", text=f"PERMISSION_ERROR: {e}")]
+        return _err(f"PERMISSION_ERROR: {e}")
     except Exception as e:
         logger.error(f"Tool '{name}' raised unexpectedly: {e}", exc_info=True)
-        return [TextContent(type="text", text=f"ERROR: {e}")]
+        return _err(f"ERROR: {e}")
 
 
 # ---------------------------------------------------------------------------

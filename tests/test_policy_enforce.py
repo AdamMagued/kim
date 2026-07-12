@@ -386,7 +386,7 @@ class TestCallToolChokepoint:
         async def _run_all():
             for tool_name in list(srv._DISPATCH):
                 result = await srv.call_tool(tool_name, {})
-                assert "POLICY_DENIED" in result[0].text, tool_name
+                assert "POLICY_DENIED" in result.content[0].text, tool_name
 
         asyncio.run(_run_all())
         assert ran == [], f"handlers ran despite deny-all policy: {ran}"
@@ -399,7 +399,7 @@ class TestCallToolChokepoint:
 
         monkeypatch.setitem(srv._DISPATCH, "read_file", _h)
         result = asyncio.run(srv.call_tool("read_file", {"path": "README.md"}))
-        assert result[0].text == "handler-output"
+        assert result.content[0].text == "handler-output"
 
     def test_deny_result_reaches_the_caller_verbatim(self):
         from mcp_server import server as srv
@@ -407,13 +407,13 @@ class TestCallToolChokepoint:
         result = asyncio.run(
             srv.call_tool("run_command", {"cmd": "cp ~/.ssh/id_rsa /tmp"})
         )
-        assert "POLICY_DENIED" in result[0].text
+        assert "POLICY_DENIED" in result.content[0].text
 
     def test_unknown_tool_still_reports_unknown(self):
         from mcp_server import server as srv
 
         result = asyncio.run(srv.call_tool("no_such_tool", {}))
-        assert "Unknown tool" in result[0].text
+        assert "Unknown tool" in result.content[0].text
 
 
 # ---------------------------------------------------------------------------
