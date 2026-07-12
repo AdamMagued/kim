@@ -40,6 +40,7 @@ from orchestrator.events_gen import (
     LOG_TAG_FAILED,
     LOG_TAG_TASK_COMPLETE,
     emit_hitl_approval_request,
+    emit_run_done,
     emit_status,
 )
 
@@ -908,6 +909,33 @@ async def _run_exec_task(
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 
+def _emit_terminal_for_rc(rc: int) -> None:
+    """Emit a typed run-lifecycle terminal event for a codex-bridge exit code.
+
+    F-H-2 / F-H-1: the Code-tab (codex browser-bridge) path historically
+    signalled termination ONLY via legacy magic-string lines (``TASK_COMPLETE:``
+    / ``[FAILED]``), so — unlike a chat run, which emits typed ``kim:run-done``
+    from ``cli.py`` — the frontend had no typed, run-attributable signal to
+    clear ``isRunning`` on. That divergence is the root cause of the stuck
+    spinner (F-F-5) and the event-bleed on a session switch (F-F-2). We now
+    emit ``kim:run-done`` on EVERY codex-bridge exit path (mapped from the
+    return code), mirroring the chat contract. The event self-stamps the
+    run-identity envelope from ``KIM_RUN_ID`` / ``KIM_SESSION_ID`` when the
+    spawner exports them (F-H-8 — handoff to D' for ``codex_browser_spec``).
+    The legacy lines are kept for back-compat (codex CLI text protocol).
+    """
+    if rc == 0:
+        termination, success = "task_complete", True
+    elif rc == 130:
+        termination, success = "cancelled", False
+    else:
+        termination, success = "failed", False
+    try:
+        emit_run_done(termination, success)
+    except Exception:  # noqa: BLE001 — a terminal event must never mask the real rc
+        pass
+
+
 def main() -> None:
     args = _parse_args()
     logging.basicConfig(
@@ -919,6 +947,8 @@ def main() -> None:
         rc = asyncio.run(_run_async(args))
     except KeyboardInterrupt:
         rc = 130
+    # F-H-2: typed terminal lifecycle event on the SAME channel as chat runs.
+    _emit_terminal_for_rc(rc)
     sys.exit(rc)
 
 
