@@ -17,6 +17,7 @@ import {
   providerLabel,
   estimateCostUsd,
   formatCostUsd,
+  costBasisLabel,
 } from './utils';
 import { buildThinkingTrace, traceToWorkedFor } from './parsers';
 import { ActivityFeed } from './ActivityFeed';
@@ -247,7 +248,7 @@ export function StreamRenderer({
         <WorkedForPill trace={workedForTrace} duration={duration} />
         {costUsd !== null && (
           <span
-            title={`~${formatCostUsd(costUsd)} estimated · ${tokenStats?.input.toLocaleString()} in / ${tokenStats?.output.toLocaleString()} out tokens`}
+            title={`~${formatCostUsd(costUsd)} — ${costBasisLabel(runProvider ?? '') ?? 'estimated'} · ${tokenStats?.input.toLocaleString()} in / ${tokenStats?.output.toLocaleString()} out tokens`}
             style={{
               fontFamily: 'var(--kim-mono)',
               fontSize: 11.5,
