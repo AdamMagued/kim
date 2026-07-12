@@ -2,7 +2,7 @@
 
 **Territory:** `tests/`, `desktop/src/**/*.test.*`, cli tests, `.github/workflows/`, pyrightconfig.json, lint configs, justfile.
 **Baseline:** BASELINE.md @ `6f69adb` — pytest 2,057 · vitest 242 · cargo desktop 164 · cli 183 · py coverage 70% · 1 known flake.
-**Status:** IN PROGRESS (preliminary pass committed early per resilience protocol; findings appended as confirmed).
+**Status:** COMPLETE — 15 findings (2 High · 8 Medium · 5 Low) + test-quality audit + coverage hot-spots + Wave-4 ratchet plan.
 
 ---
 
@@ -164,6 +164,59 @@ Modules ≥100 stmts, ranked by coverage; **bold** = on a security or kill path:
 
 Unmeasured entirely: all 26k LOC of Rust (F-K-11), all 20k LOC of TS (F-K-10).
 
+## F-K-15: The `just check` fast loop never compiles or tests the CLI crate
+- **File:** justfile:10-40 (`check` recipe)
+- **Severity:** Low
+- **Class:** test-gap
+- **Evidence:** `just check` runs `tsc`, `cargo check -p desktop`, fast pytest, and pyright — but nothing for `-p kim-cli`. Root CLAUDE.md itself warns "cli/ is a separate crate, easy to forget"; the fast loop institutionalizes the forgetting. A CLI-breaking change passes every local `just check` and dies only in CI (or, before the branch-list fix noted in ci.yml's own comment, not even there). CLI tests are otherwise NOT CI-only — `just test` does include them — but the primary dev loop skips the crate entirely.
+- **Fix sketch:** Add `cargo check -p kim-cli` (cheap, parallel with the desktop check) to the `check` recipe.
+- **Cross-territory?** no
+
 ---
 
-*(Continued — CI cli-tests question, Wave-4 ratchet plan.)*
+## Wave-4 ratchet plan (Team R1 input — the machinery that keeps it fixed)
+
+Current strictness surface, measured at this commit:
+
+| Gate | Today | Suppression debt |
+|---|---|---|
+| pyright | `basic`, 4 dirs, tests/ excluded, warnings ignored, version unpinned | 38 `type: ignore`/`pyright: ignore` |
+| clippy | `-D warnings` desktop + cli (already good) | 8 `#[allow]` total (5 too_many_arguments, 2 dead_code, 1 assertions_on_constants) — small, curate & comment each |
+| eslint | does not exist | n/a (0 `@ts-ignore` though — the codebase is ready for type-checked lint) |
+| flake8 | orchestrator/ + kimctl/ only | per-file E501 exemption on agent.py (justified, keep) |
+| coverage | py gate 60% vs 70% actual; rs/ts unmeasured | — |
+| dead code | no CI detector | 2 `#[allow(dead_code)]` seeds |
+
+Ratchet steps, ordered so each is independently mergeable:
+
+1. **Coverage ratchet (py):** raise `--cov-fail-under` to floor(actual)-1 immediately (F-K-2); then replace with a checked-in `coverage-ratchet.json` (per-package floors) + a 20-line script: fail if any package drops, auto-suggest raising when it grows. Targets from the hot-spots table: git.py and windows.py first (security), then ollama.py/bridge_client.py.
+2. **Coverage existence (ts, rs):** `@vitest/coverage-v8` config (F-K-10) and a `cargo llvm-cov` report job (F-K-11) — measure for one wave before gating.
+3. **pyright:** pin the version (F-K-3); add `tests/` to include at `basic`; then per-directory `strict` via `executionEnvironments` — order: `orchestrator/providers/` → `mcp_server/tools/` → rest of `mcp_server/` → `orchestrator/` — burning down the 38 ignores as each dir flips.
+4. **eslint introduction (with Team F):** flat config, `typescript-eslint` recommended-type-checked + `react-hooks`; CI step fails on any error from day one (codebase has zero ts-ignores — start strict, allowlist nothing).
+5. **flake8 → ruff (suggest):** one tool for the 4 python dirs + tests/, config in pyproject; keeps the agent.py E501 carve-out.
+6. **Dead-code detectors as CI:** `vulture --min-confidence 90` (py) with allowlist file; `cargo machete` (rs); `knip` (ts) — each as a non-required job for one wave, then required.
+7. **Windows CI** (F-K-1): `cargo check -p desktop -p kim-cli` + `cargo test -p kim-cli` on windows-latest, required; pytest-on-Windows as nightly non-required until the suite is proven there.
+8. **Golden/contract job** (adopts Team H's docs/CONTRACTS.md §6 test plan): a `golden` CI job running the four seam suites (TS decode, Rust emit→decode, proxy request/response goldens, app-server translation goldens) with fixtures under `tests/golden/` + `just regen-goldens`; this also closes the F-K-7 fixture-drift hole from the fake side, with the nightly real-binary job closing it from the real side.
+9. **Flake policy:** fix F-K-9's one-liner now; add `pytest-rerunfailures` for nothing (suite is clean — keep it that way by policy: a flake gets fixed or the test gets deleted, never retried-into-green).
+
+---
+
+## Summary
+
+| # | Severity | One-liner |
+|---|---|---|
+| F-K-1 | High | No Windows CI job — Windows ships release-blind |
+| F-K-8 | High | git tool's path-validation security gate: 0% coverage |
+| F-K-2 | Medium | Coverage gate 10 pts below reality, not a ratchet |
+| F-K-3 | Medium | pyright gate: warnings ignored, version unpinned, tests/ excluded |
+| F-K-5 | Medium | eslint absent (CI half of Team F F-F-1) |
+| F-K-6 | Medium | Installer archives unsigned; sha256 self-attested; unsigned releases proceed silently |
+| F-K-7 | Medium | Real-codex-binary parity suite never runs in CI |
+| F-K-9 | Medium | Known flake root-caused: 1s budget races interpreter startup (fix already documented in sibling test) |
+| F-K-10 | Medium | Frontend: 862-LOC StreamRenderer untested; vitest coverage unmeasurable |
+| F-K-11 | Medium | Rust coverage never measured (subprocess kill paths unknown) |
+| F-K-4 | Low | flake8 covers only 26% of Python LOC |
+| F-K-12 | Low | CLI tests parallel-unsafe, reason undocumented |
+| F-K-13 | Low | CI pip install diverges from shipped dep graph |
+| F-K-14 | Low | `slow` marker used by zero tests; `just check` fast filter is a no-op |
+| F-K-15 | Low | `just check` never touches the CLI crate |
