@@ -438,6 +438,12 @@ export const TOOL_MAP: Record<string, { icon: string; label: (args: Record<strin
   get_screen_info:    { icon: '›', label: _a => 'Reading screen info' },
 };
 
+// F-H-6: the canonical grammar for the legacy `[TAG]` text protocol this parser
+// implements is written down in docs/CONTRACTS.md "Seam 2" (tag-line /
+// plan-envelope-line / diff-line / tool-line). The vocabulary's single source of
+// truth is LogTags (events.gen.ts) ← events.schema.json "legacyTags". Keep this
+// parser in sync with that grammar; the golden fixture in
+// __tests__/tagGrammar.test.ts pins the representative shapes so a drift fails CI.
 export function parseLogLine(raw: string, id: number): ActivityItem | null {
   if (!raw.trim()) return null;
 
