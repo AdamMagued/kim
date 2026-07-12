@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from orchestrator.providers.browser import provider as bp
 from orchestrator.providers.browser.provider import (
+    _DeliveredNoResponse,
     BrowserProvider,
     _normalize_for_marker,
 )
@@ -331,6 +332,47 @@ class TestWaitForGenerationComplete(unittest.IsolatedAsyncioTestCase):
                 min_generation_s=0.0,
             )
         self.assertFalse(result)  # idle-heuristic exit, not the transition
+
+
+# ---------------------------------------------------------------------------
+# F-B-8: post-send timeout must NOT be a retryable re-send
+# ---------------------------------------------------------------------------
+
+class _FakeDriver:
+    def __init__(self, page, site):
+        self._page, self._site = page, site
+
+    async def acquire(self):
+        return self._page, self._site
+
+
+class TestDeliveredNoResponse(unittest.IsolatedAsyncioTestCase):
+    def test_delivered_no_response_is_not_a_retryable_timeout(self):
+        # Must not be a TimeoutError, or classify_provider_error would mark it
+        # retryable and the agent would re-inject the whole prompt.
+        self.assertFalse(issubclass(_DeliveredNoResponse, TimeoutError))
+
+    async def test_post_send_timeout_returns_need_help_not_raise(self):
+        provider = _provider()
+        provider._sent_system_prompt = False
+
+        async def _raise_delivered(*_a, **_k):
+            raise _DeliveredNoResponse("chatgpt", 60)
+
+        with patch.object(provider, "_run_chat_flow", _raise_delivered):
+            result = await provider.complete(
+                [{"role": "user", "content": "hi"}],
+                tools=[],
+                system="sys",
+                page_driver=_FakeDriver(object(), "chatgpt"),
+            )
+        self.assertEqual(result["type"], "text")
+        self.assertIn("NEED_HELP", result["content"])
+        self.assertIn("do not resend", result["content"].lower())
+        self.assertIn("chatgpt", result["content"])
+        # Delivered → the system prompt reached the thread; committed so a manual
+        # "continue" does not rebuild the full system prompt.
+        self.assertTrue(provider._sent_system_prompt)
 
 
 # ---------------------------------------------------------------------------

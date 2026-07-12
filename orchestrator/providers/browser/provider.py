@@ -109,6 +109,23 @@ _MOD_KEY = MOD_KEY
 _to_list = to_list
 
 
+class _DeliveredNoResponse(Exception):
+    """Raised when the prompt was already SUBMITTED into the site thread but no
+    response appeared in time (F-B-8).
+
+    This must NOT be retried: the message is already in the conversation, so a
+    retry (H6 re-raised the old TimeoutError as retryable) re-injects the whole
+    prompt with a NEW completion hash into the SAME chat — duplicate prompts,
+    interleaved answers, and a new-hash wait that latches onto the first send's
+    late reply. complete() converts it into an in-band NEED_HELP instead.
+    """
+
+    def __init__(self, site: str, waited_s: int):
+        self.site = site
+        self.waited_s = waited_s
+        super().__init__(f"No response from {site} after {waited_s}s (prompt already delivered)")
+
+
 def _normalize_for_marker(text: str) -> str:
     """Collapse whitespace and markdown styling characters for marker matching.
 
@@ -683,6 +700,28 @@ class BrowserProvider(BaseProvider):
                 )
                 self._commit_sent_system_prompt(result, new_sent)
                 return result
+        except _DeliveredNoResponse as e:
+            # F-B-8: prompt already delivered — return a NEED_HELP that names the
+            # thread state (non-retryable, in-band) instead of re-raising a
+            # retryable TimeoutError that would re-inject the whole prompt.
+            logger.warning(
+                "No response from %s after %ss; prompt already delivered — not retrying.",
+                e.site, e.waited_s,
+            )
+            # The send reached the thread, so the system prompt is committed.
+            self._sent_system_prompt = new_sent
+            return self._attach_usage(
+                {
+                    "type": "text",
+                    "content": (
+                        f"NEED_HELP: The message was delivered to the {e.site} chat but no "
+                        f"response appeared within {e.waited_s}s. The prompt is already in that "
+                        "thread — do not resend it. Check the browser window; if it is still "
+                        'generating, wait and send "continue" to read the reply.'
+                    ),
+                },
+                estimated_usage,
+            )
         except TimeoutError:
             # H6: TimeoutError is an OSError subclass, but a slow generation /
             # response wait is transient — re-raise so the agent's retry path
@@ -1508,9 +1547,11 @@ class BrowserProvider(BaseProvider):
             page, response_sel, initial_count
         )
         if not started:
-            raise TimeoutError(
-                f"No new response appeared after {RESPONSE_WAIT_S}s"
-            )
+            # F-B-8: the prompt was already injected + submitted above, so this
+            # timeout is POST-delivery. Signal a non-retryable delivered state
+            # instead of a retryable TimeoutError, so the agent does not re-send
+            # the same content (with a new hash) into the same live thread.
+            raise _DeliveredNoResponse(site, RESPONSE_WAIT_S)
 
         new_count = await page.locator(response_sel).count()
         new_element_index = max(new_count - 1, 0)
