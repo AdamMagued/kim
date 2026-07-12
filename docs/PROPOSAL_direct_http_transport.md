@@ -187,3 +187,206 @@ A direct-HTTP transport is a true drop-in **iff** it provides:
 The single load-bearing difference is **Auth** (and the anti-automation tokens
 bound up with it). Everything else is equal or *easier* over HTTP. Section 2
 therefore concentrates on auth + anti-bot per provider.
+
+---
+
+## 2. Per-provider investigation — direct HTTP / private-API replay
+
+**Method + honesty caveat:** I have **no network access** to these services from
+this environment, so the endpoint shapes, token names, and anti-bot mechanisms
+below are reconstructed from (a) Kim's own code, which already names several of
+these (e.g. the Gemini `authuser` routing, the Cloudflare/`__cf_chl` markers in
+`detect_auth_wall`), and (b) my training knowledge of these web apps as of early
+2026. **Every endpoint path and token name below is a hypothesis that must be
+verified empirically** (open DevTools → Network on a live logged-in session and
+read the actual request). I flag confidence explicitly. These are *private,
+unversioned* endpoints; they change without notice, so even a verified shape has
+a short shelf life.
+
+For each provider: the send/stream endpoint, the auth material, the anti-automation
+defenses, and a verdict.
+
+---
+
+### 2.1 Claude.ai (claude.ai)
+
+**Endpoints (medium-high confidence on shape, exact paths need verifying):**
+- List/create conversation: `POST /api/organizations/{org_uuid}/chat_conversations`
+- Send + stream a completion:
+  `POST /api/organizations/{org_uuid}/chat_conversations/{conv_uuid}/completion`
+  → **SSE stream** (`text/event-stream`), `data:` frames carrying
+  `completion` deltas and a terminal event. This is the cleanest of the four:
+  a well-formed SSE completion stream maps directly onto Kim's `complete()`
+  (accumulate deltas, return the final text — no sentinel needed).
+- The `{org_uuid}` is discoverable from `GET /api/organizations` (or
+  `/api/bootstrap`) once authenticated.
+
+**Auth material:**
+- Session cookie `sessionKey` (an `httpOnly` cookie set at login on `claude.ai`).
+- The organization UUID (fetched once, then cached).
+- Standard headers: `anthropic-client-*` / `anthropic-client-version`-style
+  headers the web app sends, plus `Referer`/`Origin` = `https://claude.ai`.
+
+**How Kim could obtain the credential WITHOUT a visible window:**
+- Extract `sessionKey` from the persisted Chrome profile Kim already maintains
+  (`sessions/chrome_data`) — Kim *already* keeps a logged-in profile there for
+  the headless path. Cookies live in that profile's `Cookies` SQLite DB (though
+  on macOS/Windows they may be encrypted with an OS-keychain key — extraction is
+  non-trivial and is exactly the sort of thing CLAUDE.md's secret-file sandbox is
+  designed to keep Kim *away* from).
+- Cleaner: a **one-time headless CDP session** reads `document.cookie` /
+  `context.cookies()` via Playwright, persists `sessionKey` into a Kim-owned
+  cookie jar, and refreshes it opportunistically. This is the realistic path and
+  it means "no *visible* window," not "no browser engine ever."
+
+**Anti-automation defenses:**
+- **Cloudflare** fronts claude.ai. Normal API/XHR calls from the logged-in origin
+  usually carry a `cf_clearance` cookie already minted by the browser; a raw
+  client that has a valid `cf_clearance` + `sessionKey` can often pass. But
+  `cf_clearance` is **bound to the client's IP + User-Agent + (increasingly)
+  TLS/JA3 fingerprint** — replaying it from Python `httpx` whose JA3 differs from
+  Chrome's can trip a re-challenge (`__cf_chl…`, which Kim's `detect_auth_wall`
+  already recognizes as a wall).
+- No known Arkose/proof-of-work on the *completion* call itself (unlike ChatGPT).
+- Server-side abuse heuristics on cadence/volume still apply.
+
+**Verdict: VIABLE-BUT-FRAGILE.** Claude.ai is the *best* candidate for a
+cookie-jar HTTP transport: clean SSE, a single session cookie, no per-message
+proof-of-work. The fragility is Cloudflare fingerprinting — mitigable by
+matching Chrome's User-Agent and, if needed, using a TLS-fingerprint-spoofing
+client (`curl_cffi` / a JA3-matching wrapper) and reusing the browser-minted
+`cf_clearance`. Worth a spike; **not** worth betting the whole feature on.
+
+---
+
+### 2.2 ChatGPT (chatgpt.com)
+
+**Endpoints (high confidence on names, from the well-documented web app):**
+- Send + stream: `POST /backend-api/conversation` → **SSE** (`data:` frames with
+  `message` deltas, terminal `data: [DONE]`).
+- Pre-flight: `POST /backend-api/sentinel/chat-requirements` (formerly
+  `/backend-api/conversation/requirements`) returns a **`requirements` token**
+  plus a **proof-of-work seed** that the *next* `POST /conversation` must echo in
+  the `Openai-Sentinel-Chat-Requirements-Token` header (and a computed PoW
+  answer). Session bootstrap: `GET /api/auth/session` yields the `accessToken`.
+
+**Auth material:**
+- `__Secure-next-auth.session-token` cookie (login session), **plus** a
+  short-lived **Bearer `accessToken`** fetched from `/api/auth/session`.
+- Cloudflare `cf_clearance` cookie.
+- The `requirements` token + solved **proof-of-work** (Sentinel), and,
+  historically/again under load, an **Arkose Labs token** (`arkose.func` / the
+  `openai-…` enforcement) for the conversation call.
+
+**Anti-automation defenses — the heaviest of the four:**
+- **Sentinel proof-of-work.** The `chat-requirements` response hands the client a
+  seed; the browser runs JS to compute a hashcash-style PoW and returns it. This
+  is *designed* to require executing OpenAI's obfuscated in-page JavaScript.
+  Re-implementing it in Python is possible but it is a **moving target that
+  OpenAI rotates deliberately** — a permanent arms race.
+- **Arkose / FunCaptcha** can be required for the conversation endpoint,
+  especially for automation-looking traffic.
+- **Cloudflare** + UA/JA3 fingerprinting on top.
+
+**Obtaining creds without a visible window:** the cookie + accessToken are
+extractable from a headless session, but the **PoW/Arkose tokens are minted
+per-request by page JS** — a cookie jar cannot pre-compute them. You would have
+to run the page's JS (i.e., a browser engine) *per message*, which defeats the
+entire point of "no browser."
+
+**Verdict: NOT-VIABLE without a browser engine.** ChatGPT is explicitly hardened
+against exactly this (Sentinel PoW + Arkose exist to stop cookie-replay bots).
+A pure-HTTP transport would be a perpetual reverse-engineering treadmill and
+would break on OpenAI's schedule, not Kim's. Do not build it. (This is *the*
+provider where headless-browser is the only sane answer.)
+
+---
+
+### 2.3 Gemini (gemini.google.com)
+
+**Endpoints (medium confidence — Google's RPC is deliberately opaque):**
+- Gemini web does **not** use a clean REST/SSE API. It uses Google's
+  **`batchexecute`** RPC transport:
+  `POST /_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate`
+  (RPC id historically `assistant.lamda.BardFrontendService/StreamGenerate`),
+  with a **`f.req`** form-encoded envelope and a chunked, length-prefixed
+  **JSON-array** response (not standard SSE — a Google-proprietary framing you
+  must hand-parse). Kim's `site_configs` already targets `gemini.google.com` and
+  the code already threads a Gemini **`authuser`** index for multi-account.
+
+**Auth material:**
+- Google SID/HSID/SSID/`__Secure-1PSID` + `__Secure-1PSIDTS` cookies (the
+  `1PSIDTS` one **rotates frequently** and must be refreshed).
+- A **per-page `at` token** (a.k.a. `SNlM0e`) scraped from the initial HTML of
+  `gemini.google.com` — **required in the `f.req` body of every call**. This is
+  the killer: the `at` token is *not a cookie*; it is embedded in the page and
+  must be re-scraped when it expires. `bl` (backend build label) and `reqid`
+  parameters are also page-derived.
+- `authuser` / `X-Goog-*` headers.
+
+**Anti-automation defenses:**
+- The **`at`/`SNlM0e` "magic cookie" pattern is itself the anti-automation
+  measure** — you cannot call `StreamGenerate` with cookies alone; you must first
+  GET the page and extract the token, which means you are already halfway to
+  needing a browser. Community libraries (e.g. the various `Bard`/`gemini` API
+  reverse-engineering projects) do exactly this with a cookie + a page-scrape,
+  and they **break repeatedly** as Google rotates `1PSIDTS` and the RPC ids.
+- Google account-security heuristics may challenge non-browser access patterns
+  and can flag the account.
+
+**Obtaining creds without a visible window:** the cookies + a one-time page GET
+to extract `at` are doable headlessly, but the `1PSIDTS` rotation + `at`
+expiry mean you are effectively re-scraping the page routinely — again, a browser
+engine in the loop.
+
+**Verdict: NOT-VIABLE via pure HTTP (VIABLE-BUT-VERY-FRAGILE via cookie +
+page-scrape libraries).** The `batchexecute`/`f.req` framing and the `SNlM0e`
+page token make this a proprietary-RPC reverse-engineering project with a
+notoriously short half-life. The existing browser path is more robust. Do not
+build a pure-HTTP Gemini transport.
+
+---
+
+### 2.4 Grok (grok.com / x.com)
+
+**Endpoints (lower confidence — least publicly documented, and it moved from
+x.com to grok.com):**
+- `grok.com` exposes REST-ish endpoints such as
+  `POST /rest/app-chat/conversations/new` and `.../conversations/{id}/responses`
+  returning a **streamed JSON-lines** body. The x.com-hosted variant used
+  `/i/api/graphql/…/Grok…` GraphQL operations.
+
+**Auth material:**
+- x.com/grok.com auth cookies (`auth_token`, `ct0` CSRF), and — on the x.com
+  GraphQL path — a static **Bearer** plus the `x-csrf-token` (= `ct0` cookie)
+  and a **`x-client-transaction-id`** header.
+
+**Anti-automation defenses:**
+- **Cloudflare** on grok.com.
+- The x.com path requires the **`x-client-transaction-id`** header, which is
+  computed by obfuscated client JS (the same mechanism that makes the Twitter/X
+  private API painful to automate) plus a **guest-token / CSRF** dance.
+- Aggressive account-level rate limiting and bot heuristics (X is hostile to
+  scraping by policy and by engineering).
+
+**Verdict: NOT-VIABLE-without-a-browser-engine (VIABLE-BUT-FRAGILE at best).**
+The client-transaction-id header alone requires running X's JS; grok.com's
+Cloudflare + undocumented, actively-changing endpoints make this the least
+stable target after ChatGPT. Do not build a pure-HTTP Grok transport.
+
+---
+
+### 2.5 Per-provider verdict summary
+
+| Provider | Send/stream endpoint (hypothesis) | Auth material | Hard blocker | Verdict |
+|---|---|---|---|---|
+| **Claude.ai** | `POST …/chat_conversations/{uuid}/completion` (SSE) | `sessionKey` cookie + org UUID | Cloudflare JA3/UA fingerprint on `cf_clearance` | **VIABLE-BUT-FRAGILE** — best candidate |
+| **ChatGPT** | `POST /backend-api/conversation` (SSE) | session cookie + Bearer accessToken | **Sentinel proof-of-work + Arkose** (page-JS-minted per request) | **NOT-VIABLE without a browser engine** |
+| **Gemini** | `POST …/StreamGenerate` (`batchexecute`/`f.req`) | 1PSID(+TS) cookies + **`SNlM0e`/`at` page token** | page-minted `at` token + `1PSIDTS` rotation + proprietary RPC framing | **NOT-VIABLE via pure HTTP** (fragile cookie+scrape only) |
+| **Grok** | `POST /rest/app-chat/conversations/…` (JSON-lines) or x.com GraphQL | x.com cookies + `ct0` CSRF + Bearer | **`x-client-transaction-id`** (page-JS-minted) + Cloudflare | **NOT-VIABLE-without-a-browser-engine** |
+
+**The pattern:** three of four services mint a per-request token *in the page's
+JavaScript* (ChatGPT PoW/Arkose, Gemini `SNlM0e`, Grok transaction-id). A cookie
+jar cannot manufacture those tokens; only a JS runtime (a browser engine) can.
+**Only Claude.ai** authorizes the completion call with a plain session cookie,
+and even it is gated by Cloudflare fingerprinting.
