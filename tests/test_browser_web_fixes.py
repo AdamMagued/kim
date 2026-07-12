@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import time
 import unittest
+from typing import Any
 from unittest import mock
 
 from mcp_server.tools.web import browser as web_browser
@@ -125,7 +126,7 @@ class _FakePage:
         self._unroute_raises = unroute_raises
         self._unroute_all_raises = unroute_all_raises
         if not has_unroute_all:
-            self.unroute_all = None  # attribute exists but not callable
+            self.unroute_all = None  # type: ignore[assignment]
 
     async def route(self, matcher, handler):
         self.routes.append((matcher, handler))
@@ -260,7 +261,7 @@ class _FakeGuardPage:
 
     def __init__(self):
         self.main_frame = _FakeFrame()
-        self._route_handler = None
+        self._route_handler: Any = None
         self.route_pattern = None
 
     async def route(self, pattern, handler):

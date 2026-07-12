@@ -23,6 +23,7 @@ from . import browser
 # compatibility: this module's own pre-goto check below, web/__init__.py's
 # facade, and the test suite all reach for `navigation._is_ssrf_target`.
 from .browser import _is_ssrf_target, _parse_host_as_ip, _whatwg_ipv4_part  # noqa: F401
+from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -58,15 +59,15 @@ async def handle_web_open(args: dict) -> str:
     password = str(args.get("password", "")).strip()
 
     if not url:
-        return "ERROR: url is required"
+        return tool_error("url is required")
     # Security: the controlled browser must NOT read local files or privileged
     # pages. file://, chrome://, about:, view-source:, filesystem: would bypass the
     # path sandbox entirely — e.g. open_url("file:///Users/<u>/.ssh/id_rsa") followed
     # by web_text() exfiltrates any file with no approval gate. Only http(s) (and
     # inline data:) are permitted.
     if url.lower().startswith(("file:", "chrome:", "about:", "view-source:", "filesystem:")):
-        return (
-            "ERROR: refusing to open a local or privileged URL scheme. "
+        return tool_error(
+            "refusing to open a local or privileged URL scheme. "
             "Only http(s) URLs are allowed."
         )
     if not url.startswith(("http://", "https://", "data:")):
@@ -201,12 +202,12 @@ async def handle_web_open(args: dict) -> str:
                 "otherwise ask the user to sign in manually."
                 + unroute_warn
             )
-        return f"ERROR: navigation failed: {_goto_error}{unroute_warn}"
+        return tool_error(f"navigation failed: {_goto_error}{unroute_warn}")
 
     if page.url.startswith("chrome-error://"):
         mode_str = " (Real Browser)" if browser._is_real_browser else " (Dedicated Kim Browser)"
-        return (
-            f"ERROR: browser error page after opening {url}{mode_str}\n"
+        return tool_error(
+            f"browser error page after opening {url}{mode_str}\n"
             "The controlled browser did not reach usable page content. "
             "Do not treat this as open; ask for help or retry with valid credentials."
             + unroute_warn
@@ -235,7 +236,7 @@ async def handle_web_wait_for(args: dict) -> str:
     target = text or selector
     timeout = _clamp_wait_ms(args.get("timeout_ms"))
     if not target:
-        return "ERROR: 'text' or 'selector' is required"
+        return tool_error("'text' or 'selector' is required")
     page = await browser._page()
     try:
         # A leading "/" only means XPath when the caller explicitly used the
@@ -257,7 +258,7 @@ async def handle_web_wait_for_url(args: dict) -> str:
     regex = str(args.get("url_regex") or "").strip()
     timeout = _clamp_wait_ms(args.get("timeout_ms"))
     if not contains and not regex:
-        return "ERROR: 'url_contains' or 'url_regex' is required"
+        return tool_error("'url_contains' or 'url_regex' is required")
     page = await browser._page()
     try:
         if regex:
@@ -277,7 +278,7 @@ async def handle_web_back(args: dict) -> str:
     try:
         await page.go_back(wait_until="domcontentloaded", timeout=10000)
     except Exception as e:
-        return f"ERROR: back failed: {e}"
+        return tool_error(f"back failed: {e}")
     return f"Navigated back to {page.url}"
 
 

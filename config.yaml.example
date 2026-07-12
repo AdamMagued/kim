@@ -86,7 +86,7 @@ screenshot_scale: 0.75
 # It lives in mcp_server/tools/shell.py (_DENY_COMMANDS / _DENY_PATTERNS),
 # mirrored at the policy chokepoint (mcp_server/policy.py). Config must never
 # be able to weaken a code-owned safety gate, so there is deliberately no
-# `blocked_commands` key — a previous one existed but was read by nothing
+# `blocked_cmds` key — a previous one existed but was read by nothing
 # (F-G-4), giving operators false confidence. Config can only ADD allowed
 # binaries via `shell.allowlist_extra` / `shell.safe_extra`; denied commands
 # stay denied regardless of config.

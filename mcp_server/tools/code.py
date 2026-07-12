@@ -32,6 +32,7 @@ import os
 from mcp_server.config import PROJECT_ROOT, CODE_TIMEOUT, SHELL_TIMEOUT, validate_path
 from mcp_server.os_utils import IS_MACOS, IS_LINUX, IS_WINDOWS
 from mcp_server.tools.shell import _kill_process_tree
+from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -285,10 +286,10 @@ async def _run_exec(
             parts.append("(no output)")
         return "\n".join(parts)
     except FileNotFoundError:
-        return f"ERROR: '{cmd[0]}' is not installed or not found on PATH."
+        return tool_error(f"'{cmd[0]}' is not installed or not found on PATH.")
     except Exception as e:
         logger.error(f"code exec failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 # ── Tool handlers ─────────────────────────────────────────────────────────────
@@ -328,9 +329,9 @@ async def handle_run_python(args: dict) -> str:
             return f"PERMISSION_ERROR: {e}"
 
         if not resolved.exists():
-            return f"ERROR: File not found: {resolved}"
+            return tool_error(f"File not found: {resolved}")
         if not str(resolved).endswith(".py"):
-            return f"ERROR: Expected a .py file, got: {resolved.name}"
+            return tool_error(f"Expected a .py file, got: {resolved.name}")
 
         # NOTE: the inline-snippet blocklist is NOT applied to files (M4).
         # Nearly every real .py file contains `import os` or the word
@@ -356,7 +357,7 @@ async def handle_run_python(args: dict) -> str:
         )
 
     else:
-        return "ERROR: Provide either 'file' (path to .py file) or 'code' (inline Python snippet)."
+        return tool_error("Provide either 'file' (path to .py file) or 'code' (inline Python snippet).")
 
 
 async def handle_run_node(args: dict) -> str:
@@ -387,7 +388,7 @@ async def handle_run_node(args: dict) -> str:
     try:
         node = _find_node()
     except RuntimeError as e:
-        return f"ERROR: {e}"
+        return tool_error(e)
 
     if file_path:
         # Execute a .js file
@@ -397,9 +398,9 @@ async def handle_run_node(args: dict) -> str:
             return f"PERMISSION_ERROR: {e}"
 
         if not resolved.exists():
-            return f"ERROR: File not found: {resolved}"
+            return tool_error(f"File not found: {resolved}")
         if not str(resolved).endswith((".js", ".mjs", ".cjs")):
-            return f"ERROR: Expected a .js file, got: {resolved.name}"
+            return tool_error(f"Expected a .js file, got: {resolved.name}")
 
         # NOTE: the inline-snippet blocklist is NOT applied to files (M4) —
         # any real Node script `require`s fs/http/etc. Files are gated by
@@ -424,7 +425,7 @@ async def handle_run_node(args: dict) -> str:
         return await _run_exec(cmd, cwd=cwd, timeout=timeout)
 
     else:
-        return "ERROR: Provide either 'file' (path to .js file) or 'code' (inline JavaScript snippet)."
+        return tool_error("Provide either 'file' (path to .js file) or 'code' (inline JavaScript snippet).")
 
 
 async def handle_lint_file(args: dict) -> str:
@@ -442,7 +443,7 @@ async def handle_lint_file(args: dict) -> str:
     timeout = _clamp_code_timeout(args.get("timeout"), SHELL_TIMEOUT)
 
     if not file_path:
-        return "ERROR: 'path' parameter is required (path to Python file to lint)."
+        return tool_error("'path' parameter is required (path to Python file to lint).")
 
     try:
         resolved = validate_path(file_path)
@@ -450,7 +451,7 @@ async def handle_lint_file(args: dict) -> str:
         return f"PERMISSION_ERROR: {e}"
 
     if not resolved.exists():
-        return f"ERROR: File not found: {resolved}"
+        return tool_error(f"File not found: {resolved}")
 
     # Prefer ruff, fall back to flake8. The linter must be invoked by its
     # ABSOLUTE path: availability is checked against the parent PATH, but the

@@ -22,13 +22,13 @@ import tempfile
 
 from mcp_server.config import SHELL_SANDBOX_MODE, SHELL_TIMEOUT, validate_path, PROJECT_ROOT
 from mcp_server.os_utils import (
-    CURRENT_OS,
     IS_WINDOWS,
     IS_MACOS,
     IS_LINUX,
     minimal_subprocess_env,
     translate_command,
 )
+from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +58,10 @@ def _clamp_shell_timeout(raw: object) -> int:
 # ── Deny sets ─────────────────────────────────────────────────────────────────
 #
 # CODE-OWNED (F-G-4): the deny sets below are deliberately NOT config-driven.
-# There is no `shell.blocked_commands` (or similar) config key, and none may
+# There is no `shell.blocked_cmds` (or similar) config key, and none may
 # be added — config must never be able to weaken or replace a code-owned
 # safety gate, and a config key that *claims* to extend blocking while being
-# read by nothing (as the old `blocked_commands` key was) is worse than none
+# read by nothing (as the old `blocked_cmds` key was) is worse than none
 # at all. Config can only ADD allowed binaries (`shell.allowlist_extra` /
 # `shell.safe_extra`, read in policy.py); anything denied here stays denied
 # regardless of config.
@@ -902,7 +902,7 @@ async def handle_run_command(args: dict) -> str:
         return "\n".join(parts)
     except Exception as e:
         logger.error(f"run_command failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
     finally:
         if sandbox_dir is not None:
             sandbox_dir.cleanup()
@@ -1000,7 +1000,7 @@ async def handle_run_powershell(args: dict) -> str:
         return "\n".join(parts)
     except Exception as e:
         logger.error(f"run_powershell failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
     finally:
         if sandbox_dir is not None:
             sandbox_dir.cleanup()

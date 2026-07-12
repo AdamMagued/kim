@@ -14,11 +14,12 @@ import asyncio
 
 import pytest
 
+from mcp.types import CallToolResult
 from mcp_server import server as srv
 from orchestrator.tool_errors import classify_tool_output
 
 
-def _call(name, args):
+def _call(name: str, args: dict) -> CallToolResult:
     return asyncio.run(srv.call_tool(name, args))
 
 

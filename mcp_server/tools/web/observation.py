@@ -22,6 +22,8 @@ import json
 import logging
 import re
 from typing import Any
+from mcp_server.tools._errors import tool_error
+
 
 from mcp_server.tools.web_observe_js import _OBSERVE_JS
 from mcp_server.tools.web_element_scoring import (
@@ -266,7 +268,7 @@ async def handle_web_observe(args: dict) -> str:
     try:
         result = await page.evaluate(_OBSERVE_JS)
     except Exception as e:
-        return f"ERROR: observe failed: {e}"
+        return tool_error(f"observe failed: {e}")
 
     elements, diagnostics = _remember_observation(result)
     shown_elements = [el for el in elements if _is_visible_element(el)]

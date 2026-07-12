@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import unittest
+from typing import Any, Coroutine, cast
 from unittest import mock
 
 from mcp.types import Tool
@@ -61,7 +62,7 @@ class BuiltinConnectorHygieneTests(unittest.TestCase):
                     "properties"
                 )
                 if takes_no_args:
-                    result = asyncio.run(handler({}))
+                    result = asyncio.run(cast(Coroutine[Any, Any, str], handler({})))
                     self.assertNotIn(
                         "not implemented",
                         result.lower(),
