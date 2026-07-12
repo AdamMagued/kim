@@ -564,7 +564,7 @@ async fn set_model(args: &str, config: &mut KimConfig) -> CommandOutcome {
 
 pub async fn model_options(config: &KimConfig) -> Vec<String> {
     let mut models = match config.provider.as_str() {
-        "ollama" => ollama_models().await,
+        "ollama" => ollama_models(config).await,
         // A18: current Claude model ids (claude-api).
         "claude" => vec![
             "claude-opus-4-8".to_string(),
@@ -667,22 +667,19 @@ pub(crate) fn is_openai_chat_model_for_test(id: &str) -> bool {
     is_openai_chat_model(id)
 }
 
-async fn ollama_models() -> Vec<String> {
+async fn ollama_models(config: &KimConfig) -> Vec<String> {
     let mut models = known_ollama_cloud_models()
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    if let Ok(output) = Command::new("ollama").arg("list").output().await {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines().skip(1) {
-                if let Some(name) = line.split_whitespace().next() {
-                    if !name.trim().is_empty() {
-                        models.push(name.to_string());
-                    }
-                }
-            }
-        }
+    // F-E-10: query the CONFIGURED Ollama endpoint (respects ollama_base_url /
+    // a remote or nonstandard-port host) via its HTTP API, instead of shelling
+    // out to the LOCAL `ollama list` daemon — which returned an empty/wrong list
+    // for anyone pointing Kim at a remote Ollama while doctor and actual chat
+    // requests worked.
+    let base = crate::provider::normalize_base_url(&config.ollama_base_url);
+    if let Some(server) = ollama_models_at(&base).await {
+        models.extend(server);
     }
     models.sort();
     models.dedup();
@@ -805,7 +802,12 @@ async fn ollama_login(config: &mut KimConfig) -> CommandOutcome {
             "Ollama is not installed.\nInstall it, run 'ollama serve', then /login ollama again.\nhttps://ollama.com/download".to_string(),
         );
     }
-    match ollama_server_models().await {
+    // F-E-10: probe the CONFIGURED Ollama endpoint, not a hardcoded
+    // 127.0.0.1:11434 — a user pointing Kim at a remote / nonstandard-port
+    // Ollama previously got "server is not running" from /login while doctor
+    // and chat requests (which already respect ollama_base_url) worked.
+    let base = crate::provider::normalize_base_url(&config.ollama_base_url);
+    match ollama_models_at(&base).await {
         Some(local_models) => {
             config.provider = "ollama".to_string();
             config.model = choose_ollama_model(&config.model, &local_models);
@@ -858,31 +860,6 @@ async fn ollama_is_available() -> bool {
         }
     }
     false
-}
-
-async fn ollama_server_models() -> Option<Vec<String>> {
-    let resp = reqwest::Client::new()
-        .get("http://127.0.0.1:11434/api/tags")
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let text = resp.text().await.unwrap_or_default();
-    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-    let models = json["models"]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item["name"].as_str())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    Some(models)
 }
 
 /// Fetch the model list from a specific ollama base URL (respects config, not a
@@ -1414,6 +1391,46 @@ mod tests {
         assert!(models.iter().any(|model| model == "gpt-4o"));
         assert!(models.iter().any(|model| model == "o3-mini"));
         assert!(!models.iter().any(|model| model == "gpt-5.4"));
+    }
+
+    // F-E-10: the /model picker must query the CONFIGURED Ollama endpoint
+    // (ollama_base_url), not the local `ollama list` daemon / hardcoded
+    // 127.0.0.1:11434 — so a remote/nonstandard-port Ollama shows the right
+    // models. A fake /api/tags server serving a model that exists NOWHERE else
+    // proves the configured base URL was actually queried.
+    #[tokio::test]
+    async fn model_picker_queries_configured_ollama_base_url() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ollama");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let body = r#"{"models":[{"name":"remote-only-model:latest"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+
+        let config = KimConfig {
+            provider: "ollama".to_string(),
+            ollama_base_url: format!("http://127.0.0.1:{port}"),
+            ..KimConfig::default()
+        };
+        let models = super::model_options(&config).await;
+        assert!(
+            models.iter().any(|m| m == "remote-only-model:latest"),
+            "the picker must list models from the configured Ollama endpoint; got: {models:?}"
+        );
     }
 
     #[tokio::test]
