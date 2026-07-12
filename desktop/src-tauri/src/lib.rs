@@ -920,6 +920,24 @@ async fn restore_browser_for_session(
 /// Returns `Ok(true)` if Chrome was freshly spawned (caller should wait ~2 s for the debug
 /// port to open), `Ok(false)` if it was already running, or `Err` if not found.
 ///
+/// Static Chrome flags for Kim's CDP launch.
+///
+/// F-I-4: `--remote-debugging-address=127.0.0.1` pins the (unauthenticated)
+/// DevTools port to the loopback interface so it can never bind `0.0.0.0` and
+/// expose the logged-in provider profile to the LAN. The port itself is still
+/// 9222 by default; moving it to a random port and coordinating the Python
+/// connect side is Team B's provider half (handoff below).
+fn cdp_static_flags() -> [&'static str; 3] {
+    [
+        // Loopback-only bind for the CDP endpoint (F-I-4).
+        "--remote-debugging-address=127.0.0.1",
+        "--no-first-run",
+        "--no-default-browser-check",
+        // --disable-popup-blocking intentionally NOT set: it weakens browser
+        // security (#3).
+    ]
+}
+
 /// NOTE: this function must only be called from a blocking context (e.g. inside
 /// `tokio::task::spawn_blocking`) because `TcpStream::connect` and `fs` calls are
 /// synchronous.  Do NOT call it directly from an async Tokio task.
@@ -969,13 +987,9 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
         let user_data_arg = format!("--user-data-dir={}", user_data_str);
         let cdp_port_arg = format!("--remote-debugging-port={cdp_port}");
         let result = StdCommand::new(chrome)
-            .args([
-                user_data_arg.as_str(),
-                cdp_port_arg.as_str(),
-                "--no-first-run",
-                "--no-default-browser-check",
-                // --disable-popup-blocking removed: weakens browser security (#3).
-            ])
+            .arg(user_data_arg.as_str())
+            .arg(cdp_port_arg.as_str())
+            .args(cdp_static_flags())
             .spawn();
         if let Ok(child) = result {
             // Store the child handle so it can be killed on app exit (#8).
@@ -1225,6 +1239,19 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdp_launch_flags_pin_loopback_bind() {
+        // F-I-4: the CDP DevTools port is unauthenticated — the launch must
+        // pin it to the loopback interface so it cannot bind 0.0.0.0.
+        let flags = cdp_static_flags();
+        assert!(
+            flags.contains(&"--remote-debugging-address=127.0.0.1"),
+            "CDP launch must bind the debug port to loopback only"
+        );
+        // The popup-blocking weakener stays OFF (#3).
+        assert!(!flags.iter().any(|f| f.contains("disable-popup-blocking")));
+    }
 
     // Helper: write lines to a temp file using O_EXCL-safe NamedTempFile (#23).
     // subsec_nanos() was guessable and racy — tempfile guarantees uniqueness + 0600 mode.
