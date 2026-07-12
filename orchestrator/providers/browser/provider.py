@@ -275,7 +275,16 @@ class BrowserProvider(BaseProvider):
             Path(bp_cfg.get("user_data_dir", default_data_dir)).resolve()
         )
         self._project_root = project_root
-        Path(self._user_data_dir).mkdir(parents=True, exist_ok=True)
+        _sess_dir = Path(self._user_data_dir)
+        _sess_dir.mkdir(parents=True, exist_ok=True)
+        # SECURITY (F-I-4): this profile holds live auth cookies for the user's
+        # AI logins. Lock it to owner-only (0o700) so other local users can't
+        # read the cookie jar. Best-effort — chmod is a no-op/behaves
+        # differently on Windows, and a perms hiccup must not abort startup.
+        try:
+            os.chmod(_sess_dir, 0o700)
+        except OSError:
+            pass
         logger.info(
             f"BrowserProvider: session dir = {self._user_data_dir}  "
             f"headless = {self._headless}  preferred_site = {self._preferred_site!r} "
