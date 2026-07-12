@@ -155,6 +155,14 @@ class OllamaProvider(BaseProvider):
         # M13: per-model context-limit cache so every completion doesn't shell
         # out to `ollama ps` (and POST /api/show) again.
         self._context_limit_cache: dict[str, tuple[int | None, str | None]] = {}
+        # F-INH-4: cache the per-turn liveness probe (/api/version) and tag list
+        # (/api/tags) for the session so every turn doesn't pay two extra HTTP
+        # round-trips. Both are invalidated on a transport error (re-probe so a
+        # stopped daemon still surfaces the friendly message) and the tag cache
+        # is refetched once if a model is unexpectedly reported missing (pulled
+        # or removed mid-session).
+        self._daemon_alive = False
+        self._session_tags: list[dict] | None = None
         logger.info(
             "OllamaProvider: base_url=%s mode=%s local_model=%s cloud_model=%s",
             self._base_url,
@@ -176,12 +184,23 @@ class OllamaProvider(BaseProvider):
         await self._ensure_daemon_running()
         # Fetch tags once for local mode; both _resolve_selected_model and
         # _validate_model need the tag list and would otherwise each make a
-        # separate HTTP round-trip.
+        # separate HTTP round-trip. F-INH-4: reuse the session tag cache across
+        # turns, refetching once if the selected model looks missing (stale
+        # cache after a mid-session pull/remove).
         cached_tags: list[dict] | None = None
         if self._mode == "local":
-            cached_tags = await self._fetch_tags()
-        model = await self._resolve_selected_model(tags=cached_tags)
-        await self._validate_model(model, tags=cached_tags)
+            cached_tags = await self._fetch_tags_cached()
+        try:
+            model = await self._resolve_selected_model(tags=cached_tags)
+            await self._validate_model(model, tags=cached_tags)
+        except ProviderEnvironmentError:
+            if self._mode == "local" and self._session_tags is not None:
+                self._session_tags = None
+                cached_tags = await self._fetch_tags_cached()
+                model = await self._resolve_selected_model(tags=cached_tags)
+                await self._validate_model(model, tags=cached_tags)
+            else:
+                raise
 
         # Proactively strip images for models we know don't support vision.
         if self._vision_cache.get(model) is False:
@@ -212,6 +231,13 @@ class OllamaProvider(BaseProvider):
                 final_obj, content, tool_calls = await self._stream_chat(_build_payload(messages))
             else:
                 raise
+        except (httpx.HTTPError, TimeoutError, ConnectionError):
+            # F-INH-4: a transport failure means our cached liveness/tag beliefs
+            # may be wrong — re-probe next turn so a stopped daemon surfaces the
+            # friendly "not running" message instead of a raw transport error.
+            self._daemon_alive = False
+            self._session_tags = None
+            raise
 
         usage = await self._usage_from_final(final_obj, model)
 
@@ -289,6 +315,11 @@ class OllamaProvider(BaseProvider):
         return cleaned
 
     async def _ensure_daemon_running(self) -> None:
+        # F-INH-4: probe /api/version once per session; a transport failure
+        # elsewhere resets this flag so a daemon that dies mid-session is
+        # re-probed and yields the friendly message again.
+        if self._daemon_alive:
+            return
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 resp = await client.get(f"{self._base_url}/api/version")
@@ -297,6 +328,14 @@ class OllamaProvider(BaseProvider):
                 raise ProviderEnvironmentError(
                     "Ollama is installed but not running. Start Ollama, then try again."
                 ) from exc
+        self._daemon_alive = True
+
+    async def _fetch_tags_cached(self) -> list[dict]:
+        """Session-cached /api/tags (F-INH-4). Invalidated on transport error
+        and on a stale-model miss (see complete())."""
+        if self._session_tags is None:
+            self._session_tags = await self._fetch_tags()
+        return self._session_tags
 
     async def _resolve_selected_model(self, tags: list[dict] | None = None) -> str:
         if self._mode == "cloud":

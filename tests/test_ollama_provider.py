@@ -515,6 +515,36 @@ class OllamaDoneReasonTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "stop")
 
 
+class OllamaSessionProbeCacheTests(unittest.TestCase):
+    """F-INH-4: liveness probe + tags are cached for the session."""
+
+    def test_daemon_probe_is_skipped_once_alive(self):
+        from orchestrator.providers.base import ProviderEnvironmentError
+        # Port 9 (discard) refuses instantly, so an un-cached probe raises.
+        provider = OllamaProvider({"ollama": {"base_url": "http://127.0.0.1:9"}})
+        with self.assertRaises(ProviderEnvironmentError):
+            asyncio.run(provider._ensure_daemon_running())
+        # Once the session has verified the daemon, later turns skip the probe
+        # entirely (no error even though the port is unreachable).
+        provider._daemon_alive = True
+        asyncio.run(provider._ensure_daemon_running())
+
+    def test_tags_are_fetched_once_per_session(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        calls = {"n": 0}
+
+        async def _fake_fetch():
+            calls["n"] += 1
+            return [{"name": "m:latest"}]
+
+        with patch.object(provider, "_fetch_tags", _fake_fetch):
+            t1 = asyncio.run(provider._fetch_tags_cached())
+            t2 = asyncio.run(provider._fetch_tags_cached())
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(t1, t2)
+        self.assertEqual(t1, [{"name": "m:latest"}])
+
+
 class OllamaRemotePsHostTests(unittest.TestCase):
     """F-B-6: `ollama ps` must target the configured daemon, not localhost."""
 
