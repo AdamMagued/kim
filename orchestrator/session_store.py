@@ -19,18 +19,27 @@ Usage:
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import json
 import logging
 import os
 import threading
 import time
+import weakref
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
+
+# Thread-local marker set while the single-worker append executor is running
+# `_sync_write`.  flush() and the `session_file` property both consult it and
+# no-op the "wait for pending writes" step if they are ever (mistakenly) called
+# from the executor thread — a max_workers=1 pool waiting on itself would
+# otherwise self-join deadlock (F-J-4).
+_write_tls = threading.local()
 
 # Default base directory relative to the project root
 _DEFAULT_BASE_DIR = Path(__file__).resolve().parent.parent / "kim_sessions"
@@ -54,12 +63,29 @@ class SessionStore:
         <base_dir>/<YYYY-MM-DD>/<session_id>.summary.txt
     """
 
+    # Live instances, so the static read paths (load_session) can drain a
+    # store's still-pending async writes before reading its file (F-J-4).
+    _active_stores: "weakref.WeakSet[SessionStore]" = weakref.WeakSet()
+
     def __init__(
         self,
         base_dir: Optional[Path] = None,
         session_id: Optional[str] = None,
     ) -> None:
         self.base_dir = Path(base_dir) if base_dir else _DEFAULT_BASE_DIR
+        # Single-worker executor: appends are offloaded here so the per-line
+        # fsync() never blocks the async agent event loop (F-J-4).  One worker
+        # keeps append ordering FIFO and preserves the write serialisation that
+        # self._lock used to provide inline.
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="session-store-write"
+        )
+        self._pending_futures: list[concurrent.futures.Future] = []
+        self._futures_lock = threading.Lock()
+        # Cached on-disk size of the live file so the rotation check does not
+        # stat() on every append (F-J-4); None until first computed.
+        self._cached_size: Optional[int] = None
+        SessionStore._active_stores.add(self)
         if session_id:
             # Explicit id (resume, or caller-chosen): used as-is; the block
             # below adopts its existing date dir.
@@ -100,7 +126,7 @@ class SessionStore:
                 except FileExistsError:
                     pass
 
-        self.session_file = self.session_dir / f"{self.session_id}.jsonl"
+        self._session_file = self.session_dir / f"{self.session_id}.jsonl"
         self.summary_file = self.session_dir / f"{self.session_id}.summary.txt"
         self.context_file = self.session_dir / f"{self.session_id}.context.json"
         self._message_count = 0
@@ -119,51 +145,89 @@ class SessionStore:
         except OSError:
             pass
         logger.info(
-            f"SessionStore initialized: {self.session_file} "
+            f"SessionStore initialized: {self._session_file} "
             f"(id={self.session_id})"
         )
+
+    @property
+    def session_file(self) -> Path:
+        """Path to the live JSONL file.
+
+        Reading it drains any pending async appends first (F-J-4) so external
+        readers (tests, resume paths) never observe a torn/lagging file.  The
+        drain is skipped when accessed from the write-executor thread itself —
+        `_sync_write` uses the private `self._session_file` and must never wait
+        on its own pool (self-join deadlock).
+        """
+        if not getattr(_write_tls, "in_executor", False):
+            self.flush()
+        return self._session_file
 
     # ------------------------------------------------------------------
     # Write API
     # ------------------------------------------------------------------
 
-    def _append_line(self, line: str) -> None:
-        """Write a single JSONL line with a process-level lock, flush, and fsync.
-
-        Uses a threading.Lock so two threads sharing the same SessionStore
-        instance cannot interleave writes (finding 3).  Also rotates the
-        session file when it exceeds _MAX_SESSION_BYTES so individual sessions
-        cannot grow without bound (finding 4).  Rolled files keep the session
-        date-dir so age-based pruning covers them automatically.
+    def _sync_write(self, line: str) -> None:
+        """Rotate-if-needed, then append+fsync one line.  Runs on the single
+        write-executor thread (F-J-4) — it MUST use the private
+        ``self._session_file`` and MUST NOT call ``self.flush()`` or the
+        ``session_file`` property (either would wait on its own single-worker
+        pool and self-join deadlock).
         """
-        with self._lock:
-            # Rotate before writing if the current file is over the size cap
-            if (
-                self.session_file.exists()
-                and self.session_file.stat().st_size >= _MAX_SESSION_BYTES
-            ):
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                rolled = self.session_dir / f"{self.session_id}.roll.{stamp}.jsonl"
-                try:
-                    self.session_file.rename(rolled)
-                    logger.info(
-                        "Session file rotated: %s -> %s", self.session_file.name, rolled.name
-                    )
-                except OSError as exc:
-                    logger.warning("Could not rotate session file %s: %s", self.session_file, exc)
+        _write_tls.in_executor = True
+        try:
+            with self._lock:
+                path = self._session_file
+                # Lazily learn the on-disk size once, then track it in memory so
+                # the rotation check never stat()s per append (F-J-4).
+                if self._cached_size is None:
+                    try:
+                        self._cached_size = path.stat().st_size if path.exists() else 0
+                    except OSError:
+                        self._cached_size = 0
 
-            try:
-                if not self.session_file.exists():
-                    fd = os.open(self.session_file, os.O_CREAT | os.O_WRONLY, 0o600)
-                    os.close(fd)
-                else:
-                    self.session_file.chmod(0o600)
-            except OSError:
-                pass
-            with open(self.session_file, "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
+                # Rotate before writing if the current file is over the size cap
+                if self._cached_size >= _MAX_SESSION_BYTES:
+                    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    rolled = self.session_dir / f"{self.session_id}.roll.{stamp}.jsonl"
+                    try:
+                        path.rename(rolled)
+                        logger.info(
+                            "Session file rotated: %s -> %s", path.name, rolled.name
+                        )
+                        self._cached_size = 0
+                    except OSError as exc:
+                        logger.warning("Could not rotate session file %s: %s", path, exc)
+
+                try:
+                    if not path.exists():
+                        fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+                        os.close(fd)
+                    else:
+                        path.chmod(0o600)
+                except OSError:
+                    pass
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                self._cached_size += len(line.encode("utf-8")) + 1
+        finally:
+            _write_tls.in_executor = False
+
+    def _append_line(self, line: str) -> None:
+        """Queue a single JSONL line for durable append on the write executor.
+
+        The actual open/write/fsync happens on a background single-worker
+        thread (``_sync_write``) so the per-line ``os.fsync`` never blocks the
+        async agent event loop (F-J-4).  Ordering is preserved because the pool
+        has exactly one worker.  Callers that need the bytes on disk before
+        returning (resume/read paths) call ``flush()``; the ``session_file``
+        property flushes implicitly.
+        """
+        with self._futures_lock:
+            fut = self._executor.submit(self._sync_write, line)
+            self._pending_futures.append(fut)
 
     def append_message(self, message: dict) -> None:
         """
@@ -182,7 +246,11 @@ class SessionStore:
 
         Deletes old rolled segments and writes the new messages to the active session file.
         """
+        # Drain any queued async appends first so this full-file rewrite cannot
+        # race a pending _sync_write and lose or reorder messages (F-J-4).
+        self.flush()
         with self._lock:
+            path = self._session_file
             # Delete old rolled segment files
             for roll_file in self.session_dir.glob(f"{self.session_id}.roll.*.jsonl"):
                 try:
@@ -195,7 +263,7 @@ class SessionStore:
             # Use os.open with O_CREAT | O_WRONLY | O_TRUNC to ensure permissions are set at creation.
             flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
             mode = 0o600
-            fd = os.open(self.session_file, flags, mode)
+            fd = os.open(path, flags, mode)
             try:
                 with open(fd, "w", encoding="utf-8") as fh:
                     for msg in messages:
@@ -210,11 +278,46 @@ class SessionStore:
                 except OSError:
                     pass
             self._message_count = len(messages)
+            # Resync the cached size to the rewritten file (F-J-4).
+            try:
+                self._cached_size = path.stat().st_size if path.exists() else 0
+            except OSError:
+                self._cached_size = 0
 
     def flush(self) -> None:
-        """Sync barrier — no-op because append_message opens/closes the file on
-        every call.  Exists so callers can call flush() before returning without
-        needing to know the write strategy of the underlying store."""
+        """Sync barrier — block until every queued async append is durably on
+        disk (F-J-4).
+
+        No-ops when called from the write-executor thread itself: a
+        max_workers=1 pool waiting on its own in-flight task would self-join
+        deadlock.  The executor's ``_sync_write`` never needs the barrier (it
+        already holds the write path) so skipping there is safe.
+        """
+        if getattr(_write_tls, "in_executor", False):
+            return
+        with self._futures_lock:
+            futs = list(self._pending_futures)
+            self._pending_futures.clear()
+        if futs:
+            concurrent.futures.wait(futs)
+            # Surface any exception raised inside a background write instead of
+            # swallowing it silently.
+            for fut in futs:
+                exc = fut.exception()
+                if exc is not None:
+                    logger.error("Async session write failed: %s", exc)
+
+    def close(self) -> None:
+        """Flush pending writes and shut the write executor down.
+
+        Optional: the interpreter's concurrent.futures atexit hook already
+        joins the pool, but long-lived processes that churn many stores should
+        call this to release the worker thread promptly.
+        """
+        try:
+            self.flush()
+        finally:
+            self._executor.shutdown(wait=True)
 
     def append_run_started(self, task: str, cwd: Optional[str] = None) -> None:
         """Append a run_started record to the session JSONL.
@@ -496,6 +599,24 @@ class SessionStore:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _drain_active_stores(session_id: Optional[str] = None) -> None:
+        """Flush queued async writes on live stores before a static read (F-J-4).
+
+        Static read paths (``load_session``, the enumerations) do not hold a
+        reference to the SessionStore instance that produced a file, so a line
+        appended just before the read could still be queued on that store's
+        write executor.  Drain the matching store(s) so the read is consistent.
+        ``session_id=None`` drains every live store (used by whole-directory
+        enumerations).
+        """
+        for store in list(SessionStore._active_stores):
+            if session_id is None or store.session_id == session_id:
+                try:
+                    store.flush()
+                except Exception:  # pragma: no cover - defensive
+                    pass
+
+    @staticmethod
     def find_session_file(
         session_id: str,
         base_dir: Optional[Path] = None,
@@ -546,6 +667,7 @@ class SessionStore:
         Returns the messages in order, ready to be loaded into
         ConversationMemory.
         """
+        SessionStore._drain_active_stores(session_id)
         candidate = SessionStore.find_session_file(session_id, base_dir=base_dir)
         if candidate is None:
             if warn_if_missing:
@@ -608,6 +730,7 @@ class SessionStore:
         back to their JSONL source.  This is a lightweight query layer over the
         existing inspectable files, not a separate index.
         """
+        SessionStore._drain_active_stores()
         base = Path(base_dir) if base_dir else _DEFAULT_BASE_DIR
         if not base.exists():
             return []
@@ -815,6 +938,7 @@ class SessionStore:
             {"session_id": str, "date": str, "path": str,
              "message_count": int, "has_summary": bool}
         """
+        SessionStore._drain_active_stores()
         base = Path(base_dir) if base_dir else _DEFAULT_BASE_DIR
         if not base.exists():
             return []
