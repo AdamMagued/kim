@@ -150,6 +150,40 @@ class SessionStore:
         self._append_line(line)
         self._message_count += 1
 
+    def rewrite_session(self, messages: list[dict]) -> None:
+        """Overwrite the session JSONL file with a new list of messages.
+
+        Deletes old rolled segments and writes the new messages to the active session file.
+        """
+        with self._lock:
+            # Delete old rolled segment files
+            for roll_file in self.session_dir.glob(f"{self.session_id}.roll.*.jsonl"):
+                try:
+                    roll_file.unlink()
+                except OSError as e:
+                    logger.warning(f"Could not delete rolled segment file {roll_file}: {e}")
+
+            # Overwrite the live file
+            # Tighten file permissions to 0o600 (F-I-3 — owner read/write only)
+            # Use os.open with O_CREAT | O_WRONLY | O_TRUNC to ensure permissions are set at creation.
+            flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
+            mode = 0o600
+            fd = os.open(self.session_file, flags, mode)
+            try:
+                with open(fd, "w", encoding="utf-8") as fh:
+                    for msg in messages:
+                        cleaned = _strip_images_for_disk(msg)
+                        line = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))
+                        fh.write(line + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self._message_count = len(messages)
+
     def flush(self) -> None:
         """Sync barrier — no-op because append_message opens/closes the file on
         every call.  Exists so callers can call flush() before returning without

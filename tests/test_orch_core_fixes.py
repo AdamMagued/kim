@@ -262,3 +262,40 @@ class TestHonestRetryLabels:
         with pytest.raises(PermissionError):
             _run_retry(agent)
         assert rate_limited == []
+
+
+class TestApiProviderCompactionDurable:
+    def test_api_provider_compacts_and_writes_to_jsonl(self, tmp_path):
+        from orchestrator.agent_states import AgentTermination
+        
+        class FakeProvider:
+            pass
+            
+        from orchestrator.session_store import SessionStore
+        agent = make_test_agent(provider=FakeProvider())
+        agent._log = lambda level, msg: None
+        agent._context_meter = ContextMeter(budget=10_000)
+        agent._session_store = SessionStore(base_dir=tmp_path, session_id="test-session")
+        agent._resume_session_id = "test-session"
+        
+        # Seed the session with messages
+        msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+            {"role": "user", "content": "do something"},
+        ]
+        # Write to JSONL
+        for m in msgs:
+            agent._session_store.append_message(m)
+            
+        # Run agent with /compact task
+        result = asyncio.run(agent.run("/compact"))
+        assert result["success"] is True, result
+        assert result["termination"] == "task_complete"
+        
+        # Load the session back and verify it is compacted!
+        from orchestrator.session_store import SessionStore
+        reloaded = SessionStore.load_session("test-session", base_dir=tmp_path)
+        assert len(reloaded) > 0
+        # The reloaded messages should start with the compact_summary role!
+        assert reloaded[0]["role"] == "compact_summary"

@@ -562,9 +562,6 @@ class KimAgent:
         self._current_plan_steps = []
         self._current_step_index = 0
 
-        if task.strip().lower() in _COMPACT_CONTROL_TASKS:
-            return await self._compact_and_reset_context()
-
         try:
             self._session_store.append_run_started(task)
         except Exception as e:
@@ -603,6 +600,9 @@ class KimAgent:
                 self.memory.clear()
         else:
             self.memory.clear()
+
+        if task.strip().lower() in _COMPACT_CONTROL_TASKS:
+            return await self._compact_and_reset_context()
 
         # Decide whether this task continues the session's browser thread or
         # starts a fresh one (stateful mode), or always starts fresh (legacy).
@@ -2029,6 +2029,10 @@ Rules:
 
         # Replace in-memory history with the compacted version
         self.memory.load_from_messages(compacted)
+        try:
+            self._session_store.rewrite_session(compacted)
+        except Exception as e:
+            logger.warning(f"Could not rewrite session file after compaction: {e}")
 
         # Persist: save the summary sentinel and reset context meter. Seed the
         # meter with the post-compaction message set — the next real turn
