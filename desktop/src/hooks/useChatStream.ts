@@ -224,6 +224,15 @@ export function useChatStream({
     activeResumeSessionIdRef.current = session?.session_id ?? conversationId ?? '';
   }, [session, conversationId]);
 
+  // F-F-8: the session that owns the globally-active run (App tracks a single
+  // active run app-wide). Held in a ref so belongsToView can read the latest
+  // value to route UN-enveloped bridge/codex/legacy events, which carry no
+  // session to route by.
+  const activeRunSessionIdRef = useRef<string | null>(activeRunSessionId ?? null);
+  useEffect(() => {
+    activeRunSessionIdRef.current = activeRunSessionId ?? null;
+  }, [activeRunSessionId]);
+
   // RUN-IDENTITY refs. runOwnerSessionIdRef is the session the in-flight run
   // belongs to (captured at spawn by useTaskRunner, or re-derived on switch-back
   // from the active-run hint). currentRunIdRef mirrors the run_id from the
@@ -232,14 +241,23 @@ export function useChatStream({
   const runOwnerSessionIdRef = useRef<string | null>(ownsActiveRun ? activeRunSessionId ?? null : null);
   const currentRunIdRef = useRef<string | null>(ownsActiveRun ? activeRunId ?? null : null);
 
-  // Route guard: a run-scoped event is for THIS view iff it carries no session
-  // envelope (legacy/codex/bridge streams) or its session_id matches this view's
-  // session. Foreign-run events (a run started under a different session that is
-  // still streaming after a switch) are dropped so run A never mutates view B.
-  const belongsToView = useCallback(
-    (sid?: string | null) => sid === undefined || sid === null || sid === activeResumeSessionIdRef.current,
-    [],
-  );
+  // Route guard: a run-scoped event is for THIS view iff its session_id matches
+  // this view's session. An UN-enveloped event (session_id null/undefined —
+  // legacy/codex/bridge streams that predate the envelope) carries no session to
+  // route by. F-F-8: routing those UNCONDITIONALLY to whatever view is mounted
+  // let a foreign run's typed events (kim:status/plan/tool/answer/…) bleed across
+  // a mid-run session switch — the exact hole F-F-2 closed for the raw stream but
+  // left open for typed events. Only ONE run is ever active app-wide, so an
+  // un-enveloped event belongs to that active run: route it only when NO foreign
+  // session owns it (no active run, or this view owns it); when a different
+  // session's run is streaming, drop it so run A never mutates view B.
+  const belongsToView = useCallback((sid?: string | null) => {
+    if (sid === undefined || sid === null) {
+      const runOwner = activeRunSessionIdRef.current;
+      return !runOwner || runOwner === activeResumeSessionIdRef.current;
+    }
+    return sid === activeResumeSessionIdRef.current;
+  }, []);
 
   // Deduplication functions
   const isDuplicate = useCallback((raw: string): boolean => {

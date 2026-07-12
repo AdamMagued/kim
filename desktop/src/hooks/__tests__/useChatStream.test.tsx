@@ -41,7 +41,7 @@ function emit(event: string, payload?: unknown) {
   });
 }
 
-function makeProps() {
+function makeProps(overrides: Record<string, unknown> = {}) {
   return {
     session: null,
     settings: DEFAULT_SETTINGS,
@@ -49,11 +49,12 @@ function makeProps() {
     commitCurrentBrowserUrl: vi.fn(() => Promise.resolve()),
     setMessageReloadNonce: vi.fn(),
     conversationId: 'conv-1',
+    ...overrides,
   };
 }
 
-async function renderStream() {
-  const props = makeProps();
+async function renderStream(overrides: Record<string, unknown> = {}) {
+  const props = makeProps(overrides);
   const utils = renderHook(() => useChatStream(props));
   // Listener registration happens synchronously inside the wiring effect, but
   // flush microtasks so the listen().then(unlisten) assignments settle too.
@@ -288,6 +289,45 @@ describe('useChatStream raw-stream ownership guard (F-F-2)', () => {
     act(() => { result.current.flushActivityNow(); });
 
     expect(result.current.activity.map(a => a.text)).toEqual(['Reading `mine.txt`']);
+  });
+});
+
+// ── 2c. Cross-session TYPED-event bleed (F-F-8) ───────────────────────────────
+// The raw guard (F-F-2) only covered kim-agent-output/error. Typed events
+// (kim:status/plan/tool/answer/…) from the bridge/codex/legacy path carry no
+// session envelope either, and belongsToView used to route a null session_id to
+// whatever view was mounted — so a foreign run's typed events bled across a
+// mid-run session switch. They must route only when NO foreign session owns the
+// active run.
+describe('useChatStream typed-event ownership guard (F-F-8)', () => {
+  it('drops an un-enveloped typed event while a DIFFERENT session owns the active run', async () => {
+    // A run is active app-wide under session "other-session"; this view is
+    // conv-1 (the user switched away mid-run). The foreign run keeps emitting
+    // un-enveloped typed events — they must not land in this view.
+    const { result } = await renderStream({ activeRunSessionId: 'other-session' });
+
+    emit('kim:status', { message: 'foreign run reasoning' });
+    emit('kim:plan', { steps: ['foreign step one', 'foreign step two'] });
+    emit('kim:answer', { text: 'foreign answer that belongs to session B' });
+    act(() => { result.current.flushActivityNow(); });
+
+    expect(result.current.lastStatus).toBe('');
+    expect(result.current.planSteps).toEqual([]);
+    expect(result.current.activity).toHaveLength(0);
+    expect(result.current.liveHistory).toHaveLength(0);
+  });
+
+  it('routes un-enveloped typed events when this view owns the active run', async () => {
+    // activeRunSessionId matches this view's session (conv-1) → it owns the run.
+    const { result } = await renderStream({ activeRunSessionId: 'conv-1' });
+
+    emit('kim:status', { message: 'my own run reasoning' });
+    act(() => { result.current.flushActivityNow(); });
+
+    expect(result.current.lastStatus).toBe('my own run reasoning');
+    expect(result.current.activity).toEqual([
+      expect.objectContaining({ kind: 'status', text: 'my own run reasoning' }),
+    ]);
   });
 });
 
