@@ -268,4 +268,89 @@ Code-tab typed events cross the seam envelope-less and the frontend routes them 
 mounted view (defeats the stated guarantee; root cause of F-F-2/F-F-8).
 
 ---
-*(seams 3, 4 + test plan below — written incrementally)*
+
+## Seam 3 — Python orchestrator ⇄ MCP server (stdio JSON-RPC)
+
+Transport: the `mcp` SDK over stdio (`mcp_server/server.py::main` → `stdio_server()`).
+The orchestrator is the client (`agent.py` holds `self.session`, calls
+`session.call_tool`); the server hosts 50 tools. Server stdout is protocol-only —
+`_protect_stdio_pipe()` rebinds `print` to stderr at runtime so a stray tool `print`
+can't corrupt the JSON-RPC pipe.
+
+### 3a. Tool advertisement
+
+`list_tools()` returns `_TOOLS` — `TOOLS` (tool_registry.py) filtered by
+`KIM_ENABLED_TOOL_TIERS`, plus site-connector tools merged at startup. Each `Tool` has
+`name`, `description`, `inputSchema` (JSON Schema with `properties` + `required`).
+**Schema↔dispatch parity is enforced**: every schema has a dispatch handler and vice
+versa (startup check + `tests/test_invariants.py:33`). Connector tool-name collisions
+are a hard `RuntimeError` at startup (server.py:88).
+
+### 3b. Call contract (`call_tool(name, arguments) -> list[TextContent]`)
+
+```
+request : JSON-RPC "tools/call" { name: str, arguments: dict }
+flow    : handler = _DISPATCH.get(name)
+          if handler is None            -> [TextContent("Unknown tool: <name>")]
+          decision = policy.enforce(name, args)      # ALWAYS first; never raises
+          if decision.action == "deny"  -> [TextContent(decision.message)]   # "POLICY_DENIED: ..."
+          if decision.action == "approve" and not session-approved:
+              outcome = await approvals.request_approval(...)   # broker round-trip, default-deny
+              if outcome not in ("accept","acceptForSession") -> [TextContent("HITL_DENIED: ...")]
+          result = await handler(args)                # handlers return str
+          return [TextContent(str(result))]
+except PermissionError as e -> [TextContent("PERMISSION_ERROR: <e>")]
+except Exception     as e   -> [TextContent("ERROR: <e>")]
+```
+
+**The response is ALWAYS `list[TextContent]` with `isError` unset** — success, denial,
+unknown-tool, and exception are indistinguishable at the MCP protocol level; the client
+discriminates purely by **string prefix** (F-INH-6). Works because both ends are
+in-repo, but it is a brittle contract seam.
+
+**No argument validation at the boundary (F-H-4):** the advertised `inputSchema`
+(`required`, types) is documentation for the model only — `call_tool` never validates
+`arguments` against it. Handlers read required args positionally (`args["path"]`), so a
+missing required field raises `KeyError` → generic `ERROR: 'path'`, which classifies as
+`execution_error`, NOT the (still-unpopulated) `bad_args` code. Type coercion is likewise
+absent. **Note the doc-vs-reality gap:** `mcp_server/CLAUDE.md` states "tool handlers
+never raise; return `{"error": "..."}` on failure", but the actual handlers return
+`str` with `ERROR:`-style prefixes and rely on `server.py`'s `except` — the `{"error"}`
+dict contract is aspirational, not what crosses the seam.
+
+### 3c. Error-shape vocabulary — THE contract (string prefixes on the result text)
+
+The agent's only way to know a call failed is the leading bytes of the result string.
+This vocabulary is the real seam contract:
+
+| Prefix | Producer | `tool_errors.classify_tool_output` code | in `interaction_policy` failure set |
+|---|---|---|---|
+| `PERMISSION_ERROR:` | server.py:152 / tools | `permission_denied` | ✓ |
+| `BLOCKED:` | shell tools | `blocked` | (via POLICY_BLOCK) |
+| `POLICY_DENIED:` | policy.py `_deny` messages | **MISSING** (F-H-9-class gap) | ✓ |
+| `HITL_DENIED:` | server.py:141 | **MISSING** | ✓ |
+| `Unknown tool:` | server.py:115 | **MISSING** | ✓ |
+| `TIMEOUT:` | tools | `timeout` | ✓ |
+| `OS_LIMITATION:` | tools | `os_limitation` | — |
+| `NOT_FOUND:` | tools | `not_found` | — |
+| `ERROR calling ` | agent.py:1417,1422 (client-side transport/timeout) | `internal_error` | ✓ (`ERROR`) |
+| `ERROR:` | tools / server.py:155 | `execution_error` | ✓ (`ERROR`) |
+
+**Two divergent copies of this vocabulary exist** — `orchestrator/tool_errors.py`
+(`_PREFIX_TO_CODE`) and `orchestrator/interaction_policy.py:32-33` (failure-prefix set).
+`POLICY_DENIED`/`HITL_DENIED`/`Unknown tool:` are recognized by `interaction_policy` but
+NOT mapped by `tool_errors.classify_tool_output` (they fall through to `None` = "not an
+error"), so a denied tool is not counted as an error by the classifier. Canonical list =
+this table; the fix is a single shared constant module both import.
+
+### 3d. Client-side timeout (double-execution guard)
+
+`agent.py::_execute_tool` sets `_call_timeout = approval_backstop + exec_ceiling + margin`,
+deliberately chosen to **strictly exceed** the server's worst case so `asyncio.wait_for`
+never abandons a call the server is still running (which would make the model re-issue it
+and double the side effect — the inherited finding-2.1 fix). Tool results are joined from
+`[c.text for c in result.content if hasattr(c,"text")]`; a result with no text parts
+becomes `"(no output)"`.
+
+---
+*(seam 4 + test plan below — written incrementally)*
