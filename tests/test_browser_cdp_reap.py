@@ -98,7 +98,7 @@ def test_launch_does_not_stack_a_second_chrome_when_prior_alive(tmp_path, monkey
     monkeypatch.delenv("PROJECT_ROOT", raising=False)
     provider = _provider(tmp_path)
     # A previously-launched Chrome that is still alive.
-    provider._chrome_proc = SimpleNamespace(pid=111, poll=lambda: None)
+    provider._chrome_proc = SimpleNamespace(pid=111, poll=lambda: None)  # pyright: ignore[reportAttributeAccessIssue]  # fake Popen handle
 
     popen_mock = MagicMock()
     pw = SimpleNamespace(

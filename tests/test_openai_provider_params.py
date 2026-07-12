@@ -70,7 +70,7 @@ def _provider_with_fake_client(model):
     provider._max_tokens = 4096
     provider._token_param = _default_token_param(model)
     fake_completions = _FakeCompletions()
-    provider._client = types.SimpleNamespace(
+    provider._client = types.SimpleNamespace(  # pyright: ignore[reportAttributeAccessIssue]  # fake AsyncOpenAI client
         chat=types.SimpleNamespace(completions=fake_completions)
     )
     return provider, fake_completions
@@ -132,7 +132,7 @@ def test_remote_base_url_without_key_warns(monkeypatch, caplog):
         })
     # Placeholder key is still used (some remote proxies are token-less), but the
     # user is warned instead of getting a silent cryptic 401.
-    assert provider._client.kwargs["api_key"] == "placeholder"
+    assert provider._client.kwargs["api_key"] == "placeholder"  # pyright: ignore[reportAttributeAccessIssue]  # fake AsyncOpenAI
     assert any("placeholder" in r.message and "CEREBRAS_API_KEY" in r.message for r in caplog.records)
 
 

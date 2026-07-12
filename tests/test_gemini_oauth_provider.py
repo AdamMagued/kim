@@ -1,6 +1,7 @@
 import importlib
 import sys
 import types
+from typing import Any
 
 import pytest
 
@@ -11,9 +12,11 @@ def install_google_stubs(monkeypatch):
     permanently, shadowing any real google namespace package for every later
     test in the session. (gemini.py is REST-based today, so these stubs are
     belt-and-braces for older import paths.)"""
-    google_mod = types.ModuleType("google")
-    genai_mod = types.ModuleType("google.generativeai")
-    protos_mod = types.ModuleType("google.generativeai.protos")
+    # Typed Any: these are dynamic stub modules we patch attributes onto, which
+    # a bare ModuleType annotation would reject (reportAttributeAccessIssue).
+    google_mod: Any = types.ModuleType("google")
+    genai_mod: Any = types.ModuleType("google.generativeai")
+    protos_mod: Any = types.ModuleType("google.generativeai.protos")
 
     class Type:
         STRING = 1

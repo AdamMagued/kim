@@ -252,20 +252,24 @@ class ToolResultMessageContractTests(unittest.TestCase):
         """Spec requires 'tool_call_id', not 'tool_name', in role='tool' messages."""
         result = _tool_result_message("user", "[Tool result: shell_run]\nsome output")
         self.assertIsNotNone(result)
+        assert result is not None  # narrow Optional for the type checker
         self.assertIn("tool_call_id", result)
         self.assertNotIn("tool_name", result)
 
     def test_tool_call_id_value_is_tool_name(self):
         """Without a stored call ID, the tool name is used as the identifier."""
         result = _tool_result_message("user", "[Tool result: read_file]\ncontents")
+        assert result is not None  # narrow Optional for the type checker
         self.assertEqual(result["tool_call_id"], "read_file")
 
     def test_body_extracted_correctly(self):
         result = _tool_result_message("user", "[Tool result: shell_run]\nline1\nline2")
+        assert result is not None  # narrow Optional for the type checker
         self.assertEqual(result["content"], "line1\nline2")
 
     def test_role_is_tool(self):
         result = _tool_result_message("user", "[Tool result: git_status]\nmodified: x.py")
+        assert result is not None  # narrow Optional for the type checker
         self.assertEqual(result["role"], "tool")
 
     def test_non_user_role_returns_none(self):
@@ -277,6 +281,7 @@ class ToolResultMessageContractTests(unittest.TestCase):
     def test_empty_body_is_preserved(self):
         result = _tool_result_message("user", "[Tool result: take_screenshot]\n")
         self.assertIsNotNone(result)
+        assert result is not None  # narrow Optional for the type checker
         self.assertEqual(result["content"], "")
 
 

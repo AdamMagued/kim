@@ -125,7 +125,9 @@ class _FakePage:
         self._unroute_raises = unroute_raises
         self._unroute_all_raises = unroute_all_raises
         if not has_unroute_all:
-            self.unroute_all = None  # attribute exists but not callable
+            # Intentionally shadow the method with None to simulate a page whose
+            # unroute_all attribute exists but isn't callable.
+            self.unroute_all = None  # pyright: ignore[reportAttributeAccessIssue]
 
     async def route(self, matcher, handler):
         self.routes.append((matcher, handler))
@@ -270,6 +272,7 @@ class _FakeGuardPage:
     async def fire(self, request: _FakeRequest) -> _FakeRoute:
         """Simulate Playwright invoking the installed handler for *request*."""
         route = _FakeRoute()
+        assert self._route_handler is not None  # route() installs it before fire()
         await self._route_handler(route, request)
         return route
 

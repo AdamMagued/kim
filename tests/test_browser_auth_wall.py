@@ -69,7 +69,7 @@ class AuthWallThroughProviderTest(unittest.TestCase):
 
         provider = BrowserProvider(
             {"project_root": ".", "browser_provider": {}},
-            page_driver=_WallDriver("https://chatgpt.com/auth/login"),
+            page_driver=_WallDriver("https://chatgpt.com/auth/login"),  # pyright: ignore[reportArgumentType]  # test PageDriver stub
         )
         result = asyncio.run(provider.complete(
             messages=[{"role": "user", "content": "hi"}], tools=[], system="s",

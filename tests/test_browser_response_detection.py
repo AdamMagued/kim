@@ -397,7 +397,7 @@ class TestDeliveredNoResponse(unittest.IsolatedAsyncioTestCase):
                 [{"role": "user", "content": "hi"}],
                 tools=[],
                 system="sys",
-                page_driver=_FakeDriver(object(), "chatgpt"),
+                page_driver=_FakeDriver(object(), "chatgpt"),  # pyright: ignore[reportArgumentType]  # test PageDriver stub
             )
         self.assertEqual(result["type"], "text")
         self.assertIn("NEED_HELP", result["content"])
