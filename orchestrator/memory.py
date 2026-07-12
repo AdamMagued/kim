@@ -127,42 +127,52 @@ class ConversationMemory:
         dropped regardless of the message limit.
         """
         has_summary = bool(self._messages and self._messages[0].get("role") == "compact_summary")
-        if len(self._messages) <= self.max_messages:
-            return
+        if len(self._messages) > self.max_messages:
+            # Pin the summary at index 0 and trim the rest
+            if has_summary:
+                summary = self._messages[0]
+                rest = self._messages[1:]
+                max_rest = self.max_messages - 1
+                excess = len(rest) - max_rest
+                found = False
+                for i in range(excess, len(rest)):
+                    if rest[i]["role"] == "user":
+                        # If this user message is a tool result, walk back to
+                        # include the preceding assistant tool_call (and any
+                        # further stacked tool-result messages) so we never
+                        # orphan a result from its call.
+                        start = self._fix_tool_boundary(rest, i)
+                        self._messages = [summary] + rest[start:]
+                        found = True
+                        break
+                if not found:
+                    self._messages = [summary] + rest[-1:]
+            else:
+                excess = len(self._messages) - self.max_messages
+                # Find the first user message within the allowed window
+                found = False
+                for i in range(excess, len(self._messages)):
+                    if self._messages[i]["role"] == "user":
+                        # If this user message is a tool result, walk back to
+                        # include the preceding assistant tool_call (and any further
+                        # stacked tool-result messages) so we never orphan a result
+                        # from its call.
+                        start = self._fix_tool_boundary(self._messages, i)
+                        self._messages = self._messages[start:]
+                        found = True
+                        break
+                if not found:
+                    # If no user message is found in the trailing portion,
+                    # keep at least the very last message rather than emptying.
+                    self._messages = self._messages[-1:]
 
-        # Pin the summary at index 0 and trim the rest
-        if has_summary:
-            summary = self._messages[0]
-            rest = self._messages[1:]
-            max_rest = self.max_messages - 1
-            excess = len(rest) - max_rest
-            for i in range(excess, len(rest)):
-                if rest[i]["role"] == "user":
-                    # If this user message is a tool result, walk back to
-                    # include the preceding assistant tool_call (and any
-                    # further stacked tool-result messages) so we never
-                    # orphan a result from its call.
-                    start = self._fix_tool_boundary(rest, i)
-                    self._messages = [summary] + rest[start:]
-                    return
-            self._messages = [summary] + rest[-1:]
-            return
-
-        excess = len(self._messages) - self.max_messages
-        # Find the first user message within the allowed window
-        for i in range(excess, len(self._messages)):
-            if self._messages[i]["role"] == "user":
-                # If this user message is a tool result, walk back to
-                # include the preceding assistant tool_call (and any further
-                # stacked tool-result messages) so we never orphan a result
-                # from its call.
-                start = self._fix_tool_boundary(self._messages, i)
-                self._messages = self._messages[start:]
-                return
-
-        # If no user message is found in the trailing portion,
-        # keep at least the very last message rather than emptying.
-        self._messages = self._messages[-1:]
+        # Ensure we don't start with an assistant message (F-A-2)
+        first_idx = 0
+        if self._messages and self._messages[0].get("role") == "compact_summary":
+            first_idx = 1
+        if len(self._messages) > first_idx and self._messages[first_idx].get("role") == "assistant":
+            synthetic = {"role": "user", "content": "Resuming session."}
+            self._messages.insert(first_idx, synthetic)
 
     def _is_tool_result(self, msg: dict) -> bool:
         """Return True if *msg* is a user-role tool-result message.
