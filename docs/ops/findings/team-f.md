@@ -38,4 +38,28 @@ within each batch; batches are append-only so numbering is stable across commits
 - **Fix sketch:** On any PLAN event (even <2 steps) clear or replace the live plan; ignore STEP/DONE with `n > steps.length`; document the 12-step truncation in the protocol or remove it.
 - **Cross-territory?** protocol doc side pairs with Team H.
 
+## F-F-5: Spinner-forever + suppressed failure banner when a run ends without `kim-agent-done`
+- **File:** desktop/src/hooks/useChatStream.ts:615-618 (RUN_FAILED handler), :816/:915 (only two `setIsRunning(false)` inside listeners); desktop/src/components/chat/StreamRenderer.tsx:440 (`if (!runFailure || isRunning) return null`)
+- **Severity:** High
+- **Class:** bug | contract
+- **Evidence:** `isRunning` is cleared in exactly three places: the `kim-agent-done` handler, the `kim-agent-cancelled` handler, and the `send_task` invoke() rejection in useTaskRunner (:228). There is NO frontend watchdog/timeout. The typed `kim:run-failed` handler only calls `setRunFailure` — it does NOT clear `isRunning`. So if the backend emits `kim:run-failed` (or dies) but never emits the global `kim-agent-done` (subprocess killed, HTTP-bridge crash, panic before the done signal), the view is stuck: the "thinking…" spinner + Stop button stay forever, AND the recovery banner is actively hidden because StreamRenderer returns null for the failure card while `isRunning` is true. The user's only escape is Stop (if cancel still works) or reload. Concrete trigger: kill the python orchestrator mid-run, or any code path that emits run-failed without the terminal done.
+- **Fix sketch:** Have the RUN_FAILED handler (and a client-side inactivity watchdog, e.g. no event for N s) clear `isRunning`; treat `kim:run-failed` as terminal. Guarantee `kim-agent-done` always follows a failure (Team D/H contract).
+- **Cross-territory?** yes — the "done must always fire" guarantee is Team D/H; the frontend watchdog + terminal-run-failed handling is Team F.
+
+## F-F-6: `index.css` @imports Inter from Google Fonts CDN — a network fetch on every launch of a local desktop app
+- **File:** desktop/src/index.css:1 (`@import url('https://fonts.googleapis.com/css2?family=Inter…')`)
+- **Severity:** Medium
+- **Class:** perf | security
+- **Evidence:** Kim is a local Tauri app, but the very first CSS line makes a render-blocking cross-origin request to `fonts.googleapis.com` (which in turn pulls font files from `fonts.gstatic.com`) on every window open. Offline (a documented common state for this app) → the request fails and the UI falls back to system fonts, causing a visible FOUT and a layout that was never designed/tested against the fallback. It also leaks the user's IP + a load signal to Google on every launch (privacy), and if a strict Tauri CSP is ever added (Team D/I hardening) this import silently breaks all typography. `@import` at the top of the sheet is also the slowest possible way to load a font (blocks all subsequent CSS).
+- **Fix sketch:** Self-host the Inter woff2 subset under `public/` (or `@font-face` with a bundled asset) and drop the remote `@import`; the app already ships assets locally.
+- **Cross-territory?** partial — CSP policy is Team D/I; the import itself is Team F.
+
+## F-F-7: Hard-coded provider price table is stale (marked "2025-Q2") — cost chip shows wrong USD
+- **File:** desktop/src/components/chat/utils.ts:938-964 (`PRICE_PER_1M`, comment "Last refreshed: 2025-Q2")
+- **Severity:** Low
+- **Class:** bug | docs
+- **Evidence:** The per-1M token USD rates are hardcoded (`claude 3/15`, `openai 2.50/10`, `gemini 1.25/5`, `deepseek 0.27/1.10`) with a self-admitted "2025-Q2" refresh date and model IDs (gpt-4o, gemini-1.5-pro, claude-sonnet-4.x) that no longer match what the app actually calls in mid-2026. The cost chip therefore reports figures that drift from reality with no in-UI caveat that they are estimates. This is exactly the "fabricated cost figures" the `estimateCostUsd` null-guard was written to avoid, but for known providers the stale number is shown confidently.
+- **Fix sketch:** Move rates to config the backend already knows (or fetch), add a visible "≈ est." qualifier, and add a test asserting the model IDs in comments match the providers actually dispatched.
+- **Cross-territory?** no
+
 *(hunt in progress — further findings appended below as confirmed)*
