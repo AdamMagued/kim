@@ -16,6 +16,7 @@ from typing import Optional
 
 from mcp_server.os_utils import CURRENT_OS, IS_MACOS, minimal_subprocess_env
 from mcp_server.privacy import is_privacy_paused, PRIVACY_ERROR
+from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -377,7 +378,7 @@ async def _observe_ui_macos(limit: int, depth: int) -> str:
             return _PERMISSION_HINT
         # Any other non-zero exit is NOT a permission issue. Be explicit so
         # the LLM (and the user) don't mis-attribute the failure to TCC.
-        return f"ERROR: observe_ui AppleScript walk failed (exit {code}): {combined}"
+        return tool_error(f"observe_ui AppleScript walk failed (exit {code}): {combined}")
     app, window, elements = _parse_elements(out)
     return _format_observation(app, window, elements, limit)
 
@@ -409,16 +410,16 @@ async def handle_click_ui(args: dict) -> str:
 
     element_id = str(args.get("element_id") or "").strip()
     if not element_id:
-        return "ERROR: element_id is required. Call observe_ui first."
+        return tool_error("element_id is required. Call observe_ui first.")
     el = _LAST_ELEMENTS.get(element_id)
     if not el:
-        return f"ERROR: Unknown element_id {element_id!r}. Call observe_ui again and use one of its IDs."
+        return tool_error(f"Unknown element_id {element_id!r}. Call observe_ui again and use one of its IDs.")
     # 2.3: refuse stale coordinates — the screen has likely changed since a
     # minutes-old observation, and clicking old coords can hit the wrong thing.
     age = time.monotonic() - _LAST_OBSERVE_TS
     if age > _MAX_OBSERVATION_AGE_S:
-        return (
-            f"ERROR: The last observe_ui result is {int(age)}s old (limit "
+        return tool_error(
+            f"The last observe_ui result is {int(age)}s old (limit "
             f"{int(_MAX_OBSERVATION_AGE_S)}s) and its coordinates may be stale. "
             "Call observe_ui again, then click_ui with a fresh element_id."
         )

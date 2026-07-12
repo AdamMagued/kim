@@ -19,13 +19,14 @@ from mcp_server.tools.web_element_scoring import (
 )
 
 from . import browser, observation, resolution
+from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
 async def handle_web_click(args: dict) -> str:
     el_id = str(args.get("element_id", "")).strip()
     if not el_id:
-        return "ERROR: element_id is required"
+        return tool_error("element_id is required")
     page = await browser._page()
     # Pass `page` so a selector that no longer uniquely identifies one element
     # (cssPath()'s 6-level ancestor truncation can collide on repetitive
@@ -39,7 +40,7 @@ async def handle_web_click(args: dict) -> str:
         await locator.scroll_into_view_if_needed(timeout=6000)
         await locator.click(timeout=6000)
     except Exception as e:
-        return f"ERROR: click failed for {el_id} ({selector}): {e}"
+        return tool_error(f"click failed for {el_id} ({selector}): {e}")
     state = await observation._post_action_state(page)
     return f"Clicked {el_id}" + (f"\n{state}" if state else "")
 
@@ -48,7 +49,7 @@ async def handle_web_fill(args: dict) -> str:
     el_id = str(args.get("element_id", "")).strip()
     text = str(args.get("text", ""))
     if not el_id:
-        return "ERROR: element_id is required"
+        return tool_error("element_id is required")
     page = await browser._page()
     selector, err = await resolution._resolve_selector(el_id, page)
     if not selector:
@@ -56,7 +57,7 @@ async def handle_web_fill(args: dict) -> str:
     try:
         await page.locator(selector).first.fill(text, timeout=6000)
     except Exception as e:
-        return f"ERROR: fill failed for {el_id}: {e}"
+        return tool_error(f"fill failed for {el_id}: {e}")
     state = await observation._post_action_state(page)
     return f"Filled {el_id} with {len(text)} chars" + (f"\n{state}" if state else "")
 
@@ -211,7 +212,7 @@ async def handle_web_fill_form(args: dict) -> str:
     try:
         await observation._observe_now(page)
     except Exception as e:
-        return f"ERROR: could not observe the page before filling: {e}"
+        return tool_error(f"could not observe the page before filling: {e}")
 
     report: list[dict[str, Any]] = []
     fields_ok = True
@@ -303,12 +304,12 @@ async def handle_web_fill_form(args: dict) -> str:
 async def handle_web_press(args: dict) -> str:
     key = str(args.get("key", "")).strip()
     if not key:
-        return "ERROR: key is required (e.g. 'Enter', 'Tab', 'Escape')"
+        return tool_error("key is required (e.g. 'Enter', 'Tab', 'Escape')")
     page = await browser._page()
     try:
         await page.keyboard.press(key)
     except Exception as e:
-        return f"ERROR: press failed: {e}"
+        return tool_error(f"press failed: {e}")
     return f"Pressed {key}"
 
 
@@ -319,7 +320,7 @@ async def handle_web_text(args: dict) -> str:
             "() => (document.body && document.body.innerText) || ''"
         )
     except Exception as e:
-        return f"ERROR: text extraction failed: {e}"
+        return tool_error(f"text extraction failed: {e}")
     max_chars = int(args.get("max_chars", 8000))
     text = text.strip()
     if len(text) > max_chars:
@@ -344,6 +345,6 @@ async def handle_web_screenshot(args: dict) -> str:
     try:
         png = await page.screenshot(full_page=full, type="png")
     except Exception as e:
-        return f"ERROR: screenshot failed: {e}"
+        return tool_error(f"screenshot failed: {e}")
     b64 = base64.b64encode(png).decode("ascii")
     return f"WEB_SCREENSHOT_BASE64:image/png:{b64}"

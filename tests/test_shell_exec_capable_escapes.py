@@ -203,6 +203,68 @@ def test_make_benign_usage_allowed(cmd):
     _assert_allowed(cmd)
 
 
+# ── F-C-2 residual: sed `/regex/`-ADDRESSED exec / file-IO (Wave-2 C') ─────────
+
+
+@pytest.mark.parametrize("cmd", [
+    "sed '/foo/e' file",             # regex-addressed execute
+    "sed '/foo/e id' file",          # regex-addressed execute with command
+    "sed '/foo/w /etc/passwd' file", # regex-addressed write
+    "sed '/foo/W /tmp/out' file",    # regex-addressed write-first-line
+    "sed '/foo/r /etc/shadow' file", # regex-addressed read
+    "sed '/foo/R /etc/shadow' file", # regex-addressed read-one-line
+    "sed '1,/foo/w /tmp/out' file",  # line..regex range write
+    "sed '/a/,/b/W /tmp/out' file",  # regex..regex range write
+    "sed '/foo/!e id' file",         # negated regex-addressed execute
+    "sed 's/x/y/; /foo/w /tmp/out' file",  # compound: safe subst then addressed write
+])
+def test_sed_regex_addressed_exec_io_blocked(cmd):
+    _assert_blocked(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "sed '/foo/d' file",             # regex-addressed delete — safe
+    "sed '/foo/p' file",             # regex-addressed print — safe
+    "sed -n '/foo/p' file",
+    "sed '/start/,/end/d' file",     # range delete — safe
+    "sed '/foo/{s/a/b/}' file",      # addressed substitution block — safe
+    "sed 's/write/read/' file",      # 'w'/'r' inside content must NOT false-positive
+    "sed 's/reader/x/g' file",
+]
+)
+def test_sed_regex_addressed_benign_allowed(cmd):
+    _assert_allowed(cmd)
+
+
+# ── F-C-3: gh credential-exfiltration subcommands ─────────────────────────────
+
+
+@pytest.mark.parametrize("cmd", [
+    "gh auth token",
+    "gh auth status --show-token",
+    "gh auth status -t",
+    "gh auth login",
+    "gh auth login --with-token",
+    "env gh auth token",
+    "sudo gh auth token",
+])
+def test_gh_credential_exfil_blocked(cmd):
+    _assert_blocked(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "gh auth status",                # status without --show-token is fine
+    "gh pr list",
+    "gh pr create --title x --body y",
+    "gh issue list",
+    "gh repo view",
+    "gh api /user",
+    "gh run list --limit 1",
+])
+def test_gh_benign_usage_allowed(cmd):
+    _assert_allowed(cmd)
+
+
 # ── End-to-end: the handler denies before dispatch (no execution) ─────────────
 
 

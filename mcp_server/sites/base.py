@@ -28,18 +28,18 @@ SiteToolHandler = Callable[[dict], Awaitable[str]]
 class SiteConnector:
     """One connector — a coherent toolkit for a single external system."""
 
-    # Stable id used in config + the dispatch map (e.g. "guc_cms").
+    # Stable id used in config + the dispatch map (e.g. "my_site").
     id: str
 
-    # Human-readable label shown in the Settings UI ("GUC CMS").
+    # Human-readable label shown in the Settings UI ("My Site").
     label: str
 
     # One-sentence description ("Fetch grades, assignments, and downloads
-    # from the GUC student portal.").
+    # from the student portal.").
     description: str
 
     # MCP `Tool` definitions that get broadcast to the LLM. Names should be
-    # prefixed with the connector id (e.g. "guc_cms_list_grades") so they
+    # prefixed with the connector id (e.g. "my_site_list_grades") so they
     # don't collide with base tools or other connectors.
     tools: list[Tool] = field(default_factory=list)
 

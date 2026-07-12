@@ -20,6 +20,7 @@ from pathlib import Path
 
 from mcp_server.config import PROJECT_ROOT, SHELL_TIMEOUT, validate_path
 from mcp_server.os_utils import check_tool_available, minimal_subprocess_env, IS_WINDOWS
+from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -118,12 +119,12 @@ async def _run_search_cmd(cmd: list[str], cwd: str, timeout: int) -> str:
                 await asyncio.wait_for(proc.wait(), timeout=2)
             except Exception:
                 pass
-        return f"ERROR: Search timed out after {timeout}s. Try a more specific pattern."
+        return tool_error(f"Search timed out after {timeout}s. Try a more specific pattern.")
     except FileNotFoundError:
-        return f"ERROR: '{cmd[0]}' is not installed or not found on PATH."
+        return tool_error(f"'{cmd[0]}' is not installed or not found on PATH.")
     except Exception as e:
         logger.error(f"search command failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_search_in_files(args: dict) -> str:
@@ -143,7 +144,7 @@ async def handle_search_in_files(args: dict) -> str:
     """
     pattern = args.get("pattern", "")
     if not pattern:
-        return "ERROR: 'pattern' parameter is required."
+        return tool_error("'pattern' parameter is required.")
 
     search_path = args.get("path", str(PROJECT_ROOT))
     include = args.get("include", "")
@@ -234,7 +235,7 @@ async def handle_find_files(args: dict) -> str:
     """
     pattern = args.get("pattern", "")
     if not pattern:
-        return "ERROR: 'pattern' parameter is required (e.g. '*.py', '**/*.ts')."
+        return tool_error("'pattern' parameter is required (e.g. '*.py', '**/*.ts').")
 
     search_path = args.get("path", str(PROJECT_ROOT))
     type_filter = args.get("type", "file")
@@ -246,7 +247,7 @@ async def handle_find_files(args: dict) -> str:
         return f"PERMISSION_ERROR: {e}"
 
     if not resolved_path.is_dir():
-        return f"ERROR: '{resolved_path}' is not a directory."
+        return tool_error(f"'{resolved_path}' is not a directory.")
 
     logger.info(f"find_files: pattern={pattern!r} path={resolved_path} type={type_filter}")
 
@@ -315,4 +316,4 @@ async def handle_find_files(args: dict) -> str:
 
     except Exception as e:
         logger.error(f"find_files failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
