@@ -86,4 +86,38 @@ within each batch; batches are append-only so numbering is stable across commits
 - **Fix sketch:** Toast on rejection for the security-/data-relevant invokes (delete_github_token, save_run_history); keep silent-catch only for idempotent UI-mode toggles, and add a short comment at each intentionally-silent site.
 - **Cross-territory?** no
 
-*(hunt in progress — further findings appended below as confirmed)*
+## F-F-11: `tokenStats` churn re-runs the full saved-history render map on every `kim:stats` tick (500+ msg hotspot)
+- **File:** desktop/src/components/chat/StreamRenderer.tsx:233-268 (`renderWorkedFor` `useCallback(..., [tokenStats])`), :355-385 (`savedMsgNodes` useMemo deps include `renderWorkedFor`)
+- **Severity:** Medium
+- **Class:** perf
+- **Evidence:** `renderWorkedFor`'s only dep is `tokenStats`, which is replaced on every `kim:stats` event (emitted frequently during a run — once per provider call). `savedMsgNodes` lists `renderWorkedFor` in its dependency array, so every stats tick gives `renderWorkedFor` a new identity → the `savedMsgNodes` useMemo recomputes → `.map()` rebuilds a wrapper `<div>` + calls `renderWorkedFor` for the ENTIRE saved history. Crucially, saved rows call `renderWorkedFor(idx, run)` with `showCost` defaulting to false, so they never actually read `tokenStats` — they pay the full O(N) rebuild for a value they don't use. On a 500+ message session this is a whole-history reconciliation several times per second during a run. (MessageBubble is `React.memo`, so leaf bubbles are spared, but the map, the WorkedForPill construction, and the div wrappers are not.)
+- **Fix sketch:** Split cost rendering out: give `renderWorkedFor` a `[]` dep and read `tokenStats` from a ref, or pass cost as a prop only to the single last-run pill; drop `renderWorkedFor` from `savedMsgNodes` deps (saved rows are cost-free).
+- **Cross-territory?** no
+
+## F-F-12: Time-window dedup silently drops legitimately-repeated activity lines/items
+- **File:** desktop/src/hooks/useChatStream.ts:220-246 (`isDuplicate` 800ms window on raw lines; `isDuplicateActivityItem` 2000ms window keyed on `kind:text`), :357 (appendRaw calls `isDuplicate` before parsing)
+- **Severity:** Low
+- **Class:** bug
+- **Evidence:** Any raw line identical to one seen in the last 800ms is dropped before parsing; any activity item with the same `kind:text` within 2000ms is dropped. This defeats echo/duplicate spam, but it also silences legitimate repeats: an agent that reads the same file twice in quick succession, retries the identical shell command, or emits two identical status heartbeats will show only the first — the activity feed under-reports what actually happened, and a repeated tool call that matters (e.g. a retry) is invisible. The window is time-based, not content-sequence-based, so timing alone decides whether a real action is shown.
+- **Fix sketch:** Dedup on a monotonically-increasing emit id / sequence number from the backend rather than a text+time heuristic, or exempt tool-call items from the text window.
+- **Cross-territory?** partial — a per-event sequence id is Team D/H; the dedup logic is Team F.
+
+## F-F-13: CSS z-index values are unmanaged magic numbers (0,1,2,10,30,40,50,100,200,900,1000,2000,3000,9000,9999) with no scale
+- **File:** desktop/src/styles/*.css (z-index census: 15 distinct values across the sheets, incl. 9000/9999/3000/2000/1000 competing overlays)
+- **Severity:** Low
+- **Class:** smell
+- **Evidence:** Stacking is governed by ad-hoc literals spread across ~15 CSS files with no shared token scale — 9999, 9000, 3000, 2000, 1000, 900 all coexist as "on top" values. Any new overlay (modal, toast, HITL card, screenshot flash, update banner) is a guess-and-bump against an invisible ordering, and the CLAUDE.md-documented load-bearing @import order (index.css) means a selector's file position also silently affects who wins ties. This is latent overlay-ordering debt, not a live bug, but it's the class that produces "the modal renders behind the toast" regressions.
+- **Fix sketch:** Introduce `--z-*` tokens in tokens.css (base/dropdown/sticky/overlay/modal/toast) and replace the literals; document the scale.
+- **Cross-territory?** no
+
+## Areas swept and found healthy (no finding filed)
+- **Accessibility:** ~122 `aria-*` attributes across components; no `<div onClick>` without a `role`; permission toggle uses `role="group"` + `aria-label`; ErrorBoundary SVG is `aria-hidden`. Keyboard shortcuts (Cmd+N/,/B, Escape) are wired. Reasonable baseline — no severe a11y gap surfaced in this territory (contrast on both themes not measured; recommend Team L/UX verify).
+- **Controlled inputs:** no `defaultValue`/`value` mixing found (no controlled↔uncontrolled flip risk in the 32 `value={}` inputs checked).
+- **Listener leaks:** the big useChatStream effect and App.tsx listeners all use the `cancelled`-flag + `.then(unlisten)` pattern correctly, with matching cleanup — no leak found there (the risk was the `commitCurrentBrowserUrl` identity churn, already mitigated via ref per the in-code comment at :176-183).
+- **Partial-line JSONL:** NOT a risk — the Rust stdout pump (spawn_supervisor.rs:127 `BufReader.lines()`/`next_line()`) guarantees whole newline-delimited lines to the frontend, so `parseAgentLine` never sees a split JSON frame.
+
+---
+
+## Summary
+13 findings: 2 High (F-F-1 missing eslint, F-F-2 cross-session event bleed), 5 Medium (F-F-5 spinner-forever, F-F-6 remote font, F-F-8 optional-envelope routing, F-F-10 swallowed invokes, F-F-11 perf hotspot), 6 Low/smell (F-F-3, F-F-4, F-F-7, F-F-9, F-F-12, F-F-13). Cross-territory handoffs to Teams D/H (event-stamping, run-done guarantee, contract table) and K (eslint CI wiring) noted inline.
+
