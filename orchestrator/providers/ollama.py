@@ -451,6 +451,19 @@ class OllamaProvider(BaseProvider):
         return converted
 
     async def _stream_chat(self, payload: dict[str, Any]) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+        try:
+            return await self._stream_chat_inner(payload)
+        except httpx.TimeoutException as exc:
+            # F-B-5: re-raise httpx transport timeouts as a builtin TimeoutError
+            # (mirroring claude.py/openai_provider.py) so classify_provider_error
+            # marks the single most transient failure a local daemon has —
+            # model cold-load exceeding the connect window, or the 600s read
+            # ceiling — retryable instead of a non-retryable "unknown".
+            raise TimeoutError(
+                f"Ollama request to {self._base_url} timed out: {exc or type(exc).__name__}"
+            ) from exc
+
+    async def _stream_chat_inner(self, payload: dict[str, Any]) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
         pieces: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         final_obj: dict[str, Any] | None = None

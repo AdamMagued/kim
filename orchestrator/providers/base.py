@@ -223,7 +223,18 @@ def classify_provider_error(error: Exception) -> ProviderError:
     if "overloaded" in lowered:
         return ProviderError("server_error", message, retryable=True)
 
-    if isinstance(error, TimeoutError) or "timeout" in lowered:
+    # F-B-5: httpx's transport timeouts (ReadTimeout/ConnectTimeout/PoolTimeout/
+    # TimeoutException) are NOT builtin TimeoutError, and their str() is often
+    # empty or the phrase "timed out" — which does not contain the substring
+    # "timeout". Match the exception class name ("...timeout...") and the
+    # "timed out" wording so a mid-generation transport timeout (Ollama's most
+    # common transient failure) is retried instead of dying as "unknown".
+    if (
+        isinstance(error, TimeoutError)
+        or "timeout" in lowered
+        or "timed out" in lowered
+        or "timeout" in error_type
+    ):
         return ProviderError("timeout", message, retryable=True)
     if isinstance(error, (ConnectionError, OSError)) or "connection" in lowered:
         return ProviderError("network", message, retryable=True)

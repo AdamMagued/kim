@@ -477,6 +477,30 @@ class OllamaDoneReasonTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "stop")
 
 
+class OllamaTimeoutClassificationTests(unittest.TestCase):
+    """F-B-5: httpx transport timeouts must become retryable builtin TimeoutError."""
+
+    def test_stream_chat_reraises_httpx_timeout_as_timeouterror(self):
+        import httpx
+        from orchestrator.providers.base import classify_provider_error
+
+        provider = OllamaProvider({"ollama": {"mode": "cloud", "cloud_model": "m:cloud"}})
+
+        async def _boom(_payload):
+            raise httpx.ReadTimeout("timed out")
+
+        async def _drive():
+            with patch.object(provider, "_stream_chat_inner", _boom):
+                await provider._stream_chat({"model": "m:cloud"})
+
+        with self.assertRaises(TimeoutError) as ctx:
+            asyncio.run(_drive())
+        # And the agent's retry boundary classifies it as retryable.
+        classified = classify_provider_error(ctx.exception)
+        self.assertEqual(classified.code, "timeout")
+        self.assertTrue(classified.retryable)
+
+
 if __name__ == "__main__":
     unittest.main()
 
