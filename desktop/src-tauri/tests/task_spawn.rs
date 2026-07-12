@@ -157,6 +157,68 @@ fn codex_browser_spec_keeps_hitl_stdin_contract() {
 }
 
 // ---------------------------------------------------------------------------
+// F-H-8/F-H-2 — every orchestrator-backed spawn shape MUST export the
+// run-identity envelope (KIM_RUN_ID + KIM_SESSION_ID) so the Python emitter
+// (events_gen) self-stamps typed events with the session they belong to.
+// Before the fix, codex_browser_spec exported neither, so Code-tab browser
+// events routed to whatever view was mounted (F-F-2/F-F-8).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn codex_browser_spec_exports_run_identity_envelope() {
+    let spec = codex_browser_spec(CodexBridgeSpecParams {
+        python: "/venv/bin/python",
+        kim_root: Path::new("/kim"),
+        target_root: Path::new("/proj"),
+        task: "t",
+        provider: "browser:gemini",
+        codex_bin: Path::new("/bin/codex"),
+        session_id: "sess".into(),
+        permission_mode: None,
+        extra_envs: vec![],
+    });
+    // KIM_SESSION_ID is the session verbatim; KIM_RUN_ID is derived from it,
+    // exactly as chat_task_spec does (sanitized session + "-" + timestamp).
+    assert_eq!(env_of(&spec, "KIM_SESSION_ID"), Some("sess"));
+    assert!(
+        env_of(&spec, "KIM_RUN_ID")
+            .expect("KIM_RUN_ID must be exported on the codex browser-bridge spawn")
+            .starts_with("sess-"),
+        "KIM_RUN_ID should be run_id_for_session(session_id)"
+    );
+}
+
+#[test]
+fn every_orchestrator_spawn_shape_exports_run_identity() {
+    // Both orchestrator-backed shapes (chat + codex browser-bridge) must carry
+    // the envelope. codex_direct_spec runs a non-Kim binary that emits no typed
+    // events, so it is intentionally exempt.
+    let chat = gui_spec(None);
+    let codex = codex_browser_spec(CodexBridgeSpecParams {
+        python: "/venv/bin/python",
+        kim_root: Path::new("/kim"),
+        target_root: Path::new("/proj"),
+        task: "t",
+        provider: "browser:claude",
+        codex_bin: Path::new("/bin/codex"),
+        session_id: "sess".into(),
+        permission_mode: None,
+        extra_envs: vec![],
+    });
+    for spec in [&chat, &codex] {
+        assert!(
+            env_of(spec, "KIM_RUN_ID").is_some(),
+            "orchestrator spawn shape missing KIM_RUN_ID"
+        );
+        assert_eq!(
+            env_of(spec, "KIM_SESSION_ID"),
+            Some("sess"),
+            "orchestrator spawn shape missing/incorrect KIM_SESSION_ID"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Behavioral: a TaskSpec is executable — a fake recorder binary observes
 // exactly the argv and env the spec declared.
 // ---------------------------------------------------------------------------

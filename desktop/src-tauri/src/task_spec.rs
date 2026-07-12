@@ -310,6 +310,17 @@ pub fn codex_browser_spec(p: CodexBridgeSpecParams<'_>) -> TaskSpec {
         .set("PYTHONPATH", p.kim_root.to_string_lossy())
         .set("CODEX_BIN", p.codex_bin.to_string_lossy())
         .set("KIM_TAURI_MODE", "1")
+        // F-H-8/F-H-2: export the run-identity envelope EXACTLY like
+        // `chat_task_spec` so the codex browser-bridge's typed events
+        // (kim:status / kim:answer / kim:tool / kim:hitl-approval-request,
+        // all emitted by codex_bridge_service via events_gen) self-stamp
+        // KIM_RUN_ID / KIM_SESSION_ID. Without this the Code-tab (browser
+        // bridge) path emitted typed events with NO envelope, so the frontend
+        // routed them to whatever view was mounted instead of their owning
+        // session (root cause of F-F-2/F-F-8). Names match the Python side
+        // landed in a61ffb4 (orchestrator/events_gen.py reads these two).
+        .set("KIM_RUN_ID", run_id_for_session(&p.session_id))
+        .set("KIM_SESSION_ID", p.session_id.as_str())
         .permission_mode(p.permission_mode)
         .extend(p.extra_envs)
         .build();
