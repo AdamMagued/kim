@@ -247,7 +247,10 @@ function PaneAccount({
         github_avatar_url: undefined,
         gist_id: undefined,
       });
-      await invoke('delete_github_token').catch(() => {});
+      // F-F-10: do NOT swallow this rejection. If the token can't be removed
+      // from the keychain, the UI must not falsely report "disconnected" while
+      // the credential persists on disk — let it propagate to the catch below.
+      await invoke('delete_github_token');
       toast('GitHub disconnected', 'success', 2000);
     } catch (err) {
       toast(`Could not disconnect GitHub: ${String(err)}`, 'error', 4000);

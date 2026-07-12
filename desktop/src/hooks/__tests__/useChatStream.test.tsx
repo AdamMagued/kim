@@ -27,6 +27,11 @@ vi.mock('@tauri-apps/api/event', () => ({
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(() => Promise.resolve()) }));
 
+// F-F-10: spy on Toast so we can assert the hook surfaces a save_run_history
+// failure instead of silently swallowing it.
+const toastMock = vi.fn();
+vi.mock('../../components/Toast', () => ({ toast: (...a: unknown[]) => toastMock(...a) }));
+
 import { invoke } from '@tauri-apps/api/core';
 const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
 
@@ -64,6 +69,7 @@ beforeEach(() => {
   listeners.clear();
   invokeMock.mockClear();
   invokeMock.mockResolvedValue(undefined);
+  toastMock.mockClear();
   __testOnlyPendingRunSnapshots.clear();
 });
 
@@ -419,6 +425,30 @@ describe('useChatStream lifecycle', () => {
     expect(props.setMessageReloadNonce).toHaveBeenCalled();
     expect(result.current.taskError).toBeNull();
     expect(result.current.lastFailedTask).toBeNull();
+  });
+
+  it('toasts when save_run_history rejects instead of silently losing the run (F-F-10)', async () => {
+    vi.useFakeTimers();
+    invokeMock.mockImplementation((name: string) =>
+      name === 'save_run_history'
+        ? Promise.reject(new Error('disk full'))
+        : Promise.resolve(undefined),
+    );
+    const { result } = await renderStream();
+
+    act(() => { result.current.setIsRunning(true); });
+    emit('kim:status', { message: 'working' }); // activity so the run is persisted
+    act(() => { vi.advanceTimersByTime(1000); });
+
+    emit('kim-agent-done', true);
+    // Let the rejected save_run_history promise settle.
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(invokeMock).toHaveBeenCalledWith('save_run_history', expect.objectContaining({ sessionId: 'conv-1' }));
+    const surfaced = toastMock.mock.calls.some(
+      ([msg, kind]) => typeof msg === 'string' && /history/i.test(msg) && kind === 'error',
+    );
+    expect(surfaced).toBe(true);
   });
 
   it('kim-agent-done (failure) sets taskError and strips the failed run assistant output', async () => {

@@ -847,7 +847,12 @@ export function useChatStream({
               ? `${completedCodeSession.project_path}/.codex/sessions`
               : settingsRef.current.codex_sessions_dir || null,
             runs: next,
-          }).catch(() => {});
+          }).catch(() => {
+            // F-F-10: a save failure silently lost the completed run's activity
+            // + cost from session history (empty "worked for" pill, user assumes
+            // nothing ran). Surface it so the loss is at least visible.
+            toast('Could not save this run to history — it may not appear when you reopen the session.', 'error', 4000);
+          });
         }
       }
       clearActivityNow();
