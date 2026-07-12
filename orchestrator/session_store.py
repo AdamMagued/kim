@@ -47,6 +47,53 @@ _DEFAULT_BASE_DIR = Path(__file__).resolve().parent.parent / "kim_sessions"
 # Rotate the active JSONL when it exceeds this size (finding 4: size cap)
 _MAX_SESSION_BYTES = 50 * 1024 * 1024  # 50 MB
 
+# Cache of per-file message counts keyed on the JSONL path, invalidated by
+# (mtime, size), so list_sessions() does not re-parse every line of every
+# historical session on each call (F-INH-8).  Only files whose stat changed
+# (i.e. the growing active session) are re-parsed; unchanged rolled/historical
+# files are answered from the cache.  Maps str(path) -> (mtime, size, count).
+_MSG_COUNT_CACHE: dict = {}
+_MSG_COUNT_CACHE_CAP = 4096
+_MSG_COUNT_CACHE_LOCK = threading.Lock()
+
+
+def _count_role_messages(path: Path) -> int:
+    """Return the number of role-bearing messages in a session JSONL file,
+    memoised on (path, mtime, size) so unchanged files are not re-parsed
+    (F-INH-8).  Trace records (run_started/run_result/checkpoint — no "role"
+    key) are excluded, matching the historical message_count semantics.
+    """
+    key = str(path)
+    try:
+        st = path.stat()
+        stamp = (st.st_mtime, st.st_size)
+    except OSError:
+        return 0
+    with _MSG_COUNT_CACHE_LOCK:
+        cached = _MSG_COUNT_CACHE.get(key)
+        if cached is not None and cached[0] == stamp[0] and cached[1] == stamp[1]:
+            return cached[2]
+    count = 0
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for _line in fh:
+                _stripped = _line.strip()
+                if not _stripped:
+                    continue
+                try:
+                    if "role" in json.loads(_stripped):
+                        count += 1
+                except json.JSONDecodeError:
+                    pass
+    except OSError:
+        return 0
+    with _MSG_COUNT_CACHE_LOCK:
+        # Bound the cache: on overflow drop everything (simple, rare).
+        if len(_MSG_COUNT_CACHE) >= _MSG_COUNT_CACHE_CAP:
+            _MSG_COUNT_CACHE.clear()
+        _MSG_COUNT_CACHE[key] = (stamp[0], stamp[1], count)
+    return count
+
 # The prune screenshot-strip pass rewrites session files in place. A resumed
 # session appends into its ORIGINAL (old) date dir, so a file touched within
 # this window may still be live — skip it to avoid racing a concurrent append
@@ -953,19 +1000,9 @@ class SessionStore:
                 session_id = jsonl_file.stem
                 summary_file = date_dir / f"{session_id}.summary.txt"
                 context_file = date_dir / f"{session_id}.context.json"
-                try:
-                    msg_count = 0
-                    with open(jsonl_file, encoding="utf-8") as f:
-                        for _line in f:
-                            _stripped = _line.strip()
-                            if _stripped:
-                                try:
-                                    if "role" in json.loads(_stripped):
-                                        msg_count += 1
-                                except json.JSONDecodeError:
-                                    pass
-                except Exception:
-                    msg_count = 0
+                # Stat-keyed cache: unchanged historical files are not re-parsed
+                # (F-INH-8); only the growing active file pays the parse.
+                msg_count = _count_role_messages(jsonl_file)
 
                 sessions.append({
                     "session_id": session_id,
