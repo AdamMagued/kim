@@ -64,6 +64,26 @@ def _get_fallback_token() -> str:
     return token
 
 
+def _read_home_bridge_token() -> str:
+    """Read the loopback bridge token the desktop persists to ~/.kim/bridge_token.
+
+    Since D2 the desktop app writes the active bridge token ONLY to
+    ~/.kim/bridge_token (0600, rewritten every start) and deletes the legacy
+    kim_sessions/.bridge_token. The `kim` CLI reads it
+    (cli/src/provider/bridge.rs::bridge_token_from_file); kimctl must too, or on
+    a default install with no KIM_API_KEY every kimctl bridge command 401s while
+    `kim` pairs fine (F-E-13).
+    """
+    token_file = Path.home() / ".kim" / "bridge_token"
+    try:
+        text = token_file.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    except OSError:
+        pass
+    return ""
+
+
 def _read_bridge_url_file(root: Path) -> str:
     """Read URL from kim_sessions/.bridge_url."""
     token_file = root / "kim_sessions" / ".bridge_url"
@@ -112,6 +132,15 @@ def _resolve_bridge() -> tuple[str, str]:
 
     if url and token:
         return url, token
+
+    # F-E-13: pairing-token ladder mirroring cli/src/provider/bridge.rs — an
+    # explicit KIM_API_KEY env override wins, then the desktop's
+    # ~/.kim/bridge_token pairing file, then the mcp_server config api_key.
+    if not token:
+        token = os.environ.get("KIM_API_KEY", "").strip()
+
+    if not token:
+        token = _read_home_bridge_token()
 
     if not token:
         token = _get_fallback_token()

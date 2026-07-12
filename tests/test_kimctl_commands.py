@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 
 from kimctl.__main__ import (
+    _read_home_bridge_token,
+    _resolve_bridge,
     build_parser,
     cmd_browser,
     cmd_cancel,
@@ -354,3 +356,46 @@ def test_browser_human_readable_error(monkeypatch, capsys):
     cmd_browser(Namespace(browser_action="show", selector=None, json=False))
     out = capsys.readouterr().out
     assert "not connected" in out
+
+
+# ---------------------------------------------------------------------------
+# F-E-13: kimctl must read the desktop's ~/.kim/bridge_token pairing file.
+# ---------------------------------------------------------------------------
+
+def _clear_bridge_env(monkeypatch):
+    for var in (
+        "KIM_WEBVIEW_BRIDGE_URL",
+        "KIM_WEBVIEW_BRIDGE_TOKEN",
+        "KIM_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_read_home_bridge_token_absent(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _read_home_bridge_token() == ""
+
+
+def test_resolve_bridge_reads_home_token(monkeypatch, tmp_path):
+    _clear_bridge_env(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    kim_dir = tmp_path / ".kim"
+    kim_dir.mkdir()
+    (kim_dir / "bridge_token").write_text("home-tok-123\n", encoding="utf-8")
+
+    _, token = _resolve_bridge()
+    assert token == "home-tok-123"
+
+
+def test_resolve_bridge_home_token_yields_to_env(monkeypatch, tmp_path):
+    """Mirror cli/src/provider/bridge.rs: an explicit KIM_API_KEY env override
+    wins over the ~/.kim/bridge_token pairing file."""
+    _clear_bridge_env(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    kim_dir = tmp_path / ".kim"
+    kim_dir.mkdir()
+    (kim_dir / "bridge_token").write_text("home-tok", encoding="utf-8")
+    monkeypatch.setenv("KIM_API_KEY", "env-key-wins")
+
+    _, token = _resolve_bridge()
+    assert token == "env-key-wins"
