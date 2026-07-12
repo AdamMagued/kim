@@ -793,27 +793,46 @@ class BrowserProvider(BaseProvider):
         ]
 
         if image_attachments:
-            logger.info(f"[STATUS] Uploading screenshot to {site}…")
-            image_delivered = await self._inject_image_clipboard(
-                page, cfg, str(image_attachments[-1]["data_base64"])
-            )
-            await page.wait_for_timeout(1200)
-            if not image_delivered:
+            # F-B-10: upload EVERY image, not just image_attachments[-1]. The
+            # prompt says "[Screenshot attached]" for each one, so pasting only
+            # the last silently dropped the earlier screenshots (the bridge path
+            # already supports 8). Clipboard side-effect note: on a CDP-attached
+            # real Chrome each paste writes the user's system clipboard via
+            # navigator.clipboard; the prior clipboard is not restored (an image
+            # write cannot be reliably undone). This is a documented trade-off
+            # of CDP mode — see F-I-4 / SECURITY.
+            total_images = len(image_attachments)
+            logger.info(f"[STATUS] Uploading {total_images} screenshot(s) to {site}…")
+            delivered_count = 0
+            for img in image_attachments:
+                if await self._inject_image_clipboard(page, cfg, str(img["data_base64"])):
+                    delivered_count += 1
+                await page.wait_for_timeout(1200)
+            if delivered_count < total_images:
                 # Screenshot-honesty (7.2/7.3): the prompt says "[Screenshot
-                # attached]" but the paste failed — make the missing image
-                # structurally known to the site model instead of letting it
-                # confabulate a screen description from no pixels.
+                # attached]" but one or more pastes failed — make the missing
+                # image(s) structurally known to the site model instead of
+                # letting it confabulate a screen description from no pixels.
+                missing = total_images - delivered_count
                 logger.warning(
-                    f"Screenshot paste failed on {site} — appending "
-                    "not-attached note to the prompt."
+                    f"{missing}/{total_images} screenshot paste(s) failed on {site} — "
+                    "appending not-attached note to the prompt."
                 )
-                prompt = (
-                    f"{prompt}\n\n"
-                    "[System note: The screenshot mentioned above could NOT "
-                    "be attached. You have NOT seen the image. Do not claim "
-                    "to see the screen; answer from the text context only, "
-                    "or say the screenshot was unavailable.]"
-                )
+                if delivered_count == 0:
+                    prompt = (
+                        f"{prompt}\n\n"
+                        "[System note: The screenshot(s) mentioned above could NOT "
+                        "be attached. You have NOT seen the image. Do not claim "
+                        "to see the screen; answer from the text context only, "
+                        "or say the screenshot was unavailable.]"
+                    )
+                else:
+                    prompt = (
+                        f"{prompt}\n\n"
+                        f"[System note: {missing} of {total_images} screenshot(s) could NOT "
+                        "be attached. Do not describe any image that was not provided; "
+                        "answer those from the text context only.]"
+                    )
 
         logger.info(f"[STATUS] Preparing {site}…")
         await self._dismiss_popups(page)

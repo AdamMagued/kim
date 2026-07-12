@@ -346,6 +346,39 @@ class _FakeDriver:
         return self._page, self._site
 
 
+class _ImgPage:
+    url = "https://chatgpt.com/c/x"
+
+    async def title(self):
+        return ""
+
+    async def wait_for_timeout(self, _ms):
+        return None
+
+
+class TestMultiImageUpload(unittest.IsolatedAsyncioTestCase):
+    """F-B-10: the CDP path must upload EVERY image, not just the last."""
+
+    async def test_all_images_are_uploaded(self):
+        p = _provider()
+        inject = AsyncMock(return_value=True)
+        attachments = [
+            {"mime_type": "image/png", "data_base64": "AAA"},
+            {"mime_type": "image/png", "data_base64": "BBB"},
+            {"mime_type": "image/png", "data_base64": "CCC"},
+        ]
+        with patch.object(p, "_inject_image_clipboard", inject), \
+             patch.object(p, "_dismiss_popups", AsyncMock()), \
+             patch.object(p, "_send_and_wait", AsyncMock(return_value="TASK_COMPLETE: ok [END_OF_RESPONSE_x]")):
+            await p._run_chat_flow(
+                _ImgPage(), "chatgpt", "prompt [Screenshot attached]x3",
+                attachments, None, "[END_OF_RESPONSE_x]", False, {"input": 1},
+            )
+        self.assertEqual(inject.await_count, 3)
+        uploaded = [c.args[2] for c in inject.await_args_list]
+        self.assertEqual(uploaded, ["AAA", "BBB", "CCC"])
+
+
 class TestDeliveredNoResponse(unittest.IsolatedAsyncioTestCase):
     def test_delivered_no_response_is_not_a_retryable_timeout(self):
         # Must not be a TimeoutError, or classify_provider_error would mark it
