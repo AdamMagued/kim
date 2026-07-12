@@ -25,7 +25,7 @@
   content: "";
   position: absolute;
   inset: 0;
-  z-index: 0;
+  z-index: var(--z-base);
   pointer-events: none;
   background:
     radial-gradient(120% 70% at 26% 4%, rgba(255, 255, 255, 0.18), transparent 58%),
@@ -35,7 +35,7 @@
 }
 .kim-sidebar > * {
   position: relative;
-  z-index: 1;
+  z-index: var(--z-raised);
 }
 .kim-sidebar--collapsed {
   width: 52px !important;
@@ -53,7 +53,7 @@
   width: 5px;
   height: 100%;
   cursor: col-resize;
-  z-index: 30;
+  z-index: var(--z-nav);
   background: transparent;
   transition: background 0.12s ease;
   touch-action: none;
@@ -73,7 +73,7 @@
   width: 6px;
   height: 100%;
   cursor: col-resize;
-  z-index: 40;
+  z-index: var(--z-dropdown);
   background: transparent;
   transition: background 0.12s ease, box-shadow 0.12s ease;
   touch-action: none;
@@ -253,7 +253,7 @@
 /* Custom context menu (right-click on sidebar chat items) */
 .kim-context-menu {
   position: fixed;
-  z-index: 9999;
+  z-index: var(--z-flash);
   min-width: 140px;
   background: var(--bg-glass);
   backdrop-filter: blur(20px) saturate(180%);
@@ -416,7 +416,7 @@
   border-radius: 12px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.32);
   padding: 6px;
-  z-index: 50;
+  z-index: var(--z-popover);
   animation: kim-menu-in 140ms ease-out;
 }
 @keyframes kim-menu-in {
