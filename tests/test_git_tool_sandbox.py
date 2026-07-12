@@ -130,6 +130,7 @@ async def test_git_diff_benign_path_reaches_run_git():
     with patch.object(git_tool, "_run_git", new=AsyncMock(return_value="exit_code: 0")) as run:
         result = await handle_git_diff({"path": "README.md", "cwd": str(PROJECT_ROOT)})
     run.assert_awaited_once()
+    assert run.await_args is not None
     # the '--' pathspec separator + the path are forwarded
     assert run.await_args.args[-2:] == ("--", "README.md")
     assert "exit_code: 0" in result
@@ -140,6 +141,7 @@ async def test_git_add_benign_paths_reach_run_git():
     with patch.object(git_tool, "_run_git", new=AsyncMock(return_value="exit_code: 0")) as run:
         result = await handle_git_add({"paths": ["a.py", "b.py"], "cwd": str(PROJECT_ROOT)})
     run.assert_awaited_once()
+    assert run.await_args is not None
     assert "a.py" in run.await_args.args and "b.py" in run.await_args.args
     assert "exit_code: 0" in result
 
@@ -149,6 +151,7 @@ async def test_git_checkout_benign_branch_reaches_run_git():
     with patch.object(git_tool, "_run_git", new=AsyncMock(return_value="exit_code: 0")) as run:
         result = await handle_git_checkout({"target": "feature/x", "cwd": str(PROJECT_ROOT)})
     run.assert_awaited_once()
+    assert run.await_args is not None
     assert "feature/x" in run.await_args.args
     assert "exit_code: 0" in result
 
