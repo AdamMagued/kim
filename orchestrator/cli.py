@@ -16,7 +16,14 @@ import tempfile
 from pathlib import Path
 
 from orchestrator.agent_config import DEFAULT_PROVIDER
-from orchestrator.events_gen import emit_activity, emit_answer, emit_run_done
+from orchestrator.events_gen import (
+    emit_activity,
+    emit_answer,
+    emit_run_done,
+    emit_agent_done,
+    emit_agent_cancelled,
+    emit_agent_error,
+)
 
 
 def resolve_log_dir() -> Path:
@@ -103,12 +110,16 @@ async def _cli_main(args: argparse.Namespace) -> None:
     task = args.task or input("Task: ").strip()
     print(f"Running: {task!r}  provider={config.get('provider', DEFAULT_PROVIDER)}", file=sys.stderr)
 
-    async with mcp_agent_context(
-        config,
-        resume_session_id=args.resume,
-        session_dir=args.session_dir,
-    ) as agent:
-        result = await agent.run(task)
+    result = None
+    try:
+        async with mcp_agent_context(
+            config,
+            resume_session_id=args.resume,
+            session_dir=args.session_dir,
+        ) as agent:
+            result = await agent.run(task)
+    except Exception as e:
+        result = {"success": False, "summary": f"Error: {e}", "termination": "failed"}
 
     status = "SUCCESS" if result["success"] else "FAILED"
     termination = result.get('termination', 'unknown')
@@ -122,7 +133,10 @@ async def _cli_main(args: argparse.Namespace) -> None:
             answer = answer[len("TASK_COMPLETE:"):].strip()
         if answer:
             emit_answer(answer)
-    elif termination != "cancelled":
+        emit_agent_done(True)
+    elif termination == "cancelled":
+        emit_agent_cancelled(False)
+    else:
         # #26/#27: in typed IPC mode Rust drops the legacy `[FAILED] <summary>`
         # text line, so failed runs (including NEED_HELP questions) lost their
         # detail — the UI only saw the bare termination code via kim:run-failed.
@@ -133,6 +147,8 @@ async def _cli_main(args: argparse.Namespace) -> None:
         failure_detail = str(result.get("summary", "")).strip()
         if failure_detail:
             emit_activity("error", failure_detail)
+        emit_agent_error(failure_detail or "unknown error")
+        emit_agent_done(False)
     # Human-readable line for legacy kim-agent-output path and activity feed.
     print(f"[STATUS] run ended: {termination}", flush=True)
     print(f"\n[{status}] {result['summary']}")

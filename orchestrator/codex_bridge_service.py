@@ -42,6 +42,9 @@ from orchestrator.events_gen import (
     emit_hitl_approval_request,
     emit_run_done,
     emit_status,
+    emit_agent_done,
+    emit_agent_cancelled,
+    emit_agent_error,
 )
 
 from codex_engine.engine import (
@@ -771,6 +774,10 @@ async def _run_exec_task(
     }
     if os.environ.get("CODEX_HOME"):
         env["CODEX_HOME"] = os.environ["CODEX_HOME"]
+    if "KIM_RUN_ID" in os.environ:
+        env["KIM_RUN_ID"] = os.environ["KIM_RUN_ID"]
+    if "KIM_SESSION_ID" in os.environ:
+        env["KIM_SESSION_ID"] = os.environ["KIM_SESSION_ID"]
     # On Windows the POSIX vars above are absent; forward the essentials
     # so the codex child process can locate system tools and temp storage.
     if sys.platform == "win32":
@@ -932,6 +939,13 @@ def _emit_terminal_for_rc(rc: int) -> None:
         termination, success = "failed", False
     try:
         emit_run_done(termination, success)
+        if success:
+            emit_agent_done(True)
+        elif termination == "cancelled":
+            emit_agent_cancelled(False)
+        else:
+            emit_agent_error(f"Codex bridge exited with code {rc}")
+            emit_agent_done(False)
     except Exception:  # noqa: BLE001 — a terminal event must never mask the real rc
         pass
 

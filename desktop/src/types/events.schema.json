@@ -289,6 +289,30 @@
         "phase": { "type": "string", "description": "'started' | 'completed' | 'interrupted' | 'failed'." },
         "turn_id": { "type": "string", "default": true, "description": "Codex turn id (may be empty)." }
       }
+    },
+    {
+      "event": "kim:agent-done",
+      "typeName": "KimAgentDone",
+      "description": "Agent completed its execution successfully or with expected outcome.",
+      "payload": {
+        "success": { "type": "boolean", "description": "True when the agent finished successfully." }
+      }
+    },
+    {
+      "event": "kim:agent-cancelled",
+      "typeName": "KimAgentCancelled",
+      "description": "Agent execution was cancelled.",
+      "payload": {
+        "success": { "type": "boolean", "description": "Usually false for cancellation." }
+      }
+    },
+    {
+      "event": "kim:agent-error",
+      "typeName": "KimAgentError",
+      "description": "Agent run failed with an error.",
+      "payload": {
+        "error": { "type": "string", "description": "Error description." }
+      }
     }
   ],
   "legacyTags": [

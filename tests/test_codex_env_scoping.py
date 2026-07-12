@@ -106,6 +106,14 @@ class TestCodexEnvScoping(unittest.IsolatedAsyncioTestCase):
         result = await run_bridge(self.tmp, env={"CODEX_HOME": "/custom/codex-home"})
         self.assertEqual(result.capture["env"].get("CODEX_HOME"), "/custom/codex-home")
 
+    async def test_parent_run_identity_is_forwarded(self):
+        """F-H-8: KIM_RUN_ID and KIM_SESSION_ID must be forwarded if present."""
+        planted = {"KIM_RUN_ID": "run-xyz", "KIM_SESSION_ID": "sess-123"}
+        result = await run_bridge(self.tmp, env=planted)
+        child_env = result.capture["env"]
+        self.assertEqual(child_env.get("KIM_RUN_ID"), "run-xyz")
+        self.assertEqual(child_env.get("KIM_SESSION_ID"), "sess-123")
+
     async def test_path_and_home_are_forwarded_from_parent(self):
         """The allowlisted basics come from the parent env, unmodified."""
         result = await run_bridge(self.tmp)

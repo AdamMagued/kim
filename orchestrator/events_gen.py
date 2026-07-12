@@ -37,6 +37,9 @@ DIFF_UPDATE = "kim:diff-update"
 TOKEN_USAGE = "kim:token-usage"
 ITEM_LIFECYCLE = "kim:item-lifecycle"
 TURN_LIFECYCLE = "kim:turn-lifecycle"
+AGENT_DONE = "kim:agent-done"
+AGENT_CANCELLED = "kim:agent-cancelled"
+AGENT_ERROR = "kim:agent-error"
 
 # K5: named bracket-tag constants — the single source of truth for the
 # text-protocol vocabulary. Emitters (codex_engine, codex_bridge_service)
@@ -232,3 +235,15 @@ def emit_item_lifecycle(item_id: str, kind: str, phase: str, title: str) -> None
 
 def emit_turn_lifecycle(phase: str, turn_id: str) -> None:
     emit_event("turn_lifecycle", phase=phase, turn_id=turn_id)
+
+
+def emit_agent_done(success: bool) -> None:
+    emit_event("agent_done", success=success)
+
+
+def emit_agent_cancelled(success: bool) -> None:
+    emit_event("agent_cancelled", success=success)
+
+
+def emit_agent_error(error: str) -> None:
+    emit_event("agent_error", error=error)

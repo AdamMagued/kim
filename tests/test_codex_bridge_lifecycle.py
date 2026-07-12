@@ -19,33 +19,50 @@ from contextlib import redirect_stdout
 from orchestrator import codex_bridge_service as svc
 
 
-def _capture_terminal(rc: int) -> dict:
+def _capture_events(rc: int) -> list[dict]:
     buf = io.StringIO()
     with redirect_stdout(buf):
         svc._emit_terminal_for_rc(rc)
     lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
-    assert lines, "expected a typed terminal event line on stdout"
-    return json.loads(lines[-1])
+    return [json.loads(ln) for ln in lines]
 
 
 class TestCodexBridgeLifecycle(unittest.TestCase):
-    def test_success_emits_typed_run_done(self):
-        payload = _capture_terminal(0)
-        self.assertEqual(payload["type"], "run_done")
-        self.assertTrue(payload["success"])
-        self.assertEqual(payload["termination"], "task_complete")
+    def test_success_emits_typed_run_done_and_agent_done(self):
+        payloads = _capture_events(0)
+        self.assertEqual(len(payloads), 2)
+        
+        self.assertEqual(payloads[0]["type"], "run_done")
+        self.assertTrue(payloads[0]["success"])
+        self.assertEqual(payloads[0]["termination"], "task_complete")
+        
+        self.assertEqual(payloads[1]["type"], "agent_done")
+        self.assertTrue(payloads[1]["success"])
 
-    def test_failure_emits_typed_run_done_not_success(self):
-        payload = _capture_terminal(1)
-        self.assertEqual(payload["type"], "run_done")
-        self.assertFalse(payload["success"])
-        self.assertEqual(payload["termination"], "failed")
+    def test_failure_emits_typed_run_done_and_agent_error(self):
+        payloads = _capture_events(1)
+        self.assertEqual(len(payloads), 3)
+        
+        self.assertEqual(payloads[0]["type"], "run_done")
+        self.assertFalse(payloads[0]["success"])
+        self.assertEqual(payloads[0]["termination"], "failed")
+        
+        self.assertEqual(payloads[1]["type"], "agent_error")
+        self.assertIn("bridge exited with code 1", payloads[1]["error"])
+        
+        self.assertEqual(payloads[2]["type"], "agent_done")
+        self.assertFalse(payloads[2]["success"])
 
-    def test_cancel_maps_to_cancelled(self):
-        payload = _capture_terminal(130)
-        self.assertEqual(payload["type"], "run_done")
-        self.assertFalse(payload["success"])
-        self.assertEqual(payload["termination"], "cancelled")
+    def test_cancel_maps_to_cancelled_and_agent_cancelled(self):
+        payloads = _capture_events(130)
+        self.assertEqual(len(payloads), 2)
+        
+        self.assertEqual(payloads[0]["type"], "run_done")
+        self.assertFalse(payloads[0]["success"])
+        self.assertEqual(payloads[0]["termination"], "cancelled")
+        
+        self.assertEqual(payloads[1]["type"], "agent_cancelled")
+        self.assertFalse(payloads[1]["success"])
 
     def test_terminal_event_carries_run_identity_envelope(self):
         """F-H-8: when the spawner exports run identity, the typed terminal
@@ -56,7 +73,8 @@ class TestCodexBridgeLifecycle(unittest.TestCase):
         os.environ["KIM_RUN_ID"] = "run-abc"
         os.environ["KIM_SESSION_ID"] = "sess-xyz"
         try:
-            payload = _capture_terminal(0)
+            payloads = _capture_events(0)
+            payload = payloads[0]
         finally:
             for k, v in prev.items():
                 if v is None:
