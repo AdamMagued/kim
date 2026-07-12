@@ -1036,51 +1036,98 @@ fn choose_ollama_model(current: &str, local_models: &[String]) -> String {
     })
 }
 
+/// F-E-11: per-provider validation host bases (overridable in tests). Real
+/// hosts by default.
+struct ValidationHosts<'a> {
+    anthropic: &'a str,
+    openai: &'a str,
+    deepseek: &'a str,
+    gemini: &'a str,
+}
+
+const DEFAULT_VALIDATION_HOSTS: ValidationHosts<'static> = ValidationHosts {
+    anthropic: "https://api.anthropic.com",
+    openai: "https://api.openai.com",
+    deepseek: "https://api.deepseek.com",
+    gemini: "https://generativelanguage.googleapis.com",
+};
+
+/// F-E-11: every validation request gets a hard total timeout. The default
+/// reqwest client has NONE, so a blackholed connection (captive portal,
+/// firewalled egress) left the REPL stuck forever after the user typed their
+/// key, with no spinner and no Ctrl-C-friendly path.
+const VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn validate_api_key(provider: &str, key: &str) -> Result<(), String> {
+    validate_api_key_at(provider, key, &DEFAULT_VALIDATION_HOSTS, VALIDATION_TIMEOUT).await
+}
+
+async fn validate_api_key_at(
+    provider: &str,
+    key: &str,
+    hosts: &ValidationHosts<'_>,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let status = match provider {
-        "claude" => client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&serde_json::json!({
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .status(),
-        "openai" => client
-            .get("https://api.openai.com/v1/models")
-            .bearer_auth(key)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .status(),
-        "deepseek" => client
-            .get("https://api.deepseek.com/v1/models")
-            .bearer_auth(key)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .status(),
+    let result = match provider {
+        "claude" => {
+            client
+                .post(format!("{}/v1/messages", hosts.anthropic))
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&serde_json::json!({
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .timeout(timeout)
+                .send()
+                .await
+        }
+        "openai" => {
+            client
+                .get(format!("{}/v1/models", hosts.openai))
+                .bearer_auth(key)
+                .timeout(timeout)
+                .send()
+                .await
+        }
+        "deepseek" => {
+            client
+                .get(format!("{}/v1/models", hosts.deepseek))
+                .bearer_auth(key)
+                .timeout(timeout)
+                .send()
+                .await
+        }
         // F15: pass the key in a header, not the URL query string — URLs leak
         // into proxy logs and reqwest error messages include the full URL.
-        "gemini" => client
-            .get("https://generativelanguage.googleapis.com/v1beta/models")
-            .header("x-goog-api-key", key)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .status(),
+        "gemini" => {
+            client
+                .get(format!("{}/v1beta/models", hosts.gemini))
+                .header("x-goog-api-key", key)
+                .timeout(timeout)
+                .send()
+                .await
+        }
         _ => return Ok(()),
     };
-    if status.as_u16() == 401 || status.as_u16() == 403 {
-        return Err(format!("key rejected (HTTP {status})"));
+    match result {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                Err(format!("key rejected (HTTP {status})"))
+            } else {
+                Ok(())
+            }
+        }
+        // F-E-11: a timeout or connect failure is NOT a rejection — the key may
+        // be perfectly valid; we just couldn't reach the provider. Treat it as
+        // "validation skipped" so the key is still saved and usable, rather than
+        // hanging or telling the user their key failed.
+        Err(e) if e.is_timeout() || e.is_connect() => Ok(()),
+        Err(e) => Err(e.to_string()),
     }
-    Ok(())
 }
 
 fn logout(args: &str, config: &mut KimConfig) -> CommandOutcome {
@@ -1775,6 +1822,93 @@ mod tests {
         let s = super::api_key_status("OPENAI_API_KEY", None, None, "openai");
         assert!(s.contains("missing"), "{s}");
         assert!(s.contains("openai"), "{s}");
+    }
+
+    // ── F-E-11: /login key validation must time out, and treat a timeout as
+    // "skipped", not "key rejected" ─────────────────────────────────────────
+
+    /// A blackholed connection (server accepts but never responds) must NOT
+    /// hang the REPL: the request times out and, because a timeout is not a
+    /// rejection, validation is skipped (Ok) so the key is still saved.
+    #[tokio::test]
+    async fn validate_api_key_times_out_and_skips_rather_than_rejecting() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind blackhole");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Hold every accepted connection open forever, never responding.
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                if let Ok(s) = stream {
+                    held.push(s);
+                }
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let hosts = super::ValidationHosts {
+            anthropic: &base,
+            openai: &base,
+            deepseek: &base,
+            gemini: &base,
+        };
+
+        let start = std::time::Instant::now();
+        let result = super::validate_api_key_at(
+            "openai",
+            "sk-whatever",
+            &hosts,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "a timeout must be treated as skipped, not a rejection"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "validation must not hang; it returned after {elapsed:?}"
+        );
+    }
+
+    /// A 401 response is a real rejection and must surface as an Err.
+    #[tokio::test]
+    async fn validate_api_key_reports_401_as_rejected() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 401 server");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let resp =
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let hosts = super::ValidationHosts {
+            anthropic: &base,
+            openai: &base,
+            deepseek: &base,
+            gemini: &base,
+        };
+
+        let result = super::validate_api_key_at(
+            "openai",
+            "sk-bad",
+            &hosts,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            result.is_err_and(|e| e.contains("rejected")),
+            "a 401 must be reported as a rejected key"
+        );
     }
 
     // ── F-E-1: doctor exit-code gating ──────────────────────────────────────
