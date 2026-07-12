@@ -183,11 +183,11 @@ class ConversationMemory:
         """
         content = msg.get("content", "")
         if isinstance(content, str):
-            return content.startswith("[Tool result:")
+            return content.lstrip().startswith("[Tool result:")
         if isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "text":
-                    if item.get("text", "").startswith("[Tool result:"):
+                    if str(item.get("text", "")).lstrip().startswith("[Tool result:"):
                         return True
         return False
 

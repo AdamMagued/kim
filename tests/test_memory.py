@@ -103,6 +103,19 @@ def test_is_tool_result_empty_string_false():
     assert mem._is_tool_result(msg) is False
 
 
+def test_is_tool_result_leading_whitespace():
+    """Tool result detection should match with leading space or newline (F-A-6)."""
+    mem = ConversationMemory()
+    msg = {"role": "user", "content": "  \n  [Tool result: output]"}
+    assert mem._is_tool_result(msg) is True
+    
+    msg_list = {
+        "role": "user",
+        "content": [{"type": "text", "text": "   [Tool result: output]"}],
+    }
+    assert mem._is_tool_result(msg_list) is True
+
+
 def test_is_tool_result_list_no_tool_prefix_false():
     """A list content whose text items do not start with '[Tool result:' returns False."""
     mem = ConversationMemory()
