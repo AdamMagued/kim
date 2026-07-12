@@ -18,12 +18,15 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from argparse import Namespace
 from pathlib import Path
 
 import pytest
 
 from kimctl.__main__ import (
+    EXIT_OK,
+    EXIT_TIMEOUT,
     EXIT_TRANSPORT,
     _read_home_bridge_token,
     _resolve_bridge,
@@ -31,6 +34,7 @@ from kimctl.__main__ import (
     cmd_browser,
     cmd_cancel,
     cmd_chats,
+    cmd_send,
     cmd_show,
     cmd_status,
 )
@@ -414,6 +418,102 @@ def test_browser_usage_error_stays_exit_1(capsys):
         cmd_browser(Namespace(browser_action="click", selector=None, json=False))
     assert exc_info.value.code == 1
     assert "selector" in capsys.readouterr().err.lower()
+
+
+# ---------------------------------------------------------------------------
+# F-E-7: cmd_send completion poll must not match a STALE TASK_COMPLETE left in
+# a resumed session, but must still detect a genuinely new completion.
+#
+# These drive the real cmd_send poll loop against an on-disk session file. The
+# orchestrator's writes are simulated by intercepting time.sleep (patched to a
+# tiny real sleep) so the file mutates *between* polls, deterministically and
+# without threads.
+# ---------------------------------------------------------------------------
+
+def _send_ns(session_id: str, *, timeout: float) -> Namespace:
+    return Namespace(
+        task="new task",
+        session=session_id,
+        provider=None,
+        json=True,
+        detach=False,
+        timeout=timeout,
+    )
+
+
+def test_send_ignores_stale_task_complete(monkeypatch, tmp_path):
+    """F-E-7: resuming a session whose PREVIOUS task ended with TASK_COMPLETE
+    must not report instant success for the new task — the stale line predates
+    the POST baseline, so the poll should time out instead."""
+    session_id = "sessStale"
+    date_dir = tmp_path / "2026-07-13"
+    date_dir.mkdir(parents=True)
+    sfile = date_dir / f"{session_id}.jsonl"
+    sfile.write_bytes(
+        json.dumps({"role": "user", "content": "old task"}).encode() + b"\n"
+        + json.dumps(
+            {"role": "assistant", "content": "TASK_COMPLETE: old result"}
+        ).encode()
+        + b"\n"
+    )
+
+    monkeypatch.setenv("KIM_SESSIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _fake_bridge(
+            {"ok": True, "session_id": session_id, "sessions_dir": str(tmp_path)}
+        ),
+    )
+    real_sleep = time.sleep
+    monkeypatch.setattr("kimctl.__main__.time.sleep", lambda _s: real_sleep(0.002))
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_send(_send_ns(session_id, timeout=1))
+    assert exc_info.value.code == EXIT_TIMEOUT
+
+
+def test_send_detects_new_completion_after_baseline(monkeypatch, tmp_path, capsys):
+    """F-E-7 (no over-correction): after skipping the stale line, a genuinely
+    new TASK_COMPLETE appended during polling is still detected."""
+    session_id = "sessFresh"
+    date_dir = tmp_path / "2026-07-13"
+    date_dir.mkdir(parents=True)
+    sfile = date_dir / f"{session_id}.jsonl"
+    sfile.write_bytes(
+        json.dumps(
+            {"role": "assistant", "content": "TASK_COMPLETE: old result"}
+        ).encode()
+        + b"\n"
+    )
+
+    monkeypatch.setenv("KIM_SESSIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _fake_bridge(
+            {"ok": True, "session_id": session_id, "sessions_dir": str(tmp_path)}
+        ),
+    )
+
+    fresh = (
+        json.dumps({"role": "assistant", "content": "TASK_COMPLETE: fresh result"}).encode()
+        + b"\n"
+    )
+    real_sleep = time.sleep
+    state = {"n": 0}
+
+    def fake_sleep(_s):
+        state["n"] += 1
+        if state["n"] == 2:
+            with open(sfile, "ab") as f:
+                f.write(fresh)
+        real_sleep(0.002)
+
+    monkeypatch.setattr("kimctl.__main__.time.sleep", fake_sleep)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_send(_send_ns(session_id, timeout=5))
+    assert exc_info.value.code == EXIT_OK
+    assert "fresh result" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

@@ -385,6 +385,25 @@ def cmd_send(args):
     session_id = data.get("session_id", "")
     sessions_dir = data.get("sessions_dir", "")
 
+    # F-E-7: snapshot the session file's byte size *now* — right after POST,
+    # before the orchestrator processes this task. When --session resumes an
+    # existing session, its previous task's TASK_COMPLETE / NEED_HELP line is
+    # already on disk; polling from offset 0 would match that STALE line on the
+    # first read and report instant (wrong) success. A brand-new session has no
+    # file yet → baseline 0, so its own completion is still read from the start.
+    baseline_offset = 0
+    _existing = _find_session_file(session_id) if session_id else None
+    if _existing is None and session_id and sessions_dir:
+        import datetime
+        _cand = Path(sessions_dir) / datetime.date.today().isoformat() / f"{session_id}.jsonl"
+        if _cand.exists():
+            _existing = _cand
+    if _existing is not None:
+        try:
+            baseline_offset = _existing.stat().st_size
+        except OSError:
+            baseline_offset = 0
+
     if args.json and args.detach:
         _print_json({"ok": True, "session_id": session_id})
         sys.exit(EXIT_OK)
@@ -399,7 +418,7 @@ def cmd_send(args):
     timeout = args.timeout
     deadline = time.time() + timeout
     poll_interval = 0.5
-    last_offset = 0
+    last_offset = baseline_offset  # F-E-7: skip pre-existing (stale) records
     session_file: Optional[Path] = None
 
     # Wait briefly for the JSONL file to appear
