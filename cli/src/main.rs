@@ -93,14 +93,36 @@ fn parse_cli_args(args: &[String]) -> CliCommand {
         return CliCommand::ShowVersion;
     }
     match args.first().map(String::as_str) {
-        Some("doctor") => CliCommand::Doctor,
+        // Bare `kim` opens the interactive REPL.
+        None => CliCommand::Repl { resume_id: None },
+        Some("doctor") => {
+            // doctor takes no further arguments; an extra token is a typo, not
+            // a silent no-op. (F-E-2)
+            if let Some(extra) = args.get(1) {
+                return CliCommand::UsageError(format!(
+                    "kim doctor: unexpected argument '{extra}'. Usage: kim doctor"
+                ));
+            }
+            CliCommand::Doctor
+        }
         Some(sub @ "chat") | Some(sub @ "code") => {
+            let rest = &args[1..];
+            // F-E-2: `kim chat --resume abc` used to treat `--resume abc` as
+            // prompt text and send it to the model. A leading option after the
+            // subcommand is a mistake — reject it instead of silently turning
+            // the user's intent into a prompt.
+            if let Some(first) = rest.first() {
+                if first.starts_with('-') {
+                    return CliCommand::UsageError(format!(
+                        "kim {sub}: unexpected option '{first}'. Usage: kim {sub} <prompt...>"
+                    ));
+                }
+            }
             let mode = if sub == "code" {
                 AppMode::Code
             } else {
                 AppMode::Chat
             };
-            let rest = &args[1..];
             let prompt = if rest.is_empty() {
                 None
             } else {
@@ -108,26 +130,34 @@ fn parse_cli_args(args: &[String]) -> CliCommand {
             };
             CliCommand::Oneshot { mode, prompt }
         }
-        _ => {
-            // #6: `args.windows(2).find_map(...)` silently yields None when
-            // `--resume` is the LAST arg (no following window contains it as
-            // the first element) — that used to fall through to `resume_id:
-            // None` and quietly start a brand-new session instead of erroring.
-            // Distinguish "no --resume flag at all" from "--resume with no
-            // value" explicitly.
-            match args.iter().position(|a| a == "--resume") {
-                None => CliCommand::Repl { resume_id: None },
-                Some(index) => match args.get(index + 1) {
-                    Some(value) => CliCommand::Repl {
-                        resume_id: Some(value.clone()),
-                    },
-                    None => CliCommand::UsageError(
-                        "kim --resume: missing session id. Usage: kim --resume <id|latest>"
-                            .to_string(),
-                    ),
-                },
+        // `kim --resume <id>` resumes an existing session in the REPL. The id
+        // is required (#6: a bare trailing `--resume` is a usage error, never a
+        // silent new session).
+        Some("--resume") => match args.get(1) {
+            Some(value) => {
+                if let Some(extra) = args.get(2) {
+                    return CliCommand::UsageError(format!(
+                        "kim --resume: unexpected argument '{extra}'. \
+                         Usage: kim --resume <id|latest>"
+                    ));
+                }
+                CliCommand::Repl {
+                    resume_id: Some(value.clone()),
+                }
             }
-        }
+            None => CliCommand::UsageError(
+                "kim --resume: missing session id. Usage: kim --resume <id|latest>".to_string(),
+            ),
+        },
+        // F-E-2: anything else — an unknown flag (`--continue`, a typo'd
+        // `--resum`), or an unknown bare subcommand (`resume`, `login`) — used
+        // to fall through to a brand-new REPL session, silently discarding the
+        // user's intent and scattering a fresh session file. Reject it (exit 2)
+        // the same way `--resume`-without-value is rejected.
+        Some(other) => CliCommand::UsageError(format!(
+            "kim: unknown command '{other}'.\n\
+             Usage: kim [chat|code <prompt>] | kim doctor | kim --resume <id> | kim --help"
+        )),
     }
 }
 
@@ -2038,10 +2068,64 @@ mod tests {
         }
     }
 
+    // F-E-2: an unknown flag no longer silently opens a fresh REPL — it is a
+    // usage error (exit 2), so a typo can't scatter a new session file.
     #[test]
-    fn parse_args_unknown_arg_falls_through_to_repl() {
+    fn parse_args_unknown_flag_is_usage_error() {
         let cmd = parse_cli_args(&args(&["--unknown-flag"]));
-        assert!(matches!(cmd, CliCommand::Repl { resume_id: None }));
+        match cmd {
+            CliCommand::UsageError(message) => assert!(
+                message.contains("--unknown-flag"),
+                "usage error should name the offending flag, got: {message}"
+            ),
+            other => panic!("expected UsageError for an unknown flag, got {other:?}"),
+        }
+    }
+
+    // F-E-2: an unknown bare subcommand (e.g. `kim login`, or `kim resume
+    // latest` with the dashes dropped) is a usage error, not a silent new REPL.
+    #[test]
+    fn parse_args_unknown_subcommand_is_usage_error() {
+        for argv in [
+            vec!["login"],
+            vec!["resume", "latest"],
+            vec!["--continue"],
+            vec!["--resum", "latest"],
+        ] {
+            let cmd = parse_cli_args(&args(&argv));
+            assert!(
+                matches!(cmd, CliCommand::UsageError(_)),
+                "{argv:?} should be a UsageError, got {cmd:?}"
+            );
+        }
+    }
+
+    // F-E-2: `kim chat --resume abc` must not be sent to the model as the
+    // literal prompt "--resume abc"; a leading option is a usage error.
+    #[test]
+    fn parse_args_chat_leading_option_is_usage_error() {
+        let cmd = parse_cli_args(&args(&["chat", "--resume", "abc"]));
+        match cmd {
+            CliCommand::UsageError(message) => assert!(
+                message.contains("--resume"),
+                "usage error should name the offending option, got: {message}"
+            ),
+            other => panic!("expected UsageError, got {other:?}"),
+        }
+    }
+
+    // F-E-2: extra tokens after `kim doctor` / `kim --resume <id>` are rejected
+    // rather than ignored.
+    #[test]
+    fn parse_args_trailing_garbage_is_usage_error() {
+        assert!(matches!(
+            parse_cli_args(&args(&["doctor", "--json"])),
+            CliCommand::UsageError(_)
+        ));
+        assert!(matches!(
+            parse_cli_args(&args(&["--resume", "abc", "def"])),
+            CliCommand::UsageError(_)
+        ));
     }
 
     // ── #6: trailing `--resume` with no value is a usage error, not a silent
