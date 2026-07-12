@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 
 from mcp_server.config import PROJECT_ROOT
+from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +79,11 @@ async def handle_write_memory(args: dict) -> str:
     cwd = args.get("cwd") or None
 
     if not key:
-        return "ERROR: key is required"
+        return tool_error("key is required")
     if len(key) > _MAX_KEY_LEN:
-        return f"ERROR: key too long (max {_MAX_KEY_LEN} chars)"
+        return tool_error(f"key too long (max {_MAX_KEY_LEN} chars)")
     if len(value) > _MAX_VALUE_LEN:
-        return f"ERROR: value too long (max {_MAX_VALUE_LEN} chars)"
+        return tool_error(f"value too long (max {_MAX_VALUE_LEN} chars)")
 
     path = _memory_file(cwd)
     data = _load(path)
@@ -91,7 +92,7 @@ async def handle_write_memory(args: dict) -> str:
         _save(path, data)
     except Exception as e:
         logger.error("memory: write failed for %s: %s", path, e)
-        return f"ERROR: could not persist memory: {e}"
+        return tool_error(f"could not persist memory: {e}")
 
     logger.info("memory: wrote key=%r to %s", key, path)
     return f"OK: stored {key!r} ({len(value)} chars) in {path.name}"

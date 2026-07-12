@@ -149,6 +149,30 @@ def _is_ssrf_target(url: str) -> bool:
         return True
 
 
+def _url_host(url: str) -> str | None:
+    """Lowercased host (IPv6 brackets stripped) for the SSRF verdict cache key.
+
+    Returns None when no host can be extracted, in which case the caller skips
+    the cache and evaluates `_is_ssrf_target` directly (which default-denies a
+    malformed URL). Cache keying on host is safe because `_is_ssrf_target`'s
+    verdict is a pure function of the host.
+    """
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").strip("[]").lower()
+    except Exception:
+        return None
+    return host or None
+
+
+# Per-host SSRF verdict cache (F-C-4). The route handler runs once PER REQUEST,
+# including every subresource/XHR/fetch, so re-parsing + IP-classifying the same
+# host repeatedly would add measurable per-request overhead on a busy page. The
+# verdict is a pure function of the host (immutable), so caching it is sound and
+# never needs invalidation. Bounded by the number of distinct hosts a session
+# contacts (small).
+_ssrf_host_verdict: dict[str, bool] = {}
+
+
 async def _install_ssrf_guard(page: Any) -> None:
     """Validate EVERY top-level navigation on *page*, not just the one
     ``web_open`` makes before its own ``page.goto()`` (HIGH audit finding #1).
@@ -169,28 +193,38 @@ async def _install_ssrf_guard(page: Any) -> None:
     """
 
     async def _guard(route, request) -> None:
+        # F-C-4: check EVERY request, not just top-level navigations. The old
+        # guard narrowed to `is_navigation_request()` on the main frame, so once
+        # web_open landed on any public page that page's own JavaScript could
+        # `fetch("http://169.254.169.254/…")`, `new Image().src="http://127.0.0.1"`
+        # or XHR to any RFC-1918 host — none are navigation requests, so the SSRF
+        # check never ran on them. That is the common cloud-metadata SSRF vector
+        # (an attacker/prompt-injected page exfiltrating IMDS creds via a
+        # background subresource request). Now the host verdict is applied to
+        # navigations AND subresources/XHR/fetch alike, with a per-host cache so
+        # the (per-request) route handler stays cheap.
+        url = request.url
         try:
-            is_nav = request.is_navigation_request()
+            host = _url_host(url)
         except Exception:
-            is_nav = False
-        if is_nav:
+            host = None
+        if host is not None and host in _ssrf_host_verdict:
+            blocked = _ssrf_host_verdict[host]
+        else:
             try:
-                is_main_frame = request.frame == page.main_frame
+                blocked = _is_ssrf_target(url)
             except Exception:
-                is_main_frame = True
-            if is_main_frame:
-                try:
-                    blocked = _is_ssrf_target(request.url)
-                except Exception:
-                    blocked = True  # malformed URL: default-deny, matches _is_ssrf_target
-                if blocked:
-                    logger.warning(
-                        "web: blocked navigation to internal/loopback address "
-                        f"{request.url!r} (SSRF guard, #1)"
-                    )
-                    with contextlib.suppress(Exception):
-                        await route.abort("blockedbyclient")
-                    return
+                blocked = True  # malformed URL: default-deny, matches _is_ssrf_target
+            if host is not None:
+                _ssrf_host_verdict[host] = blocked
+        if blocked:
+            logger.warning(
+                "web: blocked request to internal/loopback address "
+                f"{url!r} (SSRF guard, #1/F-C-4)"
+            )
+            with contextlib.suppress(Exception):
+                await route.abort("blockedbyclient")
+            return
         with contextlib.suppress(Exception):
             await route.continue_()
 

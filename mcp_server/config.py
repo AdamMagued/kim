@@ -183,8 +183,8 @@ USE_REAL_BROWSER: bool = _as_bool(
 VOICE_ENABLED: bool = _as_bool(_cfg.get("voice_enabled", False), False)
 
 # ── Site connectors ───────────────────────────────────────────────────────
-# `connectors.enabled` is a list of connector ids (e.g. ["guc_cms",
-# "guc_mail"]). The MCP server merges those connectors' tools into its
+# `connectors.enabled` is a list of connector ids (e.g. ["my_site"]).
+# The MCP server merges those connectors' tools into its
 # dispatch map at startup, so the LLM only sees toolkits the user has
 # explicitly opted into. Unknown ids are warned about and skipped.
 _connectors_cfg = _section(_cfg, "connectors")

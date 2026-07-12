@@ -1,6 +1,7 @@
 import logging
 
 from ..privacy import is_privacy_paused, PRIVACY_ERROR
+from ._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +37,8 @@ async def handle_type_text(args: dict) -> str:
             try:
                 pyautogui.write(text, interval=0.01)
             except Exception as write_err:  # noqa: BLE001
-                return (
-                    f"ERROR: clipboard paste unavailable ({clip_err}) and direct "
+                return tool_error(
+                    f"clipboard paste unavailable ({clip_err}) and direct "
                     f"typing failed ({write_err}). On Linux install xclip or xsel "
                     "(e.g. 'sudo apt install xclip') to enable clipboard typing."
                 )
@@ -56,7 +57,7 @@ async def handle_type_text(args: dict) -> str:
         return f"Typed {len(text)} characters (via clipboard)"
     except Exception as e:
         logger.error(f"type_text failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
     finally:
         if previous_clipboard is not None:
             # Give the target app a beat to consume the paste before the

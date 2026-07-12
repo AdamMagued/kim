@@ -102,7 +102,7 @@ async def _drive_call(monkeypatch, stdin_lines: list[dict], cmd="mkdir approved_
         sys.stdout = real_stdout
         await answer_task
         await broker.stop()
-    return result[0].text, executed, captured.getvalue()
+    return result.content[0].text, executed, captured.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +173,7 @@ class TestCliCallerRoundTrip:
             r1 = await srv.call_tool("run_command", {"cmd": "mkdir cached_dir"})
             r2 = await srv.call_tool("run_command", {"cmd": "mkdir cached_dir"})
             await broker.stop()
-            return asked, executed, r1[0].text, r2[0].text
+            return asked, executed, r1.content[0].text, r2.content[0].text
 
         asked, executed, t1, t2 = asyncio.run(_two_calls())
         assert asked == ["run_command"], "second identical call must not re-prompt"
@@ -205,7 +205,7 @@ class TestFailClosed:
             )
             result = await srv.call_tool("run_command", {"cmd": "mkdir slow_dir"})
             await broker.stop()
-            return result[0].text, executed
+            return result.content[0].text, executed
 
         text, executed = asyncio.run(_hang())
         assert "HITL_DENIED" in text
@@ -218,7 +218,7 @@ class TestFailClosed:
                 srv._DISPATCH, "run_command", _recording_handler(executed)
             )
             result = await srv.call_tool("run_command", {"cmd": "mkdir nochan_dir"})
-            return result[0].text, executed
+            return result.content[0].text, executed
 
         text, executed = asyncio.run(_call())
         assert "HITL_DENIED" in text
@@ -237,7 +237,7 @@ class TestFailClosed:
             )
             result = await srv.call_tool("run_command", {"cmd": "mkdir nores_dir"})
             await broker.stop()
-            return result[0].text, executed
+            return result.content[0].text, executed
 
         text, executed = asyncio.run(_call())
         assert "HITL_DENIED" in text

@@ -6,6 +6,7 @@ import logging
 import os
 
 from ..privacy import is_privacy_paused, PRIVACY_ERROR
+from ._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ async def handle_take_screenshot(args: dict) -> str:
         return f"data:image/png;base64,{b64}"
     except Exception as e:
         logger.error(f"take_screenshot failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_get_screen_info(args: dict) -> str:
@@ -105,7 +106,7 @@ async def handle_get_screen_info(args: dict) -> str:
         return "\n".join(lines)
     except Exception as e:
         logger.error(f"get_screen_info failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_take_annotated_screenshot(args: dict) -> str:
