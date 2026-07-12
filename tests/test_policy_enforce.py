@@ -431,6 +431,59 @@ class TestDefenseInDepthStillPresent:
         assert _check_blocked("echo hi; rm -rf /") is not None
 
 
+# ---------------------------------------------------------------------------
+# F-C-1 / F-C-2 / F-C-3 — the argv-level exec-capable-binary escapes must be a
+# hard POLICY_DENIED at the CHOKEPOINT (not merely blocked inside the handler),
+# with the risk-threshold arm OFF (default config). Mirrors the shell.py table.
+# ---------------------------------------------------------------------------
+
+class TestExecCapableArgvEscapesDeniedAtChokepoint:
+    @pytest.mark.parametrize("cmd", [
+        # F-C-1: git config-injection RCE / secret read
+        "git -c 'alias.pwn=!id' pwn",
+        "git -c core.pager=/tmp/evil log",
+        "git --config-env core.sshCommand=EVIL fetch",
+        "sudo git -c alias.x=!id x",
+        # F-C-2: awk / tar / sed / make. (Cases whose argv contains an absolute
+        # path — e.g. `/etc/passwd` — are also denied here, but via the earlier
+        # `_scan_path_tokens` arm; these use non-absolute targets so the deny is
+        # attributable to the exec-capable-argv arm specifically. The
+        # `/regex/`-addressed sed residual's home is the shell.py handler — at
+        # the policy layer a `/…`-shaped script token is caught by the path
+        # scanner first, which is also a deny.)
+        "awk 'BEGIN{system(\"id\")}'",
+        "tar --checkpoint-action=exec=id -cf out.tar .",
+        "sed 'e id' file",
+        "sed 'w outfile' file",
+        "make -f Makefile.evil",
+        # F-C-3: gh credential exfiltration
+        "gh auth token",
+        "gh auth status --show-token",
+    ])
+    def test_escape_is_denied(self, cmd):
+        d = enforce("run_command", {"cmd": cmd})
+        assert d.action == "deny", f"{cmd!r} should be denied, got {d.action}"
+        assert d.reason == "exec_capable_argv_escape"
+        assert "POLICY_DENIED" in d.message
+
+    @pytest.mark.parametrize("cmd", [
+        "git status",
+        "git -c user.email=x@y.z commit -m msg",
+        "awk '{print $1}' file",
+        "tar -xzf archive.tgz",
+        "sed 's/a/b/g' file",
+        "sed '/foo/d' file",
+        "make build",
+        "gh pr list",
+        "gh auth status",
+    ])
+    def test_benign_not_denied_for_escape(self, cmd):
+        d = enforce("run_command", {"cmd": cmd})
+        assert d.reason != "exec_capable_argv_escape", (
+            f"benign {cmd!r} wrongly flagged as an escape"
+        )
+
+
 if os.environ.get("KIM_POLICY_TEST_DEBUG"):
     def test_dump_decision_for_debug():
         print(enforce("run_command", {"cmd": "ls -la"}))

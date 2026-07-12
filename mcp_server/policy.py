@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mcp_server.config import PROJECT_ROOT, get_config, validate_path
-from mcp_server.tools.shell import _DENY_COMMANDS
+from mcp_server.tools.shell import _DENY_COMMANDS, _check_exec_capable_binary
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +454,25 @@ def _analyze_command_words(tokens: list[str], cwd: str | None, depth: int = 0) -
                 f"POLICY_DENIED: {rest[0]!r} resolves to blocked command "
                 f"{(real_base if real_base in _DENY_COMMANDS else invoked)!r}"
             ),
+        )
+
+    # F-C-1 / F-C-2 / F-C-3 — mirror the code-owned argv-level escape-vector
+    # policy at the CHOKEPOINT, not only inside the run_command handler. The
+    # shell allowlist trusts a program by NAME, but git/awk/tar/sed/make/gh are
+    # general-purpose command runners / credential readers that exec arbitrary
+    # shell (or read a secret from inside their own argument grammar, where the
+    # token-shape path scan is blind). shell.py._check_exec_capable_binary is the
+    # single source of truth for these rules (deny-list CODE-OWNED, never
+    # config-driven — CLAUDE.md invariant); calling it here makes the escape a
+    # hard POLICY_DENIED that never dispatches, rather than relying on the
+    # default-off risk-threshold arm (which would let a "risk=high but no
+    # escalation" escape dispatch unattended). Wrapper-unwrapped commands
+    # (`sudo git -c …`) are covered because the wrapper arm re-enters this fn.
+    exec_escape = _check_exec_capable_binary(rest)
+    if exec_escape:
+        return _ShellAnalysis(
+            deny_reason="exec_capable_argv_escape",
+            deny_message=f"POLICY_DENIED: {exec_escape}",
         )
 
     if base == "find":

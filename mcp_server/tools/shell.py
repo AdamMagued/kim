@@ -356,20 +356,28 @@ def _check_tar_argv(tokens: list[str]) -> str | None:
 # `sed -n '1,5p'` stay working.
 # A sed command letter sits at a "command position": at the start of the script,
 # after a command separator (`;`/`}`/newline), or right after a numeric/`$`
-# address (`1e`, `$w`, `5,10w`). We deliberately do NOT treat a `/` as a command
-# boundary — a `/`-delimited *address* is indistinguishable from substitution
-# content (`s/were/x/` would false-positive on the `w`), so `/regex/`-addressed
-# exec/IO commands are left to the policy.py layer (handoff). The `e`/`w`/`W`/
-# `r`/`R` commands exec a shell or read/write arbitrary files.
+# address (`1e`, `$w`, `5,10w`).
 _SED_EXEC_CMD_RE = re.compile(r"(?:^|[;}\n]|\d|\$)\s*e(?=[\s;}]|$)")   # `e` execute
 _SED_S_EFLAG_RE = re.compile(r"s([^\w\s])(?:\\.|[^\\])*?\1(?:\\.|[^\\])*?\1[a-z]*e", re.DOTALL)  # s///e
 _SED_WR_CMD_RE = re.compile(r"(?:^|[;}\n]|\d|\$)\s*[wWrR](?=[\s;}]|$)")  # write/read file commands
+# F-C-2 residual (handed off by the hotfix): `/regex/`-ADDRESSED exec/IO
+# commands — `sed '/foo/e'`, `sed '/foo/w out'`, `sed '1,/foo/r in'`,
+# `sed '/a/,/b/W f'`, `sed '/foo/!e cmd'`. A regex address is a `/…/` group at a
+# command boundary (start, `;`, `{`, `}`, newline, or `,` inside a range) — it is
+# distinguished from an `s///`/`y///` command because those are preceded by the
+# `s`/`y` letter, so the `/` is NOT at a boundary (`s/were/x/` won't match). Only
+# the exec/file-IO command letters `e`/`w`/`W`/`r`/`R` after the address are
+# blocked; safe address commands (`/foo/d`, `/foo/p`, `/foo/{…}`) are untouched.
+_SED_ADDR_EXEC_RE = re.compile(
+    r"(?:^|[;{}\n,])\s*/(?:\\.|[^/\\\n])+/\s*!?\s*[ewWrR](?=[\s;}]|$)"
+)
 
 
 def _check_sed_argv(tokens: list[str]) -> str | None:
     """F-C-2: block sed scripts that exec (`e`, `s///e`) or do file IO
-    (`w`/`r`), and in-place edits (`-i`). Leaves substitution/print scripts
-    (`sed 's/a/b/'`, `sed -n '1,5p'`) working."""
+    (`w`/`r`), and in-place edits (`-i`). Also blocks `/regex/`-addressed exec/IO
+    commands (`/foo/e`, `/foo/w file`). Leaves substitution/print scripts
+    (`sed 's/a/b/'`, `sed -n '1,5p'`, `sed '/foo/d'`) working."""
     for tok in tokens[1:]:
         if tok in ("-i", "--in-place") or tok.startswith("-i") or tok.startswith("--in-place"):
             return "BLOCKED: sed in-place edit (-i) writes files outside the path gate."
@@ -381,10 +389,12 @@ def _check_sed_argv(tokens: list[str]) -> str | None:
             _SED_EXEC_CMD_RE.search(tok)
             or _SED_S_EFLAG_RE.search(tok)
             or _SED_WR_CMD_RE.search(tok)
+            or _SED_ADDR_EXEC_RE.search(tok)
         ):
             return (
                 "BLOCKED: sed script uses an exec/file-IO command "
-                "(e / s///e / w / r) — this is an allowlist escape."
+                "(e / s///e / w / r, incl. /regex/-addressed) — "
+                "this is an allowlist escape."
             )
     return None
 
@@ -403,6 +413,35 @@ def _check_make_argv(tokens: list[str]) -> str | None:
     return None
 
 
+def _check_gh_argv(tokens: list[str]) -> str | None:
+    """F-C-3: block `gh` subcommands that PRINT the stored GitHub credential to
+    stdout — `gh auth token`, `gh auth status --show-token`, `gh auth login`.
+
+    The token lives in `~/.config/gh/hosts.yml`, which validate_path denies as a
+    path argument, but `gh` reads it internally so no path token is ever
+    inspected — the filename sandbox is bypassed (same class as the F-C-1/F-C-2
+    exec escapes: an allowlisted binary reading its OWN secret store). Leaves
+    ordinary gh usage (`gh pr`, `gh issue`, `gh repo`, `gh api`) working."""
+    # Non-flag words after `gh`, in order, give the subcommand path.
+    words = [t for t in tokens[1:] if not t.startswith("-")]
+    if len(words) >= 2 and words[0] == "auth":
+        action = words[1]
+        if action in ("token", "login"):
+            return (
+                f"BLOCKED: 'gh auth {action}' exposes/writes the stored GitHub "
+                "credential — denied (credential exfiltration via an allowlisted "
+                "binary)."
+            )
+        if action == "status" and any(
+            t in ("--show-token", "-t") for t in tokens[1:]
+        ):
+            return (
+                "BLOCKED: 'gh auth status --show-token' prints the stored GitHub "
+                "token to stdout — denied (credential exfiltration)."
+            )
+    return None
+
+
 # Dispatch table: basename → argv policy. Code-owned; never config-driven.
 _EXEC_CAPABLE_ARGV_POLICY = {
     "git": _check_git_argv,
@@ -416,6 +455,7 @@ _EXEC_CAPABLE_ARGV_POLICY = {
     "gsed": _check_sed_argv,
     "make": _check_make_argv,
     "gmake": _check_make_argv,
+    "gh": _check_gh_argv,
 }
 
 
