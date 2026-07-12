@@ -1,6 +1,6 @@
 use crate::*;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// RUN-IDENTITY: copy the `run_id` / `session_id` envelope off a raw agent
 /// stdout line onto a curated `kim:*` payload. The typed `KimEvent` enum drops
@@ -103,10 +103,129 @@ impl CappedLineSplitter {
     }
 }
 
+/// F-H-3: flood-protection budget for forwarding undecodable CHAT stdout lines.
+/// A burst of this many is forwarded to the UI immediately; the token bucket
+/// then refills one token every `PROTOCOL_ERROR_REFILL_MS`. Sized so genuine
+/// anomalies (version skew, a stray `print()`, a partial JSON line from a killed
+/// process) surface, but a runaway spew can't repaint the UI thousands of
+/// times a second.
+pub(crate) const PROTOCOL_ERROR_BURST: u32 = 20;
+pub(crate) const PROTOCOL_ERROR_REFILL_MS: u64 = 250;
+
+/// F-H-3: a per-run token-bucket rate limiter + decode-failure counter for the
+/// typed-mode stdout path. Chat runs previously DROPPED SILENTLY any stdout line
+/// that failed `KimEvent` decode; those lines are now forwarded raw, but through
+/// this limiter so a flood cannot spam the UI. Pure (time is injected via
+/// `record_at`), so the bucket/counter behavior is unit-tested directly; the
+/// production path reads a monotonic clock through `uptime_ms`.
+pub(crate) struct ProtocolErrorLimiter {
+    capacity: u32,
+    tokens: u32,
+    refill_ms: u64,
+    last_refill_ms: u64,
+    total_failures: u64,
+    suppressed: u64,
+    start: Instant,
+}
+
+impl ProtocolErrorLimiter {
+    pub(crate) fn new(capacity: u32, refill_ms: u64) -> Self {
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_ms,
+            last_refill_ms: 0,
+            total_failures: 0,
+            suppressed: 0,
+            start: Instant::now(),
+        }
+    }
+
+    /// The default per-run limiter used by the stdout pump.
+    pub(crate) fn for_stdout() -> Self {
+        Self::new(PROTOCOL_ERROR_BURST, PROTOCOL_ERROR_REFILL_MS)
+    }
+
+    /// Milliseconds since this limiter was constructed (monotonic). Used by the
+    /// production path to feed `record_at` a real clock; tests inject `now_ms`
+    /// directly instead.
+    pub(crate) fn uptime_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    /// Record one decode failure at `now_ms` and decide whether its raw line may
+    /// be forwarded to the UI. Every call increments `total_failures`; a call
+    /// that finds no token increments `suppressed` and returns `false` (the line
+    /// is counted but withheld — flood protection, NOT the old silent drop).
+    pub(crate) fn record_at(&mut self, now_ms: u64) -> bool {
+        self.total_failures = self.total_failures.saturating_add(1);
+        // Refill: one token per `refill_ms` elapsed, capped at `capacity`.
+        if self.refill_ms > 0 {
+            let elapsed = now_ms.saturating_sub(self.last_refill_ms);
+            let refilled = (elapsed / self.refill_ms) as u32;
+            if refilled > 0 {
+                self.tokens = self.tokens.saturating_add(refilled).min(self.capacity);
+                // Advance by the consumed whole intervals so fractional time is
+                // not lost (prevents drift under steady input).
+                self.last_refill_ms = self
+                    .last_refill_ms
+                    .saturating_add(refilled as u64 * self.refill_ms);
+            }
+        }
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            false
+        }
+    }
+
+    pub(crate) fn total_failures(&self) -> u64 {
+        self.total_failures
+    }
+
+    pub(crate) fn suppressed(&self) -> u64 {
+        self.suppressed
+    }
+}
+
+/// F-H-3: how a typed-mode stdout line that FAILED `KimEvent` decode is handled.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DecodeFailureAction {
+    /// Forward the raw line on `kim-agent-output` — codex passthrough (always),
+    /// or a chat line the rate limiter still has budget for.
+    ForwardRaw,
+    /// Chat flood protection engaged: the line is counted but withheld from the
+    /// UI. (Distinct from the pre-F-H-3 SILENT drop, which never counted.)
+    Suppress,
+}
+
+/// Decide the fate of an undecodable typed-mode stdout line. Codex forwards
+/// unconditionally (preserving the pre-F-H-3 passthrough and never consuming the
+/// chat budget); chat runs — which USED TO SILENTLY DROP the line — now forward
+/// through the token-bucket limiter, degrading to `Suppress` only under a
+/// genuine flood.
+pub(crate) fn route_decode_failure(
+    is_codex: bool,
+    limiter: &mut ProtocolErrorLimiter,
+    now_ms: u64,
+) -> DecodeFailureAction {
+    if is_codex {
+        return DecodeFailureAction::ForwardRaw;
+    }
+    if limiter.record_at(now_ms) {
+        DecodeFailureAction::ForwardRaw
+    } else {
+        DecodeFailureAction::Suppress
+    }
+}
+
 pub(crate) fn forward_agent_stdout_line(
     app: &tauri::AppHandle,
     ipc_typed: bool,
     is_codex: bool,
+    limiter: &mut ProtocolErrorLimiter,
     line: &str,
 ) {
     if ipc_typed {
@@ -365,8 +484,32 @@ pub(crate) fn forward_agent_stdout_line(
                     );
                 }
             }
-        } else if is_codex {
-            let _ = app.emit("kim-agent-output", line);
+        } else {
+            // F-H-3: the line failed `KimEvent` decode. Codex forwards it raw
+            // (unchanged passthrough). A CHAT run used to SILENTLY DROP it — no
+            // log, no counter — so a version-skewed / partial-JSON / stray-print
+            // line just vanished and the run looked like it produced nothing.
+            // Now forward it too, rate-limited via a per-run token bucket so a
+            // flood cannot spam the UI; the withheld overflow is still counted.
+            let now_ms = limiter.uptime_ms();
+            match route_decode_failure(is_codex, limiter, now_ms) {
+                DecodeFailureAction::ForwardRaw => {
+                    let _ = app.emit("kim-agent-output", line);
+                }
+                DecodeFailureAction::Suppress => {
+                    // One-time process-log note the first time flood protection
+                    // trips this run — the lines are counted (total_failures) but
+                    // withheld from the UI to avoid a repaint storm.
+                    if limiter.suppressed() == 1 {
+                        eprintln!(
+                            "[Kim] flood protection: withholding undecodable chat stdout \
+                             from the UI ({} decode failures so far this run). Check the \
+                             orchestrator version / ipc_protocol if this persists.",
+                            limiter.total_failures()
+                        );
+                    }
+                }
+            }
         }
     } else {
         let _ = app.emit("kim-agent-output", line);
@@ -1205,6 +1348,93 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("truncated"));
         assert!(out[0].len() < cap + 64);
+    }
+
+    // -- F-H-3: undecodable chat stdout is forwarded (not silently dropped) --
+
+    #[test]
+    fn chat_decode_failure_is_forwarded_not_dropped() {
+        // Regression for the finding: pre-fix, a CHAT run (is_codex == false)
+        // whose stdout line failed KimEvent decode was SILENTLY DROPPED. It must
+        // now route to ForwardRaw so version-skew / partial-JSON / stray-print
+        // lines reach the UI instead of vanishing — and be counted.
+        let mut lim = ProtocolErrorLimiter::for_stdout();
+        assert_eq!(
+            route_decode_failure(false, &mut lim, 0),
+            DecodeFailureAction::ForwardRaw
+        );
+        assert_eq!(lim.total_failures(), 1);
+        assert_eq!(lim.suppressed(), 0);
+    }
+
+    #[test]
+    fn codex_decode_failure_forwards_unbounded_and_off_chat_budget() {
+        // Preserve the existing codex raw-emit behavior: codex always forwards,
+        // is never rate-limited, and never consumes the chat token budget.
+        let mut lim = ProtocolErrorLimiter::new(1, 1_000_000);
+        for _ in 0..1000 {
+            assert_eq!(
+                route_decode_failure(true, &mut lim, 0),
+                DecodeFailureAction::ForwardRaw
+            );
+        }
+        assert_eq!(
+            lim.total_failures(),
+            0,
+            "codex passthrough must not touch the chat decode-failure counter"
+        );
+        assert_eq!(lim.suppressed(), 0);
+    }
+
+    #[test]
+    fn chat_flood_is_rate_limited_but_every_failure_counted() {
+        // A burst up to capacity is forwarded; the flood beyond it is Suppressed
+        // (withheld from the UI) yet still counted — nothing is silently lost.
+        let mut lim = ProtocolErrorLimiter::new(3, 1000);
+        for _ in 0..3 {
+            assert_eq!(
+                route_decode_failure(false, &mut lim, 0),
+                DecodeFailureAction::ForwardRaw
+            );
+        }
+        // 4th and 5th within the same instant have no token → suppressed.
+        assert_eq!(
+            route_decode_failure(false, &mut lim, 0),
+            DecodeFailureAction::Suppress
+        );
+        assert_eq!(
+            route_decode_failure(false, &mut lim, 0),
+            DecodeFailureAction::Suppress
+        );
+        assert_eq!(lim.total_failures(), 5, "every decode failure is counted");
+        assert_eq!(lim.suppressed(), 2, "the two over-budget lines are counted");
+    }
+
+    #[test]
+    fn chat_budget_refills_over_time_and_is_capped() {
+        let mut lim = ProtocolErrorLimiter::new(2, 500);
+        // Drain the burst at t=0.
+        assert!(lim.record_at(0));
+        assert!(lim.record_at(0));
+        assert!(!lim.record_at(0));
+        // One token back after one refill interval.
+        assert!(lim.record_at(500));
+        assert!(!lim.record_at(500));
+        // A long idle gap refills to capacity but NOT beyond (no unbounded
+        // accrual → the next burst is still bounded by capacity).
+        assert!(lim.record_at(100_000));
+        assert!(lim.record_at(100_000));
+        assert!(!lim.record_at(100_000));
+    }
+
+    #[test]
+    fn limiter_never_refills_when_interval_zero() {
+        // Defensive: a zero refill interval must not divide-by-zero; the bucket
+        // simply never refills.
+        let mut lim = ProtocolErrorLimiter::new(1, 0);
+        assert!(lim.record_at(0));
+        assert!(!lim.record_at(1_000_000));
+        assert_eq!(lim.suppressed(), 1);
     }
 
     #[test]

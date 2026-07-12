@@ -130,19 +130,32 @@ pub(crate) async fn supervise(
         let app = app.clone();
         tokio::spawn(async move {
             let mut splitter = CappedLineSplitter::new(MAX_STDOUT_LINE_BYTES);
+            // F-H-3: a fresh per-run rate limiter for undecodable chat lines the
+            // typed forwarder now surfaces instead of silently dropping.
+            let mut limiter = crate::subprocess::ProtocolErrorLimiter::for_stdout();
             let mut chunk = vec![0u8; 64 * 1024];
             loop {
                 match stdout.read(&mut chunk).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => splitter.push(&chunk[..n], |line| {
                         crate::subprocess::forward_agent_stdout_line(
-                            &app, ipc_typed, is_codex, &line,
+                            &app,
+                            ipc_typed,
+                            is_codex,
+                            &mut limiter,
+                            &line,
                         );
                     }),
                 }
             }
             splitter.finish(|line| {
-                crate::subprocess::forward_agent_stdout_line(&app, ipc_typed, is_codex, &line);
+                crate::subprocess::forward_agent_stdout_line(
+                    &app,
+                    ipc_typed,
+                    is_codex,
+                    &mut limiter,
+                    &line,
+                );
             });
         })
     });
