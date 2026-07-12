@@ -351,6 +351,48 @@ describe('useChatStream typed events', () => {
     expect(plan.items[1].status).toBe('done');
   });
 
+  it('a second PLAN replaces the previous plan and resets progress (F-F-4)', async () => {
+    const { result } = await renderStream();
+    emit('kim:plan', { steps: ['one', 'two', 'three'] });
+    emit('kim:step', { n: 2, data: {} });
+    emit('kim:done', { n: 1 });
+    expect(planTrace(result.current.traceItems)!.items.map(i => i.status)).toEqual(['done', 'active', 'pending']);
+
+    // Re-plan with new steps: the stale card must NOT persist — the new plan
+    // starts fresh with all steps pending.
+    emit('kim:plan', { steps: ['alpha', 'beta'] });
+    const plan = planTrace(result.current.traceItems)!;
+    expect(result.current.planSteps).toEqual(['alpha', 'beta']);
+    expect(plan.items.map(i => i.status)).toEqual(['pending', 'pending']);
+  });
+
+  it('a <2-step re-PLAN clears the previous plan instead of leaving a stale card (F-F-4)', async () => {
+    const { result } = await renderStream();
+    emit('kim:plan', { steps: ['one', 'two', 'three'] });
+    expect(result.current.planSteps).toHaveLength(3);
+
+    emit('kim:plan', { steps: ['just one'] }); // too few to render
+    expect(result.current.planSteps).toEqual([]);
+    expect(planTrace(result.current.traceItems)).toBeUndefined();
+  });
+
+  it('STEP/DONE indices beyond steps.length are rejected, not clamped (F-F-4)', async () => {
+    const { result } = await renderStream();
+    emit('kim:plan', { steps: ['one', 'two', 'three'] });
+
+    // n=9 (> 3 steps): must be ignored, not clamped to the last step.
+    emit('kim:step', { n: 9, data: {} });
+    expect(planTrace(result.current.traceItems)!.items.map(i => i.status)).toEqual(['pending', 'pending', 'pending']);
+
+    // DONE n=9 must not mark any step complete.
+    emit('kim:done', { n: 9 });
+    expect(planTrace(result.current.traceItems)!.items.every(i => i.status !== 'done')).toBe(true);
+
+    // n=0 (below 1-based range) is likewise ignored.
+    emit('kim:step', { n: 0, data: {} });
+    expect(planTrace(result.current.traceItems)!.items.map(i => i.status)).toEqual(['pending', 'pending', 'pending']);
+  });
+
   it('kim:stats sets tokenStats', async () => {
     const { result } = await renderStream();
     emit('kim:stats', { input: 100, output: 40, total: 140 });

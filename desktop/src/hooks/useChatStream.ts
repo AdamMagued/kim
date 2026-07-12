@@ -513,18 +513,26 @@ export function useChatStream({
 
     listen<KimPlanPayload>(KimEventNames.PLAN, e => {
       if (!belongsToView(e.payload.session_id)) return;
+      // Steps are truncated to 12 for display; STEP/DONE indices beyond that are
+      // rejected below (they'd otherwise clamp to the wrong step).
       const steps = e.payload.steps.filter((step): step is string => typeof step === 'string').slice(0, 12);
-      if (steps.length < 2) return;
-      setTypedLivePlan({ steps, activeStep: 0, doneSteps: [], structured: true });
+      // F-F-4: a re-plan (or a spurious <2-step PLAN) must REPLACE the live plan,
+      // never leave the previous plan card standing — otherwise subsequent STEP/
+      // DONE events for the new plan mutate the stale card's steps by index. When
+      // the new plan has too few steps to render (<2), clear it rather than
+      // leaving a stale card that later STEP/DONE would silently corrupt.
+      setTypedLivePlan(steps.length < 2 ? null : { steps, activeStep: 0, doneSteps: [], structured: true });
     }).then(fn => { if (!cancelled) unlistenTypedPlan = fn; else fn(); });
 
     listen<KimStepPayload>(KimEventNames.STEP, e => {
       if (!belongsToView(e.payload.session_id)) return;
       setTypedLivePlan(prev => {
         if (!prev) return prev;
-        const activeStep = Math.max(0, Math.min(e.payload.n, prev.steps.length));
-        if (activeStep === prev.activeStep) return prev;
-        return { ...prev, activeStep };
+        // F-F-4: reject an out-of-range step index instead of clamping it to
+        // steps.length (which marked the wrong — usually the last — step active).
+        if (e.payload.n < 1 || e.payload.n > prev.steps.length) return prev;
+        if (e.payload.n === prev.activeStep) return prev;
+        return { ...prev, activeStep: e.payload.n };
       });
     }).then(fn => { if (!cancelled) unlistenTypedStep = fn; else fn(); });
 
@@ -532,6 +540,9 @@ export function useChatStream({
       if (!belongsToView(e.payload.session_id)) return;
       setTypedLivePlan(prev => {
         if (!prev) return prev;
+        // F-F-4: reject an out-of-range done index instead of pushing an
+        // unbounded n into doneSteps (which marked a nonexistent step complete).
+        if (e.payload.n < 1 || e.payload.n > prev.steps.length) return prev;
         const doneSteps = prev.doneSteps.includes(e.payload.n)
           ? prev.doneSteps
           : [...prev.doneSteps, e.payload.n].sort((a, b) => a - b);
