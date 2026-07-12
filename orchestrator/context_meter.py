@@ -96,6 +96,8 @@ class ContextMeter:
         """
         usage = usage or {}
         input_tokens = _usage_int(usage, "input", "input_tokens", "prompt_tokens")
+        if input_tokens == 0:
+            input_tokens = None
         output_tokens = _usage_int(usage, "output", "output_tokens", "completion_tokens")
 
         usage_estimated = bool(
@@ -137,11 +139,10 @@ class ContextMeter:
             # occupy the live thread's context.
             self.cumulative_input += tokens + max(0, int(output_tokens or 0))
         else:
-            # Stateless APIs re-send the full conversation history on every turn, so
-            # summing input counts grows ~quadratically and produces spurious
-            # WARN/CRITICAL phases. Use the most-recent request size as the
-            # window-fill estimate instead.
-            self.cumulative_input = tokens
+            # Stateless APIs re-send the full conversation history on every turn.
+            # F-A-8: ignore 0 that would lower non-zero cumulative.
+            if tokens > 0 or self.cumulative_input == 0:
+                self.cumulative_input = tokens
         return self.snapshot(
             last_input=tokens,
             last_output=max(0, int(output_tokens or 0)),

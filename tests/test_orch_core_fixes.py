@@ -299,3 +299,23 @@ class TestApiProviderCompactionDurable:
         assert len(reloaded) > 0
         # The reloaded messages should start with the compact_summary role!
         assert reloaded[0]["role"] == "compact_summary"
+
+
+class TestContextMeterZeroSignal:
+    def test_zero_input_falls_back_to_estimate(self):
+        meter = ContextMeter(budget=10_000)
+        # Call observe_usage with input=0 and fallback_input_tokens=123
+        snap = meter.observe_usage({"input": 0}, fallback_input_tokens=123)
+        assert snap is not None
+        assert snap.last_input == 123
+        assert snap.estimated is True
+
+    def test_zero_input_ignored_if_would_lower_cumulative(self):
+        meter = ContextMeter(budget=10_000)
+        meter.add_input(500, source="api", estimated=False)
+        assert meter.cumulative_input == 500
+        
+        # Adding 0 should be ignored (does not reset cumulative_input to 0)
+        snap = meter.add_input(0, source="api", estimated=False)
+        assert meter.cumulative_input == 500
+        assert snap.last_input == 0
