@@ -614,6 +614,7 @@ def test_record_run_does_not_drift_with_tick_latency():
         # Run 1 establishes the anchor at ran1 + 1h.
         ran1 = datetime(2026, 6, 5, 12, 0, 0, tzinfo=timezone.utc)
         u1 = store.record_run(t.id, ran_at=ran1)
+        assert u1 is not None
         slot2 = ran1 + timedelta(hours=1)
         assert u1.next_run_at == slot2.isoformat()
 
@@ -622,6 +623,7 @@ def test_record_run_does_not_drift_with_tick_latency():
         # the slot exactly one interval past slot2.
         ran2 = slot2 + timedelta(seconds=37)
         u2 = store.record_run(t.id, ran_at=ran2)
+        assert u2 is not None
         slot3 = ran1 + timedelta(hours=2)
         assert u2.next_run_at == slot3.isoformat()
         assert u2.next_run_at != (ran2 + timedelta(hours=1)).isoformat()
@@ -629,6 +631,7 @@ def test_record_run_does_not_drift_with_tick_latency():
         # Run 3 fires late again; drift still does not accumulate.
         ran3 = slot3 + timedelta(seconds=50)
         u3 = store.record_run(t.id, ran_at=ran3)
+        assert u3 is not None
         assert u3.next_run_at == (ran1 + timedelta(hours=3)).isoformat()
 
 
@@ -646,6 +649,7 @@ def test_record_run_catches_up_after_long_downtime():
         # backlog of hourly slots.
         ran2 = ran1 + timedelta(hours=5, minutes=10)
         u2 = store.record_run(t.id, ran_at=ran2)
+        assert u2 is not None
         assert u2.next_run_at == (ran1 + timedelta(hours=6)).isoformat()
 
 
