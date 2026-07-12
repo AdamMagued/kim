@@ -103,6 +103,12 @@ or executed at runtime by Kim. Recommended cleanup package:
   `__pycache__/` only.
 - Verdict: KEEP as-is. Optional nice-to-have: note in docs which team owns protocol-
   snapshot refreshes (VERSION file exists for this).
+- History-bloat check: largest historical blobs under codex_engine are the two
+  aggregate schema JSONs (505 KB + 420 KB) — text, not binaries/models. Under
+  pythonExperimentTool the top blobs are README marketing PNGs (1.5 MB + 1.3 MB +
+  894 KB + 832 KB) plus multiple 425 KB revisions of a single `main.rs`. Note:
+  `git rm` frees the checkout + future clones' worktrees but not pack history; a
+  history rewrite is NOT recommended (shared branches) — just delete going forward.
 
 ### relay_server/ — ALREADY DELETED (no action; guard exists)
 - Directory absent on this branch (`ls relay_server` → No such file or directory).
@@ -114,105 +120,126 @@ or executed at runtime by Kim. Recommended cleanup package:
 
 ## FINDINGS (F-G-N), most severe first
 
-### F-G-1 — `find_code_backend` probes a directory that does not exist (dead resolution arm, misleading error text)
-- **Where**: `desktop/src-tauri/src/subprocess.rs` L531
-  (`CodeBackendKind::Codex => "pythonExperimentTool/codex-code/rust/target"`) and the
-  user-facing error at L856 telling users to "Build `pythonExperimentTool/codex-code/rust`
-  for Codex".
-- **What**: `pythonExperimentTool/` contains only `claw-code/`; `codex-code/` does not
-  exist anywhere in the tree (`git ls-files | grep codex-code` → 0). The bundled-Codex
-  arm can never match, and the error message sends users to build a directory that
-  isn't there.
-- **Impact**: Medium — misleading operator guidance on the primary failure path of the
-  Code tab; dead code arm.
-- **Fix shape**: Remove the bundled-codex arm (and, per the pythonExperimentTool
-  verdict, the bundled-claw arm), reword the error to "install codex or set CODEX_BIN".
-
-### F-G-2 — Stale CI comment references deleted `run_claw_bridge.py`
-- **Where**: `.github/workflows/ci.yml` L235 comment "(incl. run_claw_bridge.py and
-  providers/*) stays strict at 120".
-- **What**: `run_claw_bridge.py` no longer exists anywhere (repo-wide find → 0 hits;
-  it was merged into `orchestrator/codex_bridge_service.py` per that module's
-  docstring). Comment describes a lint scope that no longer matches reality.
-- **Impact**: Low — doc rot in CI config.
-
-### F-G-3 — `relay:` section survives in config.yaml after relay decommission (CONFIRMED dead)
-- **Where**: `config.yaml` (`relay:` with `pc_api_key`, `poll_interval`, `url`).
-- **What**: relay_server was deleted in `9f6371f` (2026-07-06) but the config section
-  remains. Reader audit: grep for `pc_api_key` / `poll_interval` / `"relay"` across
-  orchestrator/, mcp_server/, desktop/src-tauri/, cli/, codex_engine/ → **0 readers**.
-- **Impact**: Low-Medium — dead config invites confusion and cargo-cult copying;
-  `pc_api_key` is a credential-shaped key that suggests a live feature.
-
-### F-G-4 — `shell.blocked_commands` in config.yaml is read by NOTHING (false-security config)
-- **Where**: `config.yaml` L48-53 (`shell.blocked_commands:` listing `rm -rf /`,
-  `format c:`, …) and `config.yaml.example` L86.
-- **What**: repo-wide grep for `blocked_commands` across orchestrator/, mcp_server/,
+## F-G-4: `shell.blocked_commands` in config.yaml is read by NOTHING (false-security config)
+- **File:** config.yaml:49 (and config.yaml.example:86); mcp_server/tools/shell.py:64
+- **Severity:** High
+- **Class:** security (config illusion) / dead-code
+- **Evidence:** repo-wide grep for `blocked_commands` across orchestrator/, mcp_server/,
   desktop/, cli/, tests/ → **0 readers**. `mcp_server/config.py` reads only
   `shell.timeout` (L162) and `shell.sandbox_mode` (L165). The real deny-list is
   hard-coded in `mcp_server/tools/shell.py` (`_DENY_COMMANDS` L64, `_DENY_PATTERNS`
-  L84) and cannot be extended via config.
-- **Impact**: **High** (safety illusion) — an operator who adds a command to
+  L84) and cannot be extended via config. An operator who adds a command to
   `blocked_commands` reasonably believes it is now blocked; it is silently ignored.
-  Either wire the key into shell.py's deny-set (additively — never let config REMOVE
-  hard-coded entries) or delete the key from both YAML files and document the deny-list
-  as code-owned.
+- **Fix sketch:** Either wire the key into shell.py's deny-set (ADDITIVELY only —
+  config must never remove hard-coded entries, per invariant on shell gates) or delete
+  the key from both YAML files and document the deny-list as code-owned.
+- **Cross-territory?** yes — mcp_server tool-safety owner (Team C territory) must
+  choose wire-vs-delete; the invariant "don't weaken shell blocklist gates" applies.
 
-### F-G-5 — Entire `voice:` section in config.yaml is dead, and the live key has a name mismatch
-- **Where**: `config.yaml` `voice:` block (13 lines: enabled/engine/human_quirks/hume/
-  maya1/speed/voice_id) vs `mcp_server/config.py` L183.
-- **What**: the only voice key the code reads is the FLAT key
-  `voice_enabled` (`VOICE_ENABLED: bool = _as_bool(_cfg.get("voice_enabled", False), False)`) —
-  which does not exist in config.yaml. The nested `voice.enabled` and every subkey
-  (`engine`, `human_quirks`, `hume.*`, `maya1.*`, `speed`, `voice_id`) have **0
-  readers** (grep for `human_quirks|maya1|hume` in orchestrator/ + mcp_server/ → 0
-  files). Voice scaffold was decommissioned in `9f6371f`.
-- **Impact**: Medium — 13 lines of dead config, plus a real key (`voice_enabled`)
-  that no shipped config file sets; setting `voice.enabled: true` does nothing.
+## F-G-6: Pillow pin makes 5 known CVE fixes unreachable (pip-audit)
+- **File:** requirements.txt:23
+- **Severity:** High
+- **Class:** security (known-CVE dependency)
+- **Evidence:** `pip-audit -r requirements.txt --no-deps` → Pillow 10.4.0 carries
+  PYSEC-2026-165, CVE-2026-25990, CVE-2026-40192, CVE-2026-42310, CVE-2026-42311;
+  fixes land in 12.1.1/12.2.0. The compatible-release pin `Pillow~=10.0` caps at <11,
+  so `pip install` can never reach the fixed versions. Kim feeds screenshots and
+  user-supplied images through PIL. Also flagged: pytest 8.4.2 → PYSEC-2026-1845
+  (fix 9.0.3; dev-only, Low).
+- **Fix sketch:** Bump to `Pillow~=12.1` (or `>=12.1.1`), re-run all four suites;
+  consider committing the lockfile the requirements.txt header already recommends.
+- **Cross-territory?** no (root config is Team G territory; suites must go green).
 
-### F-G-6 — Pillow pin makes 5 known CVE fixes unreachable (pip-audit)
-- **Where**: `requirements.txt` L23 `Pillow~=10.0` (installs 10.4.0).
-- **What**: `pip-audit -r requirements.txt` → Pillow 10.4.0 carries PYSEC-2026-165,
-  CVE-2026-25990, CVE-2026-40192, CVE-2026-42310, CVE-2026-42311; fixes land in
-  12.1.1/12.2.0. The compatible-release pin `~=10.0` caps at <11, so `pip install`
-  can never pick up the fixed versions. Kim feeds screenshots and user-supplied
-  images through PIL. Also: pytest 8.4.2 → PYSEC-2026-1845 (fix 9.0.3; dev-only,
-  low).
-- **Impact**: High (dependency hygiene on an image-parsing library) — bump to
-  `Pillow~=12.1` (or at least `>=12.1.1`) and re-run the suites.
+## F-G-1: `find_code_backend` probes a directory that does not exist (dead arm, misleading error)
+- **File:** desktop/src-tauri/src/subprocess.rs:531 and :856
+- **Severity:** Medium
+- **Class:** dead-code / docs (operator guidance)
+- **Evidence:** L531 maps the bundled-Codex arm to
+  `"pythonExperimentTool/codex-code/rust/target"`, but `pythonExperimentTool/` contains
+  only `claw-code/` — `git ls-files | grep codex-code` → 0. The arm can never match,
+  and the not-found error (L856) tells users to "Build
+  `pythonExperimentTool/codex-code/rust` for Codex" — a directory that isn't there.
+- **Fix sketch:** Remove the bundled-codex arm (and, per the satellite verdict, the
+  bundled-claw arm); reword the error to "install codex or set CODEX_BIN".
+- **Cross-territory?** yes — desktop/src-tauri owner (Team B/D) executes; verdict
+  above supplies the evidence.
 
-### F-G-7 — `scripts/claw-via-browser` is broken: launches a module that no longer exists
-- **Where**: `scripts/claw-via-browser` L102 (`"$PYTHON" -m orchestrator.run_claw_relay …`),
-  L25 (docstring references `orchestrator.run_claw_bridge`), L61-64 (binary lookup
-  into `pythonExperimentTool/claw-code/rust/target/…`).
-- **What**: neither `orchestrator/run_claw_relay.py` nor `orchestrator/run_claw_bridge.py`
-  exists (repo-wide find → 0; both were merged into `orchestrator/codex_bridge_service.py`).
-  The script fails at launch on every invocation. Last touched 2026-05-11 (`006ef34`).
-- **Impact**: Medium-Low — dead dev tooling; belongs in the pythonExperimentTool
-  delete package (verdict item 1-3 above, extend to `git rm scripts/claw-via-browser`).
+## F-G-5: Entire `voice:` section in config.yaml is dead, and the live key has a name mismatch
+- **File:** config.yaml:55; mcp_server/config.py:183
+- **Severity:** Medium
+- **Class:** dead-code / contract (config schema drift)
+- **Evidence:** the only voice key code reads is the FLAT key `voice_enabled`
+  (`VOICE_ENABLED: bool = _as_bool(_cfg.get("voice_enabled", False), False)`), which
+  no shipped config file sets. The nested `voice.enabled` and every subkey (`engine`,
+  `human_quirks`, `hume.*`, `maya1.*`, `speed`, `voice_id`) have **0 readers** (grep
+  `human_quirks|maya1|hume` in orchestrator/ + mcp_server/ → 0 files). Voice scaffold
+  was decommissioned in `9f6371f`. Setting `voice.enabled: true` does nothing.
+- **Fix sketch:** Delete the `voice:` block from config.yaml(.example); either delete
+  `VOICE_ENABLED` too or rename to a documented key when voice returns.
+- **Cross-territory?** no.
 
-### F-G-8 — requirements.txt ships two never-imported dependencies
-- **Where**: `requirements.txt` L15 `aiosqlite~=0.20`, L41 `pynput~=1.7`.
-- **What**: repo-wide grep (excluding venv/ and pythonExperimentTool/) for
-  `import aiosqlite|from aiosqlite` and `import pynput|from pynput` → **0 hits** in
-  orchestrator/, mcp_server/, codex_engine/, cli/, scripts/, desktop/. pynput appears
-  only as a stubbed module name in `tests/conftest.py` L57 (legacy stub) and
-  commented out in `kim-orchestrator.spec` L82. Every other dep verified in use
-  (mcp, anthropic, openai, dotenv, yaml, httpx, aiofiles, aiohttp, json5,
-  json-repair, pyperclip, pyautogui, mss, Pillow, playwright, pytest/-asyncio).
-- **Impact**: Low — install weight + audit surface; drop both lines and the
-  conftest stub entries.
+## F-G-7: `scripts/claw-via-browser` is broken — launches a module that no longer exists
+- **File:** scripts/claw-via-browser:101 (also :25, :61-64)
+- **Severity:** Medium
+- **Class:** dead-code
+- **Evidence:** L101 runs `"$PYTHON" -m orchestrator.run_claw_relay`; neither
+  `orchestrator/run_claw_relay.py` nor `orchestrator/run_claw_bridge.py` (docstring,
+  L25) exists — repo-wide find → 0; both were merged into
+  `orchestrator/codex_bridge_service.py` per that module's docstring. The script fails
+  on every invocation. Binary lookup (L61-64) points into the pythonExperimentTool
+  tree recommended for deletion. Last touched 2026-05-11 (`006ef34`).
+- **Fix sketch:** `git rm scripts/claw-via-browser` as part of the claw delete package.
+- **Cross-territory?** no.
 
-### F-G-9 — install.sh: no minimum-Python-version check (repo targets 3.11)
-- **Where**: `install.sh` L29-45 accepts the first `python3`/`python` found;
-  `pyrightconfig.json` L8 declares `"pythonVersion": "3.11"`.
-- **What**: on a machine with Python 3.9/3.10 the installer proceeds and fails later
-  with confusing pip/syntax errors instead of a clear "need >= 3.11" message.
-  Otherwise install.sh audits clean: `set -e`, idempotent venv/.env/dir creation,
-  correct macOS vs Linux hints, guarded `~/.kim_root` write. (Nit: no `set -u`/
-  `pipefail`; header comment in requirements.txt recommends committing a lockfile
-  but none exists — `requirements-lock.txt` absent.)
-- **Impact**: Low — one version-guard block fixes it.
+## F-G-3: `relay:` section survives in config.yaml after relay decommission (confirmed dead)
+- **File:** config.yaml:43
+- **Severity:** Low-Medium
+- **Class:** dead-code
+- **Evidence:** relay_server was deleted in `9f6371f` (2026-07-06) but the section
+  (`pc_api_key`, `poll_interval`, `url`) remains. Grep for
+  `pc_api_key` / `poll_interval` / `"relay"` across orchestrator/, mcp_server/,
+  desktop/src-tauri/, cli/, codex_engine/ → **0 readers**. `pc_api_key` is a
+  credential-shaped key that suggests a live feature.
+- **Fix sketch:** Delete the `relay:` block from config.yaml and config.yaml.example.
+- **Cross-territory?** no.
+
+## F-G-8: requirements.txt ships two never-imported dependencies
+- **File:** requirements.txt:15 (`aiosqlite~=0.20`), requirements.txt:41 (`pynput~=1.7`)
+- **Severity:** Low
+- **Class:** dead-code (dependency)
+- **Evidence:** repo-wide grep (excluding venv/, pythonExperimentTool/) for
+  `^import aiosqlite|^from aiosqlite` and `^import pynput|^from pynput` → **0 hits**.
+  pynput appears only as a stubbed module name in `tests/conftest.py:57` (legacy stub)
+  and commented out in `kim-orchestrator.spec:82`. Every other dep verified in use
+  (mcp, anthropic, openai, dotenv, yaml, httpx, aiofiles, aiohttp, json5, json-repair,
+  pyperclip, pyautogui, mss, Pillow, playwright, pytest/-asyncio).
+- **Fix sketch:** Drop both lines; prune the pynput entries from the conftest stub list.
+- **Cross-territory?** no (conftest touch is trivial; flag to Team owning tests/).
+
+## F-G-9: install.sh has no minimum-Python-version check (repo targets 3.11)
+- **File:** install.sh:29-45; pyrightconfig.json:8
+- **Severity:** Low
+- **Class:** bug (UX on unsupported env)
+- **Evidence:** installer accepts the first `python3`/`python` found; repo declares
+  `"pythonVersion": "3.11"`. On 3.9/3.10 the install proceeds and fails later with
+  confusing pip/syntax errors instead of "need >= 3.11". Otherwise install.sh audits
+  clean: `set -e`, idempotent venv/.env/dir creation, correct macOS vs Linux hints,
+  guarded `~/.kim_root` write. Nits: no `set -u -o pipefail`; the lockfile the
+  requirements.txt header recommends (`requirements-lock.txt`) is not committed.
+- **Fix sketch:** After picking `$PYTHON`, compare
+  `$PYTHON -c 'import sys; print(sys.version_info >= (3,11))'` and exit with a clear
+  message.
+- **Cross-territory?** no.
+
+## F-G-2: Stale CI comment references deleted `run_claw_bridge.py`
+- **File:** .github/workflows/ci.yml:235
+- **Severity:** Low
+- **Class:** docs
+- **Evidence:** comment "(incl. run_claw_bridge.py and providers/*) stays strict at
+  120" — `run_claw_bridge.py` no longer exists anywhere (repo-wide find → 0; merged
+  into `orchestrator/codex_bridge_service.py`).
+- **Fix sketch:** Update the comment when touching ci.yml for the claw removal.
+- **Cross-territory?** no.
 
 ## CONFIG.YAML KEY AUDIT (every key → read by code?)
 
