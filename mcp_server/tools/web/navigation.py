@@ -26,6 +26,27 @@ from .browser import _is_ssrf_target, _parse_host_as_ip, _whatwg_ipv4_part  # no
 
 logger = logging.getLogger(__name__)
 
+# F-C-5: model-supplied `timeout_ms` for the wait tools must be clamped. The MCP
+# server serializes tool calls, so `web_wait_for(timeout_ms=10**12)` blocks the
+# whole server inside `page.locator(...).wait_for` — the same DoS-pin the shell
+# MAX_SHELL_TIMEOUT_S clamp closes. Ceiling = 300_000 ms (5 min); a non-positive
+# or bad value falls back to the 10s default.
+MAX_WEB_WAIT_MS = 300_000
+_DEFAULT_WEB_WAIT_MS = 10_000
+
+
+def _clamp_wait_ms(raw: object) -> int:
+    """Coerce a model-supplied timeout_ms to a positive int within the cap."""
+    try:
+        val = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return _DEFAULT_WEB_WAIT_MS
+    if val < 1:
+        return 1
+    if val > MAX_WEB_WAIT_MS:
+        return MAX_WEB_WAIT_MS
+    return val
+
 
 def _default_port(scheme: str) -> int | None:
     return {"http": 80, "https": 443}.get((scheme or "").lower())
@@ -212,7 +233,7 @@ async def handle_web_wait_for(args: dict) -> str:
     text = str(args.get("text") or "").strip()
     selector = str(args.get("selector") or "").strip()
     target = text or selector
-    timeout = int(args.get("timeout_ms", 10000))
+    timeout = _clamp_wait_ms(args.get("timeout_ms"))
     if not target:
         return "ERROR: 'text' or 'selector' is required"
     page = await browser._page()
@@ -234,7 +255,7 @@ async def handle_web_wait_for(args: dict) -> str:
 async def handle_web_wait_for_url(args: dict) -> str:
     contains = str(args.get("url_contains") or "").strip()
     regex = str(args.get("url_regex") or "").strip()
-    timeout = int(args.get("timeout_ms", 10000))
+    timeout = _clamp_wait_ms(args.get("timeout_ms"))
     if not contains and not regex:
         return "ERROR: 'url_contains' or 'url_regex' is required"
     page = await browser._page()

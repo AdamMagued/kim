@@ -31,8 +31,29 @@ import os
 
 from mcp_server.config import PROJECT_ROOT, CODE_TIMEOUT, SHELL_TIMEOUT, validate_path
 from mcp_server.os_utils import IS_MACOS, IS_LINUX, IS_WINDOWS
+from mcp_server.tools.shell import _kill_process_tree
 
 logger = logging.getLogger(__name__)
+
+# F-C-5: a model-supplied `timeout` must be clamped exactly like shell.py's
+# MAX_SHELL_TIMEOUT_S. Without a ceiling, run_python(timeout=999999) pins the
+# single-threaded MCP server for ~11.5 days server-side — the same client/server
+# desync the shell clamp closes, reopened for code exec. Kept in sync with
+# shell.MAX_SHELL_TIMEOUT_S (600s).
+MAX_CODE_TIMEOUT_S = 600
+
+
+def _clamp_code_timeout(raw: object, default: int) -> int:
+    """Coerce a model-supplied timeout to a positive int within the hard cap."""
+    try:
+        val = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if val < 1:
+        return 1
+    if val > MAX_CODE_TIMEOUT_S:
+        return MAX_CODE_TIMEOUT_S
+    return val
 
 # ── Minimal sandbox environment ───────────────────────────────────────────────
 
@@ -233,13 +254,19 @@ async def _run_exec(
             stderr=asyncio.subprocess.PIPE,
             cwd=resolved_cwd,
             env=env,
+            # F-C-6: own process group (POSIX) so a timeout kill reaps the whole
+            # tree. An approved run_python *file* can Popen freely (the inline
+            # blocklist is exempt for files, M4); without this those
+            # grandchildren survive proc.kill() and accumulate orphaned.
+            start_new_session=not IS_WINDOWS,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=resolved_timeout
             )
         except asyncio.TimeoutError:
-            proc.kill()
+            # F-C-6: kill the whole process group, not just the interpreter.
+            _kill_process_tree(proc)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2)
             except asyncio.TimeoutError:
@@ -282,7 +309,8 @@ async def handle_run_python(args: dict) -> str:
     file_path = args.get("file", "")
     code = args.get("code", "")
     cwd = args.get("cwd", str(PROJECT_ROOT))
-    timeout = int(args.get("timeout", CODE_TIMEOUT))
+    # F-C-5: clamp the model-supplied timeout to [1, MAX_CODE_TIMEOUT_S].
+    timeout = _clamp_code_timeout(args.get("timeout"), CODE_TIMEOUT)
 
     # Validate cwd
     try:
@@ -347,7 +375,8 @@ async def handle_run_node(args: dict) -> str:
     file_path = args.get("file", "")
     code = args.get("code", "")
     cwd = args.get("cwd", str(PROJECT_ROOT))
-    timeout = int(args.get("timeout", CODE_TIMEOUT))
+    # F-C-5: clamp the model-supplied timeout to [1, MAX_CODE_TIMEOUT_S].
+    timeout = _clamp_code_timeout(args.get("timeout"), CODE_TIMEOUT)
 
     # Validate cwd
     try:
@@ -409,7 +438,8 @@ async def handle_lint_file(args: dict) -> str:
     file_path = args.get("path", "")
     fix = args.get("fix", False)
     cwd = args.get("cwd", str(PROJECT_ROOT))
-    timeout = int(args.get("timeout", SHELL_TIMEOUT))
+    # F-C-5: clamp the model-supplied timeout to [1, MAX_CODE_TIMEOUT_S].
+    timeout = _clamp_code_timeout(args.get("timeout"), SHELL_TIMEOUT)
 
     if not file_path:
         return "ERROR: 'path' parameter is required (path to Python file to lint)."

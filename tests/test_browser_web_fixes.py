@@ -316,23 +316,50 @@ class TestSsrfNavigationGuard(unittest.TestCase):
         self.assertFalse(route.aborted)
         self.assertTrue(route.continued)
 
-    def test_ignores_non_navigation_requests(self):
-        # Subresource requests (images, XHR, etc.) are out of this guard's
-        # scope (#1 is specifically about *navigation*); it must not stall
-        # or abort ordinary page traffic.
+    def test_blocks_subresource_to_metadata_endpoint(self):
+        # F-C-4: the whole point — a public page's own JS `fetch`/`XHR`/`Image`
+        # to the cloud-metadata endpoint is NOT a navigation request, so the old
+        # nav-only guard let it through (IMDS-credential exfiltration). It must
+        # now be aborted like any other internal-host request.
         page = self._install()
-        req = _FakeRequest("http://169.254.169.254/", page.main_frame, is_navigation=False)
+        req = _FakeRequest(
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            page.main_frame,
+            is_navigation=False,
+        )
+        route = asyncio.run(page.fire(req))
+        self.assertTrue(route.aborted, "subresource to metadata endpoint must be aborted")
+        self.assertFalse(route.continued)
+
+    def test_blocks_subresource_to_loopback(self):
+        # F-C-4: XHR/fetch to a loopback service (e.g. a local admin panel /
+        # redis) from an attacker page must be aborted.
+        page = self._install()
+        req = _FakeRequest("http://127.0.0.1:6379/", page.main_frame, is_navigation=False)
+        route = asyncio.run(page.fire(req))
+        self.assertTrue(route.aborted)
+        self.assertFalse(route.continued)
+
+    def test_allows_subresource_to_public_host(self):
+        # Ordinary page traffic to a public host must NOT be stalled/aborted.
+        page = self._install()
+        req = _FakeRequest(
+            "https://cdn.example.com/app.js", page.main_frame, is_navigation=False
+        )
         route = asyncio.run(page.fire(req))
         self.assertFalse(route.aborted)
         self.assertTrue(route.continued)
 
-    def test_ignores_non_main_frame_navigation(self):
+    def test_blocks_subframe_navigation_to_private_ip(self):
+        # F-C-4: an <iframe> loading an internal host is SSRF too; the guard no
+        # longer narrows to the main frame, so a subframe request to a private
+        # address is aborted.
         page = self._install()
         other_frame = _FakeFrame()
-        req = _FakeRequest("http://127.0.0.1/", other_frame, is_navigation=True)
+        req = _FakeRequest("http://10.0.0.5/admin", other_frame, is_navigation=True)
         route = asyncio.run(page.fire(req))
-        self.assertFalse(route.aborted)
-        self.assertTrue(route.continued)
+        self.assertTrue(route.aborted)
+        self.assertFalse(route.continued)
 
     def test_ensure_browser_installs_guard_on_newly_adopted_page(self):
         # The guard must be wired up automatically when a page is adopted —
