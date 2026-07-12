@@ -713,6 +713,53 @@ describe('useChatStream rate limit', () => {
   });
 });
 
+// ── Elapsed timer survives mid-run re-attach (F-F-3) ──────────────────────────
+describe('useChatStream elapsed timer on re-attach (F-F-3)', () => {
+  it('restores the original run start instead of resetting elapsed/duration to 0', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-13T00:00:00Z'));
+    const startedAt = Date.now() - 5000; // the run began 5s before this remount
+
+    // Simulate the ChatView remount that a mid-run session switch triggers: the
+    // view mounts already owning the active run, with the App-tracked start.
+    const props = {
+      session: null,
+      settings: DEFAULT_SETTINGS,
+      onTaskDone: vi.fn(),
+      commitCurrentBrowserUrl: vi.fn(() => Promise.resolve()),
+      setMessageReloadNonce: vi.fn(),
+      conversationId: 'conv-1',
+      activeRunSessionId: 'conv-1',
+      activeRunId: 'run-1',
+      activeRunStartedAt: startedAt,
+    };
+    const { result } = renderHook(() => useChatStream(props));
+    await act(async () => {});
+
+    expect(result.current.isRunning).toBe(true); // re-attached to the owned run
+    // Elapsed reflects the ORIGINAL start (~5s), not 0.
+    expect(result.current.elapsed).toBe(5);
+
+    // And the persisted run duration must capture the full elapsed, not just the
+    // time since re-attach.
+    emit('kim:status', { message: 'still working', session_id: 'conv-1' });
+    emit('kim-agent-done', true);
+    const save = [...invokeMock.mock.calls].reverse().find(([n]) => n === 'save_run_history');
+    expect(save).toBeDefined();
+    expect((save![1] as { runs: { durationSec: number }[] }).runs[0].durationSec).toBe(5);
+  });
+
+  it('a fresh run started in this mount still stamps from now (elapsed starts at 0)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-13T00:00:00Z'));
+    const { result } = await renderStream(); // no active run at mount
+    act(() => { result.current.setIsRunning(true); });
+    expect(result.current.elapsed).toBe(0);
+    act(() => { vi.advanceTimersByTime(3000); });
+    expect(result.current.elapsed).toBe(3);
+  });
+});
+
 // ── RUN-IDENTITY (D1/B4/B5): route/file by run, not by current view ──────────
 describe('useChatStream run identity', () => {
   it('drops run-scoped events tagged for a DIFFERENT session (run A never mutates view B)', async () => {

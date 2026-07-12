@@ -129,7 +129,10 @@ export default function App() {
   // spawn, cleared on done/cancel. A ChatView remounted mid-run (tab/session/
   // New-Chat switch) reads this to re-derive that its session's run is still
   // running and re-attach to the live stream instead of orphaning it.
-  const [activeRun, setActiveRun] = useState<{ runId: string; sessionId: string } | null>(null);
+  // F-F-3: `startedAt` lives here (above the ChatView remount boundary) so the
+  // elapsed timer + persisted run duration survive a mid-run session switch —
+  // on re-attach the view restores the ORIGINAL start instead of resetting to 0.
+  const [activeRun, setActiveRun] = useState<{ runId: string; sessionId: string; startedAt: number } | null>(null);
   // V-audit #1: queued follow-up messages, lived ABOVE the ChatView remount
   // boundary for the same reason as activeRun above — a full ChatView remount
   // (New Chat / session switch) used to silently drop any queued messages,
@@ -239,7 +242,15 @@ export default function App() {
         .catch(() => {});
     };
     track<{ run_id: string; session_id: string }>('kim-run-id', p => {
-      if (p && p.session_id) setActiveRun({ runId: p.run_id, sessionId: p.session_id });
+      if (p && p.session_id) {
+        // F-F-3: stamp startedAt once per run; a repeated kim-run-id for the same
+        // run must not reset the original start.
+        setActiveRun(prev =>
+          prev && prev.runId === p.run_id
+            ? prev
+            : { runId: p.run_id, sessionId: p.session_id, startedAt: Date.now() },
+        );
+      }
     });
     // Single active run: any completion/cancel clears the active-run marker.
     track<boolean>('kim-agent-done', () => setActiveRun(null));
@@ -598,6 +609,7 @@ export default function App() {
           session={activeSession}
           activeRunSessionId={activeRun?.sessionId ?? null}
           activeRunId={activeRun?.runId ?? null}
+          activeRunStartedAt={activeRun?.startedAt ?? null}
           newChatMode={newChatMode}
           settings={settings}
           onSettingsChange={handleSettingsChange}

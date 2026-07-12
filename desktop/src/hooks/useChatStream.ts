@@ -111,6 +111,10 @@ export interface UseChatStreamProps {
   // the active run belongs to a different session.
   activeRunSessionId?: string | null;
   activeRunId?: string | null;
+  // F-F-3: wall-clock start of the globally-active run (tracked at App level so
+  // it survives the ChatView remount a tab/session/New-Chat switch triggers).
+  // On re-attach the timer restores this instead of resetting elapsed to 0.
+  activeRunStartedAt?: number | null;
 }
 
 export function useChatStream({
@@ -122,6 +126,7 @@ export function useChatStream({
   conversationId,
   activeRunSessionId,
   activeRunId,
+  activeRunStartedAt,
 }: UseChatStreamProps) {
   // The session id this view represents — the identity every run-scoped event
   // must match to be routed here (see `belongsToView`).
@@ -369,13 +374,22 @@ export function useChatStream({
   // ── Timer Effect ───────────────────────────────────────────────────────────
   useEffect(() => {
     if (!isRunning) return;
-    startTimeRef.current = Date.now();
-    setElapsed(0);
+    // F-F-3: on a mid-run re-attach (this view remounted after a session switch),
+    // restore the ORIGINAL run start so the elapsed pill — and the durationSec
+    // persisted at kim-agent-done — don't reset to 0 / under-report. startTimeRef
+    // is null at the start of each run (reset when the previous run ended), so:
+    //   • fresh run started in this mount → stamp now (activeRunStartedAt is not
+    //     yet known / this view doesn't own an active run at that instant);
+    //   • re-attach to an already-running owned run → use the App-tracked start.
+    if (startTimeRef.current === null) {
+      startTimeRef.current = ownsActiveRun && activeRunStartedAt ? activeRunStartedAt : Date.now();
+    }
+    setElapsed(Math.max(0, Math.floor((Date.now() - startTimeRef.current) / 1000)));
     const id = setInterval(() => {
-      setElapsed(Math.floor((Date.now() - (startTimeRef.current ?? Date.now())) / 1000));
+      setElapsed(Math.max(0, Math.floor((Date.now() - (startTimeRef.current ?? Date.now())) / 1000)));
     }, 1000);
     return () => clearInterval(id);
-  }, [isRunning]);
+  }, [isRunning, ownsActiveRun, activeRunStartedAt]);
 
   // Defensive isRunning guard
   useEffect(() => {
@@ -1016,6 +1030,9 @@ export function useChatStream({
       // foreign done can't be mistaken for this view's run.
       runOwnerSessionIdRef.current = null;
       currentRunIdRef.current = null;
+      // F-F-3: clear the run start so the NEXT run in this mount stamps fresh
+      // (the timer effect only stamps when startTimeRef is null).
+      startTimeRef.current = null;
     }).then(fn => { if (!cancelled) unlistenDone = fn; else fn(); });
 
     listen<SessionInfo>('kim-agent-code-session', event => {
@@ -1036,6 +1053,7 @@ export function useChatStream({
       currentTaskRef.current = null;
       runOwnerSessionIdRef.current = null;
       currentRunIdRef.current = null;
+      startTimeRef.current = null; // F-F-3: next run stamps a fresh start
     }).then(fn => { if (!cancelled) unlistenCancelled = fn; else fn(); });
 
     return () => { parkOrphanedRunSnapshotIfOwned({ isRunning: isRunningRef.current, runOwnerSessionId: runOwnerSessionIdRef.current, fallbackSessionId: activeResumeSessionIdRef.current, activity: activityRef.current, priorRuns: runHistoryRef.current, startedAt: startTimeRef.current, provider: currentTaskRef.current?.provider ?? null, completedCodeSession: completedCodeSessionRef.current, fallbackSessionDate: sessionRef.current?.date ?? null, kimSessionsDir: settingsRef.current.kim_sessions_dir || null, codexSessionsDir: settingsRef.current.codex_sessions_dir || null });
