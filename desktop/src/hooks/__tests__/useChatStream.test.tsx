@@ -586,6 +586,50 @@ describe('useChatStream lifecycle', () => {
   });
 });
 
+// ── 5b. Typed enveloped lifecycle CLEAR events (F-H-1) ────────────────────────
+describe('useChatStream typed lifecycle CLEAR events (F-H-1)', () => {
+  it('typed kim:agent-error clears the spinner and surfaces the error attributably', async () => {
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); });
+
+    emit('kim:agent-error', { error: 'orchestrator process crashed', session_id: 'conv-1' });
+
+    expect(result.current.isRunning).toBe(false);
+    expect(result.current.taskError).toBeTruthy();
+  });
+
+  it('typed kim:agent-done clears isRunning attributably (safety net for a missing bare done)', async () => {
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); });
+
+    emit('kim:agent-done', { success: true, session_id: 'conv-1' });
+
+    expect(result.current.isRunning).toBe(false);
+    expect(result.current.cancelling).toBe(false);
+  });
+
+  it('typed kim:agent-cancelled sets cancel flags attributably', async () => {
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); });
+
+    emit('kim:agent-cancelled', { success: false, session_id: 'conv-1' });
+
+    expect(result.current.isRunning).toBe(false);
+    expect(result.current.isCancelled).toBe(true);
+  });
+
+  it('a foreign-session typed lifecycle event does NOT clear this view', async () => {
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); });
+
+    // A run owned by a different session terminates while this view is mounted.
+    emit('kim:agent-error', { error: 'the other run failed', session_id: 'a-different-session' });
+
+    expect(result.current.isRunning).toBe(true); // untouched — not our run
+    expect(result.current.taskError).toBeNull();
+  });
+});
+
 // ── 6. Rate limit ─────────────────────────────────────────────────────────────
 describe('useChatStream rate limit', () => {
   it('kim:rate-limited sets state and auto-clears after (delay + 1) seconds', async () => {

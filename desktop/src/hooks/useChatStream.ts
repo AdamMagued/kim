@@ -9,6 +9,9 @@ import { browserSiteFromProvider, friendlyError, parsePlanFromActivity, TOOL_MAP
 import { parkOrphanedRunSnapshotIfOwned, flushOrphanedRunSnapshots, useCappedState } from './runSnapshotStore'; import {
   KimEventNames,
   type KimActivityPayload,
+  type KimAgentDonePayload,
+  type KimAgentCancelledPayload,
+  type KimAgentErrorPayload,
   type KimAnswerPayload,
   type KimAssistantDeltaPayload,
   type KimItemLifecyclePayload,
@@ -495,6 +498,9 @@ export function useChatStream({
     let unlistenTypedAssistantDelta: (() => void) | undefined;
     let unlistenTypedReasoningDelta: (() => void) | undefined;
     let unlistenTypedItemLifecycle: (() => void) | undefined;
+    let unlistenTypedAgentDone: (() => void) | undefined;
+    let unlistenTypedAgentCancelled: (() => void) | undefined;
+    let unlistenTypedAgentError: (() => void) | undefined;
     let unlistenRunId: (() => void) | undefined;
 
     // Typed IPC listeners own Kim's UI state. The raw listener below remains
@@ -628,6 +634,46 @@ export function useChatStream({
         setCancelling(false);
       }
     }).then(fn => { if (!cancelled) unlistenTypedRunFailed = fn; else fn(); });
+
+    // F-H-1 / F-F-2: schema-typed, ENVELOPED run-lifecycle CLEAR events (A'
+    // emitter, commit a61ffb4). Unlike the bare-bool kim-agent-done/-cancelled
+    // and the raw kim-agent-error string — none of which carry a run/session
+    // envelope — these route through belongsToView, so a stale session's
+    // termination can no longer clear the wrong view. They are the ATTRIBUTABLE
+    // CLEAR half only: the full persist/notify finalize stays on the bare
+    // kim-agent-done path (which holds the complete run context). Each no-ops
+    // once that path has released ownership (isRunning false AND owner null), so
+    // the happy path never double-finalizes; their value is guaranteeing the
+    // spinner clears when the legacy bare-bool terminal signal never arrives.
+    const ownsForClear = () => isRunningRef.current || runOwnerSessionIdRef.current !== null;
+
+    listen<KimAgentDonePayload>(KimEventNames.AGENT_DONE, e => {
+      if (!belongsToView(e.payload.session_id)) return;
+      if (!ownsForClear()) return;
+      setIsRunning(false);
+      setCancelling(false);
+    }).then(fn => { if (!cancelled) unlistenTypedAgentDone = fn; else fn(); });
+
+    listen<KimAgentCancelledPayload>(KimEventNames.AGENT_CANCELLED, e => {
+      if (!belongsToView(e.payload.session_id)) return;
+      if (!ownsForClear()) return;
+      cancelFlagRef.current = true;
+      setIsCancelled(true);
+      setIsRunning(false);
+      setCancelling(false);
+    }).then(fn => { if (!cancelled) unlistenTypedAgentCancelled = fn; else fn(); });
+
+    listen<KimAgentErrorPayload>(KimEventNames.AGENT_ERROR, e => {
+      if (!belongsToView(e.payload.session_id)) return;
+      if (!ownsForClear()) return;
+      // Attributable terminal failure: clear the spinner and reveal the recovery
+      // UI even when no bare kim-agent-done follows.
+      setIsRunning(false);
+      setCancelling(false);
+      const message = friendlyError(e.payload.error);
+      setTaskError(message);
+      if (lastRunTaskRef.current) setLastFailedTask(lastRunTaskRef.current);
+    }).then(fn => { if (!cancelled) unlistenTypedAgentError = fn; else fn(); });
 
     listen<KimRateLimitedPayload>(KimEventNames.RATE_LIMITED, e => {
       if (!belongsToView(e.payload.session_id)) return;
@@ -980,6 +1026,9 @@ export function useChatStream({
       unlistenTypedAssistantDelta?.();
       unlistenTypedReasoningDelta?.();
       unlistenTypedItemLifecycle?.();
+      unlistenTypedAgentDone?.();
+      unlistenTypedAgentCancelled?.();
+      unlistenTypedAgentError?.();
       unlistenRunId?.();
       // M7: cancel a pending assistant-delta flush on teardown.
       if (assistantFlushTimerRef.current !== null) {
