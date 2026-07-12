@@ -140,18 +140,12 @@ No telemetry, no accounts, no cloud storage.
 
 ## License
 
-<!-- TODO(human): Choose a license before making this repo public.
-     Options: MIT (permissive open source), Apache-2.0 (permissive + patent grant),
-     source-available (e.g. Business Source License), or proprietary.
-     See docs/archive/PRODUCTION_ROADMAP.md § P0-4 for tradeoffs.
-     A LICENSE file must be added once the decision is made. -->
-
-License TBD — see [docs/archive/PRODUCTION_ROADMAP.md](docs/archive/PRODUCTION_ROADMAP.md) § P0-4.
+Licensed under the [MIT License](LICENSE) — see the `LICENSE` file at the repo root for the full text.
 
 ---
 
 ## Contributing
 
-<!-- TODO(human): Add CONTRIBUTING.md if choosing an open-source license. -->
-
-Contribution guidelines TBD pending license decision.
+Contributions are welcome under the MIT License. A `CONTRIBUTING.md` with the
+full workflow is still TODO; until then, follow the test-and-CI gate described
+above (all four suites green + remote CI green before merge).
