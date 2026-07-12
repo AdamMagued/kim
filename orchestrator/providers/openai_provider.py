@@ -54,6 +54,18 @@ class OpenAIProvider(BaseProvider):
                 "Set it in .env or use openai_api_key_env in config.yaml."
             )
 
+        # F-B-12: a REMOTE OpenAI-compatible endpoint (Cerebras/Groq/Together)
+        # with no key still gets api_key="placeholder", turning a fixable config
+        # gap into a cryptic first-call 401. Only token-less LOCAL proxies are a
+        # legitimate placeholder case, so warn loudly when the host is remote.
+        if not api_key and base_url is not None and not _is_localhost_url(base_url):
+            logger.warning(
+                "%s is not set and openai_base_url=%s is remote — using a placeholder "
+                "key. If that host needs authentication you will get an HTTP 401; set "
+                "%s in .env (or openai_api_key_env in config.yaml).",
+                key_env, base_url, key_env,
+            )
+
         kwargs: dict = {"api_key": api_key or "placeholder"}
         if base_url:
             kwargs["base_url"] = base_url
@@ -238,6 +250,16 @@ class OpenAIProvider(BaseProvider):
             "stop_reason": finish_reason,
             "usage": usage,
         }
+
+
+def _is_localhost_url(url: str) -> bool:
+    """True for loopback hosts (token-less local proxies are a valid no-key case)."""
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or host.endswith(".localhost")
 
 
 def _default_token_param(model: str) -> str:
