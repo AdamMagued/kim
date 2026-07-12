@@ -1189,3 +1189,18 @@ def test_strip_images_does_not_leak_internal_metadata_keys():
     }
     result_list = _strip_images_for_disk(msg_list)
     assert "_has_screenshot" not in result_list
+
+
+def test_session_store_atomic_id_claiming():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        base_path = Path(tmp_dir)
+        store = SessionStore(base_dir=base_path)
+        
+        # Verify the chosen ID's jsonl file has been created atomically
+        assert store.session_file.exists()
+        assert store.session_file.stat().st_size == 0
+        
+        # Creating another store should not collide with the first one
+        store2 = SessionStore(base_dir=base_path)
+        assert store2.session_file.exists()
+        assert store2.session_id != store.session_id

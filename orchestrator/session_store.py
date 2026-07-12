@@ -64,31 +64,41 @@ class SessionStore:
             # Explicit id (resume, or caller-chosen): used as-is; the block
             # below adopts its existing date dir.
             self.session_id = session_id
+            existing = SessionStore.find_session_file(self.session_id, base_dir=self.base_dir)
+            if existing is not None:
+                self.session_dir = existing.parent
+                self.session_date = existing.parent.name
+            else:
+                self.session_date = date.today().isoformat()
+                self.session_dir = self.base_dir / self.session_date
         else:
             # Fresh session: pick an 8-hex id that does not already exist on
-            # disk, so a birthday collision in the ~4.3B space cannot silently
-            # append this session into an unrelated one and merge transcripts on
-            # resume (finding 4.2). Fall back to a full-length id in the
-            # astronomically unlikely event every probe collides.
-            self.session_id = uuid4().hex
-            for _ in range(1000):
-                candidate = uuid4().hex[:8]
-                if SessionStore.find_session_file(candidate, base_dir=self.base_dir) is None:
-                    self.session_id = candidate
-                    break
-
-        # When resuming a session, append to the original date dir instead of
-        # creating a parallel file under today's date. Otherwise the same
-        # session_id ends up split across two .jsonl files (one in the original
-        # day's dir, one in today's), which surfaces as a duplicate "new chat"
-        # in the sidebar containing only the latest turn.
-        existing = SessionStore.find_session_file(self.session_id, base_dir=self.base_dir)
-        if existing is not None:
-            self.session_dir = existing.parent
-            self.session_date = existing.parent.name
-        else:
+            # disk, claiming it atomically using O_CREAT|O_EXCL.
             self.session_date = date.today().isoformat()
             self.session_dir = self.base_dir / self.session_date
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+            
+            claimed = False
+            for _ in range(1000):
+                candidate = uuid4().hex[:8]
+                candidate_file = self.session_dir / f"{candidate}.jsonl"
+                try:
+                    fd = os.open(candidate_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.close(fd)
+                    self.session_id = candidate
+                    claimed = True
+                    break
+                except FileExistsError:
+                    continue
+            if not claimed:
+                # Fallback to full-length uuid4
+                self.session_id = uuid4().hex
+                candidate_file = self.session_dir / f"{self.session_id}.jsonl"
+                try:
+                    fd = os.open(candidate_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.close(fd)
+                except FileExistsError:
+                    pass
 
         self.session_file = self.session_dir / f"{self.session_id}.jsonl"
         self.summary_file = self.session_dir / f"{self.session_id}.summary.txt"
