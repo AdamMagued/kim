@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -288,7 +288,10 @@ pub async fn stream_agentic_request(
     let mut child_stdin = child.stdin.take();
     // F10: bounded concurrent stderr drain (shared helper, see provider.rs).
     let stderr_tail = child.stderr.take().map(crate::provider::drain_stderr_tail);
-    let mut lines = BufReader::new(stdout).lines();
+    // F-E-6: a length-capped line reader — one oversized/newline-less line
+    // (base64 screenshot, runaway tool output, corrupt stream) is drained past
+    // the cap instead of buffered fully into RAM.
+    let mut reader = BufReader::new(stdout);
     // F-E-4: the orchestrator declares run success/failure via
     // run_done{success} and a `[SUCCESS]/[FAILED] …` line, but the python
     // process exits 0 either way — so we must track the declared outcome
@@ -305,8 +308,23 @@ pub async fn stream_agentic_request(
     let mut answer_buf: Option<String> = None;
 
     loop {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
+        let line = match crate::provider::read_capped_line(
+            &mut reader,
+            crate::provider::SUBPROCESS_LINE_CAP,
+        )
+        .await
+        {
+            Ok(Some(crate::provider::CappedLine::Line(line))) => line,
+            Ok(Some(crate::provider::CappedLine::Truncated(_))) => {
+                // F-E-6: a line past the cap is pathological (runaway/corrupt
+                // stream). Surface it as an error rather than parsing a
+                // truncated fragment as an answer.
+                read_err = Some(format!(
+                    "agent output line exceeded {} bytes and was truncated",
+                    crate::provider::SUBPROCESS_LINE_CAP
+                ));
+                break;
+            }
             Ok(None) => break,
             Err(e) => {
                 read_err = Some(e.to_string());
@@ -390,7 +408,7 @@ pub async fn stream_agentic_request(
     }
     // On a read error, close our end of the stdout pipe before wait() so a
     // still-writing child can't block forever on a full pipe. (F9)
-    drop(lines);
+    drop(reader);
     // Process exited (stdout EOF). End the turn. used_bridge=false: this is the local
     // Python agent, not the desktop HTTP bridge (so we don't print "via Kim desktop").
     let exit_ok = child.wait().await.map(|s| s.success()).unwrap_or(false);

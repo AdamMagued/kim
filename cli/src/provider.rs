@@ -140,6 +140,90 @@ pub(crate) fn drain_stderr_tail(
     })
 }
 
+/// F-E-6: the default subprocess line cap (4 MiB). A single newline-less line
+/// from a child — a typed event carrying a base64 screenshot, a runaway tool
+/// output, a corrupted stream — is drained past this bound instead of buffered,
+/// so it can't grow memory unboundedly while stalling the turn.
+pub(crate) const SUBPROCESS_LINE_CAP: usize = 4 * 1024 * 1024;
+
+/// One line read by [`read_capped_line`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CappedLine {
+    /// A complete line within the cap (trailing `\r`/`\n` stripped).
+    Line(String),
+    /// The line exceeded the cap: the first `cap` bytes (lossy UTF-8) are
+    /// returned; the remainder up to the next newline was drained and dropped.
+    Truncated(String),
+}
+
+/// F-E-6: read one line from `reader`, buffering at most `cap` bytes. Unlike
+/// `AsyncBufReadExt::lines()` / `next_line()` (which grow their buffer until the
+/// next `\n` with no bound), a line longer than `cap` is truncated: the first
+/// `cap` bytes are kept and the rest of the line is read-and-discarded so memory
+/// stays bounded. Returns `None` at EOF.
+pub(crate) async fn read_capped_line<R>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<Option<CappedLine>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    let mut saw_any = false;
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            // EOF. A trailing line without a newline is still returned.
+            if !saw_any {
+                return Ok(None);
+            }
+            break;
+        }
+        saw_any = true;
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                if !truncated {
+                    let room = cap.saturating_sub(buf.len());
+                    let n = room.min(pos);
+                    buf.extend_from_slice(&available[..n]);
+                    if n < pos {
+                        truncated = true;
+                    }
+                }
+                reader.consume(pos + 1); // include the '\n'
+                break;
+            }
+            None => {
+                let len = available.len();
+                if !truncated {
+                    let room = cap.saturating_sub(buf.len());
+                    let n = room.min(len);
+                    buf.extend_from_slice(&available[..n]);
+                    if n < len {
+                        truncated = true;
+                    }
+                }
+                reader.consume(len);
+            }
+        }
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    let s = String::from_utf8_lossy(&buf).into_owned();
+    Ok(Some(if truncated {
+        CappedLine::Truncated(s)
+    } else {
+        CappedLine::Line(s)
+    }))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageAttachment {
     pub(crate) name: String,
@@ -566,6 +650,55 @@ Tests
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── F-E-6: length-capped subprocess line reader ─────────────────────────
+
+    #[tokio::test]
+    async fn read_capped_line_returns_whole_lines_and_strips_crlf() {
+        use tokio::io::BufReader;
+        let data = b"first line\r\nsecond\nthird-no-newline";
+        let mut r = BufReader::new(&data[..]);
+        assert_eq!(
+            read_capped_line(&mut r, 1024).await.unwrap(),
+            Some(CappedLine::Line("first line".to_string()))
+        );
+        assert_eq!(
+            read_capped_line(&mut r, 1024).await.unwrap(),
+            Some(CappedLine::Line("second".to_string()))
+        );
+        assert_eq!(
+            read_capped_line(&mut r, 1024).await.unwrap(),
+            Some(CappedLine::Line("third-no-newline".to_string()))
+        );
+        assert_eq!(read_capped_line(&mut r, 1024).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_truncates_an_oversized_line_and_resyncs() {
+        use tokio::io::BufReader;
+        // A 10 KiB newline-less line, then a normal line. With a small cap the
+        // first read must truncate to the cap (bounded memory) and the SECOND
+        // read must still return the following line — proving the reader drained
+        // past the cap and re-synced on the newline rather than mis-parsing.
+        let mut data = vec![b'x'; 10 * 1024];
+        data.push(b'\n');
+        data.extend_from_slice(b"after\n");
+        let mut r = BufReader::new(&data[..]);
+
+        let cap = 512;
+        match read_capped_line(&mut r, cap).await.unwrap() {
+            Some(CappedLine::Truncated(s)) => {
+                assert_eq!(s.len(), cap, "truncated line must be capped at {cap} bytes");
+                assert!(s.bytes().all(|b| b == b'x'));
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+        assert_eq!(
+            read_capped_line(&mut r, cap).await.unwrap(),
+            Some(CappedLine::Line("after".to_string())),
+            "the reader must re-sync on the next newline after truncating"
+        );
+    }
 
     #[test]
     fn browser_providers_are_in_providers_list() {

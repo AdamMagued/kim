@@ -19,7 +19,7 @@ pub(crate) async fn stream_codex_subprocess(
     tx: UnboundedSender<AppEvent>,
     control: Option<CodexTurnControl>,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::process::Command;
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -197,7 +197,10 @@ pub(crate) async fn stream_codex_subprocess(
     // stderr filled the OS pipe, blocked in write(2), stopped emitting stdout,
     // and the turn hung on the spinner forever.
     let stderr_tail = child.stderr.take().map(super::drain_stderr_tail);
-    let mut lines = BufReader::new(stdout).lines();
+    // F-E-6: a length-capped line reader — one oversized/newline-less line
+    // (e.g. a typed event carrying a base64 screenshot, or a corrupt stream)
+    // is drained past the cap instead of buffered fully into RAM.
+    let mut reader = BufReader::new(stdout);
     let mut had_output = false;
     let mut saw_streamed_answer = false;
     // F9: a read error (invalid UTF-8, I/O failure) must surface, not silently
@@ -205,10 +208,20 @@ pub(crate) async fn stream_codex_subprocess(
     let mut read_err: Option<String> = None;
 
     loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
+        match super::read_capped_line(&mut reader, super::SUBPROCESS_LINE_CAP).await {
+            Ok(Some(super::CappedLine::Line(line))) => {
                 had_output = true;
                 process_codex_line_stateful(&line, &tx, is_browser, &mut saw_streamed_answer);
+            }
+            Ok(Some(super::CappedLine::Truncated(_))) => {
+                // F-E-6: a line past the cap is pathological — surface it rather
+                // than parsing a truncated fragment.
+                had_output = true;
+                read_err = Some(format!(
+                    "codex output line exceeded {} bytes and was truncated",
+                    super::SUBPROCESS_LINE_CAP
+                ));
+                break;
             }
             Ok(None) => break,
             Err(e) => {
@@ -222,7 +235,7 @@ pub(crate) async fn stream_codex_subprocess(
     }
     // On a read error, close our end of the stdout pipe before wait() so a
     // still-writing child can't block forever on a full pipe.
-    drop(lines);
+    drop(reader);
 
     let exit_ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
     if read_err.is_some() || !had_output || !exit_ok {
