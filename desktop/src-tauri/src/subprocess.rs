@@ -315,10 +315,15 @@ include!("events.gen.rs");
 ///   1. Bundled `kim-orchestrator` sidecar adjacent to the Tauri executable
 ///      (set when running as a packaged .app; Tauri places sidecars in the
 ///      same MacOS/ directory as the main binary).
-///   2. `.kim_root/venv` or `.kim/venv` under the user's home directory
-///      (created by the install script).
+///   2. `~/.kim/venv` (or `.venv`) under the user's home directory (created by
+///      the install script).
 ///   3. Project-local `venv/` or `.venv/` under `project_root`.
 ///   4. System-level `python3` / `python` on PATH.
+///
+/// F-L-9: the former `~/.kim_root/venv` candidates were dead — install.sh
+/// writes `~/.kim_root` as a *file* (`echo "$PWD" > ~/.kim_root`, read as a
+/// file by paths.rs), so a `~/.kim_root/venv/bin/python` directory-join could
+/// never match anything the install script produced. Removed.
 ///
 /// When the sidecar is found, the caller should invoke it directly (as a
 /// standalone executable) rather than as `<interpreter> -m orchestrator.agent`.
@@ -330,21 +335,9 @@ pub(crate) fn find_python_interpreter(project_root: &Path) -> Result<String, Str
         return Ok(sidecar);
     }
 
-    // ── 2. Install-script venv in ~/.kim_root or ~/.kim ───────────────────────
+    // ── 2. Install-script venv in ~/.kim ──────────────────────────────────────
     if let Some(home) = dirs_home() {
-        let install_candidates = [
-            home.join(".kim_root")
-                .join("venv")
-                .join("bin")
-                .join("python"),
-            home.join(".kim_root")
-                .join(".venv")
-                .join("bin")
-                .join("python"),
-            home.join(".kim").join("venv").join("bin").join("python"),
-            home.join(".kim").join(".venv").join("bin").join("python"),
-        ];
-        for c in install_candidates {
+        for c in install_script_venv_candidates(&home) {
             if c.exists() {
                 return Ok(c.to_string_lossy().to_string());
             }
@@ -452,6 +445,17 @@ fn dirs_home() -> Option<PathBuf> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .map(PathBuf::from)
+}
+
+/// Interpreter candidates for an install-script-created venv under the user's
+/// home directory. F-L-9: only `~/.kim/...` — the former `~/.kim_root/...`
+/// candidates were dead (install.sh writes `~/.kim_root` as a file, so a
+/// `~/.kim_root/venv/bin/python` directory path never existed).
+fn install_script_venv_candidates(home: &Path) -> [PathBuf; 2] {
+    [
+        home.join(".kim").join("venv").join("bin").join("python"),
+        home.join(".kim").join(".venv").join("bin").join("python"),
+    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1108,6 +1112,24 @@ pub(crate) fn process_exists(pid: u32) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn install_venv_candidates_drop_dead_kim_root_arm() {
+        // F-L-9: the interpreter search must not probe ~/.kim_root as a
+        // directory — install.sh writes it as a FILE, so those candidates
+        // could never match. Only ~/.kim venvs remain.
+        let home = Path::new("/home/tester");
+        let cands = install_script_venv_candidates(home);
+        for c in &cands {
+            let s = c.to_string_lossy();
+            assert!(
+                !s.contains(".kim_root"),
+                "dead ~/.kim_root venv candidate must be gone: {s}"
+            );
+            assert!(s.contains("/.kim/"), "expected a ~/.kim venv candidate: {s}");
+        }
+        assert_eq!(cands.len(), 2);
+    }
 
     #[test]
     fn merge_run_envelope_reattaches_run_and_session() {
