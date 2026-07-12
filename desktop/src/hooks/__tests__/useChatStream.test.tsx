@@ -1,6 +1,6 @@
 import { renderHook, act } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { useChatStream } from '../useChatStream';
+import { useChatStream, MAX_RUN_HISTORY } from '../useChatStream';
 import { __testOnlyPendingRunSnapshots } from '../runSnapshotStore';
 import { DEFAULT_SETTINGS } from '../../types';
 import type { TraceItem } from '../../components/kim-ui/ThinkingWithPlan';
@@ -794,6 +794,33 @@ describe('useChatStream liveHistory cap', () => {
     act(() => { result.current.setLiveHistory(many); });
     expect(result.current.liveHistory).toHaveLength(300);
     expect(result.current.liveHistory[0].content).toBe('m20');
+  });
+});
+
+// ── runHistory cap (F-J-2) ────────────────────────────────────────────────────
+describe('useChatStream runHistory cap (F-J-2)', () => {
+  it('caps runHistory at MAX_RUN_HISTORY across many completed runs', async () => {
+    const { result } = await renderStream();
+    const total = MAX_RUN_HISTORY + 8;
+    for (let i = 0; i < total; i++) {
+      act(() => { result.current.setIsRunning(true); });
+      emit('kim:status', { message: `run ${i} did something`, session_id: 'conv-1' });
+      emit('kim-agent-done', true);
+    }
+    // Unbounded before the fix (would be `total`); now capped, keeping newest.
+    expect(result.current.runHistory).toHaveLength(MAX_RUN_HISTORY);
+  });
+
+  it('the bounded array is also what crosses the save_run_history IPC boundary', async () => {
+    const { result } = await renderStream();
+    for (let i = 0; i < MAX_RUN_HISTORY + 3; i++) {
+      act(() => { result.current.setIsRunning(true); });
+      emit('kim:status', { message: `run ${i} did something`, session_id: 'conv-1' });
+      emit('kim-agent-done', true);
+    }
+    const lastSave = [...invokeMock.mock.calls].reverse().find(([name]) => name === 'save_run_history');
+    expect(lastSave).toBeDefined();
+    expect((lastSave![1] as { runs: unknown[] }).runs).toHaveLength(MAX_RUN_HISTORY);
   });
 });
 

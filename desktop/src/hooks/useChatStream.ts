@@ -35,6 +35,17 @@ import { parkOrphanedRunSnapshotIfOwned, flushOrphanedRunSnapshots, useCappedSta
 
 const MAX_ACTIVITY_ITEMS = 300;
 
+// F-J-2: cap the in-session run history. It was a plain unbounded useState array
+// (unlike liveHistory, which is capped), and the FULL cumulative array is both
+// re-serialized across the Tauri IPC boundary AND rewritten to disk after every
+// run (save_run_history) — cumulative O(n²) on a long working session, with each
+// entry holding up to 300 activity items incl. full tool output. Keep only the
+// most recent runs in memory. NOTE: this bounds memory + the per-run IPC/render
+// payload, but the on-disk file still grows until the persist path is made
+// append-only. HANDOFF -> D': make save_run_history append the single new run
+// (or persist a delta) instead of receiving+rewriting the whole array.
+export const MAX_RUN_HISTORY = 50;
+
 // L4: named constant for the one non-generated event this hook listens to
 // (kim-run-id is emitted straight from Rust and isn't in KimEventNames).
 const KIM_RUN_ID_EVENT = 'kim-run-id';
@@ -911,7 +922,10 @@ export function useChatStream({
         // Fix 3: compute next outside the updater so React's StrictMode/concurrent
         // double-invocation of updater functions cannot trigger duplicate IPC writes.
         const newRunEntry = { activity: activitySnapshot, durationSec, provider: currentTaskRef.current?.provider ?? null };
-        const next = [...runHistoryRef.current, newRunEntry];
+        // F-J-2: cap so neither React state, the render map, nor the IPC/disk
+        // payload grows without bound over a long working session.
+        const appended = [...runHistoryRef.current, newRunEntry];
+        const next = appended.length > MAX_RUN_HISTORY ? appended.slice(appended.length - MAX_RUN_HISTORY) : appended;
         setRunHistory(next);
         const completedCodeSession = completedCodeSessionRef.current;
         // RUN-IDENTITY: file under the session the RUN belongs to (captured at
