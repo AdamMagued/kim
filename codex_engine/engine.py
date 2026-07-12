@@ -1138,6 +1138,13 @@ _EXEC_ALIASES = {
 }
 
 
+def _get_tool_schema(target: dict) -> dict:
+    fn_raw = target.get("function")
+    fn = fn_raw if isinstance(fn_raw, dict) else {}
+    schema = fn.get("parameters") or target.get("parameters") or target.get("input_schema")
+    return schema if isinstance(schema, dict) else {}
+
+
 def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
     """Snap model-invented tool names onto the real tools from the request.
 
@@ -1185,18 +1192,47 @@ def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
             if fixed:
                 logger.info(f"Normalized tool name {name!r} -> {fixed!r}")
                 tc = {**tc, "name": fixed}
-        # Coerce command->cmd for the exec tool (argv lists become one string).
+        # Coerce command->cmd (or the custom argument key from the schema) for the exec tool.
         target = by_name.get(str(tc.get("name") or ""))
         if target is not None:
-            required = ((target.get("parameters") or {}).get("required")) or []
+            schema = _get_tool_schema(target)
+            required = schema.get("required") or []
+            properties = schema.get("properties") or {}
+            
+            # Determine the target command key from the schema
+            target_key = "cmd" # fallback default
+            is_exec = any(k in str(tc.get("name") or "").lower() for k in ("exec", "shell", "command"))
+            if is_exec:
+                if required:
+                    cand = [k for k in required if k not in ("workdir", "cwd", "dir")]
+                    if cand:
+                        target_key = cand[0]
+                    else:
+                        target_key = required[0]
+                elif properties:
+                    cand = [k for k in properties if k not in ("workdir", "cwd", "dir")]
+                    if cand:
+                        target_key = cand[0]
+                    else:
+                        target_key = list(properties.keys())[0]
+
             inp = tc.get("input")
-            if "cmd" in required and isinstance(inp, dict) and "cmd" not in inp and "command" in inp:
-                cmd_val = inp["command"]
-                if isinstance(cmd_val, list):
-                    cmd_val = shlex.join(str(part) for part in cmd_val)
-                new_inp = {k: v for k, v in inp.items() if k != "command"}
-                new_inp["cmd"] = str(cmd_val)
-                tc = {**tc, "input": new_inp}
+            if isinstance(inp, dict):
+                # If target_key is not in input, and the model sent 'command' or 'cmd', rename it
+                alias_key = next((k for k in ("cmd", "command") if k in inp), None)
+                if alias_key and target_key not in inp:
+                    cmd_val = inp[alias_key]
+                    if isinstance(cmd_val, list):
+                        cmd_val = shlex.join(str(part) for part in cmd_val)
+                    new_inp = {k: v for k, v in inp.items() if k != alias_key}
+                    new_inp[target_key] = str(cmd_val)
+                    tc = {**tc, "input": new_inp}
+                    inp = new_inp
+                
+                # F-H-7: Validate the model's tool_calls[].input against the request tool's parameters schema
+                if schema:
+                    import jsonschema
+                    jsonschema.validate(inp, schema)
         normalized.append(tc)
     return normalized
 
