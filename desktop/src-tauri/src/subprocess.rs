@@ -458,6 +458,47 @@ fn install_script_venv_candidates(home: &Path) -> [PathBuf; 2] {
     ]
 }
 
+/// F-L-2: actionable message when Kim is about to spawn against a bare system
+/// python that is missing its dependencies.
+pub(crate) const PYTHON_DEPS_MISSING_MESSAGE: &str = "Kim's Python dependencies are not installed. Kim fell back to your system Python, which does not have Kim's packages. Run ./install.sh, or create the project venv:  python3 -m venv venv && ./venv/bin/pip install -r requirements.txt";
+
+/// True when `interp` is a bare system `python`/`python3`/`py` command (no path
+/// separator) rather than a resolved venv / bundled-sidecar interpreter.
+/// F-L-2: the bare system python is the last-resort fallback that is the one
+/// most likely to be missing Kim's dependencies.
+fn is_bare_system_python(interp: &str) -> bool {
+    !interp.contains('/') && !interp.contains('\\') && !is_bundled_orchestrator(interp)
+}
+
+/// F-L-2: when the interpreter search falls through to a bare system python
+/// (every Mac has one), a missing/broken project venv means the orchestrator
+/// spawns without its deps and dies instantly with a raw `ModuleNotFoundError:
+/// No module named 'anthropic'` in the task stream — a long-known gotcha that
+/// was neither detected nor translated. Run a cheap import preflight and, on
+/// failure, return an actionable message. The caller surfaces it as the
+/// spec-build error (shown in the UI, releases the runner slot). Venv / sidecar
+/// interpreters skip the probe (their deps are assumed present).
+async fn preflight_python_deps(interpreter: &str) -> Result<(), String> {
+    if !is_bare_system_python(interpreter) {
+        return Ok(());
+    }
+    let interp = interpreter.to_string();
+    let ok = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&interp)
+            .args(["-c", "import mcp, anthropic"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(PYTHON_DEPS_MISSING_MESSAGE.to_string())
+    }
+}
+
 /// Search PATH for an executable, returning its resolved path. (#20: uses the
 /// platform-appropriate lookup command.)
 fn executable_on_path(name: &str) -> Option<PathBuf> {
@@ -756,6 +797,7 @@ async fn build_gui_chat_spec(
         extra = extra.set("KIM_CONTEXT_BUDGET_TOKENS", budget.to_string());
     }
     let python = find_python_interpreter(p.kim_root)?;
+    preflight_python_deps(&python).await?;
     Ok(task_spec::chat_task_spec(task_spec::ChatSpecParams {
         bundled_sidecar: is_bundled_orchestrator(&python),
         python: &python,
@@ -791,6 +833,7 @@ async fn build_gui_codex_spec(
         // Browser-bridge mode: codex_bridge_service relays each LLM request
         // through Kim's BrowserProvider. No Anthropic key needed.
         let python = find_python_interpreter(p.kim_root)?;
+        preflight_python_deps(&python).await?;
         let _ = app_handle.emit(
             "kim-agent-output",
             format!(
@@ -1027,6 +1070,43 @@ pub(crate) fn process_exists(pid: u32) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn bare_system_python_is_classified() {
+        // F-L-2: only bare command names (no path separator) are the
+        // dependency-risk system fallback.
+        assert!(is_bare_system_python("python3"));
+        assert!(is_bare_system_python("python"));
+        assert!(is_bare_system_python("py"));
+        // Venv / absolute interpreters and the bundled sidecar are NOT bare.
+        assert!(!is_bare_system_python("/proj/venv/bin/python"));
+        assert!(!is_bare_system_python("/Users/x/.kim/venv/bin/python"));
+        assert!(!is_bare_system_python(r"C:\proj\venv\Scripts\python.exe"));
+        assert!(!is_bare_system_python(
+            "/Applications/Kim.app/Contents/MacOS/kim-orchestrator"
+        ));
+    }
+
+    #[tokio::test]
+    async fn preflight_skips_venv_interpreters() {
+        // A resolved venv/absolute interpreter never triggers the probe, so this
+        // returns Ok even though the path does not exist.
+        assert!(preflight_python_deps("/nonexistent/venv/bin/python")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn preflight_bare_python_missing_deps_is_friendly() {
+        // A bare command that cannot import Kim's deps yields the actionable
+        // message rather than a raw ModuleNotFoundError. Use a command name that
+        // does not exist so the probe fails deterministically.
+        let err = preflight_python_deps("kim-nonexistent-python-xyz")
+            .await
+            .unwrap_err();
+        assert_eq!(err, PYTHON_DEPS_MISSING_MESSAGE);
+        assert!(err.contains("install.sh"));
+    }
 
     #[test]
     fn install_venv_candidates_drop_dead_kim_root_arm() {
