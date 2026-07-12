@@ -89,11 +89,6 @@ _COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
 
-# Named constant for the placeholder API key used in local proxy auth (#53).
-# The proxy validates a per-run cryptographically random bearer token; this
-# value is only a human-readable label, not a real secret.
-_LOCAL_PROXY_KEY = "kim-proxy-key"
-
 logger = logging.getLogger("kim.codex_bridge_service")
 
 # asyncio's default StreamReader limit is 64 KiB per line. `codex exec --json`
