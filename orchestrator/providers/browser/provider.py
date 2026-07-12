@@ -189,7 +189,12 @@ class BrowserProvider(BaseProvider):
         bp_cfg = config.get("browser_provider", {})
         cdp_url = bp_cfg.get("cdp_url", CDP_URL)
         self._cdp_url = cdp_url
-        self._max_history_messages = int(bp_cfg.get("max_history_messages", 6))
+        # F-B-13: browser_provider.max_history_messages was read here but used
+        # nowhere — the recap in prompt_builder.build_history_recap is bounded by
+        # CHARACTERS (max_recap), not a message count, so the knob changed
+        # nothing. Removed rather than wired, to avoid silently altering recap
+        # length for anyone who had set it. (config.yaml key removal + the dead
+        # relay: section are config territory — see the HANDOFF in the commit.)
         self._max_inject_chars = int(bp_cfg.get("max_inject_chars", 120000))
         self._headless = bool(bp_cfg.get("browser_headless", False))
         self._force_headless = bool(bp_cfg.get("browser_force_headless", False))

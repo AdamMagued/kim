@@ -560,3 +560,14 @@ class TestInjectImageClipboardReturnsSuccess(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_max_history_messages_config_knob_is_inert_and_removed():
+    # F-B-13: the dead browser_provider.max_history_messages read is gone, so
+    # setting it neither creates a live attribute nor affects behavior.
+    from orchestrator.providers.browser_provider import BrowserProvider
+    provider = BrowserProvider({
+        "project_root": ".",
+        "browser_provider": {"max_history_messages": 99},
+    })
+    assert not hasattr(provider, "_max_history_messages")
