@@ -11,9 +11,13 @@ Usage:
 
 import argparse
 import logging
-import sys
+import os
+import signal
+import threading
 import tempfile
+import sys
 from pathlib import Path
+from typing import Callable, Optional
 
 from orchestrator.agent_config import DEFAULT_PROVIDER
 from orchestrator.events_gen import (
@@ -24,6 +28,83 @@ from orchestrator.events_gen import (
     emit_agent_cancelled,
     emit_agent_error,
 )
+
+# Env var by which the scheduled runner tells a DETACHED agent its wall-clock
+# cap so it can self-enforce even while the desktop app (and its reaper) is
+# closed (F-J-6).
+_WALL_CLOCK_ENV = "KIM_AGENT_MAX_WALL_SECONDS"
+
+
+def _wall_clock_deadline_from_env() -> Optional[float]:
+    """Return the self-watchdog deadline in seconds, or None if unset/invalid.
+
+    Only the scheduled runner sets ``KIM_AGENT_MAX_WALL_SECONDS`` (interactive
+    desktop launches never do), so the watchdog is scoped to detached scheduled
+    agents — an ordinary long-running interactive task is never hard-killed.
+    """
+    raw = os.environ.get(_WALL_CLOCK_ENV)
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
+def _self_terminate(exit_code: int = 124) -> None:  # pragma: no cover - kills the process
+    """Hard-kill this scheduled agent and its same-group descendants.
+
+    Scheduled agents are spawned as session/process-group leaders, so on POSIX
+    a group SIGKILL reaps the agent plus its MCP server subtree in one shot;
+    ``os._exit`` is the fallback (and the Windows path). Only the group we
+    lead is signalled — never a parent's group.
+    """
+    if os.name == "posix":
+        try:
+            pgid = os.getpgid(0)
+            if pgid == os.getpid():
+                os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+    os._exit(exit_code)
+
+
+def _watchdog_fire(seconds: float, kill_fn: Callable[[], None]) -> None:
+    """Log/emit a timeout record, then terminate via kill_fn."""
+    logging.getLogger(__name__).error(
+        "scheduled agent exceeded its %.0fs wall-clock cap — self-terminating (F-J-6)",
+        seconds,
+    )
+    try:
+        emit_run_done("timeout", False)
+    except Exception:
+        pass
+    try:
+        print("[STATUS] scheduled agent wall-clock cap exceeded — terminating", flush=True)
+    except Exception:
+        pass
+    kill_fn()
+
+
+def start_wall_clock_watchdog(
+    seconds: float, kill_fn: Optional[Callable[[], None]] = None
+) -> threading.Timer:
+    """Start a daemon timer that terminates the process after ``seconds`` (F-J-6)."""
+    fire = kill_fn if kill_fn is not None else _self_terminate
+    timer = threading.Timer(seconds, _watchdog_fire, args=(seconds, fire))
+    timer.daemon = True
+    timer.name = "kim-wall-clock-watchdog"
+    timer.start()
+    return timer
+
+
+def maybe_start_wall_clock_watchdog() -> Optional[threading.Timer]:
+    """Start the self-watchdog iff a valid deadline is present in the env."""
+    seconds = _wall_clock_deadline_from_env()
+    if seconds is None:
+        return None
+    return start_wall_clock_watchdog(seconds)
 
 
 def resolve_log_dir() -> Path:
@@ -110,6 +191,12 @@ async def _cli_main(args: argparse.Namespace) -> None:
     task = args.task or input("Task: ").strip()
     print(f"Running: {task!r}  provider={config.get('provider', DEFAULT_PROVIDER)}", file=sys.stderr)
 
+    # F-J-6: a detached scheduled agent self-enforces its wall-clock cap so a
+    # wedged run (holding an MCP server + chromium subtree) is bounded even when
+    # the desktop app and its external reaper are closed. No-op for interactive
+    # launches (which never set KIM_AGENT_MAX_WALL_SECONDS).
+    watchdog = maybe_start_wall_clock_watchdog()
+
     result = None
     try:
         async with mcp_agent_context(
@@ -120,6 +207,11 @@ async def _cli_main(args: argparse.Namespace) -> None:
             result = await agent.run(task)
     except Exception as e:
         result = {"success": False, "summary": f"Error: {e}", "termination": "failed"}
+    finally:
+        # Run finished (or errored) in time — stand the watchdog down so it
+        # cannot fire during shutdown/cleanup.
+        if watchdog is not None:
+            watchdog.cancel()
 
     status = "SUCCESS" if result["success"] else "FAILED"
     termination = result.get('termination', 'unknown')

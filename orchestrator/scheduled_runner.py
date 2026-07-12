@@ -641,6 +641,9 @@ def _build_subprocess_env(kim_root: Path) -> dict:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(kim_root)
     env["PROJECT_ROOT"] = str(kim_root)
+    # F-J-6: tell the detached agent its wall-clock cap so it can self-terminate
+    # even while the app (and the external reap_orphaned_agents reaper) is closed.
+    env["KIM_AGENT_MAX_WALL_SECONDS"] = str(int(_AGENT_MAX_WALL_SECONDS))
     return env
 
 
