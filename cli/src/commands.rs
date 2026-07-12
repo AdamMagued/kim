@@ -1838,10 +1838,8 @@ mod tests {
         std::thread::spawn(move || {
             // Hold every accepted connection open forever, never responding.
             let mut held = Vec::new();
-            for stream in listener.incoming() {
-                if let Ok(s) = stream {
-                    held.push(s);
-                }
+            for s in listener.incoming().flatten() {
+                held.push(s);
             }
         });
         let base = format!("http://127.0.0.1:{port}");

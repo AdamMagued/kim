@@ -362,6 +362,7 @@ pub fn provider_info(name: &str) -> Option<ProviderInfo> {
 
 /// Streaming entry point. Sends `AppEvent`s via `tx`; always terminates with
 /// `Done` or `Err`. Never panics — all failures go through `tx`.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_kim_request(
     config: &KimConfig,
     messages: &[ChatMessage],

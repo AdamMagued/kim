@@ -215,6 +215,7 @@ fn which(name: &str) -> Option<PathBuf> {
 
 /// Spawn the orchestrator and stream its events into `tx`. HITL requests prompt
 /// the terminal and write the decision back to the child stdin.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_agentic_request(
     root: &Path,
     python: &Path,
