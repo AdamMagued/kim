@@ -84,6 +84,66 @@ class TestCodexBridgeLifecycle(unittest.TestCase):
         self.assertEqual(payload.get("run_id"), "run-abc")
         self.assertEqual(payload.get("session_id"), "sess-xyz")
 
+    def test_compact_codex_thread_resume_payload(self):
+        """F-A-4: compact_codex_thread must pass the same common block on resume."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from orchestrator.codex_appserver_transport import compact_codex_thread
+        
+        mock_client = AsyncMock()
+        config = {
+            "model": "my-model",
+            "codex_bridge": {
+                "approval_policy": "all",
+                "sandbox_mode": "read-only",
+            }
+        }
+        thread_state = {
+            "codex_thread_id": "thread-123",
+            "codex_thread_cwd": "/some/cwd",
+        }
+        
+        async def _run():
+            import os
+            prev_env = os.environ.get("KIM_HITL_RISK_THRESHOLD")
+            os.environ["KIM_HITL_RISK_THRESHOLD"] = "high"
+            try:
+                return await compact_codex_thread(
+                    cwd="/some/cwd",
+                    config=config,
+                    thread_state=thread_state,
+                    binary_path="codex",
+                    client=mock_client,
+                )
+            finally:
+                if prev_env is None:
+                    os.environ.pop("KIM_HITL_RISK_THRESHOLD", None)
+                else:
+                    os.environ["KIM_HITL_RISK_THRESHOLD"] = prev_env
+        
+        ok = asyncio.run(_run())
+        self.assertTrue(ok)
+        
+        # Verify the requests sent to client
+        # Should have called resume first with common block
+        calls = mock_client.request.mock_calls
+        self.assertEqual(len(calls), 2)
+        
+        resume_call = calls[0]
+        self.assertEqual(resume_call[1][0], "thread/resume")
+        payload = resume_call[1][1]
+        self.assertEqual(payload["threadId"], "thread-123")
+        self.assertEqual(payload["cwd"], "/some/cwd")
+        self.assertEqual(payload["approvalPolicy"], "all")
+        self.assertEqual(payload["sandbox"], "read-only")
+        self.assertEqual(payload["model"], "my-model")
+        self.assertEqual(payload["modelProvider"], "kim-proxy")
+        self.assertEqual(payload["config"]["model_providers.kim-proxy.env_key"], "CODEX_API_KEY")
+        
+        compact_call = calls[1]
+        self.assertEqual(compact_call[1][0], "thread/compact/start")
+        self.assertEqual(compact_call[1][1], {"threadId": "thread-123"})
+
 
 if __name__ == "__main__":
     unittest.main()

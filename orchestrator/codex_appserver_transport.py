@@ -1032,6 +1032,22 @@ async def compact_codex_thread(
     stored_cwd = str(thread_state.get("codex_thread_cwd") or "")
     if not thread_id or stored_cwd != cwd:
         return False
+    approval, sandbox = resolve_policies(config)
+    model = config.get("model") or "kim-proxy-model"
+    cleaned_model = re.sub(r"[^A-Za-z0-9_\-.:/ ]", "", model)[:128] if model else "kim-proxy-model"
+    common = {
+        "cwd": cwd,
+        "approvalPolicy": approval,
+        "sandbox": sandbox,
+        "model": cleaned_model,
+        "modelProvider": "kim-proxy",
+        "config": {
+            "model_providers.kim-proxy.name": "Kim Proxy",
+            "model_providers.kim-proxy.base_url": "http://127.0.0.1:9999/v1",
+            "model_providers.kim-proxy.wire_api": "responses",
+            "model_providers.kim-proxy.env_key": "CODEX_API_KEY",
+        }
+    }
     own_client = client is None
     if client is None:
         client = AppServerClient([binary_path, "app-server"], env=build_appserver_env("kim-compact"))
@@ -1039,7 +1055,7 @@ async def compact_codex_thread(
         if own_client:
             await client.start()
             await client.initialize()
-        await client.request("thread/resume", {"threadId": thread_id, "cwd": cwd})
+        await client.request("thread/resume", {"threadId": thread_id, **common})
         await client.request("thread/compact/start", {"threadId": thread_id}, timeout=120.0)
         return True
     except Exception as exc:  # noqa: BLE001
