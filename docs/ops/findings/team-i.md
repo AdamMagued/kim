@@ -56,4 +56,63 @@ git/awk/tar/gh allowlist escapes, the bridge SSRF + token-injection, the dead
   (see F-I-4) when bypass is on.
 - **Cross-territory?** yes — Team A (orchestrator), Team D (task_spec.rs), CLI owner.
 
-## F-I-3: (placeholder — filesystem/permissions sweep, see below; will be filled after temp-home + session-perm audit)
+## F-I-3: Session JSONL transcripts (and their dirs) are written world-readable and un-scrubbed — full conversation + any secret-bearing tool output is exposed to other local users
+- **File:** orchestrator/session_store.py:101,136-137 (`session_dir.mkdir(parents=True)` no mode; `open(self.session_file, "a")` no chmod); contrast mcp_server/logger.py:133-137 (deliberate `0o600`), desktop/src-tauri/src/http_bridge/mod.rs:171 (bridge token `0o600`), cli/src/config.rs:116 (API-key config `0o600`)
+- **Severity:** Medium
+- **Class:** security / info-disclosure
+- **Evidence:** Every message (user prompts, model replies, tool inputs, tool RESULTS)
+  is appended verbatim to `kim_sessions/<date>/<id>.jsonl`. The directory is created with
+  `mkdir(parents=True)` (mode `0o777 & ~umask` → typically `0o755`) and the file opened with
+  a bare `open(..., "a")` (→ typically `0o644`). No `os.chmod`, and — unlike `mcp_server.logger`,
+  which routes every line through a secret scrubber that redacts `Authorization`, `sk-…`,
+  `AKIA…`, and PEM blocks (verified in tests/test_logger.py) — **session_store performs NO
+  scrubbing**. So on any multi-user / shared machine (or any process running as a *different*
+  local user with world-read), another account can read the complete transcript. If the user
+  pastes a credential, or a tool result echoes one (a config file read by `read_file`, a
+  `git remote -v` with an embedded token, etc.), it lands in this world-readable file in clear
+  text. The project deliberately hardened the log, the bridge token, and the CLI key store to
+  `0o600`/`0o700` but left the richest data sink — the transcript — at the process umask.
+  (Note: the MCP `run_command` sandbox env DOES strip provider API keys, so a plain `env` dump
+  won't leak *provider* keys; this finding is about the many other secret paths + the perm gap.)
+- **Fix sketch:** `os.chmod(self.session_file, 0o600)` on create and create `kim_sessions/`
+  (and date dirs) with mode `0o700`; apply the same on `summary_file`/`context_file` atomic
+  writes (session_store.py:362-363,385-389). Optionally run tool-result text through the
+  existing logger scrubber before persisting. Mirror on Windows via an ACL or accept POSIX-only.
+- **Cross-territory?** yes — Team A owns session_store.py.
+
+## F-I-4: The browser provider drives a Chrome instance over an unauthenticated CDP port (9222) holding live provider logins — any local process can read cookies / puppeteer the authenticated sessions
+- **File:** orchestrator/providers/browser/site_configs.py:15-19 (`CDP_URL = http://localhost:9222`); orchestrator/providers/browser/provider.py:43-50,184-186 (`--remote-debugging-port=9222 --user-data-dir=<project>/sessions/chrome_data`)
+- **Severity:** Medium
+- **Class:** security / local-attack-surface
+- **Evidence:** Kim's key-free "browser mode" connects Playwright to a user-launched Chrome
+  started with `--remote-debugging-port=9222`. Chrome's DevTools Protocol endpoint has **no
+  authentication** — it binds to localhost, but every process running as the user (and, if the
+  port is ever bound to `0.0.0.0` or forwarded, remote hosts) can `GET http://localhost:9222/json`,
+  attach to the browser, exfiltrate cookies/localStorage for claude.ai / chatgpt.com /
+  gemini.google.com / grok.com / deepseek, and issue authenticated requests as the user. The
+  logged-in profile persists at `<project>/sessions/chrome_data` for cookie reuse across runs,
+  so the credential material is long-lived on disk. This is a documented design trade-off of
+  CDP mode but is nowhere flagged as a security boundary; it materially widens the local attack
+  surface (a single malicious local script = full provider-account takeover, no password needed).
+  Complements Team C F-C-4 / Team D F-D-1 (SSRF) and F-D-4 (bridge-token theft): the browser is a
+  high-value, low-auth local target from three independent angles.
+- **Fix sketch:** Prefer binding the debugging port to a random loopback port + `--remote-debugging-address=127.0.0.1`
+  and, where supported, a per-launch token; document CDP mode as "any local process can drive
+  your logged-in browser" in SECURITY. Ensure `sessions/chrome_data` is `0o700` and gitignored
+  (verify). At minimum, warn the user when 9222 is reachable by processes outside Kim.
+- **Cross-territory?** partial — Team B owns the browser provider; hardening the port launch may
+  touch desktop launch code (Team D).
+
+## Clean / strength notes (verified, NOT findings)
+- **Secret logging is CLEAN.** `mcp_server/logger.py` scrubs `Authorization`/`sk-`/`AKIA`/PEM
+  from every log line (tests/test_logger.py). Full-repo `logger.*(… token|api_key|secret …)`
+  grep found no plaintext-secret log sites in orchestrator/mcp_server/cli/desktop.
+- **No committed secrets.** `git grep` for `sk-…`/`AKIA…`/`ghp_…`/PEM across the sampled
+  history → only `tests/test_logger.py` fixtures. No tracked `.env`/`.pem`/`id_rsa`/`credentials`.
+  gitleaks/trufflehog were NOT available in this environment — a CI gitleaks gate is still advised.
+- **CLI API-key store + bridge token are `0o600`; codex temp dir `0o700`.** Perm hygiene is
+  correct everywhere EXCEPT the session transcript (F-I-3).
+- **Dependencies:** `pip-audit -r requirements.txt` → 7 vulns in Pillow(5)+pytest(1), i.e.
+  exactly Team G F-G-6, no additional packages. `cargo audit` / `npm audit` were not run here
+  (cargo-audit not installed); recommend wiring all three into CI (see hardening list).
+
