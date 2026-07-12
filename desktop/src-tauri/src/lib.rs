@@ -59,6 +59,13 @@ use screenshot_flash::show_screenshot_flash;
 struct WebviewBridgeConfig {
     base_url: String,
     token: String,
+    /// F-D-4: a SEPARATE, capability-scoped token that is the only token ever
+    /// injected into a third-party provider webview (the auth-probe JS). Unlike
+    /// `token` (which authorizes every bridge route, incl. `/v1/task` and
+    /// `/v1/open`), this token authorizes ONLY `POST /v1/callback`, so a
+    /// compromised/monkeypatched provider page that steals it cannot spawn a
+    /// local agent run or drive the SSRF-capable open route.
+    webview_token: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
