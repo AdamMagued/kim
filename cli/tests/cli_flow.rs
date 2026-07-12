@@ -542,3 +542,35 @@ fn doctor_strict_exits_nonzero_on_provider_failure_but_plain_stays_zero() {
     // Both still print the human-readable report.
     assert!(combined_output(&plain).contains("KimCLI doctor"));
 }
+
+// ── F-E-14: code mode rejects non-ollama/non-browser providers up front ──────
+
+// With provider=claude, `kim code` used to fall through the openai-only gate
+// into the local-codex branch, pointing codex at ollama with a claude model
+// name (404). The gate now rejects it with exit 2 BEFORE any run starts. (Before
+// the fix, the non-git-repo check would exit 1 instead — never the gate's 2.)
+#[test]
+fn code_mode_rejects_non_ollama_provider_with_exit_2() {
+    let config = serde_json::json!({
+        "provider": "claude",
+        "model": "claude-sonnet-4-6",
+        "theme": "dark-neovim",
+        "ollama_base_url": "http://127.0.0.1:1",
+        "desktop_bridge_url": "http://127.0.0.1:1",
+        "api_keys": {"claude": "test-key"}
+    });
+    let home = temp_home_with_config(&config);
+
+    let out = run_kim(&home, &["code", "do something"], &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "code mode with a claude provider must exit 2 (provider gate), not run; output:\n{}",
+        combined_output(&out)
+    );
+    let all = combined_output(&out);
+    assert!(
+        all.contains("Code mode does not support") && all.contains("claude"),
+        "the gate message must name the rejected provider; output:\n{all}"
+    );
+}

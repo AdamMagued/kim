@@ -393,15 +393,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 One-shot commands: kim chat <prompt> / kim code <prompt>
 =========================================================== */
 
+/// F-E-14: which providers may run in code mode. Codex only has two backends
+/// here: the local `codex` binary talking to ollama through the responses proxy
+/// (`ollama` / `ollama-cloud` / empty→ollama), and the codex browser bridge
+/// (`browser` / `browser:<site>`). Every OTHER provider (openai, claude, gemini,
+/// deepseek, desktop) used to fall through the `== "openai"`-only gate into the
+/// local-codex branch, which unconditionally pointed codex at
+/// `config.ollama_base_url` with `config.model` — e.g. `claude-sonnet-4-6` sent
+/// to an ollama endpoint, which 404s with a misleading "check that ollama is
+/// running" error and no hint that the provider choice was ignored.
+///
+/// Returns `Some(reason)` for a disallowed provider, `None` when code mode may
+/// proceed. Mirrors the scheduled-runner allowlist
+/// (`orchestrator/scheduled_runner.py::is_allowed_provider`).
+fn code_mode_denied_reason(provider: &str) -> Option<String> {
+    let p = provider.trim().to_ascii_lowercase();
+    if p.is_empty()
+        || p == "ollama"
+        || p == "ollama-cloud"
+        || crate::provider::is_browser_provider(&p)
+    {
+        return None;
+    }
+    Some(format!(
+        "Code mode does not support the '{provider}' provider — it runs only on ollama \
+         or a browser provider. Switch first: /provider ollama  (or e.g. /provider browser:chatgpt)."
+    ))
+}
+
 async fn run_oneshot(mode: AppMode, prompt: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(KimConfig::load(), None);
     app.provider_ready = provider_is_ready(&app.config);
 
-    if mode == AppMode::Code && app.config.provider == "openai" {
-        eprintln!(
-            "Code mode does not support OpenAI. Switch provider first: /provider ollama or /provider claude."
-        );
-        std::process::exit(2);
+    if mode == AppMode::Code {
+        if let Some(reason) = code_mode_denied_reason(&app.config.provider) {
+            eprintln!("{reason}");
+            std::process::exit(2);
+        }
     }
 
     app.set_mode(mode);
@@ -479,11 +507,8 @@ fn choose_start_mode(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             "c" | "code" | "1" => {
-                if app.config.provider == "openai" {
-                    println!(
-                        "{}",
-                        paint_dim("Code mode does not support OpenAI. Switch provider first: /provider ollama or /provider claude.")
-                    );
+                if let Some(reason) = code_mode_denied_reason(&app.config.provider) {
+                    println!("{}", paint_dim(&reason));
                     continue;
                 }
                 app.set_mode(AppMode::Code);
@@ -1032,11 +1057,8 @@ async fn apply_repl_outcome(
             Ok(false)
         }
         CommandOutcome::SetCodeMode => {
-            if app.config.provider == "openai" {
-                app.push(
-                    MessageRole::Error,
-                    "Code mode does not support OpenAI. Switch provider first: /provider ollama or /provider claude.",
-                );
+            if let Some(reason) = code_mode_denied_reason(&app.config.provider) {
+                app.push(MessageRole::Error, reason);
                 return Ok(false);
             }
             app.set_mode(AppMode::Code);
@@ -1048,12 +1070,11 @@ async fn apply_repl_outcome(
                 AppMode::Chat => AppMode::Code,
                 AppMode::Code => AppMode::Chat,
             };
-            if next == AppMode::Code && app.config.provider == "openai" {
-                app.push(
-                    MessageRole::Error,
-                    "Code mode does not support OpenAI. Switch provider first: /provider ollama or /provider claude.",
-                );
-                return Ok(false);
+            if next == AppMode::Code {
+                if let Some(reason) = code_mode_denied_reason(&app.config.provider) {
+                    app.push(MessageRole::Error, reason);
+                    return Ok(false);
+                }
             }
             app.toggle_mode();
             print_note(&format!("mode -> {}", app.mode.label()));
@@ -1625,9 +1646,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        consume_turn_events, new_session_id, parse_cli_args, prompt_file_references,
-        prompt_with_file_references, provider_is_ready, provider_is_ready_with_env,
-        split_shellish_tokens, App, AppEvent, AppMode, CliCommand, MessageRole, ViewState,
+        code_mode_denied_reason, consume_turn_events, new_session_id, parse_cli_args,
+        prompt_file_references, prompt_with_file_references, provider_is_ready,
+        provider_is_ready_with_env, split_shellish_tokens, App, AppEvent, AppMode, CliCommand,
+        MessageRole, ViewState,
     };
     use crate::config::KimConfig;
     use std::path::{Path, PathBuf};
@@ -1971,6 +1993,29 @@ mod tests {
     fn ignores_missing_file_references() {
         let paths = prompt_file_references("/definitely/not/a/kim/file.png");
         assert!(paths.is_empty());
+    }
+
+    // ── F-E-14: code-mode provider gate ──────────────────────────────────────
+
+    #[test]
+    fn code_mode_allows_only_ollama_and_browser() {
+        // Allowed: the two real codex backends (+ empty → ollama).
+        for ok in ["ollama", "ollama-cloud", "", "browser", "browser:chatgpt", "BROWSER:Claude"] {
+            assert!(
+                code_mode_denied_reason(ok).is_none(),
+                "code mode must allow {ok:?}"
+            );
+        }
+        // Rejected: everything the old `== \"openai\"` gate let silently route to
+        // ollama with a non-ollama model name.
+        for bad in ["openai", "claude", "gemini", "deepseek", "desktop"] {
+            let reason = code_mode_denied_reason(bad)
+                .unwrap_or_else(|| panic!("code mode must reject {bad:?}"));
+            assert!(
+                reason.contains(bad) && reason.contains("ollama"),
+                "rejection for {bad:?} should name the provider and the fix; got: {reason}"
+            );
+        }
     }
 
     // ── parse_cli_args tests ──────────────────────────────────────────────────
