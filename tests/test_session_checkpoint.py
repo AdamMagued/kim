@@ -305,6 +305,10 @@ def test_kimctl_trace_json_includes_run_checkpoint_in_by_type(capsys, monkeypatc
     store.append_checkpoint(iteration=1, phase="iteration_start")
     store.append_checkpoint(iteration=2, phase="iteration_start",
                             last_tool_name="write_file")
+    # Appends are offloaded to the async fsync executor (F-J-4); a separate
+    # reader (kimctl trace, here in-process) only sees them past the flush
+    # durability barrier.
+    store.flush()
 
     monkeypatch.setenv("KIM_SESSIONS_DIR", str(base))
     cmd_trace(Namespace(session_id="ckpt_cli", json=True))

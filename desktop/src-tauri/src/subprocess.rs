@@ -315,6 +315,15 @@ pub(crate) fn forward_agent_stdout_line(
                         }),
                     );
                 }
+                KimEvent::AgentDone { success } => {
+                    emit("kim:agent-done", serde_json::json!({"success": success}));
+                }
+                KimEvent::AgentCancelled { success } => {
+                    emit("kim:agent-cancelled", serde_json::json!({"success": success}));
+                }
+                KimEvent::AgentError { error } => {
+                    emit("kim:agent-error", serde_json::json!({"error": error}));
+                }
                 KimEvent::ProviderError { code, retryable } => {
                     emit(
                         "kim:provider-error",
