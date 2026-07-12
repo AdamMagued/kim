@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from orchestrator.providers.base import BaseProvider, ProviderEnvironmentError
+from orchestrator.providers.base import BaseProvider, finalize_text_content, ProviderEnvironmentError
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +215,13 @@ class OllamaProvider(BaseProvider):
 
         usage = await self._usage_from_final(final_obj, model)
 
+        # F-B-3: Ollama's final chunk carries done_reason ("stop"|"length"|
+        # "load"). Ollama was the only API provider that never surfaced it, so
+        # a num_ctx-clipped / output-limited answer reached the agent as a
+        # complete reply. Thread it through finalize_text_content (which maps
+        # "length" → a truncation note) and expose stop_reason on every shape.
+        done_reason = str(final_obj.get("done_reason") or "").strip() or None
+
         def _parse_one(tc):
             fn = tc.get("function") if isinstance(tc, dict) else None
             name = str((fn or {}).get("name") or tc.get("name") or "").strip()
@@ -231,6 +238,7 @@ class OllamaProvider(BaseProvider):
                     "tool": "batch",
                     "args": {"calls": [_parse_one(tc) for tc in tool_calls]},
                     "content": content,
+                    "stop_reason": done_reason,
                     "usage": usage,
                 }
 
@@ -240,12 +248,14 @@ class OllamaProvider(BaseProvider):
                 "tool": parsed["tool"],
                 "args": parsed["args"],
                 "content": content,
+                "stop_reason": done_reason,
                 "usage": usage,
             }
 
         return {
             "type": "text",
-            "content": content,
+            "content": finalize_text_content(content, done_reason),
+            "stop_reason": done_reason,
             "usage": usage,
         }
 

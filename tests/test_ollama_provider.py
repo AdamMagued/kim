@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import patch
 
@@ -414,6 +415,66 @@ class InterleavedToolResultPairingTests(unittest.TestCase):
         self.assertEqual(tool_msgs[0]["tool_call_id"], assistant_ids[0])
         self.assertEqual(tool_msgs[1]["tool_call_id"], assistant_ids[1])
         self.assertNotEqual(assistant_ids[0], assistant_ids[1])
+
+
+async def _run_complete(provider, *, final_obj, content, tool_calls, messages=None, tools=None):
+    """Drive OllamaProvider.complete() with the network layer stubbed out."""
+    async def _noop_daemon():
+        return None
+
+    async def _fake_stream(_payload):
+        return final_obj, content, tool_calls
+
+    async def _fake_usage(_final, _model):
+        return {"provider": "ollama", "source": "ollama", "mode": "cloud"}
+
+    with patch.object(provider, "_ensure_daemon_running", _noop_daemon), \
+         patch.object(provider, "_stream_chat", _fake_stream), \
+         patch.object(provider, "_usage_from_final", _fake_usage):
+        return await provider.complete(messages or [{"role": "user", "content": "hi"}], tools or [], "sys")
+
+
+class OllamaDoneReasonTests(unittest.TestCase):
+    """F-B-3: Ollama must surface done_reason and finalize truncated text."""
+
+    def _provider(self):
+        return OllamaProvider({"ollama": {"mode": "cloud", "cloud_model": "m:cloud"}})
+
+    def test_length_stop_annotates_truncated_text(self):
+        provider = self._provider()
+        result = asyncio.run(_run_complete(
+            provider,
+            final_obj={"done_reason": "length", "model": "m:cloud"},
+            content="half an answer",
+            tool_calls=[],
+        ))
+        self.assertEqual(result["type"], "text")
+        self.assertEqual(result["stop_reason"], "length")
+        self.assertIn("truncated", result["content"].lower())
+        self.assertTrue(result["content"].startswith("half an answer"))
+
+    def test_normal_stop_passes_text_through_with_stop_reason(self):
+        provider = self._provider()
+        result = asyncio.run(_run_complete(
+            provider,
+            final_obj={"done_reason": "stop", "model": "m:cloud"},
+            content="complete answer",
+            tool_calls=[],
+        ))
+        self.assertEqual(result["content"], "complete answer")
+        self.assertEqual(result["stop_reason"], "stop")
+
+    def test_tool_call_carries_stop_reason(self):
+        provider = self._provider()
+        result = asyncio.run(_run_complete(
+            provider,
+            final_obj={"done_reason": "stop", "model": "m:cloud"},
+            content="",
+            tool_calls=[{"function": {"name": "read_file", "arguments": {"path": "a"}}}],
+        ))
+        self.assertEqual(result["type"], "tool_call")
+        self.assertEqual(result["tool"], "read_file")
+        self.assertEqual(result["stop_reason"], "stop")
 
 
 if __name__ == "__main__":
