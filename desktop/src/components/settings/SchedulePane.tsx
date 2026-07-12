@@ -438,7 +438,6 @@ export function PaneSchedule({
     mountedRef.current = true;
     void refresh();
     return () => { mountedRef.current = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function refreshTimerStatus() {

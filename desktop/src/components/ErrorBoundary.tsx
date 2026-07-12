@@ -41,8 +41,9 @@ export class ErrorBoundary extends React.Component<Props, State> {
     const msg = error instanceof Error ? error.message : String(error ?? "");
     console.error("[ErrorBoundary] render error:", msg, info.componentStack);
     // Route to optional sink if DSN is configured (deferred wiring).
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const dsn = (import.meta as any).env?.VITE_ERROR_DSN as string | undefined;
+    // import.meta.env is typed via vite/client (src/vite-env.d.ts); its string
+    // index signature makes an undeclared VITE_* key resolve without an `any`.
+    const dsn = import.meta.env.VITE_ERROR_DSN as string | undefined;
     if (dsn) {
       void fetch(dsn, {
         method: "POST",
