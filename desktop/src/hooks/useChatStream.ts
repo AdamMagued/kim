@@ -46,6 +46,12 @@ const MAX_ACTIVITY_ITEMS = 300;
 // (or persist a delta) instead of receiving+rewriting the whole array.
 export const MAX_RUN_HISTORY = 50;
 
+// F-F-12: how long two identical activity items are treated as the same
+// dual-emitted event (typed + raw channel of one backend flush) rather than two
+// distinct actions. Kept just above dual-emit latency and well below the
+// seconds-apart cadence of a genuine agent repeat.
+const DUAL_EMIT_DEDUP_MS = 400;
+
 // L4: named constant for the one non-generated event this hook listens to
 // (kim-run-id is emitted straight from Rust and isn't in KimEventNames).
 const KIM_RUN_ID_EVENT = 'kim-run-id';
@@ -250,10 +256,21 @@ export function useChatStream({
     const now = Date.now();
     const key = `${item.kind}:${item.text}`;
     const last = map.get(key);
-    if (last !== undefined && now - last < 2000) return true;
+    // F-F-12: this dedup exists to merge DUAL-EMIT — the same event arriving on
+    // both the typed (kim:*) and raw ([TOOL]/[STATUS]) channels near-instantly
+    // from one backend flush. The old 2000ms window was far wider than dual-emit
+    // latency, so it also silently swallowed LEGITIMATE repeats (an agent that
+    // re-reads a file or retries the identical shell command a second or two
+    // later — a real action the activity feed simply never showed). Narrow the
+    // window to the dual-emit timescale so same-instant double-emits still merge
+    // but a genuine repeat surfaces. Proper fix is a per-event sequence id from
+    // the backend (a full model round-trip separates real repeats anyway).
+    // HANDOFF -> D'/H: stamp typed events with a monotonic emit/seq id so the
+    // frontend can dedup on identity instead of on text+time.
+    if (last !== undefined && now - last < DUAL_EMIT_DEDUP_MS) return true;
     map.set(key, now);
     if (map.size > 200) {
-      const cutoff = now - 4000;
+      const cutoff = now - DUAL_EMIT_DEDUP_MS * 2;
       for (const [k, v] of map) if (v < cutoff) map.delete(k);
     }
     return false;

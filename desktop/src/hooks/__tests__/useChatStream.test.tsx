@@ -205,26 +205,33 @@ describe('useChatStream activity dedup', () => {
     expect(result.current.activity).toHaveLength(1);
   });
 
-  it('after 800ms the raw window expires but the 2000ms activity-item dedup still drops it', async () => {
+  it('merges a same-item repeat within the dual-emit window but shows a genuine later repeat (F-F-12)', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
     // F-F-2: raw lines only append while THIS view owns the active run.
     act(() => { result.current.setIsRunning(true); });
-    const line = '[TOOL] read_file({"path":"a.txt"})';
 
-    emit('kim-agent-output', line);
-    act(() => { vi.advanceTimersByTime(900); }); // raw window (800ms) expired
-    emit('kim-agent-output', line); // passes recentRawRef, caught by recentActivityItemRef
+    // Two raw strings that PARSE to the same activity item ("Reading `a.txt`").
+    // Distinct raw strings sidestep the 800ms raw-line dedup so we isolate the
+    // activity-item (dual-emit) window.
+    const a = '[TOOL] read_file({"path":"a.txt"})';
+    const b = '2026-07-06 10:00:00 [TOOL] read_file({"path":"a.txt"})';
+
+    emit('kim-agent-output', a);
+    act(() => { vi.advanceTimersByTime(200); }); // within the dual-emit window
+    emit('kim-agent-output', b); // same event on the other channel → merged
     act(() => { result.current.flushActivityNow(); });
     expect(result.current.activity).toHaveLength(1);
 
-    act(() => { vi.advanceTimersByTime(2100); }); // both windows expired
-    emit('kim-agent-output', line);
+    // A genuine repeat a full second later (agent re-reads the file) must now be
+    // SHOWN — the old 2000ms window silently swallowed it (F-F-12).
+    act(() => { vi.advanceTimersByTime(1000); });
+    emit('kim-agent-output', a);
     act(() => { result.current.flushActivityNow(); });
     expect(result.current.activity).toHaveLength(2);
   });
 
-  it('dedups different raw lines that parse to the same activity item (2000ms window)', async () => {
+  it('merges two channels of the same item emitted near-simultaneously (dual-emit)', async () => {
     vi.useFakeTimers();
     const { result } = await renderStream();
     // F-F-2: raw lines only append while THIS view owns the active run.
