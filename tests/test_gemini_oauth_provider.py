@@ -125,3 +125,87 @@ def test_parse_rest_response_preserves_usage_and_tool_calls(monkeypatch):
         # usage shape matches the other providers (finding 3.8).
         "usage": {"input": 10, "output": 4, "cache_creation_tokens": 0, "cache_read_tokens": 0},
     }
+
+
+# ── F-B-1: OAuth HTTP failures must classify by status, not by the "oauth"
+# label word that classify_provider_error's auth check would otherwise match. ──
+
+def _make_http_error(code, body):
+    import io
+    import urllib.error
+    return urllib.error.HTTPError(
+        "https://generativelanguage.googleapis.com/v1beta/models/x:generateContent",
+        code,
+        "err",
+        {},  # type: ignore[arg-type]
+        io.BytesIO(body.encode("utf-8")),
+    )
+
+
+def _oauth_provider(gemini):
+    return gemini.GeminiProvider({
+        "gemini_auth_mode": "oauth",
+        "oauth_access_token": "ya29.tok",
+        "oauth_access_token_expires_at": 4_102_444_800,
+        "google_cloud_project": "kim-shared",
+        "model": {"gemini": "gemini-2.0-flash"},
+    })
+
+
+def test_oauth_429_is_retryable_rate_limit_not_auth(monkeypatch):
+    from orchestrator.providers.base import classify_provider_error, ProviderError
+
+    gemini = load_module(monkeypatch)
+    provider = _oauth_provider(gemini)
+
+    def _raise(*_a, **_k):
+        raise _make_http_error(429, '{"error":{"message":"quota","status":"RESOURCE_EXHAUSTED"}}')
+
+    monkeypatch.setattr(gemini.urllib.request, "urlopen", _raise)
+
+    with pytest.raises(ProviderError) as ei:
+        provider._post_rest({}, {"Authorization": "Bearer x"}, "Gemini OAuth API")
+    err = ei.value
+    assert err.code == "rate_limit"
+    assert err.retryable is True
+    # The classifier must agree (ProviderError passes through) — proving the
+    # "oauth" label no longer poisons it into a non-retryable auth failure.
+    classified = classify_provider_error(err)
+    assert classified.code == "rate_limit" and classified.retryable is True
+
+
+@pytest.mark.parametrize("code", [500, 502, 503, 529])
+def test_oauth_5xx_is_retryable_server_error_not_auth(monkeypatch, code):
+    from orchestrator.providers.base import classify_provider_error, ProviderError
+
+    gemini = load_module(monkeypatch)
+    provider = _oauth_provider(gemini)
+
+    def _raise(*_a, **_k):
+        raise _make_http_error(code, '{"error":{"message":"overloaded","status":"UNAVAILABLE"}}')
+
+    monkeypatch.setattr(gemini.urllib.request, "urlopen", _raise)
+
+    with pytest.raises(ProviderError) as ei:
+        provider._post_rest({}, {"Authorization": "Bearer x"}, "Gemini OAuth API")
+    err = ei.value
+    assert err.code == "server_error" and err.retryable is True
+    classified = classify_provider_error(err)
+    assert classified.code == "server_error" and classified.retryable is True
+
+
+def test_oauth_403_still_classifies_as_auth(monkeypatch):
+    from orchestrator.providers.base import classify_provider_error
+
+    gemini = load_module(monkeypatch)
+    provider = _oauth_provider(gemini)
+
+    def _raise(*_a, **_k):
+        raise _make_http_error(403, '{"error":{"message":"permission denied","status":"PERMISSION_DENIED"}}')
+
+    monkeypatch.setattr(gemini.urllib.request, "urlopen", _raise)
+
+    with pytest.raises(RuntimeError) as ei:
+        provider._post_rest({}, {"Authorization": "Bearer x"}, "Gemini OAuth API")
+    classified = classify_provider_error(ei.value)
+    assert classified.code == "auth" and classified.retryable is False

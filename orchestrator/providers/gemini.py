@@ -272,7 +272,29 @@ class GeminiProvider(BaseProvider):
                         f"Ensure the Gemini API is enabled and billing is set up if using paid models."
                     ) from exc
 
-            raise RuntimeError(f"{error_label} error: HTTP {exc.code}: {_safe_google_error(raw)}") from exc
+            # F-B-1: classify by HTTP status BEFORE building a plain-text
+            # RuntimeError. The OAuth error_label is "Gemini OAuth API", whose
+            # standalone word "oauth" is matched by classify_provider_error's
+            # auth check — and that check runs BEFORE the 429/5xx status-code
+            # checks. So every transient overload (429 shared-quota, 500/502/
+            # 503/529) in OAuth mode was misread as a non-retryable auth
+            # failure and never retried. Raise a pre-classified ProviderError
+            # for the retryable status classes so the label can't poison it.
+            detail = _safe_google_error(raw)
+            if exc.code == 429:
+                raise ProviderError(
+                    "rate_limit",
+                    f"{error_label} rate limited (HTTP 429): {detail}",
+                    retryable=True,
+                ) from exc
+            if 500 <= exc.code < 600:
+                raise ProviderError(
+                    "server_error",
+                    f"{error_label} server error (HTTP {exc.code}): {detail}",
+                    retryable=True,
+                ) from exc
+
+            raise RuntimeError(f"{error_label} error: HTTP {exc.code}: {detail}") from exc
 
     # ------------------------------------------------------------------
     # Format transforms
