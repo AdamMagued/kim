@@ -158,3 +158,33 @@ class TestDeleteAllSessions:
             base = Path(tmp) / "nonexistent"
             count = SessionStore.delete_all_sessions(base_dir=base)
             assert count == 0
+
+
+# -- F-L-1: lock the documented retention policy to what the code actually does --
+# The README privacy section must match these numbers/mechanism; this test pins
+# the source of truth so a defaults change forces the doc to be updated too.
+
+def test_prune_defaults_match_documented_policy():
+    """F-L-1: prune defaults are 30-day delete / 2-day screenshot strip.
+
+    The README privacy claim ("retained 7 days") is wrong; the authoritative
+    numbers live here. If these defaults change, update README's privacy bullet.
+    """
+    import inspect
+
+    sig = inspect.signature(SessionStore.prune_old_sessions)
+    assert sig.parameters["max_age_days"].default == 30
+    assert sig.parameters["screenshot_strip_age_days"].default == 2
+
+
+def test_images_stripped_at_write_time_not_merely_retained():
+    """F-L-1: base64 image data is stripped from the JSONL at WRITE time, not
+    kept for N days — the README's "retained, strippable" mechanism is wrong."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SessionStore(base_dir=Path(tmp), session_id="imgwrite")
+        store.append_message(_make_message_with_screenshot())
+        store.flush()
+        raw = store.session_file.read_text(encoding="utf-8")
+        # The base64 payload must never reach disk in the live file.
+        assert "abc123" not in raw
+        assert "base64" not in raw or "image" not in raw

@@ -476,6 +476,15 @@ def run_next_due_task(
     # for new work.
     _reap_stale_agents(kim_root)
 
+    # Prune old logs from scheduled_runs/ (F-J-1)
+    try:
+        apply_scheduled_log_retention(kim_root)
+    except Exception as e:
+        import logging
+        logging.getLogger("scheduled_runner").warning(
+            f"Failed to apply log retention for scheduled runs: {e}"
+        )
+
     # ------------------------------------------------------------------
     # Atomic section: hold the cross-process runner lock across the entire
     # due-check → provider-filter → preflight → Popen → record_run sequence.
@@ -632,6 +641,9 @@ def _build_subprocess_env(kim_root: Path) -> dict:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(kim_root)
     env["PROJECT_ROOT"] = str(kim_root)
+    # F-J-6: tell the detached agent its wall-clock cap so it can self-terminate
+    # even while the app (and the external reap_orphaned_agents reaper) is closed.
+    env["KIM_AGENT_MAX_WALL_SECONDS"] = str(int(_AGENT_MAX_WALL_SECONDS))
     return env
 
 
@@ -644,3 +656,30 @@ def _make_run_log_path(kim_root: Path, task_id: str) -> Path:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     safe_id = re.sub(r"[^\w-]", "_", task_id)
     return kim_root / "logs" / "scheduled_runs" / f"{safe_id}_{ts}.log"
+
+
+def apply_scheduled_log_retention(kim_root: Path, keep_days: int = 7) -> int:
+    """Delete log files in logs/scheduled_runs/ older than keep_days."""
+    from datetime import timedelta
+    deleted = 0
+    log_dir = kim_root / "logs" / "scheduled_runs"
+    if not log_dir.exists():
+        return 0
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=keep_days)
+    for f in log_dir.glob("*.log"):
+        stem = f.stem
+        parts = stem.split("_")
+        if not parts:
+            continue
+        ts = parts[-1]
+        # ts must be 16 chars: YYYYMMDDTHHMMSSZ
+        if len(ts) == 16 and ts.endswith("Z") and "T" in ts:
+            try:
+                date_str = ts[:8] # YYYYMMDD
+                file_date = datetime.strptime(date_str, "%Y%m%d").date()
+                if file_date < cutoff:
+                    f.unlink()
+                    deleted += 1
+            except (ValueError, OSError):
+                continue
+    return deleted

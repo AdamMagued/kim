@@ -461,6 +461,12 @@ class AppServerTurnRunner:
         self._answer_parts: list[str] = []
         self._interrupted = False
         self._item_titles: dict[str, str] = {}
+        # Strong references to fire-and-forget background tasks (the native
+        # compact request). asyncio.create_task keeps only a WEAK reference to
+        # the task, so without retaining it here the compact coroutine can be
+        # garbage-collected mid-flight before it completes (F-A-5). Each task
+        # removes itself on done via the discard callback below.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     # ── Public entry ─────────────────────────────────────────────────────────
 
@@ -891,10 +897,23 @@ class AppServerTurnRunner:
             self._compact_fired = True
             emit_status("Codex transcript near its budget — compacting it natively…")
             assert self._client is not None
-            with contextlib.suppress(AppServerError, asyncio.TimeoutError):
-                await self._client.request(
-                    "thread/compact/start", {"threadId": self._thread_id}, timeout=30.0
-                )
+            # Bind the narrowed client into a local so the nested coroutine
+            # captures the non-None value (the assert's narrowing does not
+            # propagate into the closure body).
+            _client = self._client
+            _thread_id = self._thread_id
+            async def _do_compact():
+                with contextlib.suppress(AppServerError, asyncio.TimeoutError):
+                    await _client.request(
+                        "thread/compact/start", {"threadId": _thread_id}, timeout=30.0
+                    )
+            # Retain a strong reference so the event loop can't drop the task
+            # before it finishes (F-A-5); discard it once it completes.
+            # Retain a strong reference so the event loop can't drop the task
+            # before it finishes (F-A-5); discard it once it completes.
+            _compact_task = asyncio.create_task(_do_compact())
+            self._background_tasks.add(_compact_task)
+            _compact_task.add_done_callback(self._background_tasks.discard)
 
     # ── Cancellation ─────────────────────────────────────────────────────────
 
@@ -1032,6 +1051,22 @@ async def compact_codex_thread(
     stored_cwd = str(thread_state.get("codex_thread_cwd") or "")
     if not thread_id or stored_cwd != cwd:
         return False
+    approval, sandbox = resolve_policies(config)
+    model = config.get("model") or "kim-proxy-model"
+    cleaned_model = re.sub(r"[^A-Za-z0-9_\-.:/ ]", "", model)[:128] if model else "kim-proxy-model"
+    common = {
+        "cwd": cwd,
+        "approvalPolicy": approval,
+        "sandbox": sandbox,
+        "model": cleaned_model,
+        "modelProvider": "kim-proxy",
+        "config": {
+            "model_providers.kim-proxy.name": "Kim Proxy",
+            "model_providers.kim-proxy.base_url": "http://127.0.0.1:9999/v1",
+            "model_providers.kim-proxy.wire_api": "responses",
+            "model_providers.kim-proxy.env_key": "CODEX_API_KEY",
+        }
+    }
     own_client = client is None
     if client is None:
         client = AppServerClient([binary_path, "app-server"], env=build_appserver_env("kim-compact"))
@@ -1039,7 +1074,7 @@ async def compact_codex_thread(
         if own_client:
             await client.start()
             await client.initialize()
-        await client.request("thread/resume", {"threadId": thread_id, "cwd": cwd})
+        await client.request("thread/resume", {"threadId": thread_id, **common})
         await client.request("thread/compact/start", {"threadId": thread_id}, timeout=120.0)
         return True
     except Exception as exc:  # noqa: BLE001

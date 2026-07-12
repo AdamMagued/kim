@@ -1189,3 +1189,91 @@ def test_strip_images_does_not_leak_internal_metadata_keys():
     }
     result_list = _strip_images_for_disk(msg_list)
     assert "_has_screenshot" not in result_list
+
+
+def test_session_store_atomic_id_claiming():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        base_path = Path(tmp_dir)
+        store = SessionStore(base_dir=base_path)
+        
+        # Verify the chosen ID's jsonl file has been created atomically
+        assert store.session_file.exists()
+        assert store.session_file.stat().st_size == 0
+        
+        # Creating another store should not collide with the first one
+        store2 = SessionStore(base_dir=base_path)
+        assert store2.session_file.exists()
+        assert store2.session_id != store.session_id
+
+
+def test_session_store_permissions_tightened():
+    import sys
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        base_path = Path(tmp_dir)
+        store = SessionStore(base_dir=base_path, session_id="test-perms")
+        
+        # Verify base_dir and session_dir mode is 0o700
+        if sys.platform != "win32":
+            assert (store.base_dir.stat().st_mode & 0o777) == 0o700
+            assert (store.session_dir.stat().st_mode & 0o777) == 0o700
+            
+        # Write files
+        store.append_message({"role": "user", "content": "hi"})
+        store.save_summary("summary")
+        store.save_context_state({"foo": "bar"})
+        store.save_compact_artifact({"artifact": "data"})
+        
+        if sys.platform != "win32":
+            # Verify files mode is 0o600
+            assert (store.session_file.stat().st_mode & 0o777) == 0o600
+            assert (store.summary_file.stat().st_mode & 0o777) == 0o600
+            assert (store.context_file.stat().st_mode & 0o777) == 0o600
+            
+            # Find the compact artifact and check its mode
+            compact_files = list(store.session_dir.glob("*.compact.*.json"))
+            assert len(compact_files) == 1
+            assert (compact_files[0].stat().st_mode & 0o777) == 0o600
+
+
+def test_list_sessions_message_count_cached_by_stat():
+    """F-INH-8: list_sessions must not re-parse unchanged session files on every
+    call — the per-file message count is memoised on (path, mtime, size)."""
+    import orchestrator.session_store as ss
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        base = Path(tmp_dir)
+        date_dir = base / "2026-02-01"
+        date_dir.mkdir(parents=True, exist_ok=True)
+        jsonl = date_dir / "cachesess.jsonl"
+        with open(jsonl, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"role": "user", "content": "a"}) + "\n")
+            fh.write(json.dumps({"type": "run_started", "task": "t"}) + "\n")  # not a message
+            fh.write(json.dumps({"role": "assistant", "content": "b"}) + "\n")
+
+        ss._MSG_COUNT_CACHE.clear()
+        sessions = SessionStore.list_sessions(base_dir=base)
+        entry = next(s for s in sessions if s["session_id"] == "cachesess")
+        # Trace record excluded — only the two role-bearing lines count.
+        assert entry["message_count"] == 2
+
+        # Poison the cache with a sentinel keyed on the current stat. A second
+        # call must return the sentinel, proving the file was NOT re-parsed.
+        st = jsonl.stat()
+        ss._MSG_COUNT_CACHE[str(jsonl)] = (st.st_mtime, st.st_size, 999)
+        again = SessionStore.list_sessions(base_dir=base)
+        assert next(s for s in again if s["session_id"] == "cachesess")["message_count"] == 999
+
+        # Growing the file changes its size → cache invalidates → real re-parse.
+        with open(jsonl, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"role": "user", "content": "c"}) + "\n")
+        fresh = SessionStore.list_sessions(base_dir=base)
+        assert next(s for s in fresh if s["session_id"] == "cachesess")["message_count"] == 3
+
+
+def test_count_role_messages_missing_file_is_zero():
+    """F-INH-8 helper must degrade to 0 for a missing/unreadable file."""
+    import orchestrator.session_store as ss
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        missing = Path(tmp_dir) / "nope.jsonl"
+        assert ss._count_role_messages(missing) == 0

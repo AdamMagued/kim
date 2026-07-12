@@ -887,3 +887,33 @@ def test_register_agent_pid_records_boot_ref(tmp_path):
     entries = _json.loads(_pid_registry_path(tmp_path).read_text())
     assert entries[0]["pid"] == 12345
     assert abs(entries[0]["boot_ref"] - _boot_ref()) <= 1
+
+
+def test_scheduled_runs_log_retention(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from orchestrator.scheduled_runner import apply_scheduled_log_retention
+
+    log_dir = tmp_path / "logs" / "scheduled_runs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Active log: 3 days ago (kept)
+    active_ts = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y%m%dT%H%M%SZ")
+    active_file = log_dir / f"task1_{active_ts}.log"
+    active_file.write_text("active log content")
+
+    # 2. Stale log: 10 days ago (deleted)
+    stale_ts = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y%m%dT%H%M%SZ")
+    stale_file = log_dir / f"task1_{stale_ts}.log"
+    stale_file.write_text("stale log content")
+
+    # 3. Non-log file: 10 days ago (kept because not matching *.log glob)
+    other_file = log_dir / f"task1_{stale_ts}.txt"
+    other_file.write_text("other text")
+
+    # Apply retention with keep_days=7
+    deleted = apply_scheduled_log_retention(tmp_path, keep_days=7)
+
+    assert deleted == 1
+    assert active_file.exists()
+    assert not stale_file.exists()
+    assert other_file.exists()

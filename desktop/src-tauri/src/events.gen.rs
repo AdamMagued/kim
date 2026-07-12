@@ -143,4 +143,13 @@ pub(crate) enum KimEvent {
         #[serde(default)]
         turn_id: String,
     },
+    AgentDone {
+        success: bool,
+    },
+    AgentCancelled {
+        success: bool,
+    },
+    AgentError {
+        error: String,
+    },
 }

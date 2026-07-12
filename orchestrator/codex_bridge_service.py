@@ -40,7 +40,11 @@ from orchestrator.events_gen import (
     LOG_TAG_FAILED,
     LOG_TAG_TASK_COMPLETE,
     emit_hitl_approval_request,
+    emit_run_done,
     emit_status,
+    emit_agent_done,
+    emit_agent_cancelled,
+    emit_agent_error,
 )
 
 from codex_engine.engine import (
@@ -84,11 +88,6 @@ _COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
 # the Tauri launcher (``subprocess.rs``), so no ``sys.path`` manipulation is needed.
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
-
-# Named constant for the placeholder API key used in local proxy auth (#53).
-# The proxy validates a per-run cryptographically random bearer token; this
-# value is only a human-readable label, not a real secret.
-_LOCAL_PROXY_KEY = "kim-proxy-key"
 
 logger = logging.getLogger("kim.codex_bridge_service")
 
@@ -538,6 +537,27 @@ async def _run_async(args: argparse.Namespace) -> int:
     config["provider"] = args.provider
     os.environ["PROJECT_ROOT"] = args.cwd
 
+    # WARNING: KIM_CODEX_BYPASS_SANDBOX=1 enables full RCE with NO sandbox and NO approvals.
+    # This must only be run in containerized or disposable environments.
+    bypass = os.environ.get("KIM_CODEX_BYPASS_SANDBOX", "").strip() == "1"
+    if bypass:
+        print(
+            "WARNING: KIM_CODEX_BYPASS_SANDBOX=1 is active. This runs codex-exec with "
+            "full RCE capabilities and disables all approvals. Ensure this is running "
+            "in a containerized/disposable workspace.",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Refuse to combine bypass with browser-provider tasks from scraped web content
+        is_web_derived = any(k in args.task.lower() for k in ("http", "www", "url", "scrape", "fetch", "web", "download", "scraped"))
+        if is_web_derived:
+            print(
+                f"{LOG_TAG_ERROR} Refusing to run in bypass sandbox mode: task string contains web keywords or URLs which pose prompt-injection RCE risks.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+
     # /compact control task: compact the browser thread instead of running
     # Codex. No HITL gate — nothing executes in the user's project.
     if args.task.strip().lower() in _COMPACT_CONTROL_TASKS:
@@ -770,6 +790,10 @@ async def _run_exec_task(
     }
     if os.environ.get("CODEX_HOME"):
         env["CODEX_HOME"] = os.environ["CODEX_HOME"]
+    if "KIM_RUN_ID" in os.environ:
+        env["KIM_RUN_ID"] = os.environ["KIM_RUN_ID"]
+    if "KIM_SESSION_ID" in os.environ:
+        env["KIM_SESSION_ID"] = os.environ["KIM_SESSION_ID"]
     # On Windows the POSIX vars above are absent; forward the essentials
     # so the codex child process can locate system tools and temp storage.
     if sys.platform == "win32":
@@ -908,6 +932,40 @@ async def _run_exec_task(
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 
+def _emit_terminal_for_rc(rc: int) -> None:
+    """Emit a typed run-lifecycle terminal event for a codex-bridge exit code.
+
+    F-H-2 / F-H-1: the Code-tab (codex browser-bridge) path historically
+    signalled termination ONLY via legacy magic-string lines (``TASK_COMPLETE:``
+    / ``[FAILED]``), so — unlike a chat run, which emits typed ``kim:run-done``
+    from ``cli.py`` — the frontend had no typed, run-attributable signal to
+    clear ``isRunning`` on. That divergence is the root cause of the stuck
+    spinner (F-F-5) and the event-bleed on a session switch (F-F-2). We now
+    emit ``kim:run-done`` on EVERY codex-bridge exit path (mapped from the
+    return code), mirroring the chat contract. The event self-stamps the
+    run-identity envelope from ``KIM_RUN_ID`` / ``KIM_SESSION_ID`` when the
+    spawner exports them (F-H-8 — handoff to D' for ``codex_browser_spec``).
+    The legacy lines are kept for back-compat (codex CLI text protocol).
+    """
+    if rc == 0:
+        termination, success = "task_complete", True
+    elif rc == 130:
+        termination, success = "cancelled", False
+    else:
+        termination, success = "failed", False
+    try:
+        emit_run_done(termination, success)
+        if success:
+            emit_agent_done(True)
+        elif termination == "cancelled":
+            emit_agent_cancelled(False)
+        else:
+            emit_agent_error(f"Codex bridge exited with code {rc}")
+            emit_agent_done(False)
+    except Exception:  # noqa: BLE001 — a terminal event must never mask the real rc
+        pass
+
+
 def main() -> None:
     args = _parse_args()
     logging.basicConfig(
@@ -919,6 +977,8 @@ def main() -> None:
         rc = asyncio.run(_run_async(args))
     except KeyboardInterrupt:
         rc = 130
+    # F-H-2: typed terminal lifecycle event on the SAME channel as chat runs.
+    _emit_terminal_for_rc(rc)
     sys.exit(rc)
 
 

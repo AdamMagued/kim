@@ -1701,6 +1701,35 @@ class TestNormalizeToolCalls(unittest.TestCase):
         self.assertEqual(call["name"], "exec_command")
         self.assertIn("touch pong.html", call["arguments"])
 
+    def test_validation_failure_raises_validation_error(self):
+        from codex_engine.engine import _normalize_tool_calls
+        import jsonschema
+
+        # update_plan requires "plan"
+        calls = [{"name": "update_plan", "input": {"wrong_key": "some_value"}}]
+        with self.assertRaises(jsonschema.ValidationError):
+            _normalize_tool_calls(calls, _CODEX_TOOLS)
+
+    def test_custom_command_parameter_key_mapping(self):
+        from codex_engine.engine import _normalize_tool_calls
+
+        custom_tools = [
+            {
+                "type": "function",
+                "name": "custom_exec",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"script": {"type": "string"}},
+                    "required": ["script"],
+                },
+            }
+        ]
+        
+        # Custom exec tool wants "script". Model sent "command". We expect it to be renamed to "script".
+        calls = [{"name": "custom_exec", "input": {"command": "python test.py"}}]
+        out = _normalize_tool_calls(calls, custom_tools)
+        self.assertEqual(out[0]["input"], {"script": "python test.py"})
+
 
 # ---------------------------------------------------------------------------
 # Contract nudge — a prose reply ("I'll create the files…") must get ONE

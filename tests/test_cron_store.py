@@ -600,6 +600,59 @@ def test_record_run_persists_to_file():
         assert reloaded.next_run_at == (ran + timedelta(minutes=30)).isoformat()
 
 
+def test_record_run_does_not_drift_with_tick_latency():
+    """F-INH-7: interval schedules must not creep later every run.
+
+    Each real run fires a little after its scheduled slot (scheduler tick +
+    lock latency).  The next slot must anchor to the PREVIOUS scheduled slot,
+    not the late actual run time, so the offset does not compound.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        t = store.add("task", "@every 1h")
+
+        # Run 1 establishes the anchor at ran1 + 1h.
+        ran1 = datetime(2026, 6, 5, 12, 0, 0, tzinfo=timezone.utc)
+        u1 = store.record_run(t.id, ran_at=ran1)
+        assert u1 is not None
+        slot2 = ran1 + timedelta(hours=1)
+        assert u1.next_run_at == slot2.isoformat()
+
+        # Run 2 fires 37s LATE (tick latency). Old buggy behaviour would set
+        # next = ran2 + 1h, baking the 37s in forever. Anchored behaviour keeps
+        # the slot exactly one interval past slot2.
+        ran2 = slot2 + timedelta(seconds=37)
+        u2 = store.record_run(t.id, ran_at=ran2)
+        assert u2 is not None
+        slot3 = ran1 + timedelta(hours=2)
+        assert u2.next_run_at == slot3.isoformat()
+        assert u2.next_run_at != (ran2 + timedelta(hours=1)).isoformat()
+
+        # Run 3 fires late again; drift still does not accumulate.
+        ran3 = slot3 + timedelta(seconds=50)
+        u3 = store.record_run(t.id, ran_at=ran3)
+        assert u3 is not None
+        assert u3.next_run_at == (ran1 + timedelta(hours=3)).isoformat()
+
+
+def test_record_run_catches_up_after_long_downtime():
+    """F-INH-7: after the app was closed for several intervals the next slot
+    must jump ahead by whole intervals (fire once, not a catch-up storm)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        t = store.add("task", "@every 1h")
+        ran1 = datetime(2026, 6, 5, 0, 0, 0, tzinfo=timezone.utc)
+        store.record_run(t.id, ran_at=ran1)  # slot2 = 01:00
+
+        # App reopens 5h10m later and the task fires; the next slot must be the
+        # first whole-interval slot strictly after the run, i.e. 06:00 — not a
+        # backlog of hourly slots.
+        ran2 = ran1 + timedelta(hours=5, minutes=10)
+        u2 = store.record_run(t.id, ran_at=ran2)
+        assert u2 is not None
+        assert u2.next_run_at == (ran1 + timedelta(hours=6)).isoformat()
+
+
 # -- due_tasks -----------------------------------------------------------------
 
 

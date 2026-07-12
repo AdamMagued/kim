@@ -38,6 +38,14 @@ _EXTRA_SERVER_ENV_ALLOWLIST = (
 )
 
 
+# Env vars the internal Kim server may need that stdio_client would otherwise
+# drop when StdioServerParameters.env is provided.
+_EXTRA_ENV_KEYS = (
+    "PYTHONPATH", "PROJECT_ROOT", "VIRTUAL_ENV",
+    "KIM_WEBVIEW_BRIDGE_URL", "KIM_WEBVIEW_BRIDGE_TOKEN",
+)
+
+
 def _extra_server_env(base_env: dict, declared: Any) -> dict[str, str]:
     """Build the env for a third-party MCP server: a non-secret allowlist from
     the parent environment plus the server's own declared `env:` block."""
@@ -45,6 +53,33 @@ def _extra_server_env(base_env: dict, declared: Any) -> dict[str, str]:
     if isinstance(declared, dict):
         env.update({str(k): str(v) for k, v in declared.items()})
     return env
+
+
+def _resolve_project_root(config: dict) -> str:
+    """Resolve the project root the client will use as the server's cwd.
+
+    Precedence: PROJECT_ROOT env > config `project_root` > current directory.
+    Always returned absolute/resolved.
+    """
+    return str(
+        Path(
+            os.environ.get("PROJECT_ROOT") or config.get("project_root", str(Path.cwd()))
+        ).resolve()
+    )
+
+
+def _server_env(project_root: str, broker_env: dict) -> dict:
+    """Build the internal Kim server's environment.
+
+    Pins PROJECT_ROOT to the client's resolved root (F-INH-5) so the spawned
+    server does not independently fall back to its config-file directory and
+    end up sandboxed to a different root than the client's cwd. Without this
+    the two only agreed by accident when PROJECT_ROOT happened to be inherited.
+    """
+    extra_env = {k: os.environ[k] for k in _EXTRA_ENV_KEYS if k in os.environ}
+    merged_env = {**os.environ, **extra_env, **broker_env}
+    merged_env["PROJECT_ROOT"] = project_root
+    return merged_env
 
 
 class MultiMCPClient:
@@ -96,19 +131,7 @@ class MultiMCPClient:
 async def mcp_session_context(config: dict):
     """Start the Kim MCP server (plus any extras from config.yaml) and
     yield a MultiMCPClient that aggregates all sessions."""
-    project_root = str(
-        Path(
-            os.environ.get("PROJECT_ROOT") or config.get("project_root", str(Path.cwd()))
-        ).resolve()
-    )
-    # The MCP SDK's stdio_client may use a restricted environment when
-    # StdioServerParameters.env is provided.  We merge our extra keys
-    # with the full parent environment so nothing critical is lost.
-    _EXTRA_ENV_KEYS = [
-        "PYTHONPATH", "PROJECT_ROOT", "VIRTUAL_ENV",
-        "KIM_WEBVIEW_BRIDGE_URL", "KIM_WEBVIEW_BRIDGE_TOKEN",
-    ]
-    extra_env = {k: os.environ[k] for k in _EXTRA_ENV_KEYS if k in os.environ}
+    project_root = _resolve_project_root(config)
 
     # K1: start the approval broker BEFORE spawning the MCP server so the
     # server-side HITL gate (mcp_server/approvals.py) has a channel back to
@@ -123,7 +146,11 @@ async def mcp_session_context(config: dict):
         )
         broker_env = {}
 
-    merged_env = {**os.environ, **extra_env, **broker_env}
+    # The MCP SDK's stdio_client may use a restricted environment when
+    # StdioServerParameters.env is provided.  We merge our extra keys with the
+    # full parent environment (and pin PROJECT_ROOT — F-INH-5) so nothing
+    # critical is lost and the server shares the client's resolved root.
+    merged_env = _server_env(project_root, broker_env)
 
     # 1. Prepare internal Kim server
     server_list = [

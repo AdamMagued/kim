@@ -56,6 +56,8 @@ _SCRUBBED_VARS = (
     "KIM_PROVIDER",
     "CODEX_BIN",
     "CODEX_HOME",
+    "KIM_RUN_ID",
+    "KIM_SESSION_ID",
 )
 
 # The exec-path contract these harness tests pin. The service default is now

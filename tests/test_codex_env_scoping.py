@@ -106,6 +106,41 @@ class TestCodexEnvScoping(unittest.IsolatedAsyncioTestCase):
         result = await run_bridge(self.tmp, env={"CODEX_HOME": "/custom/codex-home"})
         self.assertEqual(result.capture["env"].get("CODEX_HOME"), "/custom/codex-home")
 
+    async def test_parent_run_identity_is_forwarded(self):
+        """F-H-8: KIM_RUN_ID and KIM_SESSION_ID must be forwarded if present."""
+        planted = {"KIM_RUN_ID": "run-xyz", "KIM_SESSION_ID": "sess-123"}
+        result = await run_bridge(self.tmp, env=planted)
+        child_env = result.capture["env"]
+        self.assertEqual(child_env.get("KIM_RUN_ID"), "run-xyz")
+        self.assertEqual(child_env.get("KIM_SESSION_ID"), "sess-123")
+
+    async def test_run_identity_forwarding_is_conditional(self):
+        """F-H-8 contract: the spawn env exports KIM_RUN_ID/KIM_SESSION_ID with
+        the exact parent values when set, carries NEITHER key when the parent
+        has neither (no empty-string leakage — the forwarding is guarded by
+        ``in os.environ``, not ``os.environ.get(..., "")``), and forwards each
+        independently when only one is present.
+        """
+        # Both present → both exported verbatim, as literal spawn-env keys.
+        both = await run_bridge(
+            self.tmp, env={"KIM_RUN_ID": "R-1", "KIM_SESSION_ID": "S-1"}
+        )
+        self.assertIn("KIM_RUN_ID", both.capture["env"])
+        self.assertIn("KIM_SESSION_ID", both.capture["env"])
+        self.assertEqual(both.capture["env"]["KIM_RUN_ID"], "R-1")
+        self.assertEqual(both.capture["env"]["KIM_SESSION_ID"], "S-1")
+
+        # Neither present → the keys must be ABSENT from the child env, not
+        # injected as empty strings.
+        neither = await run_bridge(self.tmp)
+        self.assertNotIn("KIM_RUN_ID", neither.capture["env"])
+        self.assertNotIn("KIM_SESSION_ID", neither.capture["env"])
+
+        # Only the run id present → only it is forwarded.
+        run_only = await run_bridge(self.tmp, env={"KIM_RUN_ID": "R-2"})
+        self.assertEqual(run_only.capture["env"].get("KIM_RUN_ID"), "R-2")
+        self.assertNotIn("KIM_SESSION_ID", run_only.capture["env"])
+
     async def test_path_and_home_are_forwarded_from_parent(self):
         """The allowlisted basics come from the parent env, unmodified."""
         result = await run_bridge(self.tmp)

@@ -32,6 +32,9 @@ export const KimEventNames = {
   TOKEN_USAGE: 'kim:token-usage' as const,
   ITEM_LIFECYCLE: 'kim:item-lifecycle' as const,
   TURN_LIFECYCLE: 'kim:turn-lifecycle' as const,
+  AGENT_DONE: 'kim:agent-done' as const,
+  AGENT_CANCELLED: 'kim:agent-cancelled' as const,
+  AGENT_ERROR: 'kim:agent-error' as const,
 } as const;
 
 export type KimEventName = (typeof KimEventNames)[keyof typeof KimEventNames];
@@ -391,6 +394,24 @@ export interface KimTurnLifecyclePayload extends KimRunEnvelope {
   turn_id: string;
 }
 
+/** Agent completed its execution successfully or with expected outcome. */
+export interface KimAgentDonePayload extends KimRunEnvelope {
+  /** True when the agent finished successfully. */
+  success: boolean;
+}
+
+/** Agent execution was cancelled. */
+export interface KimAgentCancelledPayload extends KimRunEnvelope {
+  /** Usually false for cancellation. */
+  success: boolean;
+}
+
+/** Agent run failed with an error. */
+export interface KimAgentErrorPayload extends KimRunEnvelope {
+  /** Error description. */
+  error: string;
+}
+
 /** Discriminated union of all typed IPC events. */
 export type KimEvent =
   | { event: typeof KimEventNames.STATUS; payload: KimStatusPayload }
@@ -420,7 +441,10 @@ export type KimEvent =
   | { event: typeof KimEventNames.DIFF_UPDATE; payload: KimDiffUpdatePayload }
   | { event: typeof KimEventNames.TOKEN_USAGE; payload: KimTokenUsagePayload }
   | { event: typeof KimEventNames.ITEM_LIFECYCLE; payload: KimItemLifecyclePayload }
-  | { event: typeof KimEventNames.TURN_LIFECYCLE; payload: KimTurnLifecyclePayload };
+  | { event: typeof KimEventNames.TURN_LIFECYCLE; payload: KimTurnLifecyclePayload }
+  | { event: typeof KimEventNames.AGENT_DONE; payload: KimAgentDonePayload }
+  | { event: typeof KimEventNames.AGENT_CANCELLED; payload: KimAgentCancelledPayload }
+  | { event: typeof KimEventNames.AGENT_ERROR; payload: KimAgentErrorPayload };
 
 const KimWireEventMap = {
   "status": { event: KimEventNames.STATUS },
@@ -452,6 +476,9 @@ const KimWireEventMap = {
   "token_usage": { event: KimEventNames.TOKEN_USAGE },
   "item_lifecycle": { event: KimEventNames.ITEM_LIFECYCLE },
   "turn_lifecycle": { event: KimEventNames.TURN_LIFECYCLE },
+  "agent_done": { event: KimEventNames.AGENT_DONE },
+  "agent_cancelled": { event: KimEventNames.AGENT_CANCELLED },
+  "agent_error": { event: KimEventNames.AGENT_ERROR },
 } as const;
 
 /** Decode one Python stdout JSON event using the schema-generated wire map. */

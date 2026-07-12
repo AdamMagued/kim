@@ -56,6 +56,12 @@ class CliTerminationStaticTests(unittest.TestCase):
         self.assertIn("emit_run_done", self.source)
         self.assertIn('emit_run_done(termination, bool(result["success"]))', self.source)
 
+    def test_run_lifecycle_clear_events_present_in_source(self):
+        """cli.py must use the schema-generated agent lifecycle clear emitters."""
+        self.assertIn("emit_agent_done", self.source)
+        self.assertIn("emit_agent_cancelled", self.source)
+        self.assertIn("emit_agent_error", self.source)
+
     def test_termination_key_accessed_via_get_with_fallback(self):
         """result.get('termination', 'unknown') must be used so old result dicts
         without the key don't raise KeyError."""
@@ -126,7 +132,7 @@ class CliTerminationStaticTests(unittest.TestCase):
         self.assertIn("emit_activity", self.source)
         self.assertIn('emit_activity("error", failure_detail)', self.source)
         # User cancels are not errors and must not produce an error activity.
-        self.assertIn('termination != "cancelled"', self.source)
+        self.assertIn('termination == "cancelled"', self.source)
 
 
 class CliTerminationFormatTests(unittest.TestCase):
