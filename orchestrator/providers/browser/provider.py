@@ -64,6 +64,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import uuid
 from pathlib import Path
@@ -108,6 +109,43 @@ logger = logging.getLogger(__name__)
 # Re-export for backward compatibility (tests access these via the provider instance)
 _MOD_KEY = MOD_KEY
 _to_list = to_list
+
+
+# F-J-3: where the auto-launched detached CDP Chrome's PID is recorded so the
+# desktop shell can reap the orphan on app quit.
+_CDP_CHROME_REGISTRY_NAME = ".kim_cdp_chrome.json"
+
+
+def reap_launched_cdp_chrome(project_root) -> bool:
+    """Reap the Kim-launched CDP Chrome recorded under ``project_root`` (F-J-3).
+
+    The browser provider deliberately outlives its own (short-lived) process so
+    the signed-in Chrome is reused across turns, so it cannot reap that Chrome
+    itself. This reads the PID registry and SIGTERMs the recorded process if it
+    is still alive, then clears the registry. Intended to be called by the
+    desktop shell on app quit (HANDOFF -> D').
+
+    Returns True when a live process was signalled.
+    """
+    from pathlib import Path as _Path
+    path = _Path(project_root) / "sessions" / _CDP_CHROME_REGISTRY_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    pid = data.get("pid")
+    killed = False
+    if isinstance(pid, int):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed = True
+        except (OSError, ProcessLookupError):
+            killed = False
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return killed
 
 
 class _DeliveredNoResponse(Exception):
@@ -993,33 +1031,55 @@ class BrowserProvider(BaseProvider):
             logger.warning("Auto-launch: no Chrome/Chromium binary found")
             return None
 
-        args = [
-            chrome,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={self._user_data_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ]
-        launch_url = self._site_launch_url()
-        if launch_url:
-            args.append(launch_url)
+        # F-J-3: poll the previously-launched handle before spawning again — a
+        # second detached Chrome on the same profile/port just stacks orphans.
+        if self._chrome_proc is not None and self._chrome_proc.poll() is None:
+            logger.info("Auto-launch: a previously-launched Chrome is still alive; reusing it")
+        else:
+            args = [
+                chrome,
+                f"--remote-debugging-port={port}",
+                # F-I-4: bind the debug port to loopback explicitly so it is
+                # never exposed on 0.0.0.0. The CDP endpoint is UNAUTHENTICATED —
+                # any local process running as the user can attach, read cookies,
+                # and drive the logged-in browser — so keep it strictly local.
+                "--remote-debugging-address=127.0.0.1",
+                f"--user-data-dir={self._user_data_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ]
+            launch_url = self._site_launch_url()
+            if launch_url:
+                args.append(launch_url)
 
-        logger.info(
-            "[STATUS] Chrome isn't running — opening it so you can sign in…"
-        )
-        try:
-            # start_new_session detaches Chrome from this (short-lived) process so
-            # it keeps running after the task/bridge exits and is reused next turn.
-            popen_kwargs: dict = {
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.DEVNULL,
-            }
-            if platform.system() != "Windows":
-                popen_kwargs["start_new_session"] = True
-            self._chrome_proc = subprocess.Popen(args, **popen_kwargs)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Auto-launch: failed to start Chrome: {e}")
-            return None
+            logger.warning(
+                "Auto-launching Chrome with an UNAUTHENTICATED CDP port %d (bound to "
+                "127.0.0.1). Any local process running as you can drive this logged-in "
+                "browser — see SECURITY (CDP mode).",
+                port,
+            )
+            logger.info(
+                "[STATUS] Chrome isn't running — opening it so you can sign in…"
+            )
+            try:
+                # start_new_session detaches Chrome from this (short-lived) process
+                # so it keeps running after the task/bridge exits and is reused next
+                # turn.
+                popen_kwargs: dict = {
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                }
+                if platform.system() != "Windows":
+                    popen_kwargs["start_new_session"] = True
+                self._chrome_proc = subprocess.Popen(args, **popen_kwargs)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Auto-launch: failed to start Chrome: {e}")
+                return None
+
+            # F-J-3: record the PID so the desktop shell can reap this detached
+            # orphan on app quit — the provider process is short-lived and cannot
+            # reap the Chrome it deliberately outlives.
+            self._record_launched_chrome(self._chrome_proc.pid, port)
 
         # Poll the debugging port until Chrome is ready (~15s).
         last_err: Optional[Exception] = None
@@ -1038,6 +1098,19 @@ class BrowserProvider(BaseProvider):
             f"Auto-launch: Chrome started but CDP port {port} did not come up: {last_err}"
         )
         return None
+
+    def _cdp_chrome_registry_path(self) -> Path:
+        return self._project_root / "sessions" / _CDP_CHROME_REGISTRY_NAME
+
+    def _record_launched_chrome(self, pid: int, port: int) -> None:
+        """Persist the launched Chrome's PID so the desktop shell can reap it on
+        app quit (F-J-3). Best-effort — a write failure is non-fatal."""
+        try:
+            path = self._cdp_chrome_registry_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"pid": int(pid), "port": int(port)}), encoding="utf-8")
+        except OSError as e:  # noqa: BLE001
+            logger.debug("Could not record CDP Chrome pid: %s", e)
 
     async def _auto_launch(self, pw: Playwright) -> Browser:
         session_path = Path(self._user_data_dir)
