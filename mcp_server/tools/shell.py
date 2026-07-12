@@ -170,6 +170,269 @@ _ENV_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
 _SAFE_ABSOLUTE_REDIRECTS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
 
 
+# ── Argv-level exec-capable-binary policy (F-C-1 / F-C-2) ──────────────────────
+#
+# ROOT CAUSE this closes: the shell allowlist (policy.py `_ALLOWED_MUTATING`)
+# trusts a program by *name*, on the assumption that an allowlisted binary only
+# does its nominal job. That assumption is false for a family of "local-dev"
+# binaries that are themselves general-purpose command runners / arbitrary-file
+# readers: `git -c alias.x=!<sh>`, `awk 'BEGIN{system(...)}'`,
+# `tar --checkpoint-action=exec=<cmd>`, `sed` `e`/`s///e`, `make -f`. Each execs
+# arbitrary shell (or reads any absolute path — e.g. a secret — from *inside* its
+# own argument grammar, where the token-shape path scan can't see it), so an
+# allowlisted invocation becomes un-approved RCE + secret disclosure.
+#
+# A name-blocklist cannot fix this (the names are legitimately allowlisted). The
+# durable fix is an ARGV-LEVEL policy: for each known exec-capable binary, inspect
+# its arguments and BLOCK the specific escape vectors while leaving the binary's
+# benign uses (`git status`, `awk '{print $1}'`, `tar -xzf`, `sed 's/a/b/'`)
+# working. This deny-set is CODE-OWNED — never config-driven (CLAUDE.md invariant:
+# config must never weaken a code-owned gate).
+#
+# Because handle_run_command returns the BLOCKED string before dispatch, a hit
+# here denies the command outright — strictly stronger than escalating it to HITL
+# (the risk-threshold HITL arm in policy.py is default-off, so a "risk=high but no
+# escalation" command would otherwise dispatch unattended; blocking removes that
+# window entirely).
+
+# git config keys that git will execute as an external program, or use to read
+# an arbitrary file, when set via `-c KEY=VALUE` / `--config-env`. Matched
+# case-insensitively. This is the code-owned core of the F-C-1 gate.
+_GIT_DANGEROUS_CONFIG_KEYS = frozenset({
+    "core.fsmonitor",
+    "core.pager",
+    "core.editor",
+    "core.sshcommand",
+    "core.hookspath",
+    "sequence.editor",
+    "diff.external",
+    "gpg.program",
+    "gpg.openpgp.program",
+    "gpg.ssh.program",
+    "credential.helper",
+    "uploadpack.packobjectshook",
+    "protocol.ext.allow",
+})
+
+# ...and any config key with one of these suffixes is a program/command hook
+# (matches per-remote / per-helper variants like `credential.https://x.helper`,
+# `diff.<driver>.command`, `filter.<x>.clean`, `alias.<x>`). Suffix-matched so
+# new hook names in this shape are covered without an exhaustive enumeration.
+_GIT_DANGEROUS_CONFIG_SUFFIXES = (
+    ".command",
+    ".process",
+    ".program",
+    ".helper",
+    ".external",
+    ".editor",
+    ".pager",
+    ".sshcommand",
+    ".fsmonitor",
+    ".hookspath",
+    ".packobjectshook",
+    ".clean",
+    ".smudge",
+    ".textconv",
+)
+
+
+def _git_config_token_is_dangerous(key: str, value: str | None) -> bool:
+    """True when a `git -c KEY=VALUE` (or `--config-env KEY=ENVVAR`) token can
+    exec a program or read an arbitrary file.
+
+    - Any `!`-prefixed value is a shell alias body (`alias.x=!<sh>`) — always
+      dangerous regardless of key.
+    - Any key in the code-owned dangerous set, or ending in a program/command
+      hook suffix, lets git run VALUE as an external program.
+    """
+    if value is not None and value.lstrip().startswith("!"):
+        return True
+    key_low = key.strip().lower()
+    if key_low in _GIT_DANGEROUS_CONFIG_KEYS:
+        return True
+    return any(key_low.endswith(suffix) for suffix in _GIT_DANGEROUS_CONFIG_SUFFIXES)
+
+
+def _check_git_argv(tokens: list[str]) -> str | None:
+    """F-C-1: block `git -c`/`--config`/`--config-env` config-injection RCE and
+    absolute-path secret reads that hide inside the config token.
+
+    Leaves ordinary git usage (`git status/diff/commit/log`, and even benign
+    `-c user.email=x`) working — only the exec/secret-read config keys and
+    `!`-prefixed alias bodies are denied. Legitimate needs for the dangerous
+    keys should route through the structured git_* MCP tools, not run_command.
+    """
+    i = 1  # tokens[0] == "git"
+    while i < len(tokens):
+        tok = tokens[i]
+        pair: str | None = None
+        if tok in ("-c", "--config", "--config-env"):
+            # Space-separated form: value is the next token.
+            pair = tokens[i + 1] if i + 1 < len(tokens) else ""
+            i += 2
+        elif tok.startswith("--config-env=") or tok.startswith("--config="):
+            pair = tok.split("=", 1)[1]
+            i += 1
+        elif tok.startswith("-c") and len(tok) > 2:
+            # Glued short form `-ckey=val` (git accepts this).
+            pair = tok[2:]
+            i += 1
+        else:
+            i += 1
+            continue
+        # pair is "KEY=VALUE" (or "KEY" alone for a boolean/no-value config).
+        if "=" in pair:
+            key, value = pair.split("=", 1)
+        else:
+            key, value = pair, None
+        if _git_config_token_is_dangerous(key, value):
+            return (
+                "BLOCKED: 'git -c'/'--config-env' with an executable config key "
+                f"({key!r}) is denied — it can run arbitrary commands or read "
+                "secret files. Use the git_* tools for legitimate git operations."
+            )
+    return None
+
+
+# awk/gawk/mawk program fragments that exec a shell or read/write arbitrary
+# files from inside the program string (never a path-shaped token, so the path
+# scan is blind to them). `system(...)`, `... | getline` / `"cmd" | getline`,
+# `print/printf > file` and `print/printf | "cmd"` are the exec/IO vectors.
+_AWK_SYSTEM_RE = re.compile(r"\bsystem\s*\(")
+_AWK_GETLINE_RE = re.compile(r"\bgetline\b")
+_AWK_PRINT_REDIR_RE = re.compile(r"\bprintf?\b[^;{}\n]*[>|]")
+
+
+def _check_awk_argv(tokens: list[str]) -> str | None:
+    """F-C-2: block awk/gawk/mawk programs that exec commands (`system`,
+    `|getline`, `print|\"cmd\"`) or read/write arbitrary files (`print > file`,
+    `getline < file`). Leaves field-processing programs (`awk '{print $1}'`)
+    working."""
+    for tok in tokens[1:]:
+        if tok.startswith("-") and tok != "--":
+            continue  # a flag, not the program text
+        if (
+            _AWK_SYSTEM_RE.search(tok)
+            or _AWK_GETLINE_RE.search(tok)
+            or _AWK_PRINT_REDIR_RE.search(tok)
+        ):
+            return (
+                "BLOCKED: awk program uses an exec/IO feature "
+                "(system()/getline/print-redirect) — this is an allowlist escape."
+            )
+    return None
+
+
+# tar options that run an external program (GNU/bsd tar).
+_TAR_EXEC_FLAGS = frozenset({
+    "--checkpoint-action",
+    "--to-command",
+    "--use-compress-program",
+    "--rmt-command",
+    "--info-script",
+    "--new-volume-script",
+    "-I",  # short form of --use-compress-program (runs an arbitrary program)
+})
+
+
+def _check_tar_argv(tokens: list[str]) -> str | None:
+    """F-C-2: block tar options that exec an external program
+    (`--checkpoint-action=exec=`, `--to-command`, `--use-compress-program`/`-I`,
+    `--rmt-command`, `--info-script`). Leaves archive create/extract
+    (`tar -xzf`, `tar -czf`) working."""
+    for tok in tokens[1:]:
+        head = tok.split("=", 1)[0]
+        if head in _TAR_EXEC_FLAGS:
+            return (
+                f"BLOCKED: tar option {head!r} runs an external program — "
+                "this is an allowlist escape."
+            )
+    return None
+
+
+# sed script commands that exec a shell (`e`, `s///e`) or read/write arbitrary
+# files (`w`/`W`/`r`/`R`). Detected on the script tokens; `-i` in-place edit is
+# also blocked (writes outside the redirect/path gate). `sed 's/a/b/'`,
+# `sed -n '1,5p'` stay working.
+# A sed command letter sits at a "command position": at the start of the script,
+# after a command separator (`;`/`}`/newline), or right after a numeric/`$`
+# address (`1e`, `$w`, `5,10w`). We deliberately do NOT treat a `/` as a command
+# boundary — a `/`-delimited *address* is indistinguishable from substitution
+# content (`s/were/x/` would false-positive on the `w`), so `/regex/`-addressed
+# exec/IO commands are left to the policy.py layer (handoff). The `e`/`w`/`W`/
+# `r`/`R` commands exec a shell or read/write arbitrary files.
+_SED_EXEC_CMD_RE = re.compile(r"(?:^|[;}\n]|\d|\$)\s*e(?=[\s;}]|$)")   # `e` execute
+_SED_S_EFLAG_RE = re.compile(r"s([^\w\s])(?:\\.|[^\\])*?\1(?:\\.|[^\\])*?\1[a-z]*e", re.DOTALL)  # s///e
+_SED_WR_CMD_RE = re.compile(r"(?:^|[;}\n]|\d|\$)\s*[wWrR](?=[\s;}]|$)")  # write/read file commands
+
+
+def _check_sed_argv(tokens: list[str]) -> str | None:
+    """F-C-2: block sed scripts that exec (`e`, `s///e`) or do file IO
+    (`w`/`r`), and in-place edits (`-i`). Leaves substitution/print scripts
+    (`sed 's/a/b/'`, `sed -n '1,5p'`) working."""
+    for tok in tokens[1:]:
+        if tok in ("-i", "--in-place") or tok.startswith("-i") or tok.startswith("--in-place"):
+            return "BLOCKED: sed in-place edit (-i) writes files outside the path gate."
+        if tok.startswith("-") and tok not in ("-e", "-f"):
+            continue
+        if tok in ("-e", "-f"):
+            continue  # the script is the following token, checked on its own pass
+        if (
+            _SED_EXEC_CMD_RE.search(tok)
+            or _SED_S_EFLAG_RE.search(tok)
+            or _SED_WR_CMD_RE.search(tok)
+        ):
+            return (
+                "BLOCKED: sed script uses an exec/file-IO command "
+                "(e / s///e / w / r) — this is an allowlist escape."
+            )
+    return None
+
+
+def _check_make_argv(tokens: list[str]) -> str | None:
+    """F-C-2: block `make -f <makefile>` / `--makefile` / `--eval` — running an
+    attacker-supplied makefile or inline recipe is arbitrary command execution.
+    Plain `make` (default ./Makefile) is unaffected."""
+    for tok in tokens[1:]:
+        head = tok.split("=", 1)[0]
+        if head in ("-f", "--file", "--makefile", "--eval"):
+            return (
+                f"BLOCKED: make option {head!r} runs an arbitrary makefile/recipe "
+                "— this is an allowlist escape."
+            )
+    return None
+
+
+# Dispatch table: basename → argv policy. Code-owned; never config-driven.
+_EXEC_CAPABLE_ARGV_POLICY = {
+    "git": _check_git_argv,
+    "awk": _check_awk_argv,
+    "gawk": _check_awk_argv,
+    "mawk": _check_awk_argv,
+    "tar": _check_tar_argv,
+    "gtar": _check_tar_argv,
+    "bsdtar": _check_tar_argv,
+    "sed": _check_sed_argv,
+    "gsed": _check_sed_argv,
+    "make": _check_make_argv,
+    "gmake": _check_make_argv,
+}
+
+
+def _check_exec_capable_binary(command_tokens: list[str]) -> str | None:
+    """Apply the argv-level escape-vector policy to an allowlisted but
+    exec-capable binary. `command_tokens` must start with the binary token
+    (env assignments and wrappers already stripped). Returns a BLOCKED message
+    or None."""
+    if not command_tokens:
+        return None
+    base = _basename(command_tokens[0])
+    policy = _EXEC_CAPABLE_ARGV_POLICY.get(base)
+    if policy is None:
+        return None
+    return policy(command_tokens)
+
+
 def _filtered_env() -> dict[str, str]:
     """Return the minimal allowlist env for non-sandbox subprocess runs (S4).
 
@@ -374,6 +637,13 @@ def _check_single_segment(cmd: str, powershell: bool = False) -> str | None:
     if first_cmd in _DENY_COMMANDS:
         return f"BLOCKED: '{first_cmd}' is a blocked command"
 
+    # Argv-level escape-vector policy for allowlisted-but-exec-capable binaries
+    # (git -c / awk system() / tar --checkpoint-action / sed e / make -f).
+    # F-C-1 / F-C-2 — the headline allowlist escapes.
+    exec_msg = _check_exec_capable_binary(command_tokens)
+    if exec_msg:
+        return exec_msg
+
     # Dangerous find usage: -delete flag or -exec/-execdir with a blocked cmd
     # (finding 5)
     if first_cmd == "find":
@@ -423,6 +693,13 @@ def _check_single_segment(cmd: str, powershell: bool = False) -> str | None:
             if wrapped_name in _DENY_COMMANDS:
                 return f"BLOCKED: '{wrapped_name}' is a blocked command"
             wrapped_index = next(i for i in range(1, len(command_tokens)) if command_tokens[i] == wrapped)
+            # Apply the exec-capable argv policy to the UNWRAPPED command too, so
+            # `sudo git -c alias.x=!sh x` / `env awk 'BEGIN{system(...)}'` are
+            # blocked (the wrapper hides the real binary from the direct check
+            # above). F-C-1 / F-C-2.
+            wrapped_exec_msg = _check_exec_capable_binary(command_tokens[wrapped_index:])
+            if wrapped_exec_msg:
+                return wrapped_exec_msg
             if wrapped_name in {"sudo", "doas", "command", "env", "nohup", "nice", "time", "sh", "bash", "zsh", "fish"}:
                 nested_msg = _check_single_segment(
                     " ".join(command_tokens[wrapped_index:]), powershell=powershell
