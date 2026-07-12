@@ -118,4 +118,154 @@ migrated into the schema and stamped with the run envelope so the frontend can
 attribute a run's terminal state to its owning session (root cause of F-F-2/F-F-5).
 
 ---
-*(seams 2, 3, 4 + test plan below — written incrementally)*
+
+## Seam 2 — Rust ⇄ Python (stdout line protocol + stdin lines + /v1 HTTP bridge)
+
+The orchestrator/bridge process is spawned by Rust (`spawn_supervisor::spawn` from a
+`TaskSpec`). Rust feeds it **stdin lines** (steering, approvals) and consumes its
+**stdout lines** (events). Separately, a **loopback HTTP bridge** (`/v1/*`) lets the
+Python side (and kimctl, and the webview) call back into Rust.
+
+### 2a. The stdout line protocol — GRAMMAR (previously unwritten; this is the spec)
+
+Rust's `spawn_supervisor.rs` pump uses `BufReader::lines()`/`next_line()`, so the
+consumer is **guaranteed whole newline-delimited lines** — a JSON frame is never split
+(Team F confirmed: `parseAgentLine` never sees a partial frame). Each line is exactly
+one of:
+
+```
+line            ::= typed-event-line | legacy-line
+                    # Rust tries typed decode FIRST; on failure falls through to legacy.
+
+# ---- Typed events (the governed path) ----
+typed-event-line::= compact-json-object , newline
+                    # { "type": <TYPE> [, <payload fields...>]
+                    #   [, "run_id": <str>] [, "session_id": <str>] }
+                    # Emitted ONLY by orchestrator/events_gen.py::emit_*.
+                    # The run_id/session_id envelope is appended iff KIM_RUN_ID /
+                    # KIM_SESSION_ID are in the process env (see 2d + F-H-8).
+<TYPE>          ::= "status" | "plan" | "step" | "done" | "context" | "stats"
+                  | "ui_screenshot_flash" | "ui_show"     # NB: kim:ui splits into
+                                                          # two wire types, no "action" field
+                  | "run_done" | "run_failed" | "provider_error" | "rate_limited"
+                  | "hitl_approval_request" | "hitl_approval_result"
+                  | "tool" | "answer" | "diff" | "activity"
+                  | "command_approval_request" | "file_change_approval_request"
+                  | "user_input_request" | "command_output" | "assistant_delta"
+                  | "reasoning_delta" | "plan_update" | "diff_update"
+                  | "token_usage" | "item_lifecycle" | "turn_lifecycle"
+                    # snake_case of the schema typeNames; the ONLY authoritative list
+                    # is events.schema.json. Rust decodes via #[serde(tag="type",
+                    # rename_all="snake_case")] on the KimEvent enum (events.gen.rs).
+
+# ---- Legacy text lines (the ungoverned path) ----
+legacy-line     ::= tag-line | plan-envelope-line | diff-line | free-text
+tag-line        ::= <TAG> SP text
+<TAG>           ::= "[STATUS]" | "[STATS]" | "[CONTEXT]" | "[TOOL]" | "[ANSWER]"
+                  | "[SUCCESS]" | "[FAILED]" | "[ERROR]"
+                  | "TASK_COMPLETE:" | "NEED_HELP:"
+                    # Source of truth for the vocabulary: events_gen.py LOG_TAG_*
+                    # constants (K5) + events.schema.json "legacyTags".
+plan-envelope-line ::= "[STATUS]" SP ("[PLAN]"|"[STEP]"|"[DONE]") json-object
+                    # DOUBLE-WRAPPED: a plan marker rides inside a [STATUS] line.
+                    # agent.py:341-379 emits it; parsers.ts:54 special-cases the nesting.
+diff-line       ::= "[DIFF] path=" basename " +" int " -" int [" duration_ms=" int]
+                    # basename must be space-free: parser regex is path=(\S+).
+                    # A filename with spaces mis-parses here (typed kim:diff is safe).
+tool-line       ::= "[TOOL]" SP [module ": "] tool_name "(" json-args ")"
+                    # Frontend re-parses json-args with a hand-rolled brace/quote
+                    # state machine (utils.ts:511-524) because args may contain
+                    # unbalanced characters. Emit shape lives only in the f-string.
+free-text       ::= anything else — stderr echoes, codex CLI JSONL, tracebacks,
+                    Python crash lines ("ModuleNotFoundError: ..."). Surfaced
+                    best-effort by parseLogLine's noise/crash heuristics.
+```
+
+**Emit sites** (who writes this protocol):
+- Typed: `orchestrator/events_gen.py` only (generated).
+- Legacy: `agent.py::_log` (INFO logs mirrored to stdout in Tauri mode),
+  `cli.py:137-138`, `codex_bridge_service.py` (`print(f"{LOG_TAG_…} …")`),
+  `codex_engine/engine.py` (`print(f"{LOG_TAG_STATUS} …")`), and **Rust itself**
+  pre-spawn (`subprocess.rs:866-940` emits `[STATUS] …` strings straight onto
+  `kim-agent-output` before the child starts).
+
+**Parse/route** (`subprocess.rs::forward_agent_stdout_line(ipc_typed, is_codex, line)`):
+
+| line | typed mode + chat | typed mode + codex | legacy mode |
+|---|---|---|---|
+| valid `KimEvent` JSON | decode → `emit("kim:*")` + `merge_run_envelope` | same | raw → `kim-agent-output` (frontend's `decodeKimEventLine` swallows it) |
+| anything else | **DROPPED silently** (F-H-3) | raw → `kim-agent-output` | raw → `kim-agent-output` |
+
+Frontend legacy parsing (`chat/parsers.ts` + `chat/utils.ts::parseLogLine`) matches
+tags by **substring** (`raw.includes('[SUCCESS]')`), not anchored prefix — so any text
+that merely contains a tag token is reclassified (F-H-6). `[CONTEXT]`/`[STATS]` are in
+the `legacyTags` list but are no longer emitted as text (typed-only), so those parser
+branches are dead.
+
+**Termination contract (the split-brain — F-H-1 / F-H-2):**
+
+| Spawn shape | Terminal signal(s) | Governed? |
+|---|---|---|
+| Chat (`orchestrator.agent`) | typed `run_done{termination, success}` + optional `answer`/`activity` detail (cli.py:118-135), then process exit → Rust emits untyped `kim-agent-done{bool}` | run_done ✓ / done ✗ |
+| Codex browser-bridge (`codex_bridge_service`) | **only** legacy `TASK_COMPLETE:` / `[FAILED]` / `[ERROR]` text lines, then `kim-agent-done{bool}` — **NO typed run_done/run_failed** | ✗ |
+| Codex direct (`codex exec --json`) | codex's own JSONL (parsed by `codexEvents.ts`), then `kim-agent-done{bool}` | ✗ (foreign schema) |
+| Crash / kill | possibly only `kim-agent-done{false}` (subprocess.rs:746, M-PROC-6 guarantees it even on wait() error) | ✗ |
+
+The one guaranteed terminal signal across ALL shapes is the **untyped, un-enveloped**
+`kim-agent-done{bool}`. This is why the frontend needs a watchdog (F-F-5) and why the
+Code tab's termination is magic-string-only (F-H-2).
+
+### 2b. The stdin line protocol (Rust → Python) — one JSON object per line
+
+Two DIFFERENT consumers exist depending on spawn shape (a wrong-type line is silently
+ignored — nothing enforces routing):
+
+| `type` | Fields | Rust producer | Python consumer |
+|---|---|---|---|
+| `user_steer` | `text` | `steer_task` (subprocess.rs:304) | `ui_bridge.py::StdinPump._dispatch` → agent injects as user msg |
+| `hitl_approve` (alias `hitl_approval`) | legacy `approved: bool`, or K1/T1 `id, decision: "accept"\|"acceptForSession"\|"decline"` | `hitl_respond_approval` (hitl.rs:30) | `StdinApprovalBridge` (id-gated: stale ids voided, T1) |
+| `approval_decision` | `id, decision` | `respond_approval_decision` (hitl.rs:84) | appserver `_StdinDecisionPump.read_decision` |
+| `user_input` | `id, answers` | `respond_user_input` (hitl.rs:107) | appserver `_StdinDecisionPump.read_user_input` |
+
+`normalize_decision` (ui_bridge.py:205) maps both the legacy `{approved}` and the K1
+`{decision}` shapes; `accept_for_session` is normalized to `acceptForSession`.
+
+### 2c. The /v1 loopback HTTP bridge (Rust `http_bridge/`, the OTHER direction)
+
+Server: 127.0.0.1, ports 18991+, bound by Rust. **Auth contract:** every route requires
+header `X-Kim-Token` (constant-time compared, #19) EXCEPT `GET /v1/health`. Body cap
+32 MB (M-BRIDGE-3). The `/v1/result/{id}` dynamic route is handled AFTER the token gate,
+so it IS authenticated (F-H-9 verified-not-a-vuln, but the auth rule is undocumented →
+pin it with a test). Token file `~/.kim/bridge_token` (0600, but any same-user process
+can read it — threat model in Team C F-C-4 / Team D F-D-3/F-D-4).
+
+Clients: kimctl, `BrowserProvider` (in-app bridge mode), `bridge_client.py`, and the
+provider-page JS injected into the webview (token embedded — F-D-4).
+
+| Route | Method | Purpose | Notes |
+|---|---|---|---|
+| `/v1/health` | GET | liveness | **unauthenticated** (only exemption) |
+| `/v1/task` | POST | spawn an agent run (reuses `send_task`'s TaskSpec builders) | emits orphan `kim-agent-started` (F-H-5) |
+| `/v1/cancel` | POST | cancel the active run | |
+| `/v1/task/approve` | POST | answer a HITL approval over HTTP (kimctl) | |
+| `/v1/status` | GET | run status | token-gated since #12 |
+| `/v1/send` | POST | push a prompt into the provider webview (browser provider) | |
+| `/v1/complete` | POST | provider complete (token passed through) | resolves via `provider_url.rs` allowlist |
+| `/v1/open` | POST | navigate the webview to a URL | **no allowlist — SSRF (F-D-1)** |
+| `/v1/callback`, `/v1/result/{id}` | POST/GET | async browser-result delivery + pickup | keyed by request id |
+| `/v1/provider` | POST | switch provider webview | allowlist-checked |
+| `/v1/browser/{show,hide,click,new-chat,current-url}` | POST/GET | webview control | |
+| `/v1/browser/{meta(GET/POST),commit-url,restore}` | | `BrowserSessionMeta` thread-state sidecar | `restore` exact-origin-checked (safe) |
+| `/v1/hide`, `/v1/show` | POST | main-window visibility (screenshot blink) | |
+
+### 2d. Run-identity envelope (the cross-cut that ties Seam 1 events to a run)
+
+`events_gen.py::emit_event` appends `run_id`/`session_id` from `KIM_RUN_ID`/
+`KIM_SESSION_ID` env; `subprocess.rs::merge_run_envelope` copies them from the raw line
+onto the curated `kim:*` payload (the typed enum drops them on decode). **Only
+`chat_task_spec` exports these env vars** — `codex_browser_spec` does not (F-H-8), so
+Code-tab typed events cross the seam envelope-less and the frontend routes them by
+mounted view (defeats the stated guarantee; root cause of F-F-2/F-F-8).
+
+---
+*(seams 3, 4 + test plan below — written incrementally)*
