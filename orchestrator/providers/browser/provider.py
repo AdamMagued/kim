@@ -57,6 +57,7 @@ SETUP (visible mode):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -748,7 +749,11 @@ class BrowserProvider(BaseProvider):
         markdown scrape, then parse into the canonical response format."""
         # Rb3: a "chat tab" that is actually a sign-in / Cloudflare wall would
         # swallow the send and hang for the full generation wait — fail fast.
-        wall_reason = detect_auth_wall(getattr(page, "url", "") or "")
+        # F-B-9: pass the page title too so the title-based interstitial markers
+        # (Cloudflare "Just a moment", "Sign in to …") are actually reachable —
+        # the sole prior call passed the URL alone, making them dead code.
+        wall_title = await self._safe_page_title(page)
+        wall_reason = detect_auth_wall(getattr(page, "url", "") or "", wall_title)
         if wall_reason:
             logger.warning(f"Auth wall detected on {site}: {wall_reason} ({page.url})")
             return self._attach_usage(auth_wall_response(site, wall_reason), estimated_usage)
@@ -765,6 +770,18 @@ class BrowserProvider(BaseProvider):
             )
             await page.goto(fresh_url, wait_until="domcontentloaded")
             await asyncio.sleep(2.0)
+            # F-B-9: a signed-out site redirects the fresh-chat navigation to its
+            # login page. Re-detect the wall AFTER the goto so we fail fast with
+            # an actionable AUTH_REQUIRED instead of proceeding to _find_selector
+            # and dying with the generic "could not locate chat input box".
+            post_nav_reason = detect_auth_wall(
+                getattr(page, "url", "") or "", await self._safe_page_title(page)
+            )
+            if post_nav_reason:
+                logger.warning(
+                    f"Auth wall after fresh-chat nav on {site}: {post_nav_reason} ({page.url})"
+                )
+                return self._attach_usage(auth_wall_response(site, post_nav_reason), estimated_usage)
             self._sent_system_prompt = False
             self._last_chat_page_url = page.url
 
@@ -1576,6 +1593,24 @@ class BrowserProvider(BaseProvider):
         return await self._scrape_last_response(
             page, cfg["response_selectors"], min_index=new_element_index, as_markdown=True
         )
+
+    @staticmethod
+    async def _safe_page_title(page) -> str:
+        """Best-effort page title for auth-wall detection (F-B-9).
+
+        Returns "" when the page-like object exposes no title() (injected fakes,
+        older drivers) or the call fails — the URL-based markers still apply.
+        """
+        getter = getattr(page, "title", None)
+        if getter is None:
+            return ""
+        try:
+            result = getter()
+            if inspect.isawaitable(result):
+                result = await result
+            return str(result or "")
+        except Exception:  # noqa: BLE001
+            return ""
 
     async def _find_selector(
         self, page: Page, selectors: list[str]
