@@ -172,6 +172,23 @@ def next_run_after(schedule_expr: str, after: Optional[datetime] = None) -> date
     return base + interval
 
 
+def _advance_slot(anchor: datetime, interval: timedelta, not_before: datetime) -> datetime:
+    """Return the next scheduled slot strictly after ``not_before``.
+
+    Anchoring the next run to the previously *scheduled* slot (``anchor``)
+    rather than the wall-clock run time keeps interval schedules drift-free —
+    the scheduler's per-tick latency (up to the 60 s tick + lock waits) does
+    not compound into the period each run (F-INH-7).  When the process was
+    down for several intervals, jump ahead by whole intervals so a long gap
+    fires once, not a catch-up storm.
+    """
+    nxt = anchor + interval
+    if nxt <= not_before:
+        missed = (not_before - anchor) // interval
+        nxt = anchor + (missed + 1) * interval
+    return nxt
+
+
 def _parse_utc_iso(s: str) -> datetime:
     """Parse an ISO-8601 string to a UTC-aware datetime.
 
@@ -526,16 +543,36 @@ class CronStore:
                 )
                 return None
 
-            # Compute next_run_at before touching the file.
+            # Compute next_run_at before touching the file. Anchor to the
+            # previously scheduled slot (never-run tasks: created_at + interval)
+            # rather than the wall-clock run time so interval schedules do not
+            # drift later by the scheduler's tick latency each run (F-INH-7).
             schedule_expr = str(raw.get("schedule_expr", ""))
             try:
-                next_dt = next_run_after(schedule_expr, ran_at_dt)
+                interval = parse_schedule_expr(schedule_expr)
             except ValueError as e:
                 logger.warning(
                     "cron_store: record_run skipping task %r: bad schedule_expr %r: %s",
                     task_id, schedule_expr, e,
                 )
                 return None
+
+            prev_next = raw.get("next_run_at")
+            if prev_next:
+                # Subsequent runs anchor to the previously scheduled slot so the
+                # tick latency of THIS run is not folded into the period; the
+                # schedule stays pinned to (first-run + k*interval) instead of
+                # creeping later every tick (F-INH-7).
+                try:
+                    anchor = _parse_utc_iso(str(prev_next))
+                    next_dt = _advance_slot(anchor, interval, ran_at_dt)
+                except ValueError:
+                    # Unparseable stored slot — fall back to interval-from-now.
+                    next_dt = ran_at_dt + interval
+            else:
+                # First run of a never-run task: establish the anchor at
+                # ran_at + interval (the historical contract).
+                next_dt = ran_at_dt + interval
 
             raw["run_count"] = int(raw.get("run_count", 0)) + 1
             raw["last_run_at"] = ran_at_dt.isoformat()
