@@ -1254,28 +1254,41 @@ async fn stream_repl_turn(
     } else {
         crate::agentic::agentic_available(&config.provider)
     };
-    // Parity Part 4: code-mode turns get a decision channel (REPL → child
-    // stdin, for native codex approvals) and a pid slot (Ctrl-C → SIGTERM →
-    // turn/interrupt before the hard kill).
-    let (codex_control, decision_tx, child_pid) = if code_mode {
+    // Ctrl-C → SIGTERM (graceful) before the hard kill. The pid slot is shared
+    // by anything that spawns a killable child this turn:
+    //   - code mode's codex child (via CodexTurnControl.pid_slot), and
+    //   - F-E-5: the chat-mode agentic child (orchestrator.agent), directly and
+    //     via the browser-provider TOCTOU fallback inside stream_kim_request.
+    // Populated iff a child could be spawned; the HTTP bridge path leaves it
+    // None (there is no local child to signal).
+    let child_pid: Option<std::sync::Arc<std::sync::Mutex<Option<u32>>>> =
+        if code_mode || agentic.is_some() || provider::is_browser_provider(&config.provider) {
+            Some(std::sync::Arc::new(std::sync::Mutex::new(None::<u32>)))
+        } else {
+            None
+        };
+    // Parity Part 4: code-mode turns also get a decision channel (REPL → child
+    // stdin, for native codex approvals).
+    let (codex_control, decision_tx) = if code_mode {
         let (dtx, drx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let pid_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<u32>));
         (
             Some(crate::provider::CodexTurnControl {
                 decision_rx: drx,
-                pid_slot: pid_slot.clone(),
+                pid_slot: child_pid
+                    .clone()
+                    .expect("code_mode implies a pid slot was created above"),
             }),
             Some(dtx),
-            Some(pid_slot),
         )
     } else {
-        (None, None, None)
+        (None, None)
     };
 
     let handle = if let Some((root, python)) = agentic {
         let prompt2 = prompt.clone();
         let sid = session_id.clone();
         let provider = config.provider.clone();
+        let pid_slot = child_pid.clone();
         tokio::spawn(async move {
             let session_dir = root.join("kim_sessions");
             crate::agentic::stream_agentic_request(
@@ -1285,12 +1298,14 @@ async fn stream_repl_turn(
                 &provider,
                 &session_dir,
                 Some(&sid),
+                pid_slot,
                 tx,
             )
             .await;
         })
     } else {
         maybe_note_plain_chat(code_mode, &config.provider);
+        let pid_slot = child_pid.clone();
         tokio::spawn(async move {
             stream_kim_request(
                 &config,
@@ -1300,6 +1315,7 @@ async fn stream_repl_turn(
                 allow_non_git,
                 tx,
                 codex_control,
+                pid_slot,
             )
             .await;
         })

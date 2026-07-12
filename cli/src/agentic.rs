@@ -222,6 +222,12 @@ pub async fn stream_agentic_request(
     provider: &str,
     session_dir: &Path,
     resume_session_id: Option<&str>,
+    // F-E-5: when set, the spawned orchestrator's pid is published here so a
+    // Ctrl-C mid-run can send it a graceful SIGTERM (letting the agent flush its
+    // session/checkpoint and shut down its own children — the MCP server, a
+    // Playwright-launched Chrome) BEFORE the hard kill_on_drop SIGKILL. Chat-mode
+    // agentic runs previously left this None and went straight to SIGKILL.
+    pid_slot: Option<std::sync::Arc<std::sync::Mutex<Option<u32>>>>,
     tx: UnboundedSender<AppEvent>,
 ) {
     let mut cmd = Command::new(python);
@@ -265,6 +271,13 @@ pub async fn stream_agentic_request(
             return;
         }
     };
+    // F-E-5: publish the child pid so Ctrl-C can SIGTERM it (graceful) before
+    // the kill_on_drop SIGKILL fallback.
+    if let Some(slot) = &pid_slot {
+        if let Ok(mut s) = slot.lock() {
+            *s = child.id();
+        }
+    }
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
@@ -696,7 +709,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
         let session_dir = root.join("kim_sessions");
-        stream_agentic_request(root, &fake, "do X", "ollama", &session_dir, None, tx).await;
+        stream_agentic_request(root, &fake, "do X", "ollama", &session_dir, None, None, tx).await;
 
         let mut events = Vec::new();
         while let Ok(ev) = rx.try_recv() {
@@ -713,6 +726,50 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AppEvent::Err(t) if t.contains("could not be completed"))),
             "a FAILED run must be delivered as an Error; events: {events:?}"
+        );
+    }
+
+    /// F-E-5: the chat-mode agentic child publishes its pid to the shared slot,
+    /// so a Ctrl-C mid-run can SIGTERM it (graceful) instead of only SIGKILL.
+    /// Before the fix, `stream_agentic_request` had no pid slot and the chat
+    /// path passed None, so the pid was never recorded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agentic_child_pid_is_recorded_for_graceful_cancel() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let fake = root.join("fake-python.sh");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             echo '{\"type\":\"run_done\",\"success\":true}'\n\
+             echo '[SUCCESS] ok'\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+
+        let pid_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<u32>));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let session_dir = root.join("kim_sessions");
+        stream_agentic_request(
+            root,
+            &fake,
+            "do X",
+            "ollama",
+            &session_dir,
+            None,
+            Some(pid_slot.clone()),
+            tx,
+        )
+        .await;
+
+        assert!(
+            pid_slot.lock().unwrap().is_some(),
+            "the agentic child's pid must be recorded so Ctrl-C can SIGTERM it before SIGKILL"
         );
     }
 
@@ -739,7 +796,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
         let session_dir = root.join("kim_sessions");
-        stream_agentic_request(root, &fake, "do X", "ollama", &session_dir, None, tx).await;
+        stream_agentic_request(root, &fake, "do X", "ollama", &session_dir, None, None, tx).await;
 
         let mut events = Vec::new();
         while let Ok(ev) = rx.try_recv() {

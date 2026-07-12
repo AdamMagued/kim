@@ -286,6 +286,10 @@ pub async fn stream_kim_request(
     allow_non_git: bool,
     tx: UnboundedSender<AppEvent>,
     codex_control: Option<CodexTurnControl>,
+    // F-E-5: pid slot for the browser-provider chat-mode fallback that spawns
+    // the local orchestrator (the TOCTOU path below) — lets Ctrl-C SIGTERM it
+    // gracefully instead of SIGKILL.
+    agentic_pid_slot: Option<std::sync::Arc<std::sync::Mutex<Option<u32>>>>,
 ) {
     let prompt = messages
         .iter()
@@ -335,6 +339,7 @@ pub async fn stream_kim_request(
                     &config.provider,
                     &route.session_dir,
                     Some(&route.resume_session_id),
+                    agentic_pid_slot,
                     tx,
                 )
                 .await;
