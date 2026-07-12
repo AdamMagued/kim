@@ -615,6 +615,18 @@ export function useChatStream({
     listen<KimRunFailedPayload>(KimEventNames.RUN_FAILED, e => {
       if (!belongsToView(e.payload.session_id)) return;
       setRunFailure(e.payload);
+      // F-F-5: kim:run-failed is TERMINAL. Previously it only set runFailure and
+      // left isRunning stuck true forever when the backend died before emitting
+      // the bare-bool kim-agent-done (subprocess kill, bridge crash, panic). That
+      // both froze the "thinking…" spinner + Stop button AND actively hid the
+      // recovery banner (StreamRenderer returns null for the failure card while
+      // isRunning). Clear the running/cancel state here so the run terminates and
+      // the banner shows. runOwnerSessionIdRef stays set so a later bare
+      // kim-agent-done can still run its full finalize (persist / onTaskDone).
+      if (isRunningRef.current || runOwnerSessionIdRef.current !== null) {
+        setIsRunning(false);
+        setCancelling(false);
+      }
     }).then(fn => { if (!cancelled) unlistenTypedRunFailed = fn; else fn(); });
 
     listen<KimRateLimitedPayload>(KimEventNames.RATE_LIMITED, e => {

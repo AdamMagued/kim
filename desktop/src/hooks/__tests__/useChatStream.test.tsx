@@ -562,6 +562,28 @@ describe('useChatStream lifecycle', () => {
     });
     expect(result.current.lastRunId).toBe('run-abc-123');
   });
+
+  it('kim:run-failed is terminal: clears the spinner so the recovery banner shows (F-F-5)', async () => {
+    const { result } = await renderStream();
+    act(() => { result.current.setIsRunning(true); }); // this view owns a running run
+    expect(result.current.isRunning).toBe(true);
+
+    // Backend signals failure but (simulating a subprocess kill / bridge crash)
+    // never emits the terminal bare-bool kim-agent-done.
+    emit('kim:run-failed', {
+      reason: 'provider_failed',
+      recoverable: true,
+      suggestion: 'Retry',
+      session_id: 'conv-1',
+    });
+
+    // Spinner + Stop must clear (no infinite "thinking…"), and isDone flips true
+    // so StreamRenderer stops returning null for the failure card.
+    expect(result.current.isRunning).toBe(false);
+    expect(result.current.isDone).toBe(true);
+    expect(result.current.cancelling).toBe(false);
+    expect(result.current.runFailure).toMatchObject({ reason: 'provider_failed', recoverable: true });
+  });
 });
 
 // ── 6. Rate limit ─────────────────────────────────────────────────────────────
