@@ -461,6 +461,12 @@ class AppServerTurnRunner:
         self._answer_parts: list[str] = []
         self._interrupted = False
         self._item_titles: dict[str, str] = {}
+        # Strong references to fire-and-forget background tasks (the native
+        # compact request). asyncio.create_task keeps only a WEAK reference to
+        # the task, so without retaining it here the compact coroutine can be
+        # garbage-collected mid-flight before it completes (F-A-5). Each task
+        # removes itself on done via the discard callback below.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     # ── Public entry ─────────────────────────────────────────────────────────
 
@@ -891,12 +897,23 @@ class AppServerTurnRunner:
             self._compact_fired = True
             emit_status("Codex transcript near its budget — compacting it natively…")
             assert self._client is not None
+            # Bind the narrowed client into a local so the nested coroutine
+            # captures the non-None value (the assert's narrowing does not
+            # propagate into the closure body).
+            _client = self._client
+            _thread_id = self._thread_id
             async def _do_compact():
                 with contextlib.suppress(AppServerError, asyncio.TimeoutError):
-                    await self._client.request(
-                        "thread/compact/start", {"threadId": self._thread_id}, timeout=30.0
+                    await _client.request(
+                        "thread/compact/start", {"threadId": _thread_id}, timeout=30.0
                     )
-            asyncio.create_task(_do_compact())
+            # Retain a strong reference so the event loop can't drop the task
+            # before it finishes (F-A-5); discard it once it completes.
+            # Retain a strong reference so the event loop can't drop the task
+            # before it finishes (F-A-5); discard it once it completes.
+            _compact_task = asyncio.create_task(_do_compact())
+            self._background_tasks.add(_compact_task)
+            _compact_task.add_done_callback(self._background_tasks.discard)
 
     # ── Cancellation ─────────────────────────────────────────────────────────
 
