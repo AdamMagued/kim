@@ -24,6 +24,85 @@ pub(crate) fn merge_run_envelope(
     payload
 }
 
+/// Maximum bytes buffered for a single stdout/stderr line before Kim truncates
+/// it. F-D-5: `BufReader::lines().next_line()` accumulates an entire line (a
+/// child that emits a single multi-GB line, or floods with no newline, grows
+/// Rust-side memory unboundedly) before yielding, and the request-body path
+/// already has M-BRIDGE-3's 32 MB cap while the stdout path had none. 8 MiB is
+/// far above any legitimate typed event or narration line.
+pub(crate) const MAX_STDOUT_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// A bounded, chunk-fed line splitter. F-D-5: feed it whatever bytes a child's
+/// stdout/stderr read returns; it yields completed newline-delimited lines but
+/// never buffers more than `cap` bytes for any single line — an over-cap line
+/// is truncated (with a marker) and the physical overflow is drained without
+/// buffering. This is what bounds peak memory instead of `next_line()`'s
+/// unbounded `String` growth. Pure (no I/O), so it is unit-tested directly.
+pub(crate) struct CappedLineSplitter {
+    cap: usize,
+    line: Vec<u8>,
+    overflowing: bool,
+}
+
+impl CappedLineSplitter {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            line: Vec::new(),
+            overflowing: false,
+        }
+    }
+
+    /// Feed one read chunk, invoking `emit` for each completed line.
+    pub(crate) fn push(&mut self, mut chunk: &[u8], mut emit: impl FnMut(String)) {
+        while let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            if !self.overflowing {
+                self.append_capped(&chunk[..pos]);
+            }
+            emit(self.take_line());
+            chunk = &chunk[pos + 1..];
+        }
+        if !chunk.is_empty() && !self.overflowing {
+            self.append_capped(chunk);
+        }
+    }
+
+    /// Flush a trailing partial line (input that ended without a newline),
+    /// matching `BufReader::lines()`, which yields the final unterminated line.
+    pub(crate) fn finish(&mut self, mut emit: impl FnMut(String)) {
+        if !self.line.is_empty() || self.overflowing {
+            emit(self.take_line());
+        }
+    }
+
+    fn append_capped(&mut self, seg: &[u8]) {
+        if self.line.len() >= self.cap {
+            self.overflowing = true;
+            return;
+        }
+        let room = self.cap - self.line.len();
+        let take = room.min(seg.len());
+        self.line.extend_from_slice(&seg[..take]);
+        if self.line.len() >= self.cap {
+            self.overflowing = true;
+        }
+    }
+
+    fn take_line(&mut self) -> String {
+        // Match BufReader::lines() CRLF handling: drop a trailing '\r'.
+        if self.line.last() == Some(&b'\r') {
+            self.line.pop();
+        }
+        let mut out = String::from_utf8_lossy(&self.line).into_owned();
+        if self.overflowing {
+            out.push_str(" …[Kim truncated an oversized stdout line]");
+        }
+        self.line.clear();
+        self.overflowing = false;
+        out
+    }
+}
+
 pub(crate) fn forward_agent_stdout_line(
     app: &tauri::AppHandle,
     ipc_typed: bool,
@@ -1070,6 +1149,63 @@ pub(crate) fn process_exists(pid: u32) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    // -- F-D-5: bounded stdout line splitter --
+
+    fn split_all(cap: usize, chunks: &[&[u8]]) -> Vec<String> {
+        let mut s = CappedLineSplitter::new(cap);
+        let mut out = Vec::new();
+        for c in chunks {
+            s.push(c, |line| out.push(line));
+        }
+        s.finish(|line| out.push(line));
+        out
+    }
+
+    #[test]
+    fn splitter_yields_lines_like_bufreader() {
+        // Multiple lines in one chunk, split across chunk boundaries, CRLF, and
+        // a trailing unterminated line all behave like BufReader::lines().
+        let out = split_all(1024, &[b"alpha\nbeta\r\n", b"gam", b"ma\ndelta"]);
+        assert_eq!(out, vec!["alpha", "beta", "gamma", "delta"]);
+    }
+
+    #[test]
+    fn splitter_empty_lines_preserved() {
+        let out = split_all(1024, &[b"\n\nx\n"]);
+        assert_eq!(out, vec!["", "", "x"]);
+    }
+
+    #[test]
+    fn splitter_truncates_oversized_line() {
+        // A single line far larger than the cap is truncated to ~cap bytes with
+        // a marker — never buffered whole.
+        let cap = 16;
+        let big = vec![b'A'; 10_000];
+        let mut chunks: Vec<&[u8]> = vec![&big];
+        let nl = b"\ntail\n";
+        chunks.push(nl);
+        let out = split_all(cap, &chunks);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].starts_with("AAAA"), "got {:?}", out[0]);
+        assert!(out[0].contains("truncated"), "expected marker: {:?}", out[0]);
+        // The capped prefix stays within cap + the marker (no 10k buffering).
+        assert!(out[0].len() < cap + 64);
+        // The line AFTER the oversized one is unaffected.
+        assert_eq!(out[1], "tail");
+    }
+
+    #[test]
+    fn splitter_no_newline_flood_is_bounded_at_eof() {
+        // A child that emits a huge run with no newline at all still yields a
+        // single bounded, truncated line at EOF (finish()).
+        let cap = 8;
+        let big = vec![b'x'; 5000];
+        let out = split_all(cap, &[&big]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("truncated"));
+        assert!(out[0].len() < cap + 64);
+    }
 
     #[test]
     fn bare_system_python_is_classified() {

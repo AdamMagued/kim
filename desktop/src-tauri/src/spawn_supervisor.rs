@@ -118,25 +118,51 @@ pub(crate) async fn supervise(
     app: tauri::AppHandle,
     ipc_typed: bool,
 ) -> Result<std::process::ExitStatus, String> {
-    use tokio::io::AsyncBufReadExt;
+    use crate::subprocess::{CappedLineSplitter, MAX_STDOUT_LINE_BYTES};
+    use tokio::io::AsyncReadExt;
 
     let is_codex = sup.is_codex;
-    let stdout_handle = sup.child.stdout.take().map(|stdout| {
+    // F-D-5: read stdout in fixed 64 KiB chunks and split lines through a
+    // bounded accumulator instead of BufReader::lines(), whose next_line()
+    // grows an unbounded String for a no-newline / multi-GB-line child. Peak
+    // per-line memory is now capped at MAX_STDOUT_LINE_BYTES.
+    let stdout_handle = sup.child.stdout.take().map(|mut stdout| {
         let app = app.clone();
         tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                crate::subprocess::forward_agent_stdout_line(&app, ipc_typed, is_codex, &line);
+            let mut splitter = CappedLineSplitter::new(MAX_STDOUT_LINE_BYTES);
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                match stdout.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => splitter.push(&chunk[..n], |line| {
+                        crate::subprocess::forward_agent_stdout_line(
+                            &app, ipc_typed, is_codex, &line,
+                        );
+                    }),
+                }
             }
+            splitter.finish(|line| {
+                crate::subprocess::forward_agent_stdout_line(&app, ipc_typed, is_codex, &line);
+            });
         })
     });
-    let stderr_handle = sup.child.stderr.take().map(|stderr| {
+    let stderr_handle = sup.child.stderr.take().map(|mut stderr| {
         let app = app.clone();
         tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = app.emit("kim-agent-error", line);
+            // Same bounded splitter for stderr (also an untrusted pump).
+            let mut splitter = CappedLineSplitter::new(MAX_STDOUT_LINE_BYTES);
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => splitter.push(&chunk[..n], |line| {
+                        let _ = app.emit("kim-agent-error", line);
+                    }),
+                }
             }
+            splitter.finish(|line| {
+                let _ = app.emit("kim-agent-error", line);
+            });
         })
     });
 
