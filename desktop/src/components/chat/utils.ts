@@ -158,8 +158,7 @@ export function extractTouchedFiles(messages: KimMessage[]): TouchedFile[] {
       if (block.type === 'tool_result') {
         const trb = block as ToolResultBlock;
         const raw = typeof trb.content === 'string' ? trb.content
-          : (trb as unknown as { output?: string }).output
-            ? String((trb as unknown as { output: string }).output) : '';
+          : trb.output ? String(trb.output) : '';
         if (!raw.trim()) continue;
         const parsed = parseMaybeNestedJson(raw);
         if (!parsed) continue;
@@ -616,8 +615,9 @@ export function synthesizeActivityFromMessages(messages: KimMessage[], toolMap: 
         const args = (tb.input && typeof tb.input === 'object') ? tb.input as Record<string, unknown> : {};
         items.push({ id: ++id, kind: 'tool', icon: def?.icon ?? '›', text: def ? def.label(args) : `Using tool: \`${tb.name}\`` });
       } else if (block.type === 'tool_result') {
-        const raw = typeof (block as ToolResultBlock).content === 'string' ? (block as ToolResultBlock).content as string
-          : String((block as unknown as { output?: string }).output ?? '');
+        const trb = block as ToolResultBlock;
+        const raw = typeof trb.content === 'string' ? trb.content
+          : String(trb.output ?? '');
         if (!raw.trim()) continue;
         const parsed = parseMaybeNestedJson(raw);
         if (parsed?.filePath) {

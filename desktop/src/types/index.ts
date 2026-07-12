@@ -52,6 +52,12 @@ export interface ToolResultBlock {
   type: 'tool_result';
   tool_use_id: string;
   content: string | ContentBlock[];
+  // F-F-9: the runtime session JSONL (Python/Rust) also serializes tool results
+  // with an `output` string on some paths (codex/app-server transcripts). The
+  // frontend reads it in extractTouchedFiles / synthesizeActivityFromMessages;
+  // model it here so those reads are type-checked instead of hidden behind
+  // `as unknown as { output }` casts that would silently rot on a backend rename.
+  output?: string;
 }
 
 export interface ImageBlock {
