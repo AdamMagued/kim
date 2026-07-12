@@ -337,11 +337,9 @@ pub fn codex_browser_spec(p: CodexBridgeSpecParams<'_>) -> TaskSpec {
     }
 }
 
-/// Parameters for a direct Codex/Claw CLI spawn (no Kim orchestrator).
+/// Parameters for a direct Codex CLI spawn (no Kim orchestrator).
 pub struct CodexDirectSpecParams<'a> {
     pub code_bin: &'a Path,
-    /// True for the bundled Claw compatibility binary (legacy interface).
-    pub is_claw: bool,
     pub target_root: &'a Path,
     pub task: &'a str,
     /// `KIM_CODEX_BYPASS_SANDBOX=1` opt-in (#1) — resolved by the caller.
@@ -350,33 +348,24 @@ pub struct CodexDirectSpecParams<'a> {
     pub session_id: String,
 }
 
-/// Build the direct-API Codex CLI spec (`codex exec --json …`) or the Claw
-/// compatibility spec (`claw --output-format json prompt …`).
+/// Build the direct-API Codex CLI spec (`codex exec --json …`).
+///
+/// F-G-1: the legacy Claw compatibility shape (`claw --output-format json
+/// prompt …`) was removed along with the deleted `pythonExperimentTool/` tree.
 pub fn codex_direct_spec(p: CodexDirectSpecParams<'_>) -> TaskSpec {
-    let mut args: Vec<String> = Vec::new();
-    let cwd = if p.is_claw {
-        // Claw compatibility binary: old --output-format json interface,
-        // runs in the target project directory.
-        args.extend(["--output-format".into(), "json".into()]);
-        args.extend(p.route.args.iter().cloned());
-        args.extend(["prompt".into(), p.task.into()]);
-        Some(p.target_root.to_path_buf())
-    } else {
-        // OpenAI Codex CLI: `exec --json`, target dir via -C (cwd inherited).
-        args.extend(["exec".into(), "--json".into()]);
-        if p.bypass_sandbox {
-            args.push("--dangerously-bypass-approvals-and-sandbox".into());
-        }
-        args.extend(["-C".into(), p.target_root.to_string_lossy().into_owned()]);
-        args.extend(p.route.args.iter().cloned());
-        args.push(p.task.into());
-        None
-    };
+    // OpenAI Codex CLI: `exec --json`, target dir via -C (cwd inherited).
+    let mut args: Vec<String> = vec!["exec".into(), "--json".into()];
+    if p.bypass_sandbox {
+        args.push("--dangerously-bypass-approvals-and-sandbox".into());
+    }
+    args.extend(["-C".into(), p.target_root.to_string_lossy().into_owned()]);
+    args.extend(p.route.args.iter().cloned());
+    args.push(p.task.into());
 
     TaskSpec {
         program: p.code_bin.to_string_lossy().into_owned(),
         args,
-        cwd,
+        cwd: None,
         envs: p.route.envs,
         stdin: StdinMode::Null,
         session_id: p.session_id,
@@ -559,7 +548,6 @@ mod tests {
     fn codex_direct_spec_codex_shape_with_bypass_and_route() {
         let spec = codex_direct_spec(CodexDirectSpecParams {
             code_bin: Path::new("/bin/codex"),
-            is_claw: false,
             target_root: Path::new("/proj"),
             task: "fix bug",
             bypass_sandbox: true,
@@ -592,7 +580,6 @@ mod tests {
     fn codex_direct_spec_default_is_sandboxed() {
         let spec = codex_direct_spec(CodexDirectSpecParams {
             code_bin: Path::new("/bin/codex"),
-            is_claw: false,
             target_root: Path::new("/proj"),
             task: "t",
             bypass_sandbox: false,
@@ -602,27 +589,5 @@ mod tests {
         assert!(!spec
             .args
             .contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
-    }
-
-    #[test]
-    fn codex_direct_spec_claw_shape() {
-        let spec = codex_direct_spec(CodexDirectSpecParams {
-            code_bin: Path::new("/bin/claw"),
-            is_claw: true,
-            target_root: Path::new("/proj"),
-            task: "t",
-            bypass_sandbox: true, // ignored for claw
-            route: ProviderRoute {
-                args: vec!["--model".into(), "c".into()],
-                envs: vec![],
-                label: "claw".into(),
-            },
-            session_id: "s".into(),
-        });
-        assert_eq!(
-            spec.args,
-            vec!["--output-format", "json", "--model", "c", "prompt", "t"]
-        );
-        assert_eq!(spec.cwd.as_deref(), Some(Path::new("/proj")));
     }
 }

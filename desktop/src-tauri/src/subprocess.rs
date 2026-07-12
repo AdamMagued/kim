@@ -458,45 +458,9 @@ fn install_script_venv_candidates(home: &Path) -> [PathBuf; 2] {
     ]
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CodeBackendKind {
-    Codex,
-    Claw,
-}
-
-impl CodeBackendKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Codex => "Codex",
-            Self::Claw => "Claw compatibility",
-        }
-    }
-
-    fn binary_label(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Claw => "claw",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct CodeBackend {
-    kind: CodeBackendKind,
-    binary: PathBuf,
-}
-
-fn executable_from_env(key: &str, kind: CodeBackendKind) -> Option<CodeBackend> {
-    let path = PathBuf::from(std::env::var(key).ok()?);
-    if path.is_file() {
-        Some(CodeBackend { kind, binary: path })
-    } else {
-        None
-    }
-}
-
-fn executable_on_path(name: &str, kind: CodeBackendKind) -> Option<CodeBackend> {
-    // Use the platform-appropriate PATH search command (#20).
+/// Search PATH for an executable, returning its resolved path. (#20: uses the
+/// platform-appropriate lookup command.)
+fn executable_on_path(name: &str) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let search_cmd = ("where", name);
     #[cfg(not(target_os = "windows"))]
@@ -519,58 +483,25 @@ fn executable_on_path(name: &str, kind: CodeBackendKind) -> Option<CodeBackend> 
     if s.is_empty() {
         None
     } else {
-        Some(CodeBackend {
-            kind,
-            binary: PathBuf::from(s),
-        })
+        Some(PathBuf::from(s))
     }
 }
 
-fn bundled_code_backend(kim_root: &Path, kind: CodeBackendKind) -> Option<CodeBackend> {
-    let mut roots: Vec<PathBuf> = vec![kim_root.to_path_buf()];
-    if let Some(parent) = kim_root.parent() {
-        roots.push(parent.to_path_buf());
-    }
-    let relative = match kind {
-        CodeBackendKind::Codex => "pythonExperimentTool/codex-code/rust/target",
-        CodeBackendKind::Claw => "pythonExperimentTool/claw-code/rust/target",
-    };
-    let binary_name = kind.binary_label();
-    for root in &roots {
-        for sub in &["release", "debug"] {
-            let p = root.join(relative).join(sub).join(binary_name);
-            if p.is_file() {
-                return Some(CodeBackend { kind, binary: p });
-            }
-        }
-    }
-    None
-}
-
-/// Locate the code-agent binary. Prefer the post-migration `codex` binary,
-/// but fall back to the bundled `claw` binary while this branch still carries
-/// the old Rust workspace layout.
-fn find_code_backend(kim_root: &Path) -> Option<CodeBackend> {
+/// Locate the `codex` binary for the Code tab.
+///
+/// F-G-1: the bundled-Codex / bundled-Claw arms (`pythonExperimentTool/…`) and
+/// the `CLAW_BIN` env / `claw`-on-PATH fallbacks were removed — the vendored
+/// `pythonExperimentTool/` tree is deleted, so those arms were dead hooks that
+/// could only ever produce a misleading "Build pythonExperimentTool/…" error.
+/// Resolution is now simply: `CODEX_BIN` env → `codex` on PATH.
+fn find_code_backend(_kim_root: &Path) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CODEX_BIN") {
         let path = PathBuf::from(p);
         if path.is_file() {
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            let kind = if filename == "claw" {
-                CodeBackendKind::Claw
-            } else {
-                CodeBackendKind::Codex
-            };
-            return Some(CodeBackend { kind, binary: path });
+            return Some(path);
         }
     }
-    executable_from_env("CLAW_BIN", CodeBackendKind::Claw)
-        .or_else(|| bundled_code_backend(kim_root, CodeBackendKind::Codex))
-        .or_else(|| executable_on_path("codex", CodeBackendKind::Codex))
-        .or_else(|| bundled_code_backend(kim_root, CodeBackendKind::Claw))
-        .or_else(|| executable_on_path("claw", CodeBackendKind::Claw))
+    executable_on_path("codex")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -685,11 +616,11 @@ pub(crate) async fn send_task(
     // spawn() below, these builders have no reservation to release
     // internally.
     let spec_result = if !is_codex {
-        build_gui_chat_spec(&inputs, extra).await.map(|s| (s, false))
+        build_gui_chat_spec(&inputs, extra).await
     } else {
         build_gui_codex_spec(&inputs, extra, &app_handle, &app_config).await
     };
-    let (spec, was_claw) = match spec_result {
+    let spec = match spec_result {
         Ok(v) => v,
         Err(e) => {
             crate::spawn_supervisor::release_slot().await;
@@ -753,9 +684,6 @@ pub(crate) async fn send_task(
     };
 
     if is_codex {
-        if was_claw {
-            let _ = mirror_latest_claw_session_to_codex(&target_root);
-        }
         if let Some(session) = newest_codex_session(&target_root) {
             let _ = app_handle.emit("kim-agent-code-session", session);
         }
@@ -845,27 +773,23 @@ async fn build_gui_chat_spec(
 }
 
 /// Code-tab spec: either the Codex browser-bridge (`codex_bridge_service`
-/// relaying through Kim's BrowserProvider) or the direct codex/claw CLI.
-/// Returns the spec plus whether the Claw compatibility backend was used
-/// (the caller mirrors Claw sessions after exit).
+/// relaying through Kim's BrowserProvider) or the direct Codex CLI.
 async fn build_gui_codex_spec(
     p: &GuiSpawnInputs<'_>,
     extra: crate::task_spec::EnvBuilder,
     app_handle: &tauri::AppHandle,
     app_config: &config::AppConfig,
-) -> Result<(crate::task_spec::TaskSpec, bool), String> {
+) -> Result<crate::task_spec::TaskSpec, String> {
     use crate::task_spec;
 
-    let backend = find_code_backend(p.kim_root).ok_or_else(|| {
-        "Code agent binary not found. Build `pythonExperimentTool/codex-code/rust` for Codex, build `pythonExperimentTool/claw-code/rust` for the bundled compatibility backend, or set CODEX_BIN/CLAW_BIN to the binary path.".to_string()
-    })?;
+    // F-G-1: the vendored bundled-Codex/bundled-Claw backends are gone, so the
+    // only resolution is CODEX_BIN or `codex` on PATH.
+    let codex_bin = find_code_backend(p.kim_root)
+        .ok_or_else(|| "Code agent binary not found. Install codex or set CODEX_BIN to the binary path.".to_string())?;
 
     if task_spec::is_browser_provider(p.provider_arg) {
         // Browser-bridge mode: codex_bridge_service relays each LLM request
         // through Kim's BrowserProvider. No Anthropic key needed.
-        if backend.kind == CodeBackendKind::Claw {
-            return Err("Browser-backed Code mode needs the Codex binary. This checkout only has the bundled Claw compatibility binary, so switch the provider to Ollama/OpenAI or build/set CODEX_BIN.".to_string());
-        }
         let python = find_python_interpreter(p.kim_root)?;
         let _ = app_handle.emit(
             "kim-agent-output",
@@ -876,7 +800,7 @@ async fn build_gui_codex_spec(
         );
         let _ = app_handle.emit(
             "kim-agent-output",
-            format!("[STATUS] codex binary: {}", backend.binary.display()),
+            format!("[STATUS] codex binary: {}", codex_bin.display()),
         );
         let spec = task_spec::codex_browser_spec(task_spec::CodexBridgeSpecParams {
             python: &python,
@@ -884,17 +808,16 @@ async fn build_gui_codex_spec(
             target_root: p.target_root,
             task: p.task,
             provider: p.provider_arg,
-            codex_bin: &backend.binary,
+            codex_bin: &codex_bin,
             session_id: p.session_id.to_string(),
             permission_mode: p.permission,
             extra_envs: extra.build(),
         });
-        return Ok((spec, false));
+        return Ok(spec);
     }
 
-    // Direct API mode: run the codex/claw binary itself.
-    let was_claw = backend.kind == CodeBackendKind::Claw;
-    let route = if !was_claw && p.provider_arg.trim().eq_ignore_ascii_case("ollama") {
+    // Direct API mode: run the Codex CLI itself.
+    let route = if p.provider_arg.trim().eq_ignore_ascii_case("ollama") {
         // Codex bypasses its ChatGPT auth entirely via --oss.
         let model = selected_ollama_codex_model(
             p.ollama_mode,
@@ -927,24 +850,16 @@ async fn build_gui_codex_spec(
         )
         .await?
     };
-    let status_line = if was_claw {
-        format!(
-            "[STATUS] Routing code task to {} via {}: {}",
-            backend.kind.label(),
-            route.label,
-            backend.binary.display(),
-        )
-    } else {
+    let _ = app_handle.emit(
+        "kim-agent-output",
         format!(
             "[STATUS] ✓ Using Codex CLI via {}: {}",
             route.label,
-            backend.binary.display(),
-        )
-    };
-    let _ = app_handle.emit("kim-agent-output", status_line);
+            codex_bin.display(),
+        ),
+    );
     let spec = task_spec::codex_direct_spec(task_spec::CodexDirectSpecParams {
-        code_bin: &backend.binary,
-        is_claw: was_claw,
+        code_bin: &codex_bin,
         target_root: p.target_root,
         task: p.task,
         // Gated behind an explicit opt-in env var (#1). Default: sandboxed +
@@ -953,7 +868,7 @@ async fn build_gui_codex_spec(
         route,
         session_id: p.session_id.to_string(),
     });
-    Ok((spec, was_claw))
+    Ok(spec)
 }
 
 /// Launch Chrome for CDP if no in-app webview bridge is configured, waiting

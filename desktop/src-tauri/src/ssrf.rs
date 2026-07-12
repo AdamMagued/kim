@@ -33,8 +33,10 @@ fn whatwg_ipv4_part(tok: &str) -> Option<u64> {
         (10u32, tok)
     };
     if digits.is_empty() {
-        // "0x" / "0" with nothing after: treat lone "0" as decimal zero.
-        return if tok == "0" { Some(0) } else if radix == 8 { Some(0) } else { None };
+        // Only reachable for a bare "0x"/"0X" prefix with no hex digits — not a
+        // valid IPv4 part. (Lone "0" parses as decimal zero via the path below;
+        // the octal branch requires len>1 so it never yields empty digits.)
+        return None;
     }
     u64::from_str_radix(digits, radix).ok()
 }

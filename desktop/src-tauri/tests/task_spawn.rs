@@ -124,7 +124,6 @@ fn provider_promotion_is_code_tab_only() {
 fn codex_direct_spec_has_no_stdin_and_no_orchestrator_env() {
     let spec = codex_direct_spec(CodexDirectSpecParams {
         code_bin: Path::new("/bin/codex"),
-        is_claw: false,
         target_root: Path::new("/proj"),
         task: "t",
         bypass_sandbox: false,

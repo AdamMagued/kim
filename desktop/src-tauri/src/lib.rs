@@ -46,7 +46,7 @@ pub mod task_spec;
 // Re-export commonly used types/helpers from submodules so remaining lib.rs
 // code (session listing, run history, codex file-bridge) can use them unqualified.
 use codex_bridge::start_bridge_file_watcher;
-use codex_projects::{mirror_latest_claw_session_to_codex, newest_codex_session};
+use codex_projects::newest_codex_session;
 use http_bridge::{capitalize, start_webview_bridge_server};
 use ollama::ollama_tags;
 use screenshot_flash::show_screenshot_flash;
