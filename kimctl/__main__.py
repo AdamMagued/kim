@@ -64,6 +64,26 @@ def _get_fallback_token() -> str:
     return token
 
 
+def _read_home_bridge_token() -> str:
+    """Read the loopback bridge token the desktop persists to ~/.kim/bridge_token.
+
+    Since D2 the desktop app writes the active bridge token ONLY to
+    ~/.kim/bridge_token (0600, rewritten every start) and deletes the legacy
+    kim_sessions/.bridge_token. The `kim` CLI reads it
+    (cli/src/provider/bridge.rs::bridge_token_from_file); kimctl must too, or on
+    a default install with no KIM_API_KEY every kimctl bridge command 401s while
+    `kim` pairs fine (F-E-13).
+    """
+    token_file = Path.home() / ".kim" / "bridge_token"
+    try:
+        text = token_file.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    except OSError:
+        pass
+    return ""
+
+
 def _read_bridge_url_file(root: Path) -> str:
     """Read URL from kim_sessions/.bridge_url."""
     token_file = root / "kim_sessions" / ".bridge_url"
@@ -112,6 +132,15 @@ def _resolve_bridge() -> tuple[str, str]:
 
     if url and token:
         return url, token
+
+    # F-E-13: pairing-token ladder mirroring cli/src/provider/bridge.rs — an
+    # explicit KIM_API_KEY env override wins, then the desktop's
+    # ~/.kim/bridge_token pairing file, then the mcp_server config api_key.
+    if not token:
+        token = os.environ.get("KIM_API_KEY", "").strip()
+
+    if not token:
+        token = _read_home_bridge_token()
 
     if not token:
         token = _get_fallback_token()
@@ -356,6 +385,25 @@ def cmd_send(args):
     session_id = data.get("session_id", "")
     sessions_dir = data.get("sessions_dir", "")
 
+    # F-E-7: snapshot the session file's byte size *now* — right after POST,
+    # before the orchestrator processes this task. When --session resumes an
+    # existing session, its previous task's TASK_COMPLETE / NEED_HELP line is
+    # already on disk; polling from offset 0 would match that STALE line on the
+    # first read and report instant (wrong) success. A brand-new session has no
+    # file yet → baseline 0, so its own completion is still read from the start.
+    baseline_offset = 0
+    _existing = _find_session_file(session_id) if session_id else None
+    if _existing is None and session_id and sessions_dir:
+        import datetime
+        _cand = Path(sessions_dir) / datetime.date.today().isoformat() / f"{session_id}.jsonl"
+        if _cand.exists():
+            _existing = _cand
+    if _existing is not None:
+        try:
+            baseline_offset = _existing.stat().st_size
+        except OSError:
+            baseline_offset = 0
+
     if args.json and args.detach:
         _print_json({"ok": True, "session_id": session_id})
         sys.exit(EXIT_OK)
@@ -370,7 +418,7 @@ def cmd_send(args):
     timeout = args.timeout
     deadline = time.time() + timeout
     poll_interval = 0.5
-    last_offset = 0
+    last_offset = baseline_offset  # F-E-7: skip pre-existing (stale) records
     session_file: Optional[Path] = None
 
     # Wait briefly for the JSONL file to appear
@@ -398,13 +446,27 @@ def cmd_send(args):
     # Poll for TASK_COMPLETE / NEED_HELP
     while time.time() < deadline:
         try:
-            with open(session_file, "r", encoding="utf-8") as f:
+            # F-E-8: read in binary and only advance past the last *newline-
+            # terminated* line. The orchestrator appends records with a
+            # buffered write; a poll that lands mid-write would otherwise
+            # consume a half-flushed line, advance the offset past it, and never
+            # see the completed record — spinning until timeout on a task that
+            # actually succeeded. Keep the partial tail for the next poll.
+            with open(session_file, "rb") as f:
                 f.seek(last_offset)
-                new_data = f.read()
-                last_offset = f.tell()
+                chunk = f.read()
         except FileNotFoundError:
             time.sleep(poll_interval)
             continue
+
+        nl = chunk.rfind(b"\n")
+        if nl == -1:
+            # No complete line appended yet — wait without advancing.
+            time.sleep(poll_interval)
+            continue
+        consumed = chunk[: nl + 1]
+        last_offset += len(consumed)
+        new_data = consumed.decode("utf-8", errors="replace")
 
         if new_data.strip():
             for line in new_data.strip().splitlines():
@@ -475,6 +537,11 @@ def cmd_cancel(args):
     else:
         msg = data.get("message", "Done")
         print(f"{'✅' if data.get('ok') else '❌'} {msg}")
+
+    # F-E-12: honour the exit-code vocabulary — a failed cancel (e.g. "no task
+    # running") must not report success to a script.
+    if not data.get("ok"):
+        sys.exit(EXIT_TRANSPORT)
 
 
 # ---------------------------------------------------------------------------
@@ -942,20 +1009,31 @@ def cmd_trace(args):
 
 
 def cmd_browser(args):
+    # Validate the action/args up front so a usage error (exit 1) is never
+    # confused with a transport failure (exit 3).
     if args.browser_action == "show":
-        resp = _bridge_request("POST", "/v1/browser/show", json={})
+        endpoint, body = "/v1/browser/show", {}
     elif args.browser_action == "hide":
-        resp = _bridge_request("POST", "/v1/browser/hide", json={})
+        endpoint, body = "/v1/browser/hide", {}
     elif args.browser_action == "new-chat":
-        resp = _bridge_request("POST", "/v1/browser/new-chat", json={})
+        endpoint, body = "/v1/browser/new-chat", {}
     elif args.browser_action == "click":
         if not args.selector:
             print("Error: --selector is required for 'click'", file=sys.stderr)
             sys.exit(1)
-        resp = _bridge_request("POST", "/v1/browser/click", json={"selector": args.selector})
+        endpoint, body = "/v1/browser/click", {"selector": args.selector}
     else:
         print(f"Unknown browser action: {args.browser_action}", file=sys.stderr)
         sys.exit(1)
+
+    # F-E-12: wrap the bridge request like cmd_status/cmd_cancel so a closed
+    # desktop yields the friendly transport error instead of a raw httpx
+    # ConnectError traceback.
+    try:
+        resp = _bridge_request("POST", endpoint, json=body)
+    except Exception as e:
+        print(f"Error connecting to Kim bridge: {e}", file=sys.stderr)
+        sys.exit(EXIT_TRANSPORT)
 
     try:
         data = resp.json()
@@ -969,6 +1047,10 @@ def cmd_browser(args):
             print("✅ Done")
         else:
             print(f"❌ {data.get('error', 'Failed')}")
+
+    # F-E-12: a failed browser command must not exit 0.
+    if not data.get("ok"):
+        sys.exit(EXIT_TRANSPORT)
 
 
 # ---------------------------------------------------------------------------

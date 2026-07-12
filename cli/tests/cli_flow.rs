@@ -221,6 +221,32 @@ fn run_kim_chat(home: &tempfile::TempDir, prompt: &str, extra_env: &[(&str, &str
     cmd.output().expect("kim binary should run")
 }
 
+/// Run `kim <args...>` with the same isolation as `run_kim_chat` (fresh HOME +
+/// temp cwd + clean proxy env), for subcommands other than `chat`.
+fn run_kim(home: &tempfile::TempDir, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    let cwd = tempfile::tempdir().expect("temp cwd");
+    let kim_bin = cwd.path().join("kim");
+    std::fs::copy(env!("CARGO_BIN_EXE_kim"), &kim_bin).expect("copy kim binary");
+    let mut cmd = Command::new(&kim_bin);
+    cmd.args(args)
+        .current_dir(cwd.path())
+        .env("HOME", home.path())
+        .env_remove("KIM_PROJECT_ROOT")
+        .env_remove("KIM_API_KEY")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("kim binary should run")
+}
+
 fn combined_output(output: &Output) -> String {
     format!(
         "{}{}",
@@ -476,5 +502,101 @@ fn browser_provider_errors_cleanly_when_bridge_is_down() {
         requests.iter().any(|r| r.path == "/health")
             && requests.iter().any(|r| r.path == "/v1/health"),
         "both health endpoints should be tried; got {requests:?}"
+    );
+}
+
+// ── F-E-1: `kim doctor` exit-code gating ────────────────────────────────────
+
+// A closed Ollama endpoint plus a bogus model is a provider-specific (optional)
+// failure. `kim doctor --strict` must exit non-zero (CI/install-script gate);
+// plain `kim doctor` keeps exit 0 because the only failing checks are optional.
+// Before the fix, `kim doctor` always exited 0 and `--strict` was ignored.
+#[test]
+fn doctor_strict_exits_nonzero_on_provider_failure_but_plain_stays_zero() {
+    // 127.0.0.1:1 refuses instantly — no network, fully deterministic.
+    let config = serde_json::json!({
+        "provider": "ollama",
+        "model": "definitely-not-a-real-model-xyz",
+        "theme": "dark-neovim",
+        "ollama_base_url": "http://127.0.0.1:1",
+        "desktop_bridge_url": "http://127.0.0.1:1",
+        "api_keys": {}
+    });
+    let home = temp_home_with_config(&config);
+
+    let strict = run_kim(&home, &["doctor", "--strict"], &[]);
+    assert!(
+        !strict.status.success(),
+        "kim doctor --strict must exit non-zero when a provider check fails; output:\n{}",
+        combined_output(&strict)
+    );
+
+    let plain = run_kim(&home, &["doctor"], &[]);
+    // Plain doctor only gates on required checks (a Python interpreter, present
+    // on the host); provider-specific failures do not gate it.
+    assert!(
+        plain.status.success(),
+        "plain kim doctor must stay exit 0 when only provider-specific checks fail; output:\n{}",
+        combined_output(&plain)
+    );
+    // Both still print the human-readable report.
+    assert!(combined_output(&plain).contains("KimCLI doctor"));
+}
+
+// ── F-E-14: code mode rejects non-ollama/non-browser providers up front ──────
+
+// With provider=claude, `kim code` used to fall through the openai-only gate
+// into the local-codex branch, pointing codex at ollama with a claude model
+// name (404). The gate now rejects it with exit 2 BEFORE any run starts. (Before
+// the fix, the non-git-repo check would exit 1 instead — never the gate's 2.)
+#[test]
+fn code_mode_rejects_non_ollama_provider_with_exit_2() {
+    let config = serde_json::json!({
+        "provider": "claude",
+        "model": "claude-sonnet-4-6",
+        "theme": "dark-neovim",
+        "ollama_base_url": "http://127.0.0.1:1",
+        "desktop_bridge_url": "http://127.0.0.1:1",
+        "api_keys": {"claude": "test-key"}
+    });
+    let home = temp_home_with_config(&config);
+
+    let out = run_kim(&home, &["code", "do something"], &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "code mode with a claude provider must exit 2 (provider gate), not run; output:\n{}",
+        combined_output(&out)
+    );
+    let all = combined_output(&out);
+    assert!(
+        all.contains("Code mode does not support") && all.contains("claude"),
+        "the gate message must name the rejected provider; output:\n{all}"
+    );
+}
+
+// ── F-E-4: one-shot exits non-zero on a no-response run ──────────────────────
+
+// An empty provider stream (only `[DONE]`, no content deltas) prints
+// "Kim: (no response)". Before the fix this exited 0; scripts and CI could not
+// tell a silent/failed run from a real answer. It must now exit non-zero.
+#[test]
+fn oneshot_no_response_exits_nonzero() {
+    let server = FakeServer::start(|_| {
+        // No content deltas at all.
+        (200, "text/event-stream", "data: [DONE]\n\n".to_string())
+    });
+    let home = temp_home_with_config(&ollama_config(&server.base_url));
+
+    let output = run_kim_chat(&home, "produce nothing", &[]);
+    assert!(
+        !output.status.success(),
+        "a no-response run must exit non-zero; output:\n{}",
+        combined_output(&output)
+    );
+    assert!(
+        combined_output(&output).contains("(no response)"),
+        "the no-response notice should still be printed; output:\n{}",
+        combined_output(&output)
     );
 }

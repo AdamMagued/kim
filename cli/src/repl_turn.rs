@@ -188,8 +188,13 @@ async fn run_cancel_interrupt<S>(
     print_note("(cancelled)");
     if !assistant.trim().is_empty() {
         app.push(MessageRole::Assistant, std::mem::take(assistant));
-        save(app);
     }
+    // F-E-4: a Ctrl-C interrupt is an incomplete run — record an Error (not
+    // persisted, so it doesn't pollute the transcript) so one-shot `kim
+    // chat`/`kim code` exits non-zero. The F5 fix already did this for the
+    // git-decline cancel; the Ctrl-C path was the remaining hole.
+    app.push(MessageRole::Error, "Run cancelled (interrupted).");
+    save(app);
 }
 
 pub(crate) async fn consume_turn_events<S, C>(
@@ -505,6 +510,7 @@ where
                 print_message(&UiMessage {
                     role: MessageRole::Error,
                     content: error,
+                    timestamp_ms: None,
                 });
                 save(app);
                 return Ok(false);
@@ -522,6 +528,12 @@ where
         }
     } else {
         println!("Kim: (no response)");
+        // F-E-4: a turn that ends without ANY answer (a child that exits with
+        // output but no reply, or an empty provider stream) is a failure for
+        // scripting — record an Error (not persisted) so one-shot mode exits
+        // non-zero instead of falsely reporting success.
+        app.push(MessageRole::Error, "No response from the model.");
+        save(app);
     }
 
     // Push the streamed assistant reply into the session and persist again, so

@@ -18,16 +18,23 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from argparse import Namespace
 from pathlib import Path
 
 import pytest
 
 from kimctl.__main__ import (
+    EXIT_OK,
+    EXIT_TIMEOUT,
+    EXIT_TRANSPORT,
+    _read_home_bridge_token,
+    _resolve_bridge,
     build_parser,
     cmd_browser,
     cmd_cancel,
     cmd_chats,
+    cmd_send,
     cmd_show,
     cmd_status,
 )
@@ -284,11 +291,15 @@ def test_cancel_json_ok(monkeypatch, capsys):
 
 
 def test_cancel_human_readable_failure(monkeypatch, capsys):
+    # F-E-12: a failed cancel still prints the friendly ❌ line, but must now
+    # exit non-zero so a script can tell it did not cancel anything.
     monkeypatch.setattr(
         "kimctl.__main__._bridge_request",
         _fake_bridge({"ok": False, "message": "No task running"}),
     )
-    cmd_cancel(Namespace(json=False))
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_cancel(Namespace(json=False))
+    assert exc_info.value.code != 0
     out = capsys.readouterr().out
     assert "No task running" in out
     assert "❌" in out  # ❌
@@ -347,10 +358,251 @@ def test_browser_click_with_selector_sends_it(monkeypatch, capsys):
 
 
 def test_browser_human_readable_error(monkeypatch, capsys):
+    # F-E-12: a failed browser command prints the friendly ❌ line and now
+    # exits non-zero instead of falling off the end at exit 0.
     monkeypatch.setattr(
         "kimctl.__main__._bridge_request",
         _fake_bridge({"ok": False, "error": "not connected"}),
     )
-    cmd_browser(Namespace(browser_action="show", selector=None, json=False))
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_browser(Namespace(browser_action="show", selector=None, json=False))
+    assert exc_info.value.code != 0
     out = capsys.readouterr().out
     assert "not connected" in out
+
+
+# ---------------------------------------------------------------------------
+# F-E-12: exit-code vocabulary — cancel/browser must not report success on
+# failure, and a closed desktop must yield the friendly transport error.
+# ---------------------------------------------------------------------------
+
+def test_cancel_json_failure_exits_nonzero(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _fake_bridge({"ok": False, "error": "No task running"}),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_cancel(Namespace(json=True))
+    assert exc_info.value.code == EXIT_TRANSPORT
+
+
+def test_browser_json_failure_exits_nonzero(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _fake_bridge({"ok": False, "error": "browser not connected"}),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_browser(Namespace(browser_action="show", selector=None, json=True))
+    assert exc_info.value.code == EXIT_TRANSPORT
+
+
+def test_browser_transport_error_is_friendly(monkeypatch, capsys):
+    """Bridge down → friendly stderr message + non-zero exit, not a raw
+    httpx.ConnectError traceback (F-E-12)."""
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _raising_bridge(ConnectionError("Connection refused")),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_browser(Namespace(browser_action="show", selector=None, json=False))
+    assert exc_info.value.code == EXIT_TRANSPORT
+    err = capsys.readouterr().err
+    assert "Error connecting to Kim bridge" in err
+    assert "Traceback" not in err
+
+
+def test_browser_usage_error_stays_exit_1(capsys):
+    """A missing --selector is a usage error (exit 1), not a transport error —
+    the F-E-12 try/except must not swallow the argparse-style validation."""
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_browser(Namespace(browser_action="click", selector=None, json=False))
+    assert exc_info.value.code == 1
+    assert "selector" in capsys.readouterr().err.lower()
+
+
+# ---------------------------------------------------------------------------
+# F-E-7: cmd_send completion poll must not match a STALE TASK_COMPLETE left in
+# a resumed session, but must still detect a genuinely new completion.
+#
+# These drive the real cmd_send poll loop against an on-disk session file. The
+# orchestrator's writes are simulated by intercepting time.sleep (patched to a
+# tiny real sleep) so the file mutates *between* polls, deterministically and
+# without threads.
+# ---------------------------------------------------------------------------
+
+def _send_ns(session_id: str, *, timeout: float) -> Namespace:
+    return Namespace(
+        task="new task",
+        session=session_id,
+        provider=None,
+        json=True,
+        detach=False,
+        timeout=timeout,
+    )
+
+
+def test_send_ignores_stale_task_complete(monkeypatch, tmp_path):
+    """F-E-7: resuming a session whose PREVIOUS task ended with TASK_COMPLETE
+    must not report instant success for the new task — the stale line predates
+    the POST baseline, so the poll should time out instead."""
+    session_id = "sessStale"
+    date_dir = tmp_path / "2026-07-13"
+    date_dir.mkdir(parents=True)
+    sfile = date_dir / f"{session_id}.jsonl"
+    sfile.write_bytes(
+        json.dumps({"role": "user", "content": "old task"}).encode() + b"\n"
+        + json.dumps(
+            {"role": "assistant", "content": "TASK_COMPLETE: old result"}
+        ).encode()
+        + b"\n"
+    )
+
+    monkeypatch.setenv("KIM_SESSIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _fake_bridge(
+            {"ok": True, "session_id": session_id, "sessions_dir": str(tmp_path)}
+        ),
+    )
+    real_sleep = time.sleep
+    monkeypatch.setattr("kimctl.__main__.time.sleep", lambda _s: real_sleep(0.002))
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_send(_send_ns(session_id, timeout=1))
+    assert exc_info.value.code == EXIT_TIMEOUT
+
+
+def test_send_detects_new_completion_after_baseline(monkeypatch, tmp_path, capsys):
+    """F-E-7 (no over-correction): after skipping the stale line, a genuinely
+    new TASK_COMPLETE appended during polling is still detected."""
+    session_id = "sessFresh"
+    date_dir = tmp_path / "2026-07-13"
+    date_dir.mkdir(parents=True)
+    sfile = date_dir / f"{session_id}.jsonl"
+    sfile.write_bytes(
+        json.dumps(
+            {"role": "assistant", "content": "TASK_COMPLETE: old result"}
+        ).encode()
+        + b"\n"
+    )
+
+    monkeypatch.setenv("KIM_SESSIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _fake_bridge(
+            {"ok": True, "session_id": session_id, "sessions_dir": str(tmp_path)}
+        ),
+    )
+
+    fresh = (
+        json.dumps({"role": "assistant", "content": "TASK_COMPLETE: fresh result"}).encode()
+        + b"\n"
+    )
+    real_sleep = time.sleep
+    state = {"n": 0}
+
+    def fake_sleep(_s):
+        state["n"] += 1
+        if state["n"] == 2:
+            with open(sfile, "ab") as f:
+                f.write(fresh)
+        real_sleep(0.002)
+
+    monkeypatch.setattr("kimctl.__main__.time.sleep", fake_sleep)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_send(_send_ns(session_id, timeout=5))
+    assert exc_info.value.code == EXIT_OK
+    assert "fresh result" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# F-E-8: cmd_send poll must not lose a completion record that is flushed across
+# two writes (a partial line, then the remainder + newline) straddling a poll.
+# ---------------------------------------------------------------------------
+
+def test_send_does_not_lose_partial_completion_line(monkeypatch, tmp_path, capsys):
+    session_id = "sessPartial"
+    date_dir = tmp_path / "2026-07-13"
+    date_dir.mkdir(parents=True)
+    sfile = date_dir / f"{session_id}.jsonl"
+    sfile.write_bytes(
+        json.dumps({"role": "user", "content": "old"}).encode() + b"\n"
+    )
+
+    monkeypatch.setenv("KIM_SESSIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _fake_bridge(
+            {"ok": True, "session_id": session_id, "sessions_dir": str(tmp_path)}
+        ),
+    )
+
+    complete_line = json.dumps(
+        {"role": "assistant", "content": "TASK_COMPLETE: done"}
+    )
+    split = len(complete_line) - 4
+    part1 = complete_line[:split].encode("utf-8")          # no trailing newline
+    part2 = complete_line[split:].encode("utf-8") + b"\n"  # completes the line
+    real_sleep = time.sleep
+    state = {"n": 0}
+
+    def fake_sleep(_s):
+        state["n"] += 1
+        if state["n"] == 1:
+            with open(sfile, "ab") as f:
+                f.write(part1)
+        elif state["n"] == 2:
+            with open(sfile, "ab") as f:
+                f.write(part2)
+        real_sleep(0.002)
+
+    monkeypatch.setattr("kimctl.__main__.time.sleep", fake_sleep)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_send(_send_ns(session_id, timeout=5))
+    assert exc_info.value.code == EXIT_OK
+    assert "done" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# F-E-13: kimctl must read the desktop's ~/.kim/bridge_token pairing file.
+# ---------------------------------------------------------------------------
+
+def _clear_bridge_env(monkeypatch):
+    for var in (
+        "KIM_WEBVIEW_BRIDGE_URL",
+        "KIM_WEBVIEW_BRIDGE_TOKEN",
+        "KIM_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_read_home_bridge_token_absent(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _read_home_bridge_token() == ""
+
+
+def test_resolve_bridge_reads_home_token(monkeypatch, tmp_path):
+    _clear_bridge_env(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    kim_dir = tmp_path / ".kim"
+    kim_dir.mkdir()
+    (kim_dir / "bridge_token").write_text("home-tok-123\n", encoding="utf-8")
+
+    _, token = _resolve_bridge()
+    assert token == "home-tok-123"
+
+
+def test_resolve_bridge_home_token_yields_to_env(monkeypatch, tmp_path):
+    """Mirror cli/src/provider/bridge.rs: an explicit KIM_API_KEY env override
+    wins over the ~/.kim/bridge_token pairing file."""
+    _clear_bridge_env(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    kim_dir = tmp_path / ".kim"
+    kim_dir.mkdir()
+    (kim_dir / "bridge_token").write_text("home-tok", encoding="utf-8")
+    monkeypatch.setenv("KIM_API_KEY", "env-key-wins")
+
+    _, token = _resolve_bridge()
+    assert token == "env-key-wins"
