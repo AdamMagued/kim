@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from kimctl.__main__ import (
+    EXIT_TRANSPORT,
     _read_home_bridge_token,
     _resolve_bridge,
     build_parser,
@@ -286,11 +287,15 @@ def test_cancel_json_ok(monkeypatch, capsys):
 
 
 def test_cancel_human_readable_failure(monkeypatch, capsys):
+    # F-E-12: a failed cancel still prints the friendly ❌ line, but must now
+    # exit non-zero so a script can tell it did not cancel anything.
     monkeypatch.setattr(
         "kimctl.__main__._bridge_request",
         _fake_bridge({"ok": False, "message": "No task running"}),
     )
-    cmd_cancel(Namespace(json=False))
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_cancel(Namespace(json=False))
+    assert exc_info.value.code != 0
     out = capsys.readouterr().out
     assert "No task running" in out
     assert "❌" in out  # ❌
@@ -349,13 +354,66 @@ def test_browser_click_with_selector_sends_it(monkeypatch, capsys):
 
 
 def test_browser_human_readable_error(monkeypatch, capsys):
+    # F-E-12: a failed browser command prints the friendly ❌ line and now
+    # exits non-zero instead of falling off the end at exit 0.
     monkeypatch.setattr(
         "kimctl.__main__._bridge_request",
         _fake_bridge({"ok": False, "error": "not connected"}),
     )
-    cmd_browser(Namespace(browser_action="show", selector=None, json=False))
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_browser(Namespace(browser_action="show", selector=None, json=False))
+    assert exc_info.value.code != 0
     out = capsys.readouterr().out
     assert "not connected" in out
+
+
+# ---------------------------------------------------------------------------
+# F-E-12: exit-code vocabulary — cancel/browser must not report success on
+# failure, and a closed desktop must yield the friendly transport error.
+# ---------------------------------------------------------------------------
+
+def test_cancel_json_failure_exits_nonzero(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _fake_bridge({"ok": False, "error": "No task running"}),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_cancel(Namespace(json=True))
+    assert exc_info.value.code == EXIT_TRANSPORT
+
+
+def test_browser_json_failure_exits_nonzero(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _fake_bridge({"ok": False, "error": "browser not connected"}),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_browser(Namespace(browser_action="show", selector=None, json=True))
+    assert exc_info.value.code == EXIT_TRANSPORT
+
+
+def test_browser_transport_error_is_friendly(monkeypatch, capsys):
+    """Bridge down → friendly stderr message + non-zero exit, not a raw
+    httpx.ConnectError traceback (F-E-12)."""
+    monkeypatch.setattr(
+        "kimctl.__main__._bridge_request",
+        _raising_bridge(ConnectionError("Connection refused")),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_browser(Namespace(browser_action="show", selector=None, json=False))
+    assert exc_info.value.code == EXIT_TRANSPORT
+    err = capsys.readouterr().err
+    assert "Error connecting to Kim bridge" in err
+    assert "Traceback" not in err
+
+
+def test_browser_usage_error_stays_exit_1(capsys):
+    """A missing --selector is a usage error (exit 1), not a transport error —
+    the F-E-12 try/except must not swallow the argparse-style validation."""
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_browser(Namespace(browser_action="click", selector=None, json=False))
+    assert exc_info.value.code == 1
+    assert "selector" in capsys.readouterr().err.lower()
 
 
 # ---------------------------------------------------------------------------

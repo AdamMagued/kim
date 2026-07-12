@@ -505,6 +505,11 @@ def cmd_cancel(args):
         msg = data.get("message", "Done")
         print(f"{'✅' if data.get('ok') else '❌'} {msg}")
 
+    # F-E-12: honour the exit-code vocabulary — a failed cancel (e.g. "no task
+    # running") must not report success to a script.
+    if not data.get("ok"):
+        sys.exit(EXIT_TRANSPORT)
+
 
 # ---------------------------------------------------------------------------
 # Schedule helpers (local file ops -- no bridge required)
@@ -971,20 +976,31 @@ def cmd_trace(args):
 
 
 def cmd_browser(args):
+    # Validate the action/args up front so a usage error (exit 1) is never
+    # confused with a transport failure (exit 3).
     if args.browser_action == "show":
-        resp = _bridge_request("POST", "/v1/browser/show", json={})
+        endpoint, body = "/v1/browser/show", {}
     elif args.browser_action == "hide":
-        resp = _bridge_request("POST", "/v1/browser/hide", json={})
+        endpoint, body = "/v1/browser/hide", {}
     elif args.browser_action == "new-chat":
-        resp = _bridge_request("POST", "/v1/browser/new-chat", json={})
+        endpoint, body = "/v1/browser/new-chat", {}
     elif args.browser_action == "click":
         if not args.selector:
             print("Error: --selector is required for 'click'", file=sys.stderr)
             sys.exit(1)
-        resp = _bridge_request("POST", "/v1/browser/click", json={"selector": args.selector})
+        endpoint, body = "/v1/browser/click", {"selector": args.selector}
     else:
         print(f"Unknown browser action: {args.browser_action}", file=sys.stderr)
         sys.exit(1)
+
+    # F-E-12: wrap the bridge request like cmd_status/cmd_cancel so a closed
+    # desktop yields the friendly transport error instead of a raw httpx
+    # ConnectError traceback.
+    try:
+        resp = _bridge_request("POST", endpoint, json=body)
+    except Exception as e:
+        print(f"Error connecting to Kim bridge: {e}", file=sys.stderr)
+        sys.exit(EXIT_TRANSPORT)
 
     try:
         data = resp.json()
@@ -998,6 +1014,10 @@ def cmd_browser(args):
             print("✅ Done")
         else:
             print(f"❌ {data.get('error', 'Failed')}")
+
+    # F-E-12: a failed browser command must not exit 0.
+    if not data.get("ok"):
+        sys.exit(EXIT_TRANSPORT)
 
 
 # ---------------------------------------------------------------------------
