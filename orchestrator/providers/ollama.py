@@ -17,7 +17,12 @@ from typing import Any
 
 import httpx
 
-from orchestrator.providers.base import BaseProvider, finalize_text_content, ProviderEnvironmentError
+from orchestrator.providers.base import (
+    BaseProvider,
+    finalize_text_content,
+    malformed_tool_args_text,
+    ProviderEnvironmentError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -268,11 +273,24 @@ class OllamaProvider(BaseProvider):
                     "usage": usage,
                 }
 
-            parsed = _parse_one(tool_calls[0])
+            tc0 = tool_calls[0]
+            fn0 = tc0.get("function") if isinstance(tc0, dict) else None
+            name0 = str((fn0 or {}).get("name") or tc0.get("name") or "").strip()
+            args0, arg_error = _normalize_tool_arguments_checked((fn0 or {}).get("arguments"))
+            if arg_error:
+                # F-INH-3: don't dispatch with silently-emptied args (an
+                # all-optional schema would run with defaults and the model
+                # never learns). Surface a re-emit nudge as the text turn.
+                return {
+                    "type": "text",
+                    "content": malformed_tool_args_text(name0),
+                    "stop_reason": done_reason,
+                    "usage": usage,
+                }
             return {
                 "type": "tool_call",
-                "tool": parsed["tool"],
-                "args": parsed["args"],
+                "tool": name0,
+                "args": args0,
                 "content": content,
                 "stop_reason": done_reason,
                 "usage": usage,
@@ -770,6 +788,32 @@ def _normalize_tool_arguments(raw: Any) -> dict[str, Any]:
             )
             return {}
     return {}
+
+
+def _normalize_tool_arguments_checked(raw: Any) -> tuple[dict[str, Any], bool]:
+    """Like _normalize_tool_arguments, but reports a genuine JSON parse failure.
+
+    Returns (args, arg_error). arg_error is True only when a string payload is
+    unparseable JSON (F-INH-3) — a valid-JSON-but-non-object value still coerces
+    to {} without signalling, matching the pre-existing lenient behavior.
+    """
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Ollama tool-call arguments are not valid JSON (%r) — signalling re-emit",
+                raw[:200],
+            )
+            return {}, True
+        if not isinstance(parsed, dict):
+            logger.warning(
+                "Ollama tool-call arguments are not an object (%r) — using {}",
+                raw[:200],
+            )
+            return {}, False
+        return parsed, False
+    return _normalize_tool_arguments(raw), False
 
 
 def _assistant_tool_call_message(raw_content: str, call_id: str | None = None) -> dict[str, Any] | None:

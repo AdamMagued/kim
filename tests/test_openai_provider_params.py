@@ -149,3 +149,29 @@ def test_local_base_url_without_key_stays_silent(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="orchestrator.providers.openai_provider"):
         OpenAIProvider({"openai_base_url": "http://localhost:11434/v1"})
     assert not any("placeholder" in r.message for r in caplog.records)
+
+
+# ── F-INH-3: malformed tool-call JSON → re-emit nudge, not silent {} dispatch ─
+
+def _tool_call_response(name, arguments):
+    fn = types.SimpleNamespace(name=name, arguments=arguments)
+    tc = types.SimpleNamespace(function=fn)
+    msg = types.SimpleNamespace(content="", tool_calls=[tc])
+    choice = types.SimpleNamespace(message=msg, finish_reason="tool_calls")
+    return types.SimpleNamespace(choices=[choice], usage=None)
+
+
+def test_malformed_single_tool_args_becomes_reemit_text():
+    prov = OpenAIProvider.__new__(OpenAIProvider)
+    out = prov._parse_response(_tool_call_response("read_file", "{not valid json"))
+    assert out["type"] == "text"
+    assert "not valid JSON" in out["content"]
+    assert "read_file" in out["content"]
+
+
+def test_valid_single_tool_args_still_dispatches():
+    prov = OpenAIProvider.__new__(OpenAIProvider)
+    out = prov._parse_response(_tool_call_response("read_file", '{"path":"a.txt"}'))
+    assert out["type"] == "tool_call"
+    assert out["tool"] == "read_file"
+    assert out["args"] == {"path": "a.txt"}

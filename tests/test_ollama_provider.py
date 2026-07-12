@@ -592,3 +592,36 @@ class OllamaTimeoutClassificationTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class OllamaMalformedArgsReemitTests(unittest.TestCase):
+    """F-INH-3: unparseable single tool-call args become a re-emit nudge."""
+
+    def test_malformed_single_tool_args_becomes_text(self):
+        from orchestrator.providers.ollama import _normalize_tool_arguments_checked
+        args, err = _normalize_tool_arguments_checked("{not json")
+        self.assertEqual(args, {})
+        self.assertTrue(err)
+
+        provider = OllamaProvider({"ollama": {"mode": "cloud", "cloud_model": "m:cloud"}})
+        result = asyncio.run(_run_complete(
+            provider,
+            final_obj={"done_reason": "stop", "model": "m:cloud"},
+            content="",
+            tool_calls=[{"function": {"name": "read_file", "arguments": "{not json"}}],
+        ))
+        self.assertEqual(result["type"], "text")
+        self.assertIn("not valid JSON", result["content"])
+        self.assertIn("read_file", result["content"])
+
+    def test_valid_single_tool_args_still_dispatch(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud", "cloud_model": "m:cloud"}})
+        result = asyncio.run(_run_complete(
+            provider,
+            final_obj={"done_reason": "stop", "model": "m:cloud"},
+            content="",
+            tool_calls=[{"function": {"name": "read_file", "arguments": '{"path":"a"}'}}],
+        ))
+        self.assertEqual(result["type"], "tool_call")
+        self.assertEqual(result["tool"], "read_file")
+        self.assertEqual(result["args"], {"path": "a"})

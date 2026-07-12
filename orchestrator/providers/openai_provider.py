@@ -14,7 +14,7 @@ from typing import Any
 
 import openai
 
-from orchestrator.providers.base import BaseProvider, finalize_text_content
+from orchestrator.providers.base import BaseProvider, finalize_text_content, malformed_tool_args_text
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +205,7 @@ class OpenAIProvider(BaseProvider):
             def _parse_one(tc):
                 try:
                     args = json.loads(tc.function.arguments)
+                    arg_error = False
                 except json.JSONDecodeError:
                     # M9: never silently swap malformed args for {} — log what
                     # the model actually produced so the confusing downstream
@@ -214,7 +215,8 @@ class OpenAIProvider(BaseProvider):
                         tc.function.name, str(tc.function.arguments)[:200],
                     )
                     args = {}
-                return {"tool": tc.function.name, "args": args}
+                    arg_error = True
+                return {"tool": tc.function.name, "args": args, "arg_error": arg_error}
 
             # H2: keep any assistant narration that accompanies the tool call —
             # the agent reads response["content"] for PLAN/STEP markers.
@@ -227,7 +229,10 @@ class OpenAIProvider(BaseProvider):
                 return {
                     "type": "tool_call",
                     "tool": "batch",
-                    "args": {"calls": [_parse_one(tc) for tc in msg.tool_calls]},
+                    "args": {"calls": [
+                        {"tool": p["tool"], "args": p["args"]}
+                        for p in (_parse_one(tc) for tc in msg.tool_calls)
+                    ]},
                     "content": narration,
                     "stop_reason": finish_reason,
                     "usage": usage,
@@ -235,6 +240,17 @@ class OpenAIProvider(BaseProvider):
 
             tc = msg.tool_calls[0]
             parsed = _parse_one(tc)
+            if parsed["arg_error"]:
+                # F-INH-3: rather than dispatching the tool with silently-emptied
+                # args (an all-optional schema would run with defaults and the
+                # model would never learn), surface a re-emit nudge as the text
+                # turn so the model resends a valid JSON call.
+                return {
+                    "type": "text",
+                    "content": malformed_tool_args_text(parsed["tool"]),
+                    "stop_reason": finish_reason,
+                    "usage": usage,
+                }
             return {
                 "type": "tool_call",
                 "tool": parsed["tool"],

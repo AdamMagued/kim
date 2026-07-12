@@ -47,6 +47,23 @@ _TRUNCATION_NOTE = (
 )
 
 
+def malformed_tool_args_text(tool_name: str) -> str:
+    """Re-emit nudge for a tool call whose arguments were not valid JSON (F-INH-3).
+
+    The providers used to coerce unparseable arguments to ``{}`` and dispatch
+    the tool anyway — for an all-optional schema that silently runs with
+    defaults and the model gets no signal. Returning this as the assistant text
+    turn (instead of a tool_call) surfaces the failure so the model re-emits a
+    valid call on the next turn.
+    """
+    name = tool_name or "the requested"
+    return (
+        f"[Kim: the arguments for the `{name}` tool were not valid JSON, so the "
+        f"call was not run. Re-issue the `{name}` call with a single valid JSON "
+        "object as its arguments.]"
+    )
+
+
 def finalize_text_content(content: str, stop_reason: Optional[str]) -> str:
     """Annotate terminal completion text based on why generation stopped.
 
