@@ -177,6 +177,21 @@ fn parse_cli_args(args: &[String]) -> CliCommand {
 pub struct UiMessage {
     pub role: MessageRole,
     pub content: String,
+    /// F-E-3: the epoch-millis this message was created, if known. Set when the
+    /// message is first pushed and preserved verbatim across load→save, so a
+    /// long conversation keeps its real per-message times instead of having
+    /// every record re-stamped to the last save instant. `None` for ephemeral
+    /// (print-only) messages that are never persisted.
+    pub timestamp_ms: Option<u64>,
+}
+
+impl UiMessage {
+    /// Current epoch-millis, for stamping a freshly-created message.
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64)
+    }
 }
 
 pub struct App {
@@ -245,6 +260,8 @@ impl App {
         self.messages.push(UiMessage {
             role,
             content: content.into(),
+            // F-E-3: stamp the creation time now, so it survives future saves.
+            timestamp_ms: Some(UiMessage::now_ms()),
         });
     }
 
@@ -908,6 +925,7 @@ fn choose_session_interactively(app: &mut App) -> Result<(), Box<dyn std::error:
                             Err(error) => print_message(&UiMessage {
                                 role: MessageRole::Error,
                                 content: error,
+                                timestamp_ms: None,
                             }),
                         }
                         return Ok(());
@@ -1124,6 +1142,7 @@ fn handle_repl_message(app: &mut App, message: String) -> Result<bool, Box<dyn s
             print_message(&UiMessage {
                 role: MessageRole::System,
                 content: message,
+                timestamp_ms: None,
             });
             save_current_session(app);
         }
@@ -1509,6 +1528,7 @@ fn compact_app_messages(app: &mut App) {
         UiMessage {
             role: MessageRole::System,
             content: format!("Earlier context compacted — {removed} message(s) removed."),
+            timestamp_ms: Some(UiMessage::now_ms()),
         },
     );
     app.push(

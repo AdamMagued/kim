@@ -130,11 +130,17 @@ pub(crate) fn save_session_messages_in(
         let Some(role) = persisted_role(msg.role) else {
             continue;
         };
+        // F-E-3: keep each message's own creation time; only stamp `now` for
+        // messages that never carried one (e.g. legacy records loaded before
+        // this field existed). The old code re-stamped EVERY record to the last
+        // save instant, so a 2-hour conversation showed every message as created
+        // at the final save.
+        let timestamp_ms = msg.timestamp_ms.unwrap_or(now_ms as u64);
         let value = json!({
             "type": "message",
             "role": role,
             "content": msg.content,
-            "timestamp_ms": now_ms,
+            "timestamp_ms": timestamp_ms,
         });
         let line = serde_json::to_string(&value)
             .map_err(|e| format!("Could not encode session message: {e}"))?;
@@ -285,9 +291,13 @@ pub fn load_session_messages(path: &Path) -> Result<Vec<UiMessage>, String> {
             }
             _ => continue,
         };
+        // F-E-3: preserve the persisted per-message timestamp so a later
+        // re-save doesn't rewrite it to "now".
+        let timestamp_ms = value.get("timestamp_ms").and_then(Value::as_u64);
         messages.push(UiMessage {
             role: message_role,
             content,
+            timestamp_ms,
         });
     }
     if messages.is_empty() {
@@ -681,6 +691,60 @@ mod tests {
 
     use crate::UiMessage;
 
+    // F-E-3: a message's own creation timestamp must survive a save→load→save
+    // cycle; only a message that never carried one gets stamped `now`. The old
+    // code re-stamped EVERY record to the last-save instant.
+    #[test]
+    fn save_preserves_existing_message_timestamps() {
+        let dir = unique_test_dir();
+        const OLD_TS: u64 = 1_600_000_000_000; // a fixed past instant (ms)
+        let messages = vec![
+            UiMessage {
+                role: MessageRole::User,
+                content: "first turn".to_string(),
+                timestamp_ms: Some(OLD_TS),
+            },
+            UiMessage {
+                role: MessageRole::Assistant,
+                content: "reply".to_string(),
+                timestamp_ms: None, // legacy record with no time
+            },
+        ];
+        let path = super::save_session_messages_in(&dir, "ts-test", &messages)
+            .expect("save should succeed");
+        let loaded = load_session_messages(&path).expect("load should succeed");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded[0].timestamp_ms,
+            Some(OLD_TS),
+            "an existing timestamp must be preserved verbatim on save"
+        );
+        let stamped_now = loaded[1]
+            .timestamp_ms
+            .expect("a message with no timestamp must be stamped on save");
+        assert!(
+            stamped_now > OLD_TS,
+            "a timestamp-less message should get a real (recent) time, not OLD_TS"
+        );
+
+        // Re-save the loaded transcript (as a follow-up turn would) and confirm
+        // NEITHER timestamp is rewritten.
+        let path2 = super::save_session_messages_in(&dir, "ts-test", &loaded)
+            .expect("re-save should succeed");
+        let reloaded = load_session_messages(&path2).expect("reload should succeed");
+        assert_eq!(
+            reloaded[0].timestamp_ms,
+            Some(OLD_TS),
+            "re-saving must not rewrite the original message's timestamp to now"
+        );
+        assert_eq!(
+            reloaded[1].timestamp_ms,
+            Some(stamped_now),
+            "re-saving must not rewrite a previously-stamped message's timestamp"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn save_and_load_roundtrip_user_and_assistant() {
         let dir = unique_test_dir();
@@ -688,10 +752,12 @@ mod tests {
             UiMessage {
                 role: MessageRole::User,
                 content: "hello".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Assistant,
                 content: "hi there".to_string(),
+                timestamp_ms: None,
             },
         ];
         let path = super::save_session_messages_in(&dir, "roundtrip-test", &messages)
@@ -715,14 +781,17 @@ mod tests {
             UiMessage {
                 role: MessageRole::User,
                 content: "{\"a\":1} — why is this invalid JSON5?".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Assistant,
                 content: "{ starts my answer too".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::User,
                 content: "[Tool result: looking thing] pasted by a user".to_string(),
+                timestamp_ms: None,
             },
         ];
         let path = super::save_session_messages_in(&dir, "json-prefix-test", &messages)
@@ -774,6 +843,7 @@ mod tests {
         let messages = vec![UiMessage {
             role: MessageRole::User,
             content: "hi".to_string(),
+            timestamp_ms: None,
         }];
         super::save_session_messages_in(&dir, "lock-sentinel-test", &messages)
             .expect("save should succeed");
@@ -804,6 +874,7 @@ mod tests {
             let messages = vec![UiMessage {
                 role: MessageRole::User,
                 content: "blocked writer".to_string(),
+                timestamp_ms: None,
             }];
             let result = super::save_session_messages_in(&dir_clone, safe_id, &messages);
             let _ = tx.send(());
@@ -838,6 +909,7 @@ mod tests {
         let messages = vec![UiMessage {
             role: MessageRole::User,
             content: "test".to_string(),
+            timestamp_ms: None,
         }];
         super::save_session_messages_in(&dir, "no-tmp-test", &messages)
             .expect("save should succeed");
@@ -863,10 +935,12 @@ mod tests {
                     UiMessage {
                         role: MessageRole::User,
                         content: format!("question {i}"),
+                        timestamp_ms: None,
                     },
                     UiMessage {
                         role: MessageRole::Assistant,
                         content: format!("answer {i}"),
+                        timestamp_ms: None,
                     },
                 ]
             })
@@ -878,10 +952,12 @@ mod tests {
             UiMessage {
                 role: MessageRole::User,
                 content: "only message".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Assistant,
                 content: "only reply".to_string(),
+                timestamp_ms: None,
             },
         ];
         super::save_session_messages_in(&dir, "overwrite-test", &updated).expect("overwrite save");
@@ -910,10 +986,12 @@ mod tests {
             UiMessage {
                 role: MessageRole::Error,
                 content: "transient".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Reasoning,
                 content: "thinking".to_string(),
+                timestamp_ms: None,
             },
         ];
         let path = super::save_session_messages_in(&dir, "filtered-test", &messages)
@@ -940,18 +1018,22 @@ mod tests {
             UiMessage {
                 role: MessageRole::User,
                 content: "prompt".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Error,
                 content: "transient error".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Reasoning,
                 content: "thinking...".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Assistant,
                 content: "done".to_string(),
+                timestamp_ms: None,
             },
         ];
         let path = super::save_session_messages_in(&dir, "roles-test", &messages).expect("save");

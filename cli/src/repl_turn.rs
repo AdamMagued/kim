@@ -510,6 +510,7 @@ where
                 print_message(&UiMessage {
                     role: MessageRole::Error,
                     content: error,
+                    timestamp_ms: None,
                 });
                 save(app);
                 return Ok(false);
