@@ -73,17 +73,28 @@ def finalize_text_content(content: str, stop_reason: Optional[str]) -> str:
 # Typed contracts — providers return one of these; agent consumes typed fields
 # ---------------------------------------------------------------------------
 
-class ToolCallResponse(TypedDict):
-    """Provider response requesting a tool call."""
-    type: Literal["tool_call"]
-    tool: str
-    args: dict[str, Any]
+class ToolCallResponse(TypedDict, total=False):
+    """Provider response requesting a tool call.
+
+    `type`, `tool`, and `args` are always present. `content`, `stop_reason`,
+    and `usage` are attached by the providers that have them and consumed by
+    the agent loop, so they are part of the real contract even though they were
+    historically undeclared (F-B-14). `total=False` lets a provider omit the
+    optional fields; the three required keys are noted inline.
+    """
+    type: Literal["tool_call"]  # required
+    tool: str                   # required
+    args: dict[str, Any]        # required
+    content: str                # optional — narration (PLAN/STEP) preceding the call
+    stop_reason: Optional[str]  # optional — API providers report why generation stopped
+    usage: dict[str, Any]       # optional — token counts (ollama uses extended keys)
 
 
 class TextResponse(TypedDict, total=False):
     """Provider response with a text completion."""
     type: Literal["text"]       # required
     content: str                # required
+    stop_reason: Optional[str]  # optional — why generation stopped (max_tokens/safety/…)
     usage: dict[str, Any]       # optional — token counts from the provider
 
 
