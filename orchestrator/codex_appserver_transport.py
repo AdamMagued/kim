@@ -891,10 +891,12 @@ class AppServerTurnRunner:
             self._compact_fired = True
             emit_status("Codex transcript near its budget — compacting it natively…")
             assert self._client is not None
-            with contextlib.suppress(AppServerError, asyncio.TimeoutError):
-                await self._client.request(
-                    "thread/compact/start", {"threadId": self._thread_id}, timeout=30.0
-                )
+            async def _do_compact():
+                with contextlib.suppress(AppServerError, asyncio.TimeoutError):
+                    await self._client.request(
+                        "thread/compact/start", {"threadId": self._thread_id}, timeout=30.0
+                    )
+            asyncio.create_task(_do_compact())
 
     # ── Cancellation ─────────────────────────────────────────────────────────
 
