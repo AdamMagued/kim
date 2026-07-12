@@ -229,8 +229,18 @@ export function StreamRenderer({
   _editRef.current = handleEditLiveMessage;
   const stableEdit = useCallback((idx: number, newText: string) => _editRef.current(idx, newText), []);
 
-  // renderWorkedFor as a stable useCallback so it can be a dep of the live-msg
-  // memos below. The only non-constant value it closes over is tokenStats.
+  // F-F-11: read tokenStats from a ref (assigned during render, same pattern as
+  // _retryRef/_editRef above) so renderWorkedFor has a STABLE identity ([] deps).
+  // tokenStats is replaced on every kim:stats tick (once per provider call);
+  // when it was a useCallback dep, its identity churned each tick → savedMsgNodes
+  // (which lists renderWorkedFor in its deps) rebuilt the ENTIRE saved history —
+  // an O(N) reconciliation several times/sec — even though saved rows call
+  // renderWorkedFor with showCost=false and never read tokenStats at all. The
+  // single live last-run pill that DOES show cost reads the ref at the moment its
+  // memo recomputes (run completion / message change), which is exactly when the
+  // final cost is known; intra-run stats ticks no longer rebuild history.
+  const _tokenStatsRef = useRef(tokenStats);
+  _tokenStatsRef.current = tokenStats;
   const renderWorkedFor = useCallback((_idx: number, run: { activity: ActivityItem[]; durationSec: number; provider?: string | null }, showCost = false) => {
     const historyTrace = buildThinkingTrace(run.activity, parsePlanFromActivity(run.activity));
     const workedForTrace = traceToWorkedFor(historyTrace);
@@ -240,15 +250,16 @@ export function StreamRenderer({
     const duration = run.durationSec > 0 ? formatDuration(run.durationSec) : '…';
     // B5: price with the provider THIS run used (not the currently-selected one).
     const runProvider = run.provider ?? null;
-    const costUsd = showCost && tokenStats && runProvider
-      ? estimateCostUsd(runProvider, tokenStats.input, tokenStats.output)
+    const ts = _tokenStatsRef.current;
+    const costUsd = showCost && ts && runProvider
+      ? estimateCostUsd(runProvider, ts.input, ts.output)
       : null;
     return (
       <div className="kim-msg-row kim-msg-row--assistant" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 6 }}>
         <WorkedForPill trace={workedForTrace} duration={duration} />
         {costUsd !== null && (
           <span
-            title={`~${formatCostUsd(costUsd)} — ${costBasisLabel(runProvider ?? '') ?? 'estimated'} · ${tokenStats?.input.toLocaleString()} in / ${tokenStats?.output.toLocaleString()} out tokens`}
+            title={`~${formatCostUsd(costUsd)} — ${costBasisLabel(runProvider ?? '') ?? 'estimated'} · ${ts?.input.toLocaleString()} in / ${ts?.output.toLocaleString()} out tokens`}
             style={{
               fontFamily: 'var(--kim-mono)',
               fontSize: 11.5,
@@ -266,7 +277,7 @@ export function StreamRenderer({
         )}
       </div>
     );
-  }, [tokenStats]);
+  }, []);
 
   // showLiveActivity: true when the last real user message in collapsedLive has
   // no non-intermediate assistant reply after it. Stable during activity/elapsed
@@ -290,7 +301,9 @@ export function StreamRenderer({
   //   collapsedLive / runHistory — useState refs, only update on message events
   //   settings.typing_animation  — primitive string
   //   stableRetry / stableEdit   — useCallback with empty deps (ref-backed)
-  //   renderWorkedFor            — useCallback whose only dep is tokenStats
+  //   renderWorkedFor            — useCallback with empty deps (F-F-11: tokenStats
+  //                                is read via a ref, so stats ticks no longer
+  //                                churn its identity and rebuild the history)
   const liveMsgNodesNewChat = useMemo(() => {
     let liveUserIdx = -1;
     let liveAsstRunIdx = -1;
