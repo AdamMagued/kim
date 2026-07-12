@@ -136,11 +136,106 @@ or executed at runtime by Kim. Recommended cleanup package:
   docstring). Comment describes a lint scope that no longer matches reality.
 - **Impact**: Low — doc rot in CI config.
 
-### F-G-3 — `relay:` section survives in config.yaml after relay decommission
+### F-G-3 — `relay:` section survives in config.yaml after relay decommission (CONFIRMED dead)
 - **Where**: `config.yaml` (`relay:` with `pc_api_key`, `poll_interval`, `url`).
 - **What**: relay_server was deleted in `9f6371f` (2026-07-06) but the config section
-  remains. (Reader audit in the config.yaml section below.)
+  remains. Reader audit: grep for `pc_api_key` / `poll_interval` / `"relay"` across
+  orchestrator/, mcp_server/, desktop/src-tauri/, cli/, codex_engine/ → **0 readers**.
 - **Impact**: Low-Medium — dead config invites confusion and cargo-cult copying;
   `pc_api_key` is a credential-shaped key that suggests a live feature.
 
-(further findings continue in later commits)
+### F-G-4 — `shell.blocked_commands` in config.yaml is read by NOTHING (false-security config)
+- **Where**: `config.yaml` L48-53 (`shell.blocked_commands:` listing `rm -rf /`,
+  `format c:`, …) and `config.yaml.example` L86.
+- **What**: repo-wide grep for `blocked_commands` across orchestrator/, mcp_server/,
+  desktop/, cli/, tests/ → **0 readers**. `mcp_server/config.py` reads only
+  `shell.timeout` (L162) and `shell.sandbox_mode` (L165). The real deny-list is
+  hard-coded in `mcp_server/tools/shell.py` (`_DENY_COMMANDS` L64, `_DENY_PATTERNS`
+  L84) and cannot be extended via config.
+- **Impact**: **High** (safety illusion) — an operator who adds a command to
+  `blocked_commands` reasonably believes it is now blocked; it is silently ignored.
+  Either wire the key into shell.py's deny-set (additively — never let config REMOVE
+  hard-coded entries) or delete the key from both YAML files and document the deny-list
+  as code-owned.
+
+### F-G-5 — Entire `voice:` section in config.yaml is dead, and the live key has a name mismatch
+- **Where**: `config.yaml` `voice:` block (13 lines: enabled/engine/human_quirks/hume/
+  maya1/speed/voice_id) vs `mcp_server/config.py` L183.
+- **What**: the only voice key the code reads is the FLAT key
+  `voice_enabled` (`VOICE_ENABLED: bool = _as_bool(_cfg.get("voice_enabled", False), False)`) —
+  which does not exist in config.yaml. The nested `voice.enabled` and every subkey
+  (`engine`, `human_quirks`, `hume.*`, `maya1.*`, `speed`, `voice_id`) have **0
+  readers** (grep for `human_quirks|maya1|hume` in orchestrator/ + mcp_server/ → 0
+  files). Voice scaffold was decommissioned in `9f6371f`.
+- **Impact**: Medium — 13 lines of dead config, plus a real key (`voice_enabled`)
+  that no shipped config file sets; setting `voice.enabled: true` does nothing.
+
+### F-G-6 — Pillow pin makes 5 known CVE fixes unreachable (pip-audit)
+- **Where**: `requirements.txt` L23 `Pillow~=10.0` (installs 10.4.0).
+- **What**: `pip-audit -r requirements.txt` → Pillow 10.4.0 carries PYSEC-2026-165,
+  CVE-2026-25990, CVE-2026-40192, CVE-2026-42310, CVE-2026-42311; fixes land in
+  12.1.1/12.2.0. The compatible-release pin `~=10.0` caps at <11, so `pip install`
+  can never pick up the fixed versions. Kim feeds screenshots and user-supplied
+  images through PIL. Also: pytest 8.4.2 → PYSEC-2026-1845 (fix 9.0.3; dev-only,
+  low).
+- **Impact**: High (dependency hygiene on an image-parsing library) — bump to
+  `Pillow~=12.1` (or at least `>=12.1.1`) and re-run the suites.
+
+### F-G-7 — `scripts/claw-via-browser` is broken: launches a module that no longer exists
+- **Where**: `scripts/claw-via-browser` L102 (`"$PYTHON" -m orchestrator.run_claw_relay …`),
+  L25 (docstring references `orchestrator.run_claw_bridge`), L61-64 (binary lookup
+  into `pythonExperimentTool/claw-code/rust/target/…`).
+- **What**: neither `orchestrator/run_claw_relay.py` nor `orchestrator/run_claw_bridge.py`
+  exists (repo-wide find → 0; both were merged into `orchestrator/codex_bridge_service.py`).
+  The script fails at launch on every invocation. Last touched 2026-05-11 (`006ef34`).
+- **Impact**: Medium-Low — dead dev tooling; belongs in the pythonExperimentTool
+  delete package (verdict item 1-3 above, extend to `git rm scripts/claw-via-browser`).
+
+### F-G-8 — requirements.txt ships two never-imported dependencies
+- **Where**: `requirements.txt` L15 `aiosqlite~=0.20`, L41 `pynput~=1.7`.
+- **What**: repo-wide grep (excluding venv/ and pythonExperimentTool/) for
+  `import aiosqlite|from aiosqlite` and `import pynput|from pynput` → **0 hits** in
+  orchestrator/, mcp_server/, codex_engine/, cli/, scripts/, desktop/. pynput appears
+  only as a stubbed module name in `tests/conftest.py` L57 (legacy stub) and
+  commented out in `kim-orchestrator.spec` L82. Every other dep verified in use
+  (mcp, anthropic, openai, dotenv, yaml, httpx, aiofiles, aiohttp, json5,
+  json-repair, pyperclip, pyautogui, mss, Pillow, playwright, pytest/-asyncio).
+- **Impact**: Low — install weight + audit surface; drop both lines and the
+  conftest stub entries.
+
+### F-G-9 — install.sh: no minimum-Python-version check (repo targets 3.11)
+- **Where**: `install.sh` L29-45 accepts the first `python3`/`python` found;
+  `pyrightconfig.json` L8 declares `"pythonVersion": "3.11"`.
+- **What**: on a machine with Python 3.9/3.10 the installer proceeds and fails later
+  with confusing pip/syntax errors instead of a clear "need >= 3.11" message.
+  Otherwise install.sh audits clean: `set -e`, idempotent venv/.env/dir creation,
+  correct macOS vs Linux hints, guarded `~/.kim_root` write. (Nit: no `set -u`/
+  `pipefail`; header comment in requirements.txt recommends committing a lockfile
+  but none exists — `requirements-lock.txt` absent.)
+- **Impact**: Low — one version-guard block fixes it.
+
+## CONFIG.YAML KEY AUDIT (every key → read by code?)
+
+| Key | Readers (grep, code dirs) | Status |
+|---|---|---|
+| allowed_paths, use_real_browser, custom_sites, logging.level, max_iterations, max_tokens, memory_keep_screenshots, memory_max_messages, model.{claude,deepseek,gemini,openai}, openai_api_key_env, openai_base_url, preview_mode, project_root, provider, screenshot_scale, shell.timeout, mcp_servers, connectors.enabled | >=1 each | LIVE |
+| browser_provider.* (headless, force_headless, cdp_url, max_history_messages, max_inject_chars, stateful_threads, compact_at_ratio, max_thread_turns) | >=1 each | LIVE |
+| bridge_timeout_secs, screenshot_flash_duration_ms, ipc_protocol | >=2 each | LIVE |
+| shell.blocked_commands | 0 | **DEAD — F-G-4** |
+| relay.{pc_api_key, poll_interval, url} | 0 | **DEAD — F-G-3** |
+| voice.* (entire section) | 0 (code reads flat `voice_enabled` instead) | **DEAD — F-G-5** |
+
+Note: `config.yaml.example` documents `shell.sandbox_mode` (read by code, L165 of
+mcp_server/config.py) but `config.yaml` itself does not set it — defaults to True.
+
+## SCRIPTS/ INVENTORY
+- `check_file_size_gate.py` — wired: `.github/workflows/ci.yml` L57. KEEP.
+- `gen-events.js` — wired: `desktop/package.json` `gen:events`. KEEP.
+- `probe_appserver.py` — dev tool for codex_engine protocol-drift checks; referenced
+  by codex_engine docs. KEEP.
+- `install-kim.sh` / `install-kim.ps1` — CLI release installers (download prebuilt
+  binary from GitHub releases; distinct purpose from root install.sh). KEEP.
+- `claw-via-browser` — BROKEN (F-G-7). DELETE with the claw package.
+
+justfile audits clean: `check`/`test`/`fake`/`dev` recipes reference only live paths;
+`cargo test -p kim-cli` works because `cli` is a root-workspace member (Cargo.toml L3).
