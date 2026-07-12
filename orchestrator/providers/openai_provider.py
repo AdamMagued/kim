@@ -61,6 +61,11 @@ class OpenAIProvider(BaseProvider):
         models = config.get("model", {})
         self._model = models.get("openai", "gpt-4o")
         self._max_tokens = int(config.get("max_tokens", 4096))
+        # F-INH-2: o-series reasoning models and the GPT-5 family reject the
+        # legacy `max_tokens` field and require `max_completion_tokens`. Pick the
+        # right field up front for known families; complete() also self-corrects
+        # once on the specific 400 so an unknown future model still works.
+        self._token_param = _default_token_param(self._model)
         logger.info(f"OpenAIProvider: model={self._model} base_url={base_url or 'openai'}")
 
     async def complete(
@@ -72,17 +77,17 @@ class OpenAIProvider(BaseProvider):
         oai_messages = [{"role": "system", "content": system}] + self._to_oai_messages(messages)
         oai_tools = self._to_oai_tools(tools)
 
-        try:
-            kwargs: dict = dict(
-                model=self._model,
-                messages=oai_messages,
-                max_tokens=self._max_tokens,
-            )
-            if oai_tools:
-                kwargs["tools"] = oai_tools
-                kwargs["tool_choice"] = "auto"
-            kwargs["timeout"] = 180.0
+        kwargs: dict = dict(
+            model=self._model,
+            messages=oai_messages,
+        )
+        kwargs[self._token_param] = self._max_tokens
+        if oai_tools:
+            kwargs["tools"] = oai_tools
+            kwargs["tool_choice"] = "auto"
+        kwargs["timeout"] = 180.0
 
+        try:
             response = await self._client.chat.completions.create(**kwargs)
         except openai.RateLimitError:
             raise
@@ -94,6 +99,22 @@ class OpenAIProvider(BaseProvider):
             # Re-raise as builtin TimeoutError so classify_provider_error marks it
             # retryable regardless of Python version (isinstance check works on all).
             raise TimeoutError(str(e) or "OpenAI API timed out") from e
+        except openai.BadRequestError as e:
+            # F-INH-2: a model that requires max_completion_tokens 400s on
+            # max_tokens. Swap the field and retry once, remembering the choice
+            # for the rest of the session so the wasted call happens at most once.
+            if self._token_param == "max_tokens" and _is_max_tokens_param_error(e):
+                logger.info(
+                    "OpenAI model %s rejected max_tokens; retrying with max_completion_tokens",
+                    self._model,
+                )
+                self._token_param = "max_completion_tokens"
+                kwargs.pop("max_tokens", None)
+                kwargs["max_completion_tokens"] = self._max_tokens
+                response = await self._client.chat.completions.create(**kwargs)
+            else:
+                logger.error(f"OpenAI API error: {e}")
+                raise
         except openai.APIError as e:
             logger.error(f"OpenAI API error: {e}")
             raise
@@ -217,3 +238,27 @@ class OpenAIProvider(BaseProvider):
             "stop_reason": finish_reason,
             "usage": usage,
         }
+
+
+def _default_token_param(model: str) -> str:
+    """Field name for the output-token limit (F-INH-2).
+
+    o-series reasoning models (o1/o3/o4/…) and the GPT-5 family require
+    ``max_completion_tokens``; everything else still takes ``max_tokens``.
+    An unknown model defaults to max_tokens and complete() self-corrects on the
+    specific 400.
+    """
+    m = (model or "").lower().strip()
+    # Strip a provider prefix some proxies use, e.g. "openai/o3-mini".
+    m = m.rsplit("/", 1)[-1]
+    if m.startswith(("o1", "o3", "o4", "o5")) or m.startswith("gpt-5"):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
+def _is_max_tokens_param_error(exc: Exception) -> bool:
+    """True when a 400 says max_tokens is unsupported / to use max_completion_tokens."""
+    msg = str(exc).lower()
+    return "max_completion_tokens" in msg or (
+        "max_tokens" in msg and ("unsupported" in msg or "not supported" in msg)
+    )
