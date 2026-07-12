@@ -1719,6 +1719,80 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // F-E-4: a Ctrl-C interrupt mid-turn must leave a trailing Error message so
+    // one-shot `kim chat`/`kim code` exits non-zero (run_oneshot checks the last
+    // message's role). The partial answer is still kept.
+    #[tokio::test]
+    async fn cancelled_turn_marks_error_for_nonzero_exit() {
+        let dir = temp_session_dir();
+        let mut app = test_app("cancel-err-1");
+        app.push(MessageRole::User, "long task");
+        save_into(&dir)(&app);
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        // One partial chunk arrives, then the cancel fires (biased select drains
+        // the ready chunk first, then takes the cancel branch).
+        tx.send(AppEvent::TextChunk("partial answer".to_string())).unwrap();
+
+        consume_turn_events(
+            &mut app,
+            rx,
+            Instant::now(),
+            save_into(&dir),
+            std::future::ready(()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(app.messages.last(), Some(m) if m.role == MessageRole::Error),
+            "a Ctrl-C cancel must leave a trailing Error; messages: {:?}",
+            app.messages
+        );
+        // The partial answer is preserved (as an Assistant message before the Error).
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Assistant && m.content.contains("partial answer")));
+        drop(tx);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // F-E-4: a turn that ends with no answer at all (child exited / empty stream)
+    // must leave a trailing Error so one-shot mode exits non-zero.
+    #[tokio::test]
+    async fn no_response_turn_marks_error_for_nonzero_exit() {
+        let dir = temp_session_dir();
+        let mut app = test_app("noresp-1");
+        app.push(MessageRole::User, "hi");
+        save_into(&dir)(&app);
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        tx.send(AppEvent::Done(false)).unwrap(); // stream ended, never produced text
+        drop(tx);
+
+        consume_turn_events(
+            &mut app,
+            rx,
+            Instant::now(),
+            save_into(&dir),
+            std::future::pending::<()>(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(app.messages.last(), Some(m) if m.role == MessageRole::Error),
+            "a no-response turn must leave a trailing Error; messages: {:?}",
+            app.messages
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // A1: a normal chat turn must persist BOTH the user message and the streamed
     // assistant reply, and app.messages must carry the reply for the next turn.
     #[tokio::test]

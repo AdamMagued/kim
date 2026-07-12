@@ -21,8 +21,12 @@ pub enum AgentLine {
     Activity(String),
     /// A tool invocation (`[TOOL] name(args)`).
     Tool { name: String },
-    /// Final answer summary (`[SUCCESS]/[FAILED] ...`).
+    /// Final answer summary from a SUCCEEDED run (`[SUCCESS] ...`).
     Answer(String),
+    /// Final answer summary from a FAILED run (`[FAILED] ...`). Kept distinct
+    /// from `Answer` so the CLI renders it with the Error role and one-shot mode
+    /// exits non-zero. (F-E-4)
+    FailedAnswer(String),
     /// Human-approval request.
     Hitl {
         tool: String,
@@ -75,8 +79,10 @@ pub fn parse_agent_line(line: &str) -> AgentLine {
     if let Some(rest) = trimmed.strip_prefix("[SUCCESS] ") {
         return AgentLine::Answer(rest.to_string());
     }
+    // F-E-4: `[FAILED] …` is a distinct variant, not another Answer — the run
+    // declared failure and must be surfaced as an error, not a normal reply.
     if let Some(rest) = trimmed.strip_prefix("[FAILED] ") {
-        return AgentLine::Answer(rest.to_string());
+        return AgentLine::FailedAnswer(rest.to_string());
     }
     AgentLine::Ignore
 }
@@ -270,7 +276,12 @@ pub async fn stream_agentic_request(
     // F10: bounded concurrent stderr drain (shared helper, see provider.rs).
     let stderr_tail = child.stderr.take().map(crate::provider::drain_stderr_tail);
     let mut lines = BufReader::new(stdout).lines();
-    let mut saw_done = false;
+    // F-E-4: the orchestrator declares run success/failure via
+    // run_done{success} and a `[SUCCESS]/[FAILED] …` line, but the python
+    // process exits 0 either way — so we must track the declared outcome
+    // explicitly rather than trusting the child's exit code.
+    let mut run_success: Option<bool> = None;
+    let mut answer_failed = false;
     let mut had_output = false;
     // F9: a stdout read error must surface instead of masquerading as EOF.
     let mut read_err: Option<String> = None;
@@ -308,6 +319,10 @@ pub async fn stream_agentic_request(
             AgentLine::Answer(text) => {
                 answer_buf = Some(text);
             }
+            AgentLine::FailedAnswer(text) => {
+                answer_buf = Some(text);
+                answer_failed = true;
+            }
             AgentLine::ProviderError(code) => {
                 let _ = tx.send(AppEvent::Err(format!("provider error: {code}")));
             }
@@ -330,22 +345,34 @@ pub async fn stream_agentic_request(
                     let _ = stdin.flush().await;
                 }
             }
-            AgentLine::Done(_success) => {
+            AgentLine::Done(success) => {
                 // Do NOT emit AppEvent::Done here: the orchestrator prints the
                 // `[SUCCESS]/[FAILED] <answer>` line AFTER `run_done`, and the consumer
                 // breaks on Done — emitting it now drops the answer ("(no response)").
                 // Defer Done to end-of-stream so the answer is delivered first.
-                saw_done = true;
+                // F-E-4: record the declared success so a failed run exits non-zero.
+                run_success = Some(success);
             }
             AgentLine::Ignore => {}
         }
     }
-    let _ = saw_done;
+    // F-E-4: a run the agent itself declared FAILED — via `[FAILED] …` or
+    // run_done{success:false} — must not be delivered as a normal answer.
+    let failed = answer_failed || run_success == Some(false);
     // Flush the (possibly multi-line) final answer now that we've read to EOF.
+    // A failed run's summary goes out as an Err (Error role) so one-shot mode
+    // exits non-zero; a successful answer as a normal TextChunk.
+    let mut sent_failure = false;
     if let Some(buf) = answer_buf {
         let trimmed = buf.trim();
         if !trimmed.is_empty() {
-            let _ = tx.send(AppEvent::TextChunk(render_markdown(trimmed)));
+            let rendered = render_markdown(trimmed);
+            if failed {
+                let _ = tx.send(AppEvent::Err(rendered));
+                sent_failure = true;
+            } else {
+                let _ = tx.send(AppEvent::TextChunk(rendered));
+            }
         }
     }
     // On a read error, close our end of the stdout pipe before wait() so a
@@ -375,6 +402,19 @@ pub async fn stream_agentic_request(
             let _ = tx.send(AppEvent::Err(format!("Kim agent: {detail}")));
             return;
         }
+    }
+    // F-E-4: a failed run that exited 0 with output but produced no answer text
+    // still must not report success.
+    if failed && !sent_failure {
+        let _ = tx.send(AppEvent::Err(
+            "Kim agent run failed (no summary produced).".to_string(),
+        ));
+        return;
+    }
+    // The failed answer was already delivered as an Err (which ends the turn on
+    // the consumer side); don't also send a normal Done.
+    if sent_failure {
+        return;
     }
     let _ = tx.send(AppEvent::Done(false));
 }
@@ -422,9 +462,10 @@ mod tests {
             parse_agent_line("[SUCCESS] all done"),
             AgentLine::Answer("all done".into())
         );
+        // F-E-4: [FAILED] is a distinct variant, not an Answer.
         assert_eq!(
             parse_agent_line("[FAILED] nope"),
-            AgentLine::Answer("nope".into())
+            AgentLine::FailedAnswer("nope".into())
         );
     }
 
@@ -564,11 +605,11 @@ mod tests {
             AgentLine::Answer("task complete".into()),
             "[SUCCESS] should yield Answer"
         );
-        // Failed case — same variant, different payload.
+        // Failed case — a distinct variant (F-E-4) so it renders as an error.
         assert_eq!(
             parse_agent_line("[FAILED] could not read file"),
-            AgentLine::Answer("could not read file".into()),
-            "[FAILED] should yield Answer"
+            AgentLine::FailedAnswer("could not read file".into()),
+            "[FAILED] should yield FailedAnswer"
         );
         // Payload with internal spaces preserved.
         assert_eq!(
@@ -579,7 +620,7 @@ mod tests {
         // Trailing CR+LF stripped, marker still recognised.
         assert_eq!(
             parse_agent_line("[FAILED] timeout\r\n"),
-            AgentLine::Answer("timeout".into()),
+            AgentLine::FailedAnswer("timeout".into()),
             "trailing CRLF should be stripped before matching"
         );
     }
@@ -623,6 +664,96 @@ mod tests {
             parse_agent_line(r#"{"type":"provider_error"}"#),
             AgentLine::ProviderError("error".into()),
             "provider_error without code field should default to 'error'"
+        );
+    }
+
+    /// F-E-4: an orchestrator run that ends with run_done{success:false} and a
+    /// `[FAILED] …` line (but still exits 0, as the real orchestrator does) must
+    /// be delivered to the CLI as an `AppEvent::Err`, NOT a normal TextChunk —
+    /// otherwise one-shot `kim chat` renders it like any answer and exits 0.
+    ///
+    /// Driven with a fake "python" that prints the protocol and exits 0, so the
+    /// test is hermetic (no venv / orchestrator required). Unix-only: it relies
+    /// on an executable shell script.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_run_is_delivered_as_error_not_a_normal_answer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let fake = root.join("fake-python.sh");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             echo '{\"type\":\"run_done\",\"success\":false}'\n\
+             echo '[FAILED] the task could not be completed'\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let session_dir = root.join("kim_sessions");
+        stream_agentic_request(root, &fake, "do X", "ollama", &session_dir, None, tx).await;
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            !events.iter().any(
+                |e| matches!(e, AppEvent::TextChunk(t) if t.contains("could not be completed"))
+            ),
+            "a FAILED run must not be delivered as a normal answer; events: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Err(t) if t.contains("could not be completed"))),
+            "a FAILED run must be delivered as an Error; events: {events:?}"
+        );
+    }
+
+    /// F-E-4 (mirror): a SUCCEEDED run is delivered as a normal TextChunk, so
+    /// the happy path still exits 0.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn succeeded_run_is_delivered_as_a_normal_answer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let fake = root.join("fake-python.sh");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             echo '{\"type\":\"run_done\",\"success\":true}'\n\
+             echo '[SUCCESS] all done here'\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let session_dir = root.join("kim_sessions");
+        stream_agentic_request(root, &fake, "do X", "ollama", &session_dir, None, tx).await;
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::TextChunk(t) if t.contains("all done here"))),
+            "a SUCCESS run must be delivered as a normal answer; events: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AppEvent::Err(_))),
+            "a SUCCESS run must not emit an Error; events: {events:?}"
         );
     }
 }

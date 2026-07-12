@@ -574,3 +574,29 @@ fn code_mode_rejects_non_ollama_provider_with_exit_2() {
         "the gate message must name the rejected provider; output:\n{all}"
     );
 }
+
+// ── F-E-4: one-shot exits non-zero on a no-response run ──────────────────────
+
+// An empty provider stream (only `[DONE]`, no content deltas) prints
+// "Kim: (no response)". Before the fix this exited 0; scripts and CI could not
+// tell a silent/failed run from a real answer. It must now exit non-zero.
+#[test]
+fn oneshot_no_response_exits_nonzero() {
+    let server = FakeServer::start(|_| {
+        // No content deltas at all.
+        (200, "text/event-stream", "data: [DONE]\n\n".to_string())
+    });
+    let home = temp_home_with_config(&ollama_config(&server.base_url));
+
+    let output = run_kim_chat(&home, "produce nothing", &[]);
+    assert!(
+        !output.status.success(),
+        "a no-response run must exit non-zero; output:\n{}",
+        combined_output(&output)
+    );
+    assert!(
+        combined_output(&output).contains("(no response)"),
+        "the no-response notice should still be printed; output:\n{}",
+        combined_output(&output)
+    );
+}
