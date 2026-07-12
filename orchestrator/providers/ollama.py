@@ -619,6 +619,13 @@ class OllamaProvider(BaseProvider):
         return None, None
 
     def _context_limit_from_ps_sync(self, model: str) -> int | None:
+        # F-B-6: point the `ollama` CLI at the CONFIGURED daemon. Without
+        # OLLAMA_HOST the CLI always queries localhost, so with a remote
+        # base_url (KIM_OLLAMA_BASE_URL / ollama.base_url) the reported
+        # context_limit could describe a different daemon's loaded model — or
+        # the CLI errors when nothing runs locally while the remote is healthy.
+        # If the CLI isn't installed we fall back to /api/show against base_url.
+        env = {**os.environ, "OLLAMA_HOST": self._base_url}
         try:
             proc = subprocess.run(
                 ["ollama", "ps"],
@@ -626,6 +633,7 @@ class OllamaProvider(BaseProvider):
                 text=True,
                 check=False,
                 timeout=10,
+                env=env,
             )
         except (OSError, subprocess.SubprocessError):
             return None

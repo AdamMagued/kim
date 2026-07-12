@@ -515,6 +515,26 @@ class OllamaDoneReasonTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "stop")
 
 
+class OllamaRemotePsHostTests(unittest.TestCase):
+    """F-B-6: `ollama ps` must target the configured daemon, not localhost."""
+
+    def test_ps_subprocess_gets_ollama_host_from_base_url(self):
+        import types as _t
+
+        provider = OllamaProvider({"ollama": {"base_url": "http://10.0.0.5:11434"}})
+        captured = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _t.SimpleNamespace(returncode=1, stdout="")
+
+        with patch("orchestrator.providers.ollama.subprocess.run", _fake_run):
+            provider._context_limit_from_ps_sync("m")
+
+        self.assertIsNotNone(captured["env"])
+        self.assertEqual(captured["env"].get("OLLAMA_HOST"), "http://10.0.0.5:11434")
+
+
 class OllamaTimeoutClassificationTests(unittest.TestCase):
     """F-B-5: httpx transport timeouts must become retryable builtin TimeoutError."""
 
