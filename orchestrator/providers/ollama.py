@@ -412,26 +412,39 @@ class OllamaProvider(BaseProvider):
                             text_parts.append(str(text))
                     else:
                         text_parts.append(str(item))
-                converted: dict[str, Any] = {
-                    "role": role,
-                    "content": "\n".join([p for p in text_parts if p]).strip(),
-                }
-                if images:
-                    converted["images"] = images
-                else:
-                    matched = _match_pending(converted["content"])
-                    tool_result = _tool_result_message(role, converted["content"], pending=matched)
+                text_content = "\n".join([p for p in text_parts if p]).strip()
+
+                # F-B-4: detect a tool result INDEPENDENT of whether it carries
+                # an image. A screenshot tool result (text + image) previously
+                # skipped pairing entirely — the assistant tool_call it answered
+                # stayed pending forever (strict-server 400 on an unanswered
+                # tool_call, plus an off-by-one id cascade as the stale entry
+                # was popped by the next same-named result). Only convert when a
+                # pending call of that name exists; an unmatched [Tool result: x]
+                # (user-pasted transcript, or a trimmed-history orphan) stays a
+                # plain message. Ollama accepts images on any message, so attach
+                # them to the role:"tool" message.
+                matched = _match_pending(text_content)
+                if matched is not None:
+                    tool_result = _tool_result_message(role, text_content, pending=matched)
                     if tool_result:
+                        if images:
+                            tool_result["images"] = images
                         out.append(tool_result)
                         continue
+
+                converted: dict[str, Any] = {"role": role, "content": text_content}
+                if images:
+                    converted["images"] = images
                 out.append(converted)
             else:
                 text = str(content or "")
                 matched = _match_pending(text)
-                tool_result = _tool_result_message(role, text, pending=matched)
-                if tool_result:
-                    out.append(tool_result)
-                    continue
+                if matched is not None:
+                    tool_result = _tool_result_message(role, text, pending=matched)
+                    if tool_result:
+                        out.append(tool_result)
+                        continue
                 out.append({"role": role, "content": text})
         return out
 

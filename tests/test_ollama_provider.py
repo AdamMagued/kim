@@ -400,6 +400,44 @@ class InterleavedToolResultPairingTests(unittest.TestCase):
         self.assertEqual(by_content["file contents"], assistant_ids[0])
         self.assertEqual(by_content["listing"], assistant_ids[1])
 
+    def test_image_tool_result_pairs_and_keeps_image(self):
+        # F-B-4: a screenshot tool result (text + image) that answers a pending
+        # take_screenshot call must become a role:"tool" message paired to the
+        # call's id — NOT an orphaned user message that leaves the call unanswered.
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        messages = [
+            {"role": "assistant", "content": '{"type":"tool_call","tool":"take_screenshot","args":{}}'},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[Tool result: take_screenshot]\ncaptured"},
+                    {"type": "image", "data": "IMG", "media_type": "image/png"},
+                ],
+            },
+        ]
+        out = provider._to_ollama_messages(messages, "")
+        assistant_id = out[0]["tool_calls"][0]["id"]
+        tool_msgs = [m for m in out if m.get("role") == "tool"]
+        self.assertEqual(len(tool_msgs), 1, "pending take_screenshot call must be answered")
+        self.assertEqual(tool_msgs[0]["tool_call_id"], assistant_id)
+        # The image rides along on the tool message (Ollama accepts images anywhere).
+        self.assertEqual(tool_msgs[0]["images"], ["IMG"])
+        # No stray user message left holding the orphaned result.
+        self.assertFalse(any(m.get("role") == "user" for m in out))
+
+    def test_user_typed_tool_result_without_pending_call_stays_user_message(self):
+        # F-B-4: a user pasting a [Tool result: x] transcript with no matching
+        # pending call must NOT be silently rewritten into a role:"tool" message
+        # with a fabricated tool_call_id.
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        messages = [
+            {"role": "user", "content": "[Tool result: read_file]\npasted from an old chat"},
+        ]
+        out = provider._to_ollama_messages(messages, "")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["role"], "user")
+        self.assertNotIn("tool_call_id", out[0])
+
     def test_same_tool_twice_pairs_fifo(self):
         provider = OllamaProvider({"ollama": {"mode": "cloud"}})
         messages = [
