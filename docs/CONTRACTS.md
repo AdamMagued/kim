@@ -353,4 +353,193 @@ and double the side effect — the inherited finding-2.1 fix). Tool results are 
 becomes `"(no output)"`.
 
 ---
-*(seam 4 + test plan below — written incrementally)*
+
+## Seam 4 — Codex bridge (proxy ⇄ codex binary ⇄ browser provider)
+
+The Code tab runs the real `codex` binary but routes its model calls through Kim's
+`BrowserProvider` (no OpenAI key — invariant 1). Two transports, selected by
+`codex_appserver_transport.transport_name(config)` (`codex_bridge.transport`, default
+`app-server`; unknown values degrade to default):
+
+### 4a. `exec` transport — `_CodexProxy` (codex_engine/engine.py:330)
+
+A loopback aiohttp server impersonating the OpenAI API. `codex exec --json` is spawned
+with `OPENAI_API_KEY` = a per-run `secrets.token_urlsafe(32)` bearer, verified
+constant-time on every request (#47). Endpoints:
+
+| Endpoint | Method | Fidelity contract |
+|---|---|---|
+| `POST /v1/responses` | codex Responses API | primary. Request → prompt via `_extract_prompt_from_responses_request`: `instructions`→`[SYSTEM PROMPT]` ✓ (the instruction-drop bug's fix), `tools`→`[AVAILABLE CODEX TOOLS]` **prose** (F-H-7), input items→`[USER]`/`[ASSISTANT]`. Reply ← `_provider_response_to_responses_api`: expects browser model to emit `{"text":…,"tool_calls":[{name,input}]}`; `_normalize_tool_calls` snaps invented names/keys onto request tools (`command`→`cmd`). Returns SSE (`_sse_or_json`) when `stream:true`, else JSON. |
+| `POST /v1/chat/completions` | OpenAI Chat | secondary. Same lossy prose flattening; no delta/thread state. |
+| `GET /v1/models` | — | returns a single stub `kim-proxy-model`. |
+
+Fidelity gaps (all in F-H-7): tool JSON schemas become prose; `function_call_output`
+content is `" ".join(str(...))`-flattened before the browser sees it; the model's
+emitted `tool_calls[].input` is NOT validated against the declared `parameters`. Robustness
+machinery layered on top: auto-compaction above a per-provider token threshold,
+`_nudge_contract_retry` (one re-ask when a reply ignored the JSON contract),
+loop-guard (identical/subset repeated tool calls end the turn with an honest final answer),
+`MAX_RELAYS=50` per turn (`begin_turn()` resets it), and a `Continue.`-only-delta shortcut
+that returns the cached response. Cross-task browser-thread state (system-prompt already
+sent, handoff, turns) lives in the `codex_engine/thread_state.py` sidecar and is mutated
+in place.
+
+### 4b. `app-server` transport (orchestrator/codex_appserver_transport.py — the default)
+
+`codex app-server` speaks newline-delimited **JSON-RPC 2.0** on stdin/stdout (verified
+against codex-cli 0.134.0, `docs/APPENDIX_appserver_probe_findings.md`). The model still
+routes through `_CodexProxy` (`modelProvider: "kim-proxy"`, inline `config` overrides set
+`base_url` to the proxy, `wire_api="responses"`; bearer via `CODEX_API_KEY`,
+`build_appserver_env`). This transport adds native per-command approvals, live output, and
+true session resume.
+
+**Client → server methods:** `initialize`, `thread/start`, `thread/resume`, `turn/start`,
+`turn/interrupt`, `turn/steer`, `thread/compact/start`.
+
+**Server → client REQUESTS (must answer or codex hangs)** — translated to Kim events, the
+answer written back as a stdin decision line (Seam 2b):
+
+| codex method | Kim event emitted | Answered via |
+|---|---|---|
+| `item/commandExecution/requestApproval` (+ v1 `execCommandApproval`) | `command_approval_request` | `approval_decision` stdin (`_V1_DECISION`: accept→approved, acceptForSession→approved_for_session, decline→denied) |
+| `item/fileChange/requestApproval` (+ v1 `applyPatchApproval`) | `file_change_approval_request` | `approval_decision` stdin |
+| `item/tool/requestUserInput` | `user_input_request` (kind=questions) | `user_input` stdin `{id, answers}` |
+| `mcpServer/elicitation/request` | `user_input_request` (kind=elicitation) | auto-declined today (informational) |
+
+**Server → client NOTIFICATIONS → Kim events:** `turn/started|completed|interrupted|failed`
+→ `turn_lifecycle`; `item/started|completed` → `item_lifecycle`;
+`item/agentMessage/delta` → `assistant_delta`; `item/reasoning/textDelta` →
+`reasoning_delta` (provider names scrubbed by `_PROVIDER_NAME_RE`);
+`item/commandExecution/outputDelta` → `command_output`; `turn/plan/updated` →
+`plan_update`; `turn/diff/updated` → `diff_update`; `thread/tokenUsage/updated` →
+`token_usage`; `thread/compacted` → native compaction handled inline.
+
+**Known gaps vs `docs/PROPOSAL_codex_appserver_parity.md`:**
+- `compact_codex_thread` (transport:1025-1043) issues `thread/resume` with only
+  `{threadId, cwd}` — omitting `modelProvider:"kim-proxy"`/`config`/policies that the real
+  turn path supplies — so the resumed thread has no route to the proxy and the codex-side
+  half of `/compact` silently never runs (**Team A F-A-4**).
+- `_on_token_usage` awaits `thread/compact/start` (timeout 30s) inline in the notification
+  pump, stalling all other notifications for up to 30s (**Team A F-A-5**).
+- Dynamic client-side tools (`item/tool/call`) and `account/chatgptAuthTokens/refresh` are
+  listed in the probe as server requests but are not wired — a codex build that issues them
+  would hang (no handler → no response).
+
+### 4c. Directional summary
+
+```
+codex binary ──JSON-RPC (app-server)──▶ transport.py ──emit_*──▶ stdout ──▶ Rust ──▶ frontend
+     ▲                                       │
+     │  model call (OpenAI Responses)        │ approval/user-input answer (stdin line)
+     ▼                                       ▼
+ _CodexProxy ──complete()──▶ BrowserProvider ──▶ provider webview (claude.ai / chatgpt / …)
+```
+
+The browser provider itself has its own contract (`[END_OF_RESPONSE_{id}]` sentinel — a
+behavioral invariant) documented in Team B's `team-b.md` V-3 matrix; that is the fifth,
+in-process seam and is out of scope for this cross-process doc.
+
+---
+
+## 5. Contract-drift quick reference (what fails silently today)
+
+| Seam | Silent-failure class | Finding |
+|---|---|---|
+| 1 | Run-terminal events off-schema + un-enveloped; frontend can't attribute done/cancel | F-H-1 |
+| 1 | Four orphaned event channels (3 emit-no-listener, 1 listen-no-emit) | F-H-5 |
+| 1 | `SessionInfo.project_path` / `ToolResultBlock.output` type-vs-runtime drift | F-H (1b), F-F-9 |
+| 2 | Non-JSON chat stdout dropped silently in typed mode | F-H-3 |
+| 2 | Codex bridge termination is magic-string-only (no typed run_done) | F-H-2 |
+| 2 | Tag protocol matched by substring, not prefix; grammar was unwritten | F-H-6 |
+| 2 | Codex spawn spec omits KIM_RUN_ID/SESSION_ID → events un-enveloped | F-H-8 |
+| 3 | `inputSchema.required` never enforced → cryptic `ERROR: 'path'` | F-H-4 |
+| 3 | `isError` never set; error is string-prefix-only; two divergent prefix copies | F-INH-6, F-H (3c) |
+| 4 | Tool schemas flattened to prose; tool_call input unvalidated | F-H-7 |
+| 4 | `compact_codex_thread` resume omits proxy config → no-op | F-A-4 |
+
+---
+
+## 6. Golden-transcript TEST PLAN (finishes the abandoned V-3)
+
+The principle: **each seam gets a recorded golden transcript and a test on BOTH sides**
+that asserts the wire bytes round-trip. A schema change that breaks a contract must break
+a test, not production. Fixtures live under `tests/golden/` (Python) and
+`desktop/src/**/__tests__/golden/` (TS); the same `.jsonl` is shared where both sides read it.
+
+### 6.1 Seam 1 — Frontend ⇄ Rust
+- **Command parity test** (Rust + TS): a generated test enumerates every
+  `#[tauri::command]` and asserts a matching `invoke('<name>')` exists in TS (and vice
+  versa). Fails on a renamed/removed command. (Closes the census in §1a as a guard.)
+- **Struct round-trip** (Rust → TS): for each shared struct (`SessionInfo`,
+  `CompletedCodexSession`, `BrowserSessionMeta`, `KimAccount`, `CodexProject`), serialize a
+  fixture in Rust (`serde_json::to_string`), commit it as golden, and in a TS test
+  `JSON.parse` it against the TS interface (via a type-assertion helper or zod schema).
+  Asserts optionality/field-name drift breaks the build — would have caught
+  `ToolResultBlock.output` (F-F-9) and `SessionInfo.project_path` (§1b).
+- **Event parity test**: enumerate every `emit(...)` name in Rust and every `listen(...)`
+  name in TS; assert bijection except a documented allowlist. Fails on the four orphans
+  (F-H-5).
+
+### 6.2 Seam 2 — Rust ⇄ Python
+- **Emit→decode golden** (Python → Rust): for every `events_gen.emit_*`, capture the exact
+  stdout line into `tests/golden/events/*.jsonl`; a Rust test feeds each line to
+  `serde_json::from_str::<KimEvent>` and asserts it decodes to the expected variant with the
+  envelope preserved by `merge_run_envelope`. (Extends the existing `test_parse_*` in
+  subprocess.rs to full coverage, driven by the schema.)
+- **Grammar conformance** (the tag protocol): a golden file of representative legacy lines
+  (`[STATUS]`, `[STATUS] [PLAN]{…}`, `[TOOL] mod: name({…})`, `[DIFF] path=…`,
+  `TASK_COMPLETE:`, `NEED_HELP:`, a free-text crash line) fed to BOTH the frontend
+  `parseAgentLine`/`parseLogLine` (Vitest) and — for the typed subset — the Rust decoder,
+  asserting each classifies to the documented §2a production. Add adversarial cases: a line
+  whose *payload* contains `[SUCCESS]` (F-H-6), a `[DIFF]` path with a space, a partial JSON
+  line (must not crash).
+- **Termination-contract test**: drive a `KIM_FAKE=1` chat run and a codex-bridge run;
+  assert a chat run emits typed `run_done` AND `kim-agent-done`, and record (as a known-gap
+  xfail until F-H-2) that the codex run currently emits neither typed terminal event.
+- **Stdin round-trip** (Rust → Python): golden lines for `user_steer`, `hitl_approve`
+  (both legacy `{approved}` and K1 `{id,decision}`), `approval_decision`, `user_input`;
+  a Python test feeds each to `StdinPump._dispatch` / `_StdinDecisionPump` and asserts the
+  routing + `normalize_decision` output.
+- **Bridge auth test** (Rust): hit every `/v1/*` route with no `X-Kim-Token` and assert 401
+  except `GET /v1/health` — pins the §2c exemption list (F-H-9).
+
+### 6.3 Seam 3 — Python ⇄ MCP
+- **Error-vocabulary golden**: a table test (the §3c table as data) asserting each prefix
+  maps to the expected `tool_errors.classify_tool_output` code AND is in the
+  `interaction_policy` failure set — fails today on `POLICY_DENIED`/`HITL_DENIED`/`Unknown
+  tool:` (drives the single-shared-constant fix).
+- **Missing-required-arg test**: call each tool with a required field omitted; assert a
+  `BAD_ARGS:`-prefixed result (drives F-H-4's schema validation + `bad_args` code). Until
+  fixed, an xfail documents the cryptic `ERROR: 'path'`.
+- **Response-shape test**: assert `call_tool` always returns `list[TextContent]` and (post
+  F-INH-6 fix) sets `isError` for deny/unknown/exception while keeping the string prefixes.
+- **Schema↔dispatch parity**: already covered by `tests/test_invariants.py` — keep it in the
+  required set.
+
+### 6.4 Seam 4 — Codex bridge
+- **Request→prompt golden** (`_extract_prompt_from_responses_request`): recorded codex
+  Responses request `SAMPLE_TURN.jsonl` → expected prompt string, asserting `instructions`
+  and `tools` both survive (guards the instruction-drop + F-H-7 schema-prose classes).
+- **Response→Responses-API golden** (`_provider_response_to_responses_api`): fixture browser
+  replies (clean JSON contract, prose-with-fence, bare `DONE`, aliased tool name, repeated
+  tool call) → expected Responses payload, asserting `_normalize_tool_calls` snaps names and
+  the loop-guard/salvage/nudge branches fire as documented.
+- **App-server translation golden**: recorded `codex app-server` notification/request
+  `.jsonl` (from the probe) → expected `emit_*` lines (Part 3 of the proposal's own test
+  plan). Include an `item/commandExecution/requestApproval` → `command_approval_request`
+  round-trip and its `approval_decision` answer.
+- **Parity-gap guards**: a test asserting `compact_codex_thread`'s `thread/resume` payload
+  includes `modelProvider`/`config` (fails today — F-A-4), and that `_on_token_usage`
+  schedules compaction without blocking the pump (F-A-5).
+
+### 6.5 CI wiring
+- Add a `golden` job that runs all four suites; a schema edit without regenerated goldens
+  fails it (mirrors the existing `gen:events` drift gate at ci.yml:84-95).
+- Fixtures are versioned; regenerating them is an explicit `just regen-goldens` step so a
+  drift shows up as a reviewed diff, never a silent update.
+
+---
+
+*All four seams + the golden-transcript test plan are documented above. Contract
+mismatches are cross-linked to `docs/ops/findings/team-h.md` (F-H-1…9) and the
+territory teams' findings.*
