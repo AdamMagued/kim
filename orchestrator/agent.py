@@ -83,6 +83,11 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+
+def _count_lines_sync(file_path: str) -> int:
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        return sum(1 for _ in f)
+
 _COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
 
 # ── Client-side tool-call timeout budget (finding 2.1) ─────────────────────
@@ -1366,8 +1371,7 @@ class KimAgent:
             _file_path = args.get("path") or args.get("file_path")
             if _file_path:
                 try:
-                    with open(_file_path, "r", encoding="utf-8", errors="ignore") as _f:
-                        _before_lines = sum(1 for _ in _f)
+                    _before_lines = await asyncio.to_thread(_count_lines_sync, _file_path)
                 except (OSError, IOError):
                     _before_lines = 0
 
@@ -1449,8 +1453,7 @@ class KimAgent:
         # ── Post-execution: emit line diff for file writes ───────────────
         if _file_path and name in _write_ops:
             try:
-                with open(_file_path, "r", encoding="utf-8", errors="ignore") as _f:
-                    after_lines = sum(1 for _ in _f)
+                after_lines = await asyncio.to_thread(_count_lines_sync, _file_path)
                 added = max(0, after_lines - _before_lines)
                 removed = max(0, _before_lines - after_lines)
                 import os as _os
