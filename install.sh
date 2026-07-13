@@ -47,6 +47,17 @@ fi
 echo "  Python: $($PYTHON --version 2>&1)"
 echo ""
 
+# ── Check Python version (3.11+) ────────────────────────────────────────
+if ! "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+    echo "[ERROR] Kim requires Python 3.11 or newer (found $($PYTHON --version 2>&1))."
+    if [ "$OS_NAME" = "macOS" ]; then
+        echo "        Upgrade with: brew install python@3.11 (or newer)"
+    else
+        echo "        Upgrade with: sudo apt install python3.11 python3.11-venv (or newer)"
+    fi
+    exit 1
+fi
+
 # ── Create virtual environment ──────────────────────────────────────────
 if [ ! -d "venv" ]; then
     echo "[1/6] Creating virtual environment..."
