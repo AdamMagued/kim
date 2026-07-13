@@ -239,37 +239,16 @@ jobs:
 
       - name: Install deps from requirements.txt (validates real dependency set, #54)
         run: |
-          pip install --upgrade pip
-          # Install from the canonical requirements file so CI always validates the
-          # same dep set that ships.  Exclude heavy platform deps that need system
-          # libs (playwright, pyautogui, pyobjc, pywin32) — they are guarded by
-          # sys_platform markers and are not needed for unit tests.
-          # This install MUST fail the job if requirements.txt is broken
-          # (bad specifier, yanked pin, 404) — no `|| true`, no hidden stderr.
-          pip install \
+          python -m pip install --upgrade pip
+          # Install the canonical shipped graph with dependencies enabled. Platform
+          # markers in requirements.txt decide which extras apply on this runner.
+          # flake8, pyright, and pytest-cov are CI-only quality tools.
+          python -m pip install \
             -r requirements.txt \
             flake8 \
             pyright==1.1.411 \
-            --ignore-requires-python \
-            --no-deps
-          # Re-install with deps to get transitive graph correct for the core subset
-          pip install \
-            mcp \
-            anthropic \
-            openai \
-            python-dotenv \
-            PyYAML \
-            httpx \
-            aiofiles \
-            aiohttp \
-            json5 \
-            json-repair \
-            pillow \
-            flake8 \
-            pyright==1.1.411 \
-            pytest \
-            pytest-asyncio \
             pytest-cov
+          python -m pip check
 
       - name: pyright (basic type check — orchestrator + mcp_server + codex_engine)
         run: |
@@ -284,7 +263,7 @@ jobs:
           print('pyright: 0 errors')
           "
 
-      - name: flake8 lint (orchestrator, kimctl)
+      - name: flake8 lint
         run: |
           # agent.py contains long single-line system-prompt literals that are
           # deliberately on one source line so they read as one paragraph to
@@ -295,6 +274,15 @@ jobs:
             --max-line-length=120 \
             --extend-ignore=E203,W503 \
             --per-file-ignores=orchestrator/agent.py:E501 \
+            --exclude=__pycache__,.venv,venv
+
+          # The newly covered trees have an existing style backlog. Start with
+          # flake8's errors-first gate: syntax errors, undefined names (including
+          # F821/F822/F823), and invalid control-flow constructs must stay at zero.
+          # One measured F824 remains in browser.py; keep that exact debt visible.
+          flake8 mcp_server/ codex_engine/ tests/ \
+            --select=E9,F63,F7,F82 \
+            --per-file-ignores=mcp_server/tools/web/browser.py:F824 \
             --exclude=__pycache__,.venv,venv
 
       - name: Python import check

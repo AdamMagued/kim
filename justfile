@@ -6,8 +6,7 @@
 default:
     @just --list
 
-# Fast feedback loop: type-check + rust check + pytest (no slow tests)
-# Target: <30 seconds total
+# Development check: type-check + Rust checks + the current full Python test set
 check:
     #!/usr/bin/env bash
     set -e
@@ -23,8 +22,8 @@ check:
     (cargo check -p kim-cli 2>&1) &
     CLI_PID=$!
 
-    echo "=== Python (fast) ==="
-    source venv/bin/activate && python -m pytest tests/ -q -m "not slow" --tb=short &
+    echo "=== Python ==="
+    source venv/bin/activate && python -m pytest tests/ -q --tb=short &
     PYTEST_PID=$!
 
     echo "=== pyright ==="
