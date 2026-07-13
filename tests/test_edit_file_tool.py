@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -233,6 +234,7 @@ class LineEndingAndUnicodeTests(_TmpDirMixin, unittest.TestCase):
 
 
 class FileModePreservationTests(_TmpDirMixin, unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "no POSIX exec bit on Windows")
     def test_exec_bit_preserved(self):
         import os as _os
         import stat as _stat

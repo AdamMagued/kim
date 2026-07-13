@@ -8,6 +8,7 @@ of tests/test_checkpoints.py (monkeypatched CHECKPOINT_ROOT + KIM_RUN_ID).
 from __future__ import annotations
 
 import asyncio
+import json
 
 import mcp_server.checkpoints as cp
 from mcp_server.policy import build_approval_preview
@@ -92,8 +93,10 @@ def test_sensitive_manifest_path_skipped_not_restored(monkeypatch, tmp_path):
     _isolate(monkeypatch, tmp_path, run_id="run-s")
     run_dir = tmp_path / "checkpoints" / "run-s"
     run_dir.mkdir(parents=True)
+    # json.dumps, not string concat: Windows path backslashes must be escaped
+    # or the manifest line is silently unparseable and nothing gets skipped.
     (run_dir / "manifest.jsonl").write_text(
-        '{"path": "' + str(tmp_path / ".env") + '", "kind": "created"}\n',
+        json.dumps({"path": str(tmp_path / ".env"), "kind": "created"}) + "\n",
         encoding="utf-8",
     )
     (tmp_path / ".env").write_text("SECRET=1", encoding="utf-8")
