@@ -191,7 +191,7 @@ jobs:
           pip install \
             -r requirements.txt \
             flake8 \
-            pyright \
+            pyright==1.1.411 \
             --ignore-requires-python \
             --no-deps
           # Re-install with deps to get transitive graph correct for the core subset
@@ -208,7 +208,7 @@ jobs:
             json-repair \
             pillow \
             flake8 \
-            pyright \
+            pyright==1.1.411 \
             pytest \
             pytest-asyncio \
             pytest-cov
