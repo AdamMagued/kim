@@ -1,7 +1,10 @@
 import base64
+import io
 import logging
 import os
 import re
+import stat
+import tempfile
 from pathlib import Path
 
 import aiofiles
@@ -26,8 +29,40 @@ async def handle_read_file(args: dict) -> str:
         return tool_error(f"Not a file: {path}")
     async with aiofiles.open(path, "r", encoding="utf-8", errors="replace") as f:
         content = await f.read()
-    logger.info(f"read_file: {path} ({len(content)} chars)")
-    return content
+
+    offset = args.get("offset")
+    limit = args.get("limit")
+    if offset is None and limit is None:
+        # Default (no windowing args): byte-identical to the historical behavior.
+        logger.info(f"read_file: {path} ({len(content)} chars)")
+        return content
+
+    try:
+        offset = 1 if offset is None else int(offset)
+        limit = None if limit is None else int(limit)
+    except (TypeError, ValueError):
+        return tool_error("offset and limit must be integers")
+    if offset < 1:
+        offset = 1  # clamp: line numbers are 1-based
+    if limit is not None and limit < 1:
+        return tool_error("limit must be a positive integer")
+
+    lines = content.splitlines()
+    total = len(lines)
+    if total == 0:
+        return "(empty file: 0 lines)"
+    if offset > total:
+        return tool_error(
+            f"offset {offset} is past the end of {path} ({total} lines total)"
+        )
+    end = total if limit is None else min(total, offset + limit - 1)
+    numbered = "\n".join(
+        f"{i}→{line}" for i, line in enumerate(lines[offset - 1:end], start=offset)
+    )
+    if offset > 1 or end < total:
+        numbered += f"\n(showing lines {offset}-{end} of {total} total lines)"
+    logger.info(f"read_file: {path} (lines {offset}-{end} of {total})")
+    return numbered
 
 
 async def handle_write_file(args: dict) -> str:
@@ -68,6 +103,226 @@ async def handle_write_file(args: dict) -> str:
         await f.write(content)
     logger.info(f"write_file: {path} ({len(content)} chars)")
     return f"Written {len(content)} chars to {path}"
+
+
+def _line_context(content: str, index: int, match_len: int) -> str:
+    """Return ~1-2 lines of context around content[index:index+match_len]."""
+    lines = content.splitlines()
+    if not lines:
+        return ""
+    start_line = content.count("\n", 0, index)
+    end_line = content.count("\n", 0, index + match_len)
+    lo = max(0, start_line - 1)
+    hi = min(len(lines), end_line + 2)
+    return "\n".join(lines[lo:hi])
+
+
+class EditError(ValueError):
+    """Raised by compute_edit_result when an edit_file call must be rejected."""
+
+
+def compute_edit_result(
+    content: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+    expected_occurrences: object = None,
+    *,
+    label: str = "file",
+) -> "tuple[str, int]":
+    """Single source of truth for edit_file's validation + transform logic.
+
+    Used by BOTH handle_edit_file (apply) and policy.build_approval_preview
+    (approval-card diff) so the previewed change can never diverge from what
+    apply actually does (D1). Pure string logic — no I/O.
+
+    Returns (new_content, applied_count). Raises EditError with the
+    user-facing message when the edit must be rejected (empty old_string,
+    old==new, bad expected_occurrences, not found, ambiguous multi-match).
+    ``label`` is only interpolated into error messages (typically the path).
+    """
+    if old_string == "":
+        raise EditError(
+            "old_string must not be empty — edit_file only modifies existing content "
+            "that already exists in the file; use write_file to create a new file."
+        )
+    if old_string == new_string:
+        raise EditError("old_string and new_string are identical — nothing to edit")
+
+    if expected_occurrences is not None:
+        try:
+            expected_occurrences = int(expected_occurrences)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise EditError("expected_occurrences must be an integer")
+        if expected_occurrences <= 0:
+            raise EditError("expected_occurrences must be a positive integer")
+
+    count = content.count(old_string)
+
+    if count == 0:
+        hint = ""
+        normalized_old = " ".join(old_string.split())
+        if normalized_old and " ".join(content.split()).find(normalized_old) != -1:
+            hint = (
+                " A whitespace-normalized match exists (differing indentation or line "
+                "breaks) — re-copy old_string verbatim from the file's current content; "
+                "this hint is informational only and is NOT applied automatically."
+            )
+        raise EditError(f"old_string not found in {label}.{hint}")
+
+    if expected_occurrences is not None and count != expected_occurrences:
+        raise EditError(
+            f"old_string occurs {count} time(s) in {label}, but expected_occurrences="
+            f"{expected_occurrences} — update expected_occurrences to match, or add more "
+            "surrounding context to old_string to change the count"
+        )
+
+    if count > 1 and not replace_all and expected_occurrences is None:
+        raise EditError(
+            f"old_string occurs {count} times in {label} — it must be unique. Add more "
+            "surrounding context to old_string to disambiguate, set replace_all=true to "
+            "replace every occurrence, or pass expected_occurrences to confirm the count "
+            "explicitly."
+        )
+
+    # NOTE: a verified expected_occurrences > 1 replaces ALL matches, exactly
+    # like replace_all — the count check above already confirmed intent.
+    if replace_all or count > 1:
+        return content.replace(old_string, new_string), count
+    return content.replace(old_string, new_string, 1), 1
+
+
+async def handle_edit_file(args: dict) -> str:
+    path = validate_path(args["path"])
+    old_string = args.get("old_string")
+    new_string = args.get("new_string")
+
+    if old_string is None or new_string is None:
+        return tool_error("edit_file requires both 'old_string' and 'new_string' arguments")
+    old_string = str(old_string)
+    new_string = str(new_string)
+
+    if not path.exists():
+        return tool_error(f"File not found: {path}")
+    if not path.is_file():
+        return tool_error(f"Not a file: {path}")
+
+    # Read raw bytes and decode manually (no text-mode newline translation) so
+    # CRLF/LF line endings outside the edited span are preserved byte-for-byte.
+    async with aiofiles.open(path, "rb") as f:
+        raw = await f.read()
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return tool_error(f"failed to decode {path} as UTF-8 text: {e}")
+
+    try:
+        new_content, applied = compute_edit_result(
+            content,
+            old_string,
+            new_string,
+            replace_all=bool(args.get("replace_all", False)),
+            expected_occurrences=args.get("expected_occurrences"),
+            label=str(path),
+        )
+    except EditError as e:
+        return tool_error(str(e))
+
+    first_index = content.find(old_string)
+
+    backup_pre_image(path)  # K1: checkpoint pre-image before mutating
+
+    # Preserve the original file's permission bits (D2): mkstemp creates the
+    # tmp 0600 and os.replace keeps the tmp's metadata — without the chmod
+    # below, a 0755 script would lose its exec bit after an edit.
+    original_mode = stat.S_IMODE(os.stat(path).st_mode)
+
+    # Atomic write: tmp file in the same directory, then os.replace.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(new_content.encode("utf-8"))
+        os.chmod(tmp_name, original_mode)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    logger.info(f"edit_file: {path} ({applied} replacement(s))")
+    plural = "s" if applied != 1 else ""
+    context = _line_context(new_content, first_index, len(new_string))
+    return (
+        f"Edited {path}: replaced {applied} occurrence{plural} of old_string.\n"
+        f"Context after edit:\n{context}"
+    )
+
+
+# view_image guards: extension allowlist, byte cap, and pixel cap. The pixel
+# cap mirrors screenshot handling's practical output scale (a full 4K screen
+# grab at scale=1.0 is ~8.3 MP; 25 MP leaves ample headroom while refusing
+# decompression bombs), and the byte cap keeps the base64 payload uploadable.
+_IMAGE_MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024   # 10 MB on disk
+_MAX_IMAGE_PIXELS = 25_000_000        # 25 megapixels
+
+
+async def handle_view_image(args: dict) -> str:
+    path = validate_path(args["path"])
+    if not path.exists():
+        return tool_error(f"File not found: {path}")
+    if not path.is_file():
+        return tool_error(f"Not a file: {path}")
+
+    ext = path.suffix.lower()
+    mime = _IMAGE_MIME_BY_EXT.get(ext)
+    if mime is None:
+        return tool_error(
+            f"unsupported image extension '{ext or '(none)'}' for {path} — "
+            f"supported: {', '.join(sorted(_IMAGE_MIME_BY_EXT))}"
+        )
+
+    size = path.stat().st_size
+    if size > _MAX_IMAGE_BYTES:
+        return tool_error(
+            f"image too large: {path} is {size} bytes "
+            f"(max {_MAX_IMAGE_BYTES} bytes)"
+        )
+
+    async with aiofiles.open(path, "rb") as f:
+        raw = await f.read()
+
+    # Verify it decodes as an image and respects the pixel cap (lazy PIL
+    # import, same pattern as the screenshot handlers in tools/screen.py).
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(raw)) as img:
+            width, height = img.size
+        if width * height > _MAX_IMAGE_PIXELS:
+            return tool_error(
+                f"image too large: {path} is {width}x{height} "
+                f"({width * height} pixels, max {_MAX_IMAGE_PIXELS})"
+            )
+    except Exception as e:
+        return tool_error(f"failed to decode {path} as an image: {e}")
+
+    b64 = base64.b64encode(raw).decode()
+    logger.info(f"view_image: {path} {width}x{height} ({len(b64)} b64 chars)")
+    # Same return shape as take_screenshot so the agent/provider image-upload
+    # path works unchanged: a whole-content data URI.
+    return f"data:{mime};base64,{b64}"
 
 
 async def handle_list_dir(args: dict) -> str:
@@ -112,6 +367,74 @@ async def handle_list_dir(args: dict) -> str:
                 entries.append(f"[FILE] {entry.name}  ({size} bytes)")
     logger.info(f"list_dir: {path} ({len(entries)} entries)")
     return "\n".join(entries) if entries else "(empty directory)"
+
+
+def _summarize_paths(label: str, paths: list) -> str:
+    """Render one section of the revert summary, capped at 20 entries."""
+    if not paths:
+        return ""
+    shown = [str(p) for p in paths[:20]]
+    extra = len(paths) - len(shown)
+    lines = "\n".join(f"  {p}" for p in shown)
+    if extra > 0:
+        lines += f"\n  … and {extra} more"
+    return f"\n{label} ({len(paths)}):\n{lines}"
+
+
+async def handle_revert_changes(args: dict) -> str:
+    """Revert this run's file changes from the K1 pre-image checkpoints.
+
+    Thin tool wrapper around mcp_server.checkpoints.revert_run — see that
+    function for what is restored (modified files from pre-image blobs,
+    created files deleted; both first backed up to <path>.kim-revert.bak)
+    and what is skipped (truncated over-cap entries, tampered blobs,
+    sensitive paths)."""
+    # Deferred import mirrors _resolve_safe_path's rationale in checkpoints.py
+    # and lets tests monkeypatch mcp_server.checkpoints attributes normally.
+    from mcp_server import checkpoints as _cp
+
+    run_id = str(args.get("run_id") or "").strip()
+    if not run_id:
+        run_id = os.environ.get("KIM_RUN_ID", "").strip()
+    if not run_id:
+        return tool_error(
+            "no run_id given and no current run (KIM_RUN_ID unset) — "
+            "nothing to revert"
+        )
+
+    result = _cp.revert_run(run_id)
+    err = result.get("error")
+    if err == "invalid_run_id":
+        return tool_error(f"invalid run_id: {run_id!r}")
+    if err == "no_checkpoint":
+        return tool_error(
+            f"no checkpoint exists for run '{run_id}' — only files mutated "
+            "through Kim's file tools during a checkpointed run are captured, "
+            "so there is nothing recorded to revert"
+        )
+    if err:
+        return tool_error(f"revert failed for run '{run_id}': {err}")
+
+    restored = result.get("restored", [])
+    deleted = result.get("deleted", [])
+    skipped = result.get("skipped", [])
+    logger.info(
+        f"revert_changes: run={run_id} restored={len(restored)} "
+        f"deleted={len(deleted)} skipped={len(skipped)}"
+    )
+    summary = (
+        f"Reverted run '{run_id}': {len(restored)} file(s) restored, "
+        f"{len(deleted)} created file(s) deleted, {len(skipped)} skipped."
+    )
+    summary += _summarize_paths("Restored", restored)
+    summary += _summarize_paths("Deleted", deleted)
+    summary += _summarize_paths("Skipped", skipped)
+    if restored or deleted:
+        summary += (
+            "\nCurrent state of each changed file was saved to "
+            "<path>.kim-revert.bak before revert, so the revert is undoable."
+        )
+    return summary
 
 
 async def handle_delete_file(args: dict) -> str:

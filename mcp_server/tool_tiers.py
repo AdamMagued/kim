@@ -9,8 +9,8 @@ Granular tiers (one per tool group):
     file_read, file_write, shell, screen, web, mouse, keyboard, windows,
     git, code, search, memory
 
-    file_read  -- read_file, list_dir  (no mutation)
-    file_write -- write_file, delete_file
+    file_read  -- read_file, list_dir, view_image  (no mutation)
+    file_write -- write_file, delete_file, edit_file, revert_changes
     shell      -- run_command, run_powershell  (arbitrary execution; opt-in only)
 
 Compound aliases (expand to the granular tiers listed):

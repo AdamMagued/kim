@@ -8,6 +8,8 @@ collecting instruction files at each level:
     KIM.local.md    — local overrides (gitignored)
     .kim/KIM.md     — alternate location
     .kim/instructions.md — alternate name
+    AGENTS.md       — ecosystem-standard agent instructions (after KIM names)
+    CLAUDE.md       — Claude Code instructions (lowest precedence)
 
 Files are deduplicated by content hash and truncated to stay within a
 token budget (4,000 chars per file, 12,000 total).
@@ -34,12 +36,17 @@ logger = logging.getLogger(__name__)
 MAX_CHARS_PER_FILE = 4_000
 MAX_TOTAL_CHARS = 12_000
 
-# File names to look for at each directory level
+# File names to look for at each directory level. Order is priority order
+# within a directory: kim-native names first, then the ecosystem-standard
+# agent-instruction names (AGENTS.md before CLAUDE.md) so a project that has
+# both KIM.md and AGENTS.md keeps KIM.md's content first in the prompt.
 _INSTRUCTION_FILES = [
     "KIM.md",
     "KIM.local.md",
     Path(".kim") / "KIM.md",
     Path(".kim") / "instructions.md",
+    "AGENTS.md",
+    "CLAUDE.md",
 ]
 
 
