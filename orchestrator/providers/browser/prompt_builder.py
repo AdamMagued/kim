@@ -378,6 +378,8 @@ def format_prompt(
                 "a listed tool can do it.\n"
                 "For normal UI work, prefer observe_ui and click_ui. Use screenshots "
                 "only for visual-inspection tasks or when structured UI is insufficient.\n"
+                "After editing a lintable code file, run lint_file on it to catch "
+                "errors before moving on.\n"
                 "If web_open returns AUTH_REQUIRED or AUTH_FAILED, the page content is "
                 "not usable yet. If the current task only asked to open a site, respond "
                 "TASK_COMPLETE saying it is open at the sign-in prompt. Do not log in "
