@@ -196,21 +196,49 @@ Result: PENDING
 Pre/post PID and port map:
 Artifacts:
 
-### 52-H — SSRF guard blocks internal/metadata targets and permits public auth/provider navigation
+### 52-H — SSRF guards reject controlled internal targets without contacting real services
 
 **Findings covered:** F-D-1, F-I-4 defense in depth.
 
+Safety preflight (required for both subcases):
+
+1. Run only in an owner-approved disposable VM, network namespace, or equivalent firewall-contained E2E harness. The harness must own every synthetic target address and listener and deny all network egress except an explicitly approved public-provider flow. Never run these probes on a normal workstation, corporate/VPN network, cloud host, or network that could route to an actual router, internal service, or instance-metadata endpoint.
+2. Allocate fresh synthetic loopback, private, link-local, and IPv6 target addresses to harness-controlled fake listeners. Do **not** use common gateway or real metadata addresses such as `192.168.0.1` or `169.254.169.254`. Record the harness manifest and firewall/namespace rules, with secrets redacted.
+3. Before launching Kim, prove non-harness egress is denied and every synthetic target maps only to its controlled canary. If containment cannot be proved, mark both subcases BLOCKED and send no probe.
+4. Stop immediately if a target is not demonstrably harness-owned, an unexpected destination is attempted, any request escapes containment, or a blocked-target canary receives a connection. Preserve redacted evidence, file a security handoff, and do not continue this case.
+
+#### 52-H1 — Tauri `/v1/open` rejects a directly supplied internal host
+
+Surface under test: the Tauri provider webview/open path. Its Rust guard classifies only the host in the URL initially supplied to `/v1/open`, before creating or navigating the webview.
+
 Steps:
 
-1. Use the app's browser/open surface with non-routable examples only: loopback (`http://127.0.0.1:9/`), RFC-1918 (`http://192.168.0.1/`), link-local metadata (`http://169.254.169.254/`), IPv6 loopback (`http://[::1]/`), and a hostname resolving to an internal address supplied by the approved local SSRF harness.
-2. If available, use the approved harness to return a redirect from a public-looking URL to a blocked target and to attempt a blocked iframe/subresource.
-3. Navigate to the supported public provider sign-in page and complete the disposable OAuth/provider flow through its public HTTPS endpoints.
+1. With an owner-approved token-redacting client, submit separate `POST /v1/open` requests containing harness-owned synthetic numeric hosts: loopback, RFC-1918/private, link-local (not a real metadata address), IPv6 loopback/link-local, and one browser-accepted numeric encoding of a harness-owned blocked address. Never print or attach the `X-Kim-Token` value.
+2. For each request, record the returned safe error, webview/window state, and matching controlled-canary connection count.
+3. Submit one supported public HTTPS provider sign-in URL through the same surface and complete the disposable provider flow, only under the harness's explicit egress allowlist.
 
-Expected: every direct, resolved, redirected, framed, and subresource internal/metadata target is denied before navigation/fetch, with a visible safe error and no response body. Public HTTPS provider pages and their documented OAuth loopback callback continue to work. The check does not block the app's own narrowly scoped callback.
+Expected: every directly supplied synthetic internal literal is rejected before webview creation/navigation, and its controlled canary records zero connections. The supported public HTTPS provider flow opens and its documented OAuth callback continues to work. DNS resolution/rebinding and redirects, frames, or subresources after the initially supplied Tauri URL are not PASS criteria: the current host-based Rust classifier neither resolves DNS nor installs per-request interception. Record desired coverage as an out-of-scope hardening request, not a PASS.
 
 Actual:
 Result: PENDING
-Artifacts (URLs only; no response bodies from internal targets):
+Artifacts (redacted request/result matrix and zero-connection canary evidence):
+
+#### 52-H2 — MCP Playwright intercepts redirects, frames, and subresources
+
+Surface under test: the MCP Playwright browser, whose page-level route handler evaluates each outgoing request separately from the Tauri `/v1/open` guard.
+
+Steps:
+
+1. In the isolated harness, open an approved controlled fake origin through MCP `web_open`; it must not require general network egress.
+2. Have that origin perform separate probes to harness-owned blocked numeric targets: an HTTP redirect, iframe/frame navigation, and representative subresources (for example image plus XHR/fetch). Use a fresh canary counter for every probe.
+3. Capture the MCP tool result, redacted browser/server logs, and all controlled-canary connection counts. Never capture a blocked target's response body.
+4. If separately permitted by the harness egress allowlist, exercise the supported public provider sign-in flow to confirm ordinary public HTTPS navigation remains usable.
+
+Expected: the Playwright route aborts each redirect hop, frame navigation, XHR/fetch, and other subresource request to a harness-owned blocked numeric address before its controlled canary receives a connection. Public HTTPS navigation remains usable when explicitly allowed. DNS resolution and rebinding are out of scope for `_is_ssrf_target`, which allows plain DNS names; do not report PASS merely because a hostname resolves internally. If resolution-aware blocking is required, record an explicit expected defect/hardening handoff.
+
+Actual:
+Result: PENDING
+Artifacts (redacted probe matrix and zero-connection canary evidence):
 
 ### 52-I — provider-page token is callback-only and never logged
 
