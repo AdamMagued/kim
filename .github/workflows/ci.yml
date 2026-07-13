@@ -269,8 +269,8 @@ jobs:
           # Gate is errors-only; warnings are printed (count + first 20) so the
           # backlog stays visible. pyrightconfig.json runs `standard` mode over
           # orchestrator/mcp_server/codex_engine/kimctl/tests, with known debt
-          # downgraded to warnings via file/dir-scoped executionEnvironments
-          # (agent.py mcp-1.28 type drift, tests/ monkeypatch idioms). Tighten
+          # downgraded to warnings via a tests/-scoped executionEnvironment
+          # (monkeypatch idioms); app packages carry no downgrades. Tighten
           # the gate to errors+warnings only after that backlog reaches zero.
           pyright --outputjson | python3 -c "
           import sys, json

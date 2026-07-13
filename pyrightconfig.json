@@ -12,22 +12,6 @@
   "reportMissingModuleSource": "none",
   "executionEnvironments": [
     {
-      "root": "orchestrator/agent.py",
-      "extraPaths": [
-        "."
-      ],
-      "reportAttributeAccessIssue": "warning",
-      "reportArgumentType": "warning",
-      "reportPossiblyUnboundVariable": "warning"
-    },
-    {
-      "root": "orchestrator/providers/browser/prompt_builder.py",
-      "extraPaths": [
-        "."
-      ],
-      "reportPossiblyUnboundVariable": "warning"
-    },
-    {
       "root": "tests",
       "extraPaths": [
         "."

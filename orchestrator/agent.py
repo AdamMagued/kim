@@ -40,10 +40,10 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, Optional, Protocol, cast
 
 from dotenv import load_dotenv
-from mcp import ClientSession
+from mcp.types import CallToolResult
 
 from orchestrator.context_meter import (
     DEFAULT_CONTEXT_BUDGET_TOKENS,
@@ -151,6 +151,21 @@ from orchestrator.mcp_client import mcp_session_context  # noqa: E402
 # KimAgent
 # ---------------------------------------------------------------------------
 
+class MCPSessionLike(Protocol):
+    """The structural slice of an MCP session that KimAgent actually uses.
+
+    Satisfied by both ``mcp.ClientSession`` and ``MultiMCPClient``
+    (orchestrator/mcp_client.py), which multiplexes several ClientSessions
+    behind these same two methods. Typing the agent against this protocol
+    (instead of ``mcp.ClientSession``) states the real requirement honestly
+    rather than casting the multiplexer to a class it is not.
+    """
+
+    async def list_tools(self) -> Any: ...
+
+    async def call_tool(self, name: str, arguments: dict) -> CallToolResult: ...
+
+
 class KimAgent:
     """
     Vision-tool agent loop.  Receives a live MCP session and a configured
@@ -160,7 +175,7 @@ class KimAgent:
     def __init__(
         self,
         config: dict,
-        session: ClientSession,
+        session: MCPSessionLike,
         provider: BaseProvider,
         ui_bridge: Optional[UIBridge] = None,
         session_store: Optional[SessionStore] = None,
@@ -1414,7 +1429,24 @@ class KimAgent:
                 self.session.call_tool(name=name, arguments=args),
                 timeout=_call_timeout,
             )
-            parts = [c.text for c in result.content if hasattr(c, "text")]
+            # mcp>=1.28 types result.content as a union of TextContent /
+            # ImageContent / AudioContent / ResourceLink / EmbeddedResource,
+            # and only TextContent carries a `.text` str. Kim's tool protocol
+            # is text-only, so non-text blocks are skipped exactly as before
+            # (`hasattr(c, "text")`) — but now with a debug note instead of
+            # vanishing silently. getattr keeps the historical duck-typing
+            # (anything exposing a str `.text` still counts) while the
+            # isinstance(str) guard gives pyright a sound narrow.
+            parts: list[str] = []
+            for item in result.content:
+                item_text = getattr(item, "text", None)
+                if isinstance(item_text, str):
+                    parts.append(item_text)
+                else:
+                    logger.debug(
+                        "MCP tool %r returned a non-text content block (%s); skipped",
+                        name, type(item).__name__,
+                    )
             output = "\n".join(parts) if parts else "(no output)"
         except asyncio.TimeoutError:
             logger.error(f"MCP tool '{name}' timed out after {_call_timeout:.0f}s")
@@ -1529,27 +1561,28 @@ class KimAgent:
                 )
             except Exception as trace_error:
                 self._log("WARN", f"Failed to write llm_started trace: {trace_error}")
+            # Use a provider-aware outer timeout so the cap is never shorter
+            # than the provider's own internal budget.
+            # - BrowserProvider: bridge path polls for up to _BRIDGE_TIMEOUT_S=720s;
+            #   CDP path waits up to RESPONSE_WAIT_S+GENERATION_WAIT_S≈1200s.
+            #   Use 1260s (1200+60s margin) so the internal timeouts always fire first.
+            # - OllamaProvider: httpx streaming client uses _timeout_s=600s.
+            #   Use 660s (600+60s margin).
+            # - All other providers (API-backed): keep the conservative 300s cap.
+            # Computed BEFORE the try so the except handler below can always
+            # reference it (definite assignment).
+            if provider_name == "BrowserProvider":
+                _outer_timeout = 1260.0
+            elif provider_name == "OllamaProvider":
+                _outer_timeout = 660.0
+            else:
+                _outer_timeout = 300.0
             try:
                 kwargs = {}
                 if clear_chat and _provider_accepts_kwarg(self.provider.complete, "clear_chat"):
                     kwargs["clear_chat"] = True
                 if handoff and _provider_accepts_kwarg(self.provider.complete, "handoff"):
                     kwargs["handoff"] = handoff
-                # Use a provider-aware outer timeout so the cap is never shorter
-                # than the provider's own internal budget.
-                # - BrowserProvider: bridge path polls for up to _BRIDGE_TIMEOUT_S=720s;
-                #   CDP path waits up to RESPONSE_WAIT_S+GENERATION_WAIT_S≈1200s.
-                #   Use 1260s (1200+60s margin) so the internal timeouts always fire first.
-                # - OllamaProvider: httpx streaming client uses _timeout_s=600s.
-                #   Use 660s (600+60s margin).
-                # - All other providers (API-backed): keep the conservative 300s cap.
-                _provider_cls = type(self.provider).__name__
-                if _provider_cls == "BrowserProvider":
-                    _outer_timeout = 1260.0
-                elif _provider_cls == "OllamaProvider":
-                    _outer_timeout = 660.0
-                else:
-                    _outer_timeout = 300.0
                 response = await asyncio.wait_for(
                     self.provider.complete(
                         messages=messages,

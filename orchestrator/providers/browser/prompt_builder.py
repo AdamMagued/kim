@@ -416,6 +416,9 @@ def format_prompt(
     # contract as the direct response-format request for THIS user message at
     # the tail, where it is neither quoted nor separated from the task. Keep
     # this workaround ChatGPT-only; Claude/Gemini behavior is unchanged.
+    # Bound unconditionally so the trimming fallback below (which re-appends
+    # it under the same ChatGPT-only condition) is provably initialized.
+    direct_contract = ""
     if (preferred_site or "").lower() == "chatgpt":
         if is_codex_bridge:
             direct_contract = (
