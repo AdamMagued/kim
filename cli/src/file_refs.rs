@@ -45,9 +45,9 @@ fn normalize_existing_path(token: &str) -> Option<PathBuf> {
         return None;
     }
     let expanded = if trimmed == "~" {
-        dirs::home_dir()?
+        crate::config::kim_home()?
     } else if let Some(rest) = trimmed.strip_prefix("~/") {
-        dirs::home_dir()?.join(rest)
+        crate::config::kim_home()?.join(rest)
     } else {
         PathBuf::from(trimmed)
     };

@@ -211,7 +211,7 @@ pub(super) fn format_source_root(found: Option<&std::path::Path>) -> String {
     match found {
         Some(path) => format!("ok ({})", path.display()),
         None => {
-            let marker = dirs::home_dir()
+            let marker = crate::config::kim_home()
                 .map(|h| h.join(".kim_root").display().to_string())
                 .unwrap_or_else(|| "~/.kim_root".to_string());
             format!(

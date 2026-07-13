@@ -198,6 +198,9 @@ fn temp_home_with_config(config: &serde_json::Value) -> tempfile::TempDir {
 /// `temp_home_with_config`.
 fn set_test_home(cmd: &mut Command, home: &std::path::Path) {
     cmd.env("HOME", home);
+    // dirs::home_dir() on Windows uses the known-folder OS API and ignores
+    // env vars entirely — KIM_CLI_HOME is the product-supported redirect.
+    cmd.env("KIM_CLI_HOME", home);
     #[cfg(windows)]
     cmd.env("USERPROFILE", home);
 }

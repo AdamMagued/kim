@@ -8,6 +8,19 @@ use serde::{Deserialize, Serialize};
 const CONFIG_DIR_NAME: &str = ".kim";
 const CONFIG_FILE_NAME: &str = "cli-config.json";
 
+/// Home directory for all `~/.kim` CLI state (config, sessions, bridge token).
+///
+/// `KIM_CLI_HOME` overrides when set and non-empty. This exists because
+/// `dirs::home_dir()` on Windows resolves through the known-folder OS API and
+/// ignores `HOME`/`USERPROFILE`, so tests (and portable installs) need an
+/// explicit redirect. Falls back to the platform home directory.
+pub fn kim_home() -> Option<PathBuf> {
+    match std::env::var_os("KIM_CLI_HOME") {
+        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => dirs::home_dir(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThemeName {
@@ -198,7 +211,7 @@ pub fn config_path() -> Option<PathBuf> {
 
     #[cfg(not(test))]
     {
-        dirs::home_dir().map(|home| home.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
+        kim_home().map(|home| home.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
     }
 }
 

@@ -19,7 +19,7 @@ pub fn discover_sessions() -> Vec<SessionEntry> {
     let mut roots = Vec::new();
 
     // Primary: ~/.kim/sessions
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::kim_home() {
         roots.push(home.join(".kim").join("sessions"));
     }
 
@@ -91,7 +91,7 @@ pub fn find_session_by_id(id: &str) -> Option<SessionEntry> {
 }
 
 pub fn save_session_messages(session_id: &str, messages: &[UiMessage]) -> Result<PathBuf, String> {
-    let root = dirs::home_dir()
+    let root = crate::config::kim_home()
         .ok_or_else(|| "Could not find a home directory for Kim sessions.".to_string())?
         .join(".kim")
         .join("sessions");
@@ -553,7 +553,7 @@ pub(crate) fn find_kim_repo_root() -> Option<PathBuf> {
     }
 
     // 2. ~/.kim_root written by install.sh
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::kim_home() {
         let root_file = home.join(".kim_root");
         if let Ok(contents) = std::fs::read_to_string(&root_file) {
             let p = PathBuf::from(contents.trim());

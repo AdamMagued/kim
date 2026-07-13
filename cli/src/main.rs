@@ -280,7 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(session_id) => {
                 // Only advertise --resume when a session file was actually
                 // written (empty REPLs and skipped saves leave none). (A7)
-                let session_saved = dirs::home_dir()
+                let session_saved = crate::config::kim_home()
                     .map(|h| {
                         h.join(".kim")
                             .join("sessions")
