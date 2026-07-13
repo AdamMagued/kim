@@ -28,6 +28,7 @@ from mcp_server.os_utils import (
     minimal_subprocess_env,
     translate_command,
 )
+from mcp_server.policy_platform import _with_windows_env_aliases
 from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
@@ -485,25 +486,12 @@ def _check_exec_capable_binary(command_tokens: list[str]) -> str | None:
 def _filtered_env() -> dict[str, str]:
     """Return the minimal allowlist env for non-sandbox subprocess runs (S4).
 
-    Historically this was the full parent env minus _DANGEROUS_ENV_VARS; that
-    still leaked every provider API key and token in the parent process to
+    The old denylist-based copy leaked provider API keys and tokens to
     the child. It is now a positive allowlist (PATH/HOME/locale/display —
     see os_utils.minimal_subprocess_env), so injection vectors AND secrets
     are excluded by construction.
     """
-    env = minimal_subprocess_env()
-    if IS_WINDOWS:
-        # ``os.environ`` is case-insensitive on Windows, but a plain dict built
-        # from an allowlist is not. Export stable, cross-platform key names for
-        # callers and child programs while retaining the strict positive list.
-        path_value = os.environ.get("PATH") or os.environ.get("Path")
-        home_value = os.environ.get("HOME") or os.environ.get("USERPROFILE")
-        env.pop("Path", None)
-        if path_value:
-            env["PATH"] = path_value
-        if home_value:
-            env["HOME"] = home_value
-    return env
+    return _with_windows_env_aliases(minimal_subprocess_env())
 
 
 def _sandbox_enabled() -> bool:

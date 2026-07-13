@@ -24,6 +24,20 @@ from codex_bridge_harness import run_bridge
 
 
 def _pid_is_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # type: ignore[attr-defined]
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(  # type: ignore[attr-defined]
+                handle, ctypes.byref(exit_code)
+            ):
+                return False
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

@@ -59,11 +59,8 @@ from codex_engine.thread_state import (
     reset_thread_state,
     save_thread_state,
 )
-# Reuse scheduled_runner's process-tree kill helper (finding 3) instead of a
-# bare process.kill(), which only signals the single codex-exec PID and
-# orphans any shell/tool subprocess codex itself spawned. scheduled_runner
-# already solved this exact problem for its own child agents.
-from orchestrator.scheduled_runner import _kill_process_tree
+from mcp_server.policy_platform import _with_windows_env_aliases
+from orchestrator.process_kill import _kill_process_tree
 from orchestrator.codex_appserver_transport import (
     compact_codex_thread,
     parse_decision_line,
@@ -122,6 +119,7 @@ async def _iter_stream_lines(stream: asyncio.StreamReader) -> AsyncIterator[str]
         if not raw:
             return
         yield raw.decode("utf-8", errors="replace").rstrip()
+
 
 # ── Module-level cleanup state ────────────────────────────────────────────────
 
@@ -802,20 +800,11 @@ async def _run_exec_task(
         env["KIM_RUN_ID"] = os.environ["KIM_RUN_ID"]
     if "KIM_SESSION_ID" in os.environ:
         env["KIM_SESSION_ID"] = os.environ["KIM_SESSION_ID"]
-    # On Windows the POSIX vars above are absent; forward the essentials
-    # so the codex child process can locate system tools and temp storage.
-    if sys.platform == "win32":
-        _WIN_PASSTHROUGH = (
-            "SystemRoot",
-            "ComSpec",
-            "USERPROFILE",
-            "TEMP",
-            "TMP",
-            "PATHEXT",
-        )
-        for _var in _WIN_PASSTHROUGH:
-            if _var in os.environ:
-                env[_var] = os.environ[_var]
+    # Windows normalizes environment keys to uppercase. Collect the required
+    # runtime variables case-insensitively and use canonical child-side names.
+    env = _with_windows_env_aliases(
+        env, os.environ, include_runtime=sys.platform == "win32"
+    )
     # --dangerously-bypass-approvals-and-sandbox requires explicit opt-in (#1).
     bypass_flag = os.environ.get("KIM_CODEX_BYPASS_SANDBOX", "").strip()
     cmd = [

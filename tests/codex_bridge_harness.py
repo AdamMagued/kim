@@ -47,8 +47,8 @@ EXPECTED_BASE_ENV_KEYS = {
 # shells/locales, LC_CTYPE into every spawned process regardless of the env
 # dict passed to exec; neither reaches the child from Kim's own allowlist.
 WINDOWS_PASSTHROUGH_ENV_KEYS = (
-    "SystemRoot",
-    "ComSpec",
+    "SYSTEMROOT",
+    "COMSPEC",
     "USERPROFILE",
     "TEMP",
     "TMP",

@@ -37,12 +37,18 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 from mcp_server.config import PROJECT_ROOT, get_config, validate_path
+from mcp_server.policy_platform import (
+    _is_safe_device_path,
+    _is_trusted_binary_path,
+    _portable_basename,
+    _split_shell_tokens,
+    _strip_executable_suffix,
+)
 from mcp_server.tools.shell import _DENY_COMMANDS, _check_exec_capable_binary
 
 logger = logging.getLogger(__name__)
@@ -142,12 +148,6 @@ _PATH_ARGS: dict[str, tuple[str, ...]] = {
     "read_memory": ("cwd",),
 }
 
-# Absolute paths that shell arguments may always reference.
-_SAFE_DEV_PATHS = frozenset({
-    "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin",
-    "/dev/tty", "/dev/urandom", "/dev/zero",
-})
-
 # ---------------------------------------------------------------------------
 # Tools that ALWAYS require human approval, independent of hitl_risk_threshold.
 #
@@ -235,14 +235,6 @@ _SHELL_BUILTINS = frozenset({
     ":", "[", "wait", "shift", "hash",
 })
 
-# System locations an *explicit-path* invocation may point into and still be
-# treated as the genuine binary (e.g. /usr/bin/git). Anything else invoked by
-# path (./tool, /tmp/tool, ~/tool) is an unverifiable copy → escalate.
-_TRUSTED_BIN_PREFIXES = (
-    "/usr/bin/", "/bin/", "/usr/sbin/", "/sbin/",
-    "/usr/local/bin/", "/opt/homebrew/bin/", "/opt/local/bin/",
-)
-
 # Interpreter flags that turn an allowlisted binary into arbitrary inline code.
 _INLINE_EXEC_FLAGS: dict[str, frozenset] = {
     "python": frozenset({"-c"}),
@@ -278,23 +270,6 @@ def _shell_lists() -> tuple[frozenset, frozenset]:
     return safe, mutating
 
 
-_WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
-
-
-def _portable_basename(value: str) -> str:
-    """Return a basename for either slash convention on every host OS."""
-    text = value.strip().strip('"').strip("'").rstrip("/\\")
-    return re.split(r"[/\\]", text)[-1].lower() if text else ""
-
-
-def _strip_executable_suffix(base: str) -> str:
-    lowered = base.lower()
-    for suffix in _WINDOWS_EXECUTABLE_SUFFIXES:
-        if lowered.endswith(suffix):
-            return lowered[:-len(suffix)]
-    return lowered
-
-
 def _normalize_binary_name(base: str) -> str:
     """Normalize executable suffixes and versioned interpreter names."""
     base = _strip_executable_suffix(base)
@@ -302,23 +277,6 @@ def _normalize_binary_name(base: str) -> str:
         if re.fullmatch(rf"{stem}[\d.]*", base):
             return stem
     return base
-
-
-def _is_trusted_binary_path(real_path: str) -> bool:
-    normalized = os.path.normcase(os.path.abspath(real_path))
-    prefixes: tuple[str, ...]
-    if os.name == "nt":
-        system_root = os.environ.get("SystemRoot")
-        if not system_root:
-            return False
-        prefixes = (system_root, os.path.join(system_root, "System32"))
-    else:
-        prefixes = _TRUSTED_BIN_PREFIXES
-    normalized_prefixes = (
-        os.path.normcase(os.path.abspath(prefix)).rstrip("/\\") + os.sep
-        for prefix in prefixes
-    )
-    return any(normalized.startswith(prefix) for prefix in normalized_prefixes)
 
 
 def _resolve_binary(token: str) -> tuple[str, str, bool]:
@@ -421,6 +379,8 @@ def _scan_path_tokens(tokens: list[str], cwd: str | None) -> str | None:
         candidate = candidate.lstrip("<>&123456789")
         if not candidate:
             continue
+        if _is_safe_device_path(candidate):
+            continue
         expanded = Path(candidate).expanduser()
         is_windows_drive_path = bool(re.match(r"^[A-Za-z]:", candidate))
         is_pathy = (
@@ -443,8 +403,6 @@ def _scan_path_tokens(tokens: list[str], cwd: str | None) -> str | None:
                     continue
             except OSError:
                 continue
-        if str(expanded) in _SAFE_DEV_PATHS:
-            continue
         try:
             validate_path(str(target))
         except PermissionError as e:
@@ -595,19 +553,6 @@ def _wrapped_command(tokens: list[str]) -> list[str]:
             continue
         return tokens[i:]
     return []
-
-
-def _split_shell_tokens(command: str) -> list[str]:
-    """Tokenize without treating Windows path backslashes as escapes."""
-    tokens = shlex.split(command, posix=os.name != "nt")
-    if os.name != "nt":
-        return tokens
-    return [
-        token[1:-1]
-        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'"
-        else token
-        for token in tokens
-    ]
 
 
 def _scan_powershell_script(script: str) -> str | None:
