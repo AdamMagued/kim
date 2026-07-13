@@ -709,12 +709,19 @@ def build_approval_preview(name: str, args: dict) -> str:
                 diff = diff[:40] + ["… (diff truncated)"]
             return "\n".join(diff) if diff else f"(no textual change to {path})"
         if name in ("write_file", "create_file"):
-            path = str(args.get("path") or args.get("file_path") or "")
+            # Same hardening as the edit_file branch above: only the
+            # schema-declared (policy-validated) "path" arg is honored — never
+            # a "file_path" alias _PATH_ARGS doesn't cover — and validate_path
+            # is re-applied so the preview can never render a sandboxed file.
+            path = str(args.get("path") or "")
+            try:
+                p = validate_path(str(Path(path).expanduser())) if path.strip() else None
+            except PermissionError:
+                return ""  # denied path: render no preview at all
             new = str(args.get("content", ""))
             old = ""
             try:
-                p = Path(path)
-                if p.is_file():
+                if p is not None and p.is_file():
                     old = p.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 old = ""
