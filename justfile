@@ -6,6 +6,10 @@
 default:
     @just --list
 
+# First-time setup: venv, dependencies, app wiring (runs install.sh)
+setup:
+    ./install.sh
+
 # Development check: type-check + Rust checks + the current full Python test set
 check:
     #!/usr/bin/env bash
