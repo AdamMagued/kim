@@ -55,7 +55,8 @@ WINDOWS_PASSTHROUGH_ENV_KEYS = (
     "PATHEXT",
 )
 
-PLATFORM_INJECTED_ENV_KEYS = {"__CF_USER_TEXT_ENCODING", "LC_CTYPE"}
+# Windows cmd.exe injects PROMPT into children of .cmd launchers the same way.
+PLATFORM_INJECTED_ENV_KEYS = {"__CF_USER_TEXT_ENCODING", "LC_CTYPE", "PROMPT"}
 
 # Env vars that must never influence a test unless a test sets them itself.
 _SCRUBBED_VARS = (
