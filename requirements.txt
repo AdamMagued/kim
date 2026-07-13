@@ -36,6 +36,9 @@ pygetwindow~=0.0.9; sys_platform == "win32"
 pyobjc-core~=10.0; sys_platform == "darwin"
 pyobjc-framework-Quartz~=10.0; sys_platform == "darwin"
 
+# Tool-call input validation against MCP schemas (codex_engine/engine.py)
+jsonschema~=4.26
+
 # ── Testing ──────────────────────────────────────────────────────────────────
 pytest~=8.0
 pytest-asyncio~=0.23
