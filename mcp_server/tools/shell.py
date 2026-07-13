@@ -491,7 +491,19 @@ def _filtered_env() -> dict[str, str]:
     see os_utils.minimal_subprocess_env), so injection vectors AND secrets
     are excluded by construction.
     """
-    return minimal_subprocess_env()
+    env = minimal_subprocess_env()
+    if IS_WINDOWS:
+        # ``os.environ`` is case-insensitive on Windows, but a plain dict built
+        # from an allowlist is not. Export stable, cross-platform key names for
+        # callers and child programs while retaining the strict positive list.
+        path_value = os.environ.get("PATH") or os.environ.get("Path")
+        home_value = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        env.pop("Path", None)
+        if path_value:
+            env["PATH"] = path_value
+        if home_value:
+            env["HOME"] = home_value
+    return env
 
 
 def _sandbox_enabled() -> bool:

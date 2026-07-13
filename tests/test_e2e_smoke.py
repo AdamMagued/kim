@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -31,12 +30,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from codex_bridge_harness import _SCRUBBED_VARS
+from cross_platform_helpers import write_python_executable
 
 # A fake codex that exercises the REAL relay contract: read the proxy base URL
 # + bearer token from env (exactly like real codex), POST a streaming
 # Responses-API request, record the SSE bytes, emit one codex-style JSONL
 # event, and exit 0.
-_FAKE_CODEX_TEMPLATE = """#!{python}
+_FAKE_CODEX_TEMPLATE = """
 import json, os, sys, urllib.request
 
 here = os.path.dirname(os.path.abspath(__file__))
@@ -61,7 +61,7 @@ req = urllib.request.Request(
 )
 with urllib.request.urlopen(req, timeout=30) as resp:
     data = resp.read().decode("utf-8", errors="replace")
-with open(os.path.join(here, "sse.txt"), "w") as f:
+with open(os.path.join(here, "sse.txt"), "w", encoding="utf-8") as f:
     f.write(data)
 print(json.dumps({{
     "type": "item.completed",
@@ -95,14 +95,17 @@ async def _run_smoke(tmp: Path, replies: list[str]) -> SimpleNamespace:
 
     bin_dir = tmp / "bin"
     bin_dir.mkdir()
-    script = bin_dir / "fake-codex"
-    script.write_text(_FAKE_CODEX_TEMPLATE.format(python=sys.executable))
-    script.chmod(0o755)
+    script = write_python_executable(
+        bin_dir, "fake-codex", _FAKE_CODEX_TEMPLATE.format()
+    )
 
     config_path = tmp / "config.yaml"
     # This smoke drives the legacy exec transport end-to-end (the fake codex
     # emulates `codex exec --json`); the service default is now app-server.
-    config_path.write_text("browser_provider: {}\ncodex_bridge:\n  transport: exec\n")
+    config_path.write_text(
+        "browser_provider: {}\ncodex_bridge:\n  transport: exec\n",
+        encoding="utf-8",
+    )
 
     provider = CannedProvider(replies)
 
@@ -126,7 +129,7 @@ async def _run_smoke(tmp: Path, replies: list[str]) -> SimpleNamespace:
         rc = await svc._run_async(args)
 
     sse_file = bin_dir / "sse.txt"
-    sse = sse_file.read_text() if sse_file.exists() else None
+    sse = sse_file.read_text(encoding="utf-8") if sse_file.exists() else None
     return SimpleNamespace(rc=rc, sse=sse, provider=provider)
 
 

@@ -17,10 +17,11 @@ import unittest
 from pathlib import Path
 
 from codex_bridge_harness import (
-    EXPECTED_POSIX_ENV_KEYS,
+    EXPECTED_BASE_ENV_KEYS,
     FAKE_BEARER_TOKEN,
     FAKE_PROXY_PORT,
     PLATFORM_INJECTED_ENV_KEYS,
+    WINDOWS_PASSTHROUGH_ENV_KEYS,
     run_bridge,
 )
 
@@ -41,13 +42,20 @@ class TestCodexEnvScoping(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.rc, 0)
         self.assertIsNotNone(result.capture, "fake codex binary was never spawned")
         child_keys = set(result.capture["env"].keys())
+        expected_keys = set(EXPECTED_BASE_ENV_KEYS)
+        parent_keys = {key.upper() for key in result.parent_env}
+        expected_keys.update(
+            key
+            for key in WINDOWS_PASSTHROUGH_ENV_KEYS
+            if key.upper() in parent_keys
+        )
         # Everything on the allowlist must be present…
         self.assertTrue(
-            EXPECTED_POSIX_ENV_KEYS <= child_keys,
-            f"missing allowlist keys: {EXPECTED_POSIX_ENV_KEYS - child_keys}",
+            expected_keys <= child_keys,
+            f"missing allowlist keys: {expected_keys - child_keys}",
         )
         # …and nothing else may leak in (modulo OS-injected vars).
-        extras = child_keys - EXPECTED_POSIX_ENV_KEYS - PLATFORM_INJECTED_ENV_KEYS
+        extras = child_keys - expected_keys - PLATFORM_INJECTED_ENV_KEYS
         self.assertEqual(
             extras,
             set(),
@@ -145,8 +153,11 @@ class TestCodexEnvScoping(unittest.IsolatedAsyncioTestCase):
         """The allowlisted basics come from the parent env, unmodified."""
         result = await run_bridge(self.tmp)
         child_env = result.capture["env"]
-        self.assertEqual(child_env["PATH"], result.parent_env.get("PATH", ""))
-        self.assertEqual(child_env["HOME"], result.parent_env.get("HOME", ""))
+        parent_env = {key.upper(): value for key, value in result.parent_env.items()}
+        expected_path = parent_env.get("PATH", "")
+        expected_home = parent_env.get("HOME") or parent_env.get("USERPROFILE", "")
+        self.assertEqual(child_env["PATH"], expected_path)
+        self.assertEqual(child_env["HOME"], expected_home)
 
     async def test_parent_environ_is_not_mutated(self):
         """The spawn must scope env via the env= dict, not os.environ writes."""

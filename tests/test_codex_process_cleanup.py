@@ -90,10 +90,11 @@ class TestCodexProcessLifecycle(unittest.IsolatedAsyncioTestCase):
         try:
             svc._active_process = proc  # type: ignore[assignment]
             svc._cleanup_sync()
-            # proc is our direct child: reap it and confirm it died by signal
-            # (kill), not by running to completion.
+            # proc is our direct child: reap it and confirm cleanup did not
+            # let it run to a natural successful exit. POSIX reports a negative
+            # signal code; Windows taskkill commonly reports a positive code.
             returncode = proc.wait(timeout=5)
-            self.assertLess(
+            self.assertNotEqual(
                 returncode,
                 0,
                 "_cleanup_sync did not kill the active codex process "

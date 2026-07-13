@@ -25,12 +25,25 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from mcp_server.os_utils import IS_WINDOWS
 from mcp_server.tools.code import (
     _SANDBOX_PATH,
     _check_node_blocked,
     _minimal_env,
     _sandbox_wrap_cmd,
 )
+
+
+def _env_path(env: dict[str, str]) -> str:
+    """Return PATH regardless of the platform's conventional key casing."""
+    return env.get("PATH") or env.get("Path", "")
+
+
+def _expected_sandbox_path() -> str:
+    if not IS_WINDOWS:
+        return _SANDBOX_PATH
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    return os.pathsep.join((str(Path(system_root) / "System32"), system_root))
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +71,10 @@ class TestMinimalEnvStripsProviderKeys:
         """PATH must be replaced with the hardcoded sandbox value, not inherited."""
         with patch.dict(os.environ, {"PATH": "/evil/bin:/usr/local/bin:/usr/bin"}):
             env = _minimal_env()
-        assert env["PATH"] == _SANDBOX_PATH, (
-            f"PATH should be '{_SANDBOX_PATH}', got '{env['PATH']}'"
+        actual_path = _env_path(env)
+        expected_path = _expected_sandbox_path()
+        assert actual_path == expected_path, (
+            f"sandbox PATH should be {expected_path!r}, got {actual_path!r}"
         )
 
     def test_both_keys_absent_when_both_set(self):
@@ -108,8 +123,7 @@ class TestMinimalEnvExtraMerge:
 
     def test_none_extra_is_harmless(self):
         env = _minimal_env(None)
-        assert "PATH" in env
-        assert env["PATH"] == _SANDBOX_PATH
+        assert _env_path(env) == _expected_sandbox_path()
 
 
 # ---------------------------------------------------------------------------

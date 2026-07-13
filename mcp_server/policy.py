@@ -278,12 +278,47 @@ def _shell_lists() -> tuple[frozenset, frozenset]:
     return safe, mutating
 
 
+_WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
+
+
+def _portable_basename(value: str) -> str:
+    """Return a basename for either slash convention on every host OS."""
+    text = value.strip().strip('"').strip("'").rstrip("/\\")
+    return re.split(r"[/\\]", text)[-1].lower() if text else ""
+
+
+def _strip_executable_suffix(base: str) -> str:
+    lowered = base.lower()
+    for suffix in _WINDOWS_EXECUTABLE_SUFFIXES:
+        if lowered.endswith(suffix):
+            return lowered[:-len(suffix)]
+    return lowered
+
+
 def _normalize_binary_name(base: str) -> str:
-    """python3.13 → python, pip3 → pip, node18 → node (allowlist lookups)."""
+    """Normalize executable suffixes and versioned interpreter names."""
+    base = _strip_executable_suffix(base)
     for stem in ("python", "pip", "node", "ruby", "perl"):
         if re.fullmatch(rf"{stem}[\d.]*", base):
             return stem
     return base
+
+
+def _is_trusted_binary_path(real_path: str) -> bool:
+    normalized = os.path.normcase(os.path.abspath(real_path))
+    prefixes: tuple[str, ...]
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot")
+        if not system_root:
+            return False
+        prefixes = (system_root, os.path.join(system_root, "System32"))
+    else:
+        prefixes = _TRUSTED_BIN_PREFIXES
+    normalized_prefixes = (
+        os.path.normcase(os.path.abspath(prefix)).rstrip("/\\") + os.sep
+        for prefix in prefixes
+    )
+    return any(normalized.startswith(prefix) for prefix in normalized_prefixes)
 
 
 def _resolve_binary(token: str) -> tuple[str, str, bool]:
@@ -303,21 +338,25 @@ def _resolve_binary(token: str) -> tuple[str, str, bool]:
         return "", "", False
     is_explicit = ("/" in text) or ("\\" in text) or text.startswith("~")
     if is_explicit:
-        invoked = Path(text).name.lower()
+        invoked = _strip_executable_suffix(_portable_basename(text))
         try:
             real = os.path.realpath(str(Path(text).expanduser()))
         except (OSError, ValueError):
             return invoked, "", False
-        real_base = Path(real).name.lower()
-        trusted = real.startswith(_TRUSTED_BIN_PREFIXES)
-        return invoked, real_base, trusted
+        real_base = _strip_executable_suffix(_portable_basename(real))
+        return invoked, real_base, _is_trusted_binary_path(real)
     located = shutil.which(text)
     if located is None:
         # Not on PATH: either a builtin (checked by caller) or a command that
         # will fail at exec time — unverifiable, so not trusted.
-        return text.lower(), text.lower(), False
+        base = _strip_executable_suffix(_portable_basename(text))
+        return base, base, False
     real = os.path.realpath(located)
-    return text.lower(), Path(real).name.lower(), True
+    return (
+        _strip_executable_suffix(_portable_basename(text)),
+        _strip_executable_suffix(_portable_basename(real)),
+        True,
+    )
 
 
 def _looks_like_assignment(token: str) -> bool:
@@ -383,9 +422,11 @@ def _scan_path_tokens(tokens: list[str], cwd: str | None) -> str | None:
         if not candidate:
             continue
         expanded = Path(candidate).expanduser()
+        is_windows_drive_path = bool(re.match(r"^[A-Za-z]:", candidate))
         is_pathy = (
             expanded.is_absolute()
-            or candidate.startswith("~")
+            or candidate.startswith(("/", "\\", "~"))
+            or is_windows_drive_path
             or ".." in expanded.parts
         )
         target = expanded if expanded.is_absolute() else base_dir / expanded
@@ -556,6 +597,19 @@ def _wrapped_command(tokens: list[str]) -> list[str]:
     return []
 
 
+def _split_shell_tokens(command: str) -> list[str]:
+    """Tokenize without treating Windows path backslashes as escapes."""
+    tokens = shlex.split(command, posix=os.name != "nt")
+    if os.name != "nt":
+        return tokens
+    return [
+        token[1:-1]
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'"
+        else token
+        for token in tokens
+    ]
+
+
 def _scan_powershell_script(script: str) -> str | None:
     """Best-effort sensitive-path deny scan for run_powershell scripts.
 
@@ -575,7 +629,7 @@ def _scan_powershell_script(script: str) -> str | None:
     if not text:
         return None
     try:
-        tokens = shlex.split(text)
+        tokens = _split_shell_tokens(text)
     except ValueError:
         tokens = text.split()
     # PS statement separators (';', '|') can leave a separator glued to a
@@ -593,7 +647,7 @@ _CHAIN_OPERATOR_TOKENS = frozenset({"&&", "||", ";", "|", "&"})
 def _analyze_shell(cmd: str, cwd: str | None) -> _ShellAnalysis:
     """Analyse a full run_command string, segment by segment."""
     try:
-        tokens = shlex.split(cmd)
+        tokens = _split_shell_tokens(cmd)
     except ValueError:
         return _ShellAnalysis(
             deny_reason="malformed_quoting",
@@ -629,7 +683,7 @@ def _analyze_shell(cmd: str, cwd: str | None) -> _ShellAnalysis:
 
         # Recurse into `sh -c '…'` payloads so nested commands see the same rules.
         if seg:
-            base = Path(seg[0]).name.lower()
+            base = _normalize_binary_name(_portable_basename(seg[0]))
             if base in {"sh", "bash", "zsh", "fish", "dash", "ksh"}:
                 try:
                     c_index = seg.index("-c")

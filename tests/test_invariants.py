@@ -56,7 +56,7 @@ class TestToolRegistryParity(unittest.TestCase):
         causes an immediate failure.  Update the doc when adding/removing tools.
         """
         arch_doc = Path(__file__).parent.parent / "ARCHITECTURE.md"
-        text = arch_doc.read_text()
+        text = arch_doc.read_text(encoding="utf-8")
         match = re.search(r"\*\*(\d+) OS-control tools\*\*", text)
         self.assertIsNotNone(
             match,

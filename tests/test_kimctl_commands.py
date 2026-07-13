@@ -580,12 +580,14 @@ def _clear_bridge_env(monkeypatch):
 
 def test_read_home_bridge_token_absent(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     assert _read_home_bridge_token() == ""
 
 
 def test_resolve_bridge_reads_home_token(monkeypatch, tmp_path):
     _clear_bridge_env(monkeypatch)
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     kim_dir = tmp_path / ".kim"
     kim_dir.mkdir()
     (kim_dir / "bridge_token").write_text("home-tok-123\n", encoding="utf-8")
@@ -599,6 +601,7 @@ def test_resolve_bridge_home_token_yields_to_env(monkeypatch, tmp_path):
     wins over the ~/.kim/bridge_token pairing file."""
     _clear_bridge_env(monkeypatch)
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     kim_dir = tmp_path / ".kim"
     kim_dir.mkdir()
     (kim_dir / "bridge_token").write_text("home-tok", encoding="utf-8")
