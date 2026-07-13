@@ -94,8 +94,8 @@ jobs:
             exit 1
           fi
 
-      - name: Vitest unit tests
-        run: npm run test
+      - name: Vitest unit tests + coverage ratchet
+        run: npm run test -- --coverage
 
       - name: Vite build
         run: npm run build
