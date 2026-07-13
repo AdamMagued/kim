@@ -51,7 +51,7 @@ The intelligence and action engine of the platform is written in Python and oper
 ```
 
 - **KimAgent Loop (`agent.py`)**: An asynchronous iteration loop that takes task inputs, manages history compaction, prunes screenshots, requests choices from LLM Providers, and executes actions.
-- **Local MCP Server (`server.py`)**: Communicates with the orchestrator over a secure stdio transport. Exposes **50 OS-control tools** grouped across files, shell command exec, mouse/keyboard inputs, window focal states, screen vision, browser interactions, search/grep, and git tools.
+- **Local MCP Server (`server.py`)**: Communicates with the orchestrator over a secure stdio transport. Exposes **51 OS-control tools** grouped across files, shell command exec, mouse/keyboard inputs, window focal states, screen vision, browser interactions, search/grep, and git tools.
 
 ---
 

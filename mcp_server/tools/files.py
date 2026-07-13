@@ -2,6 +2,7 @@ import base64
 import logging
 import os
 import re
+import tempfile
 from pathlib import Path
 
 import aiofiles
@@ -68,6 +69,124 @@ async def handle_write_file(args: dict) -> str:
         await f.write(content)
     logger.info(f"write_file: {path} ({len(content)} chars)")
     return f"Written {len(content)} chars to {path}"
+
+
+def _line_context(content: str, index: int, match_len: int) -> str:
+    """Return ~1-2 lines of context around content[index:index+match_len]."""
+    lines = content.splitlines()
+    if not lines:
+        return ""
+    start_line = content.count("\n", 0, index)
+    end_line = content.count("\n", 0, index + match_len)
+    lo = max(0, start_line - 1)
+    hi = min(len(lines), end_line + 2)
+    return "\n".join(lines[lo:hi])
+
+
+async def handle_edit_file(args: dict) -> str:
+    path = validate_path(args["path"])
+    old_string = args.get("old_string")
+    new_string = args.get("new_string")
+    replace_all = bool(args.get("replace_all", False))
+    expected_occurrences = args.get("expected_occurrences")
+
+    if old_string is None or new_string is None:
+        return tool_error("edit_file requires both 'old_string' and 'new_string' arguments")
+    old_string = str(old_string)
+    new_string = str(new_string)
+
+    if old_string == "":
+        return tool_error(
+            "old_string must not be empty — edit_file only modifies existing content "
+            "that already exists in the file; use write_file to create a new file."
+        )
+    if old_string == new_string:
+        return tool_error("old_string and new_string are identical — nothing to edit")
+
+    if expected_occurrences is not None:
+        try:
+            expected_occurrences = int(expected_occurrences)
+        except (TypeError, ValueError):
+            return tool_error("expected_occurrences must be an integer")
+        if expected_occurrences <= 0:
+            return tool_error("expected_occurrences must be a positive integer")
+
+    if not path.exists():
+        return tool_error(f"File not found: {path}")
+    if not path.is_file():
+        return tool_error(f"Not a file: {path}")
+
+    # Read raw bytes and decode manually (no text-mode newline translation) so
+    # CRLF/LF line endings outside the edited span are preserved byte-for-byte.
+    async with aiofiles.open(path, "rb") as f:
+        raw = await f.read()
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return tool_error(f"failed to decode {path} as UTF-8 text: {e}")
+
+    count = content.count(old_string)
+
+    if count == 0:
+        hint = ""
+        normalized_old = " ".join(old_string.split())
+        if normalized_old and " ".join(content.split()).find(normalized_old) != -1:
+            hint = (
+                " A whitespace-normalized match exists (differing indentation or line "
+                "breaks) — re-copy old_string verbatim from the file's current content; "
+                "this hint is informational only and is NOT applied automatically."
+            )
+        return tool_error(f"old_string not found in {path}.{hint}")
+
+    if expected_occurrences is not None and count != expected_occurrences:
+        return tool_error(
+            f"old_string occurs {count} time(s) in {path}, but expected_occurrences="
+            f"{expected_occurrences} — update expected_occurrences to match, or add more "
+            "surrounding context to old_string to change the count"
+        )
+
+    apply_all = replace_all or count > 1
+    if count > 1 and not replace_all and expected_occurrences is None:
+        return tool_error(
+            f"old_string occurs {count} times in {path} — it must be unique. Add more "
+            "surrounding context to old_string to disambiguate, set replace_all=true to "
+            "replace every occurrence, or pass expected_occurrences to confirm the count "
+            "explicitly."
+        )
+
+    first_index = content.find(old_string)
+    context = _line_context(content, first_index, len(old_string))
+
+    if apply_all:
+        new_content = content.replace(old_string, new_string)
+        applied = count
+    else:
+        new_content = content.replace(old_string, new_string, 1)
+        applied = 1
+
+    backup_pre_image(path)  # K1: checkpoint pre-image before mutating
+
+    # Atomic write: tmp file in the same directory, then os.replace.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(new_content.encode("utf-8"))
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    logger.info(f"edit_file: {path} ({applied} replacement(s))")
+    plural = "s" if applied != 1 else ""
+    return (
+        f"Edited {path}: replaced {applied} occurrence{plural} of old_string.\n"
+        f"Context:\n{context}"
+    )
 
 
 async def handle_list_dir(args: dict) -> str:

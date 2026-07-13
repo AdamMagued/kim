@@ -22,6 +22,7 @@ from mcp.types import Tool
 from mcp_server.tools.code import handle_lint_file, handle_run_node, handle_run_python
 from mcp_server.tools.files import (
     handle_delete_file,
+    handle_edit_file,
     handle_list_dir,
     handle_read_file,
     handle_write_file,
@@ -103,6 +104,38 @@ _FILE_TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="edit_file",
+        description=(
+            "Make a surgical, str-replace edit to an existing file without rewriting "
+            "the whole thing. Give the EXACT text to find (old_string) and what to "
+            "replace it with (new_string). old_string must match the file's current "
+            "content byte-for-byte (including whitespace/indentation) — copy it "
+            "verbatim from a prior read_file, don't retype it from memory. "
+            "old_string MUST be unique in the file by default: if it matches more "
+            "than once, the call is rejected so you don't accidentally edit the wrong "
+            "occurrence — either add a few more lines of surrounding context to "
+            "old_string to make it unique, or pass replace_all=true to intentionally "
+            "replace every occurrence (e.g. renaming a variable). If you already know "
+            "how many occurrences exist, pass expected_occurrences as a self-check: "
+            "the edit only applies if the actual count matches, otherwise it errors "
+            "instead of silently editing the wrong number of places. This is much "
+            "cheaper than write_file for small changes because you don't have to "
+            "reproduce the entire file content. Not for creating new files (use "
+            "write_file for that) — old_string must already exist in the file."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path (absolute or relative to PROJECT_ROOT)"},
+                "old_string": {"type": "string", "description": "Exact text to find in the file. Must match verbatim (whitespace included) and must not be empty."},
+                "new_string": {"type": "string", "description": "Text to replace old_string with. Must differ from old_string."},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence of old_string instead of requiring exactly one match. Default false.", "default": False},
+                "expected_occurrences": {"type": "integer", "description": "Optional self-check: the exact number of occurrences of old_string you expect. If the actual count differs, the edit is rejected instead of applied. When set, satisfies the uniqueness requirement even if the count is greater than one."},
+            },
+            "required": ["path", "old_string", "new_string"],
+        },
+    ),
+    Tool(
         name="list_dir",
         description="List files and directories inside a directory.",
         inputSchema={
@@ -134,6 +167,7 @@ _FILE_READ_DISPATCH = {
 _FILE_WRITE_DISPATCH = {
     "write_file": handle_write_file,
     "delete_file": handle_delete_file,
+    "edit_file": handle_edit_file,
 }
 
 # Merged for DISPATCH aggregation – preserves existing behavior when no tier

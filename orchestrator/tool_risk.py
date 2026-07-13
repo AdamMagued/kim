@@ -21,7 +21,7 @@ Reason codes (stable strings for downstream branching):
   git_history_change        — git_commit (permanent commit written)
   git_branch_change         — git_checkout (can discard uncommitted changes)
   remote_resource_creation  — github_create_repo
-  file_write                — write_file
+  file_write                — write_file, edit_file
   git_stage                 — git_add
   form_interaction          — web_fill, web_press (could submit forms)
   web_navigation            — web_open, web_close, web_back, open_url
@@ -67,6 +67,7 @@ _HIGH_RISK: frozenset = frozenset({
 
 _MEDIUM_RISK: frozenset = frozenset({
     "write_file",
+    "edit_file",
     "git_add",
     "web_fill",
     "web_fill_form",
@@ -110,6 +111,7 @@ _TOOL_REASON: dict[str, str] = {
     "github_create_repo": "remote_resource_creation",
     # ── Medium-risk ──────────────────────────────────────────────────────────
     "write_file": "file_write",
+    "edit_file": "file_write",
     "git_add": "git_stage",
     "web_fill": "form_interaction",
     "web_press": "form_interaction",

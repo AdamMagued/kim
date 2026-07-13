@@ -125,6 +125,7 @@ _PATH_ARGS: dict[str, tuple[str, ...]] = {
     "read_file": ("path",),
     "write_file": ("path",),
     "delete_file": ("path",),
+    "edit_file": ("path",),
     "list_dir": ("path",),
     "run_python": ("file", "cwd"),
     "run_node": ("file", "cwd"),
@@ -659,7 +660,31 @@ def build_approval_preview(name: str, args: dict) -> str:
             return str(args.get("command") or args.get("cmd") or "").strip()
         if name == "run_powershell":
             return str(args.get("script", "")).strip()[:400]
-        if name in ("write_file", "create_file", "edit_file"):
+        if name == "edit_file":
+            path = str(args.get("path") or args.get("file_path") or "")
+            old_string = str(args.get("old_string", ""))
+            new_string = str(args.get("new_string", ""))
+            old = ""
+            try:
+                p = Path(path)
+                if p.is_file():
+                    old = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                old = ""
+            if old_string and old_string in old:
+                new = old.replace(old_string, new_string) if args.get("replace_all") else old.replace(old_string, new_string, 1)
+            else:
+                new = old
+            import difflib
+
+            diff = list(difflib.unified_diff(
+                old.splitlines(), new.splitlines(),
+                fromfile=f"{path} (current)", tofile=f"{path} (new)", lineterm="",
+            ))
+            if len(diff) > 40:
+                diff = diff[:40] + ["… (diff truncated)"]
+            return "\n".join(diff) if diff else f"(no textual change to {path})"
+        if name in ("write_file", "create_file"):
             path = str(args.get("path") or args.get("file_path") or "")
             new = str(args.get("content", ""))
             old = ""
