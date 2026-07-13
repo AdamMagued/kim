@@ -549,10 +549,14 @@ async def _run_async(args: argparse.Namespace) -> int:
             flush=True,
         )
         # Refuse to combine bypass with browser-provider tasks from scraped web content
-        is_web_derived = any(k in args.task.lower() for k in ("http", "www", "url", "scrape", "fetch", "web", "download", "scraped"))
+        is_web_derived = any(
+            k in args.task.lower()
+            for k in ("http", "www", "url", "scrape", "fetch", "web", "download", "scraped")
+        )
         if is_web_derived:
             print(
-                f"{LOG_TAG_ERROR} Refusing to run in bypass sandbox mode: task string contains web keywords or URLs which pose prompt-injection RCE risks.",
+                f"{LOG_TAG_ERROR} Refusing to run in bypass sandbox mode: task string contains "
+                "web keywords or URLs which pose prompt-injection RCE risks.",
                 file=sys.stderr,
                 flush=True,
             )

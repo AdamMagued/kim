@@ -88,6 +88,7 @@ def _count_lines_sync(file_path: str) -> int:
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         return sum(1 for _ in f)
 
+
 _COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
 
 # ── Client-side tool-call timeout budget (finding 2.1) ─────────────────────

@@ -94,6 +94,7 @@ def _count_role_messages(path: Path) -> int:
         _MSG_COUNT_CACHE[key] = (stamp[0], stamp[1], count)
     return count
 
+
 # The prune screenshot-strip pass rewrites session files in place. A resumed
 # session appends into its ORIGINAL (old) date dir, so a file touched within
 # this window may still be live — skip it to avoid racing a concurrent append
@@ -150,7 +151,7 @@ class SessionStore:
             self.session_date = date.today().isoformat()
             self.session_dir = self.base_dir / self.session_date
             self.session_dir.mkdir(parents=True, exist_ok=True)
-            
+
             claimed = False
             for _ in range(1000):
                 candidate = uuid4().hex[:8]

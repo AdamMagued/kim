@@ -902,6 +902,7 @@ class AppServerTurnRunner:
             # propagate into the closure body).
             _client = self._client
             _thread_id = self._thread_id
+
             async def _do_compact():
                 with contextlib.suppress(AppServerError, asyncio.TimeoutError):
                     await _client.request(
