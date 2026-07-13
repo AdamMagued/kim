@@ -65,7 +65,10 @@ class TestCodexProcessLifecycle(unittest.IsolatedAsyncioTestCase):
         result = await run_bridge(
             self.tmp,
             sleep_s=60,
-            config_yaml="codex_bridge:\n  transport: exec\n  task_timeout_s: 1\n",
+            # A tight 1s budget races interpreter startup under a loaded
+            # machine; 8s still expires long before sleep_s=60, so the
+            # timeout-kill semantics are unchanged.
+            config_yaml="codex_bridge:\n  transport: exec\n  task_timeout_s: 8\n",
         )
         self.assertEqual(result.rc, 1)
         pid_file = result.bin_dir / "pid.txt"
