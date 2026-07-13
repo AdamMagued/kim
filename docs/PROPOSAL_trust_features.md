@@ -1,6 +1,13 @@
 # Proposal: Trust & control features (Prompt 10 — K1, K3, K6, K9)
 
-> **Status:** done — implemented in commit 673a692 (K1 `mcp_server/checkpoints.py` + revert wiring in `useChatStream.ts`; K3 steering inbox `orchestrator/agent.py:211`; K9 privacy-pause commands in `session_commands.rs`) — 2026-07-13
+> **Status:** done, with the K1 revert UI path since removed — implemented in commit 673a692.
+> Live today: K1 pre-image *capture* (`mcp_server/tools/files.py:37,123` →
+> `checkpoints.backup_pre_image`), K3 steering inbox (`orchestrator/agent.py:211`), K9 privacy
+> pause (`session_commands.rs` `set_privacy_pause`/`get_privacy_pause`, registered in `lib.rs`).
+> Removed: the Rust `revert_run`/`has_checkpoint` Tauri commands were deleted in commit 36a67d9
+> (2026-06-29), so Python `checkpoints.revert_run()` has NO caller path from the UI — revert is
+> currently unreachable (only vestigial `lastRunId` state remains, `useChatStream.ts:155`)
+> — 2026-07-13
 
 Scope: run revert, mid-run steering, approval previews, privacy pause.
 

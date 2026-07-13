@@ -1,6 +1,14 @@
 # Proposal: Session & composer UX (Prompt 12 — K4, K5, K10)
 
-> **Status:** done — implemented in commit c74c0c1 (K4/K5/K10); note the K4 `delete_session` command was later removed as caller-less dead code during the Wave-2 audit (rename/pin/search live at `session_commands.rs:365`) — 2026-07-13
+> **Status:** done, then largely removed — implemented in commit c74c0c1, but most of it was
+> subsequently deleted: `rename_session`/`set_session_pinned`/`search_sessions` (+ `write_session_meta`,
+> `SearchHit`, `search_in_dir`) and the K5 `feedback.rs region_screenshot` in commit 36a67d9
+> (2026-06-29); the K10 export (`desktop/src/export/runMarkdown.ts`) in commit 6da68b0;
+> `delete_session` in commit 9f6371f (2026-07-06, roadmap A5/S6 dead-command decommission).
+> What survives: the read-only `.meta.json` sidecar reader (`session_commands.rs:370
+> read_session_meta`, consumed by `session_store.rs:318` — title override + pinned) and the K5
+> composer attachment path (`ChatComposer.tsx` → `save_attachment`; `tests/test_attachment_payload.py`)
+> — 2026-07-13
 
 Scope: session management, paste/region capture, export.
 
