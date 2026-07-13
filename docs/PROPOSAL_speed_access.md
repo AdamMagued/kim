@@ -1,6 +1,8 @@
 # Proposal: Speed & access (Prompt 11 — K2, K7, K8)
 
-Status: accepted · Scope: quick-ask overlay, tray, command palette.
+> **Status:** done — implemented in commit d27d779 (K2/K7 live in `desktop/src-tauri/src/speed_access.rs`); note the K8 actions registry (`desktop/src/actions/registry.ts`) was later removed as dead code in the 2026-06-28 audit (commit 6da68b0) — 2026-07-13
+
+Scope: quick-ask overlay, tray, command palette.
 
 ## K8 — Command palette (the shared core)
 - New `desktop/src/actions/registry.ts`: a single source of truth for app

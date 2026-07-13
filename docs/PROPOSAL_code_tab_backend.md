@@ -1,8 +1,13 @@
 # Proposal: Code Tab Backend Options
 
+> **Status:** superseded (by `PROPOSAL_codex_appserver_parity.md`) — 2026-07-13
+> Its recommendation (Option C: replace the Codex CLI with the Kim agent) was never
+> adopted; the code tab still runs the Codex CLI, and ROADMAP.md Phase 3 adopts the
+> app-server parity proposal "as-is" (implemented code-complete 2026-07-06), which
+> keeps Codex. Retained for the option analysis and constraints.
+
 **Date:** 2026-06-11  
-**Branch:** `production-roadmap`  
-**Status:** Open for decision
+**Branch:** `production-roadmap`
 
 ---
 

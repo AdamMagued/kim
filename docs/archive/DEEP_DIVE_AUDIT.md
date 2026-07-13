@@ -1,3 +1,5 @@
+> **Archived** — historical document retained for provenance; not maintained. For current plans and repo structure see ROADMAP.md and the living docs at the repo root.
+
 # Deep-Dive Bug Audit — main @ `5d837dc` (post-merge)
 
 **Date:** 2026-06-12 · **Method:** full read of `cli/` (all 5 files), post-split frontend

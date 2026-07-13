@@ -1,6 +1,8 @@
 # Proposal: Session & composer UX (Prompt 12 — K4, K5, K10)
 
-Status: accepted · Scope: session management, paste/region capture, export.
+> **Status:** done — implemented in commit c74c0c1 (K4/K5/K10); note the K4 `delete_session` command was later removed as caller-less dead code during the Wave-2 audit (rename/pin/search live at `session_commands.rs:365`) — 2026-07-13
+
+Scope: session management, paste/region capture, export.
 
 ## K4 — Session management
 - **Meta sidecar**: `<kim_sessions>/<date>/<id>.meta.json` holding

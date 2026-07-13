@@ -1,3 +1,5 @@
+> **Archived** — historical document retained for provenance; not maintained. For current plans and repo structure see ROADMAP.md and the living docs at the repo root.
+
 # KIM — Product Requirements Document
 ### AI Agent Platform | v1.0 | April 2026 | Build with Claude Opus
 

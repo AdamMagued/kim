@@ -1,3 +1,5 @@
+> **Archived** — historical document retained for provenance; not maintained. For current plans and repo structure see ROADMAP.md and the living docs at the repo root.
+
 # Reviewer's Guide — `production-roadmap` branch
 
 Hey — thanks for reviewing. This branch is ~34 commits of work on Kim (a desktop AI

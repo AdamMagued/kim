@@ -1,6 +1,8 @@
 # Proposal: Agentic `kim chat` + rendered output (Prompt 7)
 
-Status: accepted · Goal: `kim chat` runs the REAL Kim agent (tool loop in the
+> **Status:** done — implemented in commit 1df7456 (`cli/src/agentic.rs`; HITL line also referenced by docs/ROADMAP_PROGRESS.md) — 2026-07-13
+
+Goal: `kim chat` runs the REAL Kim agent (tool loop in the
 terminal) when a Kim source root + Python are available, falling back to today's
 plain LLM chat otherwise.
 

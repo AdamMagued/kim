@@ -1,3 +1,5 @@
+> **Archived** — historical document retained for provenance; not maintained. For current plans and repo structure see ROADMAP.md and the living docs at the repo root.
+
 # Kim Desktop — Complete Project Knowledge Base
 
 > **Purpose**: Self-contained reference for AI agents. Read this file to instantly understand the architecture, every file's role, data flows, and common debugging patterns.
