@@ -14,7 +14,7 @@ Kim is a local AI agent platform that connects any cloud LLM (Claude, Gemini, GP
 - **OS control:** Take screenshots, click, type, scroll, run shell commands, read/write files, manage windows
 - **Browser automation:** Fill forms, navigate pages, extract structured data from the DOM
 - **Code workspace:** Integrated code agent (Code tab) powered by Claw/Codex with browser-provider backend
-- **MCP server:** 31 OS-control tools exposed via the Model Context Protocol — usable from Claude Code or any MCP client
+- **MCP server:** 50+ OS-control tools exposed via the Model Context Protocol — usable from Claude Code or any MCP client
 - **Session history:** Every run is saved as a JSONL trace in `kim_sessions/`
 
 ---
@@ -54,6 +54,11 @@ GOOGLE_API_KEY=...
 OPENAI_API_KEY=sk-...
 ```
 
+Beyond the provider API keys, Kim's behavior knobs are `KIM_*` environment
+variables (log level, tool tiers, HITL gates, browser automation, offline fake
+mode, …) — see [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) for the generated
+reference of every variable.
+
 ### 3. Run the desktop app
 
 ```bash
@@ -66,15 +71,20 @@ The Tauri window opens. Select a provider in Settings → AI, type a task, and p
 
 ### 4. Run tests
 
+All four test suites (the `cli/` crate is separate — easy to forget):
+
 ```bash
-# Python (816+ tests)
+# Python
 python -m pytest tests/ -q
 
-# Frontend (31 Vitest tests)
+# Frontend (Vitest + type check)
 cd desktop && npm run test && npx tsc --noEmit
 
-# Rust (50 tests)
+# Rust (desktop)
 cd desktop/src-tauri && cargo test
+
+# Rust (kim CLI)
+cd cli && cargo test
 ```
 
 Or with `just` (if installed: `brew install just`):
@@ -99,7 +109,7 @@ Rust backend (lib.rs)
     ↕ stdin/stdout IPC
 Python orchestrator (agent.py)
     ↕ MCP stdio
-MCP server (31 OS tools)
+MCP server (50+ OS tools)
 ```
 
 ---
