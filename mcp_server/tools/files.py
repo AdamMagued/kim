@@ -369,6 +369,74 @@ async def handle_list_dir(args: dict) -> str:
     return "\n".join(entries) if entries else "(empty directory)"
 
 
+def _summarize_paths(label: str, paths: list) -> str:
+    """Render one section of the revert summary, capped at 20 entries."""
+    if not paths:
+        return ""
+    shown = [str(p) for p in paths[:20]]
+    extra = len(paths) - len(shown)
+    lines = "\n".join(f"  {p}" for p in shown)
+    if extra > 0:
+        lines += f"\n  … and {extra} more"
+    return f"\n{label} ({len(paths)}):\n{lines}"
+
+
+async def handle_revert_changes(args: dict) -> str:
+    """Revert this run's file changes from the K1 pre-image checkpoints.
+
+    Thin tool wrapper around mcp_server.checkpoints.revert_run — see that
+    function for what is restored (modified files from pre-image blobs,
+    created files deleted; both first backed up to <path>.kim-revert.bak)
+    and what is skipped (truncated over-cap entries, tampered blobs,
+    sensitive paths)."""
+    # Deferred import mirrors _resolve_safe_path's rationale in checkpoints.py
+    # and lets tests monkeypatch mcp_server.checkpoints attributes normally.
+    from mcp_server import checkpoints as _cp
+
+    run_id = str(args.get("run_id") or "").strip()
+    if not run_id:
+        run_id = os.environ.get("KIM_RUN_ID", "").strip()
+    if not run_id:
+        return tool_error(
+            "no run_id given and no current run (KIM_RUN_ID unset) — "
+            "nothing to revert"
+        )
+
+    result = _cp.revert_run(run_id)
+    err = result.get("error")
+    if err == "invalid_run_id":
+        return tool_error(f"invalid run_id: {run_id!r}")
+    if err == "no_checkpoint":
+        return tool_error(
+            f"no checkpoint exists for run '{run_id}' — only files mutated "
+            "through Kim's file tools during a checkpointed run are captured, "
+            "so there is nothing recorded to revert"
+        )
+    if err:
+        return tool_error(f"revert failed for run '{run_id}': {err}")
+
+    restored = result.get("restored", [])
+    deleted = result.get("deleted", [])
+    skipped = result.get("skipped", [])
+    logger.info(
+        f"revert_changes: run={run_id} restored={len(restored)} "
+        f"deleted={len(deleted)} skipped={len(skipped)}"
+    )
+    summary = (
+        f"Reverted run '{run_id}': {len(restored)} file(s) restored, "
+        f"{len(deleted)} created file(s) deleted, {len(skipped)} skipped."
+    )
+    summary += _summarize_paths("Restored", restored)
+    summary += _summarize_paths("Deleted", deleted)
+    summary += _summarize_paths("Skipped", skipped)
+    if restored or deleted:
+        summary += (
+            "\nCurrent state of each changed file was saved to "
+            "<path>.kim-revert.bak before revert, so the revert is undoable."
+        )
+    return summary
+
+
 async def handle_delete_file(args: dict) -> str:
     path = validate_path(args["path"])
     if not path.exists():

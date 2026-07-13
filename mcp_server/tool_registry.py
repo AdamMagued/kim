@@ -25,6 +25,7 @@ from mcp_server.tools.files import (
     handle_edit_file,
     handle_list_dir,
     handle_read_file,
+    handle_revert_changes,
     handle_view_image,
     handle_write_file,
 )
@@ -190,6 +191,28 @@ _FILE_TOOLS: list[Tool] = [
             "required": ["path"],
         },
     ),
+    Tool(
+        name="revert_changes",
+        description=(
+            "Undo this run's file changes by restoring the pre-image checkpoints "
+            "Kim recorded before each mutation. SCOPE — be aware of what this can "
+            "and cannot restore: ONLY files that were modified/created through "
+            "Kim's file tools during a checkpointed run are captured (modified "
+            "files are restored from their pre-image; files the run created are "
+            "deleted). It cannot revert shell-command side effects, changes past "
+            "the per-run 50 MB checkpoint cap (recorded as skipped), directory "
+            "deletions, or anything from a run that was not checkpointed. Before "
+            "reverting, the current state of each file is saved to "
+            "<path>.kim-revert.bak so the revert itself is undoable. Returns a "
+            "summary of restored/deleted/skipped paths."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "Run id whose changes to revert. Defaults to the current run (KIM_RUN_ID)."},
+            },
+        },
+    ),
 ]
 
 _FILE_READ_DISPATCH = {
@@ -202,6 +225,7 @@ _FILE_WRITE_DISPATCH = {
     "write_file": handle_write_file,
     "delete_file": handle_delete_file,
     "edit_file": handle_edit_file,
+    "revert_changes": handle_revert_changes,
 }
 
 # Merged for DISPATCH aggregation – preserves existing behavior when no tier

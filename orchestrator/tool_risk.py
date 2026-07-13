@@ -68,6 +68,10 @@ _HIGH_RISK: frozenset = frozenset({
 _MEDIUM_RISK: frozenset = frozenset({
     "write_file",
     "edit_file",
+    # Same HITL treatment as write_file: it mutates files (restores
+    # pre-images / deletes run-created files), and every mutation is itself
+    # backed up to <path>.kim-revert.bak first, so it is recoverable.
+    "revert_changes",
     "git_add",
     "web_fill",
     "web_fill_form",
@@ -112,6 +116,7 @@ _TOOL_REASON: dict[str, str] = {
     # ── Medium-risk ──────────────────────────────────────────────────────────
     "write_file": "file_write",
     "edit_file": "file_write",
+    "revert_changes": "file_write",
     "git_add": "git_stage",
     "web_fill": "form_interaction",
     "web_press": "form_interaction",

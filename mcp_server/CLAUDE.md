@@ -1,7 +1,7 @@
 # mcp_server/CLAUDE.md
 
 ## What lives here
-The local MCP server exposing 52 OS-control tools to the orchestrator over stdio.
+The local MCP server exposing 53 OS-control tools to the orchestrator over stdio.
 
 | File | Role |
 |---|---|

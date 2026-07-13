@@ -738,6 +738,15 @@ def build_approval_preview(name: str, args: dict) -> str:
             return " ".join(x for x in parts if x).strip()
         if name in ("delete_file", "run_python", "run_node", "lint_file"):
             return str(args.get("path") or args.get("file") or args.get("code", ""))[:400]
+        if name == "revert_changes":
+            rid = str(args.get("run_id") or "").strip() or os.environ.get(
+                "KIM_RUN_ID", ""
+            ).strip() or "(current run)"
+            return (
+                f"Revert file changes from run {rid} — restores checkpointed "
+                "pre-images and deletes files the run created (each first "
+                "backed up to <path>.kim-revert.bak)."
+            )
     except Exception as preview_err:
         logger.debug("build_approval_preview failed: %s", preview_err)
     return ""

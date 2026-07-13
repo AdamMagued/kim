@@ -10,7 +10,7 @@ Granular tiers (one per tool group):
     git, code, search, memory
 
     file_read  -- read_file, list_dir, view_image  (no mutation)
-    file_write -- write_file, delete_file, edit_file
+    file_write -- write_file, delete_file, edit_file, revert_changes
     shell      -- run_command, run_powershell  (arbitrary execution; opt-in only)
 
 Compound aliases (expand to the granular tiers listed):
