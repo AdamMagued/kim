@@ -19,7 +19,7 @@ Before continuing, read the root `AGENTS.md`, `ARCHITECTURE.md`, `ROADMAP.md`, t
 | #52 | Checklist accepted; live QA **PENDING/BLOCKED** | `6533f10`, `fdd92ae`. The running Tauri app still needs human/E2E execution; do not claim it passed. |
 | #53 | Implementation accepted; hosted run pending | `7a68c91`, `8e348c0`, `e720fe7`. Windows Actions evidence is unavailable until push and workflow execution. |
 | #54 | **OWNER DECISION** | Design accepted in `721034b`, `9285e02`. Do not implement signing/key custody without explicit owner approval. |
-| #55 | Accepted | `a84bfaf`, `de839d9`, `52d70b8`, `b0e70fb`, `f7dc0c4`, `b895870`. Zero-behavior-change refactors; CLI binary gate passed 192 tests and `cargo check`. Full `cli_flow` environment failures are documented; do not recast them as refactor failures or successes. |
+| #55 | Accepted | `a84bfaf`, `de839d9`, `52d70b8`, `b0e70fb`, `f7dc0c4`, `b895870`. Zero-behavior-change refactors; CLI binary gate passed 192 tests and `cargo check`. In `cargo test -p kim-cli -- --test-threads=1`, 192 unit tests passed before `cli_flow`; managed runs then passed 0/9 `cli_flow` tests in the sandbox and 1/9 when escalated. The reviewer attributed the failures to unavailable browser/Python bridge and provider-gate/non-git environment categories; this handoff does not independently establish baseline certainty. |
 | #56 | Partially accepted | A: `a139501`, `35c7e3a`; B: `fde266c`, `780600a`; C: `dc4e7af`, `b4f78e8`; D: `4b6d922` (reviewer PASS). Hosted workflows remain pending. |
 | #57 | **NOT STARTED** | Split into the three scoped units below. |
 | #58 | **NOT UPDATED** | GitHub CLI was unavailable. Update the tracker only after accepted outcomes are final. |
@@ -67,14 +67,14 @@ git diff --check main...HEAD
 After #56-E/F/G, authorized #56-H if approved, #57, and #58 are accepted, run the full branch gate once from the repository root:
 
 ```powershell
-python -m pytest tests/
-Push-Location desktop; npx tsc --noEmit; npm run lint; npm run test; npm run build; Pop-Location
+.\venv\Scripts\python.exe -m pytest tests/
+Push-Location desktop; npx.cmd tsc --noEmit; npm.cmd run lint; npm.cmd run test; npm.cmd run build; Pop-Location
 Push-Location desktop/src-tauri; cargo test; Pop-Location
 Push-Location cli; cargo test -- --test-threads=1; Pop-Location
 git diff --check main...HEAD
 ```
 
-If the configured Python command is unavailable, use the repository venv interpreter and record the exact substitution; do not fabricate results. After an authorized conductor push, verify every hosted workflow, including Windows and coverage jobs, before opening a PR:
+The commands above use the repository venv interpreter directly; if it is unavailable, record the exact substitution and do not fabricate results. After an authorized conductor push, verify every hosted workflow, including Windows and coverage jobs, before opening a PR. `gh` is unavailable in this environment, so GitHub Actions verification and tracker updates require the GitHub UI or a machine with GitHub CLI installed:
 
 ```powershell
 gh run list --limit 10
