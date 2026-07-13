@@ -2,9 +2,10 @@
 Codex engine — the Codex bridge runtime.
 
 This top-level package is the canonical home for the Codex bridge "engine":
-``_CodexProxy``, ``run_codex_subtask``, and the subprocess/config helpers. It is
-consumed by the orchestrator-side launcher ``orchestrator/codex_bridge_service.py``,
-which imports it as a normal sibling package (``from codex_engine.engine import …``).
+``_CodexProxy`` and the subprocess/config helpers. It is consumed by the
+orchestrator-side launcher ``orchestrator/codex_bridge_service.py``, which owns
+the Codex subprocess spawn (hardened minimal-allowlist env) and imports this
+module as a normal sibling package (``from codex_engine.engine import …``).
 It is not an MCP tool — it is not registered in ``mcp_server/tool_registry.py``.
 
 Spawns an OpenAI Codex CLI subprocess and routes its LLM calls through
@@ -29,20 +30,10 @@ Auto-compaction (claw-style two-pass):
     summarizes older messages via the browser LLM (first pass), then applies
     priority-based line selection to keep the summary under a character budget
     (second pass — adapted from claw's summary_compression.rs).
-
-Usage:
-    from codex_engine.engine import run_codex_subtask
-
-    result = await run_codex_subtask(
-        task="write fibonacci.py and test it",
-        browser_provider=provider,
-        cwd="/path/to/project",
-    )
 """
 
 from __future__ import annotations
 
-import asyncio
 import hmac
 import json
 import logging
@@ -50,15 +41,21 @@ import os
 import re
 import secrets
 import shlex
-import shutil
 import sys
-import tempfile
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from orchestrator.providers.browser_provider import BrowserProvider
+
+# K5: bracket-tag vocabulary comes from the generated event manifest so the
+# text protocol cannot drift between the three runtimes.
+from orchestrator.events_gen import (  # noqa: E402
+    LOG_TAG_ANSWER,
+    LOG_TAG_STATUS,
+    LOG_TAG_TOOL,
+)
 
 logger = logging.getLogger("kim.codex_bridge")
 
@@ -112,170 +109,6 @@ def _is_thread_send_failure(response: object) -> bool:
     if response.get("type") != "text":
         return False
     return bool(_THREAD_SEND_FAILURE_RE.search(str(response.get("content", ""))))
-
-
-# ── Public API ───────────────────────────────────────────────────────────────
-
-
-async def run_codex_subtask(
-    task: str,
-    browser_provider: "BrowserProvider",
-    cwd: Optional[str] = None,
-    codex_binary: Optional[str] = None,
-    model: Optional[str] = None,
-    provider_name: Optional[str] = None,
-) -> dict:
-    """
-    Spawn Codex with a local proxy and relay LLM calls through the browser.
-
-    Args:
-        task:              The coding task to pass to Codex (natural language).
-        browser_provider:  Kim's BrowserProvider instance for LLM calls.
-        cwd:               Working directory for Codex (defaults to current dir).
-        codex_binary:      Override path to the codex binary.
-        model:             Model name to pass to Codex (optional).
-        provider_name:     Provider identifier string (e.g. 'browser:gemini') for
-                           selecting the correct compaction threshold.
-
-    Returns:
-        {"success": bool, "exit_code": int, "message": str}
-    """
-    binary = codex_binary or os.environ.get("CODEX_BIN", "").strip() or CODEX_BINARY
-
-    binary_path = shutil.which(binary) if not os.path.isabs(binary) else binary
-    if not binary_path or not os.path.exists(binary_path):
-        return {
-            "success": False,
-            "exit_code": -1,
-            "message": f"Codex binary not found: {binary}. Install with: npm i -g @openai/codex",
-        }
-
-    # Default cwd to the caller-supplied project dir or a safe temp dir — never
-    # inherit os.getcwd() which may be the app root containing secrets (#1).
-    working_dir = cwd or tempfile.mkdtemp(prefix="kim-codex-work-")
-
-    logger.info(f"Starting Codex subtask: {task[:80]}…")
-    logger.info(f"  binary: {binary_path}")
-    logger.info(f"  cwd: {working_dir}")
-
-    # Reset so system prompt is injected fresh at the start of each Codex session.
-    if hasattr(browser_provider, '_sent_system_prompt'):
-        browser_provider._sent_system_prompt = False
-
-    proxy = _CodexProxy(browser_provider, provider_name=provider_name or "")
-    proxy_port = await proxy.start()
-
-    logger.info(f"  proxy: http://127.0.0.1:{proxy_port}")
-
-    config_dir = Path(tempfile.mkdtemp(prefix="kim-codex-config-"))
-    config_file = config_dir / "config.toml"
-    _write_codex_config(config_file, proxy_port, model)
-
-    process: Optional[asyncio.subprocess.Process] = None  # type: ignore[name-defined]
-    try:
-        # Build the subprocess env: spread os.environ so the process inherits
-        # PATH, HOME and other runtime vars the agent set, then override the
-        # keys that must point at the local proxy (#47).  The CODEX_API_KEY /
-        # OPENAI_API_KEY overrides ensure no external API key leaks out of the
-        # local proxy boundary.
-        env = {
-            **os.environ,
-            "CODEX_HOME": str(config_dir),
-            # Per-run bearer token that the proxy validates (#47).
-            "CODEX_API_KEY": proxy._bearer_token,
-            "OPENAI_API_KEY": proxy._bearer_token,
-            "OPENAI_BASE_URL": f"http://127.0.0.1:{proxy_port}/v1",
-        }
-
-        # --dangerously-bypass-approvals-and-sandbox is only included when the
-        # operator explicitly opts in via KIM_CODEX_BYPASS_SANDBOX=1 (#1).
-        bypass_flag = os.environ.get("KIM_CODEX_BYPASS_SANDBOX", "").strip()
-        cmd = [
-            str(binary_path),
-            "exec", "--json",
-        ]
-        if bypass_flag == "1":
-            cmd.append("--dangerously-bypass-approvals-and-sandbox")
-        cmd += ["-C", working_dir, task]
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            env=env,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        stderr_lines: list[str] = []
-
-        async def _stream_stdout() -> None:
-            assert process and process.stdout
-            async for raw in process.stdout:
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    print(line, flush=True)
-
-        async def _drain_stderr() -> None:
-            assert process and process.stderr
-            await _drain_stderr_to(process.stderr, stderr_lines)
-
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(_stream_stdout(), _drain_stderr()),
-                timeout=600,
-            )
-        except asyncio.TimeoutError:
-            logger.error("Codex subprocess timed out after 600s")
-            try:
-                process.kill()
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except (ProcessLookupError, OSError, asyncio.TimeoutError):
-                # Process already exited or OS-level kill failed — nothing to do.
-                pass
-            return {
-                "success": False,
-                "exit_code": -1,
-                "message": "Codex task timed out after 10 minutes.",
-            }
-
-        exit_code = await process.wait()
-        success = exit_code == 0
-        stderr_text = "\n".join(stderr_lines[-10:])
-
-        result_msg = (
-            "Task completed successfully."
-            if success
-            else f"Codex exited with code {exit_code}: {stderr_text[:300]}"
-        )
-
-    except Exception as e:
-        logger.error(f"Codex bridge error: {e}", exc_info=True)
-        return {
-            "success": False,
-            "exit_code": -1,
-            "message": f"Codex bridge error: {e}",
-        }
-    finally:
-        # Kill the subprocess on every non-normal exit (exception, cancellation,
-        # BrokenPipeError from stdout, etc.).  The timeout path already kills
-        # explicitly; this guard covers all other early-exit paths so Codex
-        # never becomes an orphan process.
-        if process is not None and process.returncode is None:
-            try:
-                process.kill()
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except (ProcessLookupError, OSError, asyncio.TimeoutError):
-                # Process already exited or OS-level kill failed — nothing to do.
-                pass
-        await proxy.stop()
-        shutil.rmtree(str(config_dir), ignore_errors=True)
-
-    logger.info(result_msg[:200])
-    return {
-        "success": success,
-        "exit_code": exit_code,
-        "message": result_msg,
-    }
 
 
 # ── Codex config generation ─────────────────────────────────────────────────
@@ -522,12 +355,33 @@ class _CodexProxy:
         self._last_tool_commands: Optional[tuple] = None  # last relay's tool-call signature (loop guard)
         # Cache: hash(json(prefix_items)) → summary_item dict
         # Avoids re-summarizing the same prefix on every Codex turn.
+        # Bounded (C5): one entry per distinct compacted prefix would
+        # otherwise accrete forever in a long app-server session.
         self._compaction_cache: dict[int, dict] = {}
         # Per-run cryptographically random bearer token (#47).
         # Codex receives it via OPENAI_API_KEY in env; the proxy verifies it on
         # every request so any other local process cannot drive the authenticated
         # browser session through this proxy.
         self._bearer_token: str = secrets.token_urlsafe(32)
+
+    def begin_turn(self) -> None:
+        """Reset the relay budget for a new codex turn (Rb6).
+
+        On the app-server transport one service process may host several
+        turns of one session; MAX_RELAYS is a runaway guard for a single
+        turn, not a lifetime cap — long legitimate sessions must not be cut
+        at 50. The exec transport spawns one process per turn, so calling
+        this there is a harmless no-op.
+        """
+        self._relay_count = 0
+
+    _COMPACTION_CACHE_MAX = 32
+
+    def _cache_compaction(self, key: int, value: dict) -> None:
+        """Insert into the compaction cache with FIFO eviction (C5)."""
+        self._compaction_cache[key] = value
+        while len(self._compaction_cache) > self._COMPACTION_CACHE_MAX:
+            self._compaction_cache.pop(next(iter(self._compaction_cache)))
 
     def _check_auth(self, request) -> bool:
         """Return True iff the request carries the correct bearer token (#47)."""
@@ -639,15 +493,15 @@ class _CodexProxy:
                 if hasattr(self._provider, '_sent_system_prompt'):
                     self._provider._sent_system_prompt = False
                 logger.info(f"[relay #{relay_num}] First relay — sending full context")
-            # ChatGPT weighs the END of a long prompt far more than the top —
-            # codex's forwarded schemas bury the terminal rules, and turn 1
-            # comes back as "save this as game.html" prose. A compact reminder
-            # at the tail fixes the recency bias.
+            # ChatGPT weighs the END of a long prompt far more than the top.
+            # Repeat the same JSON contract the Responses parser expects; do
+            # not introduce a second, terminal-only response format here.
             if bool(self._provider_name) and "chatgpt" in self._provider_name.lower():
                 prompt += (
-                    "\n\n(Format reminder: reply with ONE short narration line, then "
-                    "EXACTLY ONE shell command in a single ```bash block — create files "
-                    "with a command, never paste code for me to save myself.)"
+                    "\n\n(FORMAT REMINDER: Your entire reply must be ONE raw JSON object: "
+                    '{"text":"brief reasoning","tool_calls":[{"name":"TOOL_NAME",'
+                    '"input":{}}]}. For a final answer use only {"text":"answer"}. '
+                    "No markdown, code fences, shell-only format, or prose outside JSON.)"
                 )
             self._last_sent_count = len(input_items) if isinstance(input_items, list) else 0
         else:
@@ -717,7 +571,7 @@ class _CodexProxy:
                 # The stored thread is unresponsive/gone — degrade once to the
                 # legacy behavior: fresh chat, full context, pending handoff.
                 logger.warning(f"[relay #{relay_num}] Stored-thread send failed — retrying on a fresh chat")
-                print("[STATUS] Stored thread did not respond — retrying on a fresh chat…", flush=True)
+                print(f"{LOG_TAG_STATUS} Stored thread did not respond — retrying on a fresh chat…", flush=True)
                 prompt = _extract_prompt_from_responses_request(body)
                 clear_chat = True
                 handoff = str(self._thread_state.get("handoff") or "").strip() or None
@@ -752,7 +606,8 @@ class _CodexProxy:
         # of thought can't be scraped.
         _surface_relay_reasoning(response, relay_num)
         responses_reply = _provider_response_to_responses_api(
-            response, relay_num, request_tools=body.get("tools")
+            response, relay_num, request_tools=body.get("tools"),
+            metrics=self._thread_state.setdefault("repairs", {}),
         )
         # Loop guard: if this relay's tool calls repeat the previous relay's —
         # identical, or a subset of sub-commands that already ran (`open x`
@@ -763,7 +618,7 @@ class _CodexProxy:
         cmds = _tool_command_signature(responses_reply)
         if _is_repeat_of_previous(cmds, self._last_tool_commands):
             logger.info(f"[relay #{relay_num}] Repeated tool call {cmds} — ending turn (loop guard)")
-            print("[STATUS] Command already ran — finishing up…", flush=True)
+            print(f"{LOG_TAG_STATUS} Command already ran — finishing up…", flush=True)
             # Honest final answer: name the command that actually repeated —
             # never claim work ("the file was created") the commands don't show.
             subs = sorted(_signature_subcommands(cmds))
@@ -811,9 +666,9 @@ class _CodexProxy:
             logger.info(f"[relay #{relay_num}] Prose reply has salvageable actions — executing, no nudge")
             return response
         logger.info(f"[relay #{relay_num}] Reply had no actionable command — sending one nudge")
-        print("[STATUS] Reply had no runnable command — asking for it…", flush=True)
-        is_chatgpt = bool(self._provider_name) and "chatgpt" in self._provider_name.lower()
-        nudge = _TERMINAL_NUDGE if is_chatgpt else _CONTRACT_NUDGE
+        _count_repair(self._thread_state.setdefault("repairs", {}), "nudges")
+        print(f"{LOG_TAG_STATUS} Reply had no runnable command — asking for it…", flush=True)
+        nudge = _CONTRACT_NUDGE
         try:
             retry = await self._provider.complete(
                 messages=[{"role": "user", "content": nudge}],
@@ -976,7 +831,7 @@ class _CodexProxy:
             return system_msgs + [cached] + list(to_keep)
 
         logger.info(f"[relay #{relay_num}] [compaction] Summarizing {len(to_summarize)} messages, keeping {len(to_keep)}")
-        print(f"[STATUS] Compacting context — summarizing {len(to_summarize)} messages…", flush=True)
+        print(f"{LOG_TAG_STATUS} Compacting context — summarizing {len(to_summarize)} messages…", flush=True)
 
         # Convert chat messages to codex-bridge item format for the summarizer
         items_for_summary = [
@@ -997,8 +852,8 @@ class _CodexProxy:
             "content": f"[CONTEXT SUMMARY — previous conversation compacted]\n{compressed}",
         }
 
-        self._compaction_cache[prefix_key] = summary_msg
-        print(f"[STATUS] Context compacted — summary is {len(compressed)} chars", flush=True)
+        self._cache_compaction(prefix_key, summary_msg)
+        print(f"{LOG_TAG_STATUS} Context compacted — summary is {len(compressed)} chars", flush=True)
 
         return system_msgs + [summary_msg] + list(to_keep)
 
@@ -1044,7 +899,7 @@ class _CodexProxy:
 
         # First pass: LLM summarization
         logger.info(f"[relay #{relay_num}] [compaction] Summarizing {len(to_summarize)} items, keeping {len(to_keep)}")
-        print(f"[STATUS] Compacting context — summarizing {len(to_summarize)} messages…", flush=True)
+        print(f"{LOG_TAG_STATUS} Compacting context — summarizing {len(to_summarize)} messages…", flush=True)
 
         new_summary = await _summarize_messages(to_summarize, self._provider)
 
@@ -1067,9 +922,9 @@ class _CodexProxy:
             ],
         }
 
-        self._compaction_cache[prefix_key] = summary_item
+        self._cache_compaction(prefix_key, summary_item)
 
-        print(f"[STATUS] Context compacted — summary is {len(compressed)} chars", flush=True)
+        print(f"{LOG_TAG_STATUS} Context compacted — summary is {len(compressed)} chars", flush=True)
         logger.info(f"[compaction] Done. Summary: {len(compressed)} chars")
 
         return [summary_item] + list(to_keep)
@@ -1283,6 +1138,13 @@ _EXEC_ALIASES = {
 }
 
 
+def _get_tool_schema(target: dict) -> dict:
+    fn_raw = target.get("function")
+    fn = fn_raw if isinstance(fn_raw, dict) else {}
+    schema = fn.get("parameters") or target.get("parameters") or target.get("input_schema")
+    return schema if isinstance(schema, dict) else {}
+
+
 def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
     """Snap model-invented tool names onto the real tools from the request.
 
@@ -1330,18 +1192,47 @@ def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
             if fixed:
                 logger.info(f"Normalized tool name {name!r} -> {fixed!r}")
                 tc = {**tc, "name": fixed}
-        # Coerce command->cmd for the exec tool (argv lists become one string).
+        # Coerce command->cmd (or the custom argument key from the schema) for the exec tool.
         target = by_name.get(str(tc.get("name") or ""))
         if target is not None:
-            required = ((target.get("parameters") or {}).get("required")) or []
+            schema = _get_tool_schema(target)
+            required = schema.get("required") or []
+            properties = schema.get("properties") or {}
+            
+            # Determine the target command key from the schema
+            target_key = "cmd" # fallback default
+            is_exec = any(k in str(tc.get("name") or "").lower() for k in ("exec", "shell", "command"))
+            if is_exec:
+                if required:
+                    cand = [k for k in required if k not in ("workdir", "cwd", "dir")]
+                    if cand:
+                        target_key = cand[0]
+                    else:
+                        target_key = required[0]
+                elif properties:
+                    cand = [k for k in properties if k not in ("workdir", "cwd", "dir")]
+                    if cand:
+                        target_key = cand[0]
+                    else:
+                        target_key = list(properties.keys())[0]
+
             inp = tc.get("input")
-            if "cmd" in required and isinstance(inp, dict) and "cmd" not in inp and "command" in inp:
-                cmd_val = inp["command"]
-                if isinstance(cmd_val, list):
-                    cmd_val = shlex.join(str(part) for part in cmd_val)
-                new_inp = {k: v for k, v in inp.items() if k != "command"}
-                new_inp["cmd"] = str(cmd_val)
-                tc = {**tc, "input": new_inp}
+            if isinstance(inp, dict):
+                # If target_key is not in input, and the model sent 'command' or 'cmd', rename it
+                alias_key = next((k for k in ("cmd", "command") if k in inp), None)
+                if alias_key and target_key not in inp:
+                    cmd_val = inp[alias_key]
+                    if isinstance(cmd_val, list):
+                        cmd_val = shlex.join(str(part) for part in cmd_val)
+                    new_inp = {k: v for k, v in inp.items() if k != alias_key}
+                    new_inp[target_key] = str(cmd_val)
+                    tc = {**tc, "input": new_inp}
+                    inp = new_inp
+                
+                # F-H-7: Validate the model's tool_calls[].input against the request tool's parameters schema
+                if schema:
+                    import jsonschema
+                    jsonschema.validate(inp, schema)
         normalized.append(tc)
     return normalized
 
@@ -1399,7 +1290,7 @@ def _announce_commands(tool_calls: list) -> None:
             line = _humanize_command(cmd)
             if line not in seen:
                 seen.append(line)
-                print(f"[STATUS] {line}…", flush=True)
+                print(f"{LOG_TAG_STATUS} {line}…", flush=True)
 
 
 def _salvage_action_reply(content: object, request_tools: object) -> Optional[list]:
@@ -1872,10 +1763,13 @@ def _chatgpt_terminal_system_prompt() -> str:
 
 
 def _system_prompt_for(provider_name: str) -> str:
-    """ChatGPT gets the terminal-helper prompt; every other provider keeps the
-    JSON tool-call prompt (which Gemini/others honor natively)."""
-    if provider_name and "chatgpt" in provider_name.lower():
-        return _chatgpt_terminal_system_prompt()
+    """Return the exact Codex bridge contract for every browser provider.
+
+    The Responses proxy and its parser speak the JSON tool-call protocol.  A
+    provider-specific terminal prompt here creates two incompatible protocols:
+    ChatGPT emits bash while Codex is waiting for structured tool calls.  Keep
+    one stateful contract end-to-end instead.
+    """
     return _codex_browser_system_prompt()
 
 
@@ -1969,8 +1863,14 @@ def _is_repeat_of_previous(cmds: object, last_cmds: object) -> bool:
     return bool(new_subs) and new_subs <= _signature_subcommands(last_cmds)
 
 
+def _count_repair(metrics: object, key: str) -> None:
+    """Rb1: bump a repair counter (persisted via the thread-state sidecar)."""
+    if isinstance(metrics, dict):
+        metrics[key] = int(metrics.get(key) or 0) + 1
+
+
 def _provider_response_to_responses_api(
-    response: dict, relay_num: int, request_tools: object = None
+    response: dict, relay_num: int, request_tools: object = None, metrics: object = None
 ) -> dict:
     """Convert a BrowserProvider response to OpenAI Responses API format."""
     resp_id = f"resp_{uuid.uuid4().hex[:16]}"
@@ -2005,6 +1905,7 @@ def _provider_response_to_responses_api(
                 # Empty message text: the humanized activity lines from
                 # _announce_commands narrate the work — passing the full reply
                 # (prose + file body) would dump it to the user as "Kim: …".
+                _count_repair(metrics, "salvages")
                 return _make_responses_tool_reply(resp_id, "", salvaged)
             return _make_responses_text_reply(resp_id, text or content)
 
@@ -2017,6 +1918,7 @@ def _provider_response_to_responses_api(
         salvaged = _salvage_action_reply(content, request_tools)
         if salvaged is not None:
             # Empty text — the humanized activity lines narrate it (see above).
+            _count_repair(metrics, "salvages")
             return _make_responses_tool_reply(resp_id, "", salvaged)
 
         return _make_responses_text_reply(resp_id, content)
@@ -2069,27 +1971,26 @@ def _make_responses_tool_reply(resp_id: str, text: str, tool_calls: list) -> dic
 
 
 # ── Output parsing & surfacing ───────────────────────────────────────────────
+# C4 NOTE: _surface_codex_output / _extract_final_answer / _emit_bridge_answer
+# below have no live callers today, but the codegen contract test
+# (tests/test_events_codegen.py) asserts engine.py references LOG_TAG_TOOL and
+# LOG_TAG_ANSWER — these are their only users. Removing them would break that
+# guard, so the dead-code cleanup (a Low finding) is intentionally skipped.
 
 
-async def _drain_stderr_to(
-    stderr_stream: asyncio.StreamReader,
-    stderr_lines: list,
-    max_line_chars: int = 200,
-) -> None:
-    """Read all lines from stderr, accumulate them, and surface each one in real time.
+def _is_benign_codex_stderr(line: str) -> bool:
+    """True for informational codex CLI chatter that is not an error.
 
-    Lines are printed as ``[STATUS] codex: {line}`` (truncated to *max_line_chars*)
-    so they appear in the user-visible activity feed rather than disappearing into a
-    debug log.  Accumulated lines remain available for the non-zero-exit error message.
-    Empty lines are skipped to avoid cluttering the UI with blank status entries.
+    Codex is launched with stdin=/dev/null; because that is not a TTY, codex
+    prints "Reading additional input from stdin..." (and immediately gets EOF).
+    Surfacing that in the user-visible activity feed as a codex error is pure
+    noise on every run. Used by the live stderr drain in
+    ``orchestrator/codex_bridge_service._run_async``.
     """
-    async for raw in stderr_stream:
-        line = raw.decode("utf-8", errors="replace").rstrip()
-        if not line:
-            continue
-        stderr_lines.append(line)
-        logger.debug("codex stderr: %s", line)
-        print(f"[STATUS] codex: {line[:max_line_chars]}", flush=True)
+    lowered = line.strip().lower()
+    if not lowered:
+        return True
+    return "stdin" in lowered and ("reading" in lowered or "input" in lowered)
 
 
 def _surface_codex_output(stdout_text: str) -> None:
@@ -2098,9 +1999,9 @@ def _surface_codex_output(stdout_text: str) -> None:
         if not line:
             continue
         if "Running:" in line or "Executing:" in line:
-            print(f"[TOOL] {line}", flush=True)
+            print(f"{LOG_TAG_TOOL} {line}", flush=True)
         elif line.startswith("✓") or line.startswith("✗"):
-            print(f"[STATUS] {line}", flush=True)
+            print(f"{LOG_TAG_STATUS} {line}", flush=True)
 
 
 def _extract_final_answer(stdout_text: str) -> Optional[str]:
@@ -2159,10 +2060,12 @@ def _surface_relay_reasoning(response: dict, relay_num: int) -> None:
     # prefix and be misparsed as answer text.
     display = " ".join(display.split())
     if display and not display.startswith("{"):
-        print(f"[STATUS] {display}", flush=True)
+        print(f"{LOG_TAG_STATUS} {display}", flush=True)
 
 
 def _emit_bridge_answer(answer: str) -> None:
     cleaned = answer.strip()
     if cleaned:
-        print(f"[ANSWER] {json.dumps(cleaned, ensure_ascii=False)}", flush=True)
+        print(f"{LOG_TAG_ANSWER} {json.dumps(cleaned, ensure_ascii=False)}", flush=True)
+
+

@@ -1,4 +1,5 @@
 import type { ActivityItem, LivePlanParsed } from './types';
+import { LogTags } from '../../types/events.gen';
 import type { TraceItem, WorkedForTraceItem, WorkedForToolKind } from '../kim-ui';
 import { parseAnswerLine, friendlyError, parseLogLine, speakAsKimNarration } from './utils';
 import { parseCodexItemCompleted } from './codexEvents';
@@ -51,7 +52,7 @@ export function buildThinkingTrace(items: ActivityItem[], livePlan: LivePlanPars
     const t = item.text;
     // Skip raw JSON envelope lines — they drive the plan widget
     if (/^\s*\[(?:PLAN|STEP|DONE)\]\{/.test(t)) {
-      if (t.includes('[PLAN]{') && !planInserted && livePlan && livePlan.steps.length >= 2) {
+      if (t.includes(LogTags.PLAN + '{') && !planInserted && livePlan && livePlan.steps.length >= 2) {
         trace.push(buildPlanTraceItem(livePlan));
         planInserted = true;
       }

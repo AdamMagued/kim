@@ -75,9 +75,19 @@ pub fn find_session_by_id(id: &str) -> Option<SessionEntry> {
     if matches!(id, "latest" | "last" | "recent") {
         return sessions.into_iter().next();
     }
-    sessions
-        .into_iter()
-        .find(|s| s.id == id || s.label.ends_with(id))
+    // F14: match on the session id only — exact first, else a UNIQUE id prefix.
+    // The old `label.ends_with(id)` fuzzy match silently resumed whichever
+    // newest session's preview text happened to end with the query.
+    if let Some(pos) = sessions.iter().position(|s| s.id == id) {
+        return sessions.into_iter().nth(pos);
+    }
+    let mut by_prefix = sessions.into_iter().filter(|s| s.id.starts_with(id));
+    let first = by_prefix.next()?;
+    if by_prefix.next().is_some() {
+        None // ambiguous — refuse rather than resume the wrong session
+    } else {
+        Some(first)
+    }
 }
 
 pub fn save_session_messages(session_id: &str, messages: &[UiMessage]) -> Result<PathBuf, String> {
@@ -100,6 +110,18 @@ pub(crate) fn save_session_messages_in(
     let safe_id = sanitize_session_id(session_id);
     let path = root.join(format!("{safe_id}.jsonl"));
 
+    // #7: two processes resuming the same session id (e.g. `kim --resume
+    // <id>` run twice) previously raced this whole tempfile+rename cycle
+    // with no coordination — "last renamer wins" non-deterministically, and
+    // a slower process holding stale in-memory messages could clobber a
+    // faster process's newer save. Hold an advisory cross-process lock (an
+    // OS `flock` on a `.lock` sentinel file, scoped to this session id) for
+    // the entire write cycle below so concurrent saves serialize instead.
+    let mut session_lock = lock_session_file(root, &safe_id)?;
+    let _lock_guard = session_lock
+        .write()
+        .map_err(|e| format!("Could not lock session {safe_id} for saving: {e}"))?;
+
     let (mut tmp_file, tmp_path, nanos) = create_temp_session_file(root, &safe_id)?;
 
     let now_ms = nanos / 1_000_000;
@@ -108,11 +130,17 @@ pub(crate) fn save_session_messages_in(
         let Some(role) = persisted_role(msg.role) else {
             continue;
         };
+        // F-E-3: keep each message's own creation time; only stamp `now` for
+        // messages that never carried one (e.g. legacy records loaded before
+        // this field existed). The old code re-stamped EVERY record to the last
+        // save instant, so a 2-hour conversation showed every message as created
+        // at the final save.
+        let timestamp_ms = msg.timestamp_ms.unwrap_or(now_ms as u64);
         let value = json!({
             "type": "message",
             "role": role,
             "content": msg.content,
-            "timestamp_ms": now_ms,
+            "timestamp_ms": timestamp_ms,
         });
         let line = serde_json::to_string(&value)
             .map_err(|e| format!("Could not encode session message: {e}"))?;
@@ -147,6 +175,29 @@ pub(crate) fn save_session_messages_in(
         format!("Could not commit session {}: {e}", path.display())
     })?;
     Ok(path)
+}
+
+/// #7: acquire an exclusive advisory lock on `<root>/<safe_id>.lock`,
+/// creating the sentinel file if needed. Blocks until acquired — two
+/// processes saving the same session id serialize rather than racing the
+/// tempfile+rename cycle. The returned guard holds the lock (and keeps the
+/// underlying file descriptor open) until dropped; the sentinel file itself
+/// is intentionally never cleaned up (same pattern as the Python side's
+/// flock-style `cron_store.py` locking) since re-creating it is free and
+/// deleting a lock file out from under another lock-holder is a classic
+/// TOCTOU bug.
+fn lock_session_file(
+    root: &Path,
+    safe_id: &str,
+) -> Result<fd_lock::RwLock<fs::File>, String> {
+    let lock_path = root.join(format!("{safe_id}.lock"));
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("Could not open lock file {}: {e}", lock_path.display()))?;
+    Ok(fd_lock::RwLock::new(lock_file))
 }
 
 fn create_temp_session_file(
@@ -215,7 +266,19 @@ pub fn load_session_messages(path: &Path) -> Result<Vec<UiMessage>, String> {
         let Some(content) = compact_summary
             .map(ToOwned::to_owned)
             .or_else(|| content_text(value.get("content")))
-            .and_then(|t| display_message_text(&t))
+            .and_then(|t| {
+                if record_type == Some("message") {
+                    // F4: records the CLI itself wrote carry `"type":"message"`
+                    // and hold verbatim user/assistant text — it must round-trip
+                    // even when it starts with `{` or "[Tool result:". The
+                    // prefix heuristic below is only for foreign/agent-internal
+                    // JSONL records that lack the marker.
+                    let t = t.trim().to_string();
+                    (!t.is_empty()).then_some(t)
+                } else {
+                    display_message_text(&t)
+                }
+            })
         else {
             continue;
         };
@@ -228,9 +291,13 @@ pub fn load_session_messages(path: &Path) -> Result<Vec<UiMessage>, String> {
             }
             _ => continue,
         };
+        // F-E-3: preserve the persisted per-message timestamp so a later
+        // re-save doesn't rewrite it to "now".
+        let timestamp_ms = value.get("timestamp_ms").and_then(Value::as_u64);
         messages.push(UiMessage {
             role: message_role,
             content,
+            timestamp_ms,
         });
     }
     if messages.is_empty() {
@@ -241,7 +308,14 @@ pub fn load_session_messages(path: &Path) -> Result<Vec<UiMessage>, String> {
 }
 
 fn collect_jsonl_sessions(root: &Path, sessions: &mut Vec<SessionEntry>) {
-    if !root.exists() {
+    collect_jsonl_sessions_at(root, sessions, 0);
+}
+
+fn collect_jsonl_sessions_at(root: &Path, sessions: &mut Vec<SessionEntry>, depth: usize) {
+    // F17: cap recursion so a deep/self-referencing tree under a session root
+    // can't stall every mode switch. Real layouts are ≤ 2 levels (date dirs).
+    const MAX_DEPTH: usize = 4;
+    if depth > MAX_DEPTH || !root.exists() {
         return;
     }
     if root.extension().and_then(|e| e.to_str()) == Some("jsonl") {
@@ -256,7 +330,7 @@ fn collect_jsonl_sessions(root: &Path, sessions: &mut Vec<SessionEntry>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_jsonl_sessions(&path, sessions);
+            collect_jsonl_sessions_at(&path, sessions, depth + 1);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             if let Some(entry) = session_entry(&path) {
                 sessions.push(entry);
@@ -284,9 +358,19 @@ fn session_entry(path: &Path) -> Option<SessionEntry> {
 }
 
 fn preview_for_session(path: &Path) -> String {
-    let Ok(raw) = fs::read_to_string(path) else {
+    use std::io::Read as _;
+    // F17: session files can be MBs and this runs for every session on every
+    // mode switch. The preview only needs the first user line — read at most
+    // 64 KiB instead of the whole file. (A record cut at the cap fails JSON
+    // parsing and is skipped, same as any malformed line.)
+    let Ok(file) = fs::File::open(path) else {
         return "(unreadable)".to_string();
     };
+    let mut raw_bytes = Vec::new();
+    if file.take(64 * 1024).read_to_end(&mut raw_bytes).is_err() {
+        return "(unreadable)".to_string();
+    }
+    let raw = String::from_utf8_lossy(&raw_bytes);
     for line in raw.lines().take(80) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -432,7 +516,7 @@ fn epoch_secs_to_calendar(secs: u64) -> (u16, u8, u8, u8, u8) {
 
 fn is_leap_year(year: u16) -> bool {
     let y = year as u32;
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 fn days_in_month(month: u8, year: u16) -> u8 {
@@ -607,6 +691,60 @@ mod tests {
 
     use crate::UiMessage;
 
+    // F-E-3: a message's own creation timestamp must survive a save→load→save
+    // cycle; only a message that never carried one gets stamped `now`. The old
+    // code re-stamped EVERY record to the last-save instant.
+    #[test]
+    fn save_preserves_existing_message_timestamps() {
+        let dir = unique_test_dir();
+        const OLD_TS: u64 = 1_600_000_000_000; // a fixed past instant (ms)
+        let messages = vec![
+            UiMessage {
+                role: MessageRole::User,
+                content: "first turn".to_string(),
+                timestamp_ms: Some(OLD_TS),
+            },
+            UiMessage {
+                role: MessageRole::Assistant,
+                content: "reply".to_string(),
+                timestamp_ms: None, // legacy record with no time
+            },
+        ];
+        let path = super::save_session_messages_in(&dir, "ts-test", &messages)
+            .expect("save should succeed");
+        let loaded = load_session_messages(&path).expect("load should succeed");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded[0].timestamp_ms,
+            Some(OLD_TS),
+            "an existing timestamp must be preserved verbatim on save"
+        );
+        let stamped_now = loaded[1]
+            .timestamp_ms
+            .expect("a message with no timestamp must be stamped on save");
+        assert!(
+            stamped_now > OLD_TS,
+            "a timestamp-less message should get a real (recent) time, not OLD_TS"
+        );
+
+        // Re-save the loaded transcript (as a follow-up turn would) and confirm
+        // NEITHER timestamp is rewritten.
+        let path2 = super::save_session_messages_in(&dir, "ts-test", &loaded)
+            .expect("re-save should succeed");
+        let reloaded = load_session_messages(&path2).expect("reload should succeed");
+        assert_eq!(
+            reloaded[0].timestamp_ms,
+            Some(OLD_TS),
+            "re-saving must not rewrite the original message's timestamp to now"
+        );
+        assert_eq!(
+            reloaded[1].timestamp_ms,
+            Some(stamped_now),
+            "re-saving must not rewrite a previously-stamped message's timestamp"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn save_and_load_roundtrip_user_and_assistant() {
         let dir = unique_test_dir();
@@ -614,10 +752,12 @@ mod tests {
             UiMessage {
                 role: MessageRole::User,
                 content: "hello".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Assistant,
                 content: "hi there".to_string(),
+                timestamp_ms: None,
             },
         ];
         let path = super::save_session_messages_in(&dir, "roundtrip-test", &messages)
@@ -632,23 +772,151 @@ mod tests {
     }
 
     #[test]
+    fn save_and_load_roundtrip_json_prefixed_content() {
+        // F4: content beginning with `{` or "[Tool result:" written by the CLI
+        // itself (type:"message" records) must survive a save→load round-trip.
+        // The `{`-prefix heuristic is only for foreign records.
+        let dir = unique_test_dir();
+        let messages = vec![
+            UiMessage {
+                role: MessageRole::User,
+                content: "{\"a\":1} — why is this invalid JSON5?".to_string(),
+                timestamp_ms: None,
+            },
+            UiMessage {
+                role: MessageRole::Assistant,
+                content: "{ starts my answer too".to_string(),
+                timestamp_ms: None,
+            },
+            UiMessage {
+                role: MessageRole::User,
+                content: "[Tool result: looking thing] pasted by a user".to_string(),
+                timestamp_ms: None,
+            },
+        ];
+        let path = super::save_session_messages_in(&dir, "json-prefix-test", &messages)
+            .expect("save should succeed");
+        let loaded = load_session_messages(&path).expect("load should succeed");
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            loaded.len(),
+            3,
+            "no CLI-written message may be dropped on load"
+        );
+        assert_eq!(loaded[0].content, "{\"a\":1} — why is this invalid JSON5?");
+        assert_eq!(loaded[1].content, "{ starts my answer too");
+        assert_eq!(
+            loaded[2].content,
+            "[Tool result: looking thing] pasted by a user"
+        );
+    }
+
+    #[test]
+    fn foreign_records_without_message_type_still_filtered() {
+        // Agent-internal JSONL (no type:"message") keeps the old heuristic.
+        let path = std::env::temp_dir().join(format!(
+            "kim-cli-foreign-{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            concat!(
+                "{\"role\":\"assistant\",\"content\":\"{\\\"internal\\\":true}\"}\n",
+                "{\"role\":\"assistant\",\"content\":\"real text\"}\n",
+            ),
+        )
+        .expect("fixture write");
+        let messages = load_session_messages(&path).expect("should load");
+        let _ = fs::remove_file(&path);
+        assert_eq!(messages.len(), 1, "internal JSON record must be filtered");
+        assert_eq!(messages[0].content, "real text");
+    }
+
+    // ── #7: cross-process save locking ────────────────────────────────────
+
+    #[test]
+    fn save_creates_a_lock_sentinel_file() {
+        let dir = unique_test_dir();
+        let messages = vec![UiMessage {
+            role: MessageRole::User,
+            content: "hi".to_string(),
+            timestamp_ms: None,
+        }];
+        super::save_session_messages_in(&dir, "lock-sentinel-test", &messages)
+            .expect("save should succeed");
+        let lock_path = dir.join("lock-sentinel-test.lock");
+        assert!(
+            lock_path.exists(),
+            "expected a .lock sentinel file after saving"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_save_blocks_while_another_holder_has_the_lock() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = unique_test_dir();
+        let safe_id = "lock-blocks-test";
+
+        // Simulate another process already mid-save (holding the lock).
+        let mut held_lock = super::lock_session_file(&dir, safe_id).expect("open lock file");
+        let guard = held_lock.write().expect("acquire lock");
+
+        let (tx, rx) = mpsc::channel();
+        let dir_clone = dir.clone();
+        let handle = thread::spawn(move || {
+            let messages = vec![UiMessage {
+                role: MessageRole::User,
+                content: "blocked writer".to_string(),
+                timestamp_ms: None,
+            }];
+            let result = super::save_session_messages_in(&dir_clone, safe_id, &messages);
+            let _ = tx.send(());
+            result
+        });
+
+        // Must NOT complete while another holder still has the lock — this is
+        // the "serialize instead of clobbering" guarantee (#7).
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "save_session_messages_in must block while another lock holder is active"
+        );
+
+        // Releasing the lock lets the blocked save proceed promptly.
+        drop(guard);
+        drop(held_lock);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "save_session_messages_in should complete once the lock is released"
+        );
+        handle
+            .join()
+            .expect("writer thread panicked")
+            .expect("save should succeed after the lock is released");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn save_leaves_no_tmp_artifact() {
         let dir = unique_test_dir();
         let messages = vec![UiMessage {
             role: MessageRole::User,
             content: "test".to_string(),
+            timestamp_ms: None,
         }];
         super::save_session_messages_in(&dir, "no-tmp-test", &messages)
             .expect("save should succeed");
         let tmp_count = fs::read_dir(&dir)
             .expect("read dir")
             .flatten()
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .map_or(false, |x| x == "tmp")
-            })
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"))
             .count();
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(
@@ -667,10 +935,12 @@ mod tests {
                     UiMessage {
                         role: MessageRole::User,
                         content: format!("question {i}"),
+                        timestamp_ms: None,
                     },
                     UiMessage {
                         role: MessageRole::Assistant,
                         content: format!("answer {i}"),
+                        timestamp_ms: None,
                     },
                 ]
             })
@@ -682,10 +952,12 @@ mod tests {
             UiMessage {
                 role: MessageRole::User,
                 content: "only message".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Assistant,
                 content: "only reply".to_string(),
+                timestamp_ms: None,
             },
         ];
         super::save_session_messages_in(&dir, "overwrite-test", &updated).expect("overwrite save");
@@ -714,10 +986,12 @@ mod tests {
             UiMessage {
                 role: MessageRole::Error,
                 content: "transient".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Reasoning,
                 content: "thinking".to_string(),
+                timestamp_ms: None,
             },
         ];
         let path = super::save_session_messages_in(&dir, "filtered-test", &messages)
@@ -727,12 +1001,7 @@ mod tests {
         let tmp_count = fs::read_dir(&dir)
             .expect("read dir")
             .flatten()
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .map_or(false, |x| x == "tmp")
-            })
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"))
             .count();
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(tmp_count, 0, "no .tmp files should remain");
@@ -749,18 +1018,22 @@ mod tests {
             UiMessage {
                 role: MessageRole::User,
                 content: "prompt".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Error,
                 content: "transient error".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Reasoning,
                 content: "thinking...".to_string(),
+                timestamp_ms: None,
             },
             UiMessage {
                 role: MessageRole::Assistant,
                 content: "done".to_string(),
+                timestamp_ms: None,
             },
         ];
         let path = super::save_session_messages_in(&dir, "roles-test", &messages).expect("save");

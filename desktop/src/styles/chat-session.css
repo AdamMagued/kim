@@ -47,7 +47,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 9000;
+  z-index: var(--z-toast);
   animation: kim-fade-in 0.15s ease;
 }
 @keyframes kim-fade-in {

@@ -5,6 +5,37 @@ import type { Settings } from '../../types';
 import { toast } from '../Toast';
 import { ProviderPicker } from '../ProviderPicker';
 
+/**
+ * Slash-command registry (audit B1/6.1). The `/compact` control task was only
+ * ever a hidden magic string — there was no menu, no autocomplete, so typing
+ * "/com" offered nothing and the feature was undiscoverable. This registry
+ * drives a real menu in the composer. Commands with `submitValue` fire
+ * immediately on select; the value is what actually gets sent (useTaskRunner
+ * recognizes the compact control tokens in chat + code mode).
+ */
+export interface SlashCommand {
+  name: string;
+  hint: string;
+  /** Value sent to onSubmit when picked. */
+  submitValue: string;
+}
+
+export const SLASH_COMMANDS: SlashCommand[] = [
+  {
+    name: '/compact',
+    hint: 'Summarize the conversation so far to free up context',
+    submitValue: '/compact',
+  },
+];
+
+/** Returns the commands matching a composer draft, or [] if not a slash query.
+ *  A slash query is a leading "/" with no space yet (still typing the name). */
+export function matchSlashCommands(draft: string): SlashCommand[] {
+  const t = draft.trimStart().toLowerCase();
+  if (!t.startsWith('/') || /\s/.test(t)) return [];
+  return SLASH_COMMANDS.filter(c => c.name.startsWith(t));
+}
+
 export interface ChatComposerProps {
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
   taskInput: string;
@@ -13,6 +44,9 @@ export interface ChatComposerProps {
   cancelling: boolean;
   handleCancel: () => void;
   onSubmit: (fullText: string) => void;
+  /** M1: K3 mid-run steering — inject text into the RUNNING agent instead of
+   *  queuing it as the next task. Only shown while a run is active. */
+  onSteer?: (text: string) => void;
   activeTab: 'chat' | 'code';
   activeProjectPath?: string | null;
   settings: Settings;
@@ -32,6 +66,7 @@ export function ChatComposer({
   cancelling,
   handleCancel,
   onSubmit,
+  onSteer,
   activeTab,
   activeProjectPath,
   settings,
@@ -45,6 +80,23 @@ export function ChatComposer({
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // ── Slash-command menu (audit B1/6.1) ──────────────────────────────────────
+  const [slashActiveIdx, setSlashActiveIdx] = useState(0);
+  // Escape dismisses the menu for the current draft without clearing the text.
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const slashMatches = matchSlashCommands(taskInput);
+  const slashMenuOpen = slashMatches.length > 0 && !slashDismissed && !isRunning;
+  const activeSlashIdx = Math.min(slashActiveIdx, Math.max(0, slashMatches.length - 1));
+
+  const runSlashCommand = (cmd: SlashCommand) => {
+    // No-arg control commands (e.g. /compact) submit immediately.
+    setSlashDismissed(true);
+    setSlashActiveIdx(0);
+    setTaskInput('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+    onSubmit(cmd.submitValue);
+  };
 
   const removeAttachment = (idx: number) => {
     setAttachedFiles(prev => {
@@ -78,6 +130,10 @@ export function ChatComposer({
 
   const handleTextareaInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setTaskInput(e.target.value);
+    // Typing revives a dismissed slash menu and resets the highlight so the
+    // filtered list always starts at the top.
+    setSlashDismissed(false);
+    setSlashActiveIdx(0);
     const el = e.target;
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
@@ -92,72 +148,83 @@ export function ChatComposer({
     const results: AttachedFile[] = [];
     for (const file of arr) {
       const sizeLabel = fmtBytes(file.size);
-      if (file.type.startsWith('image/')) {
-        if (file.size > MAX_IMAGE_BYTES) {
-          toast(`${file.name} is too large (max ${fmtBytes(MAX_IMAGE_BYTES)}).`, 'warning', 4000);
-          continue;
-        }
-        const base64 = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            const url = reader.result as string;
-            resolve(url.split(',')[1]);
-          };
-          reader.onerror = reject;
-          reader.readAsDataURL(file);
-        });
-        const previewUrl = URL.createObjectURL(file);
-        try {
-          const savedPath = await invoke<string>('save_attachment', {
-            filename: file.name,
-            dataBase64: base64,
+      // L10: stable chip identity (name alone can collide across duplicates).
+      const attachId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      // M16: isolate failures per file — one unreadable file used to reject the
+      // whole `void processFiles(...)` call as an unhandled rejection, silently
+      // dropping every remaining file in the batch.
+      try {
+        if (file.type.startsWith('image/')) {
+          if (file.size > MAX_IMAGE_BYTES) {
+            toast(`${file.name} is too large (max ${fmtBytes(MAX_IMAGE_BYTES)}).`, 'warning', 4000);
+            continue;
+          }
+          const base64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              const url = reader.result as string;
+              resolve(url.split(',')[1]);
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
           });
-          results.push({ name: file.name, kind: 'image', savedPath, previewUrl, sizeLabel });
-        } catch {
-          toast(`Could not save image: ${file.name}`, 'error', 3000);
-        }
-      } else if (
-        file.type.startsWith('text/') ||
-        /\.(md|txt|py|js|ts|tsx|jsx|json|yaml|yml|toml|sh|bash|zsh|fish|csv|xml|sql|rs|go|java|c|cpp|h|swift|kt|rb|php|html|css|scss|less|env|gitignore|dockerfile)$/i.test(
-          file.name
-        )
-      ) {
-        if (file.size > MAX_TEXT_BYTES) {
-          toast(`${file.name} is too large to inline (max ${fmtBytes(MAX_TEXT_BYTES)}). Attach a smaller excerpt.`, 'warning', 4000);
-          continue;
-        }
-        const content = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = reject;
-          reader.readAsText(file);
-        });
-        results.push({ name: file.name, kind: 'text', content, sizeLabel });
-      } else if (file.type.startsWith('audio/') || file.type.startsWith('video/')) {
-        toast(`${file.name}: audio and video files are not supported.`, 'warning', 4000);
-      } else {
-        if (file.size > MAX_BINARY_BYTES) {
-          toast(`${file.name} is too large (max ${fmtBytes(MAX_BINARY_BYTES)}).`, 'warning', 4000);
-          continue;
-        }
-        const base64 = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            const url = reader.result as string;
-            resolve(url.includes(',') ? url.split(',')[1] : url);
-          };
-          reader.onerror = reject;
-          reader.readAsDataURL(file);
-        });
-        try {
-          const savedPath = await invoke<string>('save_attachment', {
-            filename: file.name,
-            dataBase64: base64,
+          const previewUrl = URL.createObjectURL(file);
+          try {
+            const savedPath = await invoke<string>('save_attachment', {
+              filename: file.name,
+              dataBase64: base64,
+            });
+            results.push({ id: attachId, name: file.name, kind: 'image', savedPath, previewUrl, sizeLabel });
+          } catch {
+            // M16: don't leak the object URL when the save fails.
+            URL.revokeObjectURL(previewUrl);
+            toast(`Could not save image: ${file.name}`, 'error', 3000);
+          }
+        } else if (
+          file.type.startsWith('text/') ||
+          /\.(md|txt|py|js|ts|tsx|jsx|json|yaml|yml|toml|sh|bash|zsh|fish|csv|xml|sql|rs|go|java|c|cpp|h|swift|kt|rb|php|html|css|scss|less|env|gitignore|dockerfile)$/i.test(
+            file.name
+          )
+        ) {
+          if (file.size > MAX_TEXT_BYTES) {
+            toast(`${file.name} is too large to inline (max ${fmtBytes(MAX_TEXT_BYTES)}). Attach a smaller excerpt.`, 'warning', 4000);
+            continue;
+          }
+          const content = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsText(file);
           });
-          results.push({ name: file.name, kind: 'binary', savedPath, sizeLabel });
-        } catch {
-          toast(`Could not save attachment: ${file.name}`, 'error', 3000);
+          results.push({ id: attachId, name: file.name, kind: 'text', content, sizeLabel });
+        } else if (file.type.startsWith('audio/') || file.type.startsWith('video/')) {
+          toast(`${file.name}: audio and video files are not supported.`, 'warning', 4000);
+        } else {
+          if (file.size > MAX_BINARY_BYTES) {
+            toast(`${file.name} is too large (max ${fmtBytes(MAX_BINARY_BYTES)}).`, 'warning', 4000);
+            continue;
+          }
+          const base64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              const url = reader.result as string;
+              resolve(url.includes(',') ? url.split(',')[1] : url);
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+          });
+          try {
+            const savedPath = await invoke<string>('save_attachment', {
+              filename: file.name,
+              dataBase64: base64,
+            });
+            results.push({ id: attachId, name: file.name, kind: 'binary', savedPath, sizeLabel });
+          } catch {
+            toast(`Could not save attachment: ${file.name}`, 'error', 3000);
+          }
         }
+      } catch {
+        toast(`Could not read ${file.name}.`, 'error', 3000);
       }
     }
     if (results.length > 0) {
@@ -243,7 +310,7 @@ export function ChatComposer({
       {attachedFiles.length > 0 && (
         <div className="kim-composer__attachments">
           {attachedFiles.map((f, i) => (
-            <div key={i} className="kim-composer__attach-chip">
+            <div key={f.id ?? `${f.name}-${i}`} className="kim-composer__attach-chip">
               {f.kind === 'image' && f.previewUrl ? (
                 <img src={f.previewUrl} alt={f.name} className="kim-composer__attach-thumb" />
               ) : (
@@ -303,6 +370,29 @@ export function ChatComposer({
             }
             rows={1}
             onKeyDown={e => {
+              // Slash-command menu keyboard nav takes priority over submit/newline.
+              if (slashMenuOpen) {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  setSlashActiveIdx(i => (i + 1) % slashMatches.length);
+                  return;
+                }
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  setSlashActiveIdx(i => (i - 1 + slashMatches.length) % slashMatches.length);
+                  return;
+                }
+                if (e.key === 'Enter' || e.key === 'Tab') {
+                  e.preventDefault();
+                  runSlashCommand(slashMatches[activeSlashIdx]);
+                  return;
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setSlashDismissed(true);
+                  return;
+                }
+              }
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 void handleFormSubmit(e as unknown as React.FormEvent);
@@ -310,6 +400,37 @@ export function ChatComposer({
             }}
             className="kim-composer__textarea"
           />
+
+          {slashMenuOpen && (
+            <div
+              className="kim-slash-menu"
+              role="listbox"
+              aria-label="Slash commands"
+              data-testid="slash-menu"
+            >
+              {slashMatches.map((cmd, i) => (
+                <button
+                  type="button"
+                  key={cmd.name}
+                  role="option"
+                  aria-selected={i === activeSlashIdx}
+                  className={
+                    'kim-slash-menu__item' +
+                    (i === activeSlashIdx ? ' kim-slash-menu__item--active' : '')
+                  }
+                  // onMouseDown (not onClick) so the textarea doesn't blur/submit first.
+                  onMouseDown={e => {
+                    e.preventDefault();
+                    runSlashCommand(cmd);
+                  }}
+                  onMouseEnter={() => setSlashActiveIdx(i)}
+                >
+                  <span className="kim-slash-menu__name">{cmd.name}</span>
+                  <span className="kim-slash-menu__hint">{cmd.hint}</span>
+                </button>
+              ))}
+            </div>
+          )}
 
           {heroMode && (
             <div className="kim-composer__left-tools">
@@ -399,6 +520,25 @@ export function ChatComposer({
                 >
                   <path d="M11.5 5.5L6 11a2.5 2.5 0 01-3.5-3.5L8 2a1.5 1.5 0 012 2L4.5 9.5a.5.5 0 00.7.7L10 5.5" />
                 </svg>
+              </button>
+            )}
+            {/* M1: mid-run steering — sends the drafted text to the RUNNING
+                agent (steer_task) instead of queuing it as the next task. */}
+            {isRunning && !cancelling && onSteer && taskInput.trim() && (
+              <button
+                type="button"
+                className="kim-btn"
+                title="Steer the running task with this message (Send queues it as the next task instead)"
+                aria-label="Steer the running task"
+                onClick={() => {
+                  const text = taskInput.trim();
+                  if (!text) return;
+                  onSteer(text);
+                  setTaskInput('');
+                  if (textareaRef.current) textareaRef.current.style.height = 'auto';
+                }}
+              >
+                Steer
               </button>
             )}
             {isRunning && !cancelling && (

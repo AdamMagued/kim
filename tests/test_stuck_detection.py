@@ -155,3 +155,61 @@ def test_pixel_diff_threshold_kwarg_respected():
 
     # explicit threshold=1 same result → similar
     assert signatures_similar(a, b, pixel_diff_threshold=1) is True
+
+
+# ---------------------------------------------------------------------------
+# Agent-level: take_annotated_screenshot must feed the same perceptual-stuck
+# history as take_screenshot (finding 1). Previously only the take_screenshot
+# branch of KimAgent._store_screenshot_result called _is_stuck()/appended to
+# _screenshot_hashes; three identical annotated screenshots in a row silently
+# never tripped STUCK.
+# ---------------------------------------------------------------------------
+
+import json
+
+from conftest import make_test_agent
+from orchestrator.agent_states import AgentTermination
+
+
+def test_three_identical_annotated_screenshots_trip_stuck():
+    agent = make_test_agent()
+    agent._run_iteration = 4  # iteration > 3 guard
+
+    ann_result = json.dumps({
+        "image": _TINY_PNG_B64,
+        "grid": {"a1": [10, 10]},
+        "instructions": "tap a marker",
+        "screen_width": 100,
+        "screen_height": 100,
+    })
+
+    r1 = agent._store_screenshot_result("take_annotated_screenshot", ann_result)
+    r2 = agent._store_screenshot_result("take_annotated_screenshot", ann_result)
+    r3 = agent._store_screenshot_result("take_annotated_screenshot", ann_result)
+
+    assert r1 is None
+    assert r2 is None
+    assert r3 is not None
+    assert r3["termination"] == AgentTermination.STUCK.value
+    # The annotated-screenshot branch must be appending to the SAME history
+    # list the take_screenshot branch uses.
+    assert len(agent._screenshot_hashes) == 3
+
+
+def test_annotated_and_plain_screenshot_share_stuck_history():
+    """A mix of take_screenshot / take_annotated_screenshot calls with the
+    same visual content must still trip STUCK — proving both tool variants
+    write into the same _screenshot_hashes list rather than separate ones."""
+    agent = make_test_agent()
+    agent._run_iteration = 4
+
+    ann_result = json.dumps({"image": _TINY_PNG_B64, "grid": {}, "instructions": ""})
+
+    r1 = agent._store_screenshot_result("take_screenshot", _TINY_PNG_B64)
+    r2 = agent._store_screenshot_result("take_annotated_screenshot", ann_result)
+    r3 = agent._store_screenshot_result("take_screenshot", _TINY_PNG_B64)
+
+    assert r1 is None
+    assert r2 is None
+    assert r3 is not None
+    assert r3["termination"] == AgentTermination.STUCK.value

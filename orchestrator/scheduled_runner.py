@@ -35,6 +35,7 @@ import contextlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -175,9 +176,66 @@ def _pid_exists(pid: int) -> bool:
             return False
 
 
+def _kill_process_tree(pid: int) -> None:
+    """Kill a runaway scheduled agent AND its descendants (finding 5.1).
+
+    A bare os.kill(pid, 9) reaps only the agent, orphaning the MCP server,
+    controlled browser, and any shell-tool subprocesses it spawned — the reaper
+    that exists to stop runaways would leave untracked runaways behind. Agents
+    are spawned as session leaders (start_new_session=True), so on POSIX the
+    whole process group can be killed at once. The group kill is used ONLY when
+    the target is confirmed to be its own group leader (pgid == pid); otherwise
+    a group kill could reach the runner/app's own group, so fall back to a
+    single-process kill.
+    """
+    if sys.platform == "win32":
+        # taskkill /T terminates the whole tree; fall back to a plain kill.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=10, check=False,
+            )
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+        return
+
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return  # already gone
+    if pgid == pid:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)
+
+
 # ---------------------------------------------------------------------------
 # PID registry for orphan reaping
 # ---------------------------------------------------------------------------
+
+def _boot_ref() -> int:
+    """A cheap, portable per-boot identity.
+
+    ``time.time() - time.monotonic()`` is the wall-clock instant the
+    system-wide monotonic clock was zeroed — stable across processes within a
+    boot session and shifted by the downtime across a reboot. Used to detect
+    PID reuse across reboots (M6): a registry entry whose boot ref does not
+    match the current one predates this boot, so its PID may now belong to an
+    innocent process and must never be SIGKILLed.
+    """
+    return round(time.time() - time.monotonic())
+
+
+# Allow small NTP/monotonic drift when comparing boot refs (seconds).
+_BOOT_REF_TOLERANCE = 5
+
 
 def _pid_registry_path(kim_root: Path) -> Path:
     return kim_root / "logs" / "scheduled_runs" / ".running_pids.json"
@@ -227,6 +285,7 @@ def _write_pid_registry_atomic(reg_path: Path, data: list) -> None:
     tmp_fd, tmp_name = tempfile.mkstemp(dir=reg_path.parent, prefix=".pids_tmp")
     try:
         os.write(tmp_fd, text)
+        os.fsync(tmp_fd)  # durable before the atomic rename (finding 4.3)
         os.close(tmp_fd)
         os.replace(tmp_name, str(reg_path))
     except OSError:
@@ -259,20 +318,27 @@ def _reap_stale_agents(
                 return
 
             now_ts = time.time()
+            current_boot = _boot_ref()
             surviving = []
             for entry in entries:
                 pid = entry.get("pid")
                 if pid is None:
+                    continue
+                # M6: an entry from a previous boot cannot be trusted — the OS
+                # may have reused its PID for an unrelated process. Drop it
+                # without killing. Entries predating this fix (no boot_ref)
+                # are also treated as unverifiable and never killed.
+                entry_boot = entry.get("boot_ref")
+                if entry_boot is None or abs(int(entry_boot) - current_boot) > _BOOT_REF_TOLERANCE:
                     continue
                 started = entry.get("started_at", now_ts)
                 elapsed = now_ts - started
                 if not _pid_exists(pid):
                     continue  # already exited — drop from registry
                 if elapsed > timeout_seconds:
-                    try:
-                        os.kill(pid, 9)
-                    except OSError:
-                        pass
+                    # Kill the whole process group so orphaned children (MCP
+                    # server, browser, shell subprocesses) go with it (5.1).
+                    _kill_process_tree(pid)
                     # drop from registry after kill (do not append to surviving)
                 else:
                     surviving.append(entry)
@@ -302,7 +368,12 @@ def _register_agent_pid(kim_root: Path, task_id: str, pid: int) -> None:
                 )
             except (OSError, ValueError):
                 existing = []
-            existing.append({"task_id": task_id, "pid": int(pid), "started_at": time.time()})
+            existing.append({
+                "task_id": task_id,
+                "pid": int(pid),
+                "started_at": time.time(),
+                "boot_ref": _boot_ref(),  # M6: guards against reboot PID reuse
+            })
             try:
                 _write_pid_registry_atomic(reg_path, existing)
             except (OSError, TypeError, ValueError):
@@ -405,6 +476,15 @@ def run_next_due_task(
     # for new work.
     _reap_stale_agents(kim_root)
 
+    # Prune old logs from scheduled_runs/ (F-J-1)
+    try:
+        apply_scheduled_log_retention(kim_root)
+    except Exception as e:
+        import logging
+        logging.getLogger("scheduled_runner").warning(
+            f"Failed to apply log retention for scheduled runs: {e}"
+        )
+
     # ------------------------------------------------------------------
     # Atomic section: hold the cross-process runner lock across the entire
     # due-check → provider-filter → preflight → Popen → record_run sequence.
@@ -485,6 +565,14 @@ def run_next_due_task(
             # Spawn the agent.  Popen is non-blocking (fork+exec returns
             # immediately; the child runs asynchronously), so the lock is
             # held for only a brief moment here.
+            # Spawn as a session/process-group leader so the reaper can later
+            # kill the agent AND its descendants as a group (finding 5.1). On
+            # POSIX this makes pgid == pid; on Windows a new process group.
+            _group_kwargs: dict = {}
+            if sys.platform == "win32":
+                _group_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                _group_kwargs["start_new_session"] = True
             try:
                 proc = subprocess.Popen(
                     args,
@@ -492,6 +580,7 @@ def run_next_due_task(
                     env=env,
                     stdout=log_fh,
                     stderr=log_fh,
+                    **_group_kwargs,
                 )
             except OSError as exc:
                 log_fh.close()
@@ -515,6 +604,13 @@ def run_next_due_task(
             try:
                 recorded = store.record_run(task.id, ran_at=as_of)
             except TimeoutError as exc:
+                # M7: the agent is already spawned (launched=True). Register its
+                # PID before this early return so the reaper can still enforce
+                # the wall-clock timeout — otherwise the child runs unreaped and
+                # (next_run_at not advanced) the same task is due again next
+                # tick → a duplicate agent.
+                if proc is not None:
+                    _register_agent_pid(kim_root, task.id, int(proc.pid))
                 result.error = f"record_run failed: {exc}"
                 return result
             result.recorded = recorded is not None
@@ -545,6 +641,9 @@ def _build_subprocess_env(kim_root: Path) -> dict:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(kim_root)
     env["PROJECT_ROOT"] = str(kim_root)
+    # F-J-6: tell the detached agent its wall-clock cap so it can self-terminate
+    # even while the app (and the external reap_orphaned_agents reaper) is closed.
+    env["KIM_AGENT_MAX_WALL_SECONDS"] = str(int(_AGENT_MAX_WALL_SECONDS))
     return env
 
 
@@ -557,3 +656,30 @@ def _make_run_log_path(kim_root: Path, task_id: str) -> Path:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     safe_id = re.sub(r"[^\w-]", "_", task_id)
     return kim_root / "logs" / "scheduled_runs" / f"{safe_id}_{ts}.log"
+
+
+def apply_scheduled_log_retention(kim_root: Path, keep_days: int = 7) -> int:
+    """Delete log files in logs/scheduled_runs/ older than keep_days."""
+    from datetime import timedelta
+    deleted = 0
+    log_dir = kim_root / "logs" / "scheduled_runs"
+    if not log_dir.exists():
+        return 0
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=keep_days)
+    for f in log_dir.glob("*.log"):
+        stem = f.stem
+        parts = stem.split("_")
+        if not parts:
+            continue
+        ts = parts[-1]
+        # ts must be 16 chars: YYYYMMDDTHHMMSSZ
+        if len(ts) == 16 and ts.endswith("Z") and "T" in ts:
+            try:
+                date_str = ts[:8] # YYYYMMDD
+                file_date = datetime.strptime(date_str, "%Y%m%d").date()
+                if file_date < cutoff:
+                    f.unlink()
+                    deleted += 1
+            except (ValueError, OSError):
+                continue
+    return deleted

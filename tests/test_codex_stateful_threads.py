@@ -44,10 +44,15 @@ class _RecordingProvider:
         self._i = 0
         self.calls = []
         self.continuation_marks = 0
+        self.fresh_chat_starts = 0
         self._sent_system_prompt = True
 
     def mark_thread_continuation(self):
         self.continuation_marks += 1
+
+    async def start_fresh_chat(self):
+        self.fresh_chat_starts += 1
+        return True
 
     async def complete(self, messages, tools, system, **kwargs):
         self.calls.append({"messages": messages, "kwargs": kwargs})
@@ -122,6 +127,97 @@ class TestThreadStateSidecar(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{ not json", encoding="utf-8")
         self.assertEqual(ts.load_thread_state("/proj/a", "browser:gemini"), {})
+
+
+# ---------------------------------------------------------------------------
+# thread_state.py — cross-process locking (#7)
+# ---------------------------------------------------------------------------
+
+class TestThreadStateLocking(unittest.TestCase):
+    """A caller doing load -> mutate -> save must not lose an update to a
+    concurrent load -> mutate -> save for the SAME (cwd, provider) sidecar."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self._patch = patch.object(ts, "_STATE_DIR", Path(self._tmp.name))
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def test_lock_is_reentrant_within_one_thread(self):
+        # load_thread_state()/save_thread_state() take the same lock
+        # internally; nesting them inside an outer thread_state_lock() must
+        # not self-deadlock. Run on a background thread with a hard timeout
+        # so a regression fails the test instead of hanging the suite.
+        import threading as _threading
+
+        finished = _threading.Event()
+        error: list[BaseException] = []
+
+        def _run():
+            try:
+                with ts.thread_state_lock("/proj/reentrant", "browser:gemini"):
+                    state = ts.load_thread_state("/proj/reentrant", "browser:gemini")
+                    state["turns"] = state.get("turns", 0) + 1
+                    ts.save_thread_state("/proj/reentrant", "browser:gemini", state)
+            except BaseException as e:  # noqa: BLE001 — surfaced via `error`
+                error.append(e)
+            finally:
+                finished.set()
+
+        t = _threading.Thread(target=_run, daemon=True)
+        t.start()
+        completed = finished.wait(timeout=5.0)
+        self.assertTrue(completed, "reentrant lock acquisition deadlocked")
+        self.assertEqual(error, [])
+        self.assertEqual(
+            ts.load_thread_state("/proj/reentrant", "browser:gemini")["turns"], 1
+        )
+
+    def test_concurrent_increments_under_lock_do_not_lose_updates(self):
+        import threading as _threading
+
+        cwd, provider = "/proj/concurrent", "browser:gemini"
+        ts.save_thread_state(cwd, provider, {"turns": 0})
+
+        iterations = 25
+        n_threads = 4
+        errors: list[BaseException] = []
+
+        def _worker():
+            try:
+                for _ in range(iterations):
+                    with ts.thread_state_lock(cwd, provider):
+                        state = ts.load_thread_state(cwd, provider)
+                        state["turns"] = state.get("turns", 0) + 1
+                        ts.save_thread_state(cwd, provider, state)
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [_threading.Thread(target=_worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30.0)
+            self.assertFalse(t.is_alive(), "worker thread did not finish — possible deadlock")
+
+        self.assertEqual(errors, [])
+        final = ts.load_thread_state(cwd, provider)
+        self.assertEqual(
+            final["turns"],
+            n_threads * iterations,
+            "a concurrent load-modify-save cycle lost an update",
+        )
+
+    def test_unlocked_standalone_calls_remain_unaffected(self):
+        # Callers that don't use thread_state_lock() still get plain,
+        # working load/save (each self-locks around its own operation).
+        ts.save_thread_state("/proj/plain", "browser:gemini", {"turns": 5})
+        self.assertEqual(
+            ts.load_thread_state("/proj/plain", "browser:gemini")["turns"], 5
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +346,7 @@ class TestCompactBrowserThread(unittest.IsolatedAsyncioTestCase):
         self.assertIn("wire the login route", handoff)
         # Delta-only compact: it must not re-inject the system prompt.
         self.assertEqual(provider.continuation_marks, 1)
+        self.assertEqual(provider.fresh_chat_starts, 1)
         # State reset with the handoff carried for the next fresh chat.
         saved = ts.load_thread_state("/proj/a", "browser:gemini")
         self.assertFalse(saved["sent_instructions"])
@@ -282,6 +379,45 @@ class TestCompactBrowserThread(unittest.IsolatedAsyncioTestCase):
         # Even on failure the thread is reset so the next task starts clean.
         saved = ts.load_thread_state("/proj/a", "browser:gemini")
         self.assertIsNone(saved["handoff"])
+
+    async def test_compact_reset_is_owned_by_the_current_cli_session(self):
+        # /compact writes a reset sidecar carrying the handoff. Without an
+        # owner stamp, the very next task in the SAME session would treat the
+        # sidecar as foreign (new stricter _cli_session_changed) and drop the
+        # handoff — while a sidecar left unowned was ALSO the bug that let a
+        # brand-new session resurrect it. Stamping at compact time gives both:
+        # same-session continuity, zero context for a new session.
+        from orchestrator import codex_bridge_service as svc
+
+        provider = _RecordingProvider(
+            [{"type": "text", "content": json.dumps({"summary": "did things"})}]
+        )
+        with patch.dict(os.environ, {"KIM_CLI_SESSION_ID": "sess-live"}):
+            ok, _ = await svc._compact_browser_thread(provider, "/proj/a", "browser:chatgpt")
+
+        self.assertTrue(ok)
+        saved = ts.load_thread_state("/proj/a", "browser:chatgpt")
+        self.assertEqual(saved.get("cli_session"), "sess-live")
+        self.assertIn(saved.get("sandbox"), ("default", "bypass"))
+        # Same session → not changed; a NEW session (fresh `kim` launch) → changed.
+        self.assertFalse(svc._cli_session_changed(saved, "sess-live"))
+        self.assertTrue(svc._cli_session_changed(saved, "sess-next-launch"))
+
+    async def test_compact_reset_without_session_env_stays_unowned(self):
+        from orchestrator import codex_bridge_service as svc
+
+        provider = _RecordingProvider(
+            [{"type": "text", "content": json.dumps({"summary": "desktop compact"})}]
+        )
+        env = {k: v for k, v in os.environ.items() if k != "KIM_CLI_SESSION_ID"}
+        with patch.dict(os.environ, env, clear=True):
+            await svc._compact_browser_thread(provider, "/proj/b", "browser:chatgpt")
+
+        saved = ts.load_thread_state("/proj/b", "browser:chatgpt")
+        # Desktop compacts stay session-less (desktop sets no session id)…
+        self.assertNotIn("cli_session", saved)
+        # …which means any CLI session later starts it fresh, with no handoff.
+        self.assertTrue(svc._cli_session_changed(saved, "some-cli-session"))
 
 
 # ---------------------------------------------------------------------------
@@ -550,11 +686,23 @@ class TestCliSessionChanged(unittest.TestCase):
         # falsely resets a shared thread.
         self.assertFalse(svc._cli_session_changed({"cli_session": "sess-x"}, ""))
 
-    def test_legacy_sidecar_without_session_does_not_reset(self):
+    def test_unowned_sidecar_counts_as_changed_for_a_cli_session(self):
         from orchestrator import codex_bridge_service as svc
 
-        # A sidecar from before this field existed: reuse once, then record.
-        self.assertFalse(svc._cli_session_changed({"sent_instructions": True}, "sess-new"))
+        # The fresh-chat-resurrects-old-context bug: a sidecar with no
+        # cli_session (desktop-written or legacy) must NOT be resumed by a new
+        # CLI session — a new `kim` launch is a new chat with zero context.
+        # Previously this returned False, which routed the run into the
+        # sandbox-change branch, compacted the OLD browser chat, and seeded its
+        # summary into what the user rightly expected to be a fresh session.
+        self.assertTrue(svc._cli_session_changed({"sent_instructions": True}, "sess-new"))
+
+    def test_empty_stored_session_counts_as_changed(self):
+        from orchestrator import codex_bridge_service as svc
+
+        self.assertTrue(
+            svc._cli_session_changed({"sent_instructions": True, "cli_session": ""}, "sess-new")
+        )
 
 
 class TestThreadSandboxChanged(unittest.TestCase):
@@ -1146,15 +1294,17 @@ class TestRepeatedCommandLoopGuard(unittest.IsolatedAsyncioTestCase):
     async def test_format_reminder_appended_to_chatgpt_first_relay(self):
         from codex_engine.engine import _CodexProxy
 
-        # ChatGPT weighs the END of the prompt — turn 1 ignored the terminal
-        # rules buried above codex's schemas ("save this as game.html" prose).
+        # ChatGPT weighs the END of the prompt, so repeat the parser's JSON
+        # contract there without introducing a competing terminal protocol.
         provider = _RecordingProvider([{"type": "text", "content": "DONE"}])
         proxy = _CodexProxy(
             provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
         )
         await proxy._handle_responses(self._request(proxy, 1))
         sent = provider.calls[0]["messages"][0]["content"]
-        self.assertTrue(sent.rstrip().endswith("never paste code for me to save myself.)"))
+        self.assertIn("FORMAT REMINDER", sent)
+        self.assertIn('"tool_calls"', sent)
+        self.assertTrue(sent.rstrip().endswith("prose outside JSON.)"))
 
     async def test_format_reminder_not_appended_for_gemini(self):
         from codex_engine.engine import _CodexProxy
@@ -1421,9 +1571,9 @@ class TestDoneReply(unittest.TestCase):
         self.assertFalse(_is_done_reply("Done, but first run this:"))
 
 
-class TestChatgptTerminalNudge(unittest.IsolatedAsyncioTestCase):
-    async def test_chatgpt_gets_terminal_nudge_not_json_nudge(self):
-        from codex_engine.engine import _CodexProxy, _TERMINAL_NUDGE
+class TestChatgptContractNudge(unittest.IsolatedAsyncioTestCase):
+    async def test_chatgpt_gets_same_json_nudge_as_parser_contract(self):
+        from codex_engine.engine import _CodexProxy, _CONTRACT_NUDGE
 
         provider = _RecordingProvider([{"type": "text", "content": "still just chatting"}])
         proxy = _CodexProxy(
@@ -1432,7 +1582,7 @@ class TestChatgptTerminalNudge(unittest.IsolatedAsyncioTestCase):
         original = {"type": "text", "content": "Here's how you'd do it, in theory."}
         await proxy._nudge_contract_retry(original, relay_num=1)
         self.assertEqual(len(provider.calls), 1)
-        self.assertEqual(provider.calls[0]["messages"][0]["content"], _TERMINAL_NUDGE)
+        self.assertEqual(provider.calls[0]["messages"][0]["content"], _CONTRACT_NUDGE)
 
     async def test_gemini_still_gets_json_nudge(self):
         from codex_engine.engine import _CodexProxy, _CONTRACT_NUDGE
@@ -1550,6 +1700,35 @@ class TestNormalizeToolCalls(unittest.TestCase):
         call = next(o for o in reply["output"] if o["type"] == "function_call")
         self.assertEqual(call["name"], "exec_command")
         self.assertIn("touch pong.html", call["arguments"])
+
+    def test_validation_failure_raises_validation_error(self):
+        from codex_engine.engine import _normalize_tool_calls
+        import jsonschema
+
+        # update_plan requires "plan"
+        calls = [{"name": "update_plan", "input": {"wrong_key": "some_value"}}]
+        with self.assertRaises(jsonschema.ValidationError):
+            _normalize_tool_calls(calls, _CODEX_TOOLS)
+
+    def test_custom_command_parameter_key_mapping(self):
+        from codex_engine.engine import _normalize_tool_calls
+
+        custom_tools = [
+            {
+                "type": "function",
+                "name": "custom_exec",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"script": {"type": "string"}},
+                    "required": ["script"],
+                },
+            }
+        ]
+        
+        # Custom exec tool wants "script". Model sent "command". We expect it to be renamed to "script".
+        calls = [{"name": "custom_exec", "input": {"command": "python test.py"}}]
+        out = _normalize_tool_calls(calls, custom_tools)
+        self.assertEqual(out[0]["input"], {"script": "python test.py"})
 
 
 # ---------------------------------------------------------------------------

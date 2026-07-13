@@ -33,8 +33,25 @@ def load_config(path: Optional[str] = None) -> dict:
     if not cfg_path.exists():
         logger.warning(f"config.yaml not found at {cfg_path}, using defaults")
         return {}
-    with open(cfg_path) as f:
-        return yaml.safe_load(f) or {}
+    # A malformed or non-mapping config.yaml must degrade to defaults rather
+    # than crash the orchestrator at startup (finding 1.3). The Rust loader
+    # (desktop/src-tauri/src/config.rs) already does this, so the app shell
+    # boots fine while every Python task instantly fails — this closes that gap.
+    try:
+        with open(cfg_path) as f:
+            data = yaml.safe_load(f)
+    except (yaml.YAMLError, OSError) as exc:
+        logger.warning("Failed to parse %s (%s); using defaults.", cfg_path, exc)
+        return {}
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        logger.warning(
+            "%s top-level is %s (expected a mapping); using defaults.",
+            cfg_path, type(data).__name__,
+        )
+        return {}
+    return data
 
 
 def _resolve_hitl_threshold(config: dict, env_val: Optional[str] = None) -> Optional[str]:

@@ -18,7 +18,15 @@ import re
 import urllib.parse
 import webbrowser
 
-from mcp_server.os_utils import CURRENT_OS, IS_WINDOWS, IS_MACOS, IS_LINUX, check_tool_available
+from mcp_server.os_utils import (
+    CURRENT_OS,
+    IS_WINDOWS,
+    IS_MACOS,
+    IS_LINUX,
+    check_tool_available,
+    minimal_subprocess_env,
+)
+from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +69,7 @@ async def _focus_window_win(title: str) -> str:
     import pygetwindow as gw
     matches = gw.getWindowsWithTitle(title)  # type: ignore[attr-defined]  # Windows-only pygetwindow API
     if not matches:
-        return f"ERROR: No window found with title containing '{title}'"
+        return tool_error(f"No window found with title containing '{title}'")
     win = matches[0]
     if win.isMinimized:
         win.restore()
@@ -73,7 +81,7 @@ async def _resize_window_win(title: str, x: int, y: int, width: int, height: int
     import pygetwindow as gw
     matches = gw.getWindowsWithTitle(title)  # type: ignore[attr-defined]  # Windows-only pygetwindow API
     if not matches:
-        return f"ERROR: No window found with title containing '{title}'"
+        return tool_error(f"No window found with title containing '{title}'")
     win = matches[0]
     if win.isMinimized:
         win.restore()
@@ -92,6 +100,7 @@ async def _run_osascript(script: str) -> tuple[int, str, str]:
         "osascript", "-e", script,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=minimal_subprocess_env(),  # S4: no parent-env inherit
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
@@ -109,30 +118,41 @@ async def _run_osascript(script: str) -> tuple[int, str, str]:
     )
 
 
+# AppleScript: list all application windows with names, positions, sizes.
+# Per-window visibility is queried via the AXMinimized attribute (2.4) instead
+# of hardcoding visible=true for every window: a minimized window must not be
+# reported as visible, or the LLM believes content is on screen when it isn't.
+_MAC_LIST_WINDOWS_SCRIPT = '''
+    set output to ""
+    tell application "System Events"
+        set allProcs to (every process whose visible is true)
+        repeat with proc in allProcs
+            set procName to name of proc
+            try
+                set wins to every window of proc
+                repeat with w in wins
+                    set winName to name of w
+                    set {posX, posY} to position of w
+                    set {sizeW, sizeH} to size of w
+                    set visFlag to "true"
+                    try
+                        if (value of attribute "AXMinimized" of w) is true then
+                            set visFlag to "false"
+                        end if
+                    end try
+                    set output to output & "title=" & quoted form of (procName & " - " & winName) & "  pos=(" & posX & "," & posY & ")  size=(" & sizeW & "x" & sizeH & ")  visible=" & visFlag & linefeed
+                end repeat
+            end try
+        end repeat
+    end tell
+    return output
+'''
+
+
 async def _get_windows_mac() -> str:
-    # AppleScript: list all application windows with names, positions, sizes
-    script = '''
-        set output to ""
-        tell application "System Events"
-            set allProcs to (every process whose visible is true)
-            repeat with proc in allProcs
-                set procName to name of proc
-                try
-                    set wins to every window of proc
-                    repeat with w in wins
-                        set winName to name of w
-                        set {posX, posY} to position of w
-                        set {sizeW, sizeH} to size of w
-                        set output to output & "title=" & quoted form of (procName & " - " & winName) & "  pos=(" & posX & "," & posY & ")  size=(" & sizeW & "x" & sizeH & ")  visible=true" & linefeed
-                    end repeat
-                end try
-            end repeat
-        end tell
-        return output
-    '''
-    exit_code, out, err = await _run_osascript(script)
+    exit_code, out, err = await _run_osascript(_MAC_LIST_WINDOWS_SCRIPT)
     if exit_code != 0:
-        return f"ERROR: osascript failed: {err}"
+        return tool_error(f"osascript failed: {err}")
     return out if out.strip() else "No windows found"
 
 
@@ -140,7 +160,7 @@ async def _focus_window_mac(title: str) -> str:
     try:
         safe_title = _applescript_quote(title)
     except ValueError as e:
-        return f"ERROR: {e}"
+        return tool_error(e)
     # Use AppleScript 'contains' with safely escaped string
     script = f'''
         tell application "System Events"
@@ -160,7 +180,7 @@ async def _focus_window_mac(title: str) -> str:
     '''
     exit_code, out, err = await _run_osascript(script)
     if exit_code != 0:
-        return f"ERROR: osascript failed: {err}"
+        return tool_error(f"osascript failed: {err}")
     return out
 
 
@@ -168,7 +188,7 @@ async def _resize_window_mac(title: str, x: int, y: int, width: int, height: int
     try:
         safe_title = _applescript_quote(title)
     except ValueError as e:
-        return f"ERROR: {e}"
+        return tool_error(e)
     script = f'''
         tell application "System Events"
             set allProcs to (every process whose visible is true)
@@ -188,7 +208,7 @@ async def _resize_window_mac(title: str, x: int, y: int, width: int, height: int
     '''
     exit_code, out, err = await _run_osascript(script)
     if exit_code != 0:
-        return f"ERROR: osascript failed: {err}"
+        return tool_error(f"osascript failed: {err}")
     return out
 
 
@@ -202,6 +222,7 @@ async def _run_cmd(cmd: list[str]) -> tuple[int, str, str]:
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=minimal_subprocess_env(),  # S4: no parent-env inherit
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
@@ -230,7 +251,7 @@ async def _get_windows_linux() -> str:
 
     exit_code, out, err = await _run_cmd(["wmctrl", "-l", "-G"])
     if exit_code != 0:
-        return f"ERROR: wmctrl failed: {err}"
+        return tool_error(f"wmctrl failed: {err}")
 
     lines = []
     for line in out.splitlines():
@@ -239,8 +260,11 @@ async def _get_windows_linux() -> str:
         parts = line.split(None, 7)
         if len(parts) >= 8:
             wid, desktop, x, y, w, h, host, title = parts
+            # 2.4: wmctrl -l cannot distinguish minimized/hidden windows, so
+            # do NOT fabricate visible=true — report the honest unknown.
             lines.append(
-                f"title={title!r:50s}  pos=({x},{y})  size=({w}x{h})  visible=true"
+                f"title={title!r:50s}  pos=({x},{y})  size=({w}x{h})  "
+                f"desktop={desktop}  visible=unknown"
             )
     return "\n".join(lines) if lines else "No windows found"
 
@@ -251,14 +275,14 @@ async def _focus_window_linux(title: str) -> str:
         exit_code, out, err = await _run_cmd(["wmctrl", "-a", title])
         if exit_code == 0:
             return f"Focused window matching: '{title}'"
-        return f"ERROR: wmctrl could not find window matching '{title}': {err}"
+        return tool_error(f"wmctrl could not find window matching '{title}': {err}")
 
     if check_tool_available("xdotool"):
         exit_code, wid, err = await _run_cmd(
             ["xdotool", "search", "--name", title]
         )
         if exit_code != 0 or not wid.strip():
-            return f"ERROR: xdotool could not find window matching '{title}': {err}"
+            return tool_error(f"xdotool could not find window matching '{title}': {err}")
         # Take the first matching window ID
         first_wid = wid.strip().splitlines()[0]
         exit_code2, _, err2 = await _run_cmd(
@@ -266,7 +290,7 @@ async def _focus_window_linux(title: str) -> str:
         )
         if exit_code2 == 0:
             return f"Focused window ID {first_wid} matching: '{title}'"
-        return f"ERROR: xdotool windowactivate failed: {err2}"
+        return tool_error(f"xdotool windowactivate failed: {err2}")
 
     return (
         "OS_LIMITATION: Neither 'wmctrl' nor 'xdotool' is installed on this "
@@ -284,7 +308,7 @@ async def _resize_window_linux(title: str, x: int, y: int, width: int, height: i
         )
         if exit_code == 0:
             return f"Resized window '{title}' to ({x},{y}) {width}x{height}"
-        return f"ERROR: wmctrl resize failed: {err}"
+        return tool_error(f"wmctrl resize failed: {err}")
 
     if check_tool_available("xdotool"):
         # Find the window first
@@ -292,7 +316,7 @@ async def _resize_window_linux(title: str, x: int, y: int, width: int, height: i
             ["xdotool", "search", "--name", title]
         )
         if exit_code != 0 or not wid.strip():
-            return f"ERROR: xdotool could not find window matching '{title}': {err}"
+            return tool_error(f"xdotool could not find window matching '{title}': {err}")
         first_wid = wid.strip().splitlines()[0]
 
         # Move and resize
@@ -304,7 +328,7 @@ async def _resize_window_linux(title: str, x: int, y: int, width: int, height: i
         )
         if exit_code2 == 0 and exit_code3 == 0:
             return f"Resized window '{title}' (ID {first_wid}) to ({x},{y}) {width}x{height}"
-        return f"ERROR: xdotool move/resize failed: {err2 or err3}"
+        return tool_error(f"xdotool move/resize failed: {err2 or err3}")
 
     return (
         "OS_LIMITATION: Neither 'wmctrl' nor 'xdotool' is installed on this "
@@ -338,7 +362,7 @@ async def handle_get_windows(args: dict) -> str:
         )
     except Exception as e:
         logger.error(f"get_windows failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_focus_window(args: dict) -> str:
@@ -361,7 +385,7 @@ async def handle_focus_window(args: dict) -> str:
         )
     except Exception as e:
         logger.error(f"focus_window failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_resize_window(args: dict) -> str:
@@ -388,18 +412,54 @@ async def handle_resize_window(args: dict) -> str:
         )
     except Exception as e:
         logger.error(f"resize_window failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
+
+
+async def _open_url_linux(url: str) -> str:
+    """Open a URL on Linux via xdg-open with a real exit-code check (1.5).
+
+    webbrowser.open() on Linux can silently fail (returns True even when the
+    spawned handler dies, e.g. headless or stripped env), so shell out to
+    xdg-open directly and surface a non-zero exit.
+    """
+    if not check_tool_available("xdg-open"):
+        # Fall back to webbrowser, but check its return value.
+        if webbrowser.open(url):
+            return f"Opened URL in default browser: {url}"
+        return tool_error(
+            "Could not open URL: 'xdg-open' is not installed and no "
+            "usable browser was found (headless session?)."
+        )
+    try:
+        exit_code, out, err = await _run_cmd(["xdg-open", url])
+    except (asyncio.TimeoutError, TimeoutError):
+        # Some handlers keep xdg-open in the foreground; a timeout here means
+        # the handler was launched and is still running — not a failure.
+        return f"Opened URL (handler still running after 10s): {url}"
+    if exit_code != 0:
+        return tool_error(
+            f"xdg-open exited with code {exit_code} for {url}: "
+            f"{err or out or 'no browser/handler available (headless session?)'}"
+        )
+    return f"Opened URL in default browser: {url}"
 
 
 async def handle_open_url(args: dict) -> str:
     url = str(args["url"])
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
-        return f"ERROR: URL scheme '{parsed.scheme}' is not allowed; only http and https are permitted"
+        return tool_error(f"URL scheme '{parsed.scheme}' is not allowed; only http and https are permitted")
     try:
-        webbrowser.open(url)
+        if IS_LINUX:
+            result = await _open_url_linux(url)
+            logger.info(f"open_url [{CURRENT_OS}]: {result}")
+            return result
+        # webbrowser.open returns False when no browser could be launched —
+        # report that instead of claiming success (1.5).
+        if not webbrowser.open(url):
+            return tool_error(f"No usable browser found to open {url}")
         logger.info(f"open_url: {url}")
         return f"Opened URL in default browser: {url}"
     except Exception as e:
         logger.error(f"open_url failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)

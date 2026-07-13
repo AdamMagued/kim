@@ -26,6 +26,38 @@ TOOL = "kim:tool"
 ANSWER = "kim:answer"
 DIFF = "kim:diff"
 ACTIVITY = "kim:activity"
+COMMAND_APPROVAL_REQUEST = "kim:command-approval-request"
+FILE_CHANGE_APPROVAL_REQUEST = "kim:file-change-approval-request"
+USER_INPUT_REQUEST = "kim:user-input-request"
+COMMAND_OUTPUT = "kim:command-output"
+ASSISTANT_DELTA = "kim:assistant-delta"
+REASONING_DELTA = "kim:reasoning-delta"
+PLAN_UPDATE = "kim:plan-update"
+DIFF_UPDATE = "kim:diff-update"
+TOKEN_USAGE = "kim:token-usage"
+ITEM_LIFECYCLE = "kim:item-lifecycle"
+TURN_LIFECYCLE = "kim:turn-lifecycle"
+AGENT_DONE = "kim:agent-done"
+AGENT_CANCELLED = "kim:agent-cancelled"
+AGENT_ERROR = "kim:agent-error"
+
+# K5: named bracket-tag constants — the single source of truth for the
+# text-protocol vocabulary. Emitters (codex_engine, codex_bridge_service)
+# must reference these instead of re-typing the literals.
+LOG_TAG_STATUS = "[STATUS]"
+LOG_TAG_PLAN = "[PLAN]"
+LOG_TAG_STEP = "[STEP]"
+LOG_TAG_DONE = "[DONE]"
+LOG_TAG_CONTEXT = "[CONTEXT]"
+LOG_TAG_STATS = "[STATS]"
+LOG_TAG_TOOL = "[TOOL]"
+LOG_TAG_ANSWER = "[ANSWER]"
+LOG_TAG_DIFF = "[DIFF]"
+LOG_TAG_SUCCESS = "[SUCCESS]"
+LOG_TAG_FAILED = "[FAILED]"
+LOG_TAG_ERROR = "[ERROR]"
+LOG_TAG_TASK_COMPLETE = "TASK_COMPLETE:"
+LOG_TAG_NEED_HELP = "NEED_HELP:"
 
 LEGACY_LOG_TAGS = {
     "[STATUS]": {"tag":"[STATUS]","event":"kim:status"},
@@ -46,7 +78,19 @@ LEGACY_LOG_TAGS = {
 
 
 def emit_event(event_type: str, **payload: Any) -> None:
-    line = json.dumps({"type": event_type, **payload}, separators=(",", ":"), ensure_ascii=False)
+    # Stamp the run-identity envelope onto every event so the desktop frontend
+    # can route/file output by the run it belongs to instead of by whatever view
+    # is currently mounted. KIM_RUN_ID / KIM_SESSION_ID are exported by the Rust
+    # spawner (send_task). When unset (CLI, tests, legacy spawns) no envelope is
+    # added and the wire shape is byte-for-byte identical to before.
+    envelope = {"type": event_type, **payload}
+    _run_id = os.environ.get("KIM_RUN_ID")
+    if _run_id:
+        envelope.setdefault("run_id", _run_id)
+    _session_id = os.environ.get("KIM_SESSION_ID")
+    if _session_id:
+        envelope.setdefault("session_id", _session_id)
+    line = json.dumps(envelope, separators=(",", ":"), ensure_ascii=False)
     data = (line + "\n").encode("utf-8", errors="replace")
 
     buffer = getattr(sys.stdout, "buffer", None)
@@ -125,8 +169,8 @@ def emit_rate_limited(delay: float, attempt: float, max_retries: float) -> None:
     emit_event("rate_limited", delay=delay, attempt=attempt, max_retries=max_retries)
 
 
-def emit_hitl_approval_request(tool: str, risk: str, reason: str, preview: str) -> None:
-    emit_event("hitl_approval_request", tool=tool, risk=risk, reason=reason, preview=preview)
+def emit_hitl_approval_request(tool: str, risk: str, reason: str, preview: str, id: str = '') -> None:
+    emit_event("hitl_approval_request", tool=tool, risk=risk, reason=reason, preview=preview, id=id)
 
 
 def emit_hitl_approval_result(tool: str, approved: bool) -> None:
@@ -147,3 +191,59 @@ def emit_diff(path: str, added: float, removed: float) -> None:
 
 def emit_activity(kind: str, text: str) -> None:
     emit_event("activity", kind=kind, text=text)
+
+
+def emit_command_approval_request(id: str, command: str, cwd: str, reason: str, risk: str, network: bool, amendment: list[object]) -> None:
+    emit_event("command_approval_request", id=id, command=command, cwd=cwd, reason=reason, risk=risk, network=network, amendment=amendment)
+
+
+def emit_file_change_approval_request(id: str, files: list[object], reason: str) -> None:
+    emit_event("file_change_approval_request", id=id, files=files, reason=reason)
+
+
+def emit_user_input_request(id: str, kind: str, item_id: str, questions: list[object], message: str) -> None:
+    emit_event("user_input_request", id=id, kind=kind, item_id=item_id, questions=questions, message=message)
+
+
+def emit_command_output(item_id: str, chunk: str) -> None:
+    emit_event("command_output", item_id=item_id, chunk=chunk)
+
+
+def emit_assistant_delta(chunk: str) -> None:
+    emit_event("assistant_delta", chunk=chunk)
+
+
+def emit_reasoning_delta(chunk: str) -> None:
+    emit_event("reasoning_delta", chunk=chunk)
+
+
+def emit_plan_update(steps: list[object]) -> None:
+    emit_event("plan_update", steps=steps)
+
+
+def emit_diff_update(unified_diff: str) -> None:
+    emit_event("diff_update", unified_diff=unified_diff)
+
+
+def emit_token_usage(input: float, output: float, total: float) -> None:
+    emit_event("token_usage", input=input, output=output, total=total)
+
+
+def emit_item_lifecycle(item_id: str, kind: str, phase: str, title: str) -> None:
+    emit_event("item_lifecycle", item_id=item_id, kind=kind, phase=phase, title=title)
+
+
+def emit_turn_lifecycle(phase: str, turn_id: str) -> None:
+    emit_event("turn_lifecycle", phase=phase, turn_id=turn_id)
+
+
+def emit_agent_done(success: bool) -> None:
+    emit_event("agent_done", success=success)
+
+
+def emit_agent_cancelled(success: bool) -> None:
+    emit_event("agent_cancelled", success=success)
+
+
+def emit_agent_error(error: str) -> None:
+    emit_event("agent_error", error=error)

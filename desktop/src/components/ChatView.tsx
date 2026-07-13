@@ -1,12 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { Dispatch, SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type { SessionInfo, Settings, KimAccount, PermissionMode } from '../types';
+import type { PendingTask } from './chat/types';
 import { toast } from './Toast';
+import { ErrorBoundary } from './ErrorBoundary';
 import { ConnectorsPanel } from './kim-ui';
 import {
   friendlyError,
+  makeConversationId,
   normalizeBrowserSite,
   browserSiteFromProvider,
   providerLabel,
@@ -18,14 +22,110 @@ import { useSessionScroll } from '../hooks/useSessionScroll';
 import { useSessionLoader } from '../hooks/useSessionLoader';
 import { useBrowserRestore } from '../hooks/useBrowserRestore';
 import { useTaskRunner } from '../hooks/useTaskRunner';
+import { useCodexTurn } from '../hooks/useCodexTurn';
 import { useOsNotifications } from '../hooks/useOsNotifications';
 import { StreamRenderer } from './chat/StreamRenderer';
 import { WelcomeScreen } from './chat/WelcomeScreen';
 import { ChatComposer } from './chat/ChatComposer';
 import { CONNECTORS } from './chat/connectors';
 
+// V-audit #7: fallback for the chat/message-rendering ErrorBoundary below.
+// Scoped to "this conversation failed to render" — the sidebar, topbar, and
+// session navigation stay alive around it (they're outside this boundary),
+// so a render crash in one conversation's messages doesn't blank the app.
+function ChatRenderErrorFallback({
+  message,
+  onReset,
+  onNewChat,
+}: {
+  message: string;
+  onReset: () => void;
+  onNewChat?: () => void;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flex: 1,
+        gap: 12,
+        padding: 24,
+        textAlign: 'center',
+        color: 'var(--kim-text)',
+      }}
+    >
+      <svg
+        width="32"
+        height="32"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+        style={{ color: 'var(--kim-text-3)' }}
+      >
+        <circle cx="12" cy="12" r="10" />
+        <path d="M12 8v4M12 16h.01" />
+      </svg>
+      <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>
+        This conversation failed to render
+      </h3>
+      {message && (
+        <p style={{ margin: 0, fontSize: 12.5, opacity: 0.6, maxWidth: 360, wordBreak: 'break-word' }}>
+          {message}
+        </p>
+      )}
+      <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+        <button
+          type="button"
+          onClick={onReset}
+          style={{
+            padding: '7px 16px',
+            borderRadius: 6,
+            border: '1px solid var(--kim-border, rgba(255,255,255,0.12))',
+            background: 'var(--kim-surface, rgba(255,255,255,0.06))',
+            color: 'inherit',
+            fontSize: 13,
+            cursor: 'pointer',
+          }}
+        >
+          Try again
+        </button>
+        {onNewChat && (
+          <button
+            type="button"
+            onClick={onNewChat}
+            style={{
+              padding: '7px 16px',
+              borderRadius: 6,
+              border: '1px solid var(--kim-accent-line)',
+              background: 'transparent',
+              color: 'var(--kim-accent)',
+              fontSize: 13,
+              cursor: 'pointer',
+            }}
+          >
+            Start a new chat
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 interface Props {
   session: SessionInfo | null;
+  /** RUN-IDENTITY: identity of the single globally-active run (from App), so a
+   *  ChatView remounted mid-run can re-attach to its own session's run. */
+  activeRunSessionId?: string | null;
+  activeRunId?: string | null;
+  /** F-F-3: wall-clock start of the active run (from App), so a mid-run
+   *  re-attach restores the original elapsed instead of resetting to 0. */
+  activeRunStartedAt?: number | null;
   newChatMode: boolean;
   settings: Settings;
   onSettingsChange?: (next: Settings) => void;
@@ -44,10 +144,18 @@ interface Props {
   /** Mutable ref written by App; ChatView stores its openConnectors callback here
    *  so App can trigger the panel without a global CustomEvent bus. */
   openConnectorsRef?: { current: (() => void) | null };
+  /** V-audit #1: queued-follow-up store lifted to App.tsx so it survives a
+   *  ChatView remount (New Chat / session switch) instead of being silently
+   *  dropped. See useTaskRunner's queueKeyRef for how a bucket is chosen. */
+  queuedTasksStore?: Record<string, PendingTask[]>;
+  setQueuedTasksStore?: Dispatch<SetStateAction<Record<string, PendingTask[]>>>;
 }
 
 export function ChatView({
   session,
+  activeRunSessionId,
+  activeRunId,
+  activeRunStartedAt,
   newChatMode,
   settings,
   onSettingsChange,
@@ -63,6 +171,8 @@ export function ChatView({
   onSelectSession,
   onSelectProject,
   openConnectorsRef,
+  queuedTasksStore,
+  setQueuedTasksStore,
 }: Props) {
   const [localProvider, setLocalProvider] = useState<string | null>(null);
   const [messageReloadNonce, setMessageReloadNonce] = useState(0);
@@ -79,7 +189,10 @@ export function ChatView({
   }, [settings.permission_mode]);
   const [connectorsClosing, setConnectorsClosing] = useState(false);
   const [browserProvider, setBrowserProvider] = useState('claude');
-  const [conversationId] = useState(() => Math.random().toString(36).substring(7));
+  // L3: use the shared UUID helper — the old Math.random().toString(36)
+  // one-liner could produce very short, collision-prone ids that end up as
+  // resumeSessionId.
+  const [conversationId] = useState(() => makeConversationId());
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const connectorsCloseTimerRef = useRef<number | null>(null);
@@ -130,6 +243,8 @@ export function ChatView({
   useOsNotifications();
 
   // Hook into Tauri events and streaming state management
+  // Codex app-server transport UX (native approvals / plan / output / diff).
+  const codexTurn = useCodexTurn();
   const stream = useChatStream({
     session,
     settings,
@@ -137,6 +252,9 @@ export function ChatView({
     commitCurrentBrowserUrl,
     setMessageReloadNonce,
     conversationId,
+    activeRunSessionId,
+    activeRunId,
+    activeRunStartedAt,
   });
 
   const {
@@ -144,6 +262,7 @@ export function ChatView({
     loadingMessages,
     newestMsgIdx,
     codexRuns,
+    loadError,
   } = useSessionLoader({
     session,
     settings,
@@ -171,13 +290,22 @@ export function ChatView({
     messagesLength: messages.length,
   });
 
+  // H1: opening a (different) session should still land on the latest message
+  // even if the user had paused auto-follow in the previous one.
+  const setAutoFollowOutput = scroll.setAutoFollowOutput;
+  useEffect(() => {
+    setAutoFollowOutput(true);
+  }, [session?.session_id, newChatMode, setAutoFollowOutput]);
+
   const handleCancel = async () => {
     if (!stream.isRunning || stream.cancelling) return;
     stream.setCancelling(true);
-    stream.clearActivityNow();
     stream.cancelFlagRef.current = true;
     try {
       await invoke('cancel_task');
+      // M10: clear the feed only once the backend accepted the cancel — a
+      // rejected invoke used to leave a still-running run with an empty feed.
+      stream.clearActivityNow();
     } catch (err) {
       stream.setCancelling(false);
       stream.cancelFlagRef.current = false;
@@ -185,13 +313,22 @@ export function ChatView({
     }
   };
 
+  // L5: stable merged-settings object — an inline spread re-created it every
+  // render, which re-created runPendingTask and re-ran the queue-drain effect
+  // on each of the ~20/sec activity ticks.
+  const runnerSettings = useMemo(
+    () => ({ ...settings, permission_mode: permissionMode }),
+    [settings, permissionMode]
+  );
+
   const {
     queuedTasks,
     handleSubmit,
     handleRetryLast,
+    handleSteer,
   } = useTaskRunner({
     session,
-    settings: { ...settings, permission_mode: permissionMode },
+    settings: runnerSettings,
     activeTab,
     activeProjectPath,
     conversationId,
@@ -200,6 +337,8 @@ export function ChatView({
     browserCommandArgs,
     stream,
     scroll,
+    queuedTasksStore,
+    setQueuedTasksStore,
   });
 
   // ── Reset state when entering a new chat ─────────────────────────────────────
@@ -412,6 +551,7 @@ export function ChatView({
         cancelling={stream.cancelling}
         handleCancel={handleCancel}
         onSubmit={handleSubmit}
+        onSteer={handleSteer}
         activeTab={activeTab}
         activeProjectPath={activeProjectPath}
         settings={settings}
@@ -464,42 +604,62 @@ export function ChatView({
   const empty = !stream.hasSentMessageRef.current && messages.length === 0 && liveHistory.length === 0 && activity.length === 0;
 
   return (
-    <StreamRenderer
-      messages={messages}
-      loadingMessages={loadingMessages}
-      liveHistory={stream.liveHistory}
-      runHistory={stream.runHistory}
-      codexRuns={codexRuns}
-      taskError={stream.taskError}
-      hitlApprovalStatus={stream.hitlApprovalStatus}
-      onHitlRespond={stream.hitlRespond}
-      permissionMode={permissionMode}
-      onPermissionModeChange={setPermissionMode}
-      runFailure={stream.runFailure}
-      rateLimitedState={stream.rateLimitedState}
-      settings={settings}
-      newChatMode={newChatMode}
-      activity={stream.activity}
-      isRunning={stream.isRunning}
-      autoFollowOutput={scroll.autoFollowOutput}
-      setAutoFollowOutput={scroll.setAutoFollowOutput}
-      bottomRef={scroll.bottomRef}
-      newestMsgIdx={newestMsgIdx}
-      queuedTasks={queuedTasks}
-      lastRunTask={stream.lastRunTaskRef.current}
-      elapsed={stream.elapsed}
-      handleRetryLast={handleRetryLast}
-      handleEditLiveMessage={handleEditLiveMessage}
-      empty={empty}
-      renderComposer={renderComposer}
-      renderConnectorsChrome={renderConnectorsChrome}
-      account={account}
-      activeTab={activeTab}
-      activeProjectPath={activeProjectPath}
-      textareaRef={textareaRef}
-      setTaskInput={setTaskInput}
-      resolveProvider={resolveProvider}
-      tokenStats={stream.tokenStats}
-    />
+    // V-audit #7: a render exception anywhere in the message-rendering subtree
+    // (StreamRenderer, MessageBubble, etc.) used to bubble up to the single
+    // app-wide boundary in main.tsx and blank the whole app — sidebar, topbar,
+    // and session navigation included. This narrower boundary catches it here
+    // instead, so only this conversation's content is replaced; the outer
+    // boundary in main.tsx remains as the final backstop for anything above
+    // ChatView. resetKey clears a stale crash automatically when the app
+    // navigates to a different session/new-chat without remounting ChatView
+    // (see handleTaskDone in App.tsx, which can update `session` in place).
+    <ErrorBoundary
+      resetKey={session?.session_id ?? (newChatMode ? 'new-chat' : null)}
+      fallback={(message, reset) => (
+        <ChatRenderErrorFallback message={message} onReset={reset} onNewChat={onNewChat} />
+      )}
+    >
+      <StreamRenderer
+        messages={messages}
+        loadingMessages={loadingMessages}
+        loadError={loadError}
+        liveHistory={stream.liveHistory}
+        runHistory={stream.runHistory}
+        codexRuns={codexRuns}
+        taskError={stream.taskError}
+        hitlApprovalStatus={stream.hitlApprovalStatus}
+        onHitlRespond={stream.hitlRespond}
+        codexTurn={codexTurn}
+        permissionMode={permissionMode}
+        onPermissionModeChange={setPermissionMode}
+        runFailure={stream.runFailure}
+        rateLimitedState={stream.rateLimitedState}
+        settings={settings}
+        newChatMode={newChatMode}
+        activity={stream.activity}
+        isRunning={stream.isRunning}
+        autoFollowOutput={scroll.autoFollowOutput}
+        setAutoFollowOutput={scroll.setAutoFollowOutput}
+        bottomRef={scroll.bottomRef}
+        outputRef={scroll.outputRef}
+        newestMsgIdx={newestMsgIdx}
+        queuedTasks={queuedTasks}
+        lastRunTask={stream.lastRunTaskRef.current}
+        elapsed={stream.elapsed}
+        handleRetryLast={handleRetryLast}
+        handleEditLiveMessage={handleEditLiveMessage}
+        empty={empty}
+        renderComposer={renderComposer}
+        renderConnectorsChrome={renderConnectorsChrome}
+        account={account}
+        activeTab={activeTab}
+        activeProjectPath={activeProjectPath}
+        textareaRef={textareaRef}
+        setTaskInput={setTaskInput}
+        resolveProvider={resolveProvider}
+        tokenStats={stream.tokenStats}
+        contextState={stream.contextState}
+      />
+    </ErrorBoundary>
   );
 }

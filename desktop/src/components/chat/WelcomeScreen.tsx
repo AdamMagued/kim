@@ -165,7 +165,7 @@ export function WelcomeScreen({
                 const project = activeTab === 'code' ? projectLabel(s.project_path) : null;
                 return (
                   <div
-                    key={i}
+                    key={s.session_key ?? `${s.session_id}-${i}`}
                     className="kr-row-hover"
                     onClick={() => onSelectSession?.(s)}
                     style={{

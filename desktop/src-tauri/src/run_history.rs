@@ -157,6 +157,114 @@ pub fn get_platform_info() -> String {
 /// guarding against a tampered local git config pointing at a rogue mirror.
 const EXPECTED_REMOTE_HOST: &str = "github.com";
 
+/// AUDIT FIX #2: extract the actual host component from a git remote URL,
+/// rather than relying on a substring match (`remote_url.contains("github.com")`),
+/// which a lookalike host like `https://github.com.evil.example/...` or
+/// `https://evil.example/x?host=github.com` would also satisfy.
+///
+/// Handles the two URL shapes `git remote get-url` can return:
+///   - Standard URL form: `https://github.com/owner/repo.git`,
+///     `ssh://git@github.com/owner/repo.git`, `git://github.com/owner/repo.git`
+///   - SCP-like SSH shorthand (not a URI `url` can parse): `git@github.com:owner/repo.git`
+///
+/// Returns `None` if no host could be extracted (malformed remote).
+fn extract_remote_host(remote_url: &str) -> Option<String> {
+    let trimmed = remote_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // SCP-like syntax has no "://" scheme separator: `[user@]host:path`.
+    // Guard against Windows-style absolute paths (`C:\...`) being misread as
+    // scp syntax by requiring the part before ':' to contain no path
+    // separators and, if it has an '@', to look like user@host.
+    if !trimmed.contains("://") {
+        if let Some(colon_idx) = trimmed.find(':') {
+            let before_colon = &trimmed[..colon_idx];
+            if !before_colon.is_empty()
+                && !before_colon.contains('/')
+                && !before_colon.contains('\\')
+            {
+                let host_part = before_colon.rsplit('@').next().unwrap_or(before_colon);
+                if !host_part.is_empty() {
+                    return Some(host_part.to_ascii_lowercase());
+                }
+            }
+        }
+        return None;
+    }
+
+    // Standard URL form: parse properly and take the host component only
+    // (never the path/query, which is what made the old substring check
+    // spoofable).
+    url::Url::parse(trimmed)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+}
+
+/// True when `remote_url`'s host is exactly the expected host (or a direct
+/// subdomain of it), never merely a substring match anywhere in the URL.
+fn remote_host_is_expected(remote_url: &str) -> bool {
+    match extract_remote_host(remote_url) {
+        Some(host) => {
+            host == EXPECTED_REMOTE_HOST
+                || host.ends_with(&format!(".{EXPECTED_REMOTE_HOST}"))
+        }
+        None => false,
+    }
+}
+
+/// F-J-5: `git pull` argv with a low-speed network timeout so a black-hole
+/// network (dropped packets, captive portal) aborts the transfer after ~30s of
+/// near-zero throughput instead of wedging the update indefinitely. The `-c`
+/// overrides are per-invocation, so they never touch the user's git config.
+fn git_pull_argv() -> Vec<&'static str> {
+    vec![
+        "-c",
+        "http.lowSpeedLimit=1000",
+        "-c",
+        "http.lowSpeedTime=30",
+        "pull",
+        "--ff-only",
+    ]
+}
+
+/// F-J-5: `pip install` argv with a per-operation network timeout so a slow /
+/// black-hole index cannot wedge the update forever.
+fn pip_install_argv() -> Vec<&'static str> {
+    vec![
+        "-m",
+        "pip",
+        "install",
+        "-r",
+        "requirements.txt",
+        "--timeout",
+        "30",
+        "-q",
+        "--disable-pip-version-check",
+    ]
+}
+
+/// F-J-5: run a blocking `Command::output()` off the async runtime.
+/// `run_update` is an `async fn`, but `std::process::Command::output()` parks
+/// the calling tokio worker for the whole git/pip duration — under Tauri's
+/// multi-thread runtime that starves other async work. Running it on the
+/// dedicated blocking pool keeps the async workers free.
+async fn command_output_blocking(
+    program: String,
+    args: Vec<String>,
+    cwd: PathBuf,
+) -> std::io::Result<std::process::Output> {
+    tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&program)
+            .args(&args)
+            .current_dir(&cwd)
+            .output()
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("update command task panicked: {e}")))?
+}
+
 #[tauri::command]
 pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     let kim_root = crate::default_project_root();
@@ -171,39 +279,55 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     // Reject the update if the configured 'origin' remote does not point at the
     // expected host.  This prevents a tampered local git config (or a poisoned
     // DNS entry) from silently substituting a rogue upstream.
-    let remote_out = std::process::Command::new(git_cmd)
-        .args(["remote", "get-url", "origin"])
-        .current_dir(&kim_root)
-        .output()
-        .map_err(|e| format!("git not found — make sure Git is installed: {e}"))?;
+    let remote_out = command_output_blocking(
+        git_cmd.to_string(),
+        vec!["remote".into(), "get-url".into(), "origin".into()],
+        kim_root.clone(),
+    )
+    .await
+    .map_err(|e| format!("git not found — make sure Git is installed: {e}"))?;
 
     let remote_url = String::from_utf8_lossy(&remote_out.stdout)
         .trim()
         .to_string();
-    if remote_out.status.success() {
-        // Accept https://github.com/... and git@github.com:...
-        let host_ok = remote_url.contains(EXPECTED_REMOTE_HOST);
-        if !host_ok {
-            return Err(format!(
-                "Update aborted: remote origin '{remote_url}' does not match expected host '{EXPECTED_REMOTE_HOST}'. \
-                 Verify your git remote configuration before updating."
-            ));
-        }
-    } else {
-        // Could not read remote (detached HEAD, no remote, etc.); proceed with warning.
-        let _ = app_handle.emit(
-            "kim-update-progress",
-            "Warning: could not verify remote URL — proceeding with caution.",
-        );
+    if !remote_out.status.success() {
+        // AUDIT FIX #2: `git remote get-url origin` failing means the remote
+        // cannot be verified at all (detached HEAD, no remote configured,
+        // corrupted repo, ...). Previously this warned and proceeded straight
+        // to `git pull` anyway -- an update against an *unverified* remote is
+        // exactly the supply-chain risk this check exists to prevent. Abort
+        // instead.
+        let stderr = String::from_utf8_lossy(&remote_out.stderr).trim().to_string();
+        return Err(format!(
+            "Update aborted: could not read the 'origin' remote URL ({}). \
+             Configure a git remote pointing at {EXPECTED_REMOTE_HOST} before updating.",
+            if stderr.is_empty() { "no output".to_string() } else { stderr }
+        ));
+    }
+    // AUDIT FIX #2: compare the parsed host component exactly, not a
+    // substring match. `remote_url.contains("github.com")` previously
+    // accepted lookalike hosts such as `https://github.com.evil.example/...`
+    // or any URL that merely embedded the string "github.com" in its path
+    // or query. `remote_host_is_expected` parses both the standard URL form
+    // (https://github.com/..., ssh://git@github.com/...) and the SCP-like
+    // SSH shorthand (git@github.com:owner/repo.git) and checks the actual
+    // host component.
+    if !remote_host_is_expected(&remote_url) {
+        return Err(format!(
+            "Update aborted: remote origin '{remote_url}' does not match expected host '{EXPECTED_REMOTE_HOST}'. \
+             Verify your git remote configuration before updating."
+        ));
     }
 
     let _ = app_handle.emit("kim-update-progress", "Pulling latest source from GitHub…");
 
-    let git_out = std::process::Command::new(git_cmd)
-        .args(["pull", "--ff-only"])
-        .current_dir(&kim_root)
-        .output()
-        .map_err(|e| format!("git pull failed to spawn: {e}"))?;
+    let git_out = command_output_blocking(
+        git_cmd.to_string(),
+        git_pull_argv().into_iter().map(String::from).collect(),
+        kim_root.clone(),
+    )
+    .await
+    .map_err(|e| format!("git pull failed to spawn: {e}"))?;
 
     if !git_out.status.success() {
         let stderr = String::from_utf8_lossy(&git_out.stderr);
@@ -235,10 +359,12 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     // deployments do not have a signing key imported.  Operators who want to
     // enforce signed commits should set `commit.gpgSign` and import the project
     // key; in that case `git pull --ff-only` itself will refuse unsigned commits.
-    let verify_out = std::process::Command::new(git_cmd)
-        .args(["verify-commit", "HEAD"])
-        .current_dir(&kim_root)
-        .output();
+    let verify_out = command_output_blocking(
+        git_cmd.to_string(),
+        vec!["verify-commit".into(), "HEAD".into()],
+        kim_root.clone(),
+    )
+    .await;
 
     match verify_out {
         Ok(out) if out.status.success() => {
@@ -267,18 +393,12 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     let python =
         crate::find_python_interpreter(&kim_root).map_err(|e| format!("Python not found: {e}"))?;
 
-    let pip_out = std::process::Command::new(&python)
-        .args([
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            "requirements.txt",
-            "-q",
-            "--disable-pip-version-check",
-        ])
-        .current_dir(&kim_root)
-        .output();
+    let pip_out = command_output_blocking(
+        python.clone(),
+        pip_install_argv().into_iter().map(String::from).collect(),
+        kim_root.clone(),
+    )
+    .await;
 
     match pip_out {
         Ok(out) if out.status.success() => {
@@ -301,25 +421,35 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        let reopened = std::process::Command::new("open")
-            .args(["-a", "Kim"])
-            .spawn()
-            .is_ok();
-        if !reopened {
-            if let Ok(exe) = std::env::current_exe() {
+        // M-UPDATE-1: running `open -a Kim` while THIS instance is still alive
+        // only ACTIVATES it (macOS never launches a second instance), so the
+        // subsequent exit() left the app closed instead of restarted. Detach a
+        // shell that waits for us to exit, then reopens the bundle.
+        let app_target: String = std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
                 let mut path = exe.as_path();
                 loop {
                     if path.extension().is_some_and(|e| e == "app") {
-                        let _ = std::process::Command::new("open").arg(path).spawn();
-                        break;
+                        return Some(path.to_string_lossy().into_owned());
                     }
                     match path.parent() {
                         Some(p) => path = p,
-                        None => break,
+                        None => return None,
                     }
                 }
-            }
-        }
+            })
+            .unwrap_or_else(|| "Kim".to_string());
+        // `open` takes either an .app path or (-a) an app name.
+        let open_cmd = if app_target.ends_with(".app") {
+            format!("sleep 1; open \"{}\"", app_target.replace('"', ""))
+        } else {
+            "sleep 1; open -a \"Kim\"".to_string()
+        };
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&open_cmd)
+            .spawn();
         // Use app_handle.exit() instead of std::process::exit() so that Tauri's
         // cleanup handlers and Rust Drop implementations run before the process
         // terminates.  std::process::exit() skips all of this.
@@ -332,5 +462,150 @@ pub async fn run_update(app_handle: tauri::AppHandle) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
         app_handle.restart();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- F-J-5: update commands carry a network timeout --
+
+    #[test]
+    fn git_pull_argv_has_low_speed_timeout() {
+        let argv = git_pull_argv();
+        // A black-hole network must abort the pull, not hang it forever.
+        assert!(argv.contains(&"http.lowSpeedLimit=1000"));
+        assert!(argv.contains(&"http.lowSpeedTime=30"));
+        assert!(argv.contains(&"pull"));
+        assert!(argv.contains(&"--ff-only"));
+        // The overrides are per-invocation `-c` flags (never persisted).
+        assert_eq!(argv.iter().filter(|a| **a == "-c").count(), 2);
+    }
+
+    #[test]
+    fn pip_install_argv_has_network_timeout() {
+        let argv = pip_install_argv();
+        assert!(argv.contains(&"--timeout"));
+        assert!(argv.contains(&"30"));
+        assert!(argv.contains(&"install"));
+        assert!(argv.contains(&"requirements.txt"));
+    }
+
+    // -- extract_remote_host --
+
+    #[test]
+    fn test_extract_host_https() {
+        assert_eq!(
+            extract_remote_host("https://github.com/AdamMagued/kim.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_https_no_dot_git_suffix() {
+        assert_eq!(
+            extract_remote_host("https://github.com/AdamMagued/kim"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_ssh_url_form() {
+        assert_eq!(
+            extract_remote_host("ssh://git@github.com/AdamMagued/kim.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_scp_like_ssh_shorthand() {
+        assert_eq!(
+            extract_remote_host("git@github.com:AdamMagued/kim.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_is_case_insensitive() {
+        assert_eq!(
+            extract_remote_host("https://GitHub.COM/AdamMagued/kim.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_empty_or_malformed() {
+        assert_eq!(extract_remote_host(""), None);
+        assert_eq!(extract_remote_host("   "), None);
+        assert_eq!(extract_remote_host("not a url at all"), None);
+    }
+
+    // -- remote_host_is_expected: the security-relevant assertions --
+
+    #[test]
+    fn test_rejects_lookalike_subdomain_suffix_attack() {
+        // github.com.evil.example -- old `.contains("github.com")` check
+        // would have wrongly accepted this.
+        assert!(!remote_host_is_expected(
+            "https://github.com.evil.example/AdamMagued/kim.git"
+        ));
+    }
+
+    #[test]
+    fn test_rejects_github_com_embedded_in_path() {
+        // "github.com" appears in the URL, but not as the host.
+        assert!(!remote_host_is_expected(
+            "https://evil.example/github.com/AdamMagued/kim.git"
+        ));
+    }
+
+    #[test]
+    fn test_rejects_github_com_embedded_in_query_string() {
+        assert!(!remote_host_is_expected(
+            "https://evil.example/repo.git?x=github.com"
+        ));
+    }
+
+    #[test]
+    fn test_rejects_userinfo_spoof() {
+        // A URL with "github.com" stuffed into userinfo before the real
+        // (malicious) host -- host_str() must still resolve to evil.example.
+        assert!(!remote_host_is_expected(
+            "https://github.com@evil.example/AdamMagued/kim.git"
+        ));
+    }
+
+    #[test]
+    fn test_accepts_https_github() {
+        assert!(remote_host_is_expected(
+            "https://github.com/AdamMagued/kim.git"
+        ));
+    }
+
+    #[test]
+    fn test_accepts_ssh_scp_like_github() {
+        assert!(remote_host_is_expected("git@github.com:AdamMagued/kim.git"));
+    }
+
+    #[test]
+    fn test_accepts_ssh_url_form_github() {
+        assert!(remote_host_is_expected(
+            "ssh://git@github.com/AdamMagued/kim.git"
+        ));
+    }
+
+    #[test]
+    fn test_rejects_unrelated_host() {
+        assert!(!remote_host_is_expected("https://gitlab.com/foo/bar.git"));
+    }
+
+    #[test]
+    fn test_rejects_empty_remote() {
+        assert!(!remote_host_is_expected(""));
     }
 }

@@ -1,7 +1,7 @@
 //! Session listing, summarization, deletion, and message loading.
 //!
 //! Extracted from lib.rs (Phase 8 restructure).
-//! Public Tauri commands include `list_sessions`, `delete_session`,
+//! Public Tauri commands include `list_sessions`,
 //! `summarize_session`, `load_session_messages`, and `get_app_version`.
 
 use serde_json;
@@ -34,10 +34,19 @@ pub async fn summarize_session(
     session_id: String,
     session_type: String,
     project_root: Option<String>,
+    kim_dir: Option<String>,
 ) -> Result<(), String> {
     crate::validate_session_id(&session_id)?;
 
-    let mut dirs_to_search: Vec<PathBuf> = vec![crate::default_sessions_dir()];
+    // M-CMD-1: honour a configured kim sessions dir (same optional parameter
+    // list_sessions / load_session_messages accept). Searched FIRST so a
+    // custom kim_sessions_dir no longer yields "Session file not found" for a
+    // session that is visible in the sidebar. Falls back to the default dir.
+    let mut dirs_to_search: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = kim_dir.filter(|d| !d.trim().is_empty()) {
+        dirs_to_search.push(crate::session_base_dir("kim", Some(dir), None));
+    }
+    dirs_to_search.push(crate::default_sessions_dir());
     if session_type == "codex" {
         if let Some(ref pr) = project_root {
             let codex_dir = PathBuf::from(pr).join(".codex").join("sessions");
@@ -372,208 +381,4 @@ pub(crate) fn read_session_meta(date_dir: &Path, session_id: &str) -> (Option<St
         .map(|s| s.to_string());
     let pinned = v.get("pinned").and_then(|x| x.as_bool()).unwrap_or(false);
     (title, pinned)
-}
-
-fn base_dir(kim_dir: &Option<String>) -> PathBuf {
-    kim_dir
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(crate::default_sessions_dir)
-}
-
-/// Remove a session's JSONL + summary + meta + browser-meta + all sidecar files.
-/// Returns count of files removed.
-pub(crate) fn delete_session_files(date_dir: &Path, session_id: &str) -> usize {
-    // Fixed-name sidecars.
-    let fixed = [
-        format!("{session_id}.jsonl"),
-        format!("{session_id}.summary.txt"),
-        format!("{session_id}.meta.json"),
-        format!("{session_id}.browser.json"),
-        format!("{session_id}.context.json"),
-        format!("{session_id}.runs.json"),
-    ];
-    let mut n = 0;
-    for name in &fixed {
-        if fs::remove_file(date_dir.join(name)).is_ok() {
-            n += 1;
-        }
-    }
-    // Wildcard sidecars: <id>.compact.*.json and <id>.roll.*.jsonl.
-    // Scan the directory so we don't need an external glob crate.
-    let compact_prefix = format!("{session_id}.compact.");
-    let roll_prefix = format!("{session_id}.roll.");
-    if let Ok(entries) = fs::read_dir(date_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let fname = entry.file_name();
-            let fname_str = fname.to_string_lossy();
-            let is_compact = fname_str.starts_with(&compact_prefix) && fname_str.ends_with(".json");
-            let is_roll = fname_str.starts_with(&roll_prefix) && fname_str.ends_with(".jsonl");
-            if (is_compact || is_roll) && fs::remove_file(entry.path()).is_ok() {
-                n += 1;
-            }
-        }
-    }
-    n
-}
-
-#[tauri::command]
-pub fn delete_session(
-    session_id: String,
-    date: String,
-    kim_dir: Option<String>,
-) -> Result<usize, String> {
-    crate::validate_session_id(&session_id)?;
-    crate::validate_session_id(&date)?;
-    let date_dir = base_dir(&kim_dir).join(&date);
-    let n = delete_session_files(&date_dir, &session_id);
-    if n == 0 {
-        return Err(format!("No files removed for session {session_id}"));
-    }
-    Ok(n)
-}
-
-#[cfg(test)]
-mod k4_tests {
-    use super::*;
-
-    fn tmp() -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "kim-k4-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&p).unwrap();
-        p
-    }
-
-    #[test]
-    fn delete_removes_all_session_files() {
-        let base = tmp();
-        let date_dir = base.join("2026-06-18");
-        fs::create_dir_all(&date_dir).unwrap();
-        let id = "sess1";
-        fs::write(date_dir.join(format!("{id}.jsonl")), "{}").unwrap();
-        fs::write(date_dir.join(format!("{id}.summary.txt")), "s").unwrap();
-        fs::write(
-            date_dir.join(format!("{id}.meta.json")),
-            r#"{"title":"Title","pinned":true}"#,
-        )
-        .unwrap();
-        let n = delete_session_files(&date_dir, id);
-        assert_eq!(n, 3);
-        assert!(!date_dir.join(format!("{id}.jsonl")).exists());
-        assert!(!date_dir.join(format!("{id}.meta.json")).exists());
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    // ── Regression guards for delete_session_files (context.json / runs.json /
-    //    wildcard sidecars / isolation between session ids) ────────────────────
-
-    /// All six fixed-name sidecars are removed and the returned count matches.
-    #[test]
-    fn delete_session_files_removes_fixed_sidecars() {
-        let base = tmp();
-        let date_dir = base.join("2026-06-28");
-        fs::create_dir_all(&date_dir).unwrap();
-        let id = "abc-123";
-        let fixed = [
-            format!("{id}.jsonl"),
-            format!("{id}.summary.txt"),
-            format!("{id}.meta.json"),
-            format!("{id}.browser.json"),
-            format!("{id}.context.json"),
-            format!("{id}.runs.json"),
-        ];
-        for name in &fixed {
-            fs::write(date_dir.join(name), "x").unwrap();
-        }
-        let n = delete_session_files(&date_dir, id);
-        assert_eq!(n, 6, "expected 6 fixed sidecars removed, got {n}");
-        for name in &fixed {
-            assert!(
-                !date_dir.join(name).exists(),
-                "{name} should have been deleted"
-            );
-        }
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    /// Wildcard sidecars (<id>.compact.*.json and <id>.roll.*.jsonl) are also
-    /// removed by the directory-scan path.
-    #[test]
-    fn delete_session_files_removes_wildcards() {
-        let base = tmp();
-        let date_dir = base.join("2026-06-28");
-        fs::create_dir_all(&date_dir).unwrap();
-        let id = "sess-wild";
-        // At least one fixed file so deletion does not return 0.
-        fs::write(date_dir.join(format!("{id}.jsonl")), "{}").unwrap();
-        // Wildcard sidecars.
-        let compact = format!("{id}.compact.v1.json");
-        let roll1 = format!("{id}.roll.2026-06-28.jsonl");
-        let roll2 = format!("{id}.roll.2026-06-27.jsonl");
-        fs::write(date_dir.join(&compact), "{}").unwrap();
-        fs::write(date_dir.join(&roll1), "{}").unwrap();
-        fs::write(date_dir.join(&roll2), "{}").unwrap();
-
-        let n = delete_session_files(&date_dir, id);
-        // 1 fixed (.jsonl) + 1 compact + 2 roll = 4 total.
-        assert_eq!(n, 4, "expected 4 files removed, got {n}");
-        assert!(
-            !date_dir.join(&compact).exists(),
-            "compact sidecar should be gone"
-        );
-        assert!(
-            !date_dir.join(&roll1).exists(),
-            "roll sidecar 1 should be gone"
-        );
-        assert!(
-            !date_dir.join(&roll2).exists(),
-            "roll sidecar 2 should be gone"
-        );
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    /// Files belonging to a different session id, and files with non-matching
-    /// names, are not touched when deleting a specific session.
-    #[test]
-    fn unrelated_files_untouched() {
-        let base = tmp();
-        let date_dir = base.join("2026-06-28");
-        fs::create_dir_all(&date_dir).unwrap();
-
-        let target = "target-session";
-        let other = "other-session";
-
-        // Target session files.
-        fs::write(date_dir.join(format!("{target}.jsonl")), "{}").unwrap();
-        fs::write(date_dir.join(format!("{target}.context.json")), "{}").unwrap();
-
-        // Other session files — must survive.
-        let other_jsonl = date_dir.join(format!("{other}.jsonl"));
-        let other_meta = date_dir.join(format!("{other}.meta.json"));
-        let other_roll = date_dir.join(format!("{other}.roll.2026-06-28.jsonl"));
-        fs::write(&other_jsonl, "{}").unwrap();
-        fs::write(&other_meta, "{}").unwrap();
-        fs::write(&other_roll, "{}").unwrap();
-
-        // A completely unrelated file — must survive.
-        let unrelated = date_dir.join("README.txt");
-        fs::write(&unrelated, "hello").unwrap();
-
-        let n = delete_session_files(&date_dir, target);
-        assert_eq!(n, 2, "expected 2 target files removed, got {n}");
-
-        assert!(
-            other_jsonl.exists(),
-            "other session jsonl must be untouched"
-        );
-        assert!(other_meta.exists(), "other session meta must be untouched");
-        assert!(other_roll.exists(), "other session roll must be untouched");
-        assert!(unrelated.exists(), "unrelated file must be untouched");
-        let _ = fs::remove_dir_all(&base);
-    }
 }

@@ -63,11 +63,23 @@ interface OllamaPullFinished {
 }
 
 function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Settings) => void }) {
+  // H2/H3: `updateOllama` used to spread the render-time `settings` closure.
+  // The mount-time `ollama-pull-finished` listener (empty deps) and the
+  // in-flight `ollama_get_status` await both held a STALE settings snapshot, so
+  // applying the ollama patch silently reverted anything the user changed in
+  // the meantime (provider, theme, the model just picked, …). Route every
+  // patch through refs that always hold the latest props.
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
-    onChange({ ...settings, [key]: value });
+    onChangeRef.current({ ...settingsRef.current, [key]: value });
   }
   function updateOllama(patch: Partial<Settings['ollama']>) {
-    onChange({ ...settings, ollama: { ...settings.ollama, ...patch } });
+    const latest = settingsRef.current;
+    onChangeRef.current({ ...latest, ollama: { ...latest.ollama, ...patch } });
   }
 
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
@@ -84,6 +96,14 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
   useEffect(() => {
     setRawBudget(String(settings.context_budget_tokens ?? 200_000));
   }, [settings.context_budget_tokens]);
+
+  // D-C4: privacy-pause was fully implemented backend→MCP but invoked by ZERO
+  // frontend code — the sentinel could only be created by hand. Reflect the
+  // real backend state and let the user toggle it.
+  const [privacyPaused, setPrivacyPaused] = useState(false);
+  useEffect(() => {
+    invoke<boolean>('get_privacy_pause').then(setPrivacyPaused).catch(() => {});
+  }, []);
 
   // Sign-in refresh timers — tracked so they can be cancelled if the pane unmounts
   // before the delays fire (finding #2: setState-after-unmount).
@@ -108,14 +128,17 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
         contextLimitOverride: settings.ollama.context_limit_override ?? null,
       });
       setOllamaStatus(status);
+      // H3: compare against the LATEST settings (the invoke above can take
+      // seconds; the render-time `settings` this closure captured may be old).
+      const currentOllama = settingsRef.current.ollama;
       const nextPatch: Partial<Settings['ollama']> = {};
-      if (!settings.ollama.local_model && status.local_models[0]?.name) {
+      if (!currentOllama.local_model && status.local_models[0]?.name) {
         nextPatch.local_model = status.local_models[0].name;
       }
-      if (settings.ollama.connected !== (status.running && status.selected_mode === 'local' && status.local_models.length > 0)) {
+      if (currentOllama.connected !== (status.running && status.selected_mode === 'local' && status.local_models.length > 0)) {
         nextPatch.connected = status.running && status.selected_mode === 'local' && status.local_models.length > 0;
       }
-      if (settings.ollama.cloud_connected !== status.cloud_connected) {
+      if (currentOllama.cloud_connected !== status.cloud_connected) {
         nextPatch.cloud_connected = status.cloud_connected;
       }
       if (Object.keys(nextPatch).length > 0) updateOllama(nextPatch);
@@ -125,6 +148,12 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
       setOllamaBusy(prev => (prev === 'pulling' ? prev : 'idle'));
     }
   }
+
+  // H2: the mount-time listener effect below has empty deps, so calling
+  // `refreshOllamaStatus` directly would capture the first-render closure
+  // (stale settings). Always go through this ref, which tracks the latest one.
+  const refreshOllamaStatusRef = useRef(refreshOllamaStatus);
+  refreshOllamaStatusRef.current = refreshOllamaStatus;
 
   useEffect(() => {
     void refreshOllamaStatus();
@@ -157,7 +186,8 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
             setOllamaBusy('idle');
             if (event.payload.success) {
               toast(`Pulled ${event.payload.model}.`, 'success', 3000);
-              void refreshOllamaStatus();
+              // H2: via ref — the direct call would use first-render settings.
+              void refreshOllamaStatusRef.current();
             } else {
               setOllamaError(event.payload.error ?? `Could not pull ${event.payload.model}.`);
             }
@@ -171,7 +201,6 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
       unlistenProgress?.();
       unlistenFinished?.();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const selectedModel = settings.ollama.mode === 'cloud' ? settings.ollama.cloud_model : settings.ollama.local_model;
@@ -592,15 +621,35 @@ function PaneAI({ settings, onChange }: { settings: Settings; onChange: (s: Sett
       <SectionLabel>behavior</SectionLabel>
       <Row
         title="Queue messages while Kim is working"
-        subtitle="Off: a new send interrupts the current task. On: sends queue and run in order."
+        subtitle="On: extra sends line up and run in order. Off: Kim asks you to wait or steer instead of queuing."
       >
         <Toggle on={settings.allow_message_queue} onClick={() => update('allow_message_queue', !settings.allow_message_queue)} ariaLabel="Queue messages while Kim is working" />
       </Row>
+      {/* D-C2: "Keep browser visible" had no backend setter (WEBVIEW_KEEP_VISIBLE
+          is never written from the frontend), so the toggle did nothing. Rather
+          than fake it, disable the control and say so honestly. */}
       <Row
         title="Keep browser visible while running"
-        subtitle="Testing only — leaves the provider window on-screen so you can watch what Kim does."
+        subtitle="Not available in this build — Kim always manages the provider window itself."
       >
-        <Toggle on={settings.keep_browser_visible} onClick={() => update('keep_browser_visible', !settings.keep_browser_visible)} ariaLabel="Keep browser visible while running" />
+        <Toggle on={false} onClick={() => {}} disabled ariaLabel="Keep browser visible while running (unavailable)" />
+      </Row>
+      <Row
+        title="Privacy pause"
+        subtitle="Blocks Kim from taking screenshots or controlling your mouse/keyboard until you turn it off."
+      >
+        <Toggle
+          on={privacyPaused}
+          onClick={() => {
+            const next = !privacyPaused;
+            setPrivacyPaused(next);
+            invoke('set_privacy_pause', { on: next }).catch(() => {
+              setPrivacyPaused(!next); // revert on failure
+              toast('Could not change privacy pause.', 'error', 3000);
+            });
+          }}
+          ariaLabel="Privacy pause"
+        />
       </Row>
 
       <SectionLabel>context budget</SectionLabel>

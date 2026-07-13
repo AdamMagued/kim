@@ -93,17 +93,32 @@ class TestCodeTabConstraint:
             r'unwrap_or_else\(\|\|\s*["\'](\w+)["\']\.to_string\(\)\)',
             content,
         )
-        if default_match:
-            assert default_match.group(1) != "openai", (
-                "Code tab default provider changed to 'openai' — constraint violated"
-            )
-
-    def test_cron_store_excludes_openai_gpt55(self):
-        src = Path(__file__).parent.parent / "orchestrator/cron_store.py"
-        content = src.read_text()
-        assert "gpt-5.5" in content, (
-            "cron_store.py no longer mentions gpt-5.5 exclusion — docstring may have been removed"
+        # Guard against silent vacuity: if the default-provider expression is
+        # refactored to another form this test must fail loudly, not pass.
+        assert default_match is not None, (
+            "default-provider unwrap_or_else expression not found in subprocess.rs — "
+            "update this test's regex to match the new form"
         )
+        assert default_match.group(1) != "openai", (
+            "Code tab default provider changed to 'openai' — constraint violated"
+        )
+
+    def test_scheduled_runner_excludes_openai_gpt55(self):
+        """The REAL enforcement lives in scheduled_runner.is_allowed_provider —
+        test it, not the cron_store docstring that merely mentions it."""
+        from orchestrator.scheduled_runner import is_allowed_provider
+
+        # Allowed for scheduled execution
+        assert is_allowed_provider("ollama")
+        assert is_allowed_provider("ollama-cloud")
+        assert is_allowed_provider("browser")
+        assert is_allowed_provider("browser:chatgpt")
+        assert is_allowed_provider(None)  # empty -> defaults to ollama
+
+        # The standing constraint: never openai / gpt-5.5
+        assert not is_allowed_provider("openai")
+        assert not is_allowed_provider("gpt-5.5")
+        assert not is_allowed_provider("claude")
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +149,6 @@ class TestCSSImportOrder:
         "settings-shader.css",
         "typing-animations.css",
         "revamp.css",
-        "relay.css",
     ]
 
     def _read_imports(self) -> list[str]:
@@ -170,29 +184,31 @@ class TestCSSImportOrder:
 
 
 # ---------------------------------------------------------------------------
-# 4. II-J relay feature-flag: pane hidden but code preserved
+# 4. Relay decommissioned (Phase 0 A5/S6 — supersedes the old II-J flag-off)
 # ---------------------------------------------------------------------------
 
-class TestRelayFeatureFlag:
-    """Relay pane is feature-flagged off; code must still exist (not deleted)."""
+class TestRelayDecommissioned:
+    """The phone-relay subsystem was removed in Phase 0 (roadmap A5/S6).
 
-    def test_relay_flag_is_false(self):
-        src = Path(__file__).parent.parent / "desktop/src/components/kim-ui/RevampSettings.tsx"
-        content = src.read_text()
-        assert "RELAY_ENABLED = false" in content, (
-            "RELAY_ENABLED must be false in RevampSettings.tsx (II-J)"
+    It was never enabled (RELAY_ENABLED=false since inception) and shipped a
+    deployable server (relay_server/ + Dockerfile + railway.toml) that was
+    pure attack surface. If relay comes back, it must come back deliberately
+    through a new design — not by accident. Git history preserves the code.
+    """
+
+    def test_relay_server_is_gone(self):
+        root = Path(__file__).parent.parent
+        assert not (root / "relay_server").exists(), (
+            "relay_server/ must stay deleted (decommissioned in Phase 0); "
+            "resurrect deliberately or not at all"
         )
+        assert not (root / "railway.toml").exists(), "relay deploy config must stay deleted"
 
-    def test_relay_code_preserved(self):
-        pane_info = Path(__file__).parent.parent / "desktop/src/components/kim-ui/settings-panes/PaneInfo.tsx"
-        content = pane_info.read_text()
-        assert "PaneRelay" in content, "PaneRelay code must not be deleted (II-J: flag off, not delete)"
-
-    def test_relay_pane_id_preserved(self):
+    def test_relay_ui_is_gone(self):
         src = Path(__file__).parent.parent / "desktop/src/components/kim-ui/RevampSettings.tsx"
         content = src.read_text()
-        assert "'relay'" in content, (
-            "PaneId 'relay' must still exist in RevampSettings.tsx (code preserved, just flagged off)"
+        assert "'relay'" not in content and "PaneRelay" not in content, (
+            "relay settings pane must stay removed (decommissioned in Phase 0)"
         )
 
 

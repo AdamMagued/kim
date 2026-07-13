@@ -30,13 +30,39 @@ import tempfile
 import os
 
 from mcp_server.config import PROJECT_ROOT, CODE_TIMEOUT, SHELL_TIMEOUT, validate_path
-from mcp_server.os_utils import check_tool_available, IS_MACOS, IS_LINUX
+from mcp_server.os_utils import IS_MACOS, IS_LINUX, IS_WINDOWS
+from mcp_server.tools.shell import _kill_process_tree
+from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
+# F-C-5: a model-supplied `timeout` must be clamped exactly like shell.py's
+# MAX_SHELL_TIMEOUT_S. Without a ceiling, run_python(timeout=999999) pins the
+# single-threaded MCP server for ~11.5 days server-side — the same client/server
+# desync the shell clamp closes, reopened for code exec. Kept in sync with
+# shell.MAX_SHELL_TIMEOUT_S (600s).
+MAX_CODE_TIMEOUT_S = 600
+
+
+def _clamp_code_timeout(raw: object, default: int) -> int:
+    """Coerce a model-supplied timeout to a positive int within the hard cap."""
+    try:
+        val = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if val < 1:
+        return 1
+    if val > MAX_CODE_TIMEOUT_S:
+        return MAX_CODE_TIMEOUT_S
+    return val
+
 # ── Minimal sandbox environment ───────────────────────────────────────────────
 
-_SANDBOX_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# /usr/local/bin is included so system-wide installs (e.g. node on macOS/Linux)
+# stay reachable; /snap/bin on Linux for snap-installed interpreters (1.3).
+_SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if IS_LINUX and os.path.isdir("/snap/bin"):
+    _SANDBOX_PATH += ":/snap/bin"
 
 
 def _minimal_env(extra: dict | None = None) -> dict[str, str]:
@@ -45,8 +71,30 @@ def _minimal_env(extra: dict | None = None) -> dict[str, str]:
     All code-execution subprocesses use this instead of inheriting os.environ
     so that OPENAI_API_KEY, ANTHROPIC_API_KEY, and similar secrets are never
     visible to executed code (finding 1).
+
+    On Windows the env must carry SystemRoot/ComSpec/Path (1.1): CPython
+    cannot even initialise without SystemRoot, and a POSIX-style PATH makes
+    every child binary unfindable. Mirrors shell.py's _sandbox_env.
     """
-    env: dict[str, str] = {
+    if IS_WINDOWS:
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        env: dict[str, str] = {
+            "Path": rf"{system_root}\System32;{system_root}",
+            "SystemRoot": system_root,
+            "TEMP": tempfile.gettempdir(),
+            "TMP": tempfile.gettempdir(),
+            "USERPROFILE": str(PROJECT_ROOT),
+        }
+        comspec = os.environ.get("ComSpec")
+        if comspec:
+            env["ComSpec"] = comspec
+        pathext = os.environ.get("PATHEXT")
+        if pathext:
+            env["PATHEXT"] = pathext
+        if extra:
+            env.update(extra)
+        return env
+    env = {
         "PATH": _SANDBOX_PATH,
         "HOME": str(PROJECT_ROOT),
         "TMPDIR": tempfile.gettempdir(),
@@ -207,13 +255,19 @@ async def _run_exec(
             stderr=asyncio.subprocess.PIPE,
             cwd=resolved_cwd,
             env=env,
+            # F-C-6: own process group (POSIX) so a timeout kill reaps the whole
+            # tree. An approved run_python *file* can Popen freely (the inline
+            # blocklist is exempt for files, M4); without this those
+            # grandchildren survive proc.kill() and accumulate orphaned.
+            start_new_session=not IS_WINDOWS,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=resolved_timeout
             )
         except asyncio.TimeoutError:
-            proc.kill()
+            # F-C-6: kill the whole process group, not just the interpreter.
+            _kill_process_tree(proc)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2)
             except asyncio.TimeoutError:
@@ -232,10 +286,10 @@ async def _run_exec(
             parts.append("(no output)")
         return "\n".join(parts)
     except FileNotFoundError:
-        return f"ERROR: '{cmd[0]}' is not installed or not found on PATH."
+        return tool_error(f"'{cmd[0]}' is not installed or not found on PATH.")
     except Exception as e:
         logger.error(f"code exec failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 # ── Tool handlers ─────────────────────────────────────────────────────────────
@@ -256,7 +310,8 @@ async def handle_run_python(args: dict) -> str:
     file_path = args.get("file", "")
     code = args.get("code", "")
     cwd = args.get("cwd", str(PROJECT_ROOT))
-    timeout = int(args.get("timeout", CODE_TIMEOUT))
+    # F-C-5: clamp the model-supplied timeout to [1, MAX_CODE_TIMEOUT_S].
+    timeout = _clamp_code_timeout(args.get("timeout"), CODE_TIMEOUT)
 
     # Validate cwd
     try:
@@ -274,19 +329,15 @@ async def handle_run_python(args: dict) -> str:
             return f"PERMISSION_ERROR: {e}"
 
         if not resolved.exists():
-            return f"ERROR: File not found: {resolved}"
+            return tool_error(f"File not found: {resolved}")
         if not str(resolved).endswith(".py"):
-            return f"ERROR: Expected a .py file, got: {resolved.name}"
+            return tool_error(f"Expected a .py file, got: {resolved.name}")
 
-        # Scan file content against the blocklist — defence-in-depth.
-        try:
-            file_content = resolved.read_text(encoding="utf-8", errors="replace")
-            block_msg = _check_code_blocked(file_content)
-            if block_msg:
-                return block_msg
-        except OSError as e:
-            return f"ERROR: Cannot read file for security scan: {e}"
-
+        # NOTE: the inline-snippet blocklist is NOT applied to files (M4).
+        # Nearly every real .py file contains `import os` or the word
+        # "subprocess" (even in comments), so scanning whole files blocked the
+        # tool's primary use case. Files are gated by validate_path + the HITL
+        # gate + minimal env + the OS sandbox instead.
         cmd = _sandbox_wrap_cmd([python, str(resolved)])
         return await _run_exec(cmd, cwd=cwd, timeout=timeout)
 
@@ -306,7 +357,7 @@ async def handle_run_python(args: dict) -> str:
         )
 
     else:
-        return "ERROR: Provide either 'file' (path to .py file) or 'code' (inline Python snippet)."
+        return tool_error("Provide either 'file' (path to .py file) or 'code' (inline Python snippet).")
 
 
 async def handle_run_node(args: dict) -> str:
@@ -325,7 +376,8 @@ async def handle_run_node(args: dict) -> str:
     file_path = args.get("file", "")
     code = args.get("code", "")
     cwd = args.get("cwd", str(PROJECT_ROOT))
-    timeout = int(args.get("timeout", CODE_TIMEOUT))
+    # F-C-5: clamp the model-supplied timeout to [1, MAX_CODE_TIMEOUT_S].
+    timeout = _clamp_code_timeout(args.get("timeout"), CODE_TIMEOUT)
 
     # Validate cwd
     try:
@@ -336,7 +388,7 @@ async def handle_run_node(args: dict) -> str:
     try:
         node = _find_node()
     except RuntimeError as e:
-        return f"ERROR: {e}"
+        return tool_error(e)
 
     if file_path:
         # Execute a .js file
@@ -346,19 +398,13 @@ async def handle_run_node(args: dict) -> str:
             return f"PERMISSION_ERROR: {e}"
 
         if not resolved.exists():
-            return f"ERROR: File not found: {resolved}"
+            return tool_error(f"File not found: {resolved}")
         if not str(resolved).endswith((".js", ".mjs", ".cjs")):
-            return f"ERROR: Expected a .js file, got: {resolved.name}"
+            return tool_error(f"Expected a .js file, got: {resolved.name}")
 
-        # Scan file content against the Node blocklist — defence-in-depth.
-        try:
-            file_content = resolved.read_text(encoding="utf-8", errors="replace")
-            block_msg = _check_node_blocked(file_content)
-            if block_msg:
-                return block_msg
-        except OSError as e:
-            return f"ERROR: Cannot read file for security scan: {e}"
-
+        # NOTE: the inline-snippet blocklist is NOT applied to files (M4) —
+        # any real Node script `require`s fs/http/etc. Files are gated by
+        # validate_path + the HITL gate + minimal env + the OS sandbox.
         cmd = _sandbox_wrap_cmd([node, str(resolved)])
         return await _run_exec(cmd, cwd=cwd, timeout=timeout)
 
@@ -379,7 +425,7 @@ async def handle_run_node(args: dict) -> str:
         return await _run_exec(cmd, cwd=cwd, timeout=timeout)
 
     else:
-        return "ERROR: Provide either 'file' (path to .js file) or 'code' (inline JavaScript snippet)."
+        return tool_error("Provide either 'file' (path to .js file) or 'code' (inline JavaScript snippet).")
 
 
 async def handle_lint_file(args: dict) -> str:
@@ -393,10 +439,11 @@ async def handle_lint_file(args: dict) -> str:
     file_path = args.get("path", "")
     fix = args.get("fix", False)
     cwd = args.get("cwd", str(PROJECT_ROOT))
-    timeout = int(args.get("timeout", SHELL_TIMEOUT))
+    # F-C-5: clamp the model-supplied timeout to [1, MAX_CODE_TIMEOUT_S].
+    timeout = _clamp_code_timeout(args.get("timeout"), SHELL_TIMEOUT)
 
     if not file_path:
-        return "ERROR: 'path' parameter is required (path to Python file to lint)."
+        return tool_error("'path' parameter is required (path to Python file to lint).")
 
     try:
         resolved = validate_path(file_path)
@@ -404,19 +451,24 @@ async def handle_lint_file(args: dict) -> str:
         return f"PERMISSION_ERROR: {e}"
 
     if not resolved.exists():
-        return f"ERROR: File not found: {resolved}"
+        return tool_error(f"File not found: {resolved}")
 
-    # Prefer ruff, fall back to flake8
-    if check_tool_available("ruff"):
+    # Prefer ruff, fall back to flake8. The linter must be invoked by its
+    # ABSOLUTE path: availability is checked against the parent PATH, but the
+    # subprocess runs with the restricted sandbox PATH — a venv/homebrew ruff
+    # would resolve for the check yet FileNotFoundError at exec time (H3).
+    ruff_path = shutil.which("ruff")
+    flake8_path = shutil.which("flake8")
+    if ruff_path:
         linter = "ruff"
         if fix:
-            cmd = ["ruff", "check", "--fix", str(resolved)]
+            cmd = [ruff_path, "check", "--fix", str(resolved)]
         else:
-            cmd = ["ruff", "check", str(resolved)]
+            cmd = [ruff_path, "check", str(resolved)]
         logger.info(f"lint_file: using ruff for {resolved}")
-    elif check_tool_available("flake8"):
+    elif flake8_path:
         linter = "flake8"
-        cmd = ["flake8", str(resolved)]
+        cmd = [flake8_path, str(resolved)]
         if fix:
             logger.info("lint_file: --fix is not supported by flake8, running check only")
         logger.info(f"lint_file: using flake8 for {resolved}")

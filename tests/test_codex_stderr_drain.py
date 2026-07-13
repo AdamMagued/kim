@@ -1,128 +1,102 @@
-"""
-Tests for _drain_stderr_to() in codex_engine/engine.py.
+"""The live codex stderr drain: real errors surface, benign chatter doesn't.
 
-Verifies that Codex subprocess stderr is surfaced in real time as [STATUS] lines
-rather than silently accumulated and only shown on non-zero exit.
+Codex is launched with stdin=/dev/null; because that is not a TTY, codex
+prints "Reading additional input from stdin..." (and immediately gets EOF).
+Surfacing that in the user-visible activity feed as a codex error is pure
+noise on every run.
+
+The old version of this file unit-tested the dead
+``codex_engine.engine._drain_stderr_to`` helper (deleted with
+``run_codex_subtask``). The LIVE stderr drain is the closure inside
+``orchestrator.codex_bridge_service._run_async``; these tests drive that path
+behaviorally with a real fake codex binary (the K4 harness pattern) and
+unit-test the ``_is_benign_codex_stderr`` classifier it uses.
 """
 
 from __future__ import annotations
 
-import asyncio
+import sys
+import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from pathlib import Path
+from unittest.mock import patch
 
-from codex_engine.engine import _drain_stderr_to
+from codex_bridge_harness import run_bridge
 
-
-def _make_stderr_stream(*lines: str) -> asyncio.StreamReader:
-    """Build an asyncio.StreamReader whose content is the given lines."""
-    reader = asyncio.StreamReader()
-    for line in lines:
-        reader.feed_data((line + "\n").encode())
-    reader.feed_eof()
-    return reader
+from codex_engine.engine import _is_benign_codex_stderr
 
 
-class DrainStderrTests(unittest.IsolatedAsyncioTestCase):
-    async def test_lines_printed_with_status_prefix(self):
-        """Each stderr line must be printed as [STATUS] codex: {line}."""
-        stream = _make_stderr_stream("error: something went wrong")
-        collected: list[str] = []
+def _make_stderr_emitting_binary(dir_path: Path, *lines: str, exit_code: int = 0) -> Path:
+    """A fake codex binary that writes the given lines to stderr, then exits."""
+    dir_path.mkdir(parents=True, exist_ok=True)
+    script = dir_path / "fake-codex-stderr"
+    emitted = "".join(f"    print({line!r}, file=sys.stderr)\n" for line in lines)
+    script.write_text(
+        f"""#!{sys.executable}
+import sys
 
-        with patch("builtins.print", side_effect=lambda *a, **kw: collected.append(a[0])):
-            await _drain_stderr_to(stream, [])
+def main():
+{emitted or '    pass'}
+    sys.exit({exit_code})
 
-        self.assertEqual(len(collected), 1)
-        self.assertEqual(collected[0], "[STATUS] codex: error: something went wrong")
+main()
+"""
+    )
+    script.chmod(0o755)
+    return script
 
-    async def test_multiple_lines_all_printed_in_order(self):
-        """All non-empty stderr lines are printed, in order, without buffering."""
-        stream = _make_stderr_stream("line one", "line two", "line three")
-        collected: list[str] = []
 
-        with patch("builtins.print", side_effect=lambda *a, **kw: collected.append(a[0])):
-            await _drain_stderr_to(stream, [])
+class LiveStderrDrainTests(unittest.IsolatedAsyncioTestCase):
+    """Drive _run_async with a fake codex that talks on stderr and assert
+    exactly which lines reach the user-visible activity feed."""
 
-        self.assertEqual(collected, [
-            "[STATUS] codex: line one",
-            "[STATUS] codex: line two",
-            "[STATUS] codex: line three",
-        ])
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="kim-stderr-drain-")
+        self.tmp = Path(self._tmp.name)
 
-    async def test_empty_lines_are_skipped(self):
-        """Empty lines must not produce [STATUS] output or be accumulated."""
-        stream = _make_stderr_stream("real error", "", "  ")
-        accumulated: list[str] = []
-        collected: list[str] = []
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
 
-        with patch("builtins.print", side_effect=lambda *a, **kw: collected.append(a[0])):
-            await _drain_stderr_to(stream, accumulated)
+    async def _run_with_stderr(self, *lines: str) -> list[str]:
+        """Run the bridge with a stderr-emitting fake codex; return every
+        "codex error: …" status message that was surfaced."""
+        from orchestrator import codex_bridge_service as svc
 
-        # Only the non-empty, non-whitespace-only line is printed
-        self.assertEqual(len(collected), 1)
-        self.assertIn("real error", collected[0])
-        # "  " (whitespace-only) is rstripped to "" and skipped
-        self.assertEqual(len(accumulated), 1)
+        binary = _make_stderr_emitting_binary(self.tmp / "stderr-bin", *lines)
+        statuses: list[str] = []
+        with patch.object(svc, "_status", side_effect=statuses.append):
+            await run_bridge(self.tmp, binary_override=str(binary))
+        return [s for s in statuses if s.startswith("codex error:")]
 
-    async def test_lines_accumulated_for_exit_message(self):
-        """Lines must also be appended to stderr_lines for the non-zero-exit summary."""
-        stream = _make_stderr_stream("ModuleNotFoundError: No module named codex")
-        accumulated: list[str] = []
+    async def test_benign_stdin_notice_is_not_surfaced(self):
+        """codex prints "Reading additional input from stdin..." because our
+        stdin is /dev/null (not a TTY). It must never be shown to the user as
+        a codex error line, while a real error on the same run still is."""
+        surfaced = await self._run_with_stderr(
+            "Reading additional input from stdin...",
+            "error: real failure",
+        )
+        self.assertEqual(surfaced, ["codex error: error: real failure"])
 
-        with patch("builtins.print"):
-            await _drain_stderr_to(stream, accumulated)
+    async def test_real_errors_are_surfaced(self):
+        surfaced = await self._run_with_stderr("something exploded")
+        self.assertEqual(surfaced, ["codex error: something exploded"])
 
-        self.assertEqual(accumulated, ["ModuleNotFoundError: No module named codex"])
+    async def test_quiet_stderr_produces_no_error_statuses(self):
+        surfaced = await self._run_with_stderr()
+        self.assertEqual(surfaced, [])
 
-    async def test_long_line_truncated_in_status_output(self):
-        """Lines longer than max_line_chars are truncated in the printed output."""
-        long_line = "x" * 300
-        stream = _make_stderr_stream(long_line)
-        collected: list[str] = []
 
-        with patch("builtins.print", side_effect=lambda *a, **kw: collected.append(a[0])):
-            await _drain_stderr_to(stream, [], max_line_chars=200)
+class BenignStderrTests(unittest.TestCase):
+    def test_stdin_reading_notice_is_benign(self):
+        self.assertTrue(_is_benign_codex_stderr("Reading additional input from stdin..."))
+        self.assertTrue(_is_benign_codex_stderr("  reading prompt from stdin  "))
+        self.assertTrue(_is_benign_codex_stderr(""))
 
-        self.assertEqual(len(collected), 1)
-        # Printed line is truncated
-        self.assertEqual(collected[0], f"[STATUS] codex: {'x' * 200}")
-        # But full line is accumulated untruncated
-        # (accumulated list is passed separately — test via a fresh call)
-
-    async def test_long_line_accumulated_untruncated(self):
-        """Full line content (untruncated) must be in stderr_lines for exit summary."""
-        long_line = "y" * 300
-        stream = _make_stderr_stream(long_line)
-        accumulated: list[str] = []
-
-        with patch("builtins.print"):
-            await _drain_stderr_to(stream, accumulated, max_line_chars=200)
-
-        # The full line is in the accumulation buffer, not truncated
-        self.assertEqual(accumulated[0], long_line)
-
-    async def test_print_called_with_flush(self):
-        """print() must be called with flush=True so lines appear immediately."""
-        stream = _make_stderr_stream("some error")
-        flush_values: list[bool] = []
-
-        def capture_print(*args, **kwargs):
-            flush_values.append(kwargs.get("flush", False))
-
-        with patch("builtins.print", side_effect=capture_print):
-            await _drain_stderr_to(stream, [])
-
-        self.assertEqual(flush_values, [True])
-
-    async def test_empty_stream_produces_no_output(self):
-        """An empty stderr stream must not print anything."""
-        stream = _make_stderr_stream()
-        collected: list[str] = []
-
-        with patch("builtins.print", side_effect=lambda *a, **kw: collected.append(a[0])):
-            await _drain_stderr_to(stream, [])
-
-        self.assertEqual(collected, [])
+    def test_real_errors_are_not_benign(self):
+        self.assertFalse(_is_benign_codex_stderr("error: something went wrong"))
+        self.assertFalse(_is_benign_codex_stderr("ModuleNotFoundError: No module named codex"))
+        self.assertFalse(_is_benign_codex_stderr("stream disconnected before completion"))
 
 
 if __name__ == "__main__":

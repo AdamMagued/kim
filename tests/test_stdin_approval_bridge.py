@@ -153,10 +153,13 @@ def test_auto_wire_stdin_bridge(monkeypatch):
     assert isinstance(agent._ui_bridge, StdinApprovalBridge)
 
 
-def test_no_auto_wire_without_threshold(monkeypatch):
-    """Without KIM_HITL_RISK_THRESHOLD, _ui_bridge stays None."""
+def test_auto_wire_without_threshold(monkeypatch):
+    """K1: the bridge attaches in Tauri mode even without a risk threshold —
+    policy escalation rules (python -c, non-allowlisted binaries) request
+    approval through the broker even in full-auto mode."""
+    from orchestrator.ui_bridge import StdinApprovalBridge
     agent = _make_agent_via_init(monkeypatch, tauri_mode="1", hitl_threshold=None)
-    assert agent._ui_bridge is None
+    assert isinstance(agent._ui_bridge, StdinApprovalBridge)
 
 
 def test_no_auto_wire_without_tauri_mode(monkeypatch):

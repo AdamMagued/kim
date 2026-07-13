@@ -58,6 +58,8 @@ pub(crate) enum KimEvent {
         reason: String,
         #[serde(default)]
         preview: String,
+        #[serde(default)]
+        id: String,
     },
     HitlApprovalResult {
         tool: String,
@@ -78,5 +80,76 @@ pub(crate) enum KimEvent {
     Activity {
         kind: String,
         text: String,
+    },
+    CommandApprovalRequest {
+        id: String,
+        command: String,
+        cwd: String,
+        #[serde(default)]
+        reason: String,
+        #[serde(default)]
+        risk: String,
+        #[serde(default)]
+        network: bool,
+        #[serde(default)]
+        amendment: Vec<serde_json::Value>,
+    },
+    FileChangeApprovalRequest {
+        id: String,
+        files: Vec<serde_json::Value>,
+        #[serde(default)]
+        reason: String,
+    },
+    UserInputRequest {
+        id: String,
+        kind: String,
+        #[serde(default)]
+        item_id: String,
+        #[serde(default)]
+        questions: Vec<serde_json::Value>,
+        #[serde(default)]
+        message: String,
+    },
+    CommandOutput {
+        item_id: String,
+        chunk: String,
+    },
+    AssistantDelta {
+        chunk: String,
+    },
+    ReasoningDelta {
+        chunk: String,
+    },
+    PlanUpdate {
+        steps: Vec<serde_json::Value>,
+    },
+    DiffUpdate {
+        unified_diff: String,
+    },
+    TokenUsage {
+        input: u64,
+        output: u64,
+        total: u64,
+    },
+    ItemLifecycle {
+        item_id: String,
+        kind: String,
+        phase: String,
+        #[serde(default)]
+        title: String,
+    },
+    TurnLifecycle {
+        phase: String,
+        #[serde(default)]
+        turn_id: String,
+    },
+    AgentDone {
+        success: bool,
+    },
+    AgentCancelled {
+        success: bool,
+    },
+    AgentError {
+        error: String,
     },
 }

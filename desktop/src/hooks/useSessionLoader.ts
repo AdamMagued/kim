@@ -4,7 +4,7 @@ import type { SessionInfo, KimMessage, Settings } from '../types';
 import type { CodexRunGroup, ActivityItem } from '../components/chat/types';
 import { collapseMessages, groupCodexMessages, isIntermediateToolCall } from '../components/chat/utils';
 import { toast } from '../components/Toast';
-import type { useChatStream } from './useChatStream';
+import { type useChatStream, MAX_RUN_HISTORY } from './useChatStream';
 
 interface UseSessionLoaderProps {
   session: SessionInfo | null;
@@ -40,9 +40,12 @@ export function useSessionLoader({
 
     const isCodexContinuation =
       isSessionChange && prevId !== null && session.session_type === 'codex' && stream.hasSentMessageRef.current;
-    const isSelfTransition =
-      isSessionChange && prevId === null && session.session_id === stream.currentTaskRef.current?.id.toString();
-    const isSeamlessTransition = isSelfTransition || isCodexContinuation;
+    // V-audit #5: a former `isSelfTransition` check here compared a backend
+    // session UUID against `PendingTask.id` (a small monotonic in-memory
+    // counter) — two unrelated id spaces that can never coincide, so the
+    // branch was dead code. Removed; isCodexContinuation covers the real
+    // seamless-transition case.
+    const isSeamlessTransition = isCodexContinuation;
     lastLoadedSessionIdRef.current = session.session_id;
     setLoadError(null);
 
@@ -71,8 +74,11 @@ export function useSessionLoader({
         .then(runs => {
           if (lastLoadedSessionIdRef.current !== session.session_id) return;
           if (runs && Array.isArray(runs)) {
-            stream.setRunHistory(runs);
-            capturedCodexRuns = runs;
+            // F-J-2: a legacy on-disk history can be arbitrarily long; cap what
+            // we hold in memory / render to the most recent runs.
+            const capped = runs.length > MAX_RUN_HISTORY ? runs.slice(runs.length - MAX_RUN_HISTORY) : runs;
+            stream.setRunHistory(capped);
+            capturedCodexRuns = capped;
             if (runs.length > 0) {
               setCodexRuns(prev =>
                 prev.map((run, i) =>
@@ -84,7 +90,12 @@ export function useSessionLoader({
             }
           }
         })
-        .catch(() => {});
+        .catch(() => {
+          // M17: don't swallow silently — durations/traces will be missing, so
+          // leave a trace for debugging without spamming the user with a toast
+          // for auxiliary data.
+          console.warn('load_run_history failed for session', session.session_id);
+        });
     }
 
     invoke<KimMessage[]>('load_session_messages', {
@@ -131,11 +142,17 @@ export function useSessionLoader({
           const grouped = groupCodexMessages(msgs);
           // Merge durations captured from load_run_history (if it already resolved),
           // so the codex "Worked for …" pills show the real duration, not 0.
+          // H9: on a same-session reload (messageReloadNonce bump after a run),
+          // load_run_history is NOT re-invoked, so capturedCodexRuns stays null
+          // and the pills reverted to "…". Fall back to the already-loaded
+          // stream.runHistory durations in that case.
+          const durationSource: Array<{ durationSec: number }> | null =
+            capturedCodexRuns ?? (isSessionChange ? null : stream.runHistory);
           setCodexRuns(
-            capturedCodexRuns
+            durationSource
               ? grouped.map((run, i) =>
-                  capturedCodexRuns![i]?.durationSec > 0
-                    ? { ...run, durationSec: capturedCodexRuns![i].durationSec }
+                  durationSource[i]?.durationSec > 0
+                    ? { ...run, durationSec: durationSource[i].durationSec }
                     : run
                 )
               : grouped

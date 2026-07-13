@@ -18,7 +18,7 @@ class WebWaitForUrlTests(unittest.IsolatedAsyncioTestCase):
         async def fake_page():
             return FakePage("https://github.com/example/kim-test-repo")
 
-        with patch.object(web, "_page", side_effect=fake_page):
+        with patch.object(web.browser, "_page", side_effect=fake_page):
             result = await web.handle_web_wait_for_url({"url_contains": "/kim-test-repo", "timeout_ms": 5})
 
         self.assertIn("URL contains", result)
@@ -27,7 +27,7 @@ class WebWaitForUrlTests(unittest.IsolatedAsyncioTestCase):
         async def fake_page():
             return FakePage("https://github.com/example/kim-test-repo")
 
-        with patch.object(web, "_page", side_effect=fake_page):
+        with patch.object(web.browser, "_page", side_effect=fake_page):
             result = await web.handle_web_wait_for_url({"url_regex": r"github\.com/.+/kim-test-repo$", "timeout_ms": 5})
 
         self.assertIn("URL matched regex", result)

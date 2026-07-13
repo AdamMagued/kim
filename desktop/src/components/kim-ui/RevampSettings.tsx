@@ -5,7 +5,7 @@ import { PaneHeader } from './settings-panes/primitives';
 import { PaneAI } from './settings-panes/PaneAI';
 import { PaneAccount } from './settings-panes/PaneAccount';
 import { PaneAppearance, PanePaths, PaneData } from './settings-panes/PaneSystem';
-import { PaneMCP, PaneFeedback, PaneAbout, PaneRelay } from './settings-panes/PaneInfo';
+import { PaneMCP, PaneFeedback, PaneAbout } from './settings-panes/PaneInfo';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -16,7 +16,6 @@ type PaneId =
   | 'data'
   | 'schedule'
   | 'account'
-  | 'relay'
   | 'mcp'
   | 'feedback'
   | 'about';
@@ -32,27 +31,19 @@ interface Props {
   initialPane?: PaneId;
 }
 
-// ── Feature flags ─────────────────────────────────────────────────────────────
-
-// Set to true to re-enable the Phone Relay pane in Settings.
-const RELAY_ENABLED = false;
-
 // ── Static config ─────────────────────────────────────────────────────────────
 
-const NAV_ALL: { id: PaneId; label: string; icon: PaneId }[] = [
+const NAV: { id: PaneId; label: string; icon: PaneId }[] = [
   { id: 'appearance', label: 'Appearance', icon: 'appearance' },
   { id: 'ai', label: 'AI', icon: 'ai' },
   { id: 'paths', label: 'Paths', icon: 'paths' },
   { id: 'data', label: 'Data', icon: 'data' },
   { id: 'schedule', label: 'Schedules', icon: 'schedule' },
   { id: 'account', label: 'Account', icon: 'account' },
-  { id: 'relay', label: 'Phone Relay', icon: 'relay' },
   { id: 'mcp', label: 'MCP', icon: 'mcp' },
   { id: 'feedback', label: 'Feedback', icon: 'feedback' },
   { id: 'about', label: 'About', icon: 'about' },
 ];
-
-const NAV = RELAY_ENABLED ? NAV_ALL : NAV_ALL.filter(n => n.id !== 'relay');
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
@@ -129,13 +120,6 @@ function NavIcon({ name }: { name: PaneId }) {
           <path {...stroke} d="M8 7v4M8 5v.5" />
         </svg>
       );
-    case 'relay':
-      return (
-        <svg width="15" height="15" viewBox="0 0 24 24">
-          <rect {...stroke} x="7" y="2" width="10" height="20" rx="2" />
-          <path {...stroke} d="M11 18h2" />
-        </svg>
-      );
   }
 }
 
@@ -146,7 +130,6 @@ const PANE_META: Record<PaneId, { title: string; subtitle: string }> = {
   data: { title: 'Data', subtitle: 'Your sessions live on your machine. Nothing leaves unless you sync.' },
   schedule: { title: 'Schedules', subtitle: 'Plan recurring tasks and run due work on demand.' },
   account: { title: 'Account', subtitle: 'How you show up across Kim and your linked services.' },
-  relay: { title: 'Phone Relay', subtitle: 'Send prompts from your phone to this PC.' },
   mcp: { title: 'MCP', subtitle: 'Tool packs Kim can call — built-in and your own.' },
   feedback: { title: 'Feedback', subtitle: "Tell us what's on your mind. We read every one." },
   about: { title: 'About', subtitle: "What's running, and what's new." },
@@ -314,7 +297,6 @@ export function RevampSettings(props: Props) {
           {active === 'data' && <PaneData account={account} onAccountChange={onAccountChange} />}
           {active === 'schedule' && <PaneSchedule settings={settings} onChange={onChange} />}
           {active === 'account' && <PaneAccount account={account} onAccountChange={onAccountChange} />}
-          {RELAY_ENABLED && active === 'relay' && <PaneRelay settings={settings} />}
           {active === 'mcp' && <PaneMCP />}
           {active === 'feedback' && <PaneFeedback />}
           {active === 'about' && <PaneAbout appVersion={appVersion} onCheckUpdate={onCheckUpdate} />}

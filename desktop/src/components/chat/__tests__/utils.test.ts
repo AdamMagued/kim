@@ -88,27 +88,32 @@ describe('collapseMessages srcIdx (B2)', () => {
 
 const GENERIC_FALLBACK = 'Something went wrong. Check your settings and try again.';
 
-describe('friendlyError — sensitive detail rejection', () => {
-  it('friendlyError_rejects_sensitive_detail: file path triggers fallback', () => {
-    // A slash-separated path segment is sensitive and must never surface in the UI.
-    expect(friendlyError('process died at /home/user/project/run')).toBe(GENERIC_FALLBACK);
+describe('friendlyError — real crash text is surfaced (audit B3/B4/C20)', () => {
+  // The old scrubber deleted any error containing a path / ".py" / traceback
+  // fragment and replaced it with the generic fallback — destroying the one
+  // clue the user needs (ModuleNotFoundError, NEED_HELP questions, etc.). The
+  // fix surfaces the cleaned text; it must NOT collapse to the generic string.
+  it('surfaces a ModuleNotFoundError verbatim', () => {
+    const msg = "ModuleNotFoundError: No module named 'mcp'";
+    expect(friendlyError(msg)).toBe(msg);
   });
 
-  it('friendlyError_rejects_sensitive_detail: Traceback keyword triggers fallback', () => {
-    expect(friendlyError('Traceback (most recent call last)')).toBe(GENERIC_FALLBACK);
+  it('keeps a message that mentions a file path', () => {
+    const out = friendlyError('process died at /home/user/project/run');
+    expect(out).toBe('process died at /home/user/project/run');
+    expect(out).not.toBe(GENERIC_FALLBACK);
   });
 
-  it('friendlyError_rejects_sensitive_detail: File "..." reference triggers fallback', () => {
-    expect(friendlyError('File "/opt/project/main.py", line 42, in run')).toBe(GENERIC_FALLBACK);
+  it('keeps a .py reference instead of deleting it', () => {
+    const out = friendlyError('Exception raised in runner.py:88');
+    expect(out).toContain('runner.py');
+    expect(out).not.toBe(GENERIC_FALLBACK);
   });
 
-  it('friendlyError_rejects_sensitive_detail: .py reference triggers fallback', () => {
-    expect(friendlyError('Exception raised in runner.py:88')).toBe(GENERIC_FALLBACK);
-  });
-
-  it('friendlyError_rejects_sensitive_detail: JS stack frame triggers fallback', () => {
-    // Matches /^\s*at\s+\S+\s+\(/ after cleaning prefixes.
-    expect(friendlyError('at Object.callFn (bundle.js:1:100)')).toBe(GENERIC_FALLBACK);
+  it('keeps a NEED_HELP-style long question intact', () => {
+    const q = 'I need to know which database you want me to use before I can '
+      + 'continue — Postgres, SQLite, or something else? Please reply with one.';
+    expect(friendlyError(q)).toBe(q);
   });
 });
 
@@ -130,9 +135,16 @@ describe('friendlyError — short clean message passthrough', () => {
     expect(result).toBe('Something specific happened');
   });
 
-  it('friendlyError_keeps_short_clean_message: messages >=200 chars fall back to generic', () => {
-    const long = 'A'.repeat(200);
-    expect(friendlyError(long)).toBe(GENERIC_FALLBACK);
+  it('friendlyError_caps_very_long_message_with_ellipsis: >600 chars truncates but is not discarded', () => {
+    const long = 'A'.repeat(700);
+    const out = friendlyError(long);
+    expect(out).not.toBe(GENERIC_FALLBACK);
+    expect(out.endsWith('…')).toBe(true);
+    expect(out.length).toBe(601); // 600 chars + ellipsis
+  });
+
+  it('friendlyError_falls_back_only_when_nothing_usable_remains', () => {
+    expect(friendlyError('   ')).toBe(GENERIC_FALLBACK);
   });
 });
 

@@ -17,9 +17,13 @@ import {
   providerLabel,
   estimateCostUsd,
   formatCostUsd,
+  costBasisLabel,
 } from './utils';
 import { buildThinkingTrace, traceToWorkedFor } from './parsers';
 import { ActivityFeed } from './ActivityFeed';
+import { CodexTurnPanel, HitlStatusCard } from './CodexTurnPanel';
+import { ContextMeter, type ContextMeterState } from './ContextMeter';
+import type { CodexTurnState } from '../../hooks/useCodexTurn';
 
 // ── Blobby Loader Component ──────────────────────────────────────────────────
 
@@ -73,12 +77,19 @@ function BlobLoader({ which }: { which: 3 | 6 | 12 | 15 | 20 }) {
 export interface StreamRendererProps {
   messages: KimMessage[];
   loadingMessages: boolean;
+  /** M17: set when the session file couldn't be read — rendered instead of the
+   *  bare "No messages in this session" empty state. */
+  loadError?: string | null;
   liveHistory: { role: 'user' | 'assistant'; content: string }[];
   runHistory: { activity: ActivityItem[]; durationSec: number; provider?: string | null }[];
   codexRuns: CodexRunGroup[];
   taskError: string | null;
   hitlApprovalStatus: HitlApprovalStatus | null;
-  onHitlRespond?: (approved: boolean) => void;
+  // M3: carries the full decision vocabulary so the legacy HITL card can send
+  // acceptForSession (the narrowed `(approved: boolean) => void` type silently
+  // dropped the decision param the hook already supports).
+  onHitlRespond?: (approved: boolean, decision?: 'accept' | 'acceptForSession' | 'decline') => void;
+  codexTurn?: CodexTurnState | null;
   permissionMode?: PermissionMode;
   onPermissionModeChange?: (mode: PermissionMode) => void;
   runFailure?: { reason: string; recoverable: boolean; suggestion: string } | null;
@@ -90,6 +101,9 @@ export interface StreamRendererProps {
   autoFollowOutput: boolean;
   setAutoFollowOutput: (val: boolean) => void;
   bottomRef: RefObject<HTMLDivElement | null>;
+  /** H1: attached to `.kim-messages` so useSessionScroll can detect the user
+   *  scrolling up (was created but never attached — auto-follow was forced). */
+  outputRef?: RefObject<HTMLDivElement | null>;
   newestMsgIdx: number | null;
   queuedTasks: PendingTask[];
   lastRunTask: PendingTask | null;
@@ -106,6 +120,9 @@ export interface StreamRendererProps {
   setTaskInput: (val: string) => void;
   resolveProvider: () => string;
   tokenStats?: { input: number; output: number; total: number } | null;
+  /** A1/D-A1: context-usage state from the kim:context pipeline. Rendered as
+   *  the ContextMeter gauge above the composer (previously plumbed nowhere). */
+  contextState?: ContextMeterState | null;
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -113,12 +130,14 @@ export interface StreamRendererProps {
 export function StreamRenderer({
   messages,
   loadingMessages,
+  loadError,
   liveHistory,
   runHistory,
   codexRuns,
   taskError,
   hitlApprovalStatus,
   onHitlRespond,
+  codexTurn,
   permissionMode,
   onPermissionModeChange,
   runFailure,
@@ -130,6 +149,7 @@ export function StreamRenderer({
   autoFollowOutput,
   setAutoFollowOutput,
   bottomRef,
+  outputRef,
   newestMsgIdx,
   queuedTasks,
   lastRunTask,
@@ -146,6 +166,7 @@ export function StreamRenderer({
   setTaskInput,
   resolveProvider,
   tokenStats,
+  contextState,
 }: StreamRendererProps) {
 
   // ── Memoized derived values ────────────────────────────────────────────────
@@ -208,8 +229,18 @@ export function StreamRenderer({
   _editRef.current = handleEditLiveMessage;
   const stableEdit = useCallback((idx: number, newText: string) => _editRef.current(idx, newText), []);
 
-  // renderWorkedFor as a stable useCallback so it can be a dep of the live-msg
-  // memos below. The only non-constant value it closes over is tokenStats.
+  // F-F-11: read tokenStats from a ref (assigned during render, same pattern as
+  // _retryRef/_editRef above) so renderWorkedFor has a STABLE identity ([] deps).
+  // tokenStats is replaced on every kim:stats tick (once per provider call);
+  // when it was a useCallback dep, its identity churned each tick → savedMsgNodes
+  // (which lists renderWorkedFor in its deps) rebuilt the ENTIRE saved history —
+  // an O(N) reconciliation several times/sec — even though saved rows call
+  // renderWorkedFor with showCost=false and never read tokenStats at all. The
+  // single live last-run pill that DOES show cost reads the ref at the moment its
+  // memo recomputes (run completion / message change), which is exactly when the
+  // final cost is known; intra-run stats ticks no longer rebuild history.
+  const _tokenStatsRef = useRef(tokenStats);
+  _tokenStatsRef.current = tokenStats;
   const renderWorkedFor = useCallback((_idx: number, run: { activity: ActivityItem[]; durationSec: number; provider?: string | null }, showCost = false) => {
     const historyTrace = buildThinkingTrace(run.activity, parsePlanFromActivity(run.activity));
     const workedForTrace = traceToWorkedFor(historyTrace);
@@ -219,15 +250,16 @@ export function StreamRenderer({
     const duration = run.durationSec > 0 ? formatDuration(run.durationSec) : '…';
     // B5: price with the provider THIS run used (not the currently-selected one).
     const runProvider = run.provider ?? null;
-    const costUsd = showCost && tokenStats && runProvider
-      ? estimateCostUsd(runProvider, tokenStats.input, tokenStats.output)
+    const ts = _tokenStatsRef.current;
+    const costUsd = showCost && ts && runProvider
+      ? estimateCostUsd(runProvider, ts.input, ts.output)
       : null;
     return (
       <div className="kim-msg-row kim-msg-row--assistant" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 6 }}>
         <WorkedForPill trace={workedForTrace} duration={duration} />
         {costUsd !== null && (
           <span
-            title={`~${formatCostUsd(costUsd)} estimated · ${tokenStats?.input.toLocaleString()} in / ${tokenStats?.output.toLocaleString()} out tokens`}
+            title={`~${formatCostUsd(costUsd)} — ${costBasisLabel(runProvider ?? '') ?? 'estimated'} · ${ts?.input.toLocaleString()} in / ${ts?.output.toLocaleString()} out tokens`}
             style={{
               fontFamily: 'var(--kim-mono)',
               fontSize: 11.5,
@@ -245,7 +277,7 @@ export function StreamRenderer({
         )}
       </div>
     );
-  }, [tokenStats]);
+  }, []);
 
   // showLiveActivity: true when the last real user message in collapsedLive has
   // no non-intermediate assistant reply after it. Stable during activity/elapsed
@@ -269,7 +301,9 @@ export function StreamRenderer({
   //   collapsedLive / runHistory — useState refs, only update on message events
   //   settings.typing_animation  — primitive string
   //   stableRetry / stableEdit   — useCallback with empty deps (ref-backed)
-  //   renderWorkedFor            — useCallback whose only dep is tokenStats
+  //   renderWorkedFor            — useCallback with empty deps (F-F-11: tokenStats
+  //                                is read via a ref, so stats ticks no longer
+  //                                churn its identity and rebuild the history)
   const liveMsgNodesNewChat = useMemo(() => {
     let liveUserIdx = -1;
     let liveAsstRunIdx = -1;
@@ -329,58 +363,57 @@ export function StreamRenderer({
     });
   }, [collapsedLive, runHistory, savedUserCount, savedAsstCount, settings.typing_animation, stableRetry, stableEdit, renderWorkedFor]);
 
+  // L2: session-branch saved-message nodes, memoized like the live lists so
+  // the O(msgs × activity) regex work in renderWorkedFor doesn't re-run on
+  // every 50ms activity flush / 1s elapsed tick in long sessions.
+  const savedMsgNodes = useMemo(() => {
+    let userMsgIdx = -1;
+    return collapsedSaved.map(({ msg, retries, srcIdx }, i) => {
+      if (msg.role === 'user' && isRealUserMessage(msg)) userMsgIdx += 1;
+      if (isIntermediateToolCall(msg)) return null;
+
+      let workedRun: { activity: ActivityItem[]; durationSec: number; provider?: string | null } | null = null;
+      if (msg.role === 'assistant') {
+        const savedIdx = userMsgIdx - liveAsstCount;
+        workedRun = runHistory[savedIdx] ?? null;
+        if (!workedRun) {
+          // Use precomputed map — avoids re-calling synthesizeExchangeActivity per render
+          const synth = synthActivityMap.get(userMsgIdx) ?? null;
+          if (synth) workedRun = { activity: synth, durationSec: 0 };
+        }
+      }
+
+      return (
+        <div key={`msg-${srcIdx}`}>
+          {workedRun && renderWorkedFor(userMsgIdx, workedRun)}
+          <MessageBubble
+            message={msg}
+            animate={i === newestMsgIdx}
+            typingAnimation={settings.typing_animation ?? 'none'}
+            onRetry={stableRetry}
+            retries={retries}
+          />
+        </div>
+      );
+    });
+  }, [collapsedSaved, runHistory, liveAsstCount, synthActivityMap, newestMsgIdx, settings.typing_animation, stableRetry, renderWorkedFor]);
+
   // ── Render Helpers ─────────────────────────────────────────────────────────
 
   function renderHitlStatus() {
-    if (!hitlApprovalStatus) return null;
-    const isPending = hitlApprovalStatus.approved === null;
-    const stateLabel =
-      isPending
-        ? 'Approval required'
-        : hitlApprovalStatus.approved
-          ? 'Approved'
-          : 'Denied';
-    const detail =
-      isPending
-        ? 'Kim paused before a high-risk action.'
-        : hitlApprovalStatus.approved
-          ? 'Kim can continue with the approved action.'
-          : 'Kim will choose another approach or ask for help.';
-
+    // Approval UI lives in CodexTurnPanel.tsx; this renders BOTH the legacy
+    // task-level HITL card and the codex app-server turn panel (native
+    // per-command approvals, plan, live output, diff).
+    if (!hitlApprovalStatus && !codexTurn) return null;
     return (
-      <div className="kim-msg-row kim-msg-row--assistant">
-        <div
-          className={`kim-hitl-status${hitlApprovalStatus.approved === false ? ' kim-hitl-status--denied' : ''}`}
-          role="status"
-          aria-live="polite"
-        >
-          <span className="kim-hitl-status__label">{stateLabel}</span>
-          <span className="kim-hitl-status__body">
-            {detail} Tool: <strong>{hitlApprovalStatus.tool}</strong>. Risk: {hitlApprovalStatus.risk} ({hitlApprovalStatus.reason}).
-          </span>
-          {hitlApprovalStatus.preview && (
-            <pre className="kim-hitl-status__preview"><code>{hitlApprovalStatus.preview}</code></pre>
-          )}
-          {isPending && onHitlRespond && (
-            <span className="kim-hitl-status__actions">
-              <button
-                className="kim-hitl-btn kim-hitl-btn--approve"
-                onClick={() => onHitlRespond(true)}
-                aria-label="Approve tool execution"
-              >
-                Approve
-              </button>
-              <button
-                className="kim-hitl-btn kim-hitl-btn--deny"
-                onClick={() => onHitlRespond(false)}
-                aria-label="Deny tool execution"
-              >
-                Deny
-              </button>
-            </span>
-          )}
-        </div>
-      </div>
+      <>
+        {hitlApprovalStatus && (
+          <div className="kim-msg-row kim-msg-row--assistant">
+            <HitlStatusCard status={hitlApprovalStatus} onRespond={onHitlRespond} />
+          </div>
+        )}
+        {codexTurn && <CodexTurnPanel turn={codexTurn} />}
+      </>
     );
   }
 
@@ -506,8 +539,9 @@ export function StreamRenderer({
     return (
       <div className="kim-msg-row kim-msg-row--assistant">
         <div className="kim-file-pills">
+          {/* L10: key by path — index keys mis-reconcile when the list mutates */}
           {files.map((f, i) => (
-            <span key={i} className="kim-file-pill">
+            <span key={f.path || i} className="kim-file-pill">
               <span className="kim-file-pill__name">{basename(f.path)}</span>
               {(f.added > 0 || f.removed > 0) && (
                 <span className="kim-file-pill__stats">
@@ -550,7 +584,7 @@ export function StreamRenderer({
 
         {/* B11: only the bottom sentinel gets bottomRef — binding it here too
             made the scroll target mount-order-dependent. */}
-        <div className="kim-messages">
+        <div className="kim-messages" ref={outputRef}>
           {empty && (
             <div
               style={{
@@ -665,8 +699,11 @@ export function StreamRenderer({
           {renderHitlStatus()}
 
           {/* Error / retry — B4: suppress the legacy banner when the structured
-              run-failure card is shown for the same run (avoid double surface). */}
-          {taskError && !runFailure && (
+              run-failure card is shown for the same run (avoid double surface).
+              B2: never render the retry banner mid-run — a transient stderr line
+              would otherwise show a red "Retry" over a task that is still working
+              and inviting a duplicate-task retry. */}
+          {taskError && !runFailure && !isRunning && (
             <div className="kim-msg-row kim-msg-row--assistant">
               <div className="kim-task-error" role="alert">
                 <span className="kim-task-error__icon">⚠</span>
@@ -715,6 +752,9 @@ export function StreamRenderer({
           <div ref={bottomRef} />
         </div>
 
+        {!empty && contextState && (
+          <div className="kim-context-meter-wrap"><ContextMeter state={contextState} /></div>
+        )}
         {!empty && renderPermissionToggle()}
         {!empty && renderComposer(false)}
       </div>
@@ -727,7 +767,7 @@ export function StreamRenderer({
       {renderConnectorsChrome()}
 
       {/* Messages */}
-      <div className="kim-messages">
+      <div className="kim-messages" ref={outputRef}>
         {loadingMessages ? (
           <div className="kim-messages__loading">
             <svg width="0" height="0" style={{ position: 'absolute' }}>
@@ -744,7 +784,10 @@ export function StreamRenderer({
           </div>
         ) : messages.length === 0 ? (
           <div className="kim-messages__empty">
-            <div className="kim-messages__empty-text">No messages in this session</div>
+            {/* M17: distinguish "couldn't read the file" from "genuinely empty" */}
+            <div className="kim-messages__empty-text" role={loadError ? 'alert' : undefined}>
+              {loadError ?? 'No messages in this session'}
+            </div>
           </div>
         ) : (
           <>
@@ -773,38 +816,8 @@ export function StreamRenderer({
                 </div>
               ))
             ) : (
-              /* Normal message view */
-              (() => {
-                let userMsgIdx = -1;
-                return collapsedSaved.map(({ msg, retries, srcIdx }, i) => {
-                  if (msg.role === 'user' && isRealUserMessage(msg)) userMsgIdx += 1;
-                  if (isIntermediateToolCall(msg)) return null;
-
-                  let workedRun: { activity: ActivityItem[]; durationSec: number; provider?: string | null } | null = null;
-                  if (msg.role === 'assistant') {
-                    const savedIdx = userMsgIdx - liveAsstCount;
-                    workedRun = runHistory[savedIdx] ?? null;
-                    if (!workedRun) {
-                      // Use precomputed map — avoids re-calling synthesizeExchangeActivity per render
-                      const synth = synthActivityMap.get(userMsgIdx) ?? null;
-                      if (synth) workedRun = { activity: synth, durationSec: 0 };
-                    }
-                  }
-
-                  return (
-                    <div key={`msg-${srcIdx}`}>
-                      {workedRun && renderWorkedFor(userMsgIdx, workedRun)}
-                      <MessageBubble
-                        message={msg}
-                        animate={i === newestMsgIdx}
-                        typingAnimation={settings.typing_animation ?? 'none'}
-                        onRetry={handleRetryLast}
-                        retries={retries}
-                      />
-                    </div>
-                  );
-                });
-              })()
+              /* Normal message view — L2: memoized node list (savedMsgNodes) */
+              savedMsgNodes
             )}
 
             {/* Newly added messages in this session — same memo strategy:
@@ -821,12 +834,31 @@ export function StreamRenderer({
             {renderRateLimited()}
 
             {/* B3/B4: friendly agent-error text; suppressed when the structured
-                run-failure card already explains the same run. */}
-            {taskError && !runFailure && (
+                run-failure card already explains the same run. B2: and never
+                mid-run — a recovered stderr line must not show Resend Task over
+                a task that is still working. */}
+            {taskError && !runFailure && !isRunning && (
               <div className="kim-msg-row kim-msg-row--assistant">
                 <div style={{ maxWidth: '78%', minWidth: 0 }}>
                   <SignalCard kind="error" text={friendlyTaskError(taskError)} onAction={handleRetryLast} actionLabel="Resend Task" />
                 </div>
+              </div>
+            )}
+
+            {/* H1: "Jump to latest" pill — the session branch never had one even
+                though auto-follow can now be paused here too. */}
+            {!autoFollowOutput && (activity.length > 0 || isRunning) && (
+              <div className="kim-jump-latest-wrap">
+                <button
+                  type="button"
+                  className="kim-jump-latest-btn"
+                  onClick={() => {
+                    setAutoFollowOutput(true);
+                    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+                  }}
+                >
+                  Jump to latest
+                </button>
               </div>
             )}
           </>
@@ -834,6 +866,9 @@ export function StreamRenderer({
         <div ref={bottomRef} />
       </div>
 
+      {contextState && (
+        <div className="kim-context-meter-wrap"><ContextMeter state={contextState} /></div>
+      )}
       {renderPermissionToggle()}
       {renderComposer()}
     </div>

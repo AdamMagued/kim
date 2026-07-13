@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 import sys
 import types
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +85,35 @@ class TestPromptRender:
         prompt = agent._build_system_prompt("open Safari and take a screenshot")
         assert "Kim" in prompt
         assert "TASK_COMPLETE" in prompt
+
+    def test_browser_new_chat_does_not_inject_other_session_summaries(self):
+        from orchestrator.providers.fake import FakeProvider
+        from conftest import make_test_agent
+
+        BrowserProvider = type("BrowserProvider", (FakeProvider,), {})
+        agent = make_test_agent(provider=BrowserProvider())
+        summaries = [{"date": "2026-07-07", "summary": "secret old chat"}]
+        with patch(
+            "orchestrator.agent.SessionStore.recent_summaries",
+            return_value=summaries,
+        ) as recent_summaries:
+            prompt = agent._build_system_prompt("brand new task")
+
+        assert "secret old chat" not in prompt
+        assert "# Recent context" not in prompt
+        recent_summaries.assert_not_called()
+
+    def test_non_browser_provider_keeps_recent_context_memory(self):
+        agent = _make_agent(lean=False)
+        summaries = [{"date": "2026-07-07", "summary": "useful old task"}]
+        with patch(
+            "orchestrator.agent.SessionStore.recent_summaries",
+            return_value=summaries,
+        ):
+            prompt = agent._build_system_prompt("new API task")
+
+        assert "# Recent context" in prompt
+        assert "useful old task" in prompt
 
     def test_lean_system_prompt_renders(self):
         agent = _make_agent(lean=True)

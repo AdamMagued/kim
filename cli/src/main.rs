@@ -3,7 +3,10 @@ mod commands;
 mod config;
 mod markdown;
 mod provider;
+mod repl_turn;
+use repl_turn::consume_turn_events;
 mod sessions;
+mod stdin_reader;
 
 use std::io::{self, stdout, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -65,7 +68,11 @@ pub enum ViewState {
 enum CliCommand {
     ShowHelp,
     ShowVersion,
-    Doctor,
+    /// `kim doctor` health check. `strict` (from `--strict`) makes optional,
+    /// provider-specific check failures gate the exit code too. (F-E-1)
+    Doctor {
+        strict: bool,
+    },
     Oneshot {
         mode: AppMode,
         prompt: Option<String>,
@@ -73,6 +80,10 @@ enum CliCommand {
     Repl {
         resume_id: Option<String>,
     },
+    /// #6: a CLI flag was given but is malformed (currently only a bare
+    /// trailing `--resume`). Carries the message to print to stderr before
+    /// exiting non-zero — never silently falls through to a fresh session.
+    UsageError(String),
 }
 
 fn parse_cli_args(args: &[String]) -> CliCommand {
@@ -86,14 +97,44 @@ fn parse_cli_args(args: &[String]) -> CliCommand {
         return CliCommand::ShowVersion;
     }
     match args.first().map(String::as_str) {
-        Some("doctor") => CliCommand::Doctor,
+        // Bare `kim` opens the interactive REPL.
+        None => CliCommand::Repl { resume_id: None },
+        Some("doctor") => match args.get(1).map(String::as_str) {
+            None => CliCommand::Doctor { strict: false },
+            // F-E-1: `--strict` gates the exit code on provider-specific checks
+            // too (for CI / install scripts).
+            Some("--strict") => {
+                if let Some(extra) = args.get(2) {
+                    return CliCommand::UsageError(format!(
+                        "kim doctor: unexpected argument '{extra}'. Usage: kim doctor [--strict]"
+                    ));
+                }
+                CliCommand::Doctor { strict: true }
+            }
+            // doctor takes no other arguments; an extra token is a typo, not a
+            // silent no-op. (F-E-2)
+            Some(extra) => CliCommand::UsageError(format!(
+                "kim doctor: unexpected argument '{extra}'. Usage: kim doctor [--strict]"
+            )),
+        },
         Some(sub @ "chat") | Some(sub @ "code") => {
+            let rest = &args[1..];
+            // F-E-2: `kim chat --resume abc` used to treat `--resume abc` as
+            // prompt text and send it to the model. A leading option after the
+            // subcommand is a mistake — reject it instead of silently turning
+            // the user's intent into a prompt.
+            if let Some(first) = rest.first() {
+                if first.starts_with('-') {
+                    return CliCommand::UsageError(format!(
+                        "kim {sub}: unexpected option '{first}'. Usage: kim {sub} <prompt...>"
+                    ));
+                }
+            }
             let mode = if sub == "code" {
                 AppMode::Code
             } else {
                 AppMode::Chat
             };
-            let rest = &args[1..];
             let prompt = if rest.is_empty() {
                 None
             } else {
@@ -101,12 +142,34 @@ fn parse_cli_args(args: &[String]) -> CliCommand {
             };
             CliCommand::Oneshot { mode, prompt }
         }
-        _ => {
-            let resume_id = args
-                .windows(2)
-                .find_map(|w| (w[0] == "--resume").then_some(w[1].clone()));
-            CliCommand::Repl { resume_id }
-        }
+        // `kim --resume <id>` resumes an existing session in the REPL. The id
+        // is required (#6: a bare trailing `--resume` is a usage error, never a
+        // silent new session).
+        Some("--resume") => match args.get(1) {
+            Some(value) => {
+                if let Some(extra) = args.get(2) {
+                    return CliCommand::UsageError(format!(
+                        "kim --resume: unexpected argument '{extra}'. \
+                         Usage: kim --resume <id|latest>"
+                    ));
+                }
+                CliCommand::Repl {
+                    resume_id: Some(value.clone()),
+                }
+            }
+            None => CliCommand::UsageError(
+                "kim --resume: missing session id. Usage: kim --resume <id|latest>".to_string(),
+            ),
+        },
+        // F-E-2: anything else — an unknown flag (`--continue`, a typo'd
+        // `--resum`), or an unknown bare subcommand (`resume`, `login`) — used
+        // to fall through to a brand-new REPL session, silently discarding the
+        // user's intent and scattering a fresh session file. Reject it (exit 2)
+        // the same way `--resume`-without-value is rejected.
+        Some(other) => CliCommand::UsageError(format!(
+            "kim: unknown command '{other}'.\n\
+             Usage: kim [chat|code <prompt>] | kim doctor | kim --resume <id> | kim --help"
+        )),
     }
 }
 
@@ -114,6 +177,21 @@ fn parse_cli_args(args: &[String]) -> CliCommand {
 pub struct UiMessage {
     pub role: MessageRole,
     pub content: String,
+    /// F-E-3: the epoch-millis this message was created, if known. Set when the
+    /// message is first pushed and preserved verbatim across load→save, so a
+    /// long conversation keeps its real per-message times instead of having
+    /// every record re-stamped to the last save instant. `None` for ephemeral
+    /// (print-only) messages that are never persisted.
+    pub timestamp_ms: Option<u64>,
+}
+
+impl UiMessage {
+    /// Current epoch-millis, for stamping a freshly-created message.
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64)
+    }
 }
 
 pub struct App {
@@ -182,6 +260,8 @@ impl App {
         self.messages.push(UiMessage {
             role,
             content: content.into(),
+            // F-E-3: stamp the creation time now, so it survives future saves.
+            timestamp_ms: Some(UiMessage::now_ms()),
         });
     }
 
@@ -261,13 +341,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match parse_cli_args(&args) {
         CliCommand::ShowHelp => println!("{}", help_text()),
         CliCommand::ShowVersion => println!("kim {}", env!("CARGO_PKG_VERSION")),
-        CliCommand::Doctor => {
-            let mut config = KimConfig::load();
-            match handle_command("/doctor", &mut config).await {
-                CommandOutcome::Message(message) | CommandOutcome::Info(message) => {
-                    println!("{message}")
-                }
-                other => eprintln!("kim doctor returned unexpected outcome: {other:?}"),
+        CliCommand::UsageError(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+        CliCommand::Doctor { strict } => {
+            // F-E-1: `kim doctor` must exit non-zero when a required check fails
+            // (and, under --strict, when any provider-specific check fails) so
+            // install scripts and CI can gate on it. The old path built the
+            // report via handle_command and always fell through to Ok(()) → 0.
+            let config = KimConfig::load();
+            let report = commands::doctor_report(&config).await;
+            println!("{}", report.text);
+            if commands::doctor_should_fail(report.required_ok, report.all_ok, strict) {
+                std::process::exit(1);
             }
         }
         CliCommand::Oneshot { mode, prompt } => {
@@ -323,15 +410,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 One-shot commands: kim chat <prompt> / kim code <prompt>
 =========================================================== */
 
+/// F-E-14: which providers may run in code mode. Codex only has two backends
+/// here: the local `codex` binary talking to ollama through the responses proxy
+/// (`ollama` / `ollama-cloud` / empty→ollama), and the codex browser bridge
+/// (`browser` / `browser:<site>`). Every OTHER provider (openai, claude, gemini,
+/// deepseek, desktop) used to fall through the `== "openai"`-only gate into the
+/// local-codex branch, which unconditionally pointed codex at
+/// `config.ollama_base_url` with `config.model` — e.g. `claude-sonnet-4-6` sent
+/// to an ollama endpoint, which 404s with a misleading "check that ollama is
+/// running" error and no hint that the provider choice was ignored.
+///
+/// Returns `Some(reason)` for a disallowed provider, `None` when code mode may
+/// proceed. Mirrors the scheduled-runner allowlist
+/// (`orchestrator/scheduled_runner.py::is_allowed_provider`).
+fn code_mode_denied_reason(provider: &str) -> Option<String> {
+    let p = provider.trim().to_ascii_lowercase();
+    if p.is_empty()
+        || p == "ollama"
+        || p == "ollama-cloud"
+        || crate::provider::is_browser_provider(&p)
+    {
+        return None;
+    }
+    Some(format!(
+        "Code mode does not support the '{provider}' provider — it runs only on ollama \
+         or a browser provider. Switch first: /provider ollama  (or e.g. /provider browser:chatgpt)."
+    ))
+}
+
 async fn run_oneshot(mode: AppMode, prompt: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(KimConfig::load(), None);
     app.provider_ready = provider_is_ready(&app.config);
 
-    if mode == AppMode::Code && app.config.provider == "openai" {
-        eprintln!(
-            "Code mode does not support OpenAI. Switch provider first: /provider ollama or /provider claude."
-        );
-        std::process::exit(2);
+    if mode == AppMode::Code {
+        if let Some(reason) = code_mode_denied_reason(&app.config.provider) {
+            eprintln!("{reason}");
+            std::process::exit(2);
+        }
     }
 
     app.set_mode(mode);
@@ -409,11 +524,8 @@ fn choose_start_mode(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             "c" | "code" | "1" => {
-                if app.config.provider == "openai" {
-                    println!(
-                        "{}",
-                        paint_dim("Code mode does not support OpenAI. Switch provider first: /provider ollama or /provider claude.")
-                    );
+                if let Some(reason) = code_mode_denied_reason(&app.config.provider) {
+                    println!("{}", paint_dim(&reason));
                     continue;
                 }
                 app.set_mode(AppMode::Code);
@@ -813,6 +925,7 @@ fn choose_session_interactively(app: &mut App) -> Result<(), Box<dyn std::error:
                             Err(error) => print_message(&UiMessage {
                                 role: MessageRole::Error,
                                 content: error,
+                                timestamp_ms: None,
                             }),
                         }
                         return Ok(());
@@ -962,11 +1075,8 @@ async fn apply_repl_outcome(
             Ok(false)
         }
         CommandOutcome::SetCodeMode => {
-            if app.config.provider == "openai" {
-                app.push(
-                    MessageRole::Error,
-                    "Code mode does not support OpenAI. Switch provider first: /provider ollama or /provider claude.",
-                );
+            if let Some(reason) = code_mode_denied_reason(&app.config.provider) {
+                app.push(MessageRole::Error, reason);
                 return Ok(false);
             }
             app.set_mode(AppMode::Code);
@@ -978,12 +1088,11 @@ async fn apply_repl_outcome(
                 AppMode::Chat => AppMode::Code,
                 AppMode::Code => AppMode::Chat,
             };
-            if next == AppMode::Code && app.config.provider == "openai" {
-                app.push(
-                    MessageRole::Error,
-                    "Code mode does not support OpenAI. Switch provider first: /provider ollama or /provider claude.",
-                );
-                return Ok(false);
+            if next == AppMode::Code {
+                if let Some(reason) = code_mode_denied_reason(&app.config.provider) {
+                    app.push(MessageRole::Error, reason);
+                    return Ok(false);
+                }
             }
             app.toggle_mode();
             print_note(&format!("mode -> {}", app.mode.label()));
@@ -1033,6 +1142,7 @@ fn handle_repl_message(app: &mut App, message: String) -> Result<bool, Box<dyn s
             print_message(&UiMessage {
                 role: MessageRole::System,
                 content: message,
+                timestamp_ms: None,
             });
             save_current_session(app);
         }
@@ -1072,6 +1182,18 @@ fn is_compact_control_task(task: &str) -> bool {
 /// Interactive y/N: confirm running Codex in a directory that is not a git repo.
 /// Returns true only on an explicit yes; a non-tty / EOF / read error is "no".
 fn confirm_run_outside_git_repo(cwd: &Path) -> bool {
+    // F5: when stdin is not a terminal (piped/one-shot), reading here would
+    // steal the next queued prompt line as the y/N answer (or hit EOF).
+    // Auto-decline instead of consuming input that isn't an answer.
+    if !io::stdin().is_terminal() {
+        eprintln!(
+            "⚠  {} is not a git repository and stdin is not a terminal — \
+             declining the code-mode run. Run from a git repo, `git init` first, \
+             or use an interactive terminal to confirm.",
+            cwd.display()
+        );
+        return false;
+    }
     print!(
         "⚠  {} is not a git repository.\n   \
          Codex can't track or undo its edits here. Run anyway? [y/N] ",
@@ -1103,6 +1225,16 @@ async fn stream_repl_turn(
                     "Cancelled. Codex needs a git repo — run Kim from inside one, \
                      or `git init` here first."
                 );
+                // F5: record the cancellation so one-shot mode exits non-zero.
+                // Previously nothing was pushed, `run_oneshot`'s last-message-is-
+                // Error check never fired, and scripts saw a bogus exit 0.
+                app.push(
+                    MessageRole::Error,
+                    format!(
+                        "Cancelled: {} is not a git repository; the code-mode run was declined.",
+                        cwd.display()
+                    ),
+                );
                 return Ok(false);
             }
         }
@@ -1127,13 +1259,55 @@ async fn stream_repl_turn(
     // + Python are available; otherwise fall back to plain LLM chat with a note.
     let agentic = if code_mode {
         None
+    } else if provider::is_browser_provider(&config.provider) {
+        // Chat-mode browser provider: if the Kim desktop bridge is already
+        // running, reuse it (keeps the in-app webview experience and avoids a
+        // second Chrome). Otherwise drive ChatGPT/Gemini/Claude directly via the
+        // local Playwright agent — same mechanism code mode uses, so a bare
+        // `kim` works without launching the desktop app.
+        if provider::bridge_is_available(&config.desktop_bridge_url).await {
+            None
+        } else {
+            crate::agentic::agentic_available(&config.provider)
+        }
     } else {
         crate::agentic::agentic_available(&config.provider)
     };
+    // Ctrl-C → SIGTERM (graceful) before the hard kill. The pid slot is shared
+    // by anything that spawns a killable child this turn:
+    //   - code mode's codex child (via CodexTurnControl.pid_slot), and
+    //   - F-E-5: the chat-mode agentic child (orchestrator.agent), directly and
+    //     via the browser-provider TOCTOU fallback inside stream_kim_request.
+    // Populated iff a child could be spawned; the HTTP bridge path leaves it
+    // None (there is no local child to signal).
+    let child_pid: Option<std::sync::Arc<std::sync::Mutex<Option<u32>>>> =
+        if code_mode || agentic.is_some() || provider::is_browser_provider(&config.provider) {
+            Some(std::sync::Arc::new(std::sync::Mutex::new(None::<u32>)))
+        } else {
+            None
+        };
+    // Parity Part 4: code-mode turns also get a decision channel (REPL → child
+    // stdin, for native codex approvals).
+    let (codex_control, decision_tx) = if code_mode {
+        let (dtx, drx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        (
+            Some(crate::provider::CodexTurnControl {
+                decision_rx: drx,
+                pid_slot: child_pid
+                    .clone()
+                    .expect("code_mode implies a pid slot was created above"),
+            }),
+            Some(dtx),
+        )
+    } else {
+        (None, None)
+    };
+
     let handle = if let Some((root, python)) = agentic {
         let prompt2 = prompt.clone();
         let sid = session_id.clone();
         let provider = config.provider.clone();
+        let pid_slot = child_pid.clone();
         tokio::spawn(async move {
             let session_dir = root.join("kim_sessions");
             crate::agentic::stream_agentic_request(
@@ -1143,14 +1317,26 @@ async fn stream_repl_turn(
                 &provider,
                 &session_dir,
                 Some(&sid),
+                pid_slot,
                 tx,
             )
             .await;
         })
     } else {
         maybe_note_plain_chat(code_mode, &config.provider);
+        let pid_slot = child_pid.clone();
         tokio::spawn(async move {
-            stream_kim_request(&config, &history, code_mode, &session_id, allow_non_git, tx).await;
+            stream_kim_request(
+                &config,
+                &history,
+                code_mode,
+                &session_id,
+                allow_non_git,
+                tx,
+                codex_control,
+                pid_slot,
+            )
+            .await;
         })
     };
 
@@ -1160,173 +1346,20 @@ async fn stream_repl_turn(
     let cancel = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    let result = consume_turn_events(app, rx, Instant::now(), save_current_session, cancel).await;
+    let result = consume_turn_events(
+        app,
+        rx,
+        Instant::now(),
+        save_current_session,
+        cancel,
+        decision_tx,
+        child_pid,
+    )
+    .await;
     // Reap the request task (kill_on_drop reaps any child subprocess). No-op if
     // it already finished.
     handle.abort();
     result
-}
-
-/// Consume one turn's streamed events, render them, and persist the result.
-/// Extracted from `stream_repl_turn` so it can be driven by a stubbed event
-/// channel with an injected `save` sink in tests — no network required. (A1/A2)
-/// Erase the current terminal line if the loading spinner was drawn on it.
-/// No-op when `active` is false so callers can invoke it unconditionally.
-fn clear_spinner_line(active: bool) {
-    if active {
-        print!("\r\x1b[2K");
-        let _ = stdout().flush();
-    }
-}
-
-async fn consume_turn_events<S, C>(
-    app: &mut App,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
-    started: Instant,
-    mut save: S,
-    cancel: C,
-) -> Result<bool, Box<dyn std::error::Error>>
-where
-    S: FnMut(&App),
-    C: std::future::Future<Output = ()>,
-{
-    let mut assistant = String::new();
-    let mut printed_answer_label = false;
-    let mut printed_thinking = false;
-    let mut last_tool_line = String::new();
-    let mut bridge_used = false;
-
-    // Loading indicator: while we wait for the first output (browser providers
-    // can take many seconds to scrape a reply), animate a spinner in place.
-    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let show_spinner = stdout().is_terminal();
-    let mut spin_i = 0usize;
-    let mut spinner_active = false;
-    let mut produced_output = false;
-    let mut spinner = tokio::time::interval(Duration::from_millis(100));
-    spinner.tick().await; // consume the immediate first tick
-
-    tokio::pin!(cancel);
-    loop {
-        let event = tokio::select! {
-            biased;
-            maybe = rx.recv() => match maybe {
-                Some(event) => event,
-                None => break,
-            },
-            _ = &mut cancel => {
-                // A6: cancel mid-stream — keep whatever already streamed, drop
-                // back to the prompt instead of killing the whole CLI.
-                clear_spinner_line(spinner_active);
-                if printed_answer_label && !assistant.ends_with('\n') {
-                    println!();
-                }
-                print_note("(cancelled)");
-                if !assistant.trim().is_empty() {
-                    app.push(MessageRole::Assistant, std::mem::take(&mut assistant));
-                    save(app);
-                }
-                return Ok(false);
-            }
-            _ = spinner.tick(), if show_spinner && !produced_output => {
-                let frame = SPINNER[spin_i % SPINNER.len()];
-                spin_i += 1;
-                print!(
-                    "\r{}",
-                    paint_dim(&format!(
-                        "{frame} thinking… ({}s)",
-                        started.elapsed().as_secs()
-                    ))
-                );
-                let _ = stdout().flush();
-                spinner_active = true;
-                continue;
-            }
-        };
-        // A real event arrived — wipe the spinner line before rendering it.
-        if spinner_active {
-            clear_spinner_line(true);
-            spinner_active = false;
-        }
-        match event {
-            AppEvent::TextChunk(chunk) => {
-                produced_output = true;
-                if !printed_answer_label {
-                    if printed_thinking {
-                        println!();
-                    }
-                    print!("{}", paint_bold("Kim: ", kim_accent_color()));
-                    stdout().flush()?;
-                    printed_answer_label = true;
-                }
-                print!("{}", paint_text(&chunk));
-                stdout().flush()?;
-                assistant.push_str(&chunk);
-            }
-            AppEvent::ThoughtChunk(chunk) => {
-                produced_output = true;
-                if !printed_thinking && !printed_answer_label {
-                    printed_thinking = true;
-                }
-                print!("{}", paint_dim(&chunk));
-                stdout().flush()?;
-            }
-            AppEvent::ToolEvent { verb, target } => {
-                produced_output = true;
-                let line = format!("{verb}: {target}");
-                if line != last_tool_line {
-                    if printed_answer_label && !assistant.ends_with('\n') {
-                        println!();
-                    }
-                    print_note(&line);
-                    last_tool_line = line;
-                }
-            }
-            AppEvent::Done(used_bridge) => {
-                bridge_used = used_bridge;
-                break;
-            }
-            AppEvent::Err(error) => {
-                if printed_answer_label && !assistant.ends_with('\n') {
-                    println!();
-                }
-                app.push(MessageRole::Error, error.clone());
-                print_message(&UiMessage {
-                    role: MessageRole::Error,
-                    content: error,
-                });
-                save(app);
-                return Ok(false);
-            }
-        }
-    }
-    // The stream closed (or ended) while the spinner was on-screen — wipe it.
-    if spinner_active {
-        clear_spinner_line(true);
-    }
-
-    if printed_answer_label {
-        if !assistant.ends_with('\n') {
-            println!();
-        }
-    } else {
-        println!("Kim: (no response)");
-    }
-
-    // Push the streamed assistant reply into the session and persist again, so
-    // the next turn's `chat_history()` actually includes Kim's response. (A1)
-    if !assistant.trim().is_empty() {
-        app.push(MessageRole::Assistant, assistant);
-        save(app);
-    }
-
-    let via = if bridge_used { " via Kim desktop" } else { "" };
-    print_note(&format!(
-        "done in {}{}",
-        format_repl_elapsed(started.elapsed()),
-        via
-    ));
-    Ok(false)
 }
 
 fn format_repl_elapsed(duration: Duration) -> String {
@@ -1495,6 +1528,7 @@ fn compact_app_messages(app: &mut App) {
         UiMessage {
             role: MessageRole::System,
             content: format!("Earlier context compacted — {removed} message(s) removed."),
+            timestamp_ms: Some(UiMessage::now_ms()),
         },
     );
     app.push(
@@ -1621,7 +1655,7 @@ misc helpers
 =========================================================== */
 
 fn help_text() -> &'static str {
-    "Kim terminal CLI\n\nUsage:\n  kim                      Launch the interactive chat/code REPL\n  kim chat <prompt...>     Send one prompt in chat mode and exit\n  kim code <prompt...>     Send one prompt in code-agent mode and exit\n  kim doctor               Check install, providers, desktop bridge, and code mode\n  kim --resume <id>        Resume a Kim session in the REPL\n  kim --resume latest      Resume the newest saved session\n  kim --help               Show this help\n  kim --version            Show the version\n\nPipe a prompt via stdin:\n  echo 'explain this' | kim chat\n  echo 'fix the build' | kim code\n\nInside Kim, type /help for commands and /login to connect a provider."
+    "Kim terminal CLI\n\nUsage:\n  kim                      Launch the interactive chat/code REPL\n  kim chat <prompt...>     Send one prompt in chat mode and exit\n  kim code <prompt...>     Send one prompt in code-agent mode and exit\n  kim doctor               Check install, providers, desktop bridge, and code mode\n  kim doctor --strict      Same, but exit non-zero on any failed check (CI)\n  kim --resume <id>        Resume a Kim session in the REPL\n  kim --resume latest      Resume the newest saved session\n  kim --help               Show this help\n  kim --version            Show the version\n\nPipe a prompt via stdin:\n  echo 'explain this' | kim chat\n  echo 'fix the build' | kim code\n\nInside Kim, type /help for commands and /login to connect a provider."
 }
 
 fn new_session_id() -> String {
@@ -1648,9 +1682,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        consume_turn_events, new_session_id, parse_cli_args, prompt_file_references,
-        prompt_with_file_references, provider_is_ready, provider_is_ready_with_env,
-        split_shellish_tokens, App, AppEvent, AppMode, CliCommand, MessageRole, ViewState,
+        code_mode_denied_reason, consume_turn_events, new_session_id, parse_cli_args,
+        prompt_file_references, prompt_with_file_references, provider_is_ready,
+        provider_is_ready_with_env, split_shellish_tokens, App, AppEvent, AppMode, CliCommand,
+        MessageRole, ViewState,
     };
     use crate::config::KimConfig;
     use std::path::{Path, PathBuf};
@@ -1711,10 +1746,86 @@ mod tests {
             Instant::now(),
             save_into(&dir),
             std::future::ready(()),
+            None,
+            None,
         )
         .await;
         assert!(res.is_ok(), "cancelled turn should return Ok, not hang");
         drop(tx);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // F-E-4: a Ctrl-C interrupt mid-turn must leave a trailing Error message so
+    // one-shot `kim chat`/`kim code` exits non-zero (run_oneshot checks the last
+    // message's role). The partial answer is still kept.
+    #[tokio::test]
+    async fn cancelled_turn_marks_error_for_nonzero_exit() {
+        let dir = temp_session_dir();
+        let mut app = test_app("cancel-err-1");
+        app.push(MessageRole::User, "long task");
+        save_into(&dir)(&app);
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        // One partial chunk arrives, then the cancel fires (biased select drains
+        // the ready chunk first, then takes the cancel branch).
+        tx.send(AppEvent::TextChunk("partial answer".to_string())).unwrap();
+
+        consume_turn_events(
+            &mut app,
+            rx,
+            Instant::now(),
+            save_into(&dir),
+            std::future::ready(()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(app.messages.last(), Some(m) if m.role == MessageRole::Error),
+            "a Ctrl-C cancel must leave a trailing Error; messages: {:?}",
+            app.messages
+        );
+        // The partial answer is preserved (as an Assistant message before the Error).
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Assistant && m.content.contains("partial answer")));
+        drop(tx);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // F-E-4: a turn that ends with no answer at all (child exited / empty stream)
+    // must leave a trailing Error so one-shot mode exits non-zero.
+    #[tokio::test]
+    async fn no_response_turn_marks_error_for_nonzero_exit() {
+        let dir = temp_session_dir();
+        let mut app = test_app("noresp-1");
+        app.push(MessageRole::User, "hi");
+        save_into(&dir)(&app);
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        tx.send(AppEvent::Done(false)).unwrap(); // stream ended, never produced text
+        drop(tx);
+
+        consume_turn_events(
+            &mut app,
+            rx,
+            Instant::now(),
+            save_into(&dir),
+            std::future::pending::<()>(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(app.messages.last(), Some(m) if m.role == MessageRole::Error),
+            "a no-response turn must leave a trailing Error; messages: {:?}",
+            app.messages
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1737,6 +1848,8 @@ mod tests {
             Instant::now(),
             save_into(&dir),
             std::future::pending::<()>(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1781,6 +1894,8 @@ mod tests {
             Instant::now(),
             save_into(&dir),
             std::future::pending::<()>(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1803,6 +1918,8 @@ mod tests {
             Instant::now(),
             save_into(&dir),
             std::future::pending::<()>(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1988,6 +2105,29 @@ mod tests {
         assert!(paths.is_empty());
     }
 
+    // ── F-E-14: code-mode provider gate ──────────────────────────────────────
+
+    #[test]
+    fn code_mode_allows_only_ollama_and_browser() {
+        // Allowed: the two real codex backends (+ empty → ollama).
+        for ok in ["ollama", "ollama-cloud", "", "browser", "browser:chatgpt", "BROWSER:Claude"] {
+            assert!(
+                code_mode_denied_reason(ok).is_none(),
+                "code mode must allow {ok:?}"
+            );
+        }
+        // Rejected: everything the old `== \"openai\"` gate let silently route to
+        // ollama with a non-ollama model name.
+        for bad in ["openai", "claude", "gemini", "deepseek", "desktop"] {
+            let reason = code_mode_denied_reason(bad)
+                .unwrap_or_else(|| panic!("code mode must reject {bad:?}"));
+            assert!(
+                reason.contains(bad) && reason.contains("ollama"),
+                "rejection for {bad:?} should name the provider and the fix; got: {reason}"
+            );
+        }
+    }
+
     // ── parse_cli_args tests ──────────────────────────────────────────────────
 
     fn args(v: &[&str]) -> Vec<String> {
@@ -2025,7 +2165,14 @@ mod tests {
     #[test]
     fn parse_args_doctor() {
         let cmd = parse_cli_args(&args(&["doctor"]));
-        assert!(matches!(cmd, CliCommand::Doctor));
+        assert!(matches!(cmd, CliCommand::Doctor { strict: false }));
+    }
+
+    // F-E-1: `kim doctor --strict` parses to the strict health check.
+    #[test]
+    fn parse_args_doctor_strict() {
+        let cmd = parse_cli_args(&args(&["doctor", "--strict"]));
+        assert!(matches!(cmd, CliCommand::Doctor { strict: true }));
     }
 
     #[test]
@@ -2098,9 +2245,86 @@ mod tests {
         }
     }
 
+    // F-E-2: an unknown flag no longer silently opens a fresh REPL — it is a
+    // usage error (exit 2), so a typo can't scatter a new session file.
     #[test]
-    fn parse_args_unknown_arg_falls_through_to_repl() {
+    fn parse_args_unknown_flag_is_usage_error() {
         let cmd = parse_cli_args(&args(&["--unknown-flag"]));
+        match cmd {
+            CliCommand::UsageError(message) => assert!(
+                message.contains("--unknown-flag"),
+                "usage error should name the offending flag, got: {message}"
+            ),
+            other => panic!("expected UsageError for an unknown flag, got {other:?}"),
+        }
+    }
+
+    // F-E-2: an unknown bare subcommand (e.g. `kim login`, or `kim resume
+    // latest` with the dashes dropped) is a usage error, not a silent new REPL.
+    #[test]
+    fn parse_args_unknown_subcommand_is_usage_error() {
+        for argv in [
+            vec!["login"],
+            vec!["resume", "latest"],
+            vec!["--continue"],
+            vec!["--resum", "latest"],
+        ] {
+            let cmd = parse_cli_args(&args(&argv));
+            assert!(
+                matches!(cmd, CliCommand::UsageError(_)),
+                "{argv:?} should be a UsageError, got {cmd:?}"
+            );
+        }
+    }
+
+    // F-E-2: `kim chat --resume abc` must not be sent to the model as the
+    // literal prompt "--resume abc"; a leading option is a usage error.
+    #[test]
+    fn parse_args_chat_leading_option_is_usage_error() {
+        let cmd = parse_cli_args(&args(&["chat", "--resume", "abc"]));
+        match cmd {
+            CliCommand::UsageError(message) => assert!(
+                message.contains("--resume"),
+                "usage error should name the offending option, got: {message}"
+            ),
+            other => panic!("expected UsageError, got {other:?}"),
+        }
+    }
+
+    // F-E-2: extra tokens after `kim doctor` / `kim --resume <id>` are rejected
+    // rather than ignored.
+    #[test]
+    fn parse_args_trailing_garbage_is_usage_error() {
+        assert!(matches!(
+            parse_cli_args(&args(&["doctor", "--json"])),
+            CliCommand::UsageError(_)
+        ));
+        assert!(matches!(
+            parse_cli_args(&args(&["--resume", "abc", "def"])),
+            CliCommand::UsageError(_)
+        ));
+    }
+
+    // ── #6: trailing `--resume` with no value is a usage error, not a silent
+    // new session ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_args_resume_with_no_value_is_usage_error() {
+        let cmd = parse_cli_args(&args(&["--resume"]));
+        match cmd {
+            CliCommand::UsageError(message) => {
+                assert!(
+                    message.contains("--resume"),
+                    "usage error should mention --resume, got: {message}"
+                );
+            }
+            other => panic!("expected UsageError for trailing --resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_args_no_resume_flag_is_still_a_plain_repl() {
+        let cmd = parse_cli_args(&args(&[]));
         assert!(matches!(cmd, CliCommand::Repl { resume_id: None }));
     }
 

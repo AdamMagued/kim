@@ -19,7 +19,7 @@
 .kim-chat__backdrop {
   position: absolute;
   inset: 0;
-  z-index: 0;
+  z-index: var(--z-base);
   pointer-events: none;
   overflow: hidden;
 }
@@ -54,7 +54,7 @@
 /* Keep chat content above the backdrop */
 .kim-chat > *:not(.kim-chat__backdrop):not(.kim-connectors-layer) {
   position: relative;
-  z-index: 1;
+  z-index: var(--z-raised);
 }
 
 /* Topbar connectors button — replaces the old in-chat trigger and the theme
@@ -126,7 +126,7 @@
 .kim-connectors-layer {
   position: fixed;
   inset: 0;
-  z-index: 200;
+  z-index: var(--z-overlay);
   pointer-events: none;
   animation: kim-connectors-layer-in 0.24s ease both;
 }

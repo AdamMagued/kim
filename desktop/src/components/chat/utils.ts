@@ -11,6 +11,7 @@
 
 import type { KimMessage, TextBlock, ToolUseBlock, ToolResultBlock, SessionInfo } from '../../types';
 import type { ActivityItem, LivePlanParsed, TouchedFile, CodexRunGroup } from './types';
+import { LogTags } from '../../types/events.gen'; // K5: tag vocabulary from generated manifest
 
 // ── Simple helpers ────────────────────────────────────────────────────────────
 
@@ -36,17 +37,19 @@ const PROVIDER_BRANDS = 'Gemini|Claude|ChatGPT|Grok|DeepSeek';
 export function speakAsKimNarration(t: string): string {
   if (!t) return t;
   const B = PROVIDER_BRANDS;
+  // Honesty limit (audit item 3): only rewrite Kim's OWN pipeline framing —
+  // "<brand> is thinking…" spinners and "sending to <brand>" routing lines.
+  // The old blanket rules ("<brand> said" → "Kim", possessives, and any bare
+  // brand mention → "Kim") rewrote model-authored content (reasoning/status
+  // text that legitimately mentions Claude/Gemini/etc., e.g. "Reading the
+  // Claude API docs") and were removed as a dishonest content rewrite.
   return t
     // "Gemini is/still thinking… (3s)" → "Kim is thinking…"
     .replace(new RegExp(`\\b(?:${B})\\s+(?:is\\s+)?(?:still\\s+)?thinking(?:…|\\.\\.\\.)?(?:\\s+\\(\\d+s\\))?`, 'gi'), 'Kim is thinking…')
-    // "sending to / routing through / via / from Gemini" → neutral
-    .replace(new RegExp(`\\b(?:sending to|routed through|routing through|powered by|via|using|through|from)\\s+(?:${B})\\b`, 'gi'), 'Kim is working')
-    // "Gemini said/says/responded/returned/replied/is/was" → "Kim"
-    .replace(new RegExp(`\\b(?:${B})\\s+(?:said|says|say|responded|responds|respond|returned|replied|replies|is|was)\\b`, 'gi'), 'Kim')
-    // possessive "Gemini's" → "Kim's"
-    .replace(new RegExp(`\\b(?:${B})'s\\b`, 'gi'), "Kim's")
-    // any remaining bare brand mention in narration → "Kim"
-    .replace(new RegExp(`\\b(?:${B})\\b`, 'g'), 'Kim')
+    // "sending to / routing through / powered by Gemini" → neutral. Narrow
+    // verb list on purpose: generic "via/using/from <brand>" often appears in
+    // real content ("install it via Gemini CLI") and must not be rewritten.
+    .replace(new RegExp(`\\b(?:sending to|routed through|routing through|powered by)\\s+(?:${B})\\b`, 'gi'), 'Kim is working')
     // collapse a doubled "Kim Kim" the replacements can create
     .replace(/\bKim\s+Kim\b/g, 'Kim')
     .trim();
@@ -105,10 +108,10 @@ export function cleanAssistantAnswerText(t: string): string {
 export function parseAnswerLine(raw: string): string | null {
   const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
   const stripped = line.replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.,]?\d*\s+/, '');
-  const markerIdx = stripped.indexOf('[ANSWER]');
+  const markerIdx = stripped.indexOf(LogTags.ANSWER);
   if (markerIdx === -1) return null;
 
-  const payload = stripped.slice(markerIdx + '[ANSWER]'.length).trim();
+  const payload = stripped.slice(markerIdx + LogTags.ANSWER.length).trim();
   if (!payload) return '';
 
   try {
@@ -155,8 +158,7 @@ export function extractTouchedFiles(messages: KimMessage[]): TouchedFile[] {
       if (block.type === 'tool_result') {
         const trb = block as ToolResultBlock;
         const raw = typeof trb.content === 'string' ? trb.content
-          : (trb as unknown as { output?: string }).output
-            ? String((trb as unknown as { output: string }).output) : '';
+          : trb.output ? String(trb.output) : '';
         if (!raw.trim()) continue;
         const parsed = parseMaybeNestedJson(raw);
         if (!parsed) continue;
@@ -317,9 +319,8 @@ export const HIDDEN_REGEX: RegExp[] = [
 ];
 
 export function isNoiseLine(raw: string): boolean {
-  if (raw.startsWith('[STATUS]') || raw.includes('[STATUS]') || raw.startsWith('[ANSWER]') || raw.includes('[ANSWER]')) return false;
-  if (raw.includes('[SUCCESS]') || raw.includes('[FAILED]') || raw.includes('[ERROR]')) return false;
-  if (raw.startsWith('[TOOL]')) return false;
+  if (raw.startsWith(LogTags.STATUS) || raw.includes(LogTags.STATUS) || raw.startsWith(LogTags.ANSWER) || raw.includes(LogTags.ANSWER)) return false;
+  if (raw.includes(LogTags.SUCCESS) || raw.includes(LogTags.FAILED) || raw.includes(LogTags.ERROR) || raw.startsWith(LogTags.TOOL)) return false;
   const line = raw.startsWith('[err]') ? raw.slice(5).trimStart() : raw;
   const lower = line.toLowerCase();
   for (const sub of HIDDEN_SUBSTRINGS) {
@@ -368,17 +369,15 @@ export function friendlyError(raw: string): string {
     .replace(/\[(ERROR|WARN|INFO|DEBUG|TOOL|CRITICAL)\]\s*/g, '')
     .replace(/orchestrator\.\w+:\s*/g, '')
     .trim();
-  // Reject strings that contain internal file paths, Python tracebacks, or stack
-  // fragments — these must never be surfaced verbatim in the UI.
-  const hasSensitiveDetail =
-    /[/\\][a-zA-Z0-9_.~-]+[/\\]/.test(cleaned) ||  // absolute/relative file path
-    /\bTraceback\b/i.test(cleaned) ||
-    /File\s+"[^"]*"/.test(cleaned) ||
-    /\.py(?::\s*\d+)?/.test(cleaned) ||
-    /^\s*at\s+\S+\s+\(/.test(cleaned);              // JS stack frame
-  return cleaned.length > 0 && cleaned.length < 200 && !hasSensitiveDetail
-    ? cleaned
-    : 'Something went wrong. Check your settings and try again.';
+  // Audit item 3 (B3/B4/C20): surface the REAL error. The old gate deleted any
+  // message over 200 chars or containing a path/".py"/traceback fragment and
+  // replaced it with "Something went wrong. Check your settings and try
+  // again." — which destroyed NEED_HELP questions and real crash text
+  // (ModuleNotFoundError etc.) while pointing the user at settings that were
+  // fine. We now keep the cleaned text (length-capped) and only fall back to
+  // the generic message when nothing usable remains.
+  if (!cleaned) return 'Something went wrong. Check your settings and try again.';
+  return cleaned.length > 600 ? cleaned.slice(0, 600) + '…' : cleaned;
 }
 
 /** Friendly names + icons for known tool calls */
@@ -439,32 +438,35 @@ export const TOOL_MAP: Record<string, { icon: string; label: (args: Record<strin
   get_screen_info:    { icon: '›', label: _a => 'Reading screen info' },
 };
 
+// F-H-6: the canonical grammar for the legacy `[TAG]` text protocol this parser
+// implements is written down in docs/CONTRACTS.md "Seam 2" (tag-line /
+// plan-envelope-line / diff-line / tool-line). The vocabulary's single source of
+// truth is LogTags (events.gen.ts) ← events.schema.json "legacyTags". Keep this
+// parser in sync with that grammar; the golden fixture in
+// __tests__/tagGrammar.test.ts pins the representative shapes so a drift fails CI.
 export function parseLogLine(raw: string, id: number): ActivityItem | null {
   if (!raw.trim()) return null;
 
-  if (raw.includes('[SUCCESS]')) {
+  if (raw.includes(LogTags.SUCCESS)) {
     let text = raw.replace(/.*\[SUCCESS\]\s*/, '').trim();
     if (/^Codex (?:completed|finished)/i.test(text) || /\bLLM calls\b/i.test(text)) {
       text = 'Task completed';
     }
     return { id, kind: 'success', icon: '✓', text: text || 'Task completed successfully' };
   }
-  if (raw.includes('[FAILED]') || (raw.includes('[ERROR]') && !raw.startsWith('[err]'))) {
+  if (raw.includes(LogTags.FAILED) || (raw.includes(LogTags.ERROR) && !raw.startsWith('[err]'))) {
     const msg = raw.replace(/.*\[(FAILED|ERROR)\]\s*/, '').trim();
     return { id, kind: 'error', icon: '⚠', text: friendlyError(msg) };
-  }
-
-  if (isNoiseLine(raw)) return null;
-  if (raw.startsWith('[truncated')) return null;
-
-  if (raw.startsWith('⏹')) {
-    return { id, kind: 'cancelled', icon: '⏹', text: 'Task stopped' };
   }
 
   const isErr = raw.startsWith('[err]');
   const line = isErr ? raw.slice(5).trim() : raw;
   const stripped = line.replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[.,]?\d*\s+/, '');
 
+  // M9: match the protocol directives BEFORE the noise filter — a NEED_HELP /
+  // TASK_COMPLETE reason containing a hidden substring (e.g. "screenshot",
+  // "stdin") used to be swallowed, ending the run with a generic error banner
+  // instead of the agent's actual question.
   const taskCompleteMatch = stripped.match(/(?:^|\b)TASK_COMPLETE:\s*(.+)$/i);
   if (taskCompleteMatch) {
     const summary = taskCompleteMatch[1].trim();
@@ -477,15 +479,32 @@ export function parseLogLine(raw: string, id: number): ActivityItem | null {
     return { id, kind: 'error', icon: '⚠', text: friendlyError(reason || 'Kim needs your help to continue.') };
   }
 
-  if (stripped.startsWith('[STATUS]') || raw.startsWith('[STATUS]')) {
-    const text = (stripped.startsWith('[STATUS]') ? stripped : raw)
+  // B4: a Python crash's FINAL line ("ModuleNotFoundError: No module named
+  // 'mcp'") is the one clue the user needs, but the noise filter hides every
+  // "XxxError:" line (it was added to suppress traceback bodies). Surface the
+  // terminal exception line BEFORE the noise filter — excluding the
+  // ExceptionGroup wrappers, whose message is boilerplate, not the cause.
+  const crashMatch = stripped.match(/^([A-Za-z_][\w.]*(?:Error|Exception))\s*:\s*(.+)$/);
+  if (crashMatch && !/(?:Base)?ExceptionGroup$/.test(crashMatch[1])) {
+    return { id, kind: 'error', icon: '⚠', text: `${crashMatch[1]}: ${crashMatch[2].trim()}` };
+  }
+
+  if (isNoiseLine(raw)) return null;
+  if (raw.startsWith('[truncated')) return null;
+
+  if (raw.startsWith('⏹')) {
+    return { id, kind: 'cancelled', icon: '⏹', text: 'Task stopped' };
+  }
+
+  if (stripped.startsWith(LogTags.STATUS) || raw.startsWith(LogTags.STATUS)) {
+    const text = (stripped.startsWith(LogTags.STATUS) ? stripped : raw)
       .replace(/^\[STATUS\]\s*/, '').trim();
     if (text) return { id, kind: 'status', icon: '›', text };
     return null;
   }
-  const embeddedStatusIdx = stripped.indexOf('[STATUS]');
+  const embeddedStatusIdx = stripped.indexOf(LogTags.STATUS);
   if (isErr && embeddedStatusIdx !== -1) {
-    const text = stripped.slice(embeddedStatusIdx + '[STATUS]'.length).trim();
+    const text = stripped.slice(embeddedStatusIdx + LogTags.STATUS.length).trim();
     if (text) return { id, kind: 'status', icon: '›', text };
   }
 
@@ -524,7 +543,7 @@ export function parseLogLine(raw: string, id: number): ActivityItem | null {
     return { id, kind: 'error', icon: '⚠', text: friendlyError(msg) };
   }
 
-  if (raw.includes('[FAILED]') || raw.includes('[ERROR]')) {
+  if (raw.includes(LogTags.FAILED) || raw.includes(LogTags.ERROR)) {
     const msg = raw.replace(/.*\[(FAILED|ERROR)\]\s*/, '').trim();
     return { id, kind: 'error', icon: '⚠', text: friendlyError(msg) };
   }
@@ -602,8 +621,9 @@ export function synthesizeActivityFromMessages(messages: KimMessage[], toolMap: 
         const args = (tb.input && typeof tb.input === 'object') ? tb.input as Record<string, unknown> : {};
         items.push({ id: ++id, kind: 'tool', icon: def?.icon ?? '›', text: def ? def.label(args) : `Using tool: \`${tb.name}\`` });
       } else if (block.type === 'tool_result') {
-        const raw = typeof (block as ToolResultBlock).content === 'string' ? (block as ToolResultBlock).content as string
-          : String((block as unknown as { output?: string }).output ?? '');
+        const trb = block as ToolResultBlock;
+        const raw = typeof trb.content === 'string' ? trb.content
+          : String(trb.output ?? '');
         if (!raw.trim()) continue;
         const parsed = parseMaybeNestedJson(raw);
         if (parsed?.filePath) {
@@ -703,10 +723,10 @@ export function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | n
   const orphanStructuredSteps = new Map<number, string>();
   for (const it of items) {
     const t = it.text;
-    const planTag = t.indexOf('[PLAN]{');
+    const planTag = t.indexOf(LogTags.PLAN + '{');
     if (planTag !== -1) {
       try {
-        const json = t.slice(planTag + '[PLAN]'.length);
+        const json = t.slice(planTag + LogTags.PLAN.length);
         const parsed = JSON.parse(json) as { steps?: unknown };
         if (Array.isArray(parsed.steps)) {
           const arr = parsed.steps.filter(s => typeof s === 'string') as string[];
@@ -720,10 +740,10 @@ export function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | n
       } catch {}
       continue;
     }
-    const stepTag = t.indexOf('[STEP]{');
+    const stepTag = t.indexOf(LogTags.STEP + '{');
     if (stepTag !== -1) {
       try {
-        const json = t.slice(stepTag + '[STEP]'.length);
+        const json = t.slice(stepTag + LogTags.STEP.length);
         const parsed = JSON.parse(json) as { index?: number; name?: unknown };
         if (typeof parsed.index === 'number' && parsed.index > 0) {
           if (structuredSteps) {
@@ -736,10 +756,10 @@ export function parsePlanFromActivity(items: ActivityItem[]): LivePlanParsed | n
       } catch {}
       continue;
     }
-    const doneTag = t.indexOf('[DONE]{');
+    const doneTag = t.indexOf(LogTags.DONE + '{');
     if (doneTag !== -1) {
       try {
-        const json = t.slice(doneTag + '[DONE]'.length);
+        const json = t.slice(doneTag + LogTags.DONE.length);
         const parsed = JSON.parse(json) as { index?: number };
         if (typeof parsed.index === 'number' && parsed.index > 0) {
           structuredDone.add(parsed.index);
@@ -920,17 +940,39 @@ export function projectLabel(path?: string): string {
 
 // ── Cost estimation ───────────────────────────────────────────────────────────
 
-// USD cost per 1M tokens { input, output }. Zero for free/local providers.
-// Rates are approximate; see provider docs for exact pricing.
-// Last refreshed: 2025-Q2. Update when provider pricing changes.
-const PRICE_PER_1M: Record<string, { input: number; output: number }> = {
-  claude:   { input: 3.00,  output: 15.00  }, // claude-sonnet-4.x (Anthropic)
-  openai:   { input: 2.50,  output: 10.00  }, // gpt-4o (OpenAI)
-  gemini:   { input: 1.25,  output: 5.00   }, // gemini-1.5-pro (Google)
-  deepseek: { input: 0.27,  output: 1.10   }, // deepseek-chat V3 (cache-miss)
-  ollama:   { input: 0,     output: 0      }, // local
-  browser:  { input: 0,     output: 0      }, // local browser session
+// F-F-7: the month these rates + the model each is based on were last verified.
+// The cost chip is always shown with a "~" prefix and an "estimated" tooltip
+// (see costBasisLabel) so a user never mistakes it for a billed figure; keep
+// this current when provider pricing changes.
+export const PRICE_LAST_REFRESHED = '2026-07';
+
+// USD cost per 1M tokens { input, output }, plus the model the rate is based on
+// (surfaced in the cost-chip tooltip). Zero for free/local providers. Approximate
+// — always presented as an estimate, never a billed amount.
+const PRICE_PER_1M: Record<string, { input: number; output: number; model: string }> = {
+  claude:   { input: 3.00,  output: 15.00, model: 'claude-sonnet-4.5' },
+  openai:   { input: 2.50,  output: 10.00, model: 'gpt-4o-class' },
+  gemini:   { input: 1.25,  output: 5.00,  model: 'gemini-2.5-pro' },
+  deepseek: { input: 0.27,  output: 1.10,  model: 'deepseek-chat (cache-miss)' },
+  ollama:   { input: 0,     output: 0,     model: 'local' },
+  browser:  { input: 0,     output: 0,     model: 'browser session' },
 };
+
+/**
+ * The model + estimate qualifier a cost chip should show for `provider`, or
+ * null when the provider has no price basis (so the UI shows no cost rather
+ * than a fabricated one). Normalizes `browser:*` to the local zero-cost basis.
+ */
+export function costBasisLabel(provider: string): string | null {
+  const normalized = provider.trim().toLowerCase().startsWith('browser')
+    ? 'browser'
+    : provider.trim().toLowerCase();
+  const rates = PRICE_PER_1M[normalized];
+  if (!rates) return null;
+  return rates.input === 0 && rates.output === 0
+    ? `${rates.model} · $0`
+    : `est. · ${rates.model} rates (${PRICE_LAST_REFRESHED})`;
+}
 
 /**
  * Returns the estimated USD cost for the given token counts, or `null` when the

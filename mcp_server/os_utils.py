@@ -18,6 +18,7 @@ Translation scope:
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import re
 import shlex
@@ -32,6 +33,46 @@ CURRENT_OS: str = platform.system()  # "Windows", "Darwin", or "Linux"
 IS_WINDOWS: bool = CURRENT_OS == "Windows"
 IS_MACOS: bool = CURRENT_OS == "Darwin"
 IS_LINUX: bool = CURRENT_OS == "Linux"
+
+
+# ─── Minimal subprocess environment (S4) ─────────────────────────────────────
+# NO tool subprocess inherits the full parent environment: provider API keys,
+# tokens, and injection vectors (LD_PRELOAD, PYTHONPATH, …) must never reach
+# child processes. Children get this fixed allowlist instead — locale, paths,
+# and the display plumbing GUI helpers (osascript, wmctrl, Chrome) need.
+# PATH is inherited deliberately: it lists directories, not secrets, and dev
+# tools (npm, cargo, brew installs) live outside the system dirs.
+
+_ENV_ALLOWLIST_POSIX = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR",
+    "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+    # Display plumbing for GUI-adjacent children (wmctrl, xdotool, browsers).
+    "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
+    "XDG_DATA_HOME", "XDG_CONFIG_HOME", "DBUS_SESSION_BUS_ADDRESS",
+)
+
+_ENV_ALLOWLIST_WINDOWS = (
+    "Path", "PATH", "PATHEXT", "SystemRoot", "SystemDrive", "ComSpec",
+    "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+    "ProgramFiles", "ProgramFiles(x86)", "ProgramData",
+    "NUMBER_OF_PROCESSORS", "windir",
+)
+
+
+def minimal_subprocess_env(
+    extra_keys: tuple[str, ...] = (),
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build the allowlist environment every tool subprocess runs with.
+
+    ``extra_keys`` names additional parent vars a specific tool legitimately
+    needs (e.g. GH_TOKEN for the gh CLI). ``overrides`` sets fixed values.
+    """
+    keys = (_ENV_ALLOWLIST_WINDOWS if IS_WINDOWS else _ENV_ALLOWLIST_POSIX) + extra_keys
+    env = {k: os.environ[k] for k in keys if k in os.environ}
+    if overrides:
+        env.update(overrides)
+    return env
 
 
 def get_os_info() -> dict:
@@ -140,6 +181,18 @@ _RE_WIN_EXE = re.compile(
 )
 
 
+def _resolve_linux_app(app_name: str) -> str:
+    """Resolve a bare Linux app/tool name to an absolute path when possible.
+
+    Translated launches run under a restricted sandbox PATH that historically
+    missed /usr/local/bin and /snap/bin (1.3), so a bare 'google-chrome' or
+    'gedit' could be unfindable even when installed. Resolving against the
+    server's full PATH here makes the launch immune to the child's PATH.
+    """
+    resolved = shutil.which(app_name)
+    return resolved or app_name
+
+
 def _translate_start_command(app: str) -> str | None:
     """Translate a 'start <app>' Windows command to the current OS."""
     app_lower = app.strip().lower().rstrip('"').rstrip("'")
@@ -154,8 +207,8 @@ def _translate_start_command(app: str) -> str | None:
     if IS_LINUX:
         linux_app = _APP_MAP_LINUX.get(app_lower)
         if linux_app:
-            return linux_app
-        return f"xdg-open {shlex.quote(app.strip())}"
+            return shlex.quote(_resolve_linux_app(linux_app))
+        return f"{_resolve_linux_app('xdg-open')} {shlex.quote(app.strip())}"
 
     return None  # Windows — no translation needed
 
@@ -173,7 +226,8 @@ def _translate_exe_invocation(exe: str, rest: str) -> str | None:
     if IS_LINUX:
         linux_app = _APP_MAP_LINUX.get(exe_lower)
         if linux_app:
-            return f"{linux_app}{rest}"
+            # Absolute path so the launch survives a restricted child PATH (1.3)
+            return f"{shlex.quote(_resolve_linux_app(linux_app))}{rest}"
         return None
 
     return None

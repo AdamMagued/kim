@@ -35,7 +35,7 @@ import os
 logger = logging.getLogger(__name__)
 
 # Compound aliases expand to multiple granular tier names.
-# These match the vocabulary used in HARNESS_ROADMAP.md.
+# These match the vocabulary used in docs/archive/HARNESS_ROADMAP.md.
 TIER_ALIASES: dict[str, tuple[str, ...]] = {
     # "file" kept for backward compatibility; resolves to read+write without exec.
     "file":    ("file_read", "file_write"),

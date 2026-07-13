@@ -10,10 +10,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
-from mcp_server.os_utils import CURRENT_OS, IS_MACOS
+from mcp_server.os_utils import CURRENT_OS, IS_MACOS, minimal_subprocess_env
+from mcp_server.privacy import is_privacy_paused, PRIVACY_ERROR
+from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +38,16 @@ class UIElement:
         return (self.x + max(1, self.width) // 2, self.y + max(1, self.height) // 2)
 
 
+# SINGLE-RUN INVARIANT (3.6): this cache is module-global, so it assumes ONE
+# MCP server process per agent run (which is how Kim spawns servers today).
+# If a server is ever shared across concurrent runs/sessions, element ids from
+# one run could be clicked by another — key this by session token before ever
+# sharing a server process. _LAST_OBSERVE_TS guards against the related
+# staleness hazard: click_ui refuses coordinates from an observation old
+# enough that the screen has likely changed.
 _LAST_ELEMENTS: dict[str, UIElement] = {}
+_LAST_OBSERVE_TS: float = 0.0
+_MAX_OBSERVATION_AGE_S = 120.0
 
 # Cached AX-trust result. None until probed; True/False once known. macOS TCC
 # is process-lifetime sticky — if we have access once, we have it for the rest
@@ -68,6 +80,7 @@ async def _run_osascript(script: str, timeout: float = 15.0) -> tuple[int, str, 
         "osascript", "-e", script,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=minimal_subprocess_env(),  # S4: no parent-env inherit
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -112,7 +125,8 @@ def _parse_elements(raw: str) -> tuple[str, str, list[UIElement]]:
     seen: set[tuple[str, str, int, int, int, int]] = set()
     for line in lines[1:]:
         parts = line.split("\t")
-        if len(parts) < 9 or parts[0] != "EL":
+        # 10 fields required: parts[6:10] unpacks four bounds values (L2).
+        if len(parts) < 10 or parts[0] != "EL":
             continue
         role = _clean(parts[2], 48)
         name = _clean(parts[3])
@@ -131,8 +145,11 @@ def _parse_elements(raw: str) -> tuple[str, str, list[UIElement]]:
 
 
 def _format_observation(app: str, window: str, elements: list[UIElement], limit: int) -> str:
-    global _LAST_ELEMENTS
-    _LAST_ELEMENTS = {el.element_id: el for el in elements[:limit]}
+    global _LAST_ELEMENTS, _LAST_OBSERVE_TS
+    # Rebuilt below from the SAME sorted/limited set that gets printed, so
+    # every displayed element id is actually clickable (M1).
+    _LAST_ELEMENTS = {}
+    _LAST_OBSERVE_TS = time.monotonic()
 
     lines = [
         "STRUCTURED_UI_OBSERVATION",
@@ -179,6 +196,10 @@ def _format_observation(app: str, window: str, elements: list[UIElement], limit:
         elements,
         key=lambda el: (role_order.get(el.role, 9), el.y, el.x, el.element_id),
     )[:limit]
+    # Click map == displayed set (M1): before, it held the first `limit`
+    # elements in DOCUMENT order while the printout showed the role-sorted
+    # top `limit`, so a shown id could be "Unknown element_id" to click_ui.
+    _LAST_ELEMENTS = {el.element_id: el for el in sorted_elements}
 
     for el in sorted_elements:
         label = el.name or el.description or el.value or "(unlabeled)"
@@ -357,7 +378,7 @@ async def _observe_ui_macos(limit: int, depth: int) -> str:
             return _PERMISSION_HINT
         # Any other non-zero exit is NOT a permission issue. Be explicit so
         # the LLM (and the user) don't mis-attribute the failure to TCC.
-        return f"ERROR: observe_ui AppleScript walk failed (exit {code}): {combined}"
+        return tool_error(f"observe_ui AppleScript walk failed (exit {code}): {combined}")
     app, window, elements = _parse_elements(out)
     return _format_observation(app, window, elements, limit)
 
@@ -381,14 +402,27 @@ async def handle_observe_ui(args: dict) -> str:
 
 async def handle_click_ui(args: dict) -> str:
     """Click a UI element returned by the most recent observe_ui call."""
+    # 2.3: click_ui fires real input — it must honour the privacy pause like
+    # every other input tool (click, type_text, hotkey, ...).
+    if is_privacy_paused():  # K9
+        return PRIVACY_ERROR
     import pyautogui
 
     element_id = str(args.get("element_id") or "").strip()
     if not element_id:
-        return "ERROR: element_id is required. Call observe_ui first."
+        return tool_error("element_id is required. Call observe_ui first.")
     el = _LAST_ELEMENTS.get(element_id)
     if not el:
-        return f"ERROR: Unknown element_id {element_id!r}. Call observe_ui again and use one of its IDs."
+        return tool_error(f"Unknown element_id {element_id!r}. Call observe_ui again and use one of its IDs.")
+    # 2.3: refuse stale coordinates — the screen has likely changed since a
+    # minutes-old observation, and clicking old coords can hit the wrong thing.
+    age = time.monotonic() - _LAST_OBSERVE_TS
+    if age > _MAX_OBSERVATION_AGE_S:
+        return tool_error(
+            f"The last observe_ui result is {int(age)}s old (limit "
+            f"{int(_MAX_OBSERVATION_AGE_S)}s) and its coordinates may be stale. "
+            "Call observe_ui again, then click_ui with a fresh element_id."
+        )
     x, y = el.center
     button = str(args.get("button") or "left")
     clicks = int(args.get("clicks", 1))

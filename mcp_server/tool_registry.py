@@ -512,10 +512,32 @@ _WEB_TOOLS: list[Tool] = [
         ),
         inputSchema={"type": "object", "properties": {}},
     ),
+    # open_url drives the controlled browser (handler is handle_web_open), so it
+    # belongs to the `web` capability tier — NOT `windows`. Listing it under
+    # windows let `KIM_ENABLED_TOOL_TIERS=windows`/`ui` grant browser navigation
+    # that the operator meant to withhold (finding 2.3).
+    Tool(
+        name="open_url",
+        description=(
+            "Open a URL in Kim's controlled (Playwright-driven) web browser. "
+            "Use this for sites you intend to inspect or interact with via "
+            "the web_* tools afterwards. For opening URLs in the user's own "
+            "default browser, use run_command with the appropriate platform "
+            "command (open / xdg-open / start)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to open"},
+            },
+            "required": ["url"],
+        },
+    ),
 ]
 
 _WEB_DISPATCH = {
     "web_open": handle_web_open,
+    "open_url": handle_web_open,
     "web_observe": handle_web_observe,
     "web_resolve": handle_web_resolve,
     "web_click": handle_web_click,
@@ -702,30 +724,12 @@ _WINDOW_TOOLS: list[Tool] = [
             "required": ["title"],
         },
     ),
-    Tool(
-        name="open_url",
-        description=(
-            "Open a URL in Kim's controlled (Playwright-driven) web browser. "
-            "Use this for sites you intend to inspect or interact with via "
-            "the web_* tools afterwards. For opening URLs in the user's own "
-            "default browser, use run_command with the appropriate platform "
-            "command (open / xdg-open / start)."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "URL to open"},
-            },
-            "required": ["url"],
-        },
-    ),
 ]
 
 _WINDOW_DISPATCH = {
     "get_windows": handle_get_windows,
     "focus_window": handle_focus_window,
     "resize_window": handle_resize_window,
-    "open_url": handle_web_open,
 }
 
 
@@ -1040,7 +1044,27 @@ for _d in (
     _SEARCH_DISPATCH,
     _MEMORY_DISPATCH,
 ):
+    # Fail loudly on a duplicate tool name across groups rather than letting a
+    # later group silently shadow an earlier handler (finding 2.4). A collision
+    # is a programming error in this module, so it should surface at import.
+    _dupes = DISPATCH.keys() & _d.keys()
+    if _dupes:
+        raise RuntimeError(
+            f"Duplicate tool name(s) across dispatch groups: {sorted(_dupes)}"
+        )
     DISPATCH.update(_d)
+
+# Every advertised Tool must have a handler and vice-versa; a schema without a
+# handler would list fine and then hit "Unknown tool" at call time (finding 2.4).
+_TOOL_NAMES = {t.name for t in TOOLS}
+_missing_handlers = _TOOL_NAMES - DISPATCH.keys()
+_missing_schemas = DISPATCH.keys() - _TOOL_NAMES
+if _missing_handlers or _missing_schemas:
+    raise RuntimeError(
+        "TOOLS/DISPATCH mismatch — "
+        f"schemas without handlers: {sorted(_missing_handlers)}; "
+        f"handlers without schemas: {sorted(_missing_schemas)}"
+    )
 
 
 # -- Tier membership ----------------------------------------------------------

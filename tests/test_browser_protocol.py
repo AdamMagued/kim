@@ -8,6 +8,7 @@ from codex_engine.engine import (
     _provider_response_to_responses_api,
     _system_prompt_for,
 )
+from orchestrator.providers.browser.prompt_builder import format_prompt
 
 
 def _browser_provider_or_skip(case: unittest.TestCase):
@@ -22,6 +23,102 @@ def _browser_provider_or_skip(case: unittest.TestCase):
 
 
 class BrowserProtocolTests(unittest.TestCase):
+    def test_chatgpt_plain_agent_reply_requires_contract_repair(self):
+        from orchestrator.providers.browser_provider import BrowserProvider
+
+        self.assertTrue(BrowserProvider._needs_chatgpt_contract_repair(
+            {"type": "text", "content": "Hi!"},
+            preferred_site="chatgpt",
+            has_agent_tools=True,
+        ))
+        self.assertFalse(BrowserProvider._needs_chatgpt_contract_repair(
+            {"type": "text", "content": "TASK_COMPLETE: Hi!"},
+            preferred_site="chatgpt",
+            has_agent_tools=True,
+        ))
+
+    def test_contract_repair_does_not_touch_codex_or_other_sites(self):
+        from orchestrator.providers.browser_provider import BrowserProvider
+
+        plain = {"type": "text", "content": '{"text":"done"}'}
+        self.assertFalse(BrowserProvider._needs_chatgpt_contract_repair(
+            plain,
+            preferred_site="chatgpt",
+            has_agent_tools=False,
+        ))
+        self.assertFalse(BrowserProvider._needs_chatgpt_contract_repair(
+            plain,
+            preferred_site="gemini",
+            has_agent_tools=True,
+        ))
+
+    def test_chatgpt_false_local_access_refusal_requires_repair(self):
+        from orchestrator.providers.browser_provider import BrowserProvider
+
+        refusal = {
+            "type": "text",
+            "content": "NEED_HELP: I don't have access to the local project. Upload the files.",
+        }
+        self.assertTrue(BrowserProvider._needs_chatgpt_capability_repair(
+            refusal,
+            preferred_site="chatgpt",
+            has_agent_tools=True,
+        ))
+        self.assertFalse(BrowserProvider._needs_chatgpt_capability_repair(
+            refusal,
+            preferred_site="gemini",
+            has_agent_tools=True,
+        ))
+
+    def test_real_need_help_is_not_misclassified_as_capability_refusal(self):
+        from orchestrator.providers.browser_provider import BrowserProvider
+
+        self.assertFalse(BrowserProvider._needs_chatgpt_capability_repair(
+            {"type": "text", "content": "NEED_HELP: Please choose which account."},
+            preferred_site="chatgpt",
+            has_agent_tools=True,
+        ))
+
+    def test_chatgpt_chat_prompt_restates_parser_contract_at_tail(self):
+        prompt, _attachments, marker, _sent = format_prompt(
+            [{"role": "user", "content": "do the task"}],
+            [{"name": "observe_ui", "parameters": {"properties": {}}}],
+            "You are Kim.",
+            sent_system_prompt=False,
+            max_inject_chars=200000,
+            use_webview_bridge=True,
+            preferred_site="chatgpt",
+        )
+        tail = prompt.split("DIRECT RESPONSE FORMAT REQUEST FOR THIS MESSAGE:", 1)[1]
+        self.assertIn("TASK_COMPLETE:", tail)
+        self.assertIn(marker, tail)
+        self.assertIn("Do not discuss", tail)
+
+    def test_chatgpt_stateful_followup_repeats_direct_contract(self):
+        prompt, _attachments, marker, _sent = format_prompt(
+            [{"role": "user", "content": "continue"}],
+            [],
+            "You are Kim.",
+            sent_system_prompt=True,
+            max_inject_chars=200000,
+            use_webview_bridge=True,
+            preferred_site="chatgpt",
+        )
+        self.assertIn("DIRECT RESPONSE FORMAT REQUEST", prompt)
+        self.assertTrue(prompt.rstrip().endswith(f"{marker} at the very end of the response."))
+
+    def test_gemini_does_not_get_chatgpt_tail_workaround(self):
+        prompt, _attachments, _marker, _sent = format_prompt(
+            [{"role": "user", "content": "do the task"}],
+            [],
+            "You are Kim.",
+            sent_system_prompt=False,
+            max_inject_chars=200000,
+            use_webview_bridge=True,
+            preferred_site="gemini",
+        )
+        self.assertNotIn("DIRECT RESPONSE FORMAT REQUEST", prompt)
+
     def test_codex_prompt_has_no_static_plain_sentinel_contract(self):
         prompt = _codex_browser_system_prompt()
         self.assertNotIn("raw JSON followed by the [END_OF_RESPONSE] marker", prompt)
@@ -84,11 +181,16 @@ class BrowserProtocolTests(unittest.TestCase):
         self.assertNotIn("TASK_COMPLETE", prompt)
         self.assertNotIn("NEED_HELP", prompt)
 
-    def test_system_prompt_selector_routes_chatgpt_to_terminal_mode(self):
-        # ChatGPT → terminal-helper prompt; everyone else → JSON prompt.
+    def test_system_prompt_selector_uses_exact_json_contract_for_chatgpt(self):
+        # The proxy/parser has one protocol. ChatGPT must receive that exact
+        # contract too, including on stateful follow-up turns.
         self.assertEqual(
-            _system_prompt_for("browser:chatgpt"), _chatgpt_terminal_system_prompt()
+            _system_prompt_for("browser:chatgpt"), _codex_browser_system_prompt()
         )
+        self.assertIn(
+            '"tool_calls"', _system_prompt_for("browser:chatgpt")
+        )
+        self.assertNotIn("```bash", _system_prompt_for("browser:chatgpt"))
         self.assertEqual(
             _system_prompt_for("browser:gemini"), _codex_browser_system_prompt()
         )

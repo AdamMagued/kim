@@ -66,6 +66,16 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
 
 const KEY_PROVIDERS: &[&str] = &["claude", "openai", "gemini", "deepseek"];
 
+/// #5: is `command` (the first whitespace-delimited token of a line starting
+/// with `/`) one Kim actually recognizes? Single source of truth shared by
+/// `handle_command`'s "is this really a slash-command" gate below and by
+/// `SUPPORTED_COMMANDS` (also used for tab completion in main.rs) — no
+/// second list to keep in sync. `/` alone is the bare-help alias, matched in
+/// `handle_command` but not itself listed in `SUPPORTED_COMMANDS`.
+fn is_known_command(command: &str) -> bool {
+    command == "/" || SUPPORTED_COMMANDS.contains(&command)
+}
+
 pub async fn handle_command(input: &str, config: &mut KimConfig) -> CommandOutcome {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
@@ -74,6 +84,15 @@ pub async fn handle_command(input: &str, config: &mut KimConfig) -> CommandOutco
     let mut parts = trimmed.splitn(2, char::is_whitespace);
     let command = parts.next().unwrap_or_default();
     let args = parts.next().unwrap_or_default().trim();
+
+    // #5: a leading '/' is common in ordinary chat text too ("/etc/passwd",
+    // "explain 24/7 coverage", "/foo bar" as a literal question). Only treat
+    // the line as a slash-command when it matches a KNOWN command name —
+    // otherwise it must reach the model like any other prompt, not vanish
+    // into a silent "Unknown Kim command" note.
+    if !is_known_command(command) {
+        return CommandOutcome::SendPrompt(trimmed.to_string());
+    }
 
     match command {
         "/" | "/help" | "/commands" => CommandOutcome::Message(commands_menu(args)),
@@ -363,10 +382,47 @@ fn status(config: &KimConfig) -> String {
     )
 }
 
+/// F-E-1: the outcome of a `kim doctor` run — the human-readable text plus two
+/// health bits so `kim doctor` (and CI / install scripts calling it) can gate
+/// on the exit code instead of always seeing 0.
+///
+/// - `required_ok` covers the universal prerequisites Kim cannot run without
+///   (a Python interpreter for the orchestrator/agent; a home directory for
+///   config + sessions). A required failure ALWAYS exits non-zero.
+/// - `all_ok` additionally covers optional, provider-specific checks (Ollama
+///   server/model, desktop bridge, API key, model-in-list). These gate the
+///   exit code only under `--strict`.
+pub struct DoctorReport {
+    pub text: String,
+    pub required_ok: bool,
+    pub all_ok: bool,
+}
+
+/// F-E-1: should `kim doctor` exit non-zero? Required failures always gate;
+/// optional/provider-specific failures gate only under `--strict`. Pure so it
+/// is unit-testable without probing anything.
+#[must_use]
+pub fn doctor_should_fail(required_ok: bool, all_ok: bool, strict: bool) -> bool {
+    !required_ok || (strict && !all_ok)
+}
+
 async fn doctor(config: &KimConfig) -> CommandOutcome {
+    // The REPL `/doctor` command only surfaces the text; the process exit-code
+    // gating lives in main()'s `kim doctor` arm, which calls doctor_report.
+    CommandOutcome::Message(doctor_report(config).await.text)
+}
+
+pub async fn doctor_report(config: &KimConfig) -> DoctorReport {
+    let root =
+        crate::sessions::find_kim_repo_root().unwrap_or_else(|| std::path::PathBuf::from("."));
+    // Required: the interpreter chat/code mode actually run (find_python: repo
+    // venv first, then python3/python). This is the check CI must gate on.
+    let python_found = crate::agentic::find_python(&root).is_some();
+    let config_ok = config_path().is_some();
+
     let mut lines = vec![
         "KimCLI doctor".to_string(),
-        format!("Mode support: chat + code"),
+        "Mode support: chat + code".to_string(),
         format!("Provider: {}", config.provider),
         format!("Model: {}", config.model),
         format!(
@@ -378,17 +434,23 @@ async fn doctor(config: &KimConfig) -> CommandOutcome {
         ),
         format!("Source root: {}", source_root_status()),
         format!("Bridge token: {}", crate::provider::bridge_token_source()),
-        format!(
-            "python3: {}",
-            command_status("python3", &["--version"]).await
-        ),
+        // F12: report the interpreter the CLI actually runs (find_python:
+        // repo venv first, then system), not a bare PATH probe of `python3` —
+        // the two could disagree in both directions.
+        format!("python: {}", python_status().await),
         format!("codex: {}", command_status("codex", &["--version"]).await),
         format!("git: {}", command_status("git", &["--version"]).await),
         format!("cargo: {}", command_status("cargo", &["--version"]).await),
     ];
 
+    // required_ok gates the exit code unconditionally; all_ok also folds in the
+    // optional provider-specific checks below (only consulted under --strict).
+    let mut required_ok = python_found && config_ok;
+    let mut all_ok = required_ok;
+
     if config.provider == "ollama" {
         let base = crate::provider::normalize_base_url(&config.ollama_base_url);
+        let server = ollama_models_at(&base).await;
         lines.push(format!(
             "Ollama server: {}",
             http_status(&base, "/api/tags").await
@@ -399,12 +461,20 @@ async fn doctor(config: &KimConfig) -> CommandOutcome {
             "Ollama model: {}",
             ollama_model_status(&base, &config.model).await
         ));
+        let ollama_ok = known_ollama_cloud_models().contains(&config.model.as_str())
+            || matches!(&server, Some(models) if models.iter().any(|m| m == &config.model));
+        if !ollama_ok {
+            all_ok = false;
+        }
     }
     if config.provider == "desktop" || is_browser_provider(&config.provider) {
-        lines.push(format!(
-            "Kim desktop bridge: {}",
-            desktop_bridge_status(&config.desktop_bridge_url).await
-        ));
+        let status = desktop_bridge_status(&config.desktop_bridge_url).await;
+        // The bridge is optional (browser code mode can run via local
+        // Playwright), so it only affects --strict.
+        if !status.starts_with("ok") {
+            all_ok = false;
+        }
+        lines.push(format!("Kim desktop bridge: {status}"));
     }
     if is_browser_provider(&config.provider) {
         lines.push(
@@ -416,26 +486,53 @@ async fn doctor(config: &KimConfig) -> CommandOutcome {
         let key_env = p.key_env.unwrap();
         let env_val = std::env::var(key_env).ok();
         let stored = config.api_keys.get(&config.provider).map(String::as_str);
+        let key_present = env_val
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty())
+            || stored.map(str::trim).is_some_and(|v| !v.is_empty());
         lines.push(format!(
             "API key: {}",
             api_key_status(key_env, env_val, stored, &config.provider)
         ));
+        if !key_present {
+            all_ok = false;
+        }
         // A8: note whether the configured model appears in the known list.
         let opts = model_options(config).await;
         if !opts.is_empty() {
+            let model_known = opts.iter().any(|m| m == &config.model);
             lines.push(format!(
                 "Model '{}': {}",
                 config.model,
-                if opts.iter().any(|m| m == &config.model) {
+                if model_known {
                     "in the known model list".to_string()
                 } else {
                     format!("not in the known list (known: {})", opts.join(", "))
                 }
             ));
+            if !model_known {
+                all_ok = false;
+            }
         }
     }
 
-    CommandOutcome::Message(lines.join("\n"))
+    if !python_found {
+        // Belt-and-braces: python_status() already prints "not found", but make
+        // the gating reason explicit at the end of the report.
+        lines.push(
+            "FAIL: no Python interpreter found — install Python 3.11+ (Kim's orchestrator runtime)."
+                .to_string(),
+        );
+        required_ok = false;
+        all_ok = false;
+    }
+
+    DoctorReport {
+        text: lines.join("\n"),
+        required_ok,
+        all_ok,
+    }
 }
 
 fn set_provider(args: &str, config: &mut KimConfig) -> CommandOutcome {
@@ -467,7 +564,7 @@ async fn set_model(args: &str, config: &mut KimConfig) -> CommandOutcome {
 
 pub async fn model_options(config: &KimConfig) -> Vec<String> {
     let mut models = match config.provider.as_str() {
-        "ollama" => ollama_models().await,
+        "ollama" => ollama_models(config).await,
         // A18: current Claude model ids (claude-api).
         "claude" => vec![
             "claude-opus-4-8".to_string(),
@@ -570,22 +667,19 @@ pub(crate) fn is_openai_chat_model_for_test(id: &str) -> bool {
     is_openai_chat_model(id)
 }
 
-async fn ollama_models() -> Vec<String> {
+async fn ollama_models(config: &KimConfig) -> Vec<String> {
     let mut models = known_ollama_cloud_models()
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    if let Ok(output) = Command::new("ollama").arg("list").output().await {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines().skip(1) {
-                if let Some(name) = line.split_whitespace().next() {
-                    if !name.trim().is_empty() {
-                        models.push(name.to_string());
-                    }
-                }
-            }
-        }
+    // F-E-10: query the CONFIGURED Ollama endpoint (respects ollama_base_url /
+    // a remote or nonstandard-port host) via its HTTP API, instead of shelling
+    // out to the LOCAL `ollama list` daemon — which returned an empty/wrong list
+    // for anyone pointing Kim at a remote Ollama while doctor and actual chat
+    // requests worked.
+    let base = crate::provider::normalize_base_url(&config.ollama_base_url);
+    if let Some(server) = ollama_models_at(&base).await {
+        models.extend(server);
     }
     models.sort();
     models.dedup();
@@ -708,7 +802,12 @@ async fn ollama_login(config: &mut KimConfig) -> CommandOutcome {
             "Ollama is not installed.\nInstall it, run 'ollama serve', then /login ollama again.\nhttps://ollama.com/download".to_string(),
         );
     }
-    match ollama_server_models().await {
+    // F-E-10: probe the CONFIGURED Ollama endpoint, not a hardcoded
+    // 127.0.0.1:11434 — a user pointing Kim at a remote / nonstandard-port
+    // Ollama previously got "server is not running" from /login while doctor
+    // and chat requests (which already respect ollama_base_url) worked.
+    let base = crate::provider::normalize_base_url(&config.ollama_base_url);
+    match ollama_models_at(&base).await {
         Some(local_models) => {
             config.provider = "ollama".to_string();
             config.model = choose_ollama_model(&config.model, &local_models);
@@ -761,31 +860,6 @@ async fn ollama_is_available() -> bool {
         }
     }
     false
-}
-
-async fn ollama_server_models() -> Option<Vec<String>> {
-    let resp = reqwest::Client::new()
-        .get("http://127.0.0.1:11434/api/tags")
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let text = resp.text().await.unwrap_or_default();
-    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-    let models = json["models"]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item["name"].as_str())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    Some(models)
 }
 
 /// Fetch the model list from a specific ollama base URL (respects config, not a
@@ -881,6 +955,24 @@ fn format_source_root(found: Option<&std::path::Path>) -> String {
     }
 }
 
+/// F12: doctor's python line must reflect what chat/code mode actually run —
+/// `find_python` (repo venv first, then python3/python) — not a PATH probe.
+async fn python_status() -> String {
+    let root =
+        crate::sessions::find_kim_repo_root().unwrap_or_else(|| std::path::PathBuf::from("."));
+    match crate::agentic::find_python(&root) {
+        Some(python) => {
+            let shown = python.display().to_string();
+            format!(
+                "{} — {}",
+                shown,
+                command_status(&shown, &["--version"]).await
+            )
+        }
+        None => "not found (tried repo venv, python3, python)".to_string(),
+    }
+}
+
 async fn command_status(program: &str, args: &[&str]) -> String {
     match Command::new(program).args(args).output().await {
         Ok(output) if output.status.success() => {
@@ -944,50 +1036,98 @@ fn choose_ollama_model(current: &str, local_models: &[String]) -> String {
     })
 }
 
+/// F-E-11: per-provider validation host bases (overridable in tests). Real
+/// hosts by default.
+struct ValidationHosts<'a> {
+    anthropic: &'a str,
+    openai: &'a str,
+    deepseek: &'a str,
+    gemini: &'a str,
+}
+
+const DEFAULT_VALIDATION_HOSTS: ValidationHosts<'static> = ValidationHosts {
+    anthropic: "https://api.anthropic.com",
+    openai: "https://api.openai.com",
+    deepseek: "https://api.deepseek.com",
+    gemini: "https://generativelanguage.googleapis.com",
+};
+
+/// F-E-11: every validation request gets a hard total timeout. The default
+/// reqwest client has NONE, so a blackholed connection (captive portal,
+/// firewalled egress) left the REPL stuck forever after the user typed their
+/// key, with no spinner and no Ctrl-C-friendly path.
+const VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn validate_api_key(provider: &str, key: &str) -> Result<(), String> {
+    validate_api_key_at(provider, key, &DEFAULT_VALIDATION_HOSTS, VALIDATION_TIMEOUT).await
+}
+
+async fn validate_api_key_at(
+    provider: &str,
+    key: &str,
+    hosts: &ValidationHosts<'_>,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let status = match provider {
-        "claude" => client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&serde_json::json!({
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .status(),
-        "openai" => client
-            .get("https://api.openai.com/v1/models")
-            .bearer_auth(key)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .status(),
-        "deepseek" => client
-            .get("https://api.deepseek.com/v1/models")
-            .bearer_auth(key)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .status(),
-        "gemini" => client
-            .get(format!(
-                "https://generativelanguage.googleapis.com/v1beta/models?key={key}"
-            ))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .status(),
+    let result = match provider {
+        "claude" => {
+            client
+                .post(format!("{}/v1/messages", hosts.anthropic))
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&serde_json::json!({
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .timeout(timeout)
+                .send()
+                .await
+        }
+        "openai" => {
+            client
+                .get(format!("{}/v1/models", hosts.openai))
+                .bearer_auth(key)
+                .timeout(timeout)
+                .send()
+                .await
+        }
+        "deepseek" => {
+            client
+                .get(format!("{}/v1/models", hosts.deepseek))
+                .bearer_auth(key)
+                .timeout(timeout)
+                .send()
+                .await
+        }
+        // F15: pass the key in a header, not the URL query string — URLs leak
+        // into proxy logs and reqwest error messages include the full URL.
+        "gemini" => {
+            client
+                .get(format!("{}/v1beta/models", hosts.gemini))
+                .header("x-goog-api-key", key)
+                .timeout(timeout)
+                .send()
+                .await
+        }
         _ => return Ok(()),
     };
-    if status.as_u16() == 401 || status.as_u16() == 403 {
-        return Err(format!("key rejected (HTTP {status})"));
+    match result {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                Err(format!("key rejected (HTTP {status})"))
+            } else {
+                Ok(())
+            }
+        }
+        // F-E-11: a timeout or connect failure is NOT a rejection — the key may
+        // be perfectly valid; we just couldn't reach the provider. Treat it as
+        // "validation skipped" so the key is still saved and usable, rather than
+        // hanging or telling the user their key failed.
+        Err(e) if e.is_timeout() || e.is_connect() => Ok(()),
+        Err(e) => Err(e.to_string()),
     }
-    Ok(())
 }
 
 fn logout(args: &str, config: &mut KimConfig) -> CommandOutcome {
@@ -1035,14 +1175,41 @@ async fn run_project_command(program: &str, args: &str) -> CommandOutcome {
     shell(program, &split, &format!("{program} {args}")).await
 }
 
+/// F18: hard deadline for slash-command subprocesses (`/run`, `/git`,
+/// `/search`, `/files`). Without one, `/run sleep 10000` wedged the REPL and
+/// Ctrl-C killed the whole CLI.
+const SLASH_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run a slash-command subprocess with a timeout; `kill_on_drop` reaps the
+/// child when the deadline fires. Timeouts surface as an `io::Error` so
+/// callers' `ErrorKind::NotFound` fallbacks keep working unchanged.
+async fn output_with_timeout(mut cmd: Command) -> Result<std::process::Output, std::io::Error> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(SLASH_CMD_TIMEOUT, cmd.output()).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "timed out after {}s (process killed)",
+                SLASH_CMD_TIMEOUT.as_secs()
+            ),
+        )),
+    }
+}
+
 async fn run_shell(args: &str) -> CommandOutcome {
     if args.trim().is_empty() {
         return CommandOutcome::Message("Usage: /run <command>".to_string());
     }
     #[cfg(windows)]
-    let output = Command::new("cmd").args(["/C", args]).output().await;
+    let mut cmd = Command::new("cmd");
+    #[cfg(windows)]
+    cmd.args(["/C", args]);
     #[cfg(not(windows))]
-    let output = Command::new("sh").args(["-lc", args]).output().await;
+    let mut cmd = Command::new("sh");
+    #[cfg(not(windows))]
+    cmd.args(["-lc", args]);
+    let output = output_with_timeout(cmd).await;
     format_output(args, output)
 }
 
@@ -1050,21 +1217,19 @@ async fn search(args: &str) -> CommandOutcome {
     if args.trim().is_empty() {
         return CommandOutcome::Message("Usage: /search <query>".to_string());
     }
-    let output = Command::new("rg")
-        .args(["--line-number", "--hidden", args])
-        .output()
-        .await;
+    let mut cmd = Command::new("rg");
+    cmd.args(["--line-number", "--hidden", args]);
+    let output = output_with_timeout(cmd).await;
     match &output {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             #[cfg(windows)]
             {
-                let output = Command::new("cmd")
-                    .args([
-                        "/C",
-                        &format!("findstr /r /s /n /p \"{}\" *", args.replace('"', "")),
-                    ])
-                    .output()
-                    .await;
+                let mut cmd = Command::new("cmd");
+                cmd.args([
+                    "/C",
+                    &format!("findstr /r /s /n /p \"{}\" *", args.replace('"', "")),
+                ]);
+                let output = output_with_timeout(cmd).await;
                 return format_output(&format!("findstr {args}"), output);
             }
             #[cfg(not(windows))]
@@ -1079,15 +1244,16 @@ async fn search(args: &str) -> CommandOutcome {
 
 async fn files(args: &str) -> CommandOutcome {
     let path = if args.trim().is_empty() { "." } else { args };
-    let output = Command::new("rg").args(["--files", path]).output().await;
+    let mut cmd = Command::new("rg");
+    cmd.args(["--files", path]);
+    let output = output_with_timeout(cmd).await;
     match &output {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             #[cfg(windows)]
             {
-                let output = Command::new("cmd")
-                    .args(["/C", &format!("dir /s /b \"{}\"", path.replace('"', ""))])
-                    .output()
-                    .await;
+                let mut cmd = Command::new("cmd");
+                cmd.args(["/C", &format!("dir /s /b \"{}\"", path.replace('"', ""))]);
+                let output = output_with_timeout(cmd).await;
                 return format_output(&format!("dir {path}"), output);
             }
             #[cfg(not(windows))]
@@ -1120,9 +1286,15 @@ fn init_project() -> CommandOutcome {
 }
 
 async fn shell(program: &str, args: &[&str], label: &str) -> CommandOutcome {
-    let output = Command::new(program).args(args).output().await;
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    let output = output_with_timeout(cmd).await;
     format_output(label, output)
 }
+
+/// F18: cap the rendered subprocess output so a huge `rg` result doesn't get
+/// buffered/printed in full (chars, not bytes — truncate is char-safe).
+const MAX_OUTPUT_CHARS: usize = 200_000;
 
 fn format_output(
     label: &str,
@@ -1142,6 +1314,11 @@ fn format_output(
             }
             if text.trim().is_empty() {
                 text = format!("`{label}` completed with no output.");
+            } else if text.chars().nth(MAX_OUTPUT_CHARS).is_some() {
+                text = format!(
+                    "{}\n… (output truncated at {MAX_OUTPUT_CHARS} characters)",
+                    crate::sessions::truncate(&text, MAX_OUTPUT_CHARS)
+                );
             }
             CommandOutcome::Message(text)
         }
@@ -1170,8 +1347,52 @@ fn config_notice(config: &KimConfig, message: String) -> CommandOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_command, CommandOutcome, SUPPORTED_COMMANDS};
+    use super::{handle_command, is_known_command, CommandOutcome, SUPPORTED_COMMANDS};
     use crate::config::{KimConfig, ThemeName};
+
+    // ── #5: unrecognized leading-slash text falls through to chat ───────────
+
+    #[tokio::test]
+    async fn unknown_slash_command_falls_through_to_send_prompt() {
+        let mut config = KimConfig::default();
+        let outcome = handle_command("/etc/passwd is a file", &mut config).await;
+        assert_eq!(
+            outcome,
+            CommandOutcome::SendPrompt("/etc/passwd is a file".to_string()),
+            "an unrecognized leading-slash line must reach the model as chat text, \
+             not vanish into an 'Unknown Kim command' note"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_bare_slash_word_falls_through_to_send_prompt() {
+        let mut config = KimConfig::default();
+        let outcome = handle_command("/nonexistent", &mut config).await;
+        assert_eq!(
+            outcome,
+            CommandOutcome::SendPrompt("/nonexistent".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn known_command_is_still_dispatched_not_sent_as_prompt() {
+        let mut config = KimConfig::default();
+        let outcome = handle_command("/exit", &mut config).await;
+        assert_eq!(outcome, CommandOutcome::Exit);
+    }
+
+    #[test]
+    fn is_known_command_covers_bare_slash_and_supported_list() {
+        assert!(is_known_command("/"));
+        for command in SUPPORTED_COMMANDS {
+            assert!(
+                is_known_command(command),
+                "{command} is in SUPPORTED_COMMANDS but is_known_command rejected it"
+            );
+        }
+        assert!(!is_known_command("/nonexistent"));
+        assert!(!is_known_command("/etc"));
+    }
 
     #[tokio::test]
     async fn parses_theme_command() {
@@ -1217,6 +1438,46 @@ mod tests {
         assert!(models.iter().any(|model| model == "gpt-4o"));
         assert!(models.iter().any(|model| model == "o3-mini"));
         assert!(!models.iter().any(|model| model == "gpt-5.4"));
+    }
+
+    // F-E-10: the /model picker must query the CONFIGURED Ollama endpoint
+    // (ollama_base_url), not the local `ollama list` daemon / hardcoded
+    // 127.0.0.1:11434 — so a remote/nonstandard-port Ollama shows the right
+    // models. A fake /api/tags server serving a model that exists NOWHERE else
+    // proves the configured base URL was actually queried.
+    #[tokio::test]
+    async fn model_picker_queries_configured_ollama_base_url() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ollama");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let body = r#"{"models":[{"name":"remote-only-model:latest"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+
+        let config = KimConfig {
+            provider: "ollama".to_string(),
+            ollama_base_url: format!("http://127.0.0.1:{port}"),
+            ..KimConfig::default()
+        };
+        let models = super::model_options(&config).await;
+        assert!(
+            models.iter().any(|m| m == "remote-only-model:latest"),
+            "the picker must list models from the configured Ollama endpoint; got: {models:?}"
+        );
     }
 
     #[tokio::test]
@@ -1561,5 +1822,133 @@ mod tests {
         let s = super::api_key_status("OPENAI_API_KEY", None, None, "openai");
         assert!(s.contains("missing"), "{s}");
         assert!(s.contains("openai"), "{s}");
+    }
+
+    // ── F-E-11: /login key validation must time out, and treat a timeout as
+    // "skipped", not "key rejected" ─────────────────────────────────────────
+
+    /// A blackholed connection (server accepts but never responds) must NOT
+    /// hang the REPL: the request times out and, because a timeout is not a
+    /// rejection, validation is skipped (Ok) so the key is still saved.
+    #[tokio::test]
+    async fn validate_api_key_times_out_and_skips_rather_than_rejecting() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind blackhole");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Hold every accepted connection open forever, never responding.
+            let mut held = Vec::new();
+            for s in listener.incoming().flatten() {
+                held.push(s);
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let hosts = super::ValidationHosts {
+            anthropic: &base,
+            openai: &base,
+            deepseek: &base,
+            gemini: &base,
+        };
+
+        let start = std::time::Instant::now();
+        let result = super::validate_api_key_at(
+            "openai",
+            "sk-whatever",
+            &hosts,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "a timeout must be treated as skipped, not a rejection"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "validation must not hang; it returned after {elapsed:?}"
+        );
+    }
+
+    /// A 401 response is a real rejection and must surface as an Err.
+    #[tokio::test]
+    async fn validate_api_key_reports_401_as_rejected() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 401 server");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let resp =
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let hosts = super::ValidationHosts {
+            anthropic: &base,
+            openai: &base,
+            deepseek: &base,
+            gemini: &base,
+        };
+
+        let result = super::validate_api_key_at(
+            "openai",
+            "sk-bad",
+            &hosts,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            result.is_err_and(|e| e.contains("rejected")),
+            "a 401 must be reported as a rejected key"
+        );
+    }
+
+    // ── F-E-1: doctor exit-code gating ──────────────────────────────────────
+
+    /// Required failures always gate the exit code; optional/provider-specific
+    /// failures gate only under --strict.
+    #[test]
+    fn doctor_should_fail_gating_matrix() {
+        use super::doctor_should_fail;
+        // All green.
+        assert!(!doctor_should_fail(true, true, false));
+        assert!(!doctor_should_fail(true, true, true));
+        // Optional failure: gated only by --strict.
+        assert!(!doctor_should_fail(true, false, false));
+        assert!(doctor_should_fail(true, false, true));
+        // Required failure: always gates, regardless of --strict.
+        assert!(doctor_should_fail(false, false, false));
+        assert!(doctor_should_fail(false, false, true));
+    }
+
+    /// A provider-specific failure (Ollama server unreachable + configured model
+    /// not installed / not a known cloud tag) must clear `all_ok` — so `kim
+    /// doctor --strict` exits non-zero — while the required Python interpreter
+    /// present on the test host keeps `required_ok` true (plain `kim doctor`
+    /// stays 0). 127.0.0.1:1 refuses instantly, so the probe is deterministic.
+    #[tokio::test]
+    async fn doctor_report_flags_unreachable_ollama_without_gating_required() {
+        let config = KimConfig {
+            provider: "ollama".to_string(),
+            model: "definitely-not-a-real-model-xyz".to_string(),
+            ollama_base_url: "http://127.0.0.1:1".to_string(),
+            ..KimConfig::default()
+        };
+        let report = super::doctor_report(&config).await;
+        assert!(
+            !report.all_ok,
+            "unreachable Ollama + unknown model must clear all_ok; text:\n{}",
+            report.text
+        );
+        assert!(
+            report.text.contains("Ollama"),
+            "the human-readable report must still surface the Ollama status"
+        );
     }
 }

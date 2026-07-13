@@ -6,10 +6,33 @@ import logging
 import os
 
 from ..privacy import is_privacy_paused, PRIVACY_ERROR
+from ._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
 
+def _click_space_geometry(
+    monitor: dict, img_w: int, img_h: int
+) -> tuple[int, int, int, int]:
+    """Return (width, height, left, top) of a captured monitor in the CLICK
+    coordinate space — the space pyautogui uses.
+
+    2.1 (Retina/DPI): mss grabs the framebuffer in PHYSICAL pixels (e.g.
+    2880x1800 on a 2x Retina display) while pyautogui clicks in LOGICAL
+    points (1440x900).  The mss monitor dict, however, is reported in the
+    same coordinate space pyautogui uses (CGDisplayBounds points on macOS;
+    physical pixels on Windows/Linux where pyautogui is DPI-aware too), so
+    the monitor dict — not the grabbed image size — defines the click space.
+
+    2.2 (multi-monitor): the monitor's left/top offset in the global virtual
+    desktop must be added to any coordinate meant for clicking, because the
+    grabbed image is local to the monitor while pyautogui is global.
+    """
+    width = int(monitor.get("width", 0)) or img_w
+    height = int(monitor.get("height", 0)) or img_h
+    left = int(monitor.get("left", 0))
+    top = int(monitor.get("top", 0))
+    return (width, height, left, top)
 
 
 async def handle_take_screenshot(args: dict) -> str:
@@ -37,7 +60,7 @@ async def handle_take_screenshot(args: dict) -> str:
         return f"data:image/png;base64,{b64}"
     except Exception as e:
         logger.error(f"take_screenshot failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_get_screen_info(args: dict) -> str:
@@ -83,7 +106,7 @@ async def handle_get_screen_info(args: dict) -> str:
         return "\n".join(lines)
     except Exception as e:
         logger.error(f"get_screen_info failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_take_annotated_screenshot(args: dict) -> str:
@@ -114,11 +137,16 @@ async def handle_take_annotated_screenshot(args: dict) -> str:
             monitors = sct.monitors
             if monitor_index >= len(monitors):
                 monitor_index = 1
+            selected_monitor = dict(monitors[monitor_index])
             screenshot = sct.grab(monitors[monitor_index])
             img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
 
-        # Remember real screen dimensions before scaling
-        real_w, real_h = img.size
+        # Click-space geometry (2.1 DPI + 2.2 multi-monitor): grid coords must
+        # be expressed in pyautogui's logical/global coordinate space, NOT in
+        # the physical pixel space of the grabbed framebuffer.
+        click_w, click_h, mon_left, mon_top = _click_space_geometry(
+            selected_monitor, img.width, img.height
+        )
 
         # Scale down (same as take_screenshot)
         if scale != 1.0:
@@ -130,8 +158,10 @@ async def handle_take_annotated_screenshot(args: dict) -> str:
             img,
             grid_cols=grid_cols,
             grid_rows=grid_rows,
-            original_width=real_w,
-            original_height=real_h,
+            original_width=click_w,
+            original_height=click_h,
+            offset_x=mon_left,
+            offset_y=mon_top,
         )
 
         # Encode to base64
@@ -147,10 +177,13 @@ async def handle_take_annotated_screenshot(args: dict) -> str:
         result = {
             "image": f"data:image/png;base64,{b64}",
             "grid": grid_map,
-            "screen_width": real_w,
-            "screen_height": real_h,
+            "screen_width": click_w,
+            "screen_height": click_h,
+            "monitor_left": mon_left,
+            "monitor_top": mon_top,
             "instructions": (
-                "The screenshot has a grid of labeled markers (columns A-J, rows 1-10). "
+                f"The screenshot has a grid of labeled markers (columns A-"
+                f"{chr(ord('A') + grid_cols - 1)}, rows 1-{grid_rows}). "
                 "Each marker label (e.g. 'A1', 'E5') maps to exact screen coordinates in the 'grid' field. "
                 "To click a target: find the two nearest markers, note their coordinates from the grid, "
                 "and interpolate to estimate the target's exact (x, y) position. "

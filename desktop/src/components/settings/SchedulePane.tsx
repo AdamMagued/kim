@@ -8,7 +8,7 @@
  * standing project constraint (never openai / gpt-5.5).
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { Settings } from '../../types';
@@ -417,35 +417,27 @@ export function PaneSchedule({
     setTimerInterval(String(settings.schedule_timer.interval_seconds || 300));
   }, [settings.schedule_timer.interval_seconds]);
 
+  const mountedRef = useRef(true);
+
   async function refresh() {
     setLoading(true);
     setError(null);
     try {
       const json = await invoke<string>('list_scheduled_tasks', { enabledOnly: false });
-      setTasks(parseTaskList(json));
+      if (mountedRef.current) setTasks(parseTaskList(json));
     } catch (e) {
-      setError(extractInvokeError(e));
+      if (mountedRef.current) setError(extractInvokeError(e));
     } finally {
-      setLoading(false);
+      if (mountedRef.current) setLoading(false);
     }
   }
 
+  // L16: was a verbatim duplicate of refresh() with a cancelled flag bolted
+  // on; the mountedRef keeps one implementation for both paths.
   useEffect(() => {
-    let cancelled = false;
-    async function run() {
-      setLoading(true);
-      setError(null);
-      try {
-        const json = await invoke<string>('list_scheduled_tasks', { enabledOnly: false });
-        if (!cancelled) setTasks(parseTaskList(json));
-      } catch (e) {
-        if (!cancelled) setError(extractInvokeError(e));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-    void run();
-    return () => { cancelled = true; };
+    mountedRef.current = true;
+    void refresh();
+    return () => { mountedRef.current = false; };
   }, []);
 
   async function refreshTimerStatus() {
@@ -561,7 +553,9 @@ export function PaneSchedule({
     setTimerBusy(true);
     try {
       const parsed = Number.parseInt(timerInterval, 10);
-      const intervalSeconds = Number.isFinite(parsed) ? parsed : 300;
+      // L16: clamp to >=60s BEFORE starting the live timer — only the persisted
+      // settings value was clamped, so the running timer could tick faster.
+      const intervalSeconds = Math.max(60, Number.isFinite(parsed) ? parsed : 300);
       const status = await invoke<ScheduleTimerStatus>('start_schedule_timer', { intervalSeconds });
       const nextStatus = parseTimerStatus(status);
       setTimerStatus(nextStatus);

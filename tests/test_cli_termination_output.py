@@ -14,7 +14,7 @@ Background:
 
     The full typed-payload path — extending KimEvent::Done in Rust to carry
     termination + updating the frontend kim:done listener — requires Phase 6 and
-    is tracked in HARNESS_ROADMAP.md Tier 2b.
+    is tracked in docs/archive/HARNESS_ROADMAP.md Tier 2b.
 
 Test strategy:
     orchestrator/agent.py imports `from mcp import ClientSession` which is not
@@ -55,6 +55,12 @@ class CliTerminationStaticTests(unittest.TestCase):
         self.assertIn("from orchestrator.events_gen import", self.source)
         self.assertIn("emit_run_done", self.source)
         self.assertIn('emit_run_done(termination, bool(result["success"]))', self.source)
+
+    def test_run_lifecycle_clear_events_present_in_source(self):
+        """cli.py must use the schema-generated agent lifecycle clear emitters."""
+        self.assertIn("emit_agent_done", self.source)
+        self.assertIn("emit_agent_cancelled", self.source)
+        self.assertIn("emit_agent_error", self.source)
 
     def test_termination_key_accessed_via_get_with_fallback(self):
         """result.get('termination', 'unknown') must be used so old result dicts
@@ -126,7 +132,7 @@ class CliTerminationStaticTests(unittest.TestCase):
         self.assertIn("emit_activity", self.source)
         self.assertIn('emit_activity("error", failure_detail)', self.source)
         # User cancels are not errors and must not produce an error activity.
-        self.assertIn('termination != "cancelled"', self.source)
+        self.assertIn('termination == "cancelled"', self.source)
 
 
 class CliTerminationFormatTests(unittest.TestCase):

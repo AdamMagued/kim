@@ -18,7 +18,7 @@ The Rust Tauri backend provides a secure, sandboxed bridge to the OS, handling c
 - `main.rs`: Application entry point and Tauri application bootstrap configuration.
 - `lib.rs`: The central Tauri command router and subprocess manager (spawns the Python agent).
 - `google_oauth.rs`: Secure PKCE OAuth 2.0 desktop loopback flow management.
-- **Command Modules**: Specific command routines extracted into distinct modules (`account.rs`, `ollama.rs`, `relay.rs`, `session_commands.rs`, `voice_config.rs`, `feedback.rs`, etc.).
+- **Command Modules**: Specific command routines extracted into distinct modules (`account.rs`, `ollama.rs`, `session_commands.rs`, `feedback.rs`, etc.).
 - `build.rs`: Native desktop build configuration scripting.
 
 ---
@@ -92,8 +92,8 @@ The agent loop formats outputs printed to stdout, which `subprocess.rs` captures
 ### Surface D — WebView Automation Bridge (`browser_bridge.rs` + `bridge.js`)
 `desktop/src-tauri/src/browser_bridge.rs` manages a persistent in-app WebView window (`kim-browser-automate`) and injects `bridge.js` (extracted from `lib.rs` and loaded via `include_str!("bridge.js")`). The injected script intercepts outgoing fetch/XHR calls inside the target site (Claude, ChatGPT, Gemini) and re-routes them through the `/v1/send` HTTP bridge so the Python `BrowserProvider` can intercept LLM responses without a Playwright subprocess.
 
-### Surface E — Phone Relay (`relay.rs`)
-`desktop/src-tauri/src/relay.rs` manages the optional phone-to-PC relay integration. Tauri commands (`read_relay_config`, `write_relay_url`, `relay_pair_init`, `relay_pair_status`) wire the relay URL and RELAY_PC_API_KEY configuration stored in `config.yaml`.
+### Surface E — Phone Relay (removed)
+The phone-relay subsystem (relay_server/, `relay.rs`, the hidden settings pane) was decommissioned in Phase 0 of `docs/ROADMAP_TO_10.md` (A5/S6): it was never enabled and shipped a deployable server that was pure attack surface. Git history preserves the code if it is ever redesigned.
 
 ---
 
@@ -117,6 +117,31 @@ The 5 distinct execution layers:
 3. **`codex_bridge_service.py`**: Starts an in-process `_CodexProxy`; registers `atexit`/`SIGTERM` handlers for cleanup; uses a `tempfile.TemporaryDirectory` context for scratch files.
 4. **_CodexProxy (aiohttp)**: Intercepts OpenAI-format API endpoints and maps them to local execution structures.
 5. **Codex CLI & BrowserProvider**: Connects to the browser provider using Chromium Developer Tools Protocol (CDP) to drive prompts in the live browser.
+
+### 4.1 App-server transport (`codex_bridge.transport: app-server`)
+
+Behind a config flag (default is still `exec`), layer 5 is replaced by
+`codex app-server` — newline-delimited JSON-RPC over stdio (client:
+`codex_engine/app_server.py`; transport: `orchestrator/codex_appserver_transport.py`):
+
+```
+codex_bridge_service.py ── transport branch
+  → AppServerClient (codex app-server, JSON-RPC 2.0)
+      thread/resume(codex_thread_id from the sidecar) or thread/start
+      → one turn/start per user message
+      → notifications → typed Kim events (plan/output/diff/tokens/deltas)
+      → item/commandExecution/requestApproval → kim:command-approval-request
+         → BLOCKS on the stdin decision line {type: approval_decision, id, decision}
+  → _CodexProxy unchanged (model calls still go to the browser LLM)
+```
+
+What changes vs `exec`: native per-command approvals (accept /
+acceptForSession / decline) inside a `workspace-write` sandbox
+(`KIM_CODEX_BYPASS_SANDBOX` is ignored on this path); true session resume via
+the persisted `codex_thread_id`; the browser is **model-only** — tool
+execution happens natively in codex. Protocol contract is pinned by
+`codex_engine/appserver_schema/` (regenerate + re-probe with
+`scripts/probe_appserver.py` on codex upgrades).
 
 ---
 

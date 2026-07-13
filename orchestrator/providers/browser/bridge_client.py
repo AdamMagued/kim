@@ -5,6 +5,7 @@ Handles completion via Kim desktop's Tauri-managed webview bridge,
 using the split send/result API with legacy fallback.
 """
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -14,6 +15,52 @@ from orchestrator.providers.browser.response_parser import parse_response
 from orchestrator.providers.browser.site_configs import SITE_CONFIGS, _BRIDGE_TIMEOUT_S
 
 logger = logging.getLogger(__name__)
+
+# Structural honesty note appended when the bridge reports that NO attachment
+# actually reached the provider even though we sent an image (7.2/7.3): the
+# site model was then answering "describe what you see" WITHOUT the image, so
+# the reply must not be presented as if it had vision.
+_IMAGE_NOT_DELIVERED_NOTE = (
+    "\n\n[Kim note: the screenshot could NOT be attached to the browser "
+    "provider — the reply above was produced WITHOUT seeing the image and "
+    "may describe the screen inaccurately.]"
+)
+
+
+def _apply_attachment_signal(result: dict, data: dict, sent_attachments: list[dict]) -> dict:
+    """Gate the "image attached" claim on the bridge's REAL upload signal.
+
+    bridge.js returns ``attachments_uploaded`` in its done payload. When the
+    field is present (newer desktop builds; requires the Rust /v1/result
+    handler to forward it — see results.rs) and it says 0 attachments landed
+    while we sent an image, append a structural disclaimer to text replies so
+    the confabulation risk is visible instead of silent. The raw count is
+    also attached to the result dict for agent-side gating.
+
+    When the field is absent (older bridge), behavior is unchanged.
+    """
+    uploaded = data.get("attachments_uploaded")
+    if uploaded is None:
+        return result
+    try:
+        uploaded_n = int(uploaded)
+    except (TypeError, ValueError):
+        return result
+
+    result["attachments_uploaded"] = uploaded_n
+    images_sent = sum(
+        1 for a in sent_attachments
+        if str(a.get("mime_type", "")).startswith("image/")
+    )
+    if images_sent and uploaded_n == 0 and result.get("type") == "text":
+        content = str(result.get("content") or "")
+        result["content"] = content + _IMAGE_NOT_DELIVERED_NOTE
+        logger.warning(
+            "Bridge reported attachments_uploaded=0 for %d image(s) — "
+            "appended not-delivered disclaimer to the reply.",
+            images_sent,
+        )
+    return result
 
 
 async def complete_via_webview_bridge(
@@ -40,6 +87,12 @@ async def complete_via_webview_bridge(
     site = preferred_site or "claude"
     known_sites = site_configs or SITE_CONFIGS
     if site not in known_sites:
+        # L5: never silently reroute an unknown/typo'd preferred_site — the
+        # user asked for one provider and would get another with no notice.
+        logger.warning(
+            "Unknown preferred_site %r (known: %s) — falling back to claude.",
+            site, ", ".join(sorted(known_sites)),
+        )
         site = "claude"
 
     bridge_attachments: list[dict] = []
@@ -158,23 +211,54 @@ async def complete_via_webview_bridge(
         }
 
     # ── Long-poll for result ─────────────────────────────────────────
-    try:
-        logger.info("[STATUS] Kim is thinking…")
-        async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_S) as result_client:
-            result_resp = await result_client.get(
-                f"{bridge_url}/v1/result/{req_id}",
-                headers=headers,
+    # F-B-11: the message was already delivered by /v1/send, so re-polling
+    # /v1/result/{req_id} is IDEMPOTENT (the Rust side still holds the result;
+    # the send is NOT re-issued). A transient GET failure — connection reset,
+    # bridge busy blip — must therefore retry a few times instead of abandoning
+    # a delivered request with a terminal NEED_HELP (which drives the user to
+    # resend and duplicate the message, F-B-8's user-driven twin). A genuine
+    # long-poll timeout (the full window elapsed) is still terminal.
+    logger.info("[STATUS] Kim is thinking…")
+    result_resp = None
+    last_transport_error: Optional[Exception] = None
+    max_result_attempts = 3
+    for attempt in range(1, max_result_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=_BRIDGE_TIMEOUT_S) as result_client:
+                result_resp = await result_client.get(
+                    f"{bridge_url}/v1/result/{req_id}",
+                    headers=headers,
+                )
+            break
+        except httpx.TimeoutException as e:
+            logger.error("Bridge /v1/result timed out", exc_info=True)
+            detail = str(e).strip() or "Timed out waiting for provider response"
+            return {
+                "type": "text",
+                "content": f"NEED_HELP: In-app browser bridge timeout — {detail}",
+            }
+        except httpx.TransportError as e:
+            last_transport_error = e
+            logger.warning(
+                "Bridge /v1/result attempt %d/%d failed (%s) — re-polling req_id=%s",
+                attempt, max_result_attempts, e, req_id,
             )
-    except httpx.ReadTimeout as e:
-        logger.error("Bridge /v1/result timed out", exc_info=True)
-        detail = str(e).strip() or "Timed out waiting for provider response"
-        return {
-            "type": "text",
-            "content": f"NEED_HELP: In-app browser bridge timeout — {detail}",
-        }
-    except Exception as e:
-        logger.error(f"Bridge /v1/result failed: {e}", exc_info=True)
-        detail = str(e).strip() or e.__class__.__name__
+            if attempt < max_result_attempts:
+                await asyncio.sleep(min(2 ** (attempt - 1), 5))
+                continue
+        except Exception as e:
+            logger.error(f"Bridge /v1/result failed: {e}", exc_info=True)
+            detail = str(e).strip() or e.__class__.__name__
+            return {
+                "type": "text",
+                "content": f"NEED_HELP: In-app browser bridge result poll failed — {detail}",
+            }
+
+    if result_resp is None:
+        detail = (
+            str(last_transport_error).strip()
+            or (last_transport_error.__class__.__name__ if last_transport_error else "unknown")
+        )
         return {
             "type": "text",
             "content": f"NEED_HELP: In-app browser bridge result poll failed — {detail}",
@@ -214,9 +298,10 @@ async def complete_via_webview_bridge(
             "content": "NEED_HELP: In-app browser bridge returned an empty response.",
         }
 
-    return parse_response(
+    result = parse_response(
         raw_response.strip(), completion_hash, known_tools=known_tools
     )
+    return _apply_attachment_signal(result, data, bridge_attachments)
 
 
 async def _complete_via_webview_bridge_legacy(
@@ -290,6 +375,9 @@ async def _complete_via_webview_bridge_legacy(
             "content": "NEED_HELP: In-app browser bridge returned an empty response.",
         }
 
-    return parse_response(
+    result = parse_response(
         raw_response.strip(), completion_hash, known_tools=known_tools
+    )
+    return _apply_attachment_signal(
+        result, data, list(payload.get("attachments") or [])
     )

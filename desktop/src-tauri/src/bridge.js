@@ -148,22 +148,19 @@
     return false;
   };
 
+  // Read what the user-VISIBLE editor actually contains. For contenteditable
+  // editors (Gemini's rich-textarea, Claude's ProseMirror) this must be the
+  // editor's own rendered text — NEVER Gemini's hidden mirror <textarea>.
+  // The old code preferred the mirror, but injectPromptText also force-synced
+  // that mirror to the full prompt, so verification always "passed" against a
+  // value we wrote ourselves while the real editor could hold a truncated
+  // fragment (or nothing). Reading the visible editor makes every check
+  // downstream (promptMatchesInput / inputCleared / inputStuck) honest.
   const readInputText = (inputEl) => {
     if (!inputEl) return '';
     if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
       return normalizeText(inputEl.value || '');
     }
-    try {
-      const rich = inputEl.closest && inputEl.closest('rich-textarea');
-      if (rich) {
-        const mirror = rich.querySelector('textarea, input')
-          || (rich.shadowRoot && rich.shadowRoot.querySelector('textarea, input'));
-        if (mirror && (mirror instanceof HTMLTextAreaElement || mirror instanceof HTMLInputElement)) {
-          const mirrored = normalizeText(mirror.value || '');
-          if (mirrored) return mirrored;
-        }
-      }
-    } catch (_) {}
     return normalizeText(inputEl.innerText || inputEl.textContent || '');
   };
 
@@ -339,15 +336,46 @@
       inputEl.dispatchEvent(new Event('change', { bubbles: true }));
       return readInputText(inputEl).length;
     }
-    let inserted = false;
+    // Contenteditable editors (Gemini rich-textarea, Claude ProseMirror,
+    // ChatGPT prompt div). document.execCommand('insertText') TRUNCATES AT
+    // NEWLINES in these rich editors (see orchestrator/providers/browser/
+    // provider.py module docstring) — and Kim's chat-mode first turn is a
+    // large multi-line prompt, so insertText alone silently sends a fragment.
+    // Strategy ladder, each step VERIFIED against the visible editor text:
+    //   1. execCommand('insertText')  — fine for single-line prompts.
+    //   2. document.execCommand('paste') — trusted paste from the system
+    //      clipboard, which Rust pre-staged with the FULL prompt
+    //      (write_text_prompt_to_clipboard) before evaluating this script.
+    //   3. Synthetic ClipboardEvent('paste') carrying the full text — rich
+    //      editors implement their own paste handler that reads
+    //      event.clipboardData, which preserves newlines.
+    // NOTE: we deliberately do NOT write Gemini's hidden mirror <textarea>
+    // anymore. Force-syncing it made verification circular (we read back the
+    // value we ourselves wrote) and left stale "full prompt" text that
+    // Gemini never clears, producing false "Send did not register" errors
+    // and duplicate re-submits after a message HAD gone out.
+    const clearEditor = () => {
+      try {
+        inputEl.focus();
+        document.execCommand('selectAll', false);
+      } catch (_) {}
+    };
+    const accepted = () => promptMatchesInput(inputEl, target);
     try {
-      inputEl.focus();
-      document.execCommand('selectAll', false);
-      inserted = document.execCommand('insertText', false, target);
+      document.execCommand('insertText', false, target);
     } catch (_) {}
-    const currentText = readInputText(inputEl);
-    if (!inserted || currentText.length < Math.min(8, target.length)) {
-      // Strategy 3: Synthetic ClipboardEvent for ProseMirror (Claude)
+    if (!accepted()) {
+      clearEditor();
+      let pasted = false;
+      try { pasted = document.execCommand('paste'); } catch (_) {}
+      if (pasted && !accepted()) {
+        // Paste ran but delivered something else (stale clipboard) — clear it.
+        clearEditor();
+        try { document.execCommand('delete', false); } catch (_) {}
+      }
+    }
+    if (!accepted()) {
+      clearEditor();
       try {
         const dt = new DataTransfer();
         dt.setData('text/plain', target);
@@ -357,20 +385,6 @@
         console.warn('[KimBridge] Synthetic paste failed:', e);
       }
     }
-    // Gemini rich-textarea mirror sync
-    try {
-      const rich = inputEl.closest('rich-textarea');
-      if (rich) {
-        const mirror = rich.querySelector('textarea, input') || (rich.shadowRoot && rich.shadowRoot.querySelector('textarea, input'));
-        if (mirror && (mirror instanceof HTMLTextAreaElement || mirror instanceof HTMLInputElement)) {
-          const proto = Object.getPrototypeOf(mirror);
-          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-          if (setter) setter.call(mirror, target); else mirror.value = target;
-          mirror.dispatchEvent(new Event('input', { bubbles: true }));
-          mirror.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }
-    } catch (_) {}
     try {
       inputEl.dispatchEvent(new InputEvent('input', { data: target, inputType: 'insertText', bubbles: true, cancelable: true }));
     } catch (_) {}
@@ -416,13 +430,31 @@
     // A real attachment chip / thumbnail appearing is the only proof the upload took.
     const THUMB_SEL = 'img[src^="blob:"], img[src^="data:"], file-attachment, thumbnail-view, '
       + '[data-test-id*="image"], [aria-label*="Remove file"], [aria-label*="Remove attachment"]';
-    const baseThumbs = document.querySelectorAll(THUMB_SEL).length;
+    // Count thumbnails inside the COMPOSER region only when we can identify it.
+    // Counting document-wide made ANY blob/data image (avatars, earlier-turn
+    // inline images, site artwork) a false "upload succeeded" signal, which
+    // silently dropped the not-attached honesty note (audit 7.2). Fall back to
+    // the whole document only when no composer ancestor is recognizable, so
+    // unknown site layouts keep the old behavior rather than false-negating.
+    const COMPOSER_SEL = 'input-area-v2, .input-area-container, .input-area, form, '
+      + '[class*="composer"], [class*="input-area"]';
+    const composerScope = (() => {
+      try {
+        const scope = inputEl && inputEl.closest ? inputEl.closest(COMPOSER_SEL) : null;
+        if (scope) return scope;
+      } catch (_) {}
+      return document;
+    })();
+    const countThumbs = () => {
+      try { return composerScope.querySelectorAll(THUMB_SEL).length; } catch (_) { return 0; }
+    };
+    const baseThumbs = countThumbs();
     const thumbAppeared = async (ms) => {
       let waited = 0;
       while (waited < ms) {
         await new Promise(r => setTimeout(r, 150));
         waited += 150;
-        if (document.querySelectorAll(THUMB_SEL).length > baseThumbs) return true;
+        if (countThumbs() > baseThumbs) return true;
       }
       return false;
     };
@@ -441,7 +473,7 @@
       try { inputEl.focus(); } catch (_) {}
       await new Promise(r => setTimeout(r, 150));
       try { inputEl.focus(); } catch (_) {}            // re-assert focus right before the paste
-      const preThumbs = document.querySelectorAll(THUMB_SEL).length;
+      const preThumbs = countThumbs();
       try { requestNativePaste(); } catch (_) {}
       // The keystroke only fires ~400-500ms after this (IPC round-trip + Rust settle
       // sleep), so wait PAST that before looking — otherwise we catch a pre-paste
@@ -450,7 +482,7 @@
       await new Promise(r => setTimeout(r, 800));
       let pasted = false;
       for (let i = 0; i < 25; i++) {                   // poll up to ~5s more
-        if (document.querySelectorAll(THUMB_SEL).length > preThumbs) { pasted = true; break; }
+        if (countThumbs() > preThumbs) { pasted = true; break; }
         await new Promise(r => setTimeout(r, 200));
       }
       if (pasted) {
@@ -1046,7 +1078,7 @@
 
   // ── Public API ─────────────────────────────────────────────────────────
   window.__kimBridge = {
-    _v: 18,
+    _v: 19,
     _lastHash: null, // Tracks the completion hash of the most recent request
     _currentReqId: null, // Tracks the in-flight req_id; older send()s bail when this changes
     send,

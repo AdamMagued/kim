@@ -16,7 +16,6 @@ Kim is a local AI agent platform that connects any cloud LLM (Claude, Gemini, GP
 - **Code workspace:** Integrated code agent (Code tab) powered by Claw/Codex with browser-provider backend
 - **MCP server:** 31 OS-control tools exposed via the Model Context Protocol — usable from Claude Code or any MCP client
 - **Session history:** Every run is saved as a JSONL trace in `kim_sessions/`
-- **Relay:** Optional phone-to-desktop task relay (feature-flag off in 1.0)
 
 ---
 
@@ -113,6 +112,8 @@ See [HOW_TO.md](HOW_TO.md) for minimal file sets to:
 - Add a settings pane (3 files)
 - Run a targeted test pass
 
+Quality campaign: [docs/OPERATION_GOOGLE_LEVEL.md](docs/OPERATION_GOOGLE_LEVEL.md) (plan) · [docs/ops/](docs/ops/) (findings, triage, baseline).
+
 ---
 
 ## Provider setup
@@ -131,7 +132,7 @@ See [HOW_TO.md](HOW_TO.md) for minimal file sets to:
 
 Kim runs entirely locally. Nothing leaves your machine except:
 - LLM API calls (task text + screenshots sent to your chosen provider)
-- Screenshots in `kim_sessions/` (retained 7 days, strippable — see Settings → Data)
+- Screenshots in `kim_sessions/` (screenshot payloads are stripped from sessions older than 2 days; whole sessions are deleted after 30 days; export or back up your data from Settings → Data)
 
 No telemetry, no accounts, no cloud storage.
 
@@ -139,18 +140,12 @@ No telemetry, no accounts, no cloud storage.
 
 ## License
 
-<!-- TODO(human): Choose a license before making this repo public.
-     Options: MIT (permissive open source), Apache-2.0 (permissive + patent grant),
-     source-available (e.g. Business Source License), or proprietary.
-     See PRODUCTION_ROADMAP.md § P0-4 for tradeoffs.
-     A LICENSE file must be added once the decision is made. -->
-
-License TBD — see [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) § P0-4.
+Licensed under the [MIT License](LICENSE) — see the `LICENSE` file at the repo root for the full text.
 
 ---
 
 ## Contributing
 
-<!-- TODO(human): Add CONTRIBUTING.md if choosing an open-source license. -->
-
-Contribution guidelines TBD pending license decision.
+Contributions are welcome under the MIT License. A `CONTRIBUTING.md` with the
+full workflow is still TODO; until then, follow the test-and-CI gate described
+above (all four suites green + remote CI green before merge).

@@ -9,30 +9,71 @@
 //!   `add_scheduled_task`      -- schedule add <task> <expr> [opts] --json
 //!   `update_scheduled_task`   -- schedule update <id> [opts] --json
 //!   `delete_scheduled_task`   -- schedule delete <id> --json
-//!   `list_due_scheduled_tasks`-- schedule due [--as-of] --json
 //!   `run_due_scheduled_task`  -- schedule run-due [--dry-run] --json
 
-use crate::{default_project_root, subprocess::find_python_interpreter};
+use crate::{
+    default_project_root,
+    subprocess::{find_python_interpreter, is_bundled_orchestrator},
+};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Shared subprocess helper
 // ---------------------------------------------------------------------------
 
+/// AUDIT FIX #1: `find_python_interpreter()` can resolve to the bundled
+/// `kim-orchestrator` PyInstaller sidecar instead of a real Python
+/// interpreter (see `is_bundled_orchestrator`). That sidecar's entry point
+/// is `orchestrator.agent`'s flat CLI (`--task/--provider/...` via
+/// `orchestrator/cli.py::_build_arg_parser`) -- it has no `schedule` verb,
+/// and the `kimctl` package itself is not bundled into it (see
+/// `kim-orchestrator.spec`'s `datas`, which lists `orchestrator`,
+/// `mcp_server`, `codex_engine` but not `kimctl`). So unlike the chat-spec
+/// call sites (subprocess.rs `build_gui_chat_spec`, http_bridge/tasks.rs),
+/// which just drop the `-m orchestrator.agent` prefix and pass flags the
+/// sidecar's own entry point understands, there is no argv this Rust code
+/// can build that the current sidecar would understand for `schedule`
+/// subcommands -- a real fix requires bundling `kimctl` and adding argv
+/// dispatch on the Python side, which is out of scope for desktop/src-tauri.
+///
+/// Rather than exec the sidecar with `-m kimctl ...` (which fails opaquely --
+/// the sidecar is not a Python interpreter and cannot parse `-m`), fail fast
+/// with an actionable message before spawning anything. NOTE: this is
+/// currently a LATENT bug, not yet reachable: `tauri.conf.json`'s `bundle`
+/// section has no `externalBin` entry, so `find_bundled_orchestrator()`
+/// returns `None` in every build today and this branch is dead. It will
+/// start firing the moment the sidecar is wired into the bundle (per the
+/// TODO comment atop `kim-orchestrator.spec`), so we guard it now rather
+/// than shipping a silent failure once that lands.
+const BUNDLED_SCHEDULE_UNSUPPORTED: &str =
+    "Scheduled Tasks are not available in this packaged build (the bundled \
+     kim-orchestrator sidecar does not yet support kimctl schedule commands). \
+     Install Python 3 and create a project venv (venv/.venv), or run Kim from \
+     a source/dev build, to use Scheduled Tasks.";
+
 /// Run a kimctl subcommand given a pre-built args vec (args[0] = interpreter).
 /// Returns stdout on success, or a structured Err preferring stderr then stdout
 /// then a generic fallback (kimctl writes JSON errors to stdout with exit 1).
+/// Errors immediately (no spawn attempt) when `args[0]` is the bundled sidecar
+/// -- see `BUNDLED_SCHEDULE_UNSUPPORTED`.
 fn run_kimctl(args: &[String], kim_root: &PathBuf) -> Result<String, String> {
+    if let Some(interpreter) = args.first() {
+        if is_bundled_orchestrator(interpreter) {
+            return Err(BUNDLED_SCHEDULE_UNSUPPORTED.to_string());
+        }
+    }
     let mut cmd = std::process::Command::new(&args[0]);
     for arg in &args[1..] {
         cmd.arg(arg);
     }
+    // L-PROC-9: pass the raw OsStr -- `.to_str().unwrap_or("")` silently set
+    // PYTHONPATH="" on non-UTF-8 paths, yielding a confusing ModuleNotFoundError.
     cmd.current_dir(kim_root)
-        .env("PYTHONPATH", kim_root.to_str().unwrap_or(""));
+        .env("PYTHONPATH", kim_root.as_os_str());
 
     let output = cmd
         .output()
@@ -72,6 +113,14 @@ pub(crate) struct ScheduleTimerInner {
     last_result: Option<String>,
     last_error: Option<String>,
     handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ScheduleTimerInner {
+    /// True while the opt-in timer loop is alive. The built-in 60s scheduler
+    /// skips its tick when this is set so due tasks are not double-fired.
+    pub(crate) fn is_running(&self) -> bool {
+        self.handle.is_some()
+    }
 }
 
 pub(crate) type ScheduleTimerState = Arc<Mutex<ScheduleTimerInner>>;
@@ -116,6 +165,27 @@ fn status_from_inner(inner: &ScheduleTimerInner) -> ScheduleTimerStatus {
         last_result: inner.last_result.clone(),
         last_error: inner.last_error.clone(),
     }
+}
+
+/// D19: whether the BUILT-IN 60s scheduler loop will fire due tasks.
+/// True when schedules are enabled in config and the user has not paused
+/// scheduling via Stop. Folded into `ScheduleTimerStatus.running` so the
+/// pane's Stopped/Running label reflects reality instead of only the opt-in
+/// timer (the "Stopped is a lie" bug: the label said Stopped while the
+/// built-in loop kept firing every 60s).
+fn builtin_scheduler_active(app_handle: &AppHandle) -> bool {
+    use tauri::Manager as _;
+    let enabled = app_handle
+        .try_state::<crate::config::AppConfig>()
+        .map(|c| c.schedules_enabled)
+        .unwrap_or(true);
+    enabled && !crate::scheduler::is_scheduler_paused()
+}
+
+/// Compose the user-facing status: "running" means SOMETHING will fire due
+/// tasks -- either the opt-in timer loop or the built-in 60s loop.
+pub(crate) fn compose_running(timer_running: bool, builtin_active: bool) -> bool {
+    timer_running || builtin_active
 }
 
 // ---------------------------------------------------------------------------
@@ -295,39 +365,6 @@ pub(crate) async fn delete_scheduled_task(id: String) -> Result<String, String> 
 }
 
 // ---------------------------------------------------------------------------
-// list_due_scheduled_tasks
-// ---------------------------------------------------------------------------
-
-/// Build args for `kimctl schedule due --json [--as-of <ISO>]`.
-pub(crate) fn build_due_args(python: &str, as_of: Option<&str>) -> Vec<String> {
-    let mut args = vec![
-        python.to_string(),
-        "-m".to_string(),
-        "kimctl".to_string(),
-        "schedule".to_string(),
-        "due".to_string(),
-        "--json".to_string(),
-    ];
-    if let Some(ts) = as_of {
-        args.push("--as-of".to_string());
-        args.push(ts.to_string());
-    }
-    args
-}
-
-/// Return the JSON array of due scheduled tasks by calling
-/// `python -m kimctl schedule due --json [--as-of <ISO>]`.
-#[tauri::command]
-pub(crate) async fn list_due_scheduled_tasks(as_of: Option<String>) -> Result<String, String> {
-    let kim_root = default_project_root();
-    let python = find_python_interpreter(&kim_root)?;
-    let args = build_due_args(&python, as_of.as_deref());
-    tokio::task::spawn_blocking(move || run_kimctl(&args, &kim_root))
-        .await
-        .map_err(|e| format!("Executor error: {e}"))?
-}
-
-// ---------------------------------------------------------------------------
 // run_due_scheduled_task
 // ---------------------------------------------------------------------------
 
@@ -377,10 +414,17 @@ pub(crate) async fn start_schedule_timer(
     let interval = clamp_timer_interval(interval_seconds.unwrap_or(MIN_TIMER_INTERVAL_SECONDS));
     let timer_state = Arc::clone(&*state);
 
+    // D19: Start also un-pauses the built-in 60s loop (Stop paused it). While
+    // the opt-in timer runs, the built-in loop skips its ticks, so tasks are
+    // never double-fired.
+    crate::scheduler::set_scheduler_paused(false);
+
     {
         let mut inner = timer_state.lock().await;
         if inner.handle.is_some() {
-            return Ok(status_from_inner(&inner));
+            let mut status = status_from_inner(&inner);
+            status.running = compose_running(status.running, builtin_scheduler_active(&app_handle));
+            return Ok(status);
         }
 
         inner.interval_seconds = interval;
@@ -392,26 +436,24 @@ pub(crate) async fn start_schedule_timer(
         let handle = tokio::spawn(async move {
             let kim_root = default_project_root();
             loop {
-                // Guard: skip this tick if an interactive or bridge task is
-                // already running, matching the guard in scheduler.rs:51-56.
-                // Avoids launching a scheduled task concurrently with a live
-                // agent run (second-agent race).
+                // Guard: skip this tick if an agent task is already running or
+                // starting, matching the guard in scheduler.rs. Avoids launching
+                // a scheduled task concurrently with a live agent run.
                 //
-                // Two agent-tracking paths must both be checked:
-                //   1. TaskState (set by subprocess.rs run_task for IPC/interactive runs)
-                //   2. BRIDGE_TASK_PID / is_bridge_task_running (set by http_bridge.rs for
-                //      kimctl /v1/task runs - those never touch TaskState)
-                let busy = if let Some(task_state) = app_handle.try_state::<crate::TaskState>() {
-                    let g = task_state.lock().await;
-                    g.pid.is_some() || g.starting
-                } else {
-                    false
+                // H-PROC-1: read TaskRuntime, the single store BOTH spawn paths
+                // populate (GUI send_task and bridge /v1/task). The old check on
+                // the legacy TaskState managed state was dead code: nothing ever
+                // set its pid/starting.
+                let busy = {
+                    let mut rt = crate::task_runtime::task_runtime().lock().await;
+                    if let Some(pid) = rt.pid {
+                        if !crate::subprocess::process_exists(pid) {
+                            rt.clear();
+                        }
+                    }
+                    rt.is_occupied()
                 };
                 if busy {
-                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                    continue;
-                }
-                if crate::is_bridge_task_running() {
                     tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
                     continue;
                 }
@@ -451,11 +493,22 @@ pub(crate) async fn start_schedule_timer(
     }
 }
 
-/// Stop the opt-in periodic schedule runner if it is active.
+/// Stop ALL scheduled execution the pane's Stop button is responsible for.
+///
+/// D19 ("Stopped is a lie"): the pane previously only aborted the opt-in timer
+/// loop here, while the built-in 60s scheduler kept firing due tasks and
+/// injecting their output into the open chat. Stop now ALSO pauses the built-in
+/// loop (`set_scheduler_paused(true)`), so pressing Stop genuinely halts every
+/// scheduled run until the next Start. `start_schedule_timer` clears the pause.
+/// The returned status is `running: false` (opt-in handle aborted + built-in
+/// paused), so the label is honest.
 #[tauri::command]
 pub(crate) async fn stop_schedule_timer(
     state: State<'_, ScheduleTimerState>,
 ) -> Result<ScheduleTimerStatus, String> {
+    // Pause the built-in loop first so no tick can slip through between the
+    // abort below and the flag being observed.
+    crate::scheduler::set_scheduler_paused(true);
     let mut inner = state.lock().await;
     if let Some(handle) = inner.handle.take() {
         handle.abort();
@@ -463,13 +516,21 @@ pub(crate) async fn stop_schedule_timer(
     Ok(status_from_inner(&inner))
 }
 
-/// Return the current opt-in schedule timer status.
+/// Return the current schedule-runner status.
+///
+/// D19: `running` is composed -- true when EITHER the opt-in timer loop is alive
+/// OR the built-in 60s scheduler is still armed (config-enabled and not paused
+/// via Stop). This makes the pane's Stopped/Running label reflect whether ANY
+/// scheduled execution can fire, not just the opt-in timer.
 #[tauri::command]
 pub(crate) async fn get_schedule_timer_status(
+    app_handle: AppHandle,
     state: State<'_, ScheduleTimerState>,
 ) -> Result<ScheduleTimerStatus, String> {
     let inner = state.lock().await;
-    Ok(status_from_inner(&inner))
+    let mut status = status_from_inner(&inner);
+    status.running = compose_running(status.running, builtin_scheduler_active(&app_handle));
+    Ok(status)
 }
 
 // ---------------------------------------------------------------------------
@@ -480,61 +541,12 @@ pub(crate) async fn get_schedule_timer_status(
 mod tests {
     use super::*;
 
-    // -- async shape --
-
-    #[test]
-    fn test_list_scheduled_tasks_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(list_scheduled_tasks(false));
-        assert_is_async(list_scheduled_tasks(true));
-    }
-
-    #[test]
-    fn test_add_scheduled_task_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(add_scheduled_task("t".into(), "@daily".into(), None, false));
-        assert_is_async(add_scheduled_task(
-            "t".into(),
-            "@daily".into(),
-            Some("ollama".into()),
-            true,
-        ));
-    }
-
-    #[test]
-    fn test_update_scheduled_task_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(update_scheduled_task("id1".into(), None, None, None, None));
-        assert_is_async(update_scheduled_task(
-            "id1".into(),
-            Some("new task".into()),
-            None,
-            None,
-            Some(true),
-        ));
-    }
-
-    #[test]
-    fn test_delete_scheduled_task_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(delete_scheduled_task("id1".into()));
-    }
-
-    #[test]
-    fn test_list_due_scheduled_tasks_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(list_due_scheduled_tasks(None));
-        assert_is_async(list_due_scheduled_tasks(Some(
-            "2026-06-05T12:00:00+00:00".into(),
-        )));
-    }
-
-    #[test]
-    fn test_run_due_scheduled_task_is_async_fn() {
-        fn assert_is_async<F: std::future::Future>(_: F) {}
-        assert_is_async(run_due_scheduled_task(false));
-        assert_is_async(run_due_scheduled_task(true));
-    }
+    // NOTE: five `test_*_is_async_fn` tests were deleted here. Each built a
+    // future for a Tauri command and passed it (unpolled) to
+    // `fn assert_is_async<F: Future>(_: F) {}` -- the command bodies never
+    // executed and the "test" was a compile-time no-op inflating the pass
+    // count. Behavioral coverage for these commands belongs in tests that
+    // await them against a fake kimctl (tracked follow-up).
 
     #[test]
     fn test_clamp_timer_interval_enforces_minimum() {
@@ -545,10 +557,31 @@ mod tests {
     }
 
     #[test]
+    fn test_compose_running_is_logical_or() {
+        // D19: the pane is "running" when EITHER runner can fire due tasks.
+        assert!(!compose_running(false, false), "nothing armed -> stopped");
+        assert!(
+            compose_running(true, false),
+            "opt-in timer alone -> running"
+        );
+        assert!(
+            compose_running(false, true),
+            "built-in loop alone -> running"
+        );
+        assert!(compose_running(true, true), "both armed -> running");
+    }
+
+    #[test]
+    fn test_is_running_tracks_handle_presence() {
+        let idle = ScheduleTimerInner::default();
+        assert!(!idle.is_running(), "no handle -> not running");
+    }
+
+    #[test]
     fn test_status_from_inner_reports_idle_defaults() {
         let inner = ScheduleTimerInner::default();
         let status = status_from_inner(&inner);
-        assert_eq!(status.running, false);
+        assert!(!status.running);
         assert_eq!(status.interval_seconds, 0);
         assert_eq!(status.tick_count, 0);
         assert_eq!(status.last_result, None);
@@ -557,13 +590,15 @@ mod tests {
 
     #[test]
     fn test_status_from_inner_carries_last_result_and_error() {
-        let mut inner = ScheduleTimerInner::default();
-        inner.interval_seconds = 120;
-        inner.tick_count = 3;
-        inner.last_result = Some("{\"ok\":true}".to_string());
-        inner.last_error = Some("previous failure".to_string());
+        let inner = ScheduleTimerInner {
+            interval_seconds: 120,
+            tick_count: 3,
+            last_result: Some("{\"ok\":true}".to_string()),
+            last_error: Some("previous failure".to_string()),
+            ..ScheduleTimerInner::default()
+        };
         let status = status_from_inner(&inner);
-        assert_eq!(status.running, false);
+        assert!(!status.running);
         assert_eq!(status.interval_seconds, 120);
         assert_eq!(status.tick_count, 3);
         assert_eq!(status.last_result.as_deref(), Some("{\"ok\":true}"));
@@ -600,23 +635,6 @@ mod tests {
         let args = build_list_args("python3", true);
         assert!(args.contains(&"--enabled-only".to_string()));
         assert!(args.contains(&"--json".to_string()));
-    }
-
-    // -- build_due_args --
-
-    #[test]
-    fn test_build_due_args_without_as_of() {
-        let args = build_due_args("python3", None);
-        assert_eq!(args[4], "due");
-        assert!(args.contains(&"--json".to_string()));
-        assert!(!args.contains(&"--as-of".to_string()));
-    }
-
-    #[test]
-    fn test_build_due_args_with_as_of() {
-        let args = build_due_args("python3", Some("2026-06-05T12:00:00+00:00"));
-        let idx = args.iter().position(|a| a == "--as-of").unwrap();
-        assert_eq!(args[idx + 1], "2026-06-05T12:00:00+00:00");
     }
 
     // -- build_add_args --
@@ -748,6 +766,41 @@ mod tests {
             let args = build_run_due_args("python3", dry);
             assert!(args.contains(&"--json".to_string()), "dry_run={dry}");
         }
+    }
+
+    // -- AUDIT FIX #1: run_kimctl guards the bundled-sidecar interpreter --
+
+    #[test]
+    fn test_run_kimctl_rejects_bundled_sidecar_before_spawning() {
+        // args built exactly as build_list_args/build_add_args/etc. would,
+        // but with a bundled-sidecar "interpreter" in slot 0. Must error
+        // immediately (no process spawn attempt, no "-m kimctl" exec).
+        let args = build_list_args("/Applications/Kim.app/Contents/MacOS/kim-orchestrator", false);
+        let kim_root = PathBuf::from("/tmp/does-not-matter");
+        let err = run_kimctl(&args, &kim_root).expect_err("bundled sidecar must be rejected");
+        assert_eq!(err, BUNDLED_SCHEDULE_UNSUPPORTED);
+    }
+
+    #[test]
+    fn test_run_kimctl_rejects_bundled_sidecar_suffixed_variant() {
+        let args = build_run_due_args(
+            "/opt/Kim/kim-orchestrator-aarch64-apple-darwin",
+            false,
+        );
+        let kim_root = PathBuf::from("/tmp/does-not-matter");
+        let err = run_kimctl(&args, &kim_root).expect_err("suffixed sidecar must be rejected");
+        assert_eq!(err, BUNDLED_SCHEDULE_UNSUPPORTED);
+    }
+
+    #[test]
+    fn test_run_kimctl_allows_real_python_path_to_reach_spawn() {
+        // A real interpreter path must NOT be rejected by the bundled-sidecar
+        // guard -- it should proceed to spawn (and fail there instead, e.g.
+        // with a "No such file" spawn error, never BUNDLED_SCHEDULE_UNSUPPORTED).
+        let args = build_delete_args("/usr/bin/python3-does-not-exist-xyz", "id1");
+        let kim_root = PathBuf::from("/tmp/does-not-matter");
+        let err = run_kimctl(&args, &kim_root).expect_err("nonexistent interpreter still errors");
+        assert_ne!(err, BUNDLED_SCHEDULE_UNSUPPORTED);
     }
 
     // -- ASCII cleanliness --

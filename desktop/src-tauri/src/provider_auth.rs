@@ -232,7 +232,11 @@ pub(crate) async fn provider_check_auth(
         site,
         WEBVIEW_BRIDGE_REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    let probe_js = build_auth_probe_js(&site, &req_id, &cfg.base_url, &cfg.token);
+    // F-D-4: inject the capability-scoped webview token (callback-only), NEVER
+    // the full-capability `cfg.token`. A monkeypatched `fetch` on the provider
+    // page can still capture whatever we inject, but the scoped token cannot
+    // reach /v1/task or /v1/open.
+    let probe_js = build_auth_probe_js(&site, &req_id, &cfg.base_url, &cfg.webview_token);
     webview
         .eval(&probe_js)
         .map_err(|e| format!("eval failed: {}", e))?;
@@ -249,6 +253,12 @@ pub(crate) async fn provider_check_auth(
     }
     // Timed out: report not-signed-in with an error so the UI shows the
     // re-sign-in affordance rather than blocking forever.
+    // L-AUTH-1: drop our req_id from the shared results map — if the JS
+    // callback lands after this timeout, the entry would otherwise sit in
+    // WEBVIEW_BRIDGE_RESULTS forever (nobody collects auth-… ids twice).
+    if let Ok(mut guard) = store.lock() {
+        guard.remove(&req_id);
+    }
     Ok(ProviderAuthStatus {
         provider: site,
         signed_in: false,

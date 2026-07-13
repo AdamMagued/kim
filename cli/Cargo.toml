@@ -14,6 +14,9 @@ path = "src/main.rs"
 base64 = { workspace = true }
 crossterm = { version = "0.28", features = ["bracketed-paste", "event-stream"] }
 dirs = { workspace = true }
+# #7: cross-process advisory lock for save_session_messages_in — already a
+# transitive dependency via rustyline, promoted to direct so we can use it.
+fd-lock = "4"
 futures-util = "0.3"
 reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 rpassword = "7"

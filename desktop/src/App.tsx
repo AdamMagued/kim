@@ -17,6 +17,7 @@ import { ToastProvider, toast } from './components/Toast';
 
 import type { SessionInfo, Settings, AccentTheme, KimAccount } from './types';
 import { DEFAULT_SETTINGS } from './types';
+import type { PendingTask } from './components/chat/types';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -123,6 +124,23 @@ export default function App() {
   // Incremented every time the user presses New Chat — used as ChatView's key
   // so the component fully remounts (clearing all transient state) each time.
   const [chatSerial, setChatSerial] = useState(0);
+  // RUN-IDENTITY (D1/B4/B5): the single globally-active run's identity, lived
+  // ABOVE the ChatView remount boundary. Set from the `kim-run-id` event at
+  // spawn, cleared on done/cancel. A ChatView remounted mid-run (tab/session/
+  // New-Chat switch) reads this to re-derive that its session's run is still
+  // running and re-attach to the live stream instead of orphaning it.
+  // F-F-3: `startedAt` lives here (above the ChatView remount boundary) so the
+  // elapsed timer + persisted run duration survive a mid-run session switch —
+  // on re-attach the view restores the ORIGINAL start instead of resetting to 0.
+  const [activeRun, setActiveRun] = useState<{ runId: string; sessionId: string; startedAt: number } | null>(null);
+  // V-audit #1: queued follow-up messages, lived ABOVE the ChatView remount
+  // boundary for the same reason as activeRun above — a full ChatView remount
+  // (New Chat / session switch) used to silently drop any queued messages,
+  // breaking the UI's own promise ("Kim will run it automatically next").
+  // Keyed by session id (see useTaskRunner's queueKeyRef); ChatView reads any
+  // pre-existing queue for its session on mount instead of always starting
+  // empty.
+  const [queuedTasksStore, setQueuedTasksStore] = useState<Record<string, PendingTask[]>>({});
   const [activeTab, setActiveTab] = useState<'chat' | 'code'>('chat');
   const [activeProjectPath, setActiveProjectPath] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -194,6 +212,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // L16: cancelled-flag pattern (as used elsewhere) — if the effect cleans up
+    // before listen() resolves, immediately unsubscribe instead of leaking.
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     listen<ScheduleTimerTickEvent>('schedule-timer-tick', (event) => {
       const payload = event.payload;
@@ -207,8 +228,34 @@ export default function App() {
       } else if (result?.launched) {
         toast(`Scheduled task launched: ${result.task || result.task_id || 'task'}`, 'success', 4500);
       }
-    }).then((fn) => { unlisten = fn; }).catch(() => {});
-    return () => { unlisten?.(); };
+    }).then((fn) => { if (cancelled) fn(); else unlisten = fn; }).catch(() => {});
+    return () => { cancelled = true; unlisten?.(); };
+  }, []);
+
+  // RUN-IDENTITY: track the single active run across ChatView remounts.
+  useEffect(() => {
+    let cancelled = false;
+    const unlisteners: Array<() => void> = [];
+    const track = <T,>(name: string, cb: (p: T) => void) => {
+      listen<T>(name, e => cb(e.payload))
+        .then(fn => { if (cancelled) fn(); else unlisteners.push(fn); })
+        .catch(() => {});
+    };
+    track<{ run_id: string; session_id: string }>('kim-run-id', p => {
+      if (p && p.session_id) {
+        // F-F-3: stamp startedAt once per run; a repeated kim-run-id for the same
+        // run must not reset the original start.
+        setActiveRun(prev =>
+          prev && prev.runId === p.run_id
+            ? prev
+            : { runId: p.run_id, sessionId: p.session_id, startedAt: Date.now() },
+        );
+      }
+    });
+    // Single active run: any completion/cancel clears the active-run marker.
+    track<boolean>('kim-agent-done', () => setActiveRun(null));
+    track<boolean>('kim-agent-cancelled', () => setActiveRun(null));
+    return () => { cancelled = true; unlisteners.forEach(fn => fn()); };
   }, []);
 
   useEffect(() => {
@@ -560,6 +607,9 @@ export default function App() {
         <ChatView
           key={`chat-${activeTab}-${chatSerial}`}
           session={activeSession}
+          activeRunSessionId={activeRun?.sessionId ?? null}
+          activeRunId={activeRun?.runId ?? null}
+          activeRunStartedAt={activeRun?.startedAt ?? null}
           newChatMode={newChatMode}
           settings={settings}
           onSettingsChange={handleSettingsChange}
@@ -579,6 +629,8 @@ export default function App() {
           recentSessions={activeTab === 'code' ? codexSessions : kimSessions}
           onSelectSession={handleSelectSession}
           openConnectorsRef={openConnectorsRef}
+          queuedTasksStore={queuedTasksStore}
+          setQueuedTasksStore={setQueuedTasksStore}
         />
       </main>
 

@@ -62,7 +62,9 @@ echo       Done.
 
 REM ── Install Playwright browsers ──────────────────────────────────────
 echo [5/6] Installing Playwright browsers (Chromium)...
-python -m playwright install chromium --quiet 2>nul
+REM NOTE: `playwright install` has no --quiet flag; passing it made this step
+REM fail on every run while 2>nul hid the real error. Keep output visible.
+python -m playwright install chromium
 if %ERRORLEVEL% neq 0 (
     echo       [WARN] Playwright browser install failed. Browser provider may not work.
     echo              You can install later with: python -m playwright install chromium
@@ -86,6 +88,17 @@ if not exist ".env" (
 REM ── Create required directories ───────────────────────────────────────
 if not exist "logs" mkdir logs
 if not exist "sessions\chrome_data" mkdir sessions\chrome_data
+
+REM ── Write project root for Kim.exe discovery ────────────────────────────
+REM Guard: only record a directory that actually looks like the Kim repo so a
+REM stray run from an unrelated directory can't poison Kim.exe discovery.
+if exist "orchestrator\agent.py" (
+    >"%USERPROFILE%\.kim_root" echo %CD%
+    echo   Saved project root to %%USERPROFILE%%\.kim_root ^(used by Kim.exe^)
+) else (
+    echo   [WARN] %CD% does not look like the Kim repo ^(no orchestrator\agent.py^);
+    echo          not writing %%USERPROFILE%%\.kim_root.
+)
 
 echo.
 echo  ╔═══════════════════════════════════════════════════════╗

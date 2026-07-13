@@ -56,6 +56,9 @@ export interface CodexRunGroup {
 
 /** A file the user has attached to the current task input. */
 export interface AttachedFile {
+  /** L10: stable identity for React keys — index keys mis-reconciled the chip
+   *  list when an attachment was removed from the middle. */
+  id?: string;
   name: string;
   kind: 'text' | 'image' | 'binary';
   content?: string;   // text files: raw text; binary: unused
@@ -98,4 +101,10 @@ export interface HitlApprovalStatus {
   approved: boolean | null;
   /** K6: optional preview (command / unified diff / URL+label). */
   preview?: string;
+  /** T1: correlation id — echoed back on the decision so Python voids stale approvals. */
+  id?: string;
+  /** A3/B10: true once the user clicked a decision and it was handed to the
+   *  backend. Disables the card's buttons so a second click can't buffer a
+   *  stdin decision line that the NEXT approval gate would consume. */
+  decisionSent?: boolean;
 }

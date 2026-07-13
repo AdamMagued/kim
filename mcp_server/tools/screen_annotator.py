@@ -42,6 +42,8 @@ def annotate_screenshot(
     grid_rows: int = 10,
     original_width: Optional[int] = None,
     original_height: Optional[int] = None,
+    offset_x: int = 0,
+    offset_y: int = 0,
 ) -> tuple[Image.Image, dict]:
     """
     Draw a ruler grid onto a screenshot and return the annotated image
@@ -56,11 +58,21 @@ def annotate_screenshot(
     grid_rows : int
         Number of rows in the grid (default 10, labels 1–10).
     original_width : int, optional
-        The real screen width before scaling.  If provided, the returned
-        coordinate mapping uses real-screen pixel values so pyautogui
-        clicks land correctly.  If None, mapping uses image coordinates.
+        The screen width in the CLICK coordinate space (logical points, i.e.
+        what pyautogui uses) before image scaling.  If provided, the returned
+        coordinate mapping uses those values so pyautogui clicks land
+        correctly.  If None, mapping uses image coordinates.
+        NOTE (2.1 Retina/DPI): on HiDPI displays the framebuffer grab is in
+        PHYSICAL pixels while pyautogui clicks in LOGICAL points — callers
+        must pass the logical monitor size here, NOT the raw image size.
     original_height : int, optional
-        The real screen height before scaling.
+        The screen height in the click coordinate space.
+    offset_x : int
+        Left offset of the captured monitor in the global virtual desktop
+        (2.2 multi-monitor): added to every returned x so clicks land on the
+        correct monitor, not relative to the monitor's local origin.
+    offset_y : int
+        Top offset of the captured monitor in the global virtual desktop.
 
     Returns
     -------
@@ -77,8 +89,14 @@ def annotate_screenshot(
             f"grid_cols must be between 1 and {max_cols} (got {grid_cols}). "
             f"Supported column labels: {_COL_LABELS}"
         )
-    if grid_rows < 1:
-        raise ValueError(f"grid_rows must be at least 1 (got {grid_rows}).")
+    # Cap rows like columns (L3): an unbounded model-supplied grid_rows
+    # (e.g. 100000) would draw hundreds of thousands of markers synchronously
+    # on the event loop.
+    max_rows = 100
+    if not (1 <= grid_rows <= max_rows):
+        raise ValueError(
+            f"grid_rows must be between 1 and {max_rows} (got {grid_rows})."
+        )
 
     # Work on a copy so the caller keeps the original
     annotated = img.copy()
@@ -122,9 +140,10 @@ def annotate_screenshot(
             label = f"{col_label}{row_label}"
             _draw_label(draw, ix, iy, label, font)
 
-            # Map to real screen coordinates
-            real_x = int(ix * sx)
-            real_y = int(iy * sy)
+            # Map to real screen coordinates (click space), including the
+            # monitor's global virtual-desktop offset (2.2).
+            real_x = int(ix * sx) + offset_x
+            real_y = int(iy * sy) + offset_y
             grid_map[label] = [real_x, real_y]
 
     logger.info(

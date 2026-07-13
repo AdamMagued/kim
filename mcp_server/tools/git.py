@@ -21,6 +21,9 @@ import logging
 from pathlib import Path
 
 from mcp_server.config import PROJECT_ROOT, SHELL_TIMEOUT, validate_path
+from mcp_server.os_utils import minimal_subprocess_env
+from mcp_server.tools._errors import tool_error
+
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,9 @@ async def _run_git(*args: str, cwd: str | None = None, timeout: int | None = Non
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=resolved_cwd,
+            # S4: never inherit the full parent env (API keys/tokens); git
+            # needs HOME (for ~/.gitconfig) + PATH, both in the allowlist.
+            env=minimal_subprocess_env(),
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=resolved_timeout
@@ -91,15 +97,15 @@ async def _run_git(*args: str, cwd: str | None = None, timeout: int | None = Non
                 await asyncio.wait_for(proc.wait(), timeout=2)
             except Exception:
                 pass
-        return f"ERROR: git command timed out after {resolved_timeout}s"
+        return tool_error(f"git command timed out after {resolved_timeout}s")
     except FileNotFoundError:
-        return (
-            "ERROR: 'git' is not installed or not found on PATH. "
+        return tool_error(
+            "'git' is not installed or not found on PATH. "
             "Install git and try again."
         )
     except Exception as e:
         logger.error(f"git command failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_git_status(args: dict) -> str:
@@ -113,7 +119,7 @@ async def handle_git_status(args: dict) -> str:
         return await _run_git(*git_args, cwd=cwd)
     except Exception as e:
         logger.error(f"git_status failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_git_diff(args: dict) -> str:
@@ -138,7 +144,7 @@ async def handle_git_diff(args: dict) -> str:
         return await _run_git(*git_args, cwd=cwd)
     except Exception as e:
         logger.error(f"git_diff failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_git_add(args: dict) -> str:
@@ -159,7 +165,7 @@ async def handle_git_add(args: dict) -> str:
         return await _run_git(*git_args, cwd=cwd)
     except Exception as e:
         logger.error(f"git_add failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_git_commit(args: dict) -> str:
@@ -170,13 +176,13 @@ async def handle_git_commit(args: dict) -> str:
     cwd = args.get("cwd", str(PROJECT_ROOT))
     message = str(args.get("message") or "")
     if not message.strip():
-        return "ERROR: Commit message is required. Provide a 'message' parameter."
+        return tool_error("Commit message is required. Provide a 'message' parameter.")
     try:
         git_args = ["commit", "-m", message]
         return await _run_git(*git_args, cwd=cwd)
     except Exception as e:
         logger.error(f"git_commit failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_git_log(args: dict) -> str:
@@ -200,7 +206,7 @@ async def handle_git_log(args: dict) -> str:
         return await _run_git(*git_args, cwd=cwd)
     except Exception as e:
         logger.error(f"git_log failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_git_checkout(args: dict) -> str:
@@ -213,7 +219,7 @@ async def handle_git_checkout(args: dict) -> str:
     target = str(args.get("target") or "")
     create = args.get("create", False)
     if not target.strip():
-        return "ERROR: 'target' parameter is required (branch name or file path)."
+        return tool_error("'target' parameter is required (branch name or file path).")
     # Refuse obvious path-escape attempts. Legitimate branches can contain '/'
     # so we don't run them through validate_path, but a leading '..' or an
     # absolute path is never a valid branch name and almost always a file
@@ -228,4 +234,4 @@ async def handle_git_checkout(args: dict) -> str:
         return await _run_git(*git_args, cwd=cwd)
     except Exception as e:
         logger.error(f"git_checkout failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)

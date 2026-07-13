@@ -8,6 +8,7 @@ import aiofiles
 
 from mcp_server.config import validate_path, PROJECT_ROOT
 from mcp_server.checkpoints import backup_pre_image
+from mcp_server.tools._errors import tool_error
 
 # A data-URI is only treated as binary when it matches the WHOLE content
 # (anchored prefix, base64 body, no trailing junk). A text file that merely
@@ -20,9 +21,9 @@ logger = logging.getLogger(__name__)
 async def handle_read_file(args: dict) -> str:
     path = validate_path(args["path"])
     if not path.exists():
-        return f"ERROR: File not found: {path}"
+        return tool_error(f"File not found: {path}")
     if not path.is_file():
-        return f"ERROR: Not a file: {path}"
+        return tool_error(f"Not a file: {path}")
     async with aiofiles.open(path, "r", encoding="utf-8", errors="replace") as f:
         content = await f.read()
     logger.info(f"read_file: {path} ({len(content)} chars)")
@@ -41,8 +42,8 @@ async def handle_write_file(args: dict) -> str:
     if binary or match is not None:
         if match is None:
             # Caller asked for binary but content is not a data:...;base64, URI.
-            return (
-                "ERROR: binary=True requires content to be a 'data:<type>;base64,<data>' "
+            return tool_error(
+                "binary=True requires content to be a 'data:<type>;base64,<data>' "
                 "URI; got non-data-URI content"
             )
         try:
@@ -58,7 +59,7 @@ async def handle_write_file(args: dict) -> str:
                 # Explicit request to decode failed — surface it, don't silently
                 # write the data-URI string as text.
                 logger.warning(f"Failed to decode base64 for {path}: {e}")
-                return f"ERROR: failed to decode base64 content for {path}: {e}"
+                return tool_error(f"failed to decode base64 content for {path}: {e}")
             logger.debug(f"Content starts with data-URI but is not clean base64; "
                          f"writing as text for {path}: {e}")
             # Fall through to text write.
@@ -73,9 +74,9 @@ async def handle_list_dir(args: dict) -> str:
     path = validate_path(args.get("path", str(PROJECT_ROOT)))
     recursive = bool(args.get("recursive", False))
     if not path.exists():
-        return f"ERROR: Path not found: {path}"
+        return tool_error(f"Path not found: {path}")
     if not path.is_dir():
-        return f"ERROR: Not a directory: {path}"
+        return tool_error(f"Not a directory: {path}")
     entries = []
     if recursive:
         for root, dirs, files in os.walk(path):
@@ -101,7 +102,14 @@ async def handle_list_dir(args: dict) -> str:
             if entry.is_dir():
                 entries.append(f"[DIR]  {entry.name}/")
             else:
-                entries.append(f"[FILE] {entry.name}  ({entry.stat().st_size} bytes)")
+                # A broken symlink makes stat() raise; don't fail the whole
+                # listing over one dangling entry (L1 — mirrors the guard the
+                # recursive branch already has).
+                try:
+                    size = entry.stat().st_size
+                except OSError:
+                    size = 0
+                entries.append(f"[FILE] {entry.name}  ({size} bytes)")
     logger.info(f"list_dir: {path} ({len(entries)} entries)")
     return "\n".join(entries) if entries else "(empty directory)"
 
@@ -109,9 +117,9 @@ async def handle_list_dir(args: dict) -> str:
 async def handle_delete_file(args: dict) -> str:
     path = validate_path(args["path"])
     if not path.exists():
-        return f"ERROR: File not found: {path}"
+        return tool_error(f"File not found: {path}")
     if path.is_dir():
-        return "ERROR: Use a shell command to delete directories; delete_file only removes files."
+        return tool_error("Use a shell command to delete directories; delete_file only removes files.")
     backup_pre_image(path)  # K1: checkpoint pre-image before delete
     path.unlink()
     logger.info(f"delete_file: {path}")

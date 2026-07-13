@@ -2,9 +2,21 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, 'feature/**', 'fix/**', 'kim-improvement', 'production-roadmap']
+    # Keep this list in sync with the branch names actually in use — a branch
+    # that matches nothing here gets ZERO CI (this bit us: `dev` != `develop`).
+    branches:
+      - main
+      - dev
+      - develop
+      - 'feature/**'
+      - 'feat/**'
+      - 'fix/**'
+      - 'integration/**'
+      - 'audit-fixes'
+      - 'kim-improvement'
+      - 'production-roadmap'
   pull_request:
-    branches: [main, kim-improvement]
+    branches: [main, dev, kim-improvement, 'integration/**']
   workflow_dispatch:
 
 concurrency:
@@ -12,6 +24,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── File-size gate (Q6): no new/growing source files over 800 lines ───────
+  file-size-gate:
+    name: File-size gate (Q6)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4 (#59)
+        with:
+          fetch-depth: 0
+
+      - name: Check new/changed files stay under 800 lines
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          # New branches / force-pushes / workflow_dispatch: fall back to the
+          # default branch, then to the parent commit.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            BASE=$(git rev-parse origin/main 2>/dev/null || git rev-parse HEAD~1)
+          fi
+          # workflow_dispatch on main resolves BASE == HEAD: an empty diff would
+          # be a meaningless green, so fall back to the parent commit and say so.
+          if [ "$(git rev-parse "$BASE")" = "$(git rev-parse HEAD)" ]; then
+            echo "NOTICE: base == HEAD (manual dispatch on the base branch); comparing against HEAD~1 instead."
+            BASE=$(git rev-parse HEAD~1)
+          fi
+          echo "Comparing against base: $BASE"
+          python3 scripts/check_file_size_gate.py "$BASE"
+
   # ── Frontend: TypeScript + Vite build + Vitest ─────────────────────────────
   frontend:
     name: Frontend (TS + Vite + Vitest)
@@ -38,7 +82,17 @@ jobs:
       - name: Events schema drift check
         run: |
           npm run gen:events
-          git diff --exit-code src/types/events.gen.ts src-tauri/src/events.gen.rs ../orchestrator/events_gen.py || (echo "ERROR: generated IPC bindings are out of sync with events.schema.json. Run 'npm run gen:events' and commit all generated outputs." && exit 1)
+          # Fail on ANY modified tracked file or NEW untracked file after
+          # regeneration — not just a hardcoded output list, so a fourth
+          # generator output (or a moved one) can't silently escape the gate.
+          cd ..
+          DRIFT="$(git status --porcelain -- desktop/src orchestrator desktop/src-tauri/src)"
+          if [ -n "$DRIFT" ]; then
+            echo "$DRIFT"
+            git diff -- desktop/src orchestrator desktop/src-tauri/src
+            echo "ERROR: generated IPC bindings are out of sync with events.schema.json. Run 'npm run gen:events' (in desktop/) and commit all generated outputs."
+            exit 1
+          fi
 
       - name: Vitest unit tests
         run: npm run test
@@ -90,10 +144,10 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4 (#59)
 
-      - name: Install Rust stable (+ rustfmt)
+      - name: Install Rust stable (+ rustfmt, clippy)
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (#59)
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Rust cache (cli)
         uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2 (#59)
@@ -105,6 +159,9 @@ jobs:
 
       - name: cargo check
         run: cargo check -p kim-cli
+
+      - name: cargo clippy
+        run: cargo clippy -p kim-cli -- -D warnings
 
       - name: cargo test
         run: cargo test -p kim-cli -- --test-threads=1
@@ -129,12 +186,14 @@ jobs:
           # same dep set that ships.  Exclude heavy platform deps that need system
           # libs (playwright, pyautogui, pyobjc, pywin32) — they are guarded by
           # sys_platform markers and are not needed for unit tests.
+          # This install MUST fail the job if requirements.txt is broken
+          # (bad specifier, yanked pin, 404) — no `|| true`, no hidden stderr.
           pip install \
             -r requirements.txt \
             flake8 \
-            pyright \
+            pyright==1.1.411 \
             --ignore-requires-python \
-            --no-deps 2>/dev/null || true
+            --no-deps
           # Re-install with deps to get transitive graph correct for the core subset
           pip install \
             mcp \
@@ -147,12 +206,14 @@ jobs:
             aiohttp \
             json5 \
             json-repair \
+            pillow \
             flake8 \
-            pyright \
+            pyright==1.1.411 \
             pytest \
-            pytest-asyncio
+            pytest-asyncio \
+            pytest-cov
 
-      - name: pyright (basic type check — orchestrator/providers + mcp_server)
+      - name: pyright (basic type check — orchestrator + mcp_server + codex_engine)
         run: |
           pyright --outputjson | python3 -c "
           import sys, json
@@ -165,14 +226,14 @@ jobs:
           print('pyright: 0 errors')
           "
 
-      - name: flake8 lint (orchestrator)
+      - name: flake8 lint (orchestrator, kimctl)
         run: |
           # agent.py contains long single-line system-prompt literals that are
           # deliberately on one source line so they read as one paragraph to
           # the LLM. Breaking them would change the prompt content; instead
           # exempt that single file from line-length checks. Every other file
-          # (incl. run_claw_bridge.py and providers/*) stays strict at 120.
-          flake8 orchestrator/ \
+          # (incl. providers/*) stays strict at 120.
+          flake8 orchestrator/ kimctl/ \
             --max-line-length=120 \
             --extend-ignore=E203,W503 \
             --per-file-ignores=orchestrator/agent.py:E501 \
@@ -189,9 +250,17 @@ jobs:
           print('All orchestrator modules import cleanly.')
           "
 
-      - name: pytest (unit tests)
+      - name: pytest (unit + integration tests, coverage gate)
         run: |
+          # T7 coverage gate: measured baseline is ~62% across the three
+          # Python runtimes (2026-07). The floor is a ratchet — raise it as
+          # coverage grows; never lower it to make a PR pass.
           python -m pytest tests/ -v \
             --ignore=tests/kim_test_suite.py \
             --ignore=tests/claw_test_suite.py \
-            --ignore=tests/test_gemini_user_project_mode.py
+            --cov=orchestrator \
+            --cov=mcp_server \
+            --cov=codex_engine \
+            --cov=kimctl \
+            --cov-report=term \
+            --cov-fail-under=61

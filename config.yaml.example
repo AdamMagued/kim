@@ -19,12 +19,45 @@ browser_provider:
   stateful_threads: false
   compact_at_ratio: 0.8
   max_thread_turns: 40
+  # Force the browser provider to launch headless Chromium directly, bypassing
+  # the CDP auto-launch/connect flow. Optional; defaults to false.
+  browser_force_headless: false
 custom_sites: {}
+# Optional map of user-defined third-party MCP servers to merge alongside
+# Kim's own MCP server (name -> {command, args, cwd, env, ...}). Defaults to
+# empty (no extra servers).
+mcp_servers: {}
+# Site-connector allowlist. `enabled` is a list of connector ids whose
+# tools get merged into the MCP dispatch map at startup, so the LLM only
+# sees toolkits you've explicitly opted into.
+# Optional; defaults to an empty list (no connectors enabled).
+connectors:
+  enabled: []
 codex_bridge:
   # Whole-run budget for one Codex code-mode task (seconds). Browser relays
   # are slow — a single one can take minutes — so keep this comfortably above
   # the per-relay browser waits (600s).
   task_timeout_s: 1800
+  # Codex transport. "app-server" (the default) speaks JSON-RPC to
+  # `codex app-server`: native per-command approvals, plan/diff/output
+  # streaming, workspace-write sandbox, and true session resume via a
+  # persisted thread id — i.e. code mode remembers the conversation.
+  # "exec" is the legacy per-message `codex exec --json` spawn, kept as a
+  # fallback for older/drifted codex binaries (Kim also degrades to it
+  # automatically for a run when the binary's protocol major version doesn't
+  # match its snapshot).
+  transport: app-server
+  # App-server path only — Codex-native sandbox + approval policy.
+  # sandbox_mode: read-only | workspace-write | danger-full-access
+  sandbox_mode: workspace-write
+  # approval_policy: untrusted | on-failure | on-request | never
+  approval_policy: on-request
+  # Seconds to wait for the user's decision on a native command/file-change
+  # approval before auto-declining it.
+  approval_timeout_s: 120
+  # Codex-side transcript token budget: when thread/tokenUsage/updated exceeds
+  # this, Kim fires a native thread/compact/start. 0 disables.
+  codex_compact_tokens: 300000
 logging:
   level: INFO
 max_iterations: 25
@@ -48,29 +81,14 @@ openai_base_url: ''
 preview_mode: false
 project_root: .
 provider: ollama
-relay:
-  pc_api_key: ''
-  poll_interval: 2
-  url: ''
 screenshot_scale: 0.75
+# The shell command deny-list is CODE-OWNED and is NOT configurable here.
+# It lives in mcp_server/tools/shell.py (_DENY_COMMANDS / _DENY_PATTERNS),
+# mirrored at the policy chokepoint (mcp_server/policy.py). Config must never
+# be able to weaken a code-owned safety gate, so there is deliberately no
+# `blocked_cmds` key — a previous one existed but was read by nothing
+# (F-G-4), giving operators false confidence. Config can only ADD allowed
+# binaries via `shell.allowlist_extra` / `shell.safe_extra`; denied commands
+# stay denied regardless of config.
 shell:
-  blocked_commands:
-  - rm -rf /
-  - 'format c:'
-  - del /S /Q C:\
-  - rd /S /Q C:\
   timeout: 30
-voice:
-  enabled: true
-  engine: kokoro
-  human_quirks: false
-  hume:
-    description: A warm, clear, and friendly female voice.
-    voice_name: Alice Bennett
-  maya1:
-    max_new_tokens: 2048
-    model_id: maya-research/maya1
-    speaker_description: A young female with a warm, clear, and natural voice.
-    use_4bit: false
-  speed: 1.0
-  voice_id: af_heart

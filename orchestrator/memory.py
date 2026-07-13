@@ -15,6 +15,7 @@ native API format internally.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from typing import Union
 
@@ -126,42 +127,52 @@ class ConversationMemory:
         dropped regardless of the message limit.
         """
         has_summary = bool(self._messages and self._messages[0].get("role") == "compact_summary")
-        if len(self._messages) <= self.max_messages:
-            return
+        if len(self._messages) > self.max_messages:
+            # Pin the summary at index 0 and trim the rest
+            if has_summary:
+                summary = self._messages[0]
+                rest = self._messages[1:]
+                max_rest = self.max_messages - 1
+                excess = len(rest) - max_rest
+                found = False
+                for i in range(excess, len(rest)):
+                    if rest[i]["role"] == "user":
+                        # If this user message is a tool result, walk back to
+                        # include the preceding assistant tool_call (and any
+                        # further stacked tool-result messages) so we never
+                        # orphan a result from its call.
+                        start = self._fix_tool_boundary(rest, i)
+                        self._messages = [summary] + rest[start:]
+                        found = True
+                        break
+                if not found:
+                    self._messages = [summary] + rest[-1:]
+            else:
+                excess = len(self._messages) - self.max_messages
+                # Find the first user message within the allowed window
+                found = False
+                for i in range(excess, len(self._messages)):
+                    if self._messages[i]["role"] == "user":
+                        # If this user message is a tool result, walk back to
+                        # include the preceding assistant tool_call (and any further
+                        # stacked tool-result messages) so we never orphan a result
+                        # from its call.
+                        start = self._fix_tool_boundary(self._messages, i)
+                        self._messages = self._messages[start:]
+                        found = True
+                        break
+                if not found:
+                    # If no user message is found in the trailing portion,
+                    # keep at least the very last message rather than emptying.
+                    self._messages = self._messages[-1:]
 
-        # Pin the summary at index 0 and trim the rest
-        if has_summary:
-            summary = self._messages[0]
-            rest = self._messages[1:]
-            max_rest = self.max_messages - 1
-            excess = len(rest) - max_rest
-            for i in range(excess, len(rest)):
-                if rest[i]["role"] == "user":
-                    # If this user message is a tool result, include the
-                    # preceding assistant tool_call to avoid orphaning it.
-                    start = i
-                    if self._is_tool_result(rest[i]) and i > 0:
-                        start = i - 1
-                    self._messages = [summary] + rest[start:]
-                    return
-            self._messages = [summary] + rest[-1:]
-            return
-
-        excess = len(self._messages) - self.max_messages
-        # Find the first user message within the allowed window
-        for i in range(excess, len(self._messages)):
-            if self._messages[i]["role"] == "user":
-                # If this user message is a tool result, include the
-                # preceding assistant tool_call to avoid orphaning it.
-                start = i
-                if self._is_tool_result(self._messages[i]) and i > 0:
-                    start = i - 1
-                self._messages = self._messages[start:]
-                return
-
-        # If no user message is found in the trailing portion,
-        # keep at least the very last message rather than emptying.
-        self._messages = self._messages[-1:]
+        # Ensure we don't start with an assistant message (F-A-2)
+        first_idx = 0
+        if self._messages and self._messages[0].get("role") == "compact_summary":
+            first_idx = 1
+        if len(self._messages) > first_idx and self._messages[first_idx].get("role") == "assistant":
+            synthetic = {"role": "user", "content": "Resuming session."}
+            self._messages.insert(first_idx, synthetic)
 
     def _is_tool_result(self, msg: dict) -> bool:
         """Return True if *msg* is a user-role tool-result message.
@@ -172,13 +183,54 @@ class ConversationMemory:
         """
         content = msg.get("content", "")
         if isinstance(content, str):
-            return content.startswith("[Tool result:")
+            return content.lstrip().startswith("[Tool result:")
         if isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "text":
-                    if item.get("text", "").startswith("[Tool result:"):
+                    if str(item.get("text", "")).lstrip().startswith("[Tool result:"):
                         return True
         return False
+
+    def _is_tool_call(self, msg: dict) -> bool:
+        """Return True if *msg* is an assistant message containing a JSON tool call.
+
+        Mirrors compaction.py's ``_is_tool_call`` so both trim algorithms
+        agree on what counts as the call paired with a tool-result message.
+        """
+        if msg.get("role") != "assistant":
+            return False
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            return any(
+                isinstance(item, dict) and item.get("type") == "tool_call"
+                for item in content
+            )
+        text = content if isinstance(content, str) else str(content)
+        try:
+            parsed = json.loads(text)
+            return isinstance(parsed, dict) and parsed.get("type") == "tool_call"
+        except (json.JSONDecodeError, ValueError):
+            return False
+
+    def _fix_tool_boundary(self, history: list[dict], start: int) -> int:
+        """Walk *start* back if the first preserved message is an orphaned tool result.
+
+        Ports compaction.py's ``_fix_tool_boundary`` while-loop: a single
+        decrement only handles ONE preceding tool-result message. When
+        several tool-result messages are stacked in a row (e.g. multi-part
+        results), a single-step walk-back still orphans the earlier ones —
+        this loops back through all of them, matching compaction.py's
+        boundary-fixing behavior exactly.
+        """
+        if start <= 0 or start >= len(history):
+            return start
+        if not self._is_tool_result(history[start]):
+            return start
+        if start > 0 and self._is_tool_call(history[start - 1]):
+            start -= 1
+        while start > 0 and self._is_tool_result(history[start]):
+            start -= 1
+        return max(0, start)
 
     def _apply_screenshot_policy(self) -> list[dict]:
         """
@@ -218,7 +270,12 @@ def _strip_images(content: Content) -> Content:
     """
     if isinstance(content, str):
         return content
-    kept = [item for item in content if item.get("type") != "image"]
+    # L9: tolerate non-dict items (raw strings) — estimate_content_tokens
+    # accepts them, so this walk must too.
+    kept = [
+        item for item in content
+        if not (isinstance(item, dict) and item.get("type") == "image")
+    ]
     if not kept:
         return [{"type": "text", "text": "(screenshot removed — not in active window)"}]
     kept.append({"type": "text", "text": "(screenshot removed)"})

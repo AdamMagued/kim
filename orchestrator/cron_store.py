@@ -172,6 +172,23 @@ def next_run_after(schedule_expr: str, after: Optional[datetime] = None) -> date
     return base + interval
 
 
+def _advance_slot(anchor: datetime, interval: timedelta, not_before: datetime) -> datetime:
+    """Return the next scheduled slot strictly after ``not_before``.
+
+    Anchoring the next run to the previously *scheduled* slot (``anchor``)
+    rather than the wall-clock run time keeps interval schedules drift-free —
+    the scheduler's per-tick latency (up to the 60 s tick + lock waits) does
+    not compound into the period each run (F-INH-7).  When the process was
+    down for several intervals, jump ahead by whole intervals so a long gap
+    fires once, not a catch-up storm.
+    """
+    nxt = anchor + interval
+    if nxt <= not_before:
+        missed = (not_before - anchor) // interval
+        nxt = anchor + (missed + 1) * interval
+    return nxt
+
+
 def _parse_utc_iso(s: str) -> datetime:
     """Parse an ISO-8601 string to a UTC-aware datetime.
 
@@ -305,10 +322,15 @@ class CronStore:
     def _save(self, data: dict[str, dict]) -> None:
         self._file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._file.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        # fsync the temp file before the atomic rename (finding 4.3). os.replace
+        # is crash-atomic, but without fsync a power loss between write and
+        # rename can leave a zero-byte schedules file — _load then "starts empty"
+        # and the next _save makes the loss permanent.
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, self._file)
 
     @staticmethod
@@ -416,7 +438,25 @@ class CronStore:
             if "task" in kwargs:
                 raw["task"] = str(kwargs["task"]).strip()
             if "schedule_expr" in kwargs:
-                raw["schedule_expr"] = str(kwargs["schedule_expr"]).strip()
+                new_expr = str(kwargs["schedule_expr"]).strip()
+                schedule_changed = new_expr != str(raw.get("schedule_expr", ""))
+                raw["schedule_expr"] = new_expr
+                # M8: recompute next_run_at so the new cadence takes effect now.
+                # due_tasks reads the stored next_run_at, so leaving the old one
+                # (e.g. @daily's "tomorrow") would ignore the new schedule until
+                # then. Anchor to last_run_at when the task has run, else now.
+                if schedule_changed:
+                    base = (
+                        _parse_utc_iso(str(raw["last_run_at"]))
+                        if raw.get("last_run_at")
+                        else datetime.now(timezone.utc)
+                    )
+                    try:
+                        raw["next_run_at"] = next_run_after(new_expr, base).isoformat()
+                    except ValueError:
+                        # Invalid expr — clear next_run_at; from_dict below will
+                        # reject the entry and this update returns None.
+                        raw["next_run_at"] = None
             if "provider" in kwargs:
                 raw["provider"] = str(kwargs["provider"]).strip() if kwargs["provider"] else None
             if "enabled" in kwargs:
@@ -503,16 +543,36 @@ class CronStore:
                 )
                 return None
 
-            # Compute next_run_at before touching the file.
+            # Compute next_run_at before touching the file. Anchor to the
+            # previously scheduled slot (never-run tasks: created_at + interval)
+            # rather than the wall-clock run time so interval schedules do not
+            # drift later by the scheduler's tick latency each run (F-INH-7).
             schedule_expr = str(raw.get("schedule_expr", ""))
             try:
-                next_dt = next_run_after(schedule_expr, ran_at_dt)
+                interval = parse_schedule_expr(schedule_expr)
             except ValueError as e:
                 logger.warning(
                     "cron_store: record_run skipping task %r: bad schedule_expr %r: %s",
                     task_id, schedule_expr, e,
                 )
                 return None
+
+            prev_next = raw.get("next_run_at")
+            if prev_next:
+                # Subsequent runs anchor to the previously scheduled slot so the
+                # tick latency of THIS run is not folded into the period; the
+                # schedule stays pinned to (first-run + k*interval) instead of
+                # creeping later every tick (F-INH-7).
+                try:
+                    anchor = _parse_utc_iso(str(prev_next))
+                    next_dt = _advance_slot(anchor, interval, ran_at_dt)
+                except ValueError:
+                    # Unparseable stored slot — fall back to interval-from-now.
+                    next_dt = ran_at_dt + interval
+            else:
+                # First run of a never-run task: establish the anchor at
+                # ran_at + interval (the historical contract).
+                next_dt = ran_at_dt + interval
 
             raw["run_count"] = int(raw.get("run_count", 0)) + 1
             raw["last_run_at"] = ran_at_dt.isoformat()

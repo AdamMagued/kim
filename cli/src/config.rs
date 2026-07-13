@@ -75,7 +75,20 @@ impl KimConfig {
         let Ok(raw) = fs::read_to_string(path) else {
             return Self::default();
         };
-        serde_json::from_str(&raw).unwrap_or_default()
+        match serde_json::from_str(&raw) {
+            Ok(config) => config,
+            Err(err) => {
+                // F-E-9: a corrupt config (hand-edit typo, truncated write from
+                // an old version, disk corruption) must NOT be silently reset to
+                // defaults — the very next save (/theme, /model, any login)
+                // atomically overwrites the file and permanently discards every
+                // stored API key that was still recoverable in it. Move the
+                // corrupt file aside and warn, so the keys survive and the user
+                // learns why they were signed out.
+                back_up_corrupt_config(path, &err);
+                Self::default()
+            }
+        }
     }
 
     fn save_to(&self, path: &Path) -> io::Result<()> {
@@ -85,6 +98,40 @@ impl KimConfig {
         let raw = serde_json::to_string_pretty(self)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         atomic_write(path, &raw)
+    }
+}
+
+/// F-E-9: move a corrupt config file aside to `<name>.bak-<unix_secs>` and warn
+/// on stderr, so a later save can't clobber still-recoverable API keys. Returns
+/// the backup path when the rename succeeded (used by tests).
+fn back_up_corrupt_config(path: &Path, err: &serde_json::Error) -> Option<PathBuf> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(CONFIG_FILE_NAME);
+    let backup = path.with_file_name(format!("{name}.bak-{secs}"));
+    match fs::rename(path, &backup) {
+        Ok(()) => {
+            eprintln!(
+                "kim: {} is corrupt ({err}); moved it to {} and started from defaults. \
+                 Your saved API keys are in the backup if you need to recover them.",
+                path.display(),
+                backup.display()
+            );
+            Some(backup)
+        }
+        Err(rename_err) => {
+            eprintln!(
+                "kim: {} is corrupt ({err}) and could not be backed up ({rename_err}); \
+                 using defaults. Do NOT run a command that saves config until you have \
+                 copied any API keys out of that file, or they will be overwritten.",
+                path.display()
+            );
+            None
+        }
     }
 }
 
@@ -121,13 +168,11 @@ fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
                 format!("could not create temp config {}: {e}", tmp_path.display()),
             )
         })?;
-        file.write_all(content.as_bytes()).map_err(|e| {
+        file.write_all(content.as_bytes()).inspect_err(|_e| {
             let _ = fs::remove_file(&tmp_path);
-            e
         })?;
-        file.sync_all().map_err(|e| {
+        file.sync_all().inspect_err(|_e| {
             let _ = fs::remove_file(&tmp_path);
-            e
         })?;
     } // file closed before rename
 
@@ -138,6 +183,23 @@ fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
             format!("could not commit config to {}: {e}", path.display()),
         )
     })
+}
+
+pub fn config_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        Some(
+            std::env::temp_dir()
+                .join(format!("kim-cli-test-{}", std::process::id()))
+                .join(CONFIG_DIR_NAME)
+                .join(CONFIG_FILE_NAME),
+        )
+    }
+
+    #[cfg(not(test))]
+    {
+        dirs::home_dir().map(|home| home.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
+    }
 }
 
 #[cfg(test)]
@@ -212,12 +274,7 @@ mod tests {
         let tmp_count = fs::read_dir(dir)
             .expect("read dir")
             .flatten()
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .map_or(false, |x| x == "tmp")
-            })
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"))
             .count();
         let _ = fs::remove_dir_all(dir);
         assert_eq!(
@@ -267,21 +324,37 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
         assert_eq!(loaded, KimConfig::default());
     }
-}
 
-pub fn config_path() -> Option<PathBuf> {
-    #[cfg(test)]
-    {
-        Some(
-            std::env::temp_dir()
-                .join(format!("kim-cli-test-{}", std::process::id()))
-                .join(CONFIG_DIR_NAME)
-                .join(CONFIG_FILE_NAME),
-        )
-    }
+    // F-E-9: a corrupt config must be moved aside (preserving any recoverable
+    // API keys), not left in place where the next save would clobber it.
+    #[test]
+    fn corrupt_config_is_backed_up_not_left_to_be_clobbered() {
+        let path = unique_config_path();
+        let dir = path.parent().unwrap().to_path_buf();
+        // A truncated write that still contains a recoverable API key.
+        let corrupt = r#"{"provider":"claude","api_keys":{"claude":"sk-live-secret"#;
+        fs::write(&path, corrupt).expect("write fixture");
 
-    #[cfg(not(test))]
-    {
-        dirs::home_dir().map(|home| home.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
+        let loaded = KimConfig::load_from(&path);
+        assert_eq!(loaded, KimConfig::default(), "must fall back to defaults");
+
+        // The original path was moved aside — a save now can't overwrite it.
+        assert!(
+            !path.exists(),
+            "corrupt config must be renamed away from the canonical path"
+        );
+        let backups: Vec<_> = fs::read_dir(&dir)
+            .expect("read dir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one backup should be created");
+        // The recoverable key is still on disk in the backup.
+        let backup_contents = fs::read_to_string(backups[0].path()).expect("read backup");
+        assert!(
+            backup_contents.contains("sk-live-secret"),
+            "the backup must preserve the still-recoverable API key"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

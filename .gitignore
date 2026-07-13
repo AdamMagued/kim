@@ -38,6 +38,9 @@ desktop/.vite/
 logs/
 *.log
 *.jsonl
+# …but committed test fixtures are not runtime traces — keep them tracked.
+!codex_engine/appserver_schema/*.jsonl
+!tests/**/*.jsonl
 
 # ── Runtime: browser session persistence ──────────────────────────────────────
 sessions/
@@ -64,6 +67,9 @@ scratch_test_json.py
 .DS_Store
 Thumbs.db
 Desktop.ini
+# macOS system python (Xcode CLT) drops a com.apple.python pyc-cache tree named
+# Library/ at cwd when run from the repo root — pure junk, safe to delete anytime.
+/Library/
 
 # ── Editor / IDE ──────────────────────────────────────────────────────────────
 .vscode/
@@ -77,3 +83,8 @@ Desktop.ini
 
 # ── graphify code graph (generated/regenerable; see repomap.md to rebuild) ─────
 graphify-out/
+
+# coverage.py binary artifact (CI/local pytest --cov output)
+.coverage
+.coverage.*
+htmlcov/

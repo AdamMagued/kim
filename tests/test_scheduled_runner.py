@@ -801,3 +801,119 @@ def test_popen_receives_log_file_not_devnull(tmp_path):
     assert captured_kwargs["stderr"] is not real_subprocess.DEVNULL
     # The file handle should be a real IO object (already closed after Popen)
     assert hasattr(captured_kwargs["stdout"], "name"), "expected a file handle with a .name"
+
+
+# ---------------------------------------------------------------------------
+# PID reaper: reboot PID-reuse guard (M6) + register-before-timeout (M7)
+# ---------------------------------------------------------------------------
+
+def test_reaper_does_not_kill_pid_from_a_previous_boot(tmp_path):
+    """M6: an entry whose boot_ref predates this boot must be dropped, never
+    SIGKILLed — the OS may have reused its PID for an innocent process."""
+    import json as _json
+    import os as _os
+    from unittest.mock import patch as _patch
+
+    from orchestrator.scheduled_runner import (
+        _boot_ref,
+        _pid_registry_path,
+        _reap_stale_agents,
+    )
+
+    reg = _pid_registry_path(tmp_path)
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    # A long-running entry (elapsed > timeout) but from a DIFFERENT boot.
+    reg.write_text(_json.dumps([{
+        "task_id": "t1",
+        "pid": 999999,
+        "started_at": 0.0,
+        "boot_ref": _boot_ref() - 10_000,  # clearly a prior boot
+    }]))
+
+    killed = []
+    with _patch.object(_os, "kill", side_effect=lambda p, s: killed.append((p, s))):
+        _reap_stale_agents(tmp_path, timeout_seconds=1.0)
+
+    assert killed == []  # never killed a foreign-boot PID
+    assert _json.loads(reg.read_text()) == []  # but dropped from the registry
+
+
+def test_reaper_kills_stale_agent_from_current_boot(tmp_path):
+    """The reaper still kills a genuinely stale agent from THIS boot."""
+    import json as _json
+    import os as _os
+    from unittest.mock import patch as _patch
+
+    from orchestrator.scheduled_runner import (
+        _boot_ref,
+        _pid_registry_path,
+        _reap_stale_agents,
+    )
+
+    reg = _pid_registry_path(tmp_path)
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    reg.write_text(_json.dumps([{
+        "task_id": "t1",
+        "pid": 424242,
+        "started_at": 0.0,          # long ago → elapsed > timeout
+        "boot_ref": _boot_ref(),    # this boot
+    }]))
+
+    # The reaper now kills the whole process group via _kill_process_tree so
+    # orphaned children (MCP server, browser, shell) go with the agent
+    # (finding 5.1); assert it targets the stale pid.
+    killed = []
+    with _patch("orchestrator.scheduled_runner._pid_exists", return_value=True), \
+         _patch(
+             "orchestrator.scheduled_runner._kill_process_tree",
+             side_effect=lambda p: killed.append(p),
+         ):
+        _reap_stale_agents(tmp_path, timeout_seconds=1.0)
+
+    assert killed == [424242]
+
+
+def test_register_agent_pid_records_boot_ref(tmp_path):
+    """M6: registration stamps the current boot_ref so the reaper can verify."""
+    import json as _json
+
+    from orchestrator.scheduled_runner import (
+        _boot_ref,
+        _pid_registry_path,
+        _register_agent_pid,
+    )
+
+    _register_agent_pid(tmp_path, "t1", 12345)
+    entries = _json.loads(_pid_registry_path(tmp_path).read_text())
+    assert entries[0]["pid"] == 12345
+    assert abs(entries[0]["boot_ref"] - _boot_ref()) <= 1
+
+
+def test_scheduled_runs_log_retention(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from orchestrator.scheduled_runner import apply_scheduled_log_retention
+
+    log_dir = tmp_path / "logs" / "scheduled_runs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Active log: 3 days ago (kept)
+    active_ts = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y%m%dT%H%M%SZ")
+    active_file = log_dir / f"task1_{active_ts}.log"
+    active_file.write_text("active log content")
+
+    # 2. Stale log: 10 days ago (deleted)
+    stale_ts = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y%m%dT%H%M%SZ")
+    stale_file = log_dir / f"task1_{stale_ts}.log"
+    stale_file.write_text("stale log content")
+
+    # 3. Non-log file: 10 days ago (kept because not matching *.log glob)
+    other_file = log_dir / f"task1_{stale_ts}.txt"
+    other_file.write_text("other text")
+
+    # Apply retention with keep_days=7
+    deleted = apply_scheduled_log_retention(tmp_path, keep_days=7)
+
+    assert deleted == 1
+    assert active_file.exists()
+    assert not stale_file.exists()
+    assert other_file.exists()

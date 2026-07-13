@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from orchestrator.providers.browser import provider as bp
 from orchestrator.providers.browser.provider import (
+    _DeliveredNoResponse,
     BrowserProvider,
     _normalize_for_marker,
 )
@@ -237,6 +238,36 @@ class TestWaitForGenerationComplete(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
         self.assertEqual(scrape.await_count, 2)
 
+    async def test_prompt_echo_containing_hash_is_not_definitive(self):
+        # F-B-7: the injected prompt embeds the literal completion hash inside
+        # the "Always append the exact string …" instruction. When the echoed
+        # USER bubble is scraped first, its mid-text hash must NOT terminate the
+        # wait — only the model's OWN answer, whose hash sits at the tail, does.
+        p = _provider()
+        echo = (
+            "List the files. IMPORTANT: Always append the exact string "
+            "[END_OF_RESPONSE_abc] at the very end of your entire response."
+        )
+        answer = "Here are the files: a.txt, b.txt. [END_OF_RESPONSE_abc]"
+        result, scrape = await self._wait(
+            p, [echo, echo, answer] + ["x"] * 50, "[END_OF_RESPONSE_abc]"
+        )
+        self.assertTrue(result)
+        # Did NOT exit on the two echoed polls; only on the real answer (poll 3).
+        self.assertEqual(scrape.await_count, 3)
+
+    async def test_assistant_early_hash_echo_mid_text_is_not_definitive(self):
+        # F-B-7: a model that names the sentinel before answering ("I'll end
+        # with …") must not trip the wait mid-generation; only a tail hash does.
+        p = _provider()
+        early = "Sure, I'll end with [END_OF_RESPONSE_abc]. Working on it now, one moment."
+        done = "The answer is 42. [END_OF_RESPONSE_abc]"
+        result, scrape = await self._wait(
+            p, [early, done] + ["x"] * 50, "[END_OF_RESPONSE_abc]"
+        )
+        self.assertTrue(result)
+        self.assertEqual(scrape.await_count, 2)
+
     async def test_shrinking_text_does_not_freeze_idle_counter(self):
         # A long "thinking" text collapses into a shorter final answer. The
         # idle counter must resync to the new (shorter) baseline and exit via
@@ -301,6 +332,80 @@ class TestWaitForGenerationComplete(unittest.IsolatedAsyncioTestCase):
                 min_generation_s=0.0,
             )
         self.assertFalse(result)  # idle-heuristic exit, not the transition
+
+
+# ---------------------------------------------------------------------------
+# F-B-8: post-send timeout must NOT be a retryable re-send
+# ---------------------------------------------------------------------------
+
+class _FakeDriver:
+    def __init__(self, page, site):
+        self._page, self._site = page, site
+
+    async def acquire(self):
+        return self._page, self._site
+
+
+class _ImgPage:
+    url = "https://chatgpt.com/c/x"
+
+    async def title(self):
+        return ""
+
+    async def wait_for_timeout(self, _ms):
+        return None
+
+
+class TestMultiImageUpload(unittest.IsolatedAsyncioTestCase):
+    """F-B-10: the CDP path must upload EVERY image, not just the last."""
+
+    async def test_all_images_are_uploaded(self):
+        p = _provider()
+        inject = AsyncMock(return_value=True)
+        attachments = [
+            {"mime_type": "image/png", "data_base64": "AAA"},
+            {"mime_type": "image/png", "data_base64": "BBB"},
+            {"mime_type": "image/png", "data_base64": "CCC"},
+        ]
+        with patch.object(p, "_inject_image_clipboard", inject), \
+             patch.object(p, "_dismiss_popups", AsyncMock()), \
+             patch.object(p, "_send_and_wait", AsyncMock(return_value="TASK_COMPLETE: ok [END_OF_RESPONSE_x]")):
+            await p._run_chat_flow(
+                _ImgPage(), "chatgpt", "prompt [Screenshot attached]x3",
+                attachments, None, "[END_OF_RESPONSE_x]", False, {"input": 1},
+            )
+        self.assertEqual(inject.await_count, 3)
+        uploaded = [c.args[2] for c in inject.await_args_list]
+        self.assertEqual(uploaded, ["AAA", "BBB", "CCC"])
+
+
+class TestDeliveredNoResponse(unittest.IsolatedAsyncioTestCase):
+    def test_delivered_no_response_is_not_a_retryable_timeout(self):
+        # Must not be a TimeoutError, or classify_provider_error would mark it
+        # retryable and the agent would re-inject the whole prompt.
+        self.assertFalse(issubclass(_DeliveredNoResponse, TimeoutError))
+
+    async def test_post_send_timeout_returns_need_help_not_raise(self):
+        provider = _provider()
+        provider._sent_system_prompt = False
+
+        async def _raise_delivered(*_a, **_k):
+            raise _DeliveredNoResponse("chatgpt", 60)
+
+        with patch.object(provider, "_run_chat_flow", _raise_delivered):
+            result = await provider.complete(
+                [{"role": "user", "content": "hi"}],
+                tools=[],
+                system="sys",
+                page_driver=_FakeDriver(object(), "chatgpt"),  # pyright: ignore[reportArgumentType]  # test PageDriver stub
+            )
+        self.assertEqual(result["type"], "text")
+        self.assertIn("NEED_HELP", result["content"])
+        self.assertIn("do not resend", result["content"].lower())
+        self.assertIn("chatgpt", result["content"])
+        # Delivered → the system prompt reached the thread; committed so a manual
+        # "continue" does not rebuild the full system prompt.
+        self.assertTrue(provider._sent_system_prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +483,31 @@ class TestFindChatPagePreferredSite(unittest.IsolatedAsyncioTestCase):
         page, site = await p._find_chat_page(_browser_with([gemini]))
         self.assertEqual(site, "gemini")
         self.assertIs(page, gemini)
+
+
+class TestFreshChatUrl(unittest.TestCase):
+    """clear_chat must open a genuinely NEW conversation.
+
+    Regression for the compaction-handoff bug: after a chat has begun, the tab
+    URL is a conversation permalink (chatgpt.com/c/<id>), so `page.goto(page.url)`
+    lands back in the SAME chat — and the "fresh chat" prompt (handoff + system
+    prompt + new task) was sent into the very conversation that had just
+    produced the compaction summary. The fresh-chat target must be the site
+    root, never the current page URL.
+    """
+
+    def test_chatgpt_fresh_url_is_site_root_not_permalink(self):
+        p = _provider(preferred_site="chatgpt")
+        self.assertEqual(p._fresh_chat_url("chatgpt"), "https://chatgpt.com/")
+
+    def test_gemini_and_claude_fresh_urls(self):
+        p = _provider()
+        self.assertEqual(p._fresh_chat_url("gemini"), "https://gemini.google.com/")
+        self.assertEqual(p._fresh_chat_url("claude"), "https://claude.ai/")
+
+    def test_unknown_site_returns_none(self):
+        p = _provider()
+        self.assertIsNone(p._fresh_chat_url("nope-not-a-site"))
 
 
 class TestMaybeResetSystemPrompt(unittest.TestCase):

@@ -493,3 +493,129 @@
   color: var(--accent);
 }
 
+
+/* ── Codex app-server turn panel (parity Part 5) ─────────────────────────── */
+
+.kim-codex-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kim-codex-approval__cmd {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  background: var(--bg-elevated);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
+.kim-codex-approval__cwd {
+  color: var(--text-dim, var(--text));
+  font-size: 12px;
+}
+
+.kim-codex-approval__badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+}
+
+.kim-codex-plan {
+  list-style: none;
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  font-size: 12.5px;
+}
+
+.kim-codex-plan__step {
+  padding: 2px 0;
+  color: var(--text-dim, var(--text));
+}
+
+.kim-codex-plan__step--completed {
+  opacity: 0.65;
+  text-decoration: line-through;
+}
+
+.kim-codex-plan__step--inProgress,
+.kim-codex-plan__step--in_progress {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.kim-codex-plan__mark {
+  display: inline-block;
+  width: 16px;
+  color: var(--accent);
+}
+
+.kim-codex-output,
+.kim-codex-diff {
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+
+/* C4: codex question card — per-question block + free-text input. */
+.kim-codex-question {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+.kim-codex-question__input {
+  appearance: none;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 13px;
+  padding: 6px 10px;
+  max-width: 420px;
+}
+.kim-codex-question__input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.kim-hitl-btn--active {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.kim-codex-output__toggle,
+.kim-codex-diff__toggle {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text-dim, var(--text));
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.kim-codex-output__pre,
+.kim-codex-diff__pre {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-top: 1px solid var(--border-strong);
+}

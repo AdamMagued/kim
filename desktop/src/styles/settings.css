@@ -9,7 +9,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 900;
+  z-index: var(--z-drawer);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   animation: kim-fade-in 0.18s ease;
@@ -651,7 +651,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 2000;
+  z-index: var(--z-modal-top);
   padding: 24px;
   -webkit-app-region: drag;
 }
@@ -984,7 +984,7 @@
   position: fixed;
   bottom: 24px;
   right: 24px;
-  z-index: 9999;
+  z-index: var(--z-flash);
   display: flex;
   flex-direction: column;
   gap: 8px;

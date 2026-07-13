@@ -15,16 +15,58 @@ import asyncio
 import fnmatch
 import logging
 import os
+import re
 from pathlib import Path
 
 from mcp_server.config import PROJECT_ROOT, SHELL_TIMEOUT, validate_path
-from mcp_server.os_utils import check_tool_available, IS_WINDOWS
+from mcp_server.os_utils import check_tool_available, minimal_subprocess_env, IS_WINDOWS
+from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
 # Max results to prevent overwhelming the LLM context window
 MAX_SEARCH_RESULTS = 100
 MAX_FIND_RESULTS = 200
+
+# Leading "<path><sep><lineno><sep>" prefix emitted by every grep-family backend
+# (rg / grep -n / findstr /N). ``:`` separates path↔lineno for matches, ``-``
+# for context lines; a Windows drive letter (``C:\``) is not followed by digits
+# so the non-greedy capture skips past it to the real path↔lineno boundary.
+_MATCH_PREFIX_RE = re.compile(r"^(?P<path>.+?)[:-]\d+[:-]")
+
+
+def _extract_path(line: str) -> str | None:
+    """Return the file-path component of a ``path:lineno:content`` search line,
+    or None for structural lines (blank, ``--`` group separators, headers)."""
+    m = _MATCH_PREFIX_RE.match(line)
+    return m.group("path") if m else None
+
+
+def _drop_denied_paths(output: str, cwd: str) -> str:
+    """Post-filter raw grep-family output: drop every line whose file path fails
+    ``config.validate_path`` (secret-file / out-of-sandbox deny-list), for EVERY
+    backend. This is the authoritative sandbox check for ``search_in_files`` — it
+    reuses the exact same deny logic ``read_file``/``write_file`` rely on, so a
+    directory search that recurses into a denied file (id_rsa, *.pem, .env,
+    credentials*, .npmrc, …) yields NOTHING from that file.
+    """
+    kept: list[str] = []
+    for line in output.split("\n"):
+        path = _extract_path(line)
+        if path is None:
+            # Structural line (``--`` separator, blank) — carries no file content.
+            kept.append(line)
+            continue
+        target = path if os.path.isabs(path) else os.path.join(cwd, path)
+        try:
+            validate_path(target)
+        except PermissionError:
+            continue  # secret / out-of-sandbox file — drop this hit entirely
+        except Exception:
+            # Never let a filter error surface a hit we could not validate.
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 async def _run_search_cmd(cmd: list[str], cwd: str, timeout: int) -> str:
@@ -36,6 +78,7 @@ async def _run_search_cmd(cmd: list[str], cwd: str, timeout: int) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
+            env=minimal_subprocess_env(),  # S4: no parent-env inherit
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
@@ -50,6 +93,11 @@ async def _run_search_cmd(cmd: list[str], cwd: str, timeout: int) -> str:
 
         if exit_code not in (0, 1):
             return f"ERROR (exit {exit_code}): {err}" if err else f"ERROR: exit code {exit_code}"
+
+        # F1: drop any hit whose file path is denied by the sandbox (secret
+        # files / out-of-sandbox), for every backend, BEFORE the empty check so
+        # a search that only matched denied files reports "No matches found."
+        out = _drop_denied_paths(out, cwd)
 
         if not out.strip():
             return "No matches found."
@@ -71,12 +119,12 @@ async def _run_search_cmd(cmd: list[str], cwd: str, timeout: int) -> str:
                 await asyncio.wait_for(proc.wait(), timeout=2)
             except Exception:
                 pass
-        return f"ERROR: Search timed out after {timeout}s. Try a more specific pattern."
+        return tool_error(f"Search timed out after {timeout}s. Try a more specific pattern.")
     except FileNotFoundError:
-        return f"ERROR: '{cmd[0]}' is not installed or not found on PATH."
+        return tool_error(f"'{cmd[0]}' is not installed or not found on PATH.")
     except Exception as e:
         logger.error(f"search command failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_search_in_files(args: dict) -> str:
@@ -96,7 +144,7 @@ async def handle_search_in_files(args: dict) -> str:
     """
     pattern = args.get("pattern", "")
     if not pattern:
-        return "ERROR: 'pattern' parameter is required."
+        return tool_error("'pattern' parameter is required.")
 
     search_path = args.get("path", str(PROJECT_ROOT))
     include = args.get("include", "")
@@ -124,7 +172,9 @@ async def handle_search_in_files(args: dict) -> str:
             cmd.extend([f"--context={context_lines}"])
         if include:
             cmd.extend(["--glob", include])
-        cmd.extend(["--max-count=500", pattern, search_dir])
+        # "--" ends option parsing so patterns starting with "-" (e.g.
+        # "->getValue") are not misread as rg flags (M3).
+        cmd.extend(["--max-count=500", "--", pattern, search_dir])
 
         logger.info(f"search_in_files [rg]: pattern={pattern!r} path={search_dir}")
         return await _run_search_cmd(cmd, cwd=search_dir, timeout=timeout)
@@ -140,7 +190,8 @@ async def handle_search_in_files(args: dict) -> str:
             cmd.extend([f"-C{context_lines}"])
         if include:
             cmd.extend(["--include", include])
-        cmd.extend([pattern, search_dir])
+        # "--" ends option parsing for dash-leading patterns (M3).
+        cmd.extend(["--", pattern, search_dir])
 
         logger.info(f"search_in_files [grep]: pattern={pattern!r} path={search_dir}")
         return await _run_search_cmd(cmd, cwd=search_dir, timeout=timeout)
@@ -184,7 +235,7 @@ async def handle_find_files(args: dict) -> str:
     """
     pattern = args.get("pattern", "")
     if not pattern:
-        return "ERROR: 'pattern' parameter is required (e.g. '*.py', '**/*.ts')."
+        return tool_error("'pattern' parameter is required (e.g. '*.py', '**/*.ts').")
 
     search_path = args.get("path", str(PROJECT_ROOT))
     type_filter = args.get("type", "file")
@@ -196,7 +247,7 @@ async def handle_find_files(args: dict) -> str:
         return f"PERMISSION_ERROR: {e}"
 
     if not resolved_path.is_dir():
-        return f"ERROR: '{resolved_path}' is not a directory."
+        return tool_error(f"'{resolved_path}' is not a directory.")
 
     logger.info(f"find_files: pattern={pattern!r} path={resolved_path} type={type_filter}")
 
@@ -215,6 +266,17 @@ async def handle_find_files(args: dict) -> str:
                 continue
             if any(p in ("node_modules", "__pycache__", ".git", "venv", ".venv") for p in parts):
                 continue
+
+            # F1: never disclose the name/size of a sandbox-denied file
+            # (id_rsa, *.pem, credentials*, .env, .npmrc, …) — same deny logic
+            # read_file uses. Directories stay listable so traversal still works.
+            if match.is_file():
+                try:
+                    validate_path(str(match))
+                except PermissionError:
+                    continue
+                except Exception:
+                    continue
 
             # Apply type filter
             if type_filter == "file" and not match.is_file():
@@ -254,4 +316,4 @@ async def handle_find_files(args: dict) -> str:
 
     except Exception as e:
         logger.error(f"find_files failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)

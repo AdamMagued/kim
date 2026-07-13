@@ -36,18 +36,26 @@ def _stub(name: str, **attrs):
     return m
 
 
-for _mod in ("mcp", "mcp.client", "mcp.client.stdio",
-             "mcp.types", "mss", "pynput", "pynput.mouse", "pynput.keyboard",
+for _mod in ("mss", "pynput", "pynput.mouse", "pynput.keyboard",
              "pyautogui", "PIL", "PIL.Image", "sounddevice", "soundfile",
              "kokoro", "pygetwindow"):
     if _mod not in sys.modules:
         sys.modules[_mod] = _stub(_mod)
 
-# mcp needs a few specific names
-_mcp = sys.modules["mcp"]
-_mcp.ClientSession = MagicMock
-_mcp.StdioServerParameters = MagicMock
-sys.modules["mcp.client.stdio"].stdio_client = MagicMock()
+# mcp: prefer the REAL package (installed in CI + dev). Only stub the
+# client symbols when it is genuinely absent — stubbing unconditionally would
+# replace mcp.server for later tests that import mcp_server.server.
+try:
+    import mcp  # noqa: F401
+    import mcp.client.stdio  # noqa: F401
+except Exception:
+    for _mod in ("mcp", "mcp.client", "mcp.client.stdio", "mcp.types"):
+        if _mod not in sys.modules:
+            sys.modules[_mod] = _stub(_mod)
+    _mcp = sys.modules["mcp"]
+    _mcp.ClientSession = MagicMock
+    _mcp.StdioServerParameters = MagicMock
+    sys.modules["mcp.client.stdio"].stdio_client = MagicMock()
 
 # yaml must be real (it is installed), but stub in case it isn't
 try:

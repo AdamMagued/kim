@@ -11,6 +11,25 @@ import importlib
 import sys
 import platform
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_site_configs_module():
+    """Re-reload site_configs under the pristine env after every test.
+
+    importlib.reload() leaves the module evaluated under the patched
+    env/platform; monkeypatch restores the env but not the module, so without
+    this teardown MOD_KEY/CDP_URL would stay wrong for the rest of the pytest
+    session (an order-dependence trap for any future runtime consumer).
+
+    Autouse fixtures are instantiated before the test's own fixtures, so this
+    finalizer runs AFTER monkeypatch has restored the environment.
+    """
+    yield
+    import orchestrator.providers.browser.site_configs as sc
+    importlib.reload(sc)
+
 
 # ---------------------------------------------------------------------------
 # helpers

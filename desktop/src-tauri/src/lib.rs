@@ -4,24 +4,22 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 use tauri::{Emitter, Manager};
-use tokio::sync::Mutex;
 
 pub mod account;
 pub mod browser_bridge;
 mod codex_bridge;
-mod env_path;
 pub mod codex_projects;
 pub mod config;
 pub mod data_io;
+mod env_path;
 pub mod feedback;
 mod google_oauth;
 pub(crate) mod http_bridge;
 pub mod ollama;
 pub mod provider_auth;
-pub mod relay;
 pub mod run_history;
 pub mod schedule_commands;
 mod scheduler;
@@ -29,7 +27,6 @@ mod screenshot_flash;
 pub mod secrets;
 pub mod session_commands;
 mod speed_access;
-pub mod voice_config;
 pub(crate) use browser_bridge::*;
 mod paths;
 pub(crate) use paths::*;
@@ -37,36 +34,38 @@ mod session_store;
 pub(crate) use session_store::*;
 mod provider_url;
 pub(crate) use provider_url::*;
+mod ssrf;
 mod http_util;
 pub(crate) use http_util::*;
+pub(crate) mod codex_route;
+pub(crate) use codex_route::{configure_codex_direct_provider, selected_ollama_codex_model};
+pub(crate) mod spawn_supervisor;
 pub(crate) mod task_runtime;
+pub mod task_spec;
 
 // Re-export commonly used types/helpers from submodules so remaining lib.rs
 // code (session listing, run history, codex file-bridge) can use them unqualified.
 use codex_bridge::start_bridge_file_watcher;
-use codex_projects::{mirror_latest_claw_session_to_codex, newest_codex_session};
+use codex_projects::newest_codex_session;
 use http_bridge::{capitalize, start_webview_bridge_server};
 use ollama::ollama_tags;
 use screenshot_flash::show_screenshot_flash;
 
-// ---------------------------------------------------------------------------
-// Shared state — currently running agent child (for cancellation)
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
-pub struct RunningTask {
-    /// PID of the running agent subprocess, if any.
-    pid: Option<u32>,
-    /// True while a task has reserved the runner slot but has not spawned yet.
-    starting: bool,
-}
-
-pub type TaskState = Arc<Mutex<RunningTask>>;
+// H-PROC-1: the legacy `RunningTask`/`TaskState` managed state was removed.
+// Nothing ever wrote its pid/starting fields — all real task state lives in
+// `task_runtime::TaskRuntime` — so every guard reading it was dead code.
 
 #[derive(Clone, Debug)]
 struct WebviewBridgeConfig {
     base_url: String,
     token: String,
+    /// F-D-4: a SEPARATE, capability-scoped token that is the only token ever
+    /// injected into a third-party provider webview (the auth-probe JS). Unlike
+    /// `token` (which authorizes every bridge route, incl. `/v1/task` and
+    /// `/v1/open`), this token authorizes ONLY `POST /v1/callback`, so a
+    /// compromised/monkeypatched provider page that steals it cannot spawn a
+    /// local agent run or drive the SSRF-capable open route.
+    webview_token: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -118,6 +117,12 @@ struct BridgeCompleteResponse {
     response: Option<String>,
     error: Option<String>,
     site: Option<String>,
+    /// How many attachments bridge.js verified as actually uploaded (chip
+    /// appeared in the composer). Forwarded to Python via /v1/result so
+    /// screenshot-honesty gating can tell "image delivered" from "image
+    /// silently dropped". `None` on payloads from older bridge scripts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attachments_uploaded: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -143,6 +148,10 @@ struct BridgeIpcEvent {
     level: Option<String>,
     #[serde(default)]
     msg: Option<String>,
+    /// Verified upload count from the bridge's `done` payload (see
+    /// `BridgeCompleteResponse::attachments_uploaded`).
+    #[serde(default)]
+    attachments_uploaded: Option<u64>,
 }
 
 static IPC_LISTENER_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -163,6 +172,18 @@ static WEBVIEW_BRIDGE_NOTIFY: OnceLock<(StdMutex<()>, Condvar)> = OnceLock::new(
 static WEBVIEW_NAV_READY: OnceLock<(StdMutex<bool>, Condvar)> = OnceLock::new();
 /// Tracks whether the browser window was hidden before a specific /v1/send request, so /v1/result knows to hide it after.
 static WEBVIEW_WAS_HIDDEN: OnceLock<StdMutex<std::collections::HashSet<String>>> = OnceLock::new();
+/// AUDIT FIX #3: first-seen timestamp for every bridge req_id tracked in
+/// WEBVIEW_BRIDGE_RESULTS/PROGRESS/WAS_HIDDEN. A caller that dies (task
+/// force-killed, HTTP client crashed) before ever polling /v1/result leaves
+/// its entries in those maps forever, since the only cleanup paths today
+/// run inside `collect_bridge_payload` (on success or its own timeout) --
+/// which never runs unless something actually calls /v1/result. This map
+/// backs a periodic sweep (`browser_bridge::sweep_stale_bridge_entries`,
+/// started by `browser_bridge::start_bridge_gc_sweeper`) that evicts
+/// orphaned entries after a bound (default 15 min) regardless of whether
+/// anyone ever polls for them.
+static WEBVIEW_BRIDGE_ENTRY_TIMES: OnceLock<StdMutex<HashMap<String, std::time::Instant>>> =
+    OnceLock::new();
 /// Debug/testing mode: keep the provider webview visible while sending.
 static WEBVIEW_KEEP_VISIBLE: OnceLock<StdMutex<bool>> = OnceLock::new();
 /// The site selected via /v1/provider, to be passed to the next agent spawn.
@@ -310,7 +331,9 @@ async fn is_bridge_task_running_async() -> bool {
 
 fn is_bridge_task_running() -> bool {
     if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(|| tauri::async_runtime::block_on(is_bridge_task_running_async()))
+        tokio::task::block_in_place(|| {
+            tauri::async_runtime::block_on(is_bridge_task_running_async())
+        })
     } else {
         tauri::async_runtime::block_on(is_bridge_task_running_async())
     }
@@ -726,7 +749,6 @@ pub(crate) mod window_manager;
 pub(crate) use window_manager::{set_task_active_mode, show_main_window};
 pub(crate) mod updater;
 
-#[tauri::command]
 async fn session_browser_meta_read(
     session_id: String,
     session_date: Option<String>,
@@ -758,11 +780,11 @@ async fn session_browser_meta_write(
     let stype = session_type.unwrap_or_else(|| "kim".to_string());
     let base = session_base_dir(&stype, kim_dir, codex_dir);
     let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
-    let mut meta = read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
-
-    apply_browser_meta_writes(&mut meta, browser_last_site, site, url, last_llm_provider)?;
-    write_browser_session_meta_to_dir(&date_dir, &session_id, &meta)?;
-    Ok(meta)
+    // M-STORE-1: read-modify-write under the process-wide meta lock so a
+    // concurrent bridge commit can't discard this write's fields.
+    update_browser_session_meta(&date_dir, &session_id, |meta| {
+        apply_browser_meta_writes(meta, browser_last_site, site, url, last_llm_provider)
+    })
 }
 
 #[tauri::command]
@@ -800,13 +822,14 @@ async fn session_browser_url_commit(
         let stype = session_type.clone().unwrap_or_else(|| "kim".to_string());
         let base = session_base_dir(&stype, kim_dir, codex_dir);
         let date_dir = resolve_session_date_dir(&base, &session_id, session_date.as_deref())?;
-        let mut meta =
-            read_browser_session_meta_from_dir(&date_dir, &session_id).unwrap_or_default();
-        if meta.browser_last_site.as_deref() != Some(site.as_str()) {
-            meta.browser_last_site = Some(site);
-            meta.browser_threads_updated_at_ms = Some(now_ms());
-            let _ = write_browser_session_meta_to_dir(&date_dir, &session_id, &meta);
-        }
+        // M-STORE-1: read-modify-write under the process-wide meta lock.
+        let meta = update_browser_session_meta(&date_dir, &session_id, |meta| {
+            if meta.browser_last_site.as_deref() != Some(site.as_str()) {
+                meta.browser_last_site = Some(site.clone());
+                meta.browser_threads_updated_at_ms = Some(now_ms());
+            }
+            Ok(())
+        })?;
         return Ok(meta);
     }
 
@@ -904,6 +927,24 @@ async fn restore_browser_for_session(
 /// Returns `Ok(true)` if Chrome was freshly spawned (caller should wait ~2 s for the debug
 /// port to open), `Ok(false)` if it was already running, or `Err` if not found.
 ///
+/// Static Chrome flags for Kim's CDP launch.
+///
+/// F-I-4: `--remote-debugging-address=127.0.0.1` pins the (unauthenticated)
+/// DevTools port to the loopback interface so it can never bind `0.0.0.0` and
+/// expose the logged-in provider profile to the LAN. The port itself is still
+/// 9222 by default; moving it to a random port and coordinating the Python
+/// connect side is Team B's provider half (handoff below).
+fn cdp_static_flags() -> [&'static str; 3] {
+    [
+        // Loopback-only bind for the CDP endpoint (F-I-4).
+        "--remote-debugging-address=127.0.0.1",
+        "--no-first-run",
+        "--no-default-browser-check",
+        // --disable-popup-blocking intentionally NOT set: it weakens browser
+        // security (#3).
+    ]
+}
+
 /// NOTE: this function must only be called from a blocking context (e.g. inside
 /// `tokio::task::spawn_blocking`) because `TcpStream::connect` and `fs` calls are
 /// synchronous.  Do NOT call it directly from an async Tokio task.
@@ -953,18 +994,27 @@ fn launch_chrome_for_cdp(project_root: &Path) -> Result<bool, String> {
         let user_data_arg = format!("--user-data-dir={}", user_data_str);
         let cdp_port_arg = format!("--remote-debugging-port={cdp_port}");
         let result = StdCommand::new(chrome)
-            .args([
-                user_data_arg.as_str(),
-                cdp_port_arg.as_str(),
-                "--no-first-run",
-                "--no-default-browser-check",
-                // --disable-popup-blocking removed: weakens browser security (#3).
-            ])
+            .arg(user_data_arg.as_str())
+            .arg(cdp_port_arg.as_str())
+            .args(cdp_static_flags())
             .spawn();
         if let Ok(child) = result {
             // Store the child handle so it can be killed on app exit (#8).
             // Without this, Chrome processes accumulate as zombies.
             if let Ok(mut guard) = CDP_CHROME_CHILD.get_or_init(|| StdMutex::new(None)).lock() {
+                // M-PROC-4: reap any previous child before overwriting the
+                // slot. Dropping a Child without kill()+wait() leaves either
+                // an orphaned live Chrome or a zombie for the app's lifetime
+                // (e.g. when the first spawn never opened the debug port).
+                if let Some(mut old) = guard.take() {
+                    match old.try_wait() {
+                        Ok(Some(_)) => {} // already exited and now reaped
+                        _ => {
+                            let _ = old.kill();
+                            let _ = old.wait();
+                        }
+                    }
+                }
                 *guard = Some(child);
             }
             // Caller is responsible for the post-launch wait so it can use
@@ -981,6 +1031,9 @@ pub(crate) fn kill_cdp_chrome() {
         if let Ok(mut child_opt) = guard.lock() {
             if let Some(mut child) = child_opt.take() {
                 let _ = child.kill();
+                // M-PROC-4: reap after kill so the process doesn't linger as
+                // a zombie until our own exit.
+                let _ = child.wait();
             }
         }
     }
@@ -1035,174 +1088,14 @@ fn ollama_openai_base_url(base_url: Option<&str>) -> String {
     }
 }
 
-pub(crate) async fn selected_ollama_codex_model(
-    mode: Option<&str>,
-    base_url: Option<&str>,
-    local_model: Option<&str>,
-    cloud_model: Option<&str>,
-    config: &config::AppConfig,
-) -> Result<String, String> {
-    let mode = mode.unwrap_or("cloud").trim().to_ascii_lowercase();
-    if mode == "local" {
-        let model = local_model.unwrap_or("").trim();
-        if !model.is_empty() {
-            return Ok(model.to_string());
-        }
-        let base = base_url
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("http://localhost:11434");
-        if let Ok(models) = ollama_tags(base).await {
-            if let Some(first) = models
-                .first()
-                .map(|m| m.name.trim())
-                .filter(|m| !m.is_empty())
-            {
-                return Ok(first.to_string());
-            }
-        }
-        return Err(
-            "Pick or pull an Ollama local model before running Codex with Ollama Local."
-                .to_string(),
-        );
-    }
-    let fallback = config
-        .default_model
-        .get("ollama")
-        .map(|s| s.as_str())
-        .unwrap_or("gpt-oss:120b-cloud");
-    Ok(cloud_model
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(fallback)
-        .to_string())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn configure_codex_direct_provider(
-    cmd: &mut tokio::process::Command,
-    provider_arg: &str,
-    kim_root: &Path,
-    ollama_base_url: Option<&str>,
-    ollama_mode: Option<&str>,
-    ollama_local_model: Option<&str>,
-    ollama_cloud_model: Option<&str>,
-    config: &config::AppConfig,
-) -> Result<String, String> {
-    let provider = provider_arg.trim().to_ascii_lowercase();
-    match provider.as_str() {
-        "ollama" => {
-            let model = selected_ollama_codex_model(
-                ollama_mode,
-                ollama_base_url,
-                ollama_local_model,
-                ollama_cloud_model,
-                config,
-            )
-            .await?;
-            cmd.arg("--model")
-                .arg(&model)
-                .env("OPENAI_BASE_URL", ollama_openai_base_url(ollama_base_url))
-                // Required by OpenAI-compatible clients; ignored by Ollama.
-                .env("OPENAI_API_KEY", "ollama");
-            Ok(format!("Ollama via local daemon ({model})"))
-        }
-        "openai" => {
-            let key = read_env_file_var(kim_root, "OPENAI_API_KEY").ok_or_else(|| {
-                "Codex with OpenAI needs OPENAI_API_KEY in the environment or Kim's .env."
-                    .to_string()
-            })?;
-            let fallback = config
-                .default_model
-                .get("openai")
-                .map(|s| s.as_str())
-                .unwrap_or("openai/gpt-4o");
-            let model = read_first_env_file_var(kim_root, &["CODEX_OPENAI_MODEL", "OPENAI_MODEL"])
-                .unwrap_or_else(|| fallback.to_string());
-            cmd.arg("--model").arg(&model).env("OPENAI_API_KEY", key);
-            if let Some(base) = read_env_file_var(kim_root, "OPENAI_BASE_URL") {
-                cmd.env("OPENAI_BASE_URL", base);
-            }
-            Ok(format!("OpenAI-compatible API ({model})"))
-        }
-        "deepseek" => {
-            let key = read_env_file_var(kim_root, "DEEPSEEK_API_KEY").ok_or_else(|| {
-                "Codex with DeepSeek needs DEEPSEEK_API_KEY in the environment or Kim's .env."
-                    .to_string()
-            })?;
-            let fallback = config
-                .default_model
-                .get("deepseek")
-                .map(|s| s.as_str())
-                .unwrap_or("deepseek-chat");
-            let model =
-                read_first_env_file_var(kim_root, &["CODEX_DEEPSEEK_MODEL", "DEEPSEEK_MODEL"])
-                    .unwrap_or_else(|| fallback.to_string());
-            let base = read_env_file_var(kim_root, "DEEPSEEK_BASE_URL")
-                .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
-            cmd.arg("--model")
-                .arg(&model)
-                .env("OPENAI_API_KEY", key)
-                .env("OPENAI_BASE_URL", base);
-            Ok(format!("DeepSeek API ({model})"))
-        }
-        "gemini" => {
-            let key = read_env_file_var(kim_root, "GOOGLE_API_KEY")
-                .ok_or_else(|| "Codex with Gemini direct API needs GOOGLE_API_KEY in the environment or Kim's .env. Kim's Google OAuth token is only wired into the Chat provider path.".to_string())?;
-            let fallback = config
-                .default_model
-                .get("gemini")
-                .map(|s| s.as_str())
-                .unwrap_or("gemini-2.0-flash");
-            let model = read_first_env_file_var(kim_root, &["CODEX_GEMINI_MODEL", "GEMINI_MODEL"])
-                .unwrap_or_else(|| fallback.to_string());
-            let base = read_env_file_var(kim_root, "GEMINI_OPENAI_BASE_URL").unwrap_or_else(|| {
-                "https://generativelanguage.googleapis.com/v1beta/openai".to_string()
-            });
-            cmd.arg("--model")
-                .arg(&model)
-                .env("OPENAI_API_KEY", key)
-                .env("OPENAI_BASE_URL", base);
-            Ok(format!("Gemini OpenAI-compatible API ({model})"))
-        }
-        _ => {
-            let key = read_first_env_file_var(kim_root, &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"])
-                .ok_or_else(|| "Codex needs an Anthropic API key for Claude direct mode. Add ANTHROPIC_API_KEY to Kim's .env, or switch the provider dropdown to Ollama/Browser.".to_string())?;
-            cmd.env("ANTHROPIC_API_KEY", key);
-            for key in [
-                "ANTHROPIC_BASE_URL",
-                "ANTHROPIC_AUTH_TOKEN",
-                "CODEX_MODEL",
-                "CLAUDE_MODEL",
-                "ANTHROPIC_MODEL",
-            ] {
-                if let Some(value) = read_env_file_var(kim_root, key) {
-                    cmd.env(key, value);
-                }
-            }
-            Ok("Claude direct API".to_string())
-        }
-    }
-}
-
+pub(crate) mod hitl;
+pub(crate) use hitl::hitl_respond_approval;
+pub(crate) use hitl::respond_approval_decision;
+pub(crate) use hitl::respond_user_input;
 pub(crate) mod subprocess;
 pub(crate) use subprocess::{
-    cancel_task, find_python_interpreter, hitl_respond_approval, process_exists, send_signal,
-    send_task, steer_task,
+    cancel_task, find_python_interpreter, process_exists, send_task, steer_task,
 };
-
-// ---------------------------------------------------------------------------
-// Voice config (config.yaml — voice:/enabled, voice:/engine, voice:/voice_id)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Phone relay (config.yaml `relay:` block + RELAY_PC_API_KEY env var)
-// ---------------------------------------------------------------------------
-//
-// The PC reads `relay.url` from config.yaml so the user can point Kim at a
-// different relay (self-hosted, staging, etc.) without rebuilding. The PC
-// authenticates to the relay with `RELAY_PC_API_KEY` — which we keep in the
-// .env file rather than the YAML so it doesn't end up in screenshots.
 
 // ---------------------------------------------------------------------------
 // Account — ~/.config/kim/account.json (platform-native config dir)
@@ -1225,7 +1118,6 @@ pub fn run() {
     // #23: repair the minimal launchd PATH before anything shells out —
     // packaged GUI launches otherwise can't find ollama/git/etc.
     env_path::fix_gui_path();
-    let task_state: TaskState = Arc::new(Mutex::new(RunningTask::default()));
     let schedule_timer_state = schedule_commands::new_schedule_timer_state();
     let config_path = config_yaml_path(None);
     let config = config::load_config(&config_path);
@@ -1271,9 +1163,12 @@ pub fn run() {
             start_bridge_file_watcher(app.handle().clone());
             // D6: start the 60s in-app scheduler tick loop.
             scheduler::start_scheduler(app.handle().clone());
+            // AUDIT FIX #3: periodic sweep evicting orphaned bridge
+            // result/progress entries left behind when a caller dies before
+            // polling /v1/result.
+            browser_bridge::start_bridge_gc_sweeper(app.handle().clone());
             Ok(())
         })
-        .manage(task_state)
         .manage(schedule_timer_state)
         .manage(config)
         .invoke_handler(tauri::generate_handler![
@@ -1286,11 +1181,9 @@ pub fn run() {
             session_commands::reveal_logs,
             session_commands::set_privacy_pause,
             session_commands::get_privacy_pause,
-            session_commands::delete_session,
             run_history::get_platform_info,
             run_history::run_update,
             browser_bridge::open_browser_signin_window,
-            session_browser_meta_read,
             session_browser_meta_write,
             session_browser_url_commit,
             restore_browser_for_session,
@@ -1303,20 +1196,15 @@ pub fn run() {
             send_task,
             cancel_task,
             hitl_respond_approval,
+            respond_approval_decision,
+            respond_user_input,
             steer_task,
-            voice_config::read_voice_config,
-            voice_config::write_voice_config,
-            relay::read_relay_config,
-            relay::write_relay_url,
-            relay::relay_pair_init,
-            relay::relay_pair_status,
             google_oauth::google_oauth_status,
             google_oauth::google_oauth_start,
             google_oauth::google_oauth_disconnect,
             google_oauth::google_oauth_test,
             account::load_account,
             account::save_account,
-            account::clear_account,
             account::reset_onboarding,
             account::delete_all_sessions,
             secrets::store_github_token,
@@ -1339,7 +1227,6 @@ pub fn run() {
             schedule_commands::add_scheduled_task,
             schedule_commands::update_scheduled_task,
             schedule_commands::delete_scheduled_task,
-            schedule_commands::list_due_scheduled_tasks,
             schedule_commands::run_due_scheduled_task,
             schedule_commands::start_schedule_timer,
             schedule_commands::stop_schedule_timer,
@@ -1359,6 +1246,19 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdp_launch_flags_pin_loopback_bind() {
+        // F-I-4: the CDP DevTools port is unauthenticated — the launch must
+        // pin it to the loopback interface so it cannot bind 0.0.0.0.
+        let flags = cdp_static_flags();
+        assert!(
+            flags.contains(&"--remote-debugging-address=127.0.0.1"),
+            "CDP launch must bind the debug port to loopback only"
+        );
+        // The popup-blocking weakener stays OFF (#3).
+        assert!(!flags.iter().any(|f| f.contains("disable-popup-blocking")));
+    }
 
     // Helper: write lines to a temp file using O_EXCL-safe NamedTempFile (#23).
     // subsec_nanos() was guessable and racy — tempfile guarantees uniqueness + 0600 mode.

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { confirm } from '@tauri-apps/plugin-dialog';
 import type { KimAccount, GoogleAccount, GoogleApiAccount } from '../../../types';
 import { toast } from '../../Toast';
 import { SectionLabel, Row } from './primitives';
@@ -120,6 +121,10 @@ function PaneAccount({
         google_active_account,
       });
       if (successMessage) toast(successMessage, 'success', 2500);
+    } catch (err) {
+      // M11: was try/finally only — a save failure surfaced as an unhandled
+      // rejection with no user feedback.
+      toast(`Could not save Google accounts: ${String(err)}`, 'error', 4000);
     } finally {
       setSaving(false);
     }
@@ -221,22 +226,43 @@ function PaneAccount({
     }
   }
 
+  // M11: these three used the synchronous browser `confirm()` — Tauri webviews
+  // can return falsy from it, silently no-oping destructive actions. Use the
+  // async plugin-dialog confirm (same as RevampSidebar's remove-project flow).
   async function disconnectGitHub() {
-    if (!confirm('Disconnect GitHub? Gist sync will stop working.')) return;
-    // Remove PAT from OS keychain.
-    await invoke('delete_github_token').catch(() => {});
-    await onAccountChange({
-      ...account,
-      github_token: undefined,
-      github_username: undefined,
-      github_avatar_url: undefined,
-      gist_id: undefined,
+    const ok = await confirm('Disconnect GitHub? Gist sync will stop working.', {
+      title: 'Disconnect GitHub?',
+      kind: 'warning',
     });
-    toast('GitHub disconnected', 'success', 2000);
+    if (!ok) return;
+    try {
+      // M11: save the account state FIRST, then remove the PAT from the
+      // keychain. The old order wiped the keychain before an unguarded save —
+      // a save failure left the token gone while account.json still said
+      // "connected" (plus an unhandled rejection).
+      await onAccountChange({
+        ...account,
+        github_token: undefined,
+        github_username: undefined,
+        github_avatar_url: undefined,
+        gist_id: undefined,
+      });
+      // F-F-10: do NOT swallow this rejection. If the token can't be removed
+      // from the keychain, the UI must not falsely report "disconnected" while
+      // the credential persists on disk — let it propagate to the catch below.
+      await invoke('delete_github_token');
+      toast('GitHub disconnected', 'success', 2000);
+    } catch (err) {
+      toast(`Could not disconnect GitHub: ${String(err)}`, 'error', 4000);
+    }
   }
 
   async function resetOnboarding() {
-    if (!confirm('Reset onboarding? Kim will forget your account and re-run the welcome flow next launch.')) return;
+    const ok = await confirm(
+      'Reset onboarding? Kim will forget your account and re-run the welcome flow next launch.',
+      { title: 'Reset onboarding?', kind: 'warning' },
+    );
+    if (!ok) return;
     try {
       await invoke('reset_onboarding');
       toast('Onboarding reset — restart Kim to see the welcome flow.', 'success', 4000);
@@ -246,7 +272,11 @@ function PaneAccount({
   }
 
   async function deleteAllSessions() {
-    if (!confirm('Permanently delete ALL local session files? This cannot be undone.')) return;
+    const ok = await confirm('Permanently delete ALL local session files? This cannot be undone.', {
+      title: 'Delete all sessions?',
+      kind: 'warning',
+    });
+    if (!ok) return;
     try {
       await invoke('delete_all_sessions');
       toast('All sessions deleted.', 'success', 3000);

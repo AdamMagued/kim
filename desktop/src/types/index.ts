@@ -52,6 +52,12 @@ export interface ToolResultBlock {
   type: 'tool_result';
   tool_use_id: string;
   content: string | ContentBlock[];
+  // F-F-9: the runtime session JSONL (Python/Rust) also serializes tool results
+  // with an `output` string on some paths (codex/app-server transcripts). The
+  // frontend reads it in extractTouchedFiles / synthesizeActivityFromMessages;
+  // model it here so those reads are type-checked instead of hidden behind
+  // `as unknown as { output }` casts that would silently rot on a backend rename.
+  output?: string;
 }
 
 export interface ImageBlock {
@@ -100,11 +106,10 @@ export interface KimAccount {
   display_name: string;
   github_username?: string;
   /**
-   * @security Known limitation: this token is stored in plaintext in the local
-   * account JSON file. Migrating it to the OS keychain requires new Rust
-   * `keychain_store` / `keychain_load` commands (outside the React layer).
-   * Do not log or transmit this value. See PRODUCTION_ROADMAP.md for the
-   * keychain migration task.
+   * @security In-memory only. The PAT is persisted to the OS keychain via the
+   * `store_github_token` Rust command, and `save_account` strips this field
+   * before writing account.json — it never touches disk in plaintext (see
+   * OnboardingFlow/PaneAccount). Do not log or transmit this value.
    */
   github_token?: string;
   github_avatar_url?: string;

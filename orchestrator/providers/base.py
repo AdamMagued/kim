@@ -19,26 +19,99 @@ Return value (see ProviderResponse below):
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Literal, TypedDict, Union
+from typing import Any, Literal, Optional, TypedDict, Union
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Stop / finish reason handling (finding 3.1)
+# ---------------------------------------------------------------------------
+# Providers historically returned only the completion text and dropped the
+# stop/finish reason, so a max_tokens-truncated answer was presented as a
+# complete one and a safety-blocked reply came back as a silent empty string.
+# finalize_text_content() annotates the terminal text with an honest note so
+# neither failure masquerades as a finished answer. Reasons are matched
+# case-insensitively to cover Anthropic ("max_tokens"), OpenAI ("length",
+# "content_filter") and Gemini ("MAX_TOKENS", "SAFETY", …) vocabularies.
+
+_TRUNCATION_STOP_REASONS = frozenset({"max_tokens", "length", "model_length", "max_output_tokens"})
+_BLOCK_STOP_REASONS = frozenset({
+    "content_filter", "safety", "recitation", "refusal",
+    "prohibited_content", "blocklist", "spii", "other",
+})
+
+_TRUNCATION_NOTE = (
+    "[Response truncated: the model hit its output-token limit before "
+    "finishing. Ask for a shorter answer or raise max_tokens.]"
+)
+
+
+def malformed_tool_args_text(tool_name: str) -> str:
+    """Re-emit nudge for a tool call whose arguments were not valid JSON (F-INH-3).
+
+    The providers used to coerce unparseable arguments to ``{}`` and dispatch
+    the tool anyway — for an all-optional schema that silently runs with
+    defaults and the model gets no signal. Returning this as the assistant text
+    turn (instead of a tool_call) surfaces the failure so the model re-emits a
+    valid call on the next turn.
+    """
+    name = tool_name or "the requested"
+    return (
+        f"[Kim: the arguments for the `{name}` tool were not valid JSON, so the "
+        f"call was not run. Re-issue the `{name}` call with a single valid JSON "
+        "object as its arguments.]"
+    )
+
+
+def finalize_text_content(content: str, stop_reason: Optional[str]) -> str:
+    """Annotate terminal completion text based on why generation stopped.
+
+    - Truncation (max_tokens/length): append a note so a clipped answer is not
+      mistaken for a complete one. When nothing was produced, the note stands
+      in for the empty string.
+    - Block/refusal (content_filter/safety/…): when the model produced no text,
+      return an explanatory line instead of a blank reply.
+    Normal stops ("stop", "end_turn", "tool_use", None) pass through unchanged.
+    """
+    content = content or ""
+    reason = (stop_reason or "").strip().lower()
+    if reason in _TRUNCATION_STOP_REASONS:
+        return f"{content}\n\n{_TRUNCATION_NOTE}" if content.strip() else _TRUNCATION_NOTE
+    if reason in _BLOCK_STOP_REASONS and not content.strip():
+        return (
+            f"[No answer produced: the model stopped for reason "
+            f"'{stop_reason}' (typically a safety block or filtered content).]"
+        )
+    return content
 
 
 # ---------------------------------------------------------------------------
 # Typed contracts — providers return one of these; agent consumes typed fields
 # ---------------------------------------------------------------------------
 
-class ToolCallResponse(TypedDict):
-    """Provider response requesting a tool call."""
-    type: Literal["tool_call"]
-    tool: str
-    args: dict[str, Any]
+class ToolCallResponse(TypedDict, total=False):
+    """Provider response requesting a tool call.
+
+    `type`, `tool`, and `args` are always present. `content`, `stop_reason`,
+    and `usage` are attached by the providers that have them and consumed by
+    the agent loop, so they are part of the real contract even though they were
+    historically undeclared (F-B-14). `total=False` lets a provider omit the
+    optional fields; the three required keys are noted inline.
+    """
+    type: Literal["tool_call"]  # required
+    tool: str                   # required
+    args: dict[str, Any]        # required
+    content: str                # optional — narration (PLAN/STEP) preceding the call
+    stop_reason: Optional[str]  # optional — API providers report why generation stopped
+    usage: dict[str, Any]       # optional — token counts (ollama uses extended keys)
 
 
 class TextResponse(TypedDict, total=False):
     """Provider response with a text completion."""
     type: Literal["text"]       # required
     content: str                # required
+    stop_reason: Optional[str]  # optional — why generation stopped (max_tokens/safety/…)
     usage: dict[str, Any]       # optional — token counts from the provider
 
 
@@ -79,6 +152,18 @@ class ProviderError(Exception):
         super().__init__(self.message)
 
 
+class ProviderEnvironmentError(EnvironmentError):
+    """A provider-environment problem the user must fix (daemon not running,
+    model not installed/pulled, nothing configured).
+
+    Subclasses EnvironmentError so existing ``except EnvironmentError``
+    call sites keep working, but classify_provider_error() can distinguish it
+    from a transient OSError: retrying a stopped daemon or a missing model
+    five times under a false "rate limited" banner only hides the actionable
+    message (H1).
+    """
+
+
 def classify_provider_error(error: Exception) -> ProviderError:
     """Classify provider exceptions without requiring every provider to wrap them.
 
@@ -89,7 +174,22 @@ def classify_provider_error(error: Exception) -> ProviderError:
     if isinstance(error, ProviderError):
         return error
 
+    # Environment problems (daemon stopped, model not installed) need the user
+    # to act — never retryable, and checked before every message heuristic so
+    # wording like "not running" can't be mistaken for a transient failure.
+    if isinstance(error, ProviderEnvironmentError):
+        return ProviderError("environment", str(error), retryable=False)
+
+    import json as _json_provider_error
     import re as _re_provider_error
+
+    # A JSONDecodeError is a ValueError subclass, so without this it falls into
+    # the invalid_request branch below and is marked non-retryable — but it
+    # almost always means a truncated or proxy-garbled response body (e.g.
+    # Gemini's REST transport doing json.loads on a mangled 200), which is a
+    # transient network failure worth retrying (finding 3.4).
+    if isinstance(error, _json_provider_error.JSONDecodeError):
+        return ProviderError("network", str(error), retryable=True)
 
     message = str(error)
     lowered = message.lower()
@@ -127,7 +227,9 @@ def classify_provider_error(error: Exception) -> ProviderError:
 
     if "rate" in lowered and "limit" in lowered:
         return ProviderError("rate_limit", message, retryable=True)
-    if "429" in lowered or "ratelimit" in error_type:
+    # Digit-bounded like the 400/5xx checks — a bare "429" substring would
+    # also match e.g. "error 14290" (L4).
+    if _re_provider_error.search(r"(?<!\d)429(?!\d)", lowered) or "ratelimit" in error_type:
         return ProviderError("rate_limit", message, retryable=True)
 
     for code in ("500", "502", "503", "529"):
@@ -138,7 +240,18 @@ def classify_provider_error(error: Exception) -> ProviderError:
     if "overloaded" in lowered:
         return ProviderError("server_error", message, retryable=True)
 
-    if isinstance(error, TimeoutError) or "timeout" in lowered:
+    # F-B-5: httpx's transport timeouts (ReadTimeout/ConnectTimeout/PoolTimeout/
+    # TimeoutException) are NOT builtin TimeoutError, and their str() is often
+    # empty or the phrase "timed out" — which does not contain the substring
+    # "timeout". Match the exception class name ("...timeout...") and the
+    # "timed out" wording so a mid-generation transport timeout (Ollama's most
+    # common transient failure) is retried instead of dying as "unknown".
+    if (
+        isinstance(error, TimeoutError)
+        or "timeout" in lowered
+        or "timed out" in lowered
+        or "timeout" in error_type
+    ):
         return ProviderError("timeout", message, retryable=True)
     if isinstance(error, (ConnectionError, OSError)) or "connection" in lowered:
         return ProviderError("network", message, retryable=True)

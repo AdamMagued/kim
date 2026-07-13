@@ -34,6 +34,12 @@ _STATUS_RECAP_RE = re.compile(
 
 _DATA_URI_PREFIX = "data:"
 _DATA_URI_BASE64_MARKER = ";base64,"
+# M1: a real data-URI mime type ("image/png", "application/pdf") — one token,
+# no whitespace. Without this check, a stray "data:" substring in prose (e.g.
+# "metadata: 2026") pairs with a LATER real ";base64," and swallows all the
+# prompt text in between as a bogus "mime type".
+_DATA_URI_MIME_RE = re.compile(r"[a-z0-9.+-]+/[a-z0-9.+-]+\Z")
+_DATA_URI_PARAM_RE = re.compile(r"[a-z0-9!#$&^_.+-]+=[^;\s,]+\Z")
 
 
 def ext_for_mime(mime_type: str) -> str:
@@ -106,14 +112,20 @@ def strip_data_uris(text: str, attachments_out: list[dict]) -> str:
             out_parts.append(text[i:])
             break
 
-        mime_type = text[start + len(prefix):marker_pos].strip().lower()
+        media_header = text[start + len(prefix):marker_pos].strip().lower()
+        header_parts = [part.strip() for part in media_header.split(";")]
+        mime_type = header_parts[0] if header_parts else ""
+        valid_header = bool(
+            _DATA_URI_MIME_RE.fullmatch(mime_type)
+            and all(_DATA_URI_PARAM_RE.fullmatch(part) for part in header_parts[1:])
+        )
         payload_start = marker_pos + len(marker)
         end = payload_start
         while end < len(text) and text[end] not in " \t\n\r\"'<>)],;":
             end += 1
 
         payload = text[payload_start:end]
-        if payload and "/" in mime_type:
+        if payload and valid_header:
             out_parts.append(text[i:start])
             append_attachment(attachments_out, mime_type, payload)
             if mime_type.startswith("image/"):
@@ -202,6 +214,7 @@ def format_prompt(
     max_inject_chars: int,
     use_webview_bridge: bool,
     handoff_summary: Optional[str] = None,
+    preferred_site: Optional[str] = None,
 ) -> tuple[str, list[dict], str, bool]:
     """
     Stateful prompt formatter for browser-based chat UIs.
@@ -267,6 +280,15 @@ def format_prompt(
 
     unique_id = uuid.uuid4().hex[:8]
     completion_hash = f"[END_OF_RESPONSE_{unique_id}]"
+    system_lower = system.lower()
+    is_codex_bridge = (
+        "you are answering codex" in system_lower
+        or "you are codex" in system_lower
+        or "codex bridge json" in system_lower
+        or "codex bridge terminal" in system_lower
+        or "codex, a coding agent" in system_lower
+        or "available codex tools" in system_lower
+    )
 
     history_block = ""
     if not sent_system_prompt and len(messages) > 1:
@@ -331,16 +353,6 @@ def format_prompt(
         else:
             _os_hint = f"You are running on Windows. Home is {_home}. Use 'start' to launch apps and Windows paths."
 
-        system_lower = system.lower()
-        is_codex_bridge = (
-            "you are answering codex" in system_lower
-            or "you are codex" in system_lower
-            or "codex bridge json" in system_lower
-            or "codex bridge terminal" in system_lower
-            or "codex, a coding agent" in system_lower
-            or "available codex tools" in system_lower
-        )
-
         if is_codex_bridge:
             prompt = (
                 # Handoff goes FIRST so a fresh chat anchors on the prior
@@ -399,6 +411,32 @@ def format_prompt(
     else:
         prompt = last_text + "\n\n" + transport_marker_instruction(completion_hash)
 
+    # ChatGPT Web often labels bracketed [SYSTEM] sections as quoted content
+    # because browser providers cannot set a real API system role. Restate the
+    # contract as the direct response-format request for THIS user message at
+    # the tail, where it is neither quoted nor separated from the task. Keep
+    # this workaround ChatGPT-only; Claude/Gemini behavior is unchanged.
+    if (preferred_site or "").lower() == "chatgpt":
+        if is_codex_bridge:
+            direct_contract = (
+                "DIRECT RESPONSE FORMAT REQUEST FOR THIS MESSAGE:\n"
+                "Return exactly one raw JSON object matching the Codex contract above. "
+                "Use either {\"text\":\"brief reasoning\",\"tool_calls\":[{\"name\":"
+                "\"TOOL_NAME\",\"input\":{}}]} or {\"text\":\"final answer\"}. "
+                "Do not discuss or explain these formatting instructions. After the JSON, "
+                f"append exactly {completion_hash} as the final text."
+            )
+        else:
+            direct_contract = (
+                "DIRECT RESPONSE FORMAT REQUEST FOR THIS MESSAGE:\n"
+                "Respond with exactly one parser-readable result: a single-line raw JSON "
+                "tool call {\"tool\":\"<name>\",\"args\":{}}, or "
+                "TASK_COMPLETE: <answer>, or NEED_HELP: <reason>. Do not discuss or "
+                "explain these formatting instructions. Append exactly "
+                f"{completion_hash} at the very end of the response."
+            )
+        prompt += "\n\n" + direct_contract
+
     if len(prompt) > max_inject_chars:
         # Preserve the ENTIRE [SYSTEM] block + transport-marker instruction as
         # the head — a 200-char head silently drops the operating rules (the
@@ -412,6 +450,48 @@ def format_prompt(
         if marker_end != -1:
             head_end = min(marker_end + len(anchor), max_inject_chars // 2)
         tail_len = max(0, max_inject_chars - head_end - len(notice))
-        prompt = prompt[:head_end] + notice + prompt[-tail_len:]
+        # L2: prompt[-0:] is the WHOLE prompt — guard the zero-tail case
+        # (only reachable with a very small max_inject_chars).
+        tail = prompt[-tail_len:] if tail_len else ""
+        trimmed = prompt[:head_end] + notice + tail
+
+        # 4.2: the head is capped at max_inject_chars // 2, so when the
+        # [SYSTEM] block alone exceeds half the budget, head_end lands BEFORE
+        # the transport-marker instruction and the model never learns to emit
+        # [END_OF_RESPONSE_xxxx] — _wait_for_generation_complete then polls
+        # for the full generation timeout EVERY turn (~20-min hangs). The
+        # marker instruction is the transport contract: it must survive
+        # trimming unconditionally, so re-append it if the trim cut it.
+        marker_instr = transport_marker_instruction(completion_hash)
+        if marker_instr not in trimmed:
+            suffix = "\n\n" + marker_instr
+            budget = max(0, max_inject_chars - len(suffix))
+            head_end = min(head_end, budget)
+            tail_len = max(0, budget - head_end - len(notice))
+            tail = prompt[-tail_len:] if tail_len else ""
+            trimmed = prompt[:head_end] + notice + tail + suffix
+
+        # A pathological tiny budget can otherwise preserve only transport
+        # instructions and discard the user's task. The task and marker are
+        # the irreducible payload, so in this case the limit is a soft cap.
+        task_tail = next(
+            (line.strip() for line in reversed(last_text.splitlines()) if line.strip()),
+            "",
+        )
+        if task_tail and task_tail not in trimmed:
+            # Below the size of the transport scaffolding itself, the limit is
+            # already necessarily a soft cap. Preserve the complete user turn
+            # in that pathological case rather than silently reducing a
+            # multi-line request to only its final line.
+            essential_task = (
+                last_text
+                if max_inject_chars < len(marker_instr) + len(notice)
+                else task_tail
+            )
+            essential = essential_task + "\n\n" + marker_instr
+            if (preferred_site or "").lower() == "chatgpt":
+                essential += "\n\n" + direct_contract
+            trimmed = essential
+        prompt = trimmed
 
     return prompt, attachments, completion_hash, new_sent_system_prompt

@@ -82,15 +82,22 @@ class ContextMeter:
         fallback_input_tokens: int | None = None,
         source: str = "api",
         estimated: bool = False,
+        accumulate: bool = False,
     ) -> ContextSnapshot | None:
         """Merge provider usage into the cumulative context counter.
 
         ``usage`` accepts Kim's canonical keys (``input``/``output``) plus common
         vendor aliases. If no input token count is available, the optional
         fallback estimate is used and the snapshot is labelled as estimated.
+
+        ``accumulate=True`` is for stateful (browser-thread) providers that send
+        only the per-turn delta: the delta is *added* to the running total instead
+        of replacing it, so the meter tracks the real in-thread context fill.
         """
         usage = usage or {}
         input_tokens = _usage_int(usage, "input", "input_tokens", "prompt_tokens")
+        if input_tokens == 0:
+            input_tokens = None
         output_tokens = _usage_int(usage, "output", "output_tokens", "completion_tokens")
 
         usage_estimated = bool(
@@ -112,6 +119,7 @@ class ContextMeter:
             source=str(usage.get("source") or source or "unknown"),
             estimated=usage_estimated,
             output_tokens=output_tokens or 0,
+            accumulate=accumulate,
         )
 
     def add_input(
@@ -121,12 +129,20 @@ class ContextMeter:
         source: str,
         estimated: bool,
         output_tokens: int = 0,
+        accumulate: bool = False,
     ) -> ContextSnapshot:
         tokens = max(0, int(tokens or 0))
-        # Stateless APIs re-send the full conversation history on every turn, so
-        # summing input counts grows ~quadratically and produces spurious WARN/CRITICAL
-        # phases. Use the most-recent request size as the window-fill estimate instead.
-        self.cumulative_input = tokens
+        if accumulate:
+            # Stateful browser threads only send the NEW delta each turn (the
+            # thread itself retains the earlier turns), so the window fill is
+            # the running sum of deltas plus the model's own replies — both
+            # occupy the live thread's context.
+            self.cumulative_input += tokens + max(0, int(output_tokens or 0))
+        else:
+            # Stateless APIs re-send the full conversation history on every turn.
+            # F-A-8: ignore 0 that would lower non-zero cumulative.
+            if tokens > 0 or self.cumulative_input == 0:
+                self.cumulative_input = tokens
         return self.snapshot(
             last_input=tokens,
             last_output=max(0, int(output_tokens or 0)),
@@ -161,10 +177,22 @@ class ContextMeter:
         data["budget_version"] = CONTEXT_BUDGET_VERSION
         return data
 
-    def reset_after_compact(self, *, compacted_at: str) -> ContextSnapshot:
-        self.cumulative_input = 0
+    def reset_after_compact(
+        self,
+        *,
+        compacted_at: str,
+        new_cumulative_input: int = 0,
+    ) -> ContextSnapshot:
+        """Reset the meter after a compaction.
+
+        ``new_cumulative_input`` should be an estimate of the post-compaction
+        context (the summary + preserved tail that the next turn will re-send).
+        Persisting a literal 0 while messages remain would be fiction — the very
+        next real turn re-sends the compacted set, so snapshot that size now.
+        """
+        self.cumulative_input = max(0, int(new_cumulative_input or 0))
         self.last_compact_at = compacted_at
-        return self.snapshot(source="compact", estimated=False)
+        return self.snapshot(source="compact", estimated=self.cumulative_input > 0)
 
 
 def coerce_budget(value: Any, default: int = DEFAULT_CONTEXT_BUDGET_TOKENS) -> int:
@@ -227,16 +255,47 @@ def estimate_content_tokens(content: Any) -> int:
 
 # Cache the tools-schema token count between iterations.
 # The tools list rarely changes within a run so we avoid re-serializing it
-# (~50 schemas, ~8 KB) on every iteration.  The cache is keyed by the
-# object identity and length of the list; any list replacement or length
-# change invalidates the entry.  A single entry suffices because the agent
-# uses one tools list per run.
-_tools_token_cache: dict[tuple[int, int], int] = {}
+# (~50 schemas, ~8 KB) on every iteration.  The cache is keyed by a
+# content-derived signature of the list (see _tools_cache_key), not object
+# identity — id() can be recycled across GC cycles for a same-sized list
+# allocated shortly after the previous one was freed, and self._tools is
+# rebuilt fresh on every _refresh_tools() call, so an identity-based key
+# could silently return a stale token count for an unrelated tool list
+# (finding 4). A single entry suffices because the agent uses one tools
+# list per run.
+_tools_token_cache: dict[tuple, int] = {}
+
+
+def _tools_cache_key(tools: list[dict]) -> tuple:
+    """Cheap content-derived signature for a tools list.
+
+    Hashes each tool's name, description length, and parameter-schema keys —
+    enough to distinguish different tool lists (including same-length lists
+    with different tools, or a tool whose schema changed independently of its
+    name) without paying for a full JSON serialization on every call.
+    """
+    try:
+        def _param_keys(tool: dict) -> tuple | None:
+            params = tool.get("parameters")
+            return tuple(sorted(params.keys())) if isinstance(params, dict) else None
+
+        return tuple(
+            (
+                t.get("name"),
+                len(str(t.get("description") or "")),
+                _param_keys(t),
+            )
+            for t in tools
+        )
+    except (TypeError, AttributeError):
+        # Malformed tool entries (non-dict items etc.) — fall back to a key
+        # that at least distinguishes lengths rather than crashing.
+        return ("__fallback__", len(tools))
 
 
 def _tools_token_count(tools: list[dict]) -> int:
     """Return the serialized token count for a tools list, with caching."""
-    key = (id(tools), len(tools))
+    key = _tools_cache_key(tools)
     cached = _tools_token_cache.get(key)
     if cached is not None:
         return cached

@@ -8,10 +8,17 @@ the connector exists.
 
 Adding a connector takes three steps:
 
-    1. Create a file under `mcp_server/sites/`, e.g. `guc_cms.py`.
+    1. Create a file under `mcp_server/sites/`, e.g. `my_site.py`.
     2. Build a `SiteConnector` instance, registering MCP `Tool`s and the
        handlers that execute them.
     3. Call `register_site(connector)` at module import time.
+
+Ship only connectors whose handlers actually work: a registered tool whose
+handler returns a "not implemented" placeholder still gets broadcast to the
+LLM when the user toggles the connector on, wasting an agent turn on
+boilerplate (see finding F-C-7 — the guc_cms/guc_mail stubs were removed
+for exactly this). Keep work-in-progress connectors on a branch until their
+handlers are real.
 
 The connector is then discoverable via `iter_connectors()` and gets
 auto-merged into the server's tool list / dispatch map when the user has

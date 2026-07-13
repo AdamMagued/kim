@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
+import type { Dispatch, SetStateAction } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { SessionInfo, Settings } from '../types';
 import type { PendingTask } from '../components/chat/types';
@@ -27,9 +28,24 @@ interface UseTaskRunnerProps {
   };
   stream: ReturnType<typeof useChatStream>;
   scroll: ReturnType<typeof useSessionScroll>;
+  // V-audit #1: queuedTasks used to live only in this hook's own useState — a
+  // full ChatView remount (New Chat / session switch) destroyed it, silently
+  // breaking the UI's own promise ("Kim will run it automatically next").
+  // When the caller (App.tsx) lifts this store above the ChatView remount
+  // boundary and passes it down, queued messages survive the remount instead
+  // of vanishing. Optional so this hook still works standalone (tests, or any
+  // future caller that doesn't need cross-mount survival) via a local store.
+  queuedTasksStore?: Record<string, PendingTask[]>;
+  setQueuedTasksStore?: Dispatch<SetStateAction<Record<string, PendingTask[]>>>;
 }
 
 let _taskCounter = 0;
+
+// Stable empty-array reference so `store[key] ?? EMPTY_QUEUE` doesn't create a
+// new array identity on every render when nothing is queued for this key —
+// keeps the drain effect (which depends on `queuedTasks`) from re-running
+// needlessly.
+const EMPTY_QUEUE: PendingTask[] = [];
 
 export function useTaskRunner({
   session,
@@ -42,8 +58,48 @@ export function useTaskRunner({
   browserCommandArgs,
   stream,
   scroll,
+  queuedTasksStore,
+  setQueuedTasksStore,
 }: UseTaskRunnerProps) {
-  const [queuedTasks, setQueuedTasks] = useState<PendingTask[]>([]);
+  // V-audit #1: the bucket a queued message is filed under is frozen at THIS
+  // mount's creation and never recomputed — deliberately NOT derived from
+  // stream.runOwnerSessionIdRef or an activeRunSessionId prop, both of which
+  // change over a run's lifetime (null at mount for a view that doesn't yet
+  // own the run; cleared the instant the run's done handler fires) and would
+  // make a freshly-mounted New Chat view transiently key off a foreign
+  // session's run, or make the drain effect miss its own bucket right after
+  // completion. `session?.session_id ?? conversationId` is exactly what
+  // runPendingTask itself resolves the run's session to (see resolvedSessionId
+  // below), so reads/writes/drain all agree on one bucket for this mount's
+  // entire lifetime.
+  const queueKeyRef = useRef<string>(session?.session_id ?? conversationId);
+
+  const [localQueuedTasksStore, setLocalQueuedTasksStore] = useState<Record<string, PendingTask[]>>({});
+  const store = queuedTasksStore ?? localQueuedTasksStore;
+  const setStore = setQueuedTasksStore ?? setLocalQueuedTasksStore;
+
+  const queuedTasks = store[queueKeyRef.current] ?? EMPTY_QUEUE;
+
+  const setQueuedTasks = useCallback(
+    (updater: PendingTask[] | ((prev: PendingTask[]) => PendingTask[])) => {
+      setStore(prev => {
+        const key = queueKeyRef.current;
+        const prevList = prev[key] ?? EMPTY_QUEUE;
+        const nextList = typeof updater === 'function'
+          ? (updater as (p: PendingTask[]) => PendingTask[])(prevList)
+          : updater;
+        if (nextList === prevList) return prev;
+        if (nextList.length === 0) {
+          if (!(key in prev)) return prev;
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        }
+        return { ...prev, [key]: nextList };
+      });
+    },
+    [setStore]
+  );
 
   const makePendingTask = useCallback(
     (text: string, providerOverride?: string): PendingTask => {
@@ -100,6 +156,10 @@ export function useTaskRunner({
       try {
         const resolvedSessionId =
           stream.completedCodeSessionRef.current?.session_id ?? (session?.session_id || conversationId);
+        // RUN-IDENTITY: capture the session this run belongs to at spawn. Rust
+        // stamps the same id (KIM_SESSION_ID) onto every event; the done handler
+        // files history under THIS owner even if the user has switched views.
+        stream.runOwnerSessionIdRef.current = resolvedSessionId;
         const pendingBrowserSite = browserSiteFromProvider(pending.provider);
         const pendingProvider = pending.provider.trim().toLowerCase();
         if (pendingProvider === 'browser' || pendingProvider.startsWith('browser:')) {
@@ -156,6 +216,11 @@ export function useTaskRunner({
           ollamaCloudModel: settings.ollama.cloud_model || null,
           ollamaContextLimitOverride: settings.ollama.context_limit_override ?? null,
           permissionMode: settings.permission_mode ?? 'full_auto',
+          // D-C3: the "Context budget" setting was a no-op — send_task accepts
+          // context_budget_tokens (forwarded as KIM_CONTEXT_BUDGET_TOKENS to the
+          // context meter) but the frontend never passed it, so every run used
+          // the 200k default. Wire the real value (0/falsy → backend default).
+          contextBudgetTokens: settings.context_budget_tokens || null,
         });
       } catch (err) {
         if (!stream.doneHandledRef.current) {
@@ -200,6 +265,19 @@ export function useTaskRunner({
     const task = makePendingTask(fullText);
 
     if (stream.isRunning) {
+      // D-C1: the "Queue messages while Kim is working" toggle was a no-op —
+      // messages were ALWAYS queued. Honor it: when queuing is disabled, don't
+      // silently swallow the message. Tell the user their options (Steer folds
+      // it into the running task; otherwise wait) instead of pretending it will
+      // run next.
+      if (settings.allow_message_queue === false) {
+        toast(
+          'Kim is still working. Turn on "Queue messages" in Settings to line this up, or use Steer to fold it into the current task.',
+          'warning',
+          5000
+        );
+        return;
+      }
       const nextCount = queuedTasks.length + 1;
       setQueuedTasks(prev => [...prev, task]);
       toast(`Queued message #${nextCount}. Kim will run it automatically next.`, 'info', 3000);
@@ -214,6 +292,18 @@ export function useTaskRunner({
     if (!failed) return;
 
     if (stream.isRunning) {
+      // V-audit #2: handleSubmit already refuses to auto-queue when the user
+      // has turned off "Queue messages while Kim is working" (D-C1 above) —
+      // Retry silently queued anyway, bypassing that setting. Apply the same
+      // guard here so Retry can't queue when Send wouldn't.
+      if (settings.allow_message_queue === false) {
+        toast(
+          'Kim is still working. Turn on "Queue messages" in Settings to line this up, or use Steer to fold it into the current task.',
+          'warning',
+          5000
+        );
+        return;
+      }
       setQueuedTasks(prev => [...prev, failed]);
       toast('Retry queued. It will run after the current task.', 'info', 3000);
       return;

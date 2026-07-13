@@ -1,6 +1,31 @@
 /* Enable class-based dark mode */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* ── Stacking scale (F-F-13) ──────────────────────────────────────────────────
+   A single ordered z-index token scale replaces the ad-hoc literals that were
+   spread across ~10 sheets (0,1,2,10,30,40,50,100,200,900,1000,2000,3000,9000,
+   9999). Each token's VALUE equals the literal it replaced, so the computed
+   stacking order is unchanged — this only names the layers so new overlays pick
+   a slot instead of guess-and-bumping an invisible ordering. Add new layers here
+   rather than inventing another magic number. */
+:root {
+  --z-base:          0;    /* default flow layer */
+  --z-raised:        1;    /* lifted above siblings (bg accents, rails) */
+  --z-above:         2;    /* content stacked over a raised element */
+  --z-sticky:        10;   /* sticky bars / pinned in-flow chrome */
+  --z-nav:           30;   /* sidebar nav layer */
+  --z-dropdown:      40;   /* menus / composer affordances */
+  --z-popover:       50;   /* popovers / provider pickers */
+  --z-header:        100;  /* app header / typing overlays */
+  --z-overlay:       200;  /* in-view overlays (activity, provider sheet) */
+  --z-drawer:        900;  /* settings drawer scrim */
+  --z-modal:         1000; /* modal dialogs */
+  --z-modal-top:     2000; /* modal stacked above another modal */
+  --z-onboarding:    3000; /* onboarding flow (over everything else) */
+  --z-toast:         9000; /* toast stack */
+  --z-flash:         9999; /* screenshot flash / topmost transient */
+}
+
 /* ── Accent themes — applied via data-accent="..." on <html> ─────────────── */
 
 /* Ocean — muted teal-blue (warm-shifted) */

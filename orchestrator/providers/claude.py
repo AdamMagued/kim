@@ -12,7 +12,7 @@ from typing import Any
 
 import anthropic
 
-from orchestrator.providers.base import BaseProvider
+from orchestrator.providers.base import BaseProvider, finalize_text_content
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,16 @@ class AnthropicProvider(BaseProvider):
             else:
                 result.append({"role": role, "content": str(content)})
 
+        # F-B-2: Anthropic rejects a message list whose first turn is not a user
+        # turn ("first message must use the user role", HTTP 400 → non-retryable
+        # invalid_request). A memory trim that walks the resume boundary back to
+        # include an assistant tool-call turn yields [assistant, user, …], which
+        # bricks the whole resumed session. Every other provider tolerates this
+        # shape; prepend a synthetic user turn so claude.py does too. (Root fix
+        # is memory.py — Team A; this is the provider-side belt-and-suspenders.)
+        if result and result[0]["role"] == "assistant":
+            result.insert(0, {"role": "user", "content": "[Conversation resumed mid-exchange.]"})
+
         return result
 
     def _to_claude_tools(self, tools: list[dict]) -> list[dict]:
@@ -122,7 +132,19 @@ class AnthropicProvider(BaseProvider):
                 "cache_read_tokens": getattr(response.usage, "cache_read_input_tokens", 0) or 0,
             }
 
+        # Why generation stopped: "end_turn"/"tool_use" are normal; "max_tokens"
+        # means the reply was truncated and "refusal" a safety stop (finding 3.1).
+        stop_reason = getattr(response, "stop_reason", None)
+
         tool_blocks = [b for b in response.content if b.type == "tool_use"]
+
+        # Concatenate all text blocks. Also attached to tool_call responses:
+        # the agent reads response["content"] for the PLAN/STEP/THINKING
+        # narration that precedes a tool call (H2 — it was silently dropped
+        # for the API providers while Ollama/browser preserved it).
+        text = " ".join(
+            b.text for b in response.content if hasattr(b, "text") and b.text
+        )
 
         if len(tool_blocks) == 1:
             b = tool_blocks[0]
@@ -130,6 +152,8 @@ class AnthropicProvider(BaseProvider):
                 "type": "tool_call",
                 "tool": b.name,
                 "args": dict(b.input),
+                "content": text,
+                "stop_reason": stop_reason,
                 "usage": usage,
             }
 
@@ -142,11 +166,14 @@ class AnthropicProvider(BaseProvider):
                 "type": "tool_call",
                 "tool": "batch",
                 "args": {"calls": [{"tool": b.name, "args": dict(b.input)} for b in tool_blocks]},
+                "content": text,
+                "stop_reason": stop_reason,
                 "usage": usage,
             }
 
-        # Fallback: concatenate all text blocks
-        text = " ".join(
-            b.text for b in response.content if hasattr(b, "text") and b.text
-        )
-        return {"type": "text", "content": text or "", "usage": usage}
+        return {
+            "type": "text",
+            "content": finalize_text_content(text, stop_reason),
+            "stop_reason": stop_reason,
+            "usage": usage,
+        }

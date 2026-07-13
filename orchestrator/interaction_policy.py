@@ -24,6 +24,14 @@ class InteractionPolicy:
     _WEB_STATE_CHANGERS = {"web_click", "web_fill", "web_press"}
     _NATIVE_STATE_CHANGERS = {"click_ui", "type_text", "hotkey", "key_press"}
     _COORDINATE_TOOLS = {"click", "double_click", "right_click", "drag"}
+    # Result-text prefixes that mean the tool did NOT change state. Beyond
+    # ERROR/PERMISSION_ERROR these include the server-side denial and timeout
+    # markers, so a user-denied or timed-out action isn't recorded as a
+    # successful state change that forces a needless re-observe (finding 6.4).
+    _FAILURE_PREFIXES = (
+        "ERROR", "PERMISSION_ERROR", "HITL_DENIED", "POLICY_DENIED",
+        "POLICY_BLOCK", "TIMEOUT", "Unknown tool:",
+    )
 
     def __init__(self, *, block_high_risk: bool = False) -> None:
         # When True, high-risk tools are hard-blocked via before_tool() so that
@@ -166,7 +174,7 @@ class InteractionPolicy:
         return PolicyDecision()
 
     def after_tool(self, name: str, args: dict[str, Any] | None, result_text: str) -> None:
-        failed = str(result_text or "").startswith(("ERROR", "PERMISSION_ERROR"))
+        failed = str(result_text or "").startswith(self._FAILURE_PREFIXES)
         if name == "web_open":
             self.known_web_element_ids.clear()
             self.web_generation = 0
@@ -185,6 +193,17 @@ class InteractionPolicy:
                 self.web_generation = 0
                 return
             ids, generation, submit_may_exist = self._parse_web_observe(result_text)
+            if generation < 0:
+                # The JSON marker was present but its payload could not be parsed
+                # (e.g. truncated on a very large page). Treat it as a failed
+                # observation so element_id actions get the "observe again"
+                # remedy, instead of registering an EMPTY id set at a bumped
+                # generation that hard-blocks every web_click/web_fill forever
+                # and induces a policy stall (finding 6.3).
+                self.web_observe_failed = True
+                self.known_web_element_ids.clear()
+                self.web_generation = 0
+                return
             self.known_web_element_ids = ids
             self.web_generation = generation or (self.web_generation + 1)
             self.web_submit_may_exist = submit_may_exist
@@ -193,9 +212,35 @@ class InteractionPolicy:
         if name == "observe_ui":
             self.ui_observe_attempted = True
             self.ui_state_dirty = False
+            if failed:
+                # M5: a failed observation must not bump the generation or
+                # scrape "ids" out of the error text — mirroring web_observe,
+                # reset so click_ui is blocked with the accurate
+                # "requires a prior observe_ui snapshot" remedy.
+                self.known_ui_element_ids.clear()
+                self.ui_generation = 0
+                return
             ids = set(re.findall(r"\b(e\d+)\s*:", result_text))
             self.known_ui_element_ids = ids
             self.ui_generation += 1
+            return
+
+        if name == "web_resolve":
+            # M3: web_resolve resolves from the FULL element map (including
+            # currently-invisible elements), so the id it returns may not be in
+            # the visible-elements set web_observe registered. Register it here
+            # or the follow-up web_click gets hard-blocked as unknown/stale and
+            # the model loops between resolve and click.
+            if failed:
+                return
+            try:
+                data = json.loads(result_text)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return
+            if isinstance(data, dict):
+                element_id = str(data.get("element_id") or "").strip()
+                if element_id:
+                    self.known_web_element_ids.add(element_id)
             return
 
         if name == "web_fill_form":
@@ -263,6 +308,11 @@ class InteractionPolicy:
                         break
                 return ids, int(data.get("observation_generation") or 0), submit_may_exist
             except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
-                pass
+                # Marker present but unparseable (e.g. truncated JSON). Signal
+                # failure with generation -1 so the caller resets instead of
+                # registering an empty id set at a bumped generation (6.3). The
+                # plain-text fallback below only applies when NO JSON marker was
+                # emitted, so it must not swallow a corrupt JSON observation.
+                return set(), -1, False
         submit_may_exist = bool(re.search(r"\b(submit|create|save|send|publish)\b", result_text, re.IGNORECASE))
         return set(re.findall(r"^- (w\d+):", result_text, flags=re.MULTILINE)), 0, submit_may_exist

@@ -21,9 +21,36 @@ export const KimEventNames = {
   ANSWER: 'kim:answer' as const,
   DIFF: 'kim:diff' as const,
   ACTIVITY: 'kim:activity' as const,
+  COMMAND_APPROVAL_REQUEST: 'kim:command-approval-request' as const,
+  FILE_CHANGE_APPROVAL_REQUEST: 'kim:file-change-approval-request' as const,
+  USER_INPUT_REQUEST: 'kim:user-input-request' as const,
+  COMMAND_OUTPUT: 'kim:command-output' as const,
+  ASSISTANT_DELTA: 'kim:assistant-delta' as const,
+  REASONING_DELTA: 'kim:reasoning-delta' as const,
+  PLAN_UPDATE: 'kim:plan-update' as const,
+  DIFF_UPDATE: 'kim:diff-update' as const,
+  TOKEN_USAGE: 'kim:token-usage' as const,
+  ITEM_LIFECYCLE: 'kim:item-lifecycle' as const,
+  TURN_LIFECYCLE: 'kim:turn-lifecycle' as const,
+  AGENT_DONE: 'kim:agent-done' as const,
+  AGENT_CANCELLED: 'kim:agent-cancelled' as const,
+  AGENT_ERROR: 'kim:agent-error' as const,
 } as const;
 
 export type KimEventName = (typeof KimEventNames)[keyof typeof KimEventNames];
+
+/**
+ * Run-identity envelope shared by every typed payload. `run_id` is minted at
+ * task spawn (Rust `send_task`, forwarded to Python as KIM_RUN_ID); `session_id`
+ * is the session the run belongs to (KIM_SESSION_ID). Both are optional so
+ * events from legacy/bridge streams that predate the envelope still type-check.
+ * The frontend routes and files run output by these fields, never by which
+ * view happens to be mounted.
+ */
+export interface KimRunEnvelope {
+  run_id?: string;
+  session_id?: string;
+}
 
 /** Legacy markers retained for the uncontrolled Codex compatibility stream. */
 export const LegacyLogTags = {
@@ -89,20 +116,42 @@ export const LegacyLogTags = {
   }
 } as const;
 
+/**
+ * K5: named bracket-tag constants — the single source of truth for the
+ * text-protocol vocabulary. Hand parsers (chat/utils.ts, chat/parsers.ts)
+ * must reference these instead of re-typing the literals.
+ */
+export const LogTags = {
+  STATUS: "[STATUS]",
+  PLAN: "[PLAN]",
+  STEP: "[STEP]",
+  DONE: "[DONE]",
+  CONTEXT: "[CONTEXT]",
+  STATS: "[STATS]",
+  TOOL: "[TOOL]",
+  ANSWER: "[ANSWER]",
+  DIFF: "[DIFF]",
+  SUCCESS: "[SUCCESS]",
+  FAILED: "[FAILED]",
+  ERROR: "[ERROR]",
+  TASK_COMPLETE: "TASK_COMPLETE:",
+  NEED_HELP: "NEED_HELP:",
+} as const;
+
 /** A human-readable status message from the agent loop (activity feed item). */
-export interface KimStatusPayload {
+export interface KimStatusPayload extends KimRunEnvelope {
   /** Status text to display in activity feed. */
   message: string;
 }
 
 /** Agent emitted a structured plan with step list. */
-export interface KimPlanPayload {
+export interface KimPlanPayload extends KimRunEnvelope {
   /** Array of plan step objects. */
   steps: unknown[];
 }
 
 /** Agent advanced to a new plan step. */
-export interface KimStepPayload {
+export interface KimStepPayload extends KimRunEnvelope {
   /** 1-based step index. */
   n: number;
   /** Step metadata. */
@@ -110,13 +159,13 @@ export interface KimStepPayload {
 }
 
 /** Agent completed a plan step. */
-export interface KimDonePayload {
+export interface KimDonePayload extends KimRunEnvelope {
   /** 1-based step index that finished. */
   n: number;
 }
 
 /** Context window usage snapshot. */
-export interface KimContextPayload {
+export interface KimContextPayload extends KimRunEnvelope {
   /** Total input tokens consumed so far. */
   cumulative_input: number;
   /** Configured context token budget. */
@@ -136,7 +185,7 @@ export interface KimContextPayload {
 }
 
 /** Cumulative token usage for this run. */
-export interface KimStatsPayload {
+export interface KimStatsPayload extends KimRunEnvelope {
   /** Cumulative input tokens. */
   input: number;
   /** Cumulative output tokens. */
@@ -146,13 +195,13 @@ export interface KimStatsPayload {
 }
 
 /** Window/UI control signal from the agent. */
-export interface KimUiPayload {
+export interface KimUiPayload extends KimRunEnvelope {
   /** 'screenshot_flash' triggers flash overlay; 'show' brings main window to front. */
   action: 'screenshot_flash' | 'show';
 }
 
 /** Run completed (success or expected failure). */
-export interface KimRunDonePayload {
+export interface KimRunDonePayload extends KimRunEnvelope {
   /** Termination reason key: task_complete | max_iterations | stuck | provider_failed | need_help | cancelled | conversational_loop. */
   termination: string;
   /** True only when termination === 'task_complete'. */
@@ -160,7 +209,7 @@ export interface KimRunDonePayload {
 }
 
 /** Run ended due to a recoverable or unrecoverable error. */
-export interface KimRunFailedPayload {
+export interface KimRunFailedPayload extends KimRunEnvelope {
   /** Machine-readable error key (e.g. 'provider_auth', 'rate_limit'). */
   reason: string;
   /** True when the user can retry without config changes. */
@@ -170,7 +219,7 @@ export interface KimRunFailedPayload {
 }
 
 /** Provider call failed with a specific error code. */
-export interface KimProviderErrorPayload {
+export interface KimProviderErrorPayload extends KimRunEnvelope {
   /** Error code: auth | rate_limit | server_error | timeout | network | invalid_request. */
   code: string;
   /** True when automatic retry is possible. */
@@ -178,7 +227,7 @@ export interface KimProviderErrorPayload {
 }
 
 /** Provider rate-limited; agent will retry after a delay. */
-export interface KimRateLimitedPayload {
+export interface KimRateLimitedPayload extends KimRunEnvelope {
   /** Seconds until next retry. */
   delay: number;
   /** Current retry attempt number (1-based). */
@@ -188,7 +237,7 @@ export interface KimRateLimitedPayload {
 }
 
 /** Agent is requesting human approval before executing a high-risk tool. */
-export interface KimHitlApprovalRequestPayload {
+export interface KimHitlApprovalRequestPayload extends KimRunEnvelope {
   /** MCP tool name requiring approval. */
   tool: string;
   /** Risk level: high | medium. Determines UI prominence. */
@@ -197,10 +246,12 @@ export interface KimHitlApprovalRequestPayload {
   reason: string;
   /** K6: human-readable preview — command string, unified diff (<=40 lines), or URL + element label. May be empty. */
   preview: string;
+  /** T1 decision id — unique per approval request. Echo it back in the hitl_approve stdin line; a decision whose id does not match the currently pending request is discarded. May be empty on legacy emitters. */
+  id?: string;
 }
 
 /** Human approval decision sent back to the agent. */
-export interface KimHitlApprovalResultPayload {
+export interface KimHitlApprovalResultPayload extends KimRunEnvelope {
   /** MCP tool name that was approved or denied. */
   tool: string;
   /** True if the user approved the tool call. */
@@ -208,7 +259,7 @@ export interface KimHitlApprovalResultPayload {
 }
 
 /** A tool invocation shown in the live activity feed. */
-export interface KimToolPayload {
+export interface KimToolPayload extends KimRunEnvelope {
   /** Canonical MCP tool name. */
   name: string;
   /** Tool arguments used to build the activity label. */
@@ -216,13 +267,13 @@ export interface KimToolPayload {
 }
 
 /** A final assistant answer to append to the conversation. */
-export interface KimAnswerPayload {
+export interface KimAnswerPayload extends KimRunEnvelope {
   /** Answer text without a legacy marker prefix. */
   text: string;
 }
 
 /** Line-count summary for a file changed by a tool. */
-export interface KimDiffPayload {
+export interface KimDiffPayload extends KimRunEnvelope {
   /** Display-safe file basename. */
   path: string;
   /** Lines added. */
@@ -232,11 +283,133 @@ export interface KimDiffPayload {
 }
 
 /** A structured status, success, or error activity item. */
-export interface KimActivityPayload {
+export interface KimActivityPayload extends KimRunEnvelope {
   /** Activity severity and presentation kind. */
   kind: 'status' | 'success' | 'error';
   /** Human-readable activity text. */
   text: string;
+}
+
+/** Codex app-server: native per-command approval request. Block until the user answers with an approval_decision stdin line (accept | acceptForSession | decline). */
+export interface KimCommandApprovalRequestPayload extends KimRunEnvelope {
+  /** Approval request id — echo it back in the approval_decision stdin line. */
+  id: string;
+  /** Full shell command codex wants to run. */
+  command: string;
+  /** Working directory the command would run in. */
+  cwd: string;
+  /** Model-provided justification (may be empty). */
+  reason: string;
+  /** Risk hint: 'network' when the command needs network access, else '' (sandbox escalation). */
+  risk: string;
+  /** True when this is a managed-network approval (command needs network access). */
+  network: boolean;
+  /** Proposed execpolicy amendment tokens (allow similar commands without prompting); may be empty. */
+  amendment: unknown[];
+}
+
+/** Codex app-server: native file-change (patch) approval request. */
+export interface KimFileChangeApprovalRequestPayload extends KimRunEnvelope {
+  /** Approval request id — echo it back in the approval_decision stdin line. */
+  id: string;
+  /** Changed files: [{path, kind}] best-effort; may be empty. */
+  files: unknown[];
+  /** Model-provided justification (may be empty). */
+  reason: string;
+}
+
+/** Codex app-server: codex is asking the USER a question (item/tool/requestUserInput) or an MCP server raised an elicitation. Render the questions and answer via the respond_user_input Tauri command, which writes a {"type":"user_input","id":…,"answers":…} stdin line back to the bridge. */
+export interface KimUserInputRequestPayload extends KimRunEnvelope {
+  /** Request id — echo it back in the user_input stdin line (respond_user_input's id argument). */
+  id: string;
+  /** 'questions' (codex requestUserInput) or 'elicitation' (MCP elicitation; informational — Kim auto-declines these today). */
+  kind: string;
+  /** Codex thread item id the questions belong to; may be empty (always empty for elicitation). */
+  item_id: string;
+  /** Question objects as sent by codex: [{id, header, question, options?: [{label, description?}], isOther?, isSecret?}]. Empty for elicitation. */
+  questions: unknown[];
+  /** Elicitation message text; empty for kind='questions'. */
+  message: string;
+}
+
+/** Codex app-server: live output chunk from a running command. */
+export interface KimCommandOutputPayload extends KimRunEnvelope {
+  /** Command-execution item id this chunk belongs to. */
+  item_id: string;
+  /** Raw output chunk (may contain partial lines). */
+  chunk: string;
+}
+
+/** Codex app-server: streaming assistant-message text delta. */
+export interface KimAssistantDeltaPayload extends KimRunEnvelope {
+  /** Assistant text delta. */
+  chunk: string;
+}
+
+/** Codex app-server: streaming reasoning text delta (provider names scrubbed). */
+export interface KimReasoningDeltaPayload extends KimRunEnvelope {
+  /** Reasoning text delta. */
+  chunk: string;
+}
+
+/** Codex app-server: the turn's plan checklist changed. */
+export interface KimPlanUpdatePayload extends KimRunEnvelope {
+  /** Plan steps: [{text/step, status}] as sent by codex. */
+  steps: unknown[];
+}
+
+/** Codex app-server: cumulative unified diff of the turn's file changes. */
+export interface KimDiffUpdatePayload extends KimRunEnvelope {
+  /** Unified diff text (whole-turn snapshot, not incremental). */
+  unified_diff: string;
+}
+
+/** Codex app-server: codex-side transcript token usage snapshot. */
+export interface KimTokenUsagePayload extends KimRunEnvelope {
+  /** Cumulative input tokens. */
+  input: number;
+  /** Cumulative output tokens. */
+  output: number;
+  /** Cumulative total tokens. */
+  total: number;
+}
+
+/** Codex app-server: a thread item started or completed. */
+export interface KimItemLifecyclePayload extends KimRunEnvelope {
+  /** Item id. */
+  item_id: string;
+  /** Item kind (commandExecution | agentMessage | fileChange | reasoning | …). */
+  kind: string;
+  /** 'started' or 'completed'. */
+  phase: string;
+  /** Human-readable label (command string, file list, …); may be empty. */
+  title: string;
+}
+
+/** Codex app-server: a turn started / completed / was interrupted. */
+export interface KimTurnLifecyclePayload extends KimRunEnvelope {
+  /** 'started' | 'completed' | 'interrupted' | 'failed'. */
+  phase: string;
+  /** Codex turn id (may be empty). */
+  turn_id: string;
+}
+
+/** Agent completed its execution successfully or with expected outcome. */
+export interface KimAgentDonePayload extends KimRunEnvelope {
+  /** True when the agent finished successfully. */
+  success: boolean;
+}
+
+/** Agent execution was cancelled. */
+export interface KimAgentCancelledPayload extends KimRunEnvelope {
+  /** Usually false for cancellation. */
+  success: boolean;
+}
+
+/** Agent run failed with an error. */
+export interface KimAgentErrorPayload extends KimRunEnvelope {
+  /** Error description. */
+  error: string;
 }
 
 /** Discriminated union of all typed IPC events. */
@@ -257,7 +430,21 @@ export type KimEvent =
   | { event: typeof KimEventNames.TOOL; payload: KimToolPayload }
   | { event: typeof KimEventNames.ANSWER; payload: KimAnswerPayload }
   | { event: typeof KimEventNames.DIFF; payload: KimDiffPayload }
-  | { event: typeof KimEventNames.ACTIVITY; payload: KimActivityPayload };
+  | { event: typeof KimEventNames.ACTIVITY; payload: KimActivityPayload }
+  | { event: typeof KimEventNames.COMMAND_APPROVAL_REQUEST; payload: KimCommandApprovalRequestPayload }
+  | { event: typeof KimEventNames.FILE_CHANGE_APPROVAL_REQUEST; payload: KimFileChangeApprovalRequestPayload }
+  | { event: typeof KimEventNames.USER_INPUT_REQUEST; payload: KimUserInputRequestPayload }
+  | { event: typeof KimEventNames.COMMAND_OUTPUT; payload: KimCommandOutputPayload }
+  | { event: typeof KimEventNames.ASSISTANT_DELTA; payload: KimAssistantDeltaPayload }
+  | { event: typeof KimEventNames.REASONING_DELTA; payload: KimReasoningDeltaPayload }
+  | { event: typeof KimEventNames.PLAN_UPDATE; payload: KimPlanUpdatePayload }
+  | { event: typeof KimEventNames.DIFF_UPDATE; payload: KimDiffUpdatePayload }
+  | { event: typeof KimEventNames.TOKEN_USAGE; payload: KimTokenUsagePayload }
+  | { event: typeof KimEventNames.ITEM_LIFECYCLE; payload: KimItemLifecyclePayload }
+  | { event: typeof KimEventNames.TURN_LIFECYCLE; payload: KimTurnLifecyclePayload }
+  | { event: typeof KimEventNames.AGENT_DONE; payload: KimAgentDonePayload }
+  | { event: typeof KimEventNames.AGENT_CANCELLED; payload: KimAgentCancelledPayload }
+  | { event: typeof KimEventNames.AGENT_ERROR; payload: KimAgentErrorPayload };
 
 const KimWireEventMap = {
   "status": { event: KimEventNames.STATUS },
@@ -278,6 +465,20 @@ const KimWireEventMap = {
   "answer": { event: KimEventNames.ANSWER },
   "diff": { event: KimEventNames.DIFF },
   "activity": { event: KimEventNames.ACTIVITY },
+  "command_approval_request": { event: KimEventNames.COMMAND_APPROVAL_REQUEST },
+  "file_change_approval_request": { event: KimEventNames.FILE_CHANGE_APPROVAL_REQUEST },
+  "user_input_request": { event: KimEventNames.USER_INPUT_REQUEST },
+  "command_output": { event: KimEventNames.COMMAND_OUTPUT },
+  "assistant_delta": { event: KimEventNames.ASSISTANT_DELTA },
+  "reasoning_delta": { event: KimEventNames.REASONING_DELTA },
+  "plan_update": { event: KimEventNames.PLAN_UPDATE },
+  "diff_update": { event: KimEventNames.DIFF_UPDATE },
+  "token_usage": { event: KimEventNames.TOKEN_USAGE },
+  "item_lifecycle": { event: KimEventNames.ITEM_LIFECYCLE },
+  "turn_lifecycle": { event: KimEventNames.TURN_LIFECYCLE },
+  "agent_done": { event: KimEventNames.AGENT_DONE },
+  "agent_cancelled": { event: KimEventNames.AGENT_CANCELLED },
+  "agent_error": { event: KimEventNames.AGENT_ERROR },
 } as const;
 
 /** Decode one Python stdout JSON event using the schema-generated wire map. */

@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import patch
 
@@ -251,20 +252,24 @@ class ToolResultMessageContractTests(unittest.TestCase):
         """Spec requires 'tool_call_id', not 'tool_name', in role='tool' messages."""
         result = _tool_result_message("user", "[Tool result: shell_run]\nsome output")
         self.assertIsNotNone(result)
+        assert result is not None  # narrow Optional for the type checker
         self.assertIn("tool_call_id", result)
         self.assertNotIn("tool_name", result)
 
     def test_tool_call_id_value_is_tool_name(self):
         """Without a stored call ID, the tool name is used as the identifier."""
         result = _tool_result_message("user", "[Tool result: read_file]\ncontents")
+        assert result is not None  # narrow Optional for the type checker
         self.assertEqual(result["tool_call_id"], "read_file")
 
     def test_body_extracted_correctly(self):
         result = _tool_result_message("user", "[Tool result: shell_run]\nline1\nline2")
+        assert result is not None  # narrow Optional for the type checker
         self.assertEqual(result["content"], "line1\nline2")
 
     def test_role_is_tool(self):
         result = _tool_result_message("user", "[Tool result: git_status]\nmodified: x.py")
+        assert result is not None  # narrow Optional for the type checker
         self.assertEqual(result["role"], "tool")
 
     def test_non_user_role_returns_none(self):
@@ -276,6 +281,7 @@ class ToolResultMessageContractTests(unittest.TestCase):
     def test_empty_body_is_preserved(self):
         result = _tool_result_message("user", "[Tool result: take_screenshot]\n")
         self.assertIsNotNone(result)
+        assert result is not None  # narrow Optional for the type checker
         self.assertEqual(result["content"], "")
 
 
@@ -399,6 +405,44 @@ class InterleavedToolResultPairingTests(unittest.TestCase):
         self.assertEqual(by_content["file contents"], assistant_ids[0])
         self.assertEqual(by_content["listing"], assistant_ids[1])
 
+    def test_image_tool_result_pairs_and_keeps_image(self):
+        # F-B-4: a screenshot tool result (text + image) that answers a pending
+        # take_screenshot call must become a role:"tool" message paired to the
+        # call's id — NOT an orphaned user message that leaves the call unanswered.
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        messages = [
+            {"role": "assistant", "content": '{"type":"tool_call","tool":"take_screenshot","args":{}}'},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[Tool result: take_screenshot]\ncaptured"},
+                    {"type": "image", "data": "IMG", "media_type": "image/png"},
+                ],
+            },
+        ]
+        out = provider._to_ollama_messages(messages, "")
+        assistant_id = out[0]["tool_calls"][0]["id"]
+        tool_msgs = [m for m in out if m.get("role") == "tool"]
+        self.assertEqual(len(tool_msgs), 1, "pending take_screenshot call must be answered")
+        self.assertEqual(tool_msgs[0]["tool_call_id"], assistant_id)
+        # The image rides along on the tool message (Ollama accepts images anywhere).
+        self.assertEqual(tool_msgs[0]["images"], ["IMG"])
+        # No stray user message left holding the orphaned result.
+        self.assertFalse(any(m.get("role") == "user" for m in out))
+
+    def test_user_typed_tool_result_without_pending_call_stays_user_message(self):
+        # F-B-4: a user pasting a [Tool result: x] transcript with no matching
+        # pending call must NOT be silently rewritten into a role:"tool" message
+        # with a fabricated tool_call_id.
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        messages = [
+            {"role": "user", "content": "[Tool result: read_file]\npasted from an old chat"},
+        ]
+        out = provider._to_ollama_messages(messages, "")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["role"], "user")
+        self.assertNotIn("tool_call_id", out[0])
+
     def test_same_tool_twice_pairs_fifo(self):
         provider = OllamaProvider({"ollama": {"mode": "cloud"}})
         messages = [
@@ -416,6 +460,173 @@ class InterleavedToolResultPairingTests(unittest.TestCase):
         self.assertNotEqual(assistant_ids[0], assistant_ids[1])
 
 
+async def _run_complete(provider, *, final_obj, content, tool_calls, messages=None, tools=None):
+    """Drive OllamaProvider.complete() with the network layer stubbed out."""
+    async def _noop_daemon():
+        return None
+
+    async def _fake_stream(_payload):
+        return final_obj, content, tool_calls
+
+    async def _fake_usage(_final, _model):
+        return {"provider": "ollama", "source": "ollama", "mode": "cloud"}
+
+    with patch.object(provider, "_ensure_daemon_running", _noop_daemon), \
+         patch.object(provider, "_stream_chat", _fake_stream), \
+         patch.object(provider, "_usage_from_final", _fake_usage):
+        return await provider.complete(messages or [{"role": "user", "content": "hi"}], tools or [], "sys")
+
+
+class OllamaDoneReasonTests(unittest.TestCase):
+    """F-B-3: Ollama must surface done_reason and finalize truncated text."""
+
+    def _provider(self):
+        return OllamaProvider({"ollama": {"mode": "cloud", "cloud_model": "m:cloud"}})
+
+    def test_length_stop_annotates_truncated_text(self):
+        provider = self._provider()
+        result = asyncio.run(_run_complete(
+            provider,
+            final_obj={"done_reason": "length", "model": "m:cloud"},
+            content="half an answer",
+            tool_calls=[],
+        ))
+        self.assertEqual(result["type"], "text")
+        self.assertEqual(result["stop_reason"], "length")
+        self.assertIn("truncated", result["content"].lower())
+        self.assertTrue(result["content"].startswith("half an answer"))
+
+    def test_normal_stop_passes_text_through_with_stop_reason(self):
+        provider = self._provider()
+        result = asyncio.run(_run_complete(
+            provider,
+            final_obj={"done_reason": "stop", "model": "m:cloud"},
+            content="complete answer",
+            tool_calls=[],
+        ))
+        self.assertEqual(result["content"], "complete answer")
+        self.assertEqual(result["stop_reason"], "stop")
+
+    def test_tool_call_carries_stop_reason(self):
+        provider = self._provider()
+        result = asyncio.run(_run_complete(
+            provider,
+            final_obj={"done_reason": "stop", "model": "m:cloud"},
+            content="",
+            tool_calls=[{"function": {"name": "read_file", "arguments": {"path": "a"}}}],
+        ))
+        self.assertEqual(result["type"], "tool_call")
+        self.assertEqual(result["tool"], "read_file")
+        self.assertEqual(result["stop_reason"], "stop")
+
+
+class OllamaSessionProbeCacheTests(unittest.TestCase):
+    """F-INH-4: liveness probe + tags are cached for the session."""
+
+    def test_daemon_probe_is_skipped_once_alive(self):
+        from orchestrator.providers.base import ProviderEnvironmentError
+        # Port 9 (discard) refuses instantly, so an un-cached probe raises.
+        provider = OllamaProvider({"ollama": {"base_url": "http://127.0.0.1:9"}})
+        with self.assertRaises(ProviderEnvironmentError):
+            asyncio.run(provider._ensure_daemon_running())
+        # Once the session has verified the daemon, later turns skip the probe
+        # entirely (no error even though the port is unreachable).
+        provider._daemon_alive = True
+        asyncio.run(provider._ensure_daemon_running())
+
+    def test_tags_are_fetched_once_per_session(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud"}})
+        calls = {"n": 0}
+
+        async def _fake_fetch():
+            calls["n"] += 1
+            return [{"name": "m:latest"}]
+
+        with patch.object(provider, "_fetch_tags", _fake_fetch):
+            t1 = asyncio.run(provider._fetch_tags_cached())
+            t2 = asyncio.run(provider._fetch_tags_cached())
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(t1, t2)
+        self.assertEqual(t1, [{"name": "m:latest"}])
+
+
+class OllamaRemotePsHostTests(unittest.TestCase):
+    """F-B-6: `ollama ps` must target the configured daemon, not localhost."""
+
+    def test_ps_subprocess_gets_ollama_host_from_base_url(self):
+        import types as _t
+
+        provider = OllamaProvider({"ollama": {"base_url": "http://10.0.0.5:11434"}})
+        captured = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _t.SimpleNamespace(returncode=1, stdout="")
+
+        with patch("orchestrator.providers.ollama.subprocess.run", _fake_run):
+            provider._context_limit_from_ps_sync("m")
+
+        self.assertIsNotNone(captured["env"])
+        self.assertEqual(captured["env"].get("OLLAMA_HOST"), "http://10.0.0.5:11434")
+
+
+class OllamaTimeoutClassificationTests(unittest.TestCase):
+    """F-B-5: httpx transport timeouts must become retryable builtin TimeoutError."""
+
+    def test_stream_chat_reraises_httpx_timeout_as_timeouterror(self):
+        import httpx
+        from orchestrator.providers.base import classify_provider_error
+
+        provider = OllamaProvider({"ollama": {"mode": "cloud", "cloud_model": "m:cloud"}})
+
+        async def _boom(_payload):
+            raise httpx.ReadTimeout("timed out")
+
+        async def _drive():
+            with patch.object(provider, "_stream_chat_inner", _boom):
+                await provider._stream_chat({"model": "m:cloud"})
+
+        with self.assertRaises(TimeoutError) as ctx:
+            asyncio.run(_drive())
+        # And the agent's retry boundary classifies it as retryable.
+        classified = classify_provider_error(ctx.exception)
+        self.assertEqual(classified.code, "timeout")
+        self.assertTrue(classified.retryable)
+
+
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class OllamaMalformedArgsReemitTests(unittest.TestCase):
+    """F-INH-3: unparseable single tool-call args become a re-emit nudge."""
+
+    def test_malformed_single_tool_args_becomes_text(self):
+        from orchestrator.providers.ollama import _normalize_tool_arguments_checked
+        args, err = _normalize_tool_arguments_checked("{not json")
+        self.assertEqual(args, {})
+        self.assertTrue(err)
+
+        provider = OllamaProvider({"ollama": {"mode": "cloud", "cloud_model": "m:cloud"}})
+        result = asyncio.run(_run_complete(
+            provider,
+            final_obj={"done_reason": "stop", "model": "m:cloud"},
+            content="",
+            tool_calls=[{"function": {"name": "read_file", "arguments": "{not json"}}],
+        ))
+        self.assertEqual(result["type"], "text")
+        self.assertIn("not valid JSON", result["content"])
+        self.assertIn("read_file", result["content"])
+
+    def test_valid_single_tool_args_still_dispatch(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud", "cloud_model": "m:cloud"}})
+        result = asyncio.run(_run_complete(
+            provider,
+            final_obj={"done_reason": "stop", "model": "m:cloud"},
+            content="",
+            tool_calls=[{"function": {"name": "read_file", "arguments": '{"path":"a"}'}}],
+        ))
+        self.assertEqual(result["type"], "tool_call")
+        self.assertEqual(result["tool"], "read_file")
+        self.assertEqual(result["args"], {"path": "a"})

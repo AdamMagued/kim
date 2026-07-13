@@ -39,7 +39,8 @@ import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional, cast
 
 from dotenv import load_dotenv
 from mcp import ClientSession
@@ -82,7 +83,28 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+
+def _count_lines_sync(file_path: str) -> int:
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        return sum(1 for _ in f)
+
 _COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
+
+# ── Client-side tool-call timeout budget (finding 2.1) ─────────────────────
+# asyncio.wait_for on session.call_tool must wait STRICTLY LONGER than the
+# server can legitimately spend, or it abandons a still-running call and the
+# model re-issues it — running the side effect twice. The budget is the sum of
+# the approval round-trip backstop (only when a UI bridge can prompt a human)
+# and the tool-execution ceiling, plus a margin.
+#   _APPROVAL_BACKSTOP_S mirrors mcp_server/approvals.py _APPROVAL_TIMEOUT_S.
+#   _MAX_SHELL_EXEC_S mirrors mcp_server/tools/shell.py MAX_SHELL_TIMEOUT_S.
+_APPROVAL_BACKSTOP_S = float(os.environ.get("KIM_APPROVAL_TIMEOUT_S", "150"))
+_MAX_SHELL_EXEC_S = 600.0
+# A client timeout does not prove that the MCP server stopped executing. Use
+# the conservative ceiling for every tool so a slow call is not abandoned and
+# then duplicated by a model retry. Individual tools may enforce shorter caps.
+_DEFAULT_TOOL_EXEC_S = 600.0
+_CLIENT_TIMEOUT_MARGIN_S = 60.0
 
 # Deterministic bridge.js failure signatures for a follow-up send that never
 # registered in a reused browser thread (see bridge.js fail-fast diagnostics).
@@ -167,13 +189,25 @@ class KimAgent:
         self._hitl_risk_threshold = _resolve_hitl_threshold(
             config, _os.environ.get("KIM_HITL_RISK_THRESHOLD")
         )
-        # In Tauri mode with HITL enabled, auto-wire StdinApprovalBridge so the
-        # interactive approval gate can pause the agent and wait for user input.
+        # In Tauri/CLI mode, auto-wire StdinApprovalBridge so the server-side
+        # approval gate (mcp_server policy → approval broker → this bridge)
+        # can pause the run and wait for user input. Attached regardless of
+        # the risk threshold: policy escalation rules (e.g. `python -c`,
+        # non-allowlisted binaries) request approval even in full-auto mode.
         if (not self._ui_bridge
-                and self._hitl_risk_threshold
                 and _os.environ.get("KIM_TAURI_MODE") == "1"):
             from orchestrator.ui_bridge import StdinApprovalBridge
             self._ui_bridge = StdinApprovalBridge()
+        # K1: the MCP server owns the HITL gate now; this process only answers
+        # its approval requests. Route them through the UIBridge (or decline
+        # everything when running headless without one).
+        try:
+            from orchestrator.approval_broker import get_approval_broker
+            get_approval_broker().set_resolver(
+                self._make_approval_resolver() if self._ui_bridge else None
+            )
+        except Exception as _broker_err:
+            logger.warning("approval resolver not registered: %s", _broker_err)
         # K3: mid-run steering inbox. Lines pushed by the stdin pump (runtime) or
         # add_steer() (tests) are drained into memory before each LLM call.
         self._steer_inbox: list[str] = []
@@ -261,9 +295,15 @@ class KimAgent:
         """Detect PLAN: / STEP n: markers in an assistant text turn and forward
         them to the UI as structured [STATUS] events.
 
-        The frontend (parseLogLine + parsePlanFromActivity in ChatView.tsx)
-        understands the `[PLAN]{json}` and `[STEP]{json}` envelopes and renders
-        a live checklist that crosses off each step as it completes.
+        The primary path is the typed `kim:plan`/`kim:step` events emitted
+        below (emit_plan/emit_step) — that's what the live checklist actually
+        renders from. The bracket-tag `[PLAN]{json}`/`[STEP]{json}` envelope
+        logged alongside them (via self._log) is a fallback for legacy or
+        uncontrolled text streams whose parser (parseLogLine +
+        parsePlanFromActivity in ChatView.tsx) can still pick it out of plain
+        log text; in this code path it's normally unreachable because _log()
+        suppresses [PLAN]/[STEP]-prefixed status lines from the emit_status
+        text stream (see the check at the top of _log()).
         """
         if not content:
             return
@@ -304,7 +344,7 @@ class KimAgent:
                     self._last_step_signature = ""  # reset step dedupe on new plan
                     self._last_done_signature = ""
                     self._log("INFO", f"[STATUS] [PLAN]{sig}")
-                    emit_plan(plan_payload["steps"])
+                    emit_plan(cast("list[object]", plan_payload["steps"]))
 
         # ── STEP markers ────────────────────────────────────────────────
         # Match the LAST step marker in this turn (the most recent one wins —
@@ -358,8 +398,15 @@ class KimAgent:
         *,
         fallback_input_tokens: Optional[int] = None,
         fallback_source: str = "unknown",
+        accumulate: bool = False,
     ) -> None:
-        """Emit legacy [STATS] for exact usage and [CONTEXT] for the budget UI."""
+        """Emit legacy [STATS] for exact usage and [CONTEXT] for the budget UI.
+
+        ``accumulate=True`` is used for stateful browser-thread continuation
+        turns, where the provider reports only the per-turn delta: the meter
+        sums deltas (+ replies) so the gauge tracks the real in-thread fill
+        instead of flat-lining at the last delta's size.
+        """
         usage = usage or {}
         estimated = bool(
             usage.get("estimated")
@@ -396,6 +443,7 @@ class KimAgent:
             fallback_input_tokens=None if forbid_fallback else fallback_input_tokens,
             source=fallback_source,
             estimated=input_tokens is None,
+            accumulate=accumulate,
         )
         if snapshot is None:
             return
@@ -519,9 +567,6 @@ class KimAgent:
         self._current_plan_steps = []
         self._current_step_index = 0
 
-        if task.strip().lower() in _COMPACT_CONTROL_TASKS:
-            return await self._compact_and_reset_context()
-
         try:
             self._session_store.append_run_started(task)
         except Exception as e:
@@ -529,8 +574,9 @@ class KimAgent:
 
         # Let the provider reset any per-session state (e.g. BrowserProvider
         # clears _sent_system_prompt so the new task gets its system prompt).
-        if hasattr(self.provider, "reset_session"):
-            self.provider.reset_session()
+        reset_session = getattr(self.provider, "reset_session", None)
+        if callable(reset_session):
+            reset_session()
 
         # Resume from saved session or start fresh
         if self._resume_session_id:
@@ -559,6 +605,9 @@ class KimAgent:
                 self.memory.clear()
         else:
             self.memory.clear()
+
+        if task.strip().lower() in _COMPACT_CONTROL_TASKS:
+            return await self._compact_and_reset_context()
 
         # Decide whether this task continues the session's browser thread or
         # starts a fresh one (stateful mode), or always starts fresh (legacy).
@@ -766,10 +815,24 @@ class KimAgent:
                 None if _has_exact_input
                 else estimate_request_tokens(request_messages, tools=call_tools, system=system_prompt)
             )
+            # Stateful browser continuation turns carry only the NEW delta in
+            # usage (the live thread retains prior turns), so the meter must
+            # accumulate deltas — otherwise cumulative_input flat-lines at the
+            # last delta and the ratio-based rollover never fires (finding 4.1).
+            # Only accumulate when the provider actually reported a per-turn
+            # count — the fallback estimate covers the FULL history and must
+            # keep assignment semantics or it would compound every turn.
+            _accumulate_delta = (
+                self._browser_stateful
+                and self._is_browser_provider()
+                and not clear_chat
+                and _usage_int(_usage, "input", "input_tokens", "prompt_tokens") is not None
+            )
             self._track_context_usage(
                 _usage,
                 fallback_input_tokens=request_estimate,
                 fallback_source=type(self.provider).__name__,
+                accumulate=_accumulate_delta,
             )
             if clear_chat:
                 self._clear_chat_on_next_call = False
@@ -850,8 +913,12 @@ class KimAgent:
         if tool_name == "batch":
             calls = tool_args.get("calls", [])
             if not isinstance(calls, list):
-                self._session_store.append_message(
-                    {"role": "user", "content": "[Tool result: batch]\nERROR: 'calls' must be a list."})
+                # M11: write the error to memory too (not just the session
+                # store) — otherwise the model never sees it in its next
+                # context and re-issues the same malformed batch.
+                err = "[Tool result: batch]\nERROR: 'calls' must be a list."
+                self.memory.add_user(err)
+                self._session_store.append_message({"role": "user", "content": err})
                 return None
 
             batch_results = []
@@ -887,7 +954,7 @@ class KimAgent:
                     aborted_after = idx
                     break
 
-            summary_obj = {"ok": ok}
+            summary_obj: dict[str, object] = {"ok": ok}
             if not ok:
                 summary_obj["aborted_after"] = aborted_after
             result_text = json.dumps(summary_obj) + "\n\n" + "\n---\n".join(batch_results)
@@ -1148,6 +1215,18 @@ class KimAgent:
                 ann_image_b64 = ann_image_b64[len("data:image/png;base64,"):]
             self._run_screenshot_b64 = ann_image_b64
 
+            # Stuck detection — mirrors the take_screenshot branch above so
+            # take_annotated_screenshot calls contribute to (and are caught
+            # by) the same perceptual-stuck history instead of silently
+            # bypassing it (finding 1).
+            if ann_image_b64 and self._is_stuck(ann_image_b64) and iteration > 3:
+                self._log("WARN", "Stuck — 3 identical screenshots in a row. Stopping.")
+                return self._complete_run(make_run_result(
+                    AgentTermination.STUCK,
+                    "STUCK: Screen not changing after repeated actions.",
+                    ann_image_b64,
+                ))
+
             grid_map = ann_data.get("grid", {})
             instructions = ann_data.get("instructions", "")
             screen_w = ann_data.get("screen_width", "?")
@@ -1189,51 +1268,40 @@ class KimAgent:
         ]
         self._log("INFO", f"Loaded {len(self._tools)} MCP tools")
 
-    @staticmethod
-    def _build_approval_preview(name: str, args: dict) -> str:
-        """K6: human-readable preview for the approval card.
+    def _make_approval_resolver(self):
+        """Build the coroutine the ApprovalBroker calls for each server-side
+        approval request (K1). It forwards the request through the existing
+        plumbing: hitl_approval_request event on stdout, decision from the
+        UIBridge (Tauri/CLI stdin line, or the tray confirm dialog)."""
 
-        run_command → the command; write/edit → unified diff (≤40 lines); web
-        actions → URL + element label. Empty string when nothing useful.
-        """
-        args = args or {}
-        try:
-            if name in ("run_command", "shell", "execute_command"):
-                return str(args.get("command") or args.get("cmd") or "").strip()
-            if name in ("write_file", "create_file", "edit_file"):
-                path = str(args.get("path") or args.get("file_path") or "")
-                new = str(args.get("content", ""))
-                old = ""
-                try:
-                    from pathlib import Path as _P
-                    p = _P(path)
-                    if p.is_file():
-                        old = p.read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    old = ""
-                import difflib
-                diff = list(difflib.unified_diff(
-                    old.splitlines(), new.splitlines(),
-                    fromfile=f"{path} (current)", tofile=f"{path} (new)", lineterm="",
-                ))
-                if len(diff) > 40:
-                    diff = diff[:40] + ["… (diff truncated)"]
-                return "\n".join(diff) if diff else f"(no textual change to {path})"
-            if name.startswith("web_") or name in ("navigate", "click_element"):
-                url = str(args.get("url") or args.get("href") or "")
-                label = str(
-                    args.get("label")
-                    or args.get("selector")
-                    or args.get("element_id")
-                    or ""
-                )
-                parts = [url]
-                if label:
-                    parts.append(f"→ {label}")
-                return " ".join(x for x in parts if x).strip()
-        except Exception as _preview_err:
-            logger.debug("_build_approval_preview failed: %s", _preview_err)
-        return ""
+        async def _resolve(request: dict) -> str:
+            bridge = self._ui_bridge
+            if bridge is None:
+                return "decline"
+            tool = str(request.get("tool", ""))
+            risk = str(request.get("risk", ""))
+            reason = str(request.get("reason", ""))
+            preview = str(request.get("preview", ""))
+            raw_args = request.get("args")
+            tool_args = raw_args if isinstance(raw_args, dict) else {}
+            if self._is_preview_mode():
+                # Preview mode already confirms every action in run() before
+                # the tool call reaches the server — don't double-prompt.
+                return "accept"
+            # T1: every approval request carries a unique decision id. The UI
+            # echoes it back in the hitl_approve stdin line, and the bridge
+            # only applies a decision whose id matches this pending request —
+            # a late Approve for a timed-out prompt can no longer authorize
+            # the next tool.
+            request_id = str(request.get("id") or "") or secrets.token_hex(8)
+            emit_hitl_approval_request(tool, risk, reason, preview, id=request_id)
+            decision = await bridge.decide_action(tool, tool_args, request_id=request_id)
+            emit_hitl_approval_result(
+                tool, decision in ("accept", "acceptForSession")
+            )
+            return decision
+
+        return _resolve
 
     async def _execute_tool(self, name: str, args: dict) -> str:
         import time as _time
@@ -1243,37 +1311,44 @@ class KimAgent:
             level = "WARN" if not decision.allowed or "WARNING" in decision.message else "INFO"
             self._log(level, f"[POLICY] {decision.message}")
 
-        # Interactive HITL approval gate — ask the user before executing tools at or
-        # above the configured risk threshold.  Fires only when a UIBridge is attached
-        # and preview mode is not already handling confirmation.  If the user approves,
-        # a HITL hard-block from block_high_risk is bypassed so the tool actually runs.
-        _hitl_interactively_approved = False
-        if (self._hitl_risk_threshold
-                and self._ui_bridge
-                and not self._is_preview_mode()):
-            _hitl_risk = classify_tool_risk(name, args or {})
-            _ord = {"high": 2, "medium": 1, "low": 0}
-            if _ord.get(_hitl_risk["level"], 0) >= _ord.get(self._hitl_risk_threshold, 99):
-                emit_hitl_approval_request(
-                    name,
-                    _hitl_risk["level"],
-                    _hitl_risk["reason"],
-                    self._build_approval_preview(name, args or {}),
-                )
-                _hitl_interactively_approved = await self._ui_bridge.confirm_action(name, args or {})
-                emit_hitl_approval_result(name, _hitl_interactively_approved)
-                if not _hitl_interactively_approved:
-                    return (
-                        f"HITL_DENIED: User denied '{name}' ({_hitl_risk['reason']}). "
-                        "Choose a different approach or ask the user for permission."
-                    )
-
         if not decision.allowed:
-            # When interactive approval was granted above, bypass HITL hard-blocks so
-            # the tool executes.  All other policy blocks (staleness, unknown IDs…) are
-            # still enforced regardless of approval.
-            if _hitl_interactively_approved and decision.hard_block and "HITL_REQUIRED" in decision.message:
-                pass
+            if decision.hard_block and "HITL_REQUIRED" in decision.message:
+                # Client-side hard-block (hitl_block_high_risk /
+                # KIM_HITL_BLOCK_HIGH_RISK). This used to fall through
+                # un-executed on the ASSUMPTION that the MCP server's own,
+                # separately-configured policy (mcp_server/policy.py, its
+                # own hitl_risk_threshold / KIM_HITL_RISK_THRESHOLD) would
+                # independently also classify this exact tool+args as
+                # needing approval and pause on the ApprovalBroker — but
+                # that server-side gate can disagree with this client-side
+                # one (different config key, different classification), so
+                # a tool the user believed was hard-blocked could execute
+                # with a human never actually asked (finding 2).
+                #
+                # This side now enforces its own block unconditionally: it
+                # invokes the SAME resolver _make_approval_resolver() builds
+                # for server-originated HITL requests (K1) — the identical
+                # id generation, hitl_approval_request/result events,
+                # preview-mode auto-accept (preview's blanket
+                # confirm_action already asked the user about this exact
+                # call before _execute_tool was reached — see the call
+                # sites above), and "no bridge → decline" fail-closed
+                # behavior — so there is exactly one approval mechanism in
+                # this process, not two that can disagree. Only a decision
+                # of "accept"/"acceptForSession" lets execution continue
+                # below; anything else (decline, no bridge) returns the
+                # blocking message like every other policy block.
+                resolver = self._make_approval_resolver()
+                hitl_decision = await resolver({
+                    "tool": name,
+                    "risk": "high",
+                    "reason": decision.message,
+                    "preview": json.dumps(args or {}, default=str)[:200],
+                    "args": args or {},
+                })
+                if hitl_decision not in ("accept", "acceptForSession"):
+                    return decision.message
+                # Approved — fall through and execute the tool below.
             else:
                 return decision.message
 
@@ -1296,8 +1371,7 @@ class KimAgent:
             _file_path = args.get("path") or args.get("file_path")
             if _file_path:
                 try:
-                    with open(_file_path, "r", encoding="utf-8", errors="ignore") as _f:
-                        _before_lines = sum(1 for _ in _f)
+                    _before_lines = await asyncio.to_thread(_count_lines_sync, _file_path)
                 except (OSError, IOError):
                     _before_lines = 0
 
@@ -1319,16 +1393,34 @@ class KimAgent:
         t0 = _time.monotonic()
         output = ""
 
+        # The client timeout MUST exceed the longest the server could
+        # legitimately spend on this call, or asyncio.wait_for abandons a call
+        # the server is still running — the model then re-issues it and the
+        # side effect happens twice (finding 2.1). Server-side worst case =
+        # approval round-trip backstop (when a UI bridge can prompt a human)
+        # + the tool-execution ceiling. Any tool can be gated depending on the
+        # HITL threshold, so the approval budget is keyed off the presence of a
+        # bridge, not the tool's own risk level.
+        _approval_budget = _APPROVAL_BACKSTOP_S if self._ui_bridge is not None else 0.0
+        _exec_budget = (
+            _MAX_SHELL_EXEC_S if name in ("run_command", "run_powershell")
+            else _DEFAULT_TOOL_EXEC_S
+        )
+        _call_timeout = _approval_budget + _exec_budget + _CLIENT_TIMEOUT_MARGIN_S
+
         try:
             result = await asyncio.wait_for(
                 self.session.call_tool(name=name, arguments=args),
-                timeout=120.0,
+                timeout=_call_timeout,
             )
             parts = [c.text for c in result.content if hasattr(c, "text")]
             output = "\n".join(parts) if parts else "(no output)"
         except asyncio.TimeoutError:
-            logger.error(f"MCP tool '{name}' timed out after 120s")
-            output = f"ERROR calling {name}: timed out after 120s"
+            logger.error(f"MCP tool '{name}' timed out after {_call_timeout:.0f}s")
+            output = (
+                f"ERROR calling {name}: timed out after {_call_timeout:.0f}s; "
+                "execution status is unknown. Do not retry this action automatically."
+            )
         except Exception as e:
             logger.error(f"MCP tool '{name}' failed: {e}", exc_info=True)
             output = f"ERROR calling {name}: {e}"
@@ -1361,8 +1453,7 @@ class KimAgent:
         # ── Post-execution: emit line diff for file writes ───────────────
         if _file_path and name in _write_ops:
             try:
-                with open(_file_path, "r", encoding="utf-8", errors="ignore") as _f:
-                    after_lines = sum(1 for _ in _f)
+                after_lines = await asyncio.to_thread(_count_lines_sync, _file_path)
                 added = max(0, after_lines - _before_lines)
                 removed = max(0, _before_lines - after_lines)
                 import os as _os
@@ -1514,8 +1605,20 @@ class KimAgent:
                     f"LLM call failed (attempt {attempt}/{self._max_retries}): "
                     f"{type(e).__name__}: {e} ({provider_error.code}) — retrying in {delay:.1f}s",
                 )
-                # Emit typed event so the frontend can show "Rate-limited, retrying in Xs..."
-                emit_rate_limited(round(delay, 1), attempt, self._max_retries)
+                # Tell the user the TRUTH about what happened.  Only genuine
+                # rate limits emit the typed rate_limited event (the frontend
+                # renders it as "Rate-limited — retrying in Xs"); every other
+                # retryable failure (network drop, timeout, server error) gets
+                # an honest [STATUS] line instead of masquerading as a rate limit.
+                if provider_error.code == "rate_limit":
+                    emit_rate_limited(round(delay, 1), attempt, self._max_retries)
+                else:
+                    self._log(
+                        "INFO",
+                        f"[STATUS] {_retry_notice_label(provider_error.code)} — "
+                        f"retrying in {delay:.0f}s "
+                        f"(attempt {attempt}/{self._max_retries})",
+                    )
                 # Do NOT sleep on the final attempt — the raise immediately follows (#31)
                 if attempt < self._max_retries:
                     await asyncio.sleep(delay)
@@ -1728,8 +1831,12 @@ completes.
         if instructions_section:
             prompt += "\n" + instructions_section + "\n"
 
-        # Inject recent session context
-        recent = SessionStore.recent_summaries(count=3)
+        # Browser chats already have explicit, session-scoped continuity:
+        # either their live web thread or the handoff produced by /compact.
+        # Injecting global recent summaries here leaks OTHER sessions into a
+        # deliberately fresh browser chat. Keep cross-session memory for API
+        # providers, but make browser new-chat semantics genuinely blank.
+        recent = [] if self._is_browser_provider() else SessionStore.recent_summaries(count=3)
         if recent:
             prompt += "\n# Recent context\nSummaries of your most recent sessions:\n"
             for entry in recent:
@@ -1925,10 +2032,20 @@ Rules:
 
         # Replace in-memory history with the compacted version
         self.memory.load_from_messages(compacted)
+        try:
+            self._session_store.rewrite_session(compacted)
+        except Exception as e:
+            logger.warning(f"Could not rewrite session file after compaction: {e}")
 
-        # Persist: save the summary sentinel and reset context meter
+        # Persist: save the summary sentinel and reset context meter. Seed the
+        # meter with the post-compaction message set — the next real turn
+        # re-sends summary + tail, so persisting a literal 0 would be fiction
+        # that is stale the instant the next turn runs (finding 4.5).
         compacted_at = datetime.now(timezone.utc).isoformat()
-        snapshot = self._context_meter.reset_after_compact(compacted_at=compacted_at)
+        snapshot = self._context_meter.reset_after_compact(
+            compacted_at=compacted_at,
+            new_cumulative_input=estimate_request_tokens(self.memory.get_messages()),
+        )
         self._log("INFO", snapshot.to_log_line())
         self._print_context_json(snapshot)
 
@@ -1992,8 +2109,9 @@ Rules:
             # Tell the provider directly — reset_session() (called just before
             # this) cleared its flag, and the env-var heuristic only covers
             # restored-thread spawns.
-            if hasattr(self.provider, "mark_thread_continuation"):
-                self.provider.mark_thread_continuation()
+            mark_continuation = getattr(self.provider, "mark_thread_continuation", None)
+            if callable(mark_continuation):
+                mark_continuation()
             self._log(
                 "INFO",
                 f"Continuing browser thread (turn {self._browser_thread_turns}, "
@@ -2051,6 +2169,8 @@ Rules:
                 response.get("usage", {}),
                 fallback_input_tokens=None,
                 fallback_source=f"{type(self.provider).__name__}:rollover_compact",
+                # The compact request is one more delta into the OLD thread.
+                accumulate=True,
             )
             raw = str(response.get("content", "")).strip()
             if raw:
@@ -2103,7 +2223,12 @@ Rules:
     def _arm_fresh_browser_thread(self, handoff: Optional[str]) -> None:
         """Shared tail of rollover/fallback: reset meter + flag a seeded fresh chat."""
         compacted_at = datetime.now(timezone.utc).isoformat()
-        snapshot = self._context_meter.reset_after_compact(compacted_at=compacted_at)
+        # Seed the meter with the compacted set (summary + preserved tail) that
+        # the fresh chat's first send will carry, instead of a fictional 0.
+        snapshot = self._context_meter.reset_after_compact(
+            compacted_at=compacted_at,
+            new_cumulative_input=estimate_request_tokens(self.memory.get_messages()),
+        )
         self._clear_chat_on_next_call = True
         self._pending_handoff = handoff or None
         self._browser_thread_turns = 0
@@ -2143,6 +2268,21 @@ from orchestrator.visual_task import (  # noqa: E402,F401
     _looks_visual,
     _uses_proactive_visual_context,
 )
+
+
+#: Honest user-facing labels for retryable provider-error codes.  Only
+#: "rate_limit" uses the typed rate_limited event; everything else surfaces
+#: as a [STATUS] line so a wifi drop is never reported as "Rate-limited".
+_RETRY_NOTICE_LABELS = {
+    "rate_limit": "Rate-limited by the provider",
+    "network": "Connection problem reaching the provider",
+    "timeout": "Provider timed out",
+    "server_error": "Provider server error",
+}
+
+
+def _retry_notice_label(code: str) -> str:
+    return _RETRY_NOTICE_LABELS.get(code, f"Provider error ({code})")
 
 
 def _provider_accepts_kwarg(fn: Any, name: str) -> bool:
@@ -2201,8 +2341,10 @@ async def mcp_agent_context(
     provider = create_provider(name, config)
 
     async with mcp_session_context(config) as session:
-        store = SessionStore(base_dir=session_dir, session_id=resume_session_id) if (
-            session_dir or resume_session_id) else SessionStore()
+        store = SessionStore(
+            base_dir=Path(session_dir) if session_dir else None,
+            session_id=resume_session_id,
+        ) if (session_dir or resume_session_id) else SessionStore()
         agent = KimAgent(
             config=config, session=session, provider=provider,
             ui_bridge=ui_bridge,

@@ -21,50 +21,77 @@ pub(crate) fn exe_ancestor_kim_root() -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn default_project_root() -> PathBuf {
-    // 0a. Compile-time baked path — the only reliable option when the app runs
-    //     from inside a .app bundle where no ancestor contains orchestrator/.
-    //     Set by build.rs from CARGO_MANIFEST_DIR at build time.
-    if let Some(baked) = option_env!("KIM_COMPILE_TIME_ROOT") {
-        let p = PathBuf::from(baked);
-        if p.exists() && p.join("orchestrator").join("agent.py").exists() {
+/// True when *p* is a usable Kim project root (contains `orchestrator/agent.py`).
+fn is_kim_root(p: &std::path::Path) -> bool {
+    p.exists() && p.join("orchestrator").join("agent.py").exists()
+}
+
+/// Pure precedence resolver for the project root, with every environment /
+/// home input injected so the ordering is deterministically testable.
+///
+/// F-D-2: the `KIM_PROJECT_ROOT` env override now WINS over the compile-time
+/// baked path and `~/.kim_root`, as its own comment always claimed ("explicit
+/// user intent"). Previously it was consulted third — so a developer who built
+/// the `.app` and then set `KIM_PROJECT_ROOT` to a second checkout still got the
+/// original baked tree (config.yaml, sessions, orchestrator all loaded from the
+/// wrong root, silently). To keep the promotion safe, an env root is only
+/// accepted when it is a real Kim root (`orchestrator/agent.py` present); an env
+/// value that does not resolve falls through to the baked/`~/.kim_root` chain
+/// exactly as before.
+fn resolve_project_root(
+    env_project_root: Option<String>,
+    baked: Option<&str>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    // 1. Explicit env override wins (verified to be a real Kim root).
+    if let Some(env_root) = env_project_root {
+        let p = PathBuf::from(env_root);
+        if is_kim_root(&p) {
             return p;
         }
     }
 
-    // 0b. ~/.kim_root — written by install.sh so even a moved/renamed project
-    //     can be found at runtime without a rebuild.
-    if let Some(home) = dirs::home_dir() {
+    // 2. Compile-time baked path — the only reliable option when the app runs
+    //    from inside a .app bundle where no ancestor contains orchestrator/.
+    //    Set by build.rs from CARGO_MANIFEST_DIR at build time.
+    if let Some(baked) = baked {
+        let p = PathBuf::from(baked);
+        if is_kim_root(&p) {
+            return p;
+        }
+    }
+
+    // 3. ~/.kim_root — written by install.sh so even a moved/renamed project
+    //    can be found at runtime without a rebuild.
+    if let Some(home) = &home {
         let root_file = home.join(".kim_root");
         if let Ok(contents) = std::fs::read_to_string(&root_file) {
             let p = PathBuf::from(contents.trim());
-            if p.exists() && p.join("orchestrator").join("agent.py").exists() {
+            if is_kim_root(&p) {
                 return p;
             }
         }
     }
 
-    // 1. Environment override wins (explicit user intent).
-    if let Ok(env_root) = std::env::var("KIM_PROJECT_ROOT") {
-        let p = PathBuf::from(env_root);
-        if p.exists() {
-            return p;
-        }
-    }
-    // 2. Walk up from the executable.
+    // 4. Walk up from the executable.
     if let Some(root) = exe_ancestor_kim_root() {
         return root;
     }
-    // 3. ~/.kim (standard per-user install).
-    if let Some(home) = dirs::home_dir() {
-        let user = home.join(".kim");
-        if user.exists() {
-            return user;
-        }
-        // Return the default location even if not yet created
-        return user;
+
+    // 5. ~/.kim (standard per-user install). Return the default location even
+    //    if not yet created.
+    if let Some(home) = home {
+        return home.join(".kim");
     }
     PathBuf::from(".")
+}
+
+pub(crate) fn default_project_root() -> PathBuf {
+    resolve_project_root(
+        std::env::var("KIM_PROJECT_ROOT").ok(),
+        option_env!("KIM_COMPILE_TIME_ROOT"),
+        dirs::home_dir(),
+    )
 }
 
 pub(crate) fn default_sessions_dir() -> PathBuf {
@@ -115,4 +142,68 @@ pub(crate) fn config_yaml_path(project_root: Option<String>) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(default_project_root)
         .join("config.yaml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a directory that looks like a real Kim root (`orchestrator/agent.py`).
+    fn make_kim_root(dir: &std::path::Path) {
+        let orch = dir.join("orchestrator");
+        std::fs::create_dir_all(&orch).unwrap();
+        std::fs::write(orch.join("agent.py"), b"# fake").unwrap();
+    }
+
+    #[test]
+    fn env_project_root_wins_over_baked_and_kim_root_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_root = tmp.path().join("env_checkout");
+        let baked_root = tmp.path().join("baked_checkout");
+        let home = tmp.path().join("home");
+        make_kim_root(&env_root);
+        make_kim_root(&baked_root);
+        // ~/.kim_root also points at yet another valid root.
+        let file_root = tmp.path().join("file_checkout");
+        make_kim_root(&file_root);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".kim_root"), file_root.to_string_lossy().as_bytes()).unwrap();
+
+        let resolved = resolve_project_root(
+            Some(env_root.to_string_lossy().into_owned()),
+            Some(baked_root.to_str().unwrap()),
+            Some(home.clone()),
+        );
+        // F-D-2: the explicit env override must win over BOTH the baked path
+        // and ~/.kim_root, even though all three are valid Kim roots.
+        assert_eq!(resolved, env_root);
+    }
+
+    #[test]
+    fn invalid_env_root_falls_through_to_baked() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Env points at a dir that exists but is NOT a Kim root (no agent.py).
+        let bogus_env = tmp.path().join("not_kim");
+        std::fs::create_dir_all(&bogus_env).unwrap();
+        let baked_root = tmp.path().join("baked_checkout");
+        make_kim_root(&baked_root);
+
+        let resolved = resolve_project_root(
+            Some(bogus_env.to_string_lossy().into_owned()),
+            Some(baked_root.to_str().unwrap()),
+            None,
+        );
+        // An env value that is not a real Kim root does not hijack resolution.
+        assert_eq!(resolved, baked_root);
+    }
+
+    #[test]
+    fn baked_wins_when_no_env_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let baked_root = tmp.path().join("baked_checkout");
+        make_kim_root(&baked_root);
+        let resolved =
+            resolve_project_root(None, Some(baked_root.to_str().unwrap()), None);
+        assert_eq!(resolved, baked_root);
+    }
 }

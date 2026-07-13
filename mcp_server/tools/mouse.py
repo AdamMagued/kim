@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from ..privacy import is_privacy_paused, PRIVACY_ERROR
+from ._errors import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ async def handle_click(args: dict) -> str:
         return f"Clicked ({x},{y}) with {button} button x{clicks}"
     except Exception as e:
         logger.error(f"click failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_double_click(args: dict) -> str:
@@ -41,7 +42,7 @@ async def handle_double_click(args: dict) -> str:
         return f"Double-clicked ({x},{y})"
     except Exception as e:
         logger.error(f"double_click failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_right_click(args: dict) -> str:
@@ -56,7 +57,7 @@ async def handle_right_click(args: dict) -> str:
         return f"Right-clicked ({x},{y})"
     except Exception as e:
         logger.error(f"right_click failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_drag(args: dict) -> str:
@@ -76,7 +77,7 @@ async def handle_drag(args: dict) -> str:
         return f"Dragged from ({x1},{y1}) to ({x2},{y2})"
     except Exception as e:
         logger.error(f"drag failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
 
 
 async def handle_scroll(args: dict) -> str:
@@ -86,7 +87,10 @@ async def handle_scroll(args: dict) -> str:
     x = int(args.get("x", -1))
     y = int(args.get("y", -1))
     clicks = max(1, min(int(args.get("clicks", 3)), _MAX_SCROLL_CLICKS))
-    direction = str(args.get("direction", "up"))
+    # Normalize case/whitespace: "Up"/"UP " must scroll up, not silently down.
+    direction = str(args.get("direction", "up")).strip().lower()
+    if direction not in ("up", "down"):
+        return tool_error(f"invalid scroll direction {direction!r}; use 'up' or 'down'")
     amount = clicks if direction == "up" else -clicks
     try:
         if x >= 0 and y >= 0:
@@ -97,4 +101,4 @@ async def handle_scroll(args: dict) -> str:
         return f"Scrolled {direction} {clicks} clicks at ({x},{y})"
     except Exception as e:
         logger.error(f"scroll failed: {e}", exc_info=True)
-        return f"ERROR: {e}"
+        return tool_error(e)
