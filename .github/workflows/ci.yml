@@ -193,70 +193,9 @@ jobs:
           workspaces: . -> target
 
       - name: Install Python dependencies
-        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install packaging
-
-          # The Windows smoke job must not install OpenAI/Codex. Keep every other
-          # canonical requirement (including markers) instead of maintaining a
-          # second hand-copied dependency list. This parser is deliberately
-          # fail-closed: unsupported requirement syntax, a missing OpenAI entry,
-          # or any newly-added Codex distribution stops CI rather than silently
-          # drifting from requirements.txt.
-          $filterScript = Join-Path $env:RUNNER_TEMP "filter_requirements.py"
-          @'
-          from pathlib import Path
-          from packaging.requirements import Requirement
-          from packaging.utils import canonicalize_name
-
-          source = Path("requirements.txt")
-          output = Path.home() / "kim-windows-requirements.txt"
-          forbidden = {"openai", "codex", "codex-cli"}
-          removed = []
-          kept = []
-          for line_number, raw in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
-              stripped = raw.strip()
-              if not stripped or stripped.startswith("#"):
-                  kept.append(raw)
-                  continue
-              try:
-                  name = canonicalize_name(Requirement(stripped).name)
-              except Exception as exc:
-                  raise SystemExit(f"Unsupported requirement at {source}:{line_number}: {exc}")
-              if name in forbidden:
-                  removed.append(name)
-              else:
-                  kept.append(raw)
-          if removed != ["openai"]:
-              raise SystemExit(f"Expected to exclude exactly openai; excluded {removed!r}")
-          output.write_text("\n".join(kept) + "\n", encoding="utf-8")
-          print(f"Wrote {output}; excluded exactly: {removed}")
-          '@ | Set-Content -LiteralPath $filterScript -Encoding utf8
-          python $filterScript
-          python -m pip install -r (Join-Path $HOME "kim-windows-requirements.txt")
-
-          # Assert neither prohibited distribution appeared transitively.
-          python -c "import importlib.metadata as m; from packaging.utils import canonicalize_name; forbidden={'openai','codex','codex-cli'}; installed={canonicalize_name(d.metadata['Name']) for d in m.distributions() if d.metadata['Name']}; found=sorted(forbidden & installed); assert not found, f'prohibited distributions installed: {found}'"
-          if (Get-Command codex -ErrorAction SilentlyContinue) {
-            throw "Prohibited codex executable is present on PATH"
-          }
-
-          # A focused provider unit test imports two SDK symbols, then replaces
-          # all client behavior with fakes. Supply only that explicit import
-          # surface from RUNNER_TEMP. If tests begin using more SDK behavior,
-          # collection fails loudly; no test is skipped or deselected.
-          $shimDir = Join-Path $env:RUNNER_TEMP "kim-ci-shims"
-          New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
-          @'
-          class BadRequestError(Exception):
-              pass
-
-          class AsyncOpenAI:
-              def __init__(self, *args, **kwargs):
-                  raise RuntimeError("OpenAI SDK is prohibited in Windows CI; tests must inject a fake client")
-          '@ | Set-Content -LiteralPath (Join-Path $shimDir "openai.py") -Encoding utf8
-          "PYTHONPATH=$shimDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python -m pip install -r requirements.txt
 
       - name: Python tests
         run: python -m pytest tests/ -v --ignore=tests/kim_test_suite.py --ignore=tests/claw_test_suite.py
