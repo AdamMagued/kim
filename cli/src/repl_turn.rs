@@ -7,11 +7,11 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use crate::provider::{AppEvent, UserInputQuestion};
-use crate::{
-    format_repl_elapsed, kim_accent_color, paint_bold, paint_dim, paint_text, print_message,
-    print_note, stdout, App, MessageRole, UiMessage,
+use crate::paint::{
+    kim_accent_color, paint_bold, paint_dim, paint_text, print_message, print_note,
 };
+use crate::provider::{AppEvent, UserInputQuestion};
+use crate::{format_repl_elapsed, stdout, App, MessageRole, UiMessage};
 
 /// Consume one turn's streamed events, render them, and persist the result.
 /// Extracted from `stream_repl_turn` so it can be driven by a stubbed event

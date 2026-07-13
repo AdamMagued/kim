@@ -2,6 +2,7 @@ mod agentic;
 mod commands;
 mod config;
 mod markdown;
+mod paint;
 mod pickers;
 mod provider;
 mod repl_turn;
@@ -17,7 +18,7 @@ use commands::{
     command_summary, handle_command, login_with_key, CommandOutcome, SUPPORTED_COMMANDS,
 };
 use config::KimConfig;
-use crossterm::style::{Color as TerminalColor, Stylize};
+use paint::{kim_accent_color, paint_bold, paint_dim, paint_text, print_message, print_note};
 use pickers::{choose_model_interactively, choose_session_interactively};
 use provider::{provider_info, stream_kim_request, AppEvent, ChatMessage};
 use rustyline::completion::{Completer, Pair};
@@ -676,46 +677,6 @@ fn repl_prompt(app: &App) -> String {
     }
 }
 
-fn colors_enabled() -> bool {
-    stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-}
-
-fn kim_accent_color() -> TerminalColor {
-    TerminalColor::Rgb {
-        r: 0xe8,
-        g: 0xb8,
-        b: 0x9a,
-    }
-}
-
-fn kim_dim_color() -> TerminalColor {
-    TerminalColor::Grey
-}
-
-fn paint_text(text: &str) -> String {
-    text.to_string()
-}
-
-fn paint_dim(text: &str) -> String {
-    paint(text, kim_dim_color())
-}
-
-fn paint_bold(text: &str, color: TerminalColor) -> String {
-    if colors_enabled() {
-        format!("{}", text.with(color).bold())
-    } else {
-        text.to_string()
-    }
-}
-
-fn paint(text: &str, color: TerminalColor) -> String {
-    if colors_enabled() {
-        format!("{}", text.with(color))
-    } else {
-        text.to_string()
-    }
-}
-
 async fn handle_repl_input(
     app: &mut App,
     input: String,
@@ -1093,34 +1054,6 @@ fn print_recent_transcript(app: &App) {
     if !app.messages.is_empty() {
         println!();
     }
-}
-
-fn print_message(message: &UiMessage) {
-    let label = match message.role {
-        MessageRole::User => "You",
-        MessageRole::Assistant => "Kim",
-        MessageRole::System => "Note",
-        MessageRole::Error => "Error",
-        MessageRole::Reasoning => "Thinking",
-    };
-    for (index, line) in message.content.lines().enumerate() {
-        if index == 0 {
-            println!(
-                "{} {}",
-                paint_bold(&format!("{label}:"), kim_accent_color()),
-                paint_text(line)
-            );
-        } else {
-            println!("{}  {}", " ".repeat(label.len()), paint_text(line));
-        }
-    }
-    if message.content.lines().next().is_none() {
-        println!("{}", paint_bold(&format!("{label}:"), kim_accent_color()));
-    }
-}
-
-fn print_note(message: &str) {
-    println!("{}", paint_dim(message));
 }
 
 fn print_session_list(sessions: &[SessionEntry]) {
