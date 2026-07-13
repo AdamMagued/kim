@@ -14,7 +14,7 @@ authenticity: an actor able to replace the payload can replace the sidecar too.
 |---|---|---|---|
 | Bare KimCLI binaries (`kim-cli-*`, including `.exe`) | The tagged GitHub Actions matrix builds and uploads them to a draft GitHub Release. | A keyless `cosign sign-blob` step publishes a `.sig` and signing certificate `.pem` beside each bare binary. Release notes show a generic manual command. | No installer consumes this material, and the documented command does not pin the expected GitHub workflow/repository identity. |
 | CLI install archives (`kim-<triple>.tar.gz` / `.zip`) | The same matrix repackages the bare binary and publishes archive plus `.sha256`. | `install-kim.sh` and `install-kim.ps1` download the archive and same-origin sidecar and fail on missing/mismatched checksums unless `KIM_SKIP_CHECKSUM=1`. | Archives—the artifacts actually installed by the one-line flows—are not signed. Their checksum proves corruption detection only, not publisher identity. |
-| Desktop bundles/installers (`.app`, `.dmg`, Windows installer, Linux bundles) | `tauri-action` builds them and creates/updates a draft GitHub Release. macOS certificate import is conditional. | Platform mechanisms may validate a build when the corresponding platform signing configuration exists. | There is no uniform project-level signature covering all published desktop artifacts. A missing Apple certificate only emits a notice, so a tag build can continue unsigned/unnotarized. |
+| Desktop bundles/installers | The only desktop bundle targets configured in `desktop/src-tauri/tauri.conf.json` are `app` and `dmg`; therefore the exact configured desktop outputs are a macOS `.app` bundle and `.dmg` disk image. `release.yml` invokes `tauri-action` on macOS, Windows, and Linux but supplies no per-platform bundle-target override. Its release-note table advertises a Windows NSIS `*_x64-setup.exe`, Linux `*_amd64.deb` and `*_amd64.AppImage`, but those formats are not configured by the checked-in Tauri targets. Whether non-macOS matrix jobs currently fail, skip unsupported targets, or publish some tool-default output must be established from an actual release run; the advertised names are intended outputs, not evidence that those assets exist. macOS certificate import is conditional. | Platform mechanisms may validate a build when the corresponding platform signing configuration exists. | The configuration and advertised artifact inventory contradict each other, so the complete published desktop set is currently uncertain. There is no uniform project-level signature covering all selected desktop artifacts. A missing Apple certificate only emits a notice, so a tag build can continue unsigned/unnotarized. |
 | Desktop update discovery | `App.tsx` calls the fixed `AdamMagued/kim` GitHub latest-release API and compares tags. | The UI displays release notes/version. | Discovery metadata is not itself verified by Kim. |
 | Desktop “Update Now” | `UpdateModal.tsx` invokes `run_update`; `run_history.rs` validates that `origin` has a `github.com` host, performs `git pull --ff-only`, then updates Python dependencies and restarts. | `git verify-commit HEAD` is best-effort only: failure or missing GPG support produces a warning and continues. | This updates a source checkout, not a downloaded desktop bundle. Host validation does not pin owner/repository, and signature verification is not fail-closed. |
 | Tauri-native updater | None. `tauri.conf.json` has bundle configuration but no updater endpoint/public key, and `updater.rs` explicitly says checking is frontend-owned. | None. | No Tauri signed-update channel is configured; do not describe the current UI as one. |
@@ -78,7 +78,10 @@ cost, minisign with hardware/KMS custody is a valid alternative.
 2. Define the signed set: bare CLI binaries, install archives, checksum sidecars, a
    canonical manifest, desktop bundles/installers, updater metadata, SBOM/provenance.
    Signing a canonical manifest can cover hashes of all assets; direct signatures may
-   still be retained for ergonomic verification.
+   still be retained for ergonomic verification. Explicitly decide whether GitHub's
+   automatically generated source-code archives are outside the Kim signed-set policy
+   or must be represented and authenticated by that policy; do not silently treat
+   GitHub-generated archives as equivalent to workflow-produced release assets.
 3. Choose fail-closed behavior when signature material, verifier, transparency proof,
    network, or identity policy is unavailable. Decide whether any override exists and
    how prominently it is named, logged, and documented.
@@ -99,14 +102,24 @@ cost, minisign with hardware/KMS custody is a valid alternative.
 
 - Record the owner decisions in this document or an ADR and specify exact certificate
   claims/public-key fingerprints and asset naming.
+- Reconcile the desktop bundle targets with the release-note inventory: decide the
+  supported Windows/Linux/macOS formats, record the exact expected filenames, and
+  verify those expectations against a release or isolated packaging run before the
+  inventory becomes signing policy. Also record the decision for GitHub-generated
+  source archives.
 - Future files: `docs/THREAT_MODEL.md`, `docs/ops/TRIAGE.md`, release/operator docs, and
-  dedicated verification fixtures under `tests/` or `scripts/tests/`.
+  dedicated release-inventory and verification fixtures under `tests/` or
+  `scripts/tests/`.
 - Create an isolated test identity/key and fixtures for valid, corrupted, missing,
   wrong-repository, wrong-workflow, expired/revoked, replayed, and rotated signatures.
 
 ### Phase 1 — make the release a complete signed set
 
 - Future file: `.github/workflows/release.yml`.
+- Future files also include `desktop/src-tauri/tauri.conf.json` (or explicit
+  per-platform `tauri-action` arguments) and release-workflow tests that assert the
+  configured targets, produced asset names, and release-note table agree on every
+  matrix platform.
 - Generate a deterministic manifest containing version, commit, platform, artifact
   name, size, and SHA-256 for every CLI archive/binary and any selected desktop asset.
 - Sign the manifest and/or every owner-selected artifact; verify the staged outputs in
@@ -134,6 +147,10 @@ cost, minisign with hardware/KMS custody is a valid alternative.
   `desktop/src/components/UpdateModal.tsx`, and `.github/workflows/release.yml`.
   Configure Tauri updater endpoints/public key and signed update metadata; keep update
   discovery and verification in the native updater path.
+- Resolve the current `app`/`dmg`-only configuration versus the advertised
+  NSIS/deb/AppImage inventory as part of this migration; updater metadata and tests
+  must be generated from the artifacts actually produced, not from hand-typed release
+  notes.
 - If source update remains, future files include `desktop/src-tauri/src/run_history.rs`
   and its tests. Pin repository owner/name and an enforceable commit/tag trust policy;
   do not treat best-effort `git verify-commit` as authentication.
@@ -160,6 +177,9 @@ invalid Rekor proof when required, and an unconfigured `KIM_RELEASE_REPO` fork.
 The release workflow must also perform a clean-room install of the exact uploaded
 archive through each installer and verify the installed executable’s version. Desktop
 tests must distinguish source/git update behavior from Tauri-native signed updates.
+Release tests must fail when configured bundle targets, produced desktop assets,
+signed-manifest entries, and advertised download names diverge, and must exercise the
+owner-selected policy for GitHub-generated source archives.
 
 ## Evidence references
 
