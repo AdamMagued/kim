@@ -20,7 +20,7 @@ pyperclip~=1.8
 # ── Screen / Input Automation ────────────────────────────────────────────────
 pyautogui~=0.9.54
 mss~=9.0
-Pillow~=10.0
+Pillow~=11.0
 playwright~=1.40
 
 
