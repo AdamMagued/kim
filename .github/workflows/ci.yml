@@ -310,11 +310,11 @@ jobs:
           print('All orchestrator modules import cleanly.')
           "
 
-      - name: pytest (unit + integration tests, coverage gate)
+      - name: pytest (unit + integration tests, coverage report)
         run: |
-          # T7 coverage gate: measured baseline is ~62% across the three
-          # Python runtimes (2026-07). The floor is a ratchet — raise it as
-          # coverage grows; never lower it to make a PR pass.
+          # Coverage floors are enforced by the per-package ratchet step below
+          # (coverage-ratchet.json + scripts/check_coverage_ratchet.py), which
+          # replaced the old flat --cov-fail-under gate (#56 F-K-2).
           python -m pytest tests/ -v \
             --ignore=tests/kim_test_suite.py \
             --ignore=tests/claw_test_suite.py \
@@ -323,4 +323,7 @@ jobs:
             --cov=codex_engine \
             --cov=kimctl \
             --cov-report=term \
-            --cov-fail-under=61
+            --cov-report=json:coverage.json
+
+      - name: Coverage ratchet (per-package floors)
+        run: python scripts/check_coverage_ratchet.py
