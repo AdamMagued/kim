@@ -3,8 +3,9 @@
 //! OpenAI-compatible provider (ollama) and the Kim desktop bridge, then assert
 //! both the request bodies the CLI sent and the output/exit code it produced.
 //!
-//! Isolation: each test runs the binary with HOME pointed at a fresh temp dir
-//! (config, sessions, and bridge-token lookups all resolve under HOME), a temp
+//! Isolation: each test runs the binary with the platform home environment
+//! pointed at a fresh temp dir (config, sessions, and bridge-token lookups all
+//! resolve under that home), a temp
 //! cwd (so no Kim repo root or KIM.md is discovered and the plain
 //! `stream_kim_request` path is taken), and proxy/KIM env vars cleared.
 
@@ -189,7 +190,19 @@ fn temp_home_with_config(config: &serde_json::Value) -> tempfile::TempDir {
     home
 }
 
-/// Run `kim chat <prompt>` with an isolated HOME/cwd and a clean env.
+/// Point the child process at the test home on every supported platform.
+///
+/// `dirs::home_dir()` reads `HOME` on Unix and `USERPROFILE` on Windows. Setting
+/// only `HOME` made Windows integration tests silently load the runner's real
+/// config (or defaults) instead of the fixture written by
+/// `temp_home_with_config`.
+fn set_test_home(cmd: &mut Command, home: &std::path::Path) {
+    cmd.env("HOME", home);
+    #[cfg(windows)]
+    cmd.env("USERPROFILE", home);
+}
+
+/// Run `kim chat <prompt>` with an isolated home/cwd and a clean env.
 ///
 /// The binary is copied into the temp cwd first: `find_kim_repo_root` walks up
 /// from the running executable as a last resort, and the freshly built binary
@@ -201,9 +214,9 @@ fn run_kim_chat(home: &tempfile::TempDir, prompt: &str, extra_env: &[(&str, &str
     let kim_bin = cwd.path().join("kim");
     std::fs::copy(env!("CARGO_BIN_EXE_kim"), &kim_bin).expect("copy kim binary");
     let mut cmd = Command::new(&kim_bin);
+    set_test_home(&mut cmd, home.path());
     cmd.args(["chat", prompt])
         .current_dir(cwd.path())
-        .env("HOME", home.path())
         // Never discover a real Kim repo root / desktop pairing / proxies.
         .env_remove("KIM_PROJECT_ROOT")
         .env_remove("KIM_API_KEY")
@@ -221,16 +234,16 @@ fn run_kim_chat(home: &tempfile::TempDir, prompt: &str, extra_env: &[(&str, &str
     cmd.output().expect("kim binary should run")
 }
 
-/// Run `kim <args...>` with the same isolation as `run_kim_chat` (fresh HOME +
+/// Run `kim <args...>` with the same isolation as `run_kim_chat` (fresh home +
 /// temp cwd + clean proxy env), for subcommands other than `chat`.
 fn run_kim(home: &tempfile::TempDir, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let cwd = tempfile::tempdir().expect("temp cwd");
     let kim_bin = cwd.path().join("kim");
     std::fs::copy(env!("CARGO_BIN_EXE_kim"), &kim_bin).expect("copy kim binary");
     let mut cmd = Command::new(&kim_bin);
+    set_test_home(&mut cmd, home.path());
     cmd.args(args)
         .current_dir(cwd.path())
-        .env("HOME", home.path())
         .env_remove("KIM_PROJECT_ROOT")
         .env_remove("KIM_API_KEY")
         .env_remove("HTTP_PROXY")
