@@ -1495,7 +1495,8 @@ mod tests {
                 !s.contains(".kim_root"),
                 "dead ~/.kim_root venv candidate must be gone: {s}"
             );
-            assert!(s.contains("/.kim/"), "expected a ~/.kim venv candidate: {s}");
+            // Component check, not substring: Windows renders these with `\`.
+            assert!(c.components().any(|p| p.as_os_str() == ".kim"), "expected ~/.kim candidate: {s}");
         }
         assert_eq!(cands.len(), 2);
     }
