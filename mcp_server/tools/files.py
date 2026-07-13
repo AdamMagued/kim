@@ -28,8 +28,40 @@ async def handle_read_file(args: dict) -> str:
         return tool_error(f"Not a file: {path}")
     async with aiofiles.open(path, "r", encoding="utf-8", errors="replace") as f:
         content = await f.read()
-    logger.info(f"read_file: {path} ({len(content)} chars)")
-    return content
+
+    offset = args.get("offset")
+    limit = args.get("limit")
+    if offset is None and limit is None:
+        # Default (no windowing args): byte-identical to the historical behavior.
+        logger.info(f"read_file: {path} ({len(content)} chars)")
+        return content
+
+    try:
+        offset = 1 if offset is None else int(offset)
+        limit = None if limit is None else int(limit)
+    except (TypeError, ValueError):
+        return tool_error("offset and limit must be integers")
+    if offset < 1:
+        offset = 1  # clamp: line numbers are 1-based
+    if limit is not None and limit < 1:
+        return tool_error("limit must be a positive integer")
+
+    lines = content.splitlines()
+    total = len(lines)
+    if total == 0:
+        return "(empty file: 0 lines)"
+    if offset > total:
+        return tool_error(
+            f"offset {offset} is past the end of {path} ({total} lines total)"
+        )
+    end = total if limit is None else min(total, offset + limit - 1)
+    numbered = "\n".join(
+        f"{i}→{line}" for i, line in enumerate(lines[offset - 1:end], start=offset)
+    )
+    if offset > 1 or end < total:
+        numbered += f"\n(showing lines {offset}-{end} of {total} total lines)"
+    logger.info(f"read_file: {path} (lines {offset}-{end} of {total})")
+    return numbered
 
 
 async def handle_write_file(args: dict) -> str:

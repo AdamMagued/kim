@@ -81,11 +81,22 @@ from mcp_server.tools.windows import (
 _FILE_TOOLS: list[Tool] = [
     Tool(
         name="read_file",
-        description="Read the full text content of a file. Path can be absolute or relative to PROJECT_ROOT.",
+        description=(
+            "Read the text content of a file. Path can be absolute or relative to "
+            "PROJECT_ROOT. By default returns the whole file verbatim. Pass offset "
+            "(1-based line number) and/or limit (number of lines) to read a window "
+            "of a large file instead: the result is then line-numbered, one line "
+            "per row in the format '<n>→<line text>', with a footer noting the "
+            "window and total line count when truncated (e.g. 'showing lines "
+            "120-180 of 2368 total lines'). Line numbers from a windowed read let "
+            "you target a follow-up edit_file call precisely."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path (absolute or relative to PROJECT_ROOT)"},
+                "offset": {"type": "integer", "description": "Optional 1-based line number to start reading from (default 1). When offset or limit is given, output is line-numbered as '<n>→<line>'."},
+                "limit": {"type": "integer", "description": "Optional maximum number of lines to return (default: all remaining lines)."},
             },
             "required": ["path"],
         },
