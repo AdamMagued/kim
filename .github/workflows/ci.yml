@@ -191,7 +191,7 @@ jobs:
           pip install \
             -r requirements.txt \
             flake8 \
-            pyright \
+            pyright==1.1.411 \
             --ignore-requires-python \
             --no-deps
           # Re-install with deps to get transitive graph correct for the core subset
@@ -208,7 +208,7 @@ jobs:
             json-repair \
             pillow \
             flake8 \
-            pyright \
+            pyright==1.1.411 \
             pytest \
             pytest-asyncio \
             pytest-cov
@@ -232,7 +232,7 @@ jobs:
           # deliberately on one source line so they read as one paragraph to
           # the LLM. Breaking them would change the prompt content; instead
           # exempt that single file from line-length checks. Every other file
-          # (incl. run_claw_bridge.py and providers/*) stays strict at 120.
+          # (incl. providers/*) stays strict at 120.
           flake8 orchestrator/ kimctl/ \
             --max-line-length=120 \
             --extend-ignore=E203,W503 \
@@ -263,4 +263,4 @@ jobs:
             --cov=codex_engine \
             --cov=kimctl \
             --cov-report=term \
-            --cov-fail-under=60
+            --cov-fail-under=61

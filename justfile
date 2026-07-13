@@ -19,6 +19,10 @@ check:
     (cargo check -p desktop 2>&1) &
     CARGO_PID=$!
 
+    echo "=== Rust (CLI) ==="
+    (cargo check -p kim-cli 2>&1) &
+    CLI_PID=$!
+
     echo "=== Python (fast) ==="
     source venv/bin/activate && python -m pytest tests/ -q -m "not slow" --tb=short &
     PYTEST_PID=$!
@@ -36,7 +40,7 @@ print('pyright: 0 errors')
 " &
     PYRIGHT_PID=$!
 
-    wait $TSC_PID && wait $CARGO_PID && wait $PYTEST_PID && wait $PYRIGHT_PID
+    wait $TSC_PID && wait $CARGO_PID && wait $CLI_PID && wait $PYTEST_PID && wait $PYRIGHT_PID
     echo "=== check: all green ==="
 
 # pyright type check only

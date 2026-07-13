@@ -12,7 +12,6 @@ PyYAML~=6.0
 httpx~=0.27
 aiofiles~=23.0
 aiohttp~=3.9
-aiosqlite~=0.20
 json5~=0.10
 json-repair~=0.30
 pyperclip~=1.8
@@ -20,7 +19,7 @@ pyperclip~=1.8
 # ── Screen / Input Automation ────────────────────────────────────────────────
 pyautogui~=0.9.54
 mss~=9.0
-Pillow~=10.0
+Pillow~=11.0
 playwright~=1.40
 
 
@@ -36,9 +35,6 @@ pygetwindow~=0.0.9; sys_platform == "win32"
 # osascript (used for window management) is built-in and needs no pip dep.
 pyobjc-core~=10.0; sys_platform == "darwin"
 pyobjc-framework-Quartz~=10.0; sys_platform == "darwin"
-
-# ── Input Automation ────────────────────────────────────────────────────────
-pynput~=1.7
 
 # ── Testing ──────────────────────────────────────────────────────────────────
 pytest~=8.0
