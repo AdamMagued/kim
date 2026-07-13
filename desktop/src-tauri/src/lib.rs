@@ -1,4 +1,3 @@
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -509,6 +508,8 @@ fn schedule_frontmost_restore(_bundle_id: String) {}
 /// Non-blocking best-effort: errors are logged but never propagate.
 #[cfg(target_os = "macos")]
 fn write_first_png_to_clipboard(attachments: &[BridgeAttachment]) -> bool {
+    use base64::Engine as _;
+
     let att = match attachments.iter().find(|a| a.mime_type == "image/png") {
         Some(a) => a,
         None => return false,
