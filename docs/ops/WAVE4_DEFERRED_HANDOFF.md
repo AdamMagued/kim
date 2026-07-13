@@ -41,6 +41,24 @@ Read `docs/ops/findings/team-l.md`, then dispatch and review these separately:
 2. Onboarding/log truth audit: reconcile setup, logging, and operator-facing claims with actual behavior.
 3. Roadmap/proposal/archive status audit: clearly label current, proposed, completed, superseded, and archived material without rewriting history.
 
+## Branch gate + hosted CI results (2026-07-13, conductor session 2)
+
+Local full gate on macOS (recorded substitutions: `./venv/bin/python` for `.\venv\Scripts\python.exe`; `cd` subshells for Push-Location; `npx`/`npm` for the `.cmd` wrappers):
+
+- pytest: **2388 passed, 3 skipped, 0 failed** (a first-pass failure of `test_github_create_repo.py::test_private_visibility_unresolved_fails_compactly` was environmental — Playwright updated but chromium-1223 never installed; `./venv/bin/playwright install chromium` fixed it and the full suite re-ran green).
+- desktop: tsc 0, eslint 0, vitest 279 passed, vite build OK.
+- desktop cargo test: all green. cli cargo test (serial): 196 + 9 green.
+- `git diff --check main...HEAD`: clean.
+
+Hosted CI (`workflow_dispatch` on the ref — note `wave-4/deferred` matches NO ci.yml push pattern, so pushes get zero CI; dispatch manually or add the pattern): run 29256442298 = 2 green (File-size gate, Frontend) / 4 red, all classified:
+
+- **Python (lint+test)**: pyright now PASSES on CI (the #56-G ratchet + agent.py carve-out worked). Failure moved to the next pre-existing layer: 7 flake8 style hits (E305/E306/E501×2/E261/W293) in orchestrator files **byte-identical to main** — inherited, previously masked because main fails at pyright first. Fix needs .py style edits (out of this branch's scope).
+- **Windows smoke (#53's job, first real hosted run)**: 47 pytest failures / 2332 passed — genuine pre-existing Windows incompatibilities (WindowsPath vs POSIX in config hardening tests, cp1252 `charmap` decode in test_invariants, `_filtered_env` dropping HOME, policy allow/deny divergence, codex fake-binary spawn differences). The job is doing exactly what F-K-1 wanted: making Windows breakage visible. Burn-down is future-wave product work.
+- **Rust (check+clippy+test)**: 2 clippy `-D warnings` errors in code byte-identical to main (lib.rs:1 unused `base64::Engine` import; subprocess.rs:163 `manual_checked_ops` — a lint NEW in clippy 1.97; hosted stable is newer than the local 1.94 toolchain). Inherited; needs desktop Rust source edits (out of scope).
+- **Rust CLI (fmt+check+test)**: `cargo fmt --check` diff introduced by the accepted #55 refactor commits — the one branch-caused failure. **FIXED** in `7503b1a` (pure `cargo fmt` output, reviewer-verified byte-for-byte reproducible; 196+9 tests green). Second dispatch (run 29257503786) verifies.
+
+`nightly-contract.yml` and `rust-coverage.yml` (#56-A/#56-C) **cannot produce hosted runs from this branch at all**: GitHub registers dispatchable/scheduled workflows only from the default branch, and these files exist only here. `gh workflow run` returns 404 for them. Hosted proof requires merging to main first — recorded as a structural limitation, not a failure.
+
 ## Invariants
 
 Every worker and reviewer prompt must preserve all nine:
