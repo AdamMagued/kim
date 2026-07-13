@@ -295,8 +295,8 @@ async fn http_status(base_url: &str, path: &str) -> String {
 mod tests {
     use crate::config::KimConfig;
 
-    /// Required failures always gate the exit code; optional/provider-specific
-    /// failures gate only under --strict.
+    // ── source_root formatting ────────────────────────────────────────────────
+
     #[test]
     fn format_source_root_ok_when_path_supplied() {
         let p = std::path::Path::new("/some/kim");
@@ -322,7 +322,7 @@ mod tests {
         );
     }
 
-    // ── Browser provider tests ────────────────────────────────────────────────
+    // ── api_key_status ────────────────────────────────────────────────────────
 
     #[test]
     fn api_key_status_env_var_only_reports_env_name() {
@@ -382,12 +382,10 @@ mod tests {
         assert!(s.contains("openai"), "{s}");
     }
 
-    // ── F-E-11: /login key validation must time out, and treat a timeout as
-    // "skipped", not "key rejected" ─────────────────────────────────────────
+    // ── F-E-1: doctor exit-code gating ──────────────────────────────────────
 
-    /// A blackholed connection (server accepts but never responds) must NOT
-    /// hang the REPL: the request times out and, because a timeout is not a
-    /// rejection, validation is skipped (Ok) so the key is still saved.
+    /// Required failures always gate the exit code; optional/provider-specific
+    /// failures gate only under --strict.
     #[test]
     fn doctor_should_fail_gating_matrix() {
         use super::doctor_should_fail;

@@ -587,6 +587,8 @@ mod tests {
         );
     }
 
+    // ── Browser provider tests ────────────────────────────────────────────────
+
     #[test]
     fn is_browser_provider_recognises_all_variants() {
         use crate::provider::is_browser_provider;
@@ -699,8 +701,12 @@ mod tests {
         }
     }
 
-    // ── api_key_status ────────────────────────────────────────────────────────
+    // ── F-E-11: /login key validation must time out, and treat a timeout as
+    // "skipped", not "key rejected" ─────────────────────────────────────────
 
+    /// A blackholed connection (server accepts but never responds) must NOT
+    /// hang the REPL: the request times out and, because a timeout is not a
+    /// rejection, validation is skipped (Ok) so the key is still saved.
     #[tokio::test]
     async fn validate_api_key_times_out_and_skips_rather_than_rejecting() {
         use std::net::TcpListener;
