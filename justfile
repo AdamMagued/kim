@@ -61,6 +61,13 @@ test:
     echo "=== Rust ==="
     cargo test -p desktop
     echo "=== CLI Rust ==="
+    # --test-threads=1 is required (#56 F-K-12): kim-cli tests name temp dirs
+    # by SystemTime nanos alone (unique_config_path, cli/src/config.rs:213;
+    # same pattern in sessions.rs/provider.rs/file_refs.rs). SystemTime has
+    # ~1us resolution on macOS, so parallel tests can share a dir and one
+    # test's remove_dir_all deletes another's dir mid-save. Measured
+    # 2026-07-13: parallel failed 1/3 full runs + 2/10 config stress runs;
+    # serial passed 3/3. Full details in .github/workflows/ci.yml (linux-cli).
     cargo test -p kim-cli -- --test-threads=1
 
 # Web automation evals only
