@@ -240,9 +240,7 @@ class SessionStore:
                     rolled = self.session_dir / f"{self.session_id}.roll.{stamp}.jsonl"
                     try:
                         path.rename(rolled)
-                        logger.info(
-                            "Session file rotated: %s -> %s", path.name, rolled.name
-                        )
+                        logger.info("Session file rotated: %s -> %s", path.name, rolled.name)
                         self._cached_size = 0
                     except OSError as exc:
                         logger.warning("Could not rotate session file %s: %s", path, exc)

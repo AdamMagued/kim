@@ -160,19 +160,16 @@ impl ProtocolErrorLimiter {
     pub(crate) fn record_at(&mut self, now_ms: u64) -> bool {
         self.total_failures = self.total_failures.saturating_add(1);
         // Refill: one token per `refill_ms` elapsed, capped at `capacity`.
-        // checked_div returns None only when the divisor is 0, so this is
-        // exactly the old `if self.refill_ms > 0` guard.
+        // checked_div is None only when `refill_ms` is 0 — the old zero guard.
         let elapsed = now_ms.saturating_sub(self.last_refill_ms);
-        if let Some(quotient) = elapsed.checked_div(self.refill_ms) {
-            let refilled = quotient as u32;
-            if refilled > 0 {
-                self.tokens = self.tokens.saturating_add(refilled).min(self.capacity);
-                // Advance by the consumed whole intervals so fractional time is
-                // not lost (prevents drift under steady input).
-                self.last_refill_ms = self
-                    .last_refill_ms
-                    .saturating_add(refilled as u64 * self.refill_ms);
-            }
+        let refilled = elapsed.checked_div(self.refill_ms).unwrap_or(0) as u32;
+        if refilled > 0 {
+            self.tokens = self.tokens.saturating_add(refilled).min(self.capacity);
+            // Advance by the consumed whole intervals so fractional time is
+            // not lost (prevents drift under steady input).
+            self.last_refill_ms = self
+                .last_refill_ms
+                .saturating_add(refilled as u64 * self.refill_ms);
         }
         if self.tokens > 0 {
             self.tokens -= 1;

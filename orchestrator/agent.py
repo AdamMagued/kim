@@ -110,16 +110,13 @@ _CLIENT_TIMEOUT_MARGIN_S = 60.0
 # Deterministic bridge.js failure signatures for a follow-up send that never
 # registered in a reused browser thread (see bridge.js fail-fast diagnostics).
 # Stateful mode retries these once on a fresh chat instead of dying.
-_BROWSER_SEND_FAILURE_RE = re.compile(
-    r"Send did not register|No response turn detected",
-    re.IGNORECASE,
-)
+_BROWSER_SEND_FAILURE_RE = re.compile(r"Send did not register|No response turn detected", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
 # OS detection (extracted to orchestrator/agent_env.py)
 # ---------------------------------------------------------------------------
-from orchestrator.agent_env import _detect_os, _OS_NAME, _LAUNCH_EXAMPLE, _PATH_STYLE  # noqa: E402,F401
+from orchestrator.agent_env import _OS_NAME, _LAUNCH_EXAMPLE, _PATH_STYLE  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Tool name normalization (extracted to orchestrator/tool_utils.py)
@@ -139,7 +136,7 @@ from orchestrator.ui_bridge import UIBridge  # noqa: E402
 # ---------------------------------------------------------------------------
 # Config loading (extracted to orchestrator/agent_config.py)
 # ---------------------------------------------------------------------------
-from orchestrator.agent_config import _DEFAULT_CONFIG_PATH, load_config, _resolve_hitl_threshold, DEFAULT_PROVIDER  # noqa: E402,F401
+from orchestrator.agent_config import load_config, _resolve_hitl_threshold, DEFAULT_PROVIDER  # noqa: E402,F401
 
 # ---------------------------------------------------------------------------
 # MCP client (extracted to orchestrator/mcp_client.py)
@@ -152,14 +149,12 @@ from orchestrator.mcp_client import mcp_session_context  # noqa: E402
 # ---------------------------------------------------------------------------
 
 class MCPSessionLike(Protocol):
-    """The structural slice of an MCP session that KimAgent actually uses.
+    """Structural slice of an MCP session that KimAgent actually uses.
 
     Satisfied by both ``mcp.ClientSession`` and ``MultiMCPClient``
-    (orchestrator/mcp_client.py), which multiplexes several ClientSessions
-    behind these same two methods. Typing the agent against this protocol
-    (instead of ``mcp.ClientSession``) states the real requirement honestly
-    rather than casting the multiplexer to a class it is not.
-    """
+    (orchestrator/mcp_client.py) — typing the agent against this protocol
+    states the real requirement instead of casting the multiplexer to a
+    class it is not."""
 
     async def list_tools(self) -> Any: ...
 
@@ -366,13 +361,7 @@ class KimAgent:
         # Match the LAST step marker in this turn (the most recent one wins —
         # a turn rarely has more than one but a model could announce a
         # transition like "STEP 2: foo" right before calling a tool).
-        step_matches = list(
-            re.finditer(
-                r"^\s*STEP\s*(\d+)\s*:\s*(.+?)\s*$",
-                content,
-                re.IGNORECASE | re.MULTILINE,
-            )
-        )
+        step_matches = list(re.finditer(r"^\s*STEP\s*(\d+)\s*:\s*(.+?)\s*$", content, re.IGNORECASE | re.MULTILINE))
         if step_matches:
             m = step_matches[-1]
             step_payload = {"index": int(m.group(1)), "name": m.group(2).strip()[:120]}
@@ -384,13 +373,7 @@ class KimAgent:
                 emit_step(step_payload["index"], step_payload)
 
         # ── DONE markers ────────────────────────────────────────────────
-        done_matches = list(
-            re.finditer(
-                r"^\s*DONE\s*(\d+)\s*:\s*(.+?)\s*$",
-                content,
-                re.IGNORECASE | re.MULTILINE,
-            )
-        )
+        done_matches = list(re.finditer(r"^\s*DONE\s*(\d+)\s*:\s*(.+?)\s*$", content, re.IGNORECASE | re.MULTILINE))
         if done_matches:
             m = done_matches[-1]
             done_payload = {"index": int(m.group(1)), "summary": m.group(2).strip()[:160]}
@@ -1429,24 +1412,18 @@ class KimAgent:
                 self.session.call_tool(name=name, arguments=args),
                 timeout=_call_timeout,
             )
-            # mcp>=1.28 types result.content as a union of TextContent /
-            # ImageContent / AudioContent / ResourceLink / EmbeddedResource,
-            # and only TextContent carries a `.text` str. Kim's tool protocol
-            # is text-only, so non-text blocks are skipped exactly as before
-            # (`hasattr(c, "text")`) — but now with a debug note instead of
-            # vanishing silently. getattr keeps the historical duck-typing
-            # (anything exposing a str `.text` still counts) while the
-            # isinstance(str) guard gives pyright a sound narrow.
+            # mcp>=1.28 types result.content as a union where only TextContent
+            # carries a `.text` str. Kim's tool protocol is text-only, so
+            # non-text blocks are skipped exactly as before (`hasattr(c, "text")`)
+            # — now with a debug note instead of vanishing silently. getattr keeps
+            # the duck-typing; the isinstance(str) guard gives pyright a sound narrow.
             parts: list[str] = []
             for item in result.content:
                 item_text = getattr(item, "text", None)
                 if isinstance(item_text, str):
                     parts.append(item_text)
                 else:
-                    logger.debug(
-                        "MCP tool %r returned a non-text content block (%s); skipped",
-                        name, type(item).__name__,
-                    )
+                    logger.debug("MCP tool %r returned a non-text content block (%s); skipped", name, type(item).__name__)
             output = "\n".join(parts) if parts else "(no output)"
         except asyncio.TimeoutError:
             logger.error(f"MCP tool '{name}' timed out after {_call_timeout:.0f}s")
@@ -1509,13 +1486,6 @@ class KimAgent:
     # Stuck detection — logic lives in orchestrator/stuck_detection.py
     # ------------------------------------------------------------------
 
-    def _screenshot_signature(self, screenshot_b64: str):
-        return _stuck.screenshot_signature(screenshot_b64)
-
-    @staticmethod
-    def _signatures_similar(a, b) -> bool:
-        return _stuck.signatures_similar(a, b)
-
     def _is_stuck(self, screenshot_b64: str) -> bool:
         stuck = _stuck.is_stuck(self._screenshot_hashes, screenshot_b64)
         if stuck:
@@ -1569,8 +1539,7 @@ class KimAgent:
             # - OllamaProvider: httpx streaming client uses _timeout_s=600s.
             #   Use 660s (600+60s margin).
             # - All other providers (API-backed): keep the conservative 300s cap.
-            # Computed BEFORE the try so the except handler below can always
-            # reference it (definite assignment).
+            # Computed BEFORE the try so the except handler can always reference it.
             if provider_name == "BrowserProvider":
                 _outer_timeout = 1260.0
             elif provider_name == "OllamaProvider":
@@ -2296,12 +2265,7 @@ Rules:
 # ---------------------------------------------------------------------------
 # Visual-task detection (extracted to orchestrator/visual_task.py)
 # ---------------------------------------------------------------------------
-from orchestrator.visual_task import (  # noqa: E402,F401
-    _SCREEN_READ_TOOLS,
-    _VISUAL_TASK_RE,
-    _looks_visual,
-    _uses_proactive_visual_context,
-)
+from orchestrator.visual_task import _SCREEN_READ_TOOLS, _uses_proactive_visual_context  # noqa: E402
 
 
 #: Honest user-facing labels for retryable provider-error codes.  Only

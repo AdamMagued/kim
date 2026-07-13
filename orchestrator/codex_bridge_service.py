@@ -643,11 +643,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             # of the bridge. Keeping codex_thread_id here resumed Codex's old
             # transcript, which could immediately compact and re-seed the new
             # browser chat with the conversation the user just left.
-            thread_state = reset_thread_state(
-                args.cwd,
-                args.provider,
-                preserve_codex_thread=False,
-            )
+            thread_state = reset_thread_state(args.cwd, args.provider, preserve_codex_thread=False)
         elif thread_state.get("burned"):
             # The stored thread ignored the tool protocol even after a format
             # nudge — its context argues against compliance, so resuming it

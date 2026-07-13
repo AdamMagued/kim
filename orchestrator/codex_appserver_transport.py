@@ -905,9 +905,7 @@ class AppServerTurnRunner:
 
             async def _do_compact():
                 with contextlib.suppress(AppServerError, asyncio.TimeoutError):
-                    await _client.request(
-                        "thread/compact/start", {"threadId": _thread_id}, timeout=30.0
-                    )
+                    await _client.request("thread/compact/start", {"threadId": _thread_id}, timeout=30.0)
             # Retain a strong reference so the event loop can't drop the task
             # before it finishes (F-A-5); discard it once it completes.
             # Retain a strong reference so the event loop can't drop the task
