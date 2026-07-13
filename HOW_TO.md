@@ -7,7 +7,7 @@ Each recipe lists the exact minimal file set to touch. Read only those files.
 ## Add an MCP tool (3 files)
 
 1. **`mcp_server/tools/<group>.py`** — implement `async def handle_<tool>(args) -> str`.
-2. **`mcp_server/tool_registry.py`** — add the tool schema to the `TOOLS` list, a dispatch entry in the `DISPATCH` dict pointing to your handler, and a tier entry in `TIER_DISPATCH` (`core` / `git` / `shell` / …). All three tables live in this one file; `mcp_server/tool_tiers.py` only *filters* tools by `KIM_ENABLED_TOOL_TIERS` — no per-tool entry goes there.
+2. **`mcp_server/tool_registry.py`** — add the tool schema to the `TOOLS` list, a dispatch entry in the `DISPATCH` dict pointing to your handler, and a tier entry in `TIER_DISPATCH` (`file_read` / `git` / `shell` / …). All three tables live in this one file; `mcp_server/tool_tiers.py` only *filters* tools by `KIM_ENABLED_TOOL_TIERS` — no per-tool entry goes there.
 3. **`tests/`** — add a unit test for the new tool (schema↔dispatch parity is enforced by `tests/test_invariants.py` and `tests/test_tool_registry_schema.py`).
 
 Invariant: schema and dispatch entries must be added in the same commit — startup validation catches mismatches.
@@ -33,11 +33,11 @@ Invariant: schema and dispatch entries must be added in the same commit — star
 ## Add an agent event — end-to-end (3 files, 4 steps)
 
 1. **`desktop/src/types/events.schema.json`** — define the new event shape.
-2. Run **`npm run gen:events`** (from `desktop/`) — regenerates `desktop/src/types/events.gen.ts` (do not hand-edit).
-3. **`orchestrator/ui_bridge.py`** — add an emit method calling `self._emit("kim:<event>", payload)`.
-4. **`desktop/src/components/ChatView.tsx`** (or the relevant consumer) — add a `listen("kim:<event>", ...)` handler.
+2. Run **`npm run gen:events`** (from `desktop/`) — regenerates all three codegen targets: `desktop/src/types/events.gen.ts`, `desktop/src-tauri/src/events.gen.rs`, and `orchestrator/events_gen.py` (do not hand-edit any of them).
+3. Emit site (e.g. **`orchestrator/agent.py`** / **`orchestrator/cli.py`**) — call the generated `emit_<event>(...)` helper from `orchestrator/events_gen.py`.
+4. **`desktop/src/hooks/useChatStream.ts`** (or the relevant consumer) — add a listener for the typed `kim:<event>` Tauri event (names in `KimEventNames`, `events.gen.ts`).
 
-Typed IPC (`ipc_protocol: typed`) is the default. If you must also support legacy mode (`ipc_protocol: legacy` in `config.yaml`), emit the legacy text line from `ui_bridge.py` and add a regex in `desktop/src/components/chat/parsers.ts`.
+Typed IPC (`ipc_protocol: typed`) is the default. Legacy mode (`ipc_protocol: legacy` in `config.yaml`) forwards raw stdout lines on `kim-agent-output`; text-tag parsing for that path lives in `desktop/src/components/chat/parsers.ts`.
 
 ---
 
