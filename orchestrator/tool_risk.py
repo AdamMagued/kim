@@ -16,7 +16,7 @@ Risk levels:
   low     — Read-only or purely observational. Safe to execute autonomously.
 
 Reason codes (stable strings for downstream branching):
-  arbitrary_code_execution  — run_command, run_powershell, run_python, run_node
+  arbitrary_code_execution  — run_command, run_powershell, run_python, run_node, background_start
   file_deletion             — delete_file
   git_history_change        — git_commit (permanent commit written)
   git_branch_change         — git_checkout (can discard uncommitted changes)
@@ -31,6 +31,8 @@ Reason codes (stable strings for downstream branching):
   ui_interaction            — click_ui (native/accessibility click by element ID)
   window_management         — focus_window, resize_window
   memory_write              — write_memory
+  process_control           — background_cancel
+  user_question             — ask_user
   read_only                 — all remaining tools (read, observe, search, lint, git queries)
 
 Arg-level refinement (e.g. detecting force-push in run_command args, or
@@ -60,6 +62,7 @@ _HIGH_RISK: frozenset = frozenset({
     "run_powershell",
     "run_python",
     "run_node",
+    "background_start",
     "git_commit",
     "git_checkout",
     "github_create_repo",
@@ -92,6 +95,7 @@ _MEDIUM_RISK: frozenset = frozenset({
     "focus_window",
     "resize_window",
     "write_memory",
+    "background_cancel",
     # Accessibility click: state-changing even though it uses element IDs rather
     # than raw pixel coordinates.  Kept at medium (not high) because the target
     # is resolved from the accessibility tree, making accidental activation less
@@ -110,6 +114,7 @@ _TOOL_REASON: dict[str, str] = {
     "run_powershell": "arbitrary_code_execution",
     "run_python": "arbitrary_code_execution",
     "run_node": "arbitrary_code_execution",
+    "background_start": "arbitrary_code_execution",
     "git_commit": "git_history_change",
     "git_checkout": "git_branch_change",
     "github_create_repo": "remote_resource_creation",
@@ -137,6 +142,7 @@ _TOOL_REASON: dict[str, str] = {
     "focus_window": "window_management",
     "resize_window": "window_management",
     "write_memory": "memory_write",
+    "background_cancel": "process_control",
     # ── Low-risk (explicit so every registered tool has a classification) ────
     # File operations
     "read_file": "read_only",
@@ -147,6 +153,10 @@ _TOOL_REASON: dict[str, str] = {
     "get_screen_info": "read_only",
     "observe_ui": "read_only",
     "take_annotated_screenshot": "read_only",
+    # Browser-provider coordination
+    "web_search": "read_only",
+    "background_poll": "read_only",
+    "ask_user": "user_question",
     # Web read / passive wait
     "web_observe": "read_only",
     "web_resolve": "read_only",

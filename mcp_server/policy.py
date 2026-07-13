@@ -132,6 +132,7 @@ _PATH_ARGS: dict[str, tuple[str, ...]] = {
     "run_node": ("file", "cwd"),
     "lint_file": ("path", "cwd"),
     "run_command": ("cwd",),
+    "background_start": ("cwd",),
     "git_status": ("cwd",),
     "git_diff": ("path", "cwd"),
     "git_add": ("paths", "cwd"),
@@ -662,10 +663,13 @@ def build_approval_preview(name: str, args: dict) -> str:
     """Human-readable preview for the approval card."""
     args = args or {}
     try:
-        if name in ("run_command", "shell", "execute_command"):
+        if name in ("run_command", "background_start", "shell", "execute_command"):
             return str(args.get("command") or args.get("cmd") or "").strip()
         if name == "run_powershell":
             return str(args.get("script", "")).strip()[:400]
+        if name == "background_cancel":
+            job_id = str(args.get("job_id", "")).strip() or "(missing job id)"
+            return f"Cancel background command {job_id}"
         if name == "edit_file":
             # D3: only the schema-declared (and policy-validated) "path" arg is
             # honored — never a "file_path" alias that _PATH_ARGS doesn't cover.
@@ -796,16 +800,16 @@ def _enforce(name: str, args: dict) -> PolicyDecision:
         )
         if discriminator:
             signature = f"{name}:{discriminator}"
-    if name == "run_command":
+    if name in ("run_command", "background_start"):
         analysis = _analyze_shell(str(args.get("cmd", "")), args.get("cwd"))
         if analysis.deny_reason:
             return _deny(risk, analysis.deny_reason, analysis.deny_message)
         escalations = analysis.escalations
         risk = analysis.effective_risk
-        signature = f"run_command:bin={analysis.binary}"
+        signature = f"{name}:bin={analysis.binary}"
         if escalations:
             # Escalated shell calls are only session-cacheable per exact command.
-            signature = f"run_command:cmd={str(args.get('cmd', '')).strip()}"
+            signature = f"{name}:cmd={str(args.get('cmd', '')).strip()}"
             reason = escalations[0]
     elif name == "run_powershell":
         # Sensitive/out-of-sandbox path arguments hard-deny first, exactly

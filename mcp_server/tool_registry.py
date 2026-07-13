@@ -19,6 +19,13 @@ Grouped by domain:
 
 from mcp.types import Tool
 
+from mcp_server.tools.browser_parity import (
+    handle_ask_user,
+    handle_background_cancel,
+    handle_background_poll,
+    handle_background_start,
+    handle_web_search,
+)
 from mcp_server.tools.code import handle_lint_file, handle_run_node, handle_run_python
 from mcp_server.tools.files import (
     handle_delete_file,
@@ -267,17 +274,108 @@ _SHELL_TOOLS: list[Tool] = [
             "additionalProperties": False,
         },
     ),
+    Tool(
+        name="background_start",
+        description=(
+            "Start a shell command in the background and immediately return a job_id. "
+            "This uses the same sandbox, deny-list, approval policy, and command handler "
+            "as run_command. Use background_poll to read its state/output and "
+            "background_cancel to stop it. Prefer run_command for short commands."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "cmd": {"type": "string", "description": "Shell command to execute"},
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory (defaults to PROJECT_ROOT)",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": (
+                        "Maximum runtime in seconds. Hard cap is 600 seconds; "
+                        "larger values are rejected."
+                    ),
+                    "default": 300,
+                    "minimum": 1,
+                    "maximum": 600,
+                },
+            },
+            "required": ["cmd"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="background_poll",
+        description=(
+            "Check a background command. Returns JSON with status=running, completed, "
+            "failed, or cancelled; completed jobs include the run_command result."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Job id from background_start"},
+            },
+            "required": ["job_id"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="background_cancel",
+        description=(
+            "Cancel a running background command by job_id. The underlying run_command "
+            "handler is cancelled so its normal process-cleanup path can run."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Job id from background_start"},
+            },
+            "required": ["job_id"],
+            "additionalProperties": False,
+        },
+    ),
 ]
 
 _SHELL_DISPATCH = {
     "run_command": handle_run_command,
     "run_powershell": handle_run_powershell,
+    "background_start": handle_background_start,
+    "background_poll": handle_background_poll,
+    "background_cancel": handle_background_cancel,
 }
 
 
 # ── Screen / UI observation ──────────────────────────────────────────────────
 
 _SCREEN_TOOLS: list[Tool] = [
+    Tool(
+        name="ask_user",
+        description=(
+            "Pause the current task and ask the user one necessary question. Use only "
+            "when missing information blocks safe progress. The tool returns a NEED_HELP "
+            "message; echo that result exactly so Kim displays the question and the user "
+            "can answer in the next turn. Optional choices make the question easier to answer."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "Clear, specific question for the user",
+                    "maxLength": 2000,
+                },
+                "choices": {
+                    "type": "array",
+                    "description": "Optional answer choices",
+                    "items": {"type": "string"},
+                    "maxItems": 10,
+                },
+            },
+            "required": ["question"],
+            "additionalProperties": False,
+        },
+    ),
     Tool(
         name="take_screenshot",
         description=(
@@ -352,6 +450,7 @@ _SCREEN_TOOLS: list[Tool] = [
 ]
 
 _SCREEN_DISPATCH = {
+    "ask_user": handle_ask_user,
     "take_screenshot": handle_take_screenshot,
     "get_screen_info": handle_get_screen_info,
     "observe_ui": handle_observe_ui,
@@ -363,6 +462,38 @@ _SCREEN_DISPATCH = {
 # ── Web browser automation ───────────────────────────────────────────────────
 
 _WEB_TOOLS: list[Tool] = [
+    Tool(
+        name="web_search",
+        description=(
+            "Search the live web using the current browser chat provider's built-in "
+            "search capability. Use for current, niche, or externally verified facts. "
+            "The tool returns a provider-native search request; on the next turn, carry "
+            "out that search in the chat UI, cite source names and URLs, and continue the "
+            "original task. Do not use web_open to scrape a search engine when this tool "
+            "is available."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Focused search query"},
+                "max_results": {
+                    "type": "integer",
+                    "description": "Approximate number of sources to consult",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 20,
+                },
+                "recency_days": {
+                    "type": "integer",
+                    "description": "Optional recency window in days (0 means today)",
+                    "minimum": 0,
+                    "maximum": 3650,
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    ),
     Tool(
         name="web_open",
         description=(
@@ -628,6 +759,7 @@ _WEB_TOOLS: list[Tool] = [
 ]
 
 _WEB_DISPATCH = {
+    "web_search": handle_web_search,
     "web_open": handle_web_open,
     "open_url": handle_web_open,
     "web_observe": handle_web_observe,
