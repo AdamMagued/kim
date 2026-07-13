@@ -213,11 +213,25 @@ class TestScrapeMarkdown(unittest.IsolatedAsyncioTestCase):
 # _wait_for_generation_complete
 # ---------------------------------------------------------------------------
 
+
+class _FakeClock:
+    """Deterministic monotonic clock for no-sleep polling tests."""
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def time(self) -> float:
+        self._now += 0.01
+        return self._now
+
+
 class TestWaitForGenerationComplete(unittest.IsolatedAsyncioTestCase):
     async def _wait(self, provider, scrapes, completion_hash):
         scrape = AsyncMock(side_effect=scrapes)
+        clock = _FakeClock()
         with patch.object(provider, "_scrape_last_response", scrape), \
              patch.object(bp, "GENERATION_WAIT_S", 3.0), \
+             patch.object(bp.asyncio, "get_running_loop", return_value=clock), \
              patch.object(bp.asyncio, "sleep", AsyncMock()):
             result = await provider._wait_for_generation_complete(
                 MagicMock(),

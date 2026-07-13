@@ -18,19 +18,20 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from cross_platform_helpers import write_python_executable
+
 FAKE_BEARER_TOKEN = "test-bearer-token-0123456789"
 FAKE_PROXY_PORT = 45871
 
 # The hardened minimal env allowlist that codex_bridge_service passes to the
-# codex subprocess on POSIX platforms. This is the single env contract — the
+# codex subprocess on every platform. This is the single env contract — the
 # old ``**os.environ`` spread (dead run_codex_subtask) was deleted in Phase 0.
-EXPECTED_POSIX_ENV_KEYS = {
+EXPECTED_BASE_ENV_KEYS = {
     "PATH",
     "HOME",
     "USER",
@@ -45,7 +46,17 @@ EXPECTED_POSIX_ENV_KEYS = {
 # of the contract. macOS injects __CF_USER_TEXT_ENCODING and, on some
 # shells/locales, LC_CTYPE into every spawned process regardless of the env
 # dict passed to exec; neither reaches the child from Kim's own allowlist.
-PLATFORM_INJECTED_ENV_KEYS = {"__CF_USER_TEXT_ENCODING", "LC_CTYPE"}
+WINDOWS_PASSTHROUGH_ENV_KEYS = (
+    "SYSTEMROOT",
+    "COMSPEC",
+    "USERPROFILE",
+    "TEMP",
+    "TMP",
+    "PATHEXT",
+)
+
+# Windows cmd.exe injects PROMPT into children of .cmd launchers the same way.
+PLATFORM_INJECTED_ENV_KEYS = {"__CF_USER_TEXT_ENCODING", "LC_CTYPE", "PROMPT"}
 
 # Env vars that must never influence a test unless a test sets them itself.
 _SCRUBBED_VARS = (
@@ -76,32 +87,32 @@ def make_fake_codex_binary(
     prove a timeout kill reaps the whole process tree, not just the direct
     codex-exec PID (finding 3).
     """
-    dir_path.mkdir(parents=True, exist_ok=True)
-    script = dir_path / "fake-codex"
     child_spawn_code = (
         """
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
-with open(os.path.join(base, "child_pid.txt"), "w") as f:
+with open(os.path.join(base, "child_pid.txt"), "w", encoding="utf-8") as f:
     f.write(str(child.pid))
 """
         if spawn_child
         else ""
     )
-    script.write_text(
-        f"""#!{sys.executable}
-import json, os, subprocess, sys, time
+    source = f"""
+import json
+import os
+import subprocess
+import sys
+import time
+
 base = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(base, "pid.txt"), "w") as f:
+with open(os.path.join(base, "pid.txt"), "w", encoding="utf-8") as f:
     f.write(str(os.getpid()))
-with open(os.path.join(base, "capture.json"), "w") as f:
+with open(os.path.join(base, "capture.json"), "w", encoding="utf-8") as f:
     json.dump({{"argv": sys.argv[1:], "env": dict(os.environ)}}, f)
 {child_spawn_code}
 time.sleep({sleep_s})
 sys.exit({exit_code})
 """
-    )
-    script.chmod(0o755)
-    return script
+    return write_python_executable(dir_path, "fake-codex", source)
 
 
 class FakeBrowserProvider:
@@ -152,7 +163,7 @@ async def run_bridge(
     )
 
     config_path = tmp / "config.yaml"
-    config_path.write_text(config_yaml or _DEFAULT_CONFIG_YAML)
+    config_path.write_text(config_yaml or _DEFAULT_CONFIG_YAML, encoding="utf-8")
 
     parent_env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED_VARS}
     parent_env["CODEX_BIN"] = binary_override or str(binary)
@@ -173,21 +184,22 @@ async def run_bridge(
     )
 
     with (
-        patch.object(os, "environ", parent_env),
+        patch.dict(os.environ, parent_env, clear=True),
         patch.object(ts, "_STATE_DIR", tmp / "state"),
         patch.object(svc, "create_provider", return_value=FakeBrowserProvider()),
         patch.object(svc, "_CodexProxy", return_value=fake_proxy),
     ):
         rc = await svc._run_async(args)
+        observed_parent_env = dict(os.environ)
 
     capture_file = bin_dir / "capture.json"
     capture = (
-        json.loads(capture_file.read_text()) if capture_file.exists() else None
+        json.loads(capture_file.read_text(encoding="utf-8")) if capture_file.exists() else None
     )
     return SimpleNamespace(
         rc=rc,
         capture=capture,
-        parent_env=parent_env,
+        parent_env=observed_parent_env,
         bin_dir=bin_dir,
         project=str(project),
         proxy=fake_proxy,

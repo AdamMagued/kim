@@ -1,6 +1,7 @@
 # PROPOSAL: Direct-HTTP / Private-API Transport for the Browser Provider
 
-**Status:** Feasibility investigation (read-only). No code changed.
+> **Status:** draft — feasibility investigation (read-only, no code changed); no adoption decision recorded — 2026-07-13
+
 **Branch:** `integration/audit-fixes`
 **Author:** Claude Fable 5 (research agent)
 **Date:** 2026-07-12

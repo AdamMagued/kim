@@ -215,7 +215,7 @@ function PaneFeedback() {
       <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--kim-border)' }}>
         <SectionLabel>attach logs to your report</SectionLabel>
         <div style={{ fontSize: 12.5, color: 'var(--kim-text-3)', marginBottom: 10, lineHeight: 1.55 }}>
-          Kim writes structured logs to <code style={{ fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace' }}>logs/kim-YYYY-MM-DD.jsonl</code> (7-day rolling window). Attach them to bug reports for faster diagnosis.
+          Kim writes structured logs to <code style={{ fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace' }}>logs/kim_YYYY-MM-DD.jsonl</code> (7-day rolling window). Attach them to bug reports for faster diagnosis.
         </div>
         <button
           type="button"

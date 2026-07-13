@@ -3,10 +3,27 @@
     "orchestrator",
     "mcp_server",
     "codex_engine",
-    "kimctl"
+    "kimctl",
+    "tests"
   ],
   "pythonVersion": "3.11",
-  "typeCheckingMode": "basic",
-  "reportMissingImports": "none",
-  "reportMissingModuleSource": "none"
+  "typeCheckingMode": "standard",
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none",
+  "executionEnvironments": [
+    {
+      "root": "tests",
+      "extraPaths": [
+        "."
+      ],
+      "reportArgumentType": "warning",
+      "reportOptionalMemberAccess": "warning",
+      "reportAttributeAccessIssue": "warning",
+      "reportOperatorIssue": "warning",
+      "reportIndexIssue": "warning",
+      "reportOptionalSubscript": "warning",
+      "reportGeneralTypeIssues": "warning",
+      "reportPossiblyUnboundVariable": "warning"
+    }
+  ]
 }

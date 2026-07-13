@@ -160,17 +160,16 @@ impl ProtocolErrorLimiter {
     pub(crate) fn record_at(&mut self, now_ms: u64) -> bool {
         self.total_failures = self.total_failures.saturating_add(1);
         // Refill: one token per `refill_ms` elapsed, capped at `capacity`.
-        if self.refill_ms > 0 {
-            let elapsed = now_ms.saturating_sub(self.last_refill_ms);
-            let refilled = (elapsed / self.refill_ms) as u32;
-            if refilled > 0 {
-                self.tokens = self.tokens.saturating_add(refilled).min(self.capacity);
-                // Advance by the consumed whole intervals so fractional time is
-                // not lost (prevents drift under steady input).
-                self.last_refill_ms = self
-                    .last_refill_ms
-                    .saturating_add(refilled as u64 * self.refill_ms);
-            }
+        // checked_div is None only when `refill_ms` is 0 — the old zero guard.
+        let elapsed = now_ms.saturating_sub(self.last_refill_ms);
+        let refilled = elapsed.checked_div(self.refill_ms).unwrap_or(0) as u32;
+        if refilled > 0 {
+            self.tokens = self.tokens.saturating_add(refilled).min(self.capacity);
+            // Advance by the consumed whole intervals so fractional time is
+            // not lost (prevents drift under steady input).
+            self.last_refill_ms = self
+                .last_refill_ms
+                .saturating_add(refilled as u64 * self.refill_ms);
         }
         if self.tokens > 0 {
             self.tokens -= 1;
@@ -1496,7 +1495,8 @@ mod tests {
                 !s.contains(".kim_root"),
                 "dead ~/.kim_root venv candidate must be gone: {s}"
             );
-            assert!(s.contains("/.kim/"), "expected a ~/.kim venv candidate: {s}");
+            // Component check, not substring: Windows renders these with `\`.
+            assert!(c.components().any(|p| p.as_os_str() == ".kim"), "expected ~/.kim candidate: {s}");
         }
         assert_eq!(cands.len(), 2);
     }

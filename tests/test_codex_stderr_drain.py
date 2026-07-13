@@ -15,24 +15,21 @@ unit-test the ``_is_benign_codex_stderr`` classifier it uses.
 
 from __future__ import annotations
 
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from codex_bridge_harness import run_bridge
+from cross_platform_helpers import write_python_executable
 
 from codex_engine.engine import _is_benign_codex_stderr
 
 
 def _make_stderr_emitting_binary(dir_path: Path, *lines: str, exit_code: int = 0) -> Path:
     """A fake codex binary that writes the given lines to stderr, then exits."""
-    dir_path.mkdir(parents=True, exist_ok=True)
-    script = dir_path / "fake-codex-stderr"
     emitted = "".join(f"    print({line!r}, file=sys.stderr)\n" for line in lines)
-    script.write_text(
-        f"""#!{sys.executable}
+    source = f"""
 import sys
 
 def main():
@@ -41,9 +38,7 @@ def main():
 
 main()
 """
-    )
-    script.chmod(0o755)
-    return script
+    return write_python_executable(dir_path, "fake-codex-stderr", source)
 
 
 class LiveStderrDrainTests(unittest.IsolatedAsyncioTestCase):

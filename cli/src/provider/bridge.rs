@@ -319,8 +319,8 @@ mod tests {
         .unwrap();
         tmp.flush().unwrap();
 
-        let (summary, success) =
-            read_run_result_after(tmp.path(), 0).expect("should parse the trailing run_result line");
+        let (summary, success) = read_run_result_after(tmp.path(), 0)
+            .expect("should parse the trailing run_result line");
         assert_eq!(summary, "task complete");
         assert!(success, "success flag should be true");
     }

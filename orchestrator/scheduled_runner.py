@@ -675,7 +675,7 @@ def apply_scheduled_log_retention(kim_root: Path, keep_days: int = 7) -> int:
         # ts must be 16 chars: YYYYMMDDTHHMMSSZ
         if len(ts) == 16 and ts.endswith("Z") and "T" in ts:
             try:
-                date_str = ts[:8] # YYYYMMDD
+                date_str = ts[:8]  # YYYYMMDD
                 file_date = datetime.strptime(date_str, "%Y%m%d").date()
                 if file_date < cutoff:
                     f.unlink()

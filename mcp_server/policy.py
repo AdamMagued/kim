@@ -37,12 +37,18 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 from mcp_server.config import PROJECT_ROOT, get_config, validate_path
+from mcp_server.policy_platform import (
+    _is_safe_device_path,
+    _is_trusted_binary_path,
+    _portable_basename,
+    _split_shell_tokens,
+    _strip_executable_suffix,
+)
 from mcp_server.tools.shell import _DENY_COMMANDS, _check_exec_capable_binary
 
 logger = logging.getLogger(__name__)
@@ -142,12 +148,6 @@ _PATH_ARGS: dict[str, tuple[str, ...]] = {
     "read_memory": ("cwd",),
 }
 
-# Absolute paths that shell arguments may always reference.
-_SAFE_DEV_PATHS = frozenset({
-    "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin",
-    "/dev/tty", "/dev/urandom", "/dev/zero",
-})
-
 # ---------------------------------------------------------------------------
 # Tools that ALWAYS require human approval, independent of hitl_risk_threshold.
 #
@@ -235,14 +235,6 @@ _SHELL_BUILTINS = frozenset({
     ":", "[", "wait", "shift", "hash",
 })
 
-# System locations an *explicit-path* invocation may point into and still be
-# treated as the genuine binary (e.g. /usr/bin/git). Anything else invoked by
-# path (./tool, /tmp/tool, ~/tool) is an unverifiable copy → escalate.
-_TRUSTED_BIN_PREFIXES = (
-    "/usr/bin/", "/bin/", "/usr/sbin/", "/sbin/",
-    "/usr/local/bin/", "/opt/homebrew/bin/", "/opt/local/bin/",
-)
-
 # Interpreter flags that turn an allowlisted binary into arbitrary inline code.
 _INLINE_EXEC_FLAGS: dict[str, frozenset] = {
     "python": frozenset({"-c"}),
@@ -279,7 +271,8 @@ def _shell_lists() -> tuple[frozenset, frozenset]:
 
 
 def _normalize_binary_name(base: str) -> str:
-    """python3.13 → python, pip3 → pip, node18 → node (allowlist lookups)."""
+    """Normalize executable suffixes and versioned interpreter names."""
+    base = _strip_executable_suffix(base)
     for stem in ("python", "pip", "node", "ruby", "perl"):
         if re.fullmatch(rf"{stem}[\d.]*", base):
             return stem
@@ -303,21 +296,25 @@ def _resolve_binary(token: str) -> tuple[str, str, bool]:
         return "", "", False
     is_explicit = ("/" in text) or ("\\" in text) or text.startswith("~")
     if is_explicit:
-        invoked = Path(text).name.lower()
+        invoked = _strip_executable_suffix(_portable_basename(text))
         try:
             real = os.path.realpath(str(Path(text).expanduser()))
         except (OSError, ValueError):
             return invoked, "", False
-        real_base = Path(real).name.lower()
-        trusted = real.startswith(_TRUSTED_BIN_PREFIXES)
-        return invoked, real_base, trusted
+        real_base = _strip_executable_suffix(_portable_basename(real))
+        return invoked, real_base, _is_trusted_binary_path(real)
     located = shutil.which(text)
     if located is None:
         # Not on PATH: either a builtin (checked by caller) or a command that
         # will fail at exec time — unverifiable, so not trusted.
-        return text.lower(), text.lower(), False
+        base = _strip_executable_suffix(_portable_basename(text))
+        return base, base, False
     real = os.path.realpath(located)
-    return text.lower(), Path(real).name.lower(), True
+    return (
+        _strip_executable_suffix(_portable_basename(text)),
+        _strip_executable_suffix(_portable_basename(real)),
+        True,
+    )
 
 
 def _looks_like_assignment(token: str) -> bool:
@@ -382,10 +379,14 @@ def _scan_path_tokens(tokens: list[str], cwd: str | None) -> str | None:
         candidate = candidate.lstrip("<>&123456789")
         if not candidate:
             continue
+        if _is_safe_device_path(candidate):
+            continue
         expanded = Path(candidate).expanduser()
+        is_windows_drive_path = bool(re.match(r"^[A-Za-z]:", candidate))
         is_pathy = (
             expanded.is_absolute()
-            or candidate.startswith("~")
+            or candidate.startswith(("/", "\\", "~"))
+            or is_windows_drive_path
             or ".." in expanded.parts
         )
         target = expanded if expanded.is_absolute() else base_dir / expanded
@@ -402,8 +403,6 @@ def _scan_path_tokens(tokens: list[str], cwd: str | None) -> str | None:
                     continue
             except OSError:
                 continue
-        if str(expanded) in _SAFE_DEV_PATHS:
-            continue
         try:
             validate_path(str(target))
         except PermissionError as e:
@@ -575,7 +574,7 @@ def _scan_powershell_script(script: str) -> str | None:
     if not text:
         return None
     try:
-        tokens = shlex.split(text)
+        tokens = _split_shell_tokens(text)
     except ValueError:
         tokens = text.split()
     # PS statement separators (';', '|') can leave a separator glued to a
@@ -593,7 +592,7 @@ _CHAIN_OPERATOR_TOKENS = frozenset({"&&", "||", ";", "|", "&"})
 def _analyze_shell(cmd: str, cwd: str | None) -> _ShellAnalysis:
     """Analyse a full run_command string, segment by segment."""
     try:
-        tokens = shlex.split(cmd)
+        tokens = _split_shell_tokens(cmd)
     except ValueError:
         return _ShellAnalysis(
             deny_reason="malformed_quoting",
@@ -629,7 +628,7 @@ def _analyze_shell(cmd: str, cwd: str | None) -> _ShellAnalysis:
 
         # Recurse into `sh -c '…'` payloads so nested commands see the same rules.
         if seg:
-            base = Path(seg[0]).name.lower()
+            base = _normalize_binary_name(_portable_basename(seg[0]))
             if base in {"sh", "bash", "zsh", "fish", "dash", "ksh"}:
                 try:
                     c_index = seg.index("-c")

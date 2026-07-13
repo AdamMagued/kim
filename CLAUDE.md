@@ -24,7 +24,7 @@ active plan, `docs/ROADMAP_TO_10.md`).
 | Directory | Guide | What's there |
 |---|---|---|
 | `orchestrator/` | `orchestrator/CLAUDE.md` | Agent loop, providers, session store |
-| `mcp_server/` | `mcp_server/CLAUDE.md` | 50 OS-control tools, tool registry |
+| `mcp_server/` | `mcp_server/CLAUDE.md` | 50+ OS-control tools, tool registry |
 | `desktop/src/` | `desktop/src/CLAUDE.md` | React UI, IPC event consumers |
 | `desktop/src-tauri/` | `desktop/src-tauri/CLAUDE.md` | Rust shell, subprocess mgmt |
 
@@ -38,9 +38,9 @@ active plan, `docs/ROADMAP_TO_10.md`).
 
 ## Test commands (all four suites — cli/ is a separate crate, easy to forget)
 ```
-python -m pytest tests/            # 927+ Python tests (venv required)
-cd desktop && npx tsc --noEmit && npm run test  # 73 Vitest tests
-cd desktop/src-tauri && cargo test # 54 Rust tests (desktop)
-cd cli && cargo test               # 90 Rust tests (kim CLI)
+python -m pytest tests/            # Python tests (venv required)
+cd desktop && npx tsc --noEmit && npm run test  # Vitest tests
+cd desktop/src-tauri && cargo test # Rust tests (desktop)
+cd cli && cargo test               # Rust tests (kim CLI)
 ```
 After every push, confirm the remote CI run is green: `gh run list --limit 1`.

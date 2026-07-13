@@ -29,13 +29,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import stat
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+
+from cross_platform_helpers import write_python_executable
 
 # Make sure the repo root is importable regardless of cwd
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -150,7 +151,7 @@ class C2HitlStdinTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(bridge_mod._pending_stdin_read)
             # The supervisor answers prompt 2; the parked read delivers it.
             os.write(self._w, b'{"type": "hitl_approve", "approved": true}\n')
-            self.assertTrue(await bridge_mod._await_hitl_decision(timeout=5.0))
+            self.assertTrue(await bridge_mod._await_hitl_decision(timeout=30.0))
             self.assertIsNone(bridge_mod._pending_stdin_read)
 
     async def test_late_decision_for_timed_out_prompt_is_discarded(self):
@@ -165,7 +166,7 @@ class C2HitlStdinTest(unittest.IsolatedAsyncioTestCase):
             # ...so the next prompt must NOT be approved by it; it waits for
             # its own line (a denial here).
             os.write(self._w, b'{"type": "hitl_approve", "approved": false}\n')
-            self.assertFalse(await bridge_mod._await_hitl_decision(timeout=5.0))
+            self.assertFalse(await bridge_mod._await_hitl_decision(timeout=30.0))
 
 
 # ---------------------------------------------------------------------------
@@ -300,13 +301,18 @@ class H3LintAbsolutePathTest(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as td:
             tool_dir = Path(td) / "bin"
             tool_dir.mkdir()
-            fake_ruff = tool_dir / "ruff"
-            fake_ruff.write_text("#!/bin/sh\necho fake-ruff-ran\nexit 0\n")
-            fake_ruff.chmod(fake_ruff.stat().st_mode | stat.S_IEXEC)
+            write_python_executable(
+                tool_dir,
+                "ruff",
+                "import sys\nprint('fake-ruff-ran')\nsys.exit(0)\n",
+            )
             target = Path(td) / "target.py"
-            target.write_text("x = 1\n")
+            target.write_text("x = 1\n", encoding="utf-8")
 
-            env = dict(os.environ, PATH=f"{tool_dir}:{os.environ.get('PATH', '')}")
+            env = dict(
+                os.environ,
+                PATH=os.pathsep.join((str(tool_dir), os.environ.get("PATH", ""))),
+            )
             with patch.dict(os.environ, env, clear=True), \
                     patch.object(code_mod, "validate_path", lambda p: Path(p)):
                 result = await code_mod.handle_lint_file({"path": str(target)})

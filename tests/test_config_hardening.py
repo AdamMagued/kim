@@ -37,21 +37,35 @@ def test_scalar_slash_char_not_present():
     assert non_root[0].name == "passwd"
 
 
-def test_list_allowed_paths_preserved():
-    resolved = cfg._resolve_allowed_paths(["/a", "/b"], Path("/pd"), Path("/pr"))
-    assert Path("/a") in resolved and Path("/b") in resolved
-    assert Path("/pr") in resolved  # project_root always appended
+def test_list_allowed_paths_preserved(tmp_path):
+    project_dir = tmp_path / "config-dir"
+    project_root = tmp_path / "project-root"
+    allowed_a = tmp_path / "allowed-a"
+    allowed_b = tmp_path / "allowed-b"
+    resolved = cfg._resolve_allowed_paths(
+        [str(allowed_a), str(allowed_b)], project_dir, project_root
+    )
+    assert allowed_a.resolve() in resolved and allowed_b.resolve() in resolved
+    assert project_root in resolved  # project_root always appended
 
 
-def test_non_list_shape_falls_back_to_project_root():
-    resolved = cfg._resolve_allowed_paths(5, Path("/pd"), Path("/pr"))
-    assert resolved == [Path("/pr")]
+def test_non_list_shape_falls_back_to_project_root(tmp_path):
+    project_dir = tmp_path / "config-dir"
+    project_root = tmp_path / "project-root"
+    resolved = cfg._resolve_allowed_paths(5, project_dir, project_root)
+    assert resolved == [project_root]
 
 
-def test_non_string_entries_skipped():
-    resolved = cfg._resolve_allowed_paths(["/a", 5, None, "/b"], Path("/pd"), Path("/pr"))
-    assert Path("/a") in resolved and Path("/b") in resolved
-    assert Path("/pr") in resolved
+def test_non_string_entries_skipped(tmp_path):
+    project_dir = tmp_path / "config-dir"
+    project_root = tmp_path / "project-root"
+    allowed_a = tmp_path / "allowed-a"
+    allowed_b = tmp_path / "allowed-b"
+    resolved = cfg._resolve_allowed_paths(
+        [str(allowed_a), 5, None, str(allowed_b)], project_dir, project_root
+    )
+    assert allowed_a.resolve() in resolved and allowed_b.resolve() in resolved
+    assert project_root in resolved
 
 
 # ── 1.4 strict bool coercion (quoted "false" must not become True) ──

@@ -1,7 +1,11 @@
 mod agentic;
 mod commands;
 mod config;
+mod file_refs;
 mod markdown;
+mod oneshot;
+mod paint;
+mod pickers;
 mod provider;
 mod repl_turn;
 use repl_turn::consume_turn_events;
@@ -16,11 +20,11 @@ use commands::{
     command_summary, handle_command, login_with_key, CommandOutcome, SUPPORTED_COMMANDS,
 };
 use config::KimConfig;
-use crossterm::cursor::{MoveToColumn, MoveUp};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::execute;
-use crossterm::style::{Color as TerminalColor, Stylize};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
+use file_refs::prompt_with_file_references;
+pub(crate) use file_refs::split_shellish_tokens;
+use oneshot::{help_text, parse_cli_args, run_oneshot, CliCommand};
+use paint::{kim_accent_color, paint_bold, paint_dim, paint_text, print_message, print_note};
+use pickers::{choose_model_interactively, choose_session_interactively};
 use provider::{provider_info, stream_kim_request, AppEvent, ChatMessage};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -62,115 +66,6 @@ impl AppMode {
 pub enum ViewState {
     SessionMenu,
     InChat,
-}
-
-#[derive(Debug)]
-enum CliCommand {
-    ShowHelp,
-    ShowVersion,
-    /// `kim doctor` health check. `strict` (from `--strict`) makes optional,
-    /// provider-specific check failures gate the exit code too. (F-E-1)
-    Doctor {
-        strict: bool,
-    },
-    Oneshot {
-        mode: AppMode,
-        prompt: Option<String>,
-    },
-    Repl {
-        resume_id: Option<String>,
-    },
-    /// #6: a CLI flag was given but is malformed (currently only a bare
-    /// trailing `--resume`). Carries the message to print to stderr before
-    /// exiting non-zero — never silently falls through to a fresh session.
-    UsageError(String),
-}
-
-fn parse_cli_args(args: &[String]) -> CliCommand {
-    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
-        return CliCommand::ShowHelp;
-    }
-    if args
-        .iter()
-        .any(|a| matches!(a.as_str(), "--version" | "-V"))
-    {
-        return CliCommand::ShowVersion;
-    }
-    match args.first().map(String::as_str) {
-        // Bare `kim` opens the interactive REPL.
-        None => CliCommand::Repl { resume_id: None },
-        Some("doctor") => match args.get(1).map(String::as_str) {
-            None => CliCommand::Doctor { strict: false },
-            // F-E-1: `--strict` gates the exit code on provider-specific checks
-            // too (for CI / install scripts).
-            Some("--strict") => {
-                if let Some(extra) = args.get(2) {
-                    return CliCommand::UsageError(format!(
-                        "kim doctor: unexpected argument '{extra}'. Usage: kim doctor [--strict]"
-                    ));
-                }
-                CliCommand::Doctor { strict: true }
-            }
-            // doctor takes no other arguments; an extra token is a typo, not a
-            // silent no-op. (F-E-2)
-            Some(extra) => CliCommand::UsageError(format!(
-                "kim doctor: unexpected argument '{extra}'. Usage: kim doctor [--strict]"
-            )),
-        },
-        Some(sub @ "chat") | Some(sub @ "code") => {
-            let rest = &args[1..];
-            // F-E-2: `kim chat --resume abc` used to treat `--resume abc` as
-            // prompt text and send it to the model. A leading option after the
-            // subcommand is a mistake — reject it instead of silently turning
-            // the user's intent into a prompt.
-            if let Some(first) = rest.first() {
-                if first.starts_with('-') {
-                    return CliCommand::UsageError(format!(
-                        "kim {sub}: unexpected option '{first}'. Usage: kim {sub} <prompt...>"
-                    ));
-                }
-            }
-            let mode = if sub == "code" {
-                AppMode::Code
-            } else {
-                AppMode::Chat
-            };
-            let prompt = if rest.is_empty() {
-                None
-            } else {
-                Some(rest.join(" "))
-            };
-            CliCommand::Oneshot { mode, prompt }
-        }
-        // `kim --resume <id>` resumes an existing session in the REPL. The id
-        // is required (#6: a bare trailing `--resume` is a usage error, never a
-        // silent new session).
-        Some("--resume") => match args.get(1) {
-            Some(value) => {
-                if let Some(extra) = args.get(2) {
-                    return CliCommand::UsageError(format!(
-                        "kim --resume: unexpected argument '{extra}'. \
-                         Usage: kim --resume <id|latest>"
-                    ));
-                }
-                CliCommand::Repl {
-                    resume_id: Some(value.clone()),
-                }
-            }
-            None => CliCommand::UsageError(
-                "kim --resume: missing session id. Usage: kim --resume <id|latest>".to_string(),
-            ),
-        },
-        // F-E-2: anything else — an unknown flag (`--continue`, a typo'd
-        // `--resum`), or an unknown bare subcommand (`resume`, `login`) — used
-        // to fall through to a brand-new REPL session, silently discarding the
-        // user's intent and scattering a fresh session file. Reject it (exit 2)
-        // the same way `--resume`-without-value is rejected.
-        Some(other) => CliCommand::UsageError(format!(
-            "kim: unknown command '{other}'.\n\
-             Usage: kim [chat|code <prompt>] | kim doctor | kim --resume <id> | kim --help"
-        )),
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /* ===========================================================
-One-shot commands: kim chat <prompt> / kim code <prompt>
+Claude-style prompt loop
 =========================================================== */
 
 /// F-E-14: which providers may run in code mode. Codex only has two backends
@@ -437,35 +332,6 @@ fn code_mode_denied_reason(provider: &str) -> Option<String> {
          or a browser provider. Switch first: /provider ollama  (or e.g. /provider browser:chatgpt)."
     ))
 }
-
-async fn run_oneshot(mode: AppMode, prompt: String) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new(KimConfig::load(), None);
-    app.provider_ready = provider_is_ready(&app.config);
-
-    if mode == AppMode::Code {
-        if let Some(reason) = code_mode_denied_reason(&app.config.provider) {
-            eprintln!("{reason}");
-            std::process::exit(2);
-        }
-    }
-
-    app.set_mode(mode);
-    stream_repl_turn(&mut app, prompt).await?;
-
-    if app
-        .messages
-        .last()
-        .is_some_and(|m| m.role == MessageRole::Error)
-    {
-        std::process::exit(1);
-    }
-
-    Ok(())
-}
-
-/* ===========================================================
-Claude-style prompt loop
-=========================================================== */
 
 async fn run_repl(resume_id: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     let mut app = App::new(KimConfig::load(), resume_id);
@@ -676,330 +542,6 @@ fn repl_prompt(app: &App) -> String {
     } else {
         paint_bold("> ", kim_accent_color())
     }
-}
-
-fn colors_enabled() -> bool {
-    stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-}
-
-fn kim_accent_color() -> TerminalColor {
-    TerminalColor::Rgb {
-        r: 0xe8,
-        g: 0xb8,
-        b: 0x9a,
-    }
-}
-
-fn kim_dim_color() -> TerminalColor {
-    TerminalColor::Grey
-}
-
-fn paint_text(text: &str) -> String {
-    text.to_string()
-}
-
-fn paint_dim(text: &str) -> String {
-    paint(text, kim_dim_color())
-}
-
-fn paint_bold(text: &str, color: TerminalColor) -> String {
-    if colors_enabled() {
-        format!("{}", text.with(color).bold())
-    } else {
-        text.to_string()
-    }
-}
-
-fn paint(text: &str, color: TerminalColor) -> String {
-    if colors_enabled() {
-        format!("{}", text.with(color))
-    } else {
-        text.to_string()
-    }
-}
-
-struct RawModeGuard;
-
-impl RawModeGuard {
-    fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        Ok(Self)
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-    }
-}
-
-fn choose_model_interactively(
-    app: &mut App,
-    options: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
-    if options.is_empty() {
-        print_model_options(&app.config.model, options);
-        return Ok(());
-    }
-
-    let mut selected = options
-        .iter()
-        .position(|model| model == &app.config.model)
-        .unwrap_or(0);
-    let mut out = stdout();
-    let _raw_mode = RawModeGuard::enter()?;
-    let mut rendered_lines = render_model_picker(&mut out, options, selected, &app.config.model)?;
-
-    loop {
-        match event::read()? {
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                match key.code {
-                    KeyCode::Up => {
-                        selected = selected.saturating_sub(1);
-                        rendered_lines = rerender_model_picker(
-                            &mut out,
-                            rendered_lines,
-                            options,
-                            selected,
-                            &app.config.model,
-                        )?;
-                    }
-                    KeyCode::Down => {
-                        selected = selected
-                            .saturating_add(1)
-                            .min(options.len().saturating_sub(1));
-                        rendered_lines = rerender_model_picker(
-                            &mut out,
-                            rendered_lines,
-                            options,
-                            selected,
-                            &app.config.model,
-                        )?;
-                    }
-                    KeyCode::Enter => {
-                        clear_rendered_lines(&mut out, rendered_lines)?;
-                        let model = options[selected].clone();
-                        app.config.model = model.clone();
-                        let note = match app.config.save() {
-                            Ok(()) => format!("model -> {model}"),
-                            Err(error) => {
-                                format!("model -> {model}\nWarning: config was not saved: {error}")
-                            }
-                        };
-                        drop(_raw_mode);
-                        print_note(&note);
-                        return Ok(());
-                    }
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        clear_rendered_lines(&mut out, rendered_lines)?;
-                        drop(_raw_mode);
-                        print_note("model unchanged");
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn rerender_model_picker(
-    out: &mut impl Write,
-    rendered_lines: u16,
-    options: &[String],
-    selected: usize,
-    current: &str,
-) -> io::Result<u16> {
-    clear_rendered_lines(out, rendered_lines)?;
-    render_model_picker(out, options, selected, current)
-}
-
-fn clear_rendered_lines(out: &mut impl Write, rendered_lines: u16) -> io::Result<()> {
-    if rendered_lines > 0 {
-        execute!(
-            out,
-            MoveUp(rendered_lines),
-            MoveToColumn(0),
-            Clear(ClearType::FromCursorDown)
-        )?;
-    }
-    out.flush()
-}
-
-fn raw_writeln(out: &mut impl Write, line: &str) -> io::Result<()> {
-    write!(out, "{line}\r\n")
-}
-
-fn render_model_picker(
-    out: &mut impl Write,
-    options: &[String],
-    selected: usize,
-    current: &str,
-) -> io::Result<u16> {
-    let max_visible = 12usize;
-    let half = max_visible / 2;
-    let start = selected
-        .saturating_sub(half)
-        .min(options.len().saturating_sub(max_visible));
-    let end = options.len().min(start + max_visible);
-    let mut lines = 0u16;
-
-    raw_writeln(
-        out,
-        &paint_bold("Choose model (Up/Down, Enter, Esc)", kim_accent_color()),
-    )?;
-    lines += 1;
-
-    if start > 0 {
-        raw_writeln(out, &format!("  {}", paint_dim("...")))?;
-        lines += 1;
-    }
-
-    for (index, model) in options.iter().enumerate().take(end).skip(start) {
-        let pointer = if index == selected { ">" } else { " " };
-        let active = if model == current { " current" } else { "" };
-        let line = format!("{pointer} {model}{active}");
-        if index == selected {
-            raw_writeln(out, &paint_bold(&line, kim_accent_color()))?;
-        } else {
-            raw_writeln(out, &line)?;
-        }
-        lines += 1;
-    }
-
-    if end < options.len() {
-        raw_writeln(out, &format!("  {}", paint_dim("...")))?;
-        lines += 1;
-    }
-
-    raw_writeln(out, &paint_dim("q or Esc cancels"))?;
-    lines += 1;
-    out.flush()?;
-    Ok(lines)
-}
-
-fn choose_session_interactively(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
-    app.refresh_sessions();
-    if app.sessions.is_empty() {
-        print_note("No saved sessions yet. Keep typing to chat here.");
-        return Ok(());
-    }
-
-    let mut selected = 0usize;
-    let mut out = stdout();
-    let _raw_mode = RawModeGuard::enter()?;
-    let mut rendered_lines = render_session_picker(&mut out, app, selected)?;
-
-    loop {
-        match event::read()? {
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                match key.code {
-                    KeyCode::Up => {
-                        selected = selected.saturating_sub(1);
-                        rendered_lines =
-                            rerender_session_picker(&mut out, rendered_lines, app, selected)?;
-                    }
-                    KeyCode::Down => {
-                        selected = selected.saturating_add(1).min(app.sessions.len());
-                        rendered_lines =
-                            rerender_session_picker(&mut out, rendered_lines, app, selected)?;
-                    }
-                    KeyCode::Enter => {
-                        clear_rendered_lines(&mut out, rendered_lines)?;
-                        if selected == 0 {
-                            drop(_raw_mode);
-                            print_note("staying in current chat");
-                            return Ok(());
-                        }
-                        let session = app.sessions[selected - 1].clone();
-                        drop(_raw_mode);
-                        match load_session_messages(&session.path) {
-                            Ok(messages) => {
-                                app.messages = messages;
-                                app.current_session_id = session.id.clone();
-                                app.view = ViewState::InChat;
-                                print_note(&format!("opened {}", session.label));
-                                print_recent_transcript(app);
-                            }
-                            Err(error) => print_message(&UiMessage {
-                                role: MessageRole::Error,
-                                content: error,
-                                timestamp_ms: None,
-                            }),
-                        }
-                        return Ok(());
-                    }
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        clear_rendered_lines(&mut out, rendered_lines)?;
-                        drop(_raw_mode);
-                        print_note("staying in current chat");
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn rerender_session_picker(
-    out: &mut impl Write,
-    rendered_lines: u16,
-    app: &App,
-    selected: usize,
-) -> io::Result<u16> {
-    clear_rendered_lines(out, rendered_lines)?;
-    render_session_picker(out, app, selected)
-}
-
-fn render_session_picker(out: &mut impl Write, app: &App, selected: usize) -> io::Result<u16> {
-    let max_visible = 12usize;
-    let half = max_visible / 2;
-    let item_count = app.sessions.len().saturating_add(1);
-    let start = selected
-        .saturating_sub(half)
-        .min(item_count.saturating_sub(max_visible));
-    let end = item_count.min(start + max_visible);
-    let mut lines = 0u16;
-
-    raw_writeln(
-        out,
-        &paint_bold("Choose session (Up/Down, Enter, Esc)", kim_accent_color()),
-    )?;
-    lines += 1;
-    raw_writeln(out, &paint_dim("Esc or q keeps you in the current chat."))?;
-    lines += 1;
-
-    if start > 0 {
-        raw_writeln(out, &format!("  {}", paint_dim("...")))?;
-        lines += 1;
-    }
-
-    for index in start..end {
-        let pointer = if index == selected { ">" } else { " " };
-        let line = if index == 0 {
-            format!("{pointer} Continue current chat")
-        } else {
-            let session = &app.sessions[index - 1];
-            format!("{pointer} {} ({})", session.label, session.id)
-        };
-        if index == selected {
-            raw_writeln(out, &paint_bold(&line, kim_accent_color()))?;
-        } else {
-            raw_writeln(out, &line)?;
-        }
-        lines += 1;
-    }
-
-    if end < item_count {
-        raw_writeln(out, &format!("  {}", paint_dim("...")))?;
-        lines += 1;
-    }
-
-    out.flush()?;
-    Ok(lines)
 }
 
 async fn handle_repl_input(
@@ -1381,34 +923,6 @@ fn print_recent_transcript(app: &App) {
     }
 }
 
-fn print_message(message: &UiMessage) {
-    let label = match message.role {
-        MessageRole::User => "You",
-        MessageRole::Assistant => "Kim",
-        MessageRole::System => "Note",
-        MessageRole::Error => "Error",
-        MessageRole::Reasoning => "Thinking",
-    };
-    for (index, line) in message.content.lines().enumerate() {
-        if index == 0 {
-            println!(
-                "{} {}",
-                paint_bold(&format!("{label}:"), kim_accent_color()),
-                paint_text(line)
-            );
-        } else {
-            println!("{}  {}", " ".repeat(label.len()), paint_text(line));
-        }
-    }
-    if message.content.lines().next().is_none() {
-        println!("{}", paint_bold(&format!("{label}:"), kim_accent_color()));
-    }
-}
-
-fn print_note(message: &str) {
-    println!("{}", paint_dim(message));
-}
-
 fn print_session_list(sessions: &[SessionEntry]) {
     if sessions.is_empty() {
         println!("{}", paint_dim("No saved sessions yet."));
@@ -1538,125 +1052,8 @@ fn compact_app_messages(app: &mut App) {
 }
 
 /* ===========================================================
-file reference helpers
-=========================================================== */
-
-fn prompt_with_file_references(input: &str) -> String {
-    let file_paths = prompt_file_references(input);
-    if file_paths.is_empty() {
-        return input.to_string();
-    }
-    let mut prompt = input.trim().to_string();
-    prompt.push_str("\n\nReferenced local files Kim may access:");
-    for path in file_paths {
-        prompt.push_str("\n- ");
-        prompt.push_str(&path.display().to_string());
-    }
-    prompt.push_str("\n\nUse these file paths directly when reading or inspecting attachments.");
-    prompt
-}
-
-fn prompt_file_references(input: &str) -> Vec<PathBuf> {
-    let mut paths = split_shellish_tokens(input)
-        .into_iter()
-        .filter_map(|token| normalize_existing_path(&token))
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
-fn normalize_existing_path(token: &str) -> Option<PathBuf> {
-    let trimmed = token
-        .trim()
-        .trim_matches(|ch| matches!(ch, '\'' | '"' | '`' | ',' | ';'));
-    if trimmed.is_empty() {
-        return None;
-    }
-    // A19: don't match innocent words. Require a path-ish token (a separator, a
-    // dot, or ~) and never treat a bare "." / ".." as a reference.
-    if trimmed == "." || trimmed == ".." {
-        return None;
-    }
-    let path_ish = trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains('.')
-        || trimmed.starts_with('~');
-    if !path_ish {
-        return None;
-    }
-    let expanded = if trimmed == "~" {
-        dirs::home_dir()?
-    } else if let Some(rest) = trimmed.strip_prefix("~/") {
-        dirs::home_dir()?.join(rest)
-    } else {
-        PathBuf::from(trimmed)
-    };
-    let candidate = if expanded.is_absolute() {
-        expanded
-    } else {
-        std::env::current_dir().ok()?.join(expanded)
-    };
-    if !candidate.exists() {
-        return None;
-    }
-    let canonical = std::fs::canonicalize(&candidate).ok()?;
-    // A19: never reference the current working directory itself.
-    if let Ok(cwd) = std::env::current_dir() {
-        if std::fs::canonicalize(&cwd).ok().as_deref() == Some(canonical.as_path()) {
-            return None;
-        }
-    }
-    Some(canonical)
-}
-
-pub(crate) fn split_shellish_tokens(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if chars
-                .peek()
-                .is_some_and(|next| next.is_whitespace() || matches!(*next, '\'' | '"'))
-            {
-                current.push(chars.next().expect("peeked character must exist"));
-            } else {
-                // Preserve Windows path separators (for example C:\\Users).
-                current.push(ch);
-            }
-            continue;
-        }
-        if quote == Some(ch) {
-            quote = None;
-            continue;
-        }
-        if quote.is_none() && matches!(ch, '\'' | '"') {
-            quote = Some(ch);
-            continue;
-        }
-        if quote.is_none() && ch.is_whitespace() {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-        current.push(ch);
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-/* ===========================================================
 misc helpers
 =========================================================== */
-
-fn help_text() -> &'static str {
-    "Kim terminal CLI\n\nUsage:\n  kim                      Launch the interactive chat/code REPL\n  kim chat <prompt...>     Send one prompt in chat mode and exit\n  kim code <prompt...>     Send one prompt in code-agent mode and exit\n  kim doctor               Check install, providers, desktop bridge, and code mode\n  kim doctor --strict      Same, but exit non-zero on any failed check (CI)\n  kim --resume <id>        Resume a Kim session in the REPL\n  kim --resume latest      Resume the newest saved session\n  kim --help               Show this help\n  kim --version            Show the version\n\nPipe a prompt via stdin:\n  echo 'explain this' | kim chat\n  echo 'fix the build' | kim code\n\nInside Kim, type /help for commands and /login to connect a provider."
-}
 
 fn new_session_id() -> String {
     // Include PID so two `kim` processes that start within the same millisecond
@@ -1682,10 +1079,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        code_mode_denied_reason, consume_turn_events, new_session_id, parse_cli_args,
-        prompt_file_references, prompt_with_file_references, provider_is_ready,
-        provider_is_ready_with_env, split_shellish_tokens, App, AppEvent, AppMode, CliCommand,
-        MessageRole, ViewState,
+        code_mode_denied_reason, consume_turn_events, new_session_id, provider_is_ready,
+        provider_is_ready_with_env, App, AppEvent, AppMode, MessageRole, ViewState,
     };
     use crate::config::KimConfig;
     use std::path::{Path, PathBuf};
@@ -1768,7 +1163,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
         // One partial chunk arrives, then the cancel fires (biased select drains
         // the ready chunk first, then takes the cancel branch).
-        tx.send(AppEvent::TextChunk("partial answer".to_string())).unwrap();
+        tx.send(AppEvent::TextChunk("partial answer".to_string()))
+            .unwrap();
 
         consume_turn_events(
             &mut app,
@@ -2045,72 +1441,19 @@ mod tests {
         assert_eq!(hist[0].content.chars().next(), Some('c'));
     }
 
-    // ── A19: file-reference detector ────────────────────────────────────────
-
-    #[test]
-    fn file_refs_ignore_bare_dot_and_plain_words() {
-        assert!(prompt_file_references("what is .").is_empty());
-        assert!(prompt_file_references("tell me about cargo").is_empty());
-    }
-
-    #[test]
-    fn file_refs_match_pathish_existing_file() {
-        let path = std::env::temp_dir().join(format!(
-            "kim-ref-{}.txt",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::write(&path, "x").unwrap();
-        // Use forward slashes — split_shellish_tokens treats `\` as an escape, so
-        // a Windows backslash path would be mangled (a real cross-platform gap in
-        // the tokenizer, separate from A19's matching gate).
-        let token = path.to_string_lossy().replace('\\', "/");
-        let refs = prompt_file_references(&format!("inspect {token}"));
-        let _ = fs::remove_file(&path);
-        assert!(refs
-            .iter()
-            .any(|p| p.to_string_lossy().contains("kim-ref-")));
-    }
-
-    #[test]
-    fn splits_dragged_paths_with_escaped_spaces() {
-        let tokens = split_shellish_tokens(r#"please inspect /tmp/my\ file.png "and this.txt""#);
-        assert_eq!(
-            tokens,
-            vec!["please", "inspect", "/tmp/my file.png", "and this.txt"]
-        );
-    }
-
-    #[test]
-    fn prompt_adds_existing_file_references() {
-        let path = std::env::temp_dir().join(format!(
-            "kim-cli-attach-{}.txt",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock should be after epoch")
-                .as_nanos()
-        ));
-        fs::write(&path, "hello").expect("fixture should write");
-        let prompt = prompt_with_file_references(&format!("read {}", path.display()));
-        let _ = fs::remove_file(&path);
-        assert!(prompt.contains("Referenced local files Kim may access:"));
-        assert!(prompt.contains("kim-cli-attach-"));
-    }
-
-    #[test]
-    fn ignores_missing_file_references() {
-        let paths = prompt_file_references("/definitely/not/a/kim/file.png");
-        assert!(paths.is_empty());
-    }
-
     // ── F-E-14: code-mode provider gate ──────────────────────────────────────
 
     #[test]
     fn code_mode_allows_only_ollama_and_browser() {
         // Allowed: the two real codex backends (+ empty → ollama).
-        for ok in ["ollama", "ollama-cloud", "", "browser", "browser:chatgpt", "BROWSER:Claude"] {
+        for ok in [
+            "ollama",
+            "ollama-cloud",
+            "",
+            "browser",
+            "browser:chatgpt",
+            "BROWSER:Claude",
+        ] {
             assert!(
                 code_mode_denied_reason(ok).is_none(),
                 "code mode must allow {ok:?}"
@@ -2125,217 +1468,6 @@ mod tests {
                 reason.contains(bad) && reason.contains("ollama"),
                 "rejection for {bad:?} should name the provider and the fix; got: {reason}"
             );
-        }
-    }
-
-    // ── parse_cli_args tests ──────────────────────────────────────────────────
-
-    fn args(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn parse_args_empty_launches_repl() {
-        let cmd = parse_cli_args(&args(&[]));
-        assert!(matches!(cmd, CliCommand::Repl { resume_id: None }));
-    }
-
-    #[test]
-    fn parse_args_help_flags() {
-        for flag in &["--help", "-h"] {
-            let cmd = parse_cli_args(&args(&[flag]));
-            assert!(
-                matches!(cmd, CliCommand::ShowHelp),
-                "{flag} should show help"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_args_version_flags() {
-        for flag in &["--version", "-V"] {
-            let cmd = parse_cli_args(&args(&[flag]));
-            assert!(
-                matches!(cmd, CliCommand::ShowVersion),
-                "{flag} should show version"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_args_doctor() {
-        let cmd = parse_cli_args(&args(&["doctor"]));
-        assert!(matches!(cmd, CliCommand::Doctor { strict: false }));
-    }
-
-    // F-E-1: `kim doctor --strict` parses to the strict health check.
-    #[test]
-    fn parse_args_doctor_strict() {
-        let cmd = parse_cli_args(&args(&["doctor", "--strict"]));
-        assert!(matches!(cmd, CliCommand::Doctor { strict: true }));
-    }
-
-    #[test]
-    fn parse_args_chat_with_prompt() {
-        let cmd = parse_cli_args(&args(&["chat", "hello", "world"]));
-        match cmd {
-            CliCommand::Oneshot {
-                mode: AppMode::Chat,
-                prompt: Some(p),
-            } => assert_eq!(p, "hello world"),
-            other => panic!("expected Oneshot Chat, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_args_code_with_prompt() {
-        let cmd = parse_cli_args(&args(&["code", "fix", "this", "bug"]));
-        match cmd {
-            CliCommand::Oneshot {
-                mode: AppMode::Code,
-                prompt: Some(p),
-            } => assert_eq!(p, "fix this bug"),
-            other => panic!("expected Oneshot Code, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_args_chat_no_prompt_is_none() {
-        let cmd = parse_cli_args(&args(&["chat"]));
-        assert!(matches!(
-            cmd,
-            CliCommand::Oneshot {
-                mode: AppMode::Chat,
-                prompt: None
-            }
-        ));
-    }
-
-    #[test]
-    fn parse_args_code_no_prompt_is_none() {
-        let cmd = parse_cli_args(&args(&["code"]));
-        assert!(matches!(
-            cmd,
-            CliCommand::Oneshot {
-                mode: AppMode::Code,
-                prompt: None
-            }
-        ));
-    }
-
-    #[test]
-    fn parse_args_resume_with_id() {
-        let cmd = parse_cli_args(&args(&["--resume", "session-1234"]));
-        match cmd {
-            CliCommand::Repl {
-                resume_id: Some(id),
-            } => assert_eq!(id, "session-1234"),
-            other => panic!("expected Repl with resume_id, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_args_resume_latest() {
-        let cmd = parse_cli_args(&args(&["--resume", "latest"]));
-        match cmd {
-            CliCommand::Repl {
-                resume_id: Some(id),
-            } => assert_eq!(id, "latest"),
-            other => panic!("expected Repl with resume_id=latest, got {other:?}"),
-        }
-    }
-
-    // F-E-2: an unknown flag no longer silently opens a fresh REPL — it is a
-    // usage error (exit 2), so a typo can't scatter a new session file.
-    #[test]
-    fn parse_args_unknown_flag_is_usage_error() {
-        let cmd = parse_cli_args(&args(&["--unknown-flag"]));
-        match cmd {
-            CliCommand::UsageError(message) => assert!(
-                message.contains("--unknown-flag"),
-                "usage error should name the offending flag, got: {message}"
-            ),
-            other => panic!("expected UsageError for an unknown flag, got {other:?}"),
-        }
-    }
-
-    // F-E-2: an unknown bare subcommand (e.g. `kim login`, or `kim resume
-    // latest` with the dashes dropped) is a usage error, not a silent new REPL.
-    #[test]
-    fn parse_args_unknown_subcommand_is_usage_error() {
-        for argv in [
-            vec!["login"],
-            vec!["resume", "latest"],
-            vec!["--continue"],
-            vec!["--resum", "latest"],
-        ] {
-            let cmd = parse_cli_args(&args(&argv));
-            assert!(
-                matches!(cmd, CliCommand::UsageError(_)),
-                "{argv:?} should be a UsageError, got {cmd:?}"
-            );
-        }
-    }
-
-    // F-E-2: `kim chat --resume abc` must not be sent to the model as the
-    // literal prompt "--resume abc"; a leading option is a usage error.
-    #[test]
-    fn parse_args_chat_leading_option_is_usage_error() {
-        let cmd = parse_cli_args(&args(&["chat", "--resume", "abc"]));
-        match cmd {
-            CliCommand::UsageError(message) => assert!(
-                message.contains("--resume"),
-                "usage error should name the offending option, got: {message}"
-            ),
-            other => panic!("expected UsageError, got {other:?}"),
-        }
-    }
-
-    // F-E-2: extra tokens after `kim doctor` / `kim --resume <id>` are rejected
-    // rather than ignored.
-    #[test]
-    fn parse_args_trailing_garbage_is_usage_error() {
-        assert!(matches!(
-            parse_cli_args(&args(&["doctor", "--json"])),
-            CliCommand::UsageError(_)
-        ));
-        assert!(matches!(
-            parse_cli_args(&args(&["--resume", "abc", "def"])),
-            CliCommand::UsageError(_)
-        ));
-    }
-
-    // ── #6: trailing `--resume` with no value is a usage error, not a silent
-    // new session ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_args_resume_with_no_value_is_usage_error() {
-        let cmd = parse_cli_args(&args(&["--resume"]));
-        match cmd {
-            CliCommand::UsageError(message) => {
-                assert!(
-                    message.contains("--resume"),
-                    "usage error should mention --resume, got: {message}"
-                );
-            }
-            other => panic!("expected UsageError for trailing --resume, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_args_no_resume_flag_is_still_a_plain_repl() {
-        let cmd = parse_cli_args(&args(&[]));
-        assert!(matches!(cmd, CliCommand::Repl { resume_id: None }));
-    }
-
-    #[test]
-    fn parse_args_chat_prompt_is_joined_with_spaces() {
-        let cmd = parse_cli_args(&args(&["chat", "one", "two", "three"]));
-        match cmd {
-            CliCommand::Oneshot {
-                prompt: Some(p), ..
-            } => assert_eq!(p, "one two three"),
-            other => panic!("unexpected {other:?}"),
         }
     }
 

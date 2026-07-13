@@ -249,21 +249,26 @@ class TestArgvRuleTable:
             d = enforce("run_command", {"cmd": f"git {sub}"})
             assert d.action == "allow", f"git {sub} should not prompt"
 
-    def test_config_allowlist_extra_extends_the_allowlist(self, monkeypatch):
+    def test_config_allowlist_extra_extends_the_allowlist(self, monkeypatch, tmp_path):
         d = enforce("run_command", {"cmd": "mytool --version"})
-        assert d.action == "approve"  # unknown binary
+        assert d.action == "approve"  # unknown binary, not on PATH
+        # An allowlisted name still escalates unless it resolves through PATH
+        # (untrusted-location rule). Prove the config extension end to end with
+        # a hermetic binary on a temp PATH entry — never a machine-dependent
+        # one like osascript, which only exists on macOS.
+        if os.name == "nt":
+            exe = tmp_path / "mytool.bat"
+            exe.write_text("@echo off\r\n")
+        else:
+            exe = tmp_path / "mytool"
+            exe.write_text("#!/bin/sh\nexit 0\n")
+            exe.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
         monkeypatch.setattr(
             policy, "get_config",
-            lambda: {"shell": {"allowlist_extra": ["mytool"]}},
+            lambda: {"shell": {"safe_extra": ["mytool"]}},
         )
-        # still escalated if the binary can't be resolved on PATH; an
-        # allowlisted name resolved through PATH would be trusted. Use a real
-        # binary name to prove the extension works end to end.
-        monkeypatch.setattr(
-            policy, "get_config",
-            lambda: {"shell": {"safe_extra": ["osascript"]}},
-        )
-        d = enforce("run_command", {"cmd": "osascript -e 'return 1'"})
+        d = enforce("run_command", {"cmd": "mytool --version"})
         assert d.action == "allow"
 
     def test_run_powershell_is_threshold_gated(self, monkeypatch):

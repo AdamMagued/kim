@@ -1,3 +1,5 @@
+> **Archived snapshot — hand-maintained file map, last rebuilt 2026-06-29 (commit 394363c). Stale by design: do NOT trust it for current structure; read the code or regenerate. Retained for provenance.**
+
 # repomap.md — Kim Agent Platform
 
 > **What this is.** A complete, file-by-file map of the Kim codebase — the fast way to find the right file without grepping the whole tree. It is a *file map*, not an architecture narrative: for the layer diagram, IPC protocol, and end-to-end flows, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For a machine-queryable knowledge graph of the code (functions, imports, call edges), see `graphify-out/` (`graph.json` + `GRAPH_REPORT.md`).

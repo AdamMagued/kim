@@ -24,7 +24,7 @@ active plan, `docs/ROADMAP_TO_10.md`).
 | Directory | Guide | What's there |
 |---|---|---|
 | `orchestrator/` | `orchestrator/CLAUDE.md` | Agent loop, providers, session store |
-| `mcp_server/` | `mcp_server/CLAUDE.md` | 50 OS-control tools, tool registry |
+| `mcp_server/` | `mcp_server/CLAUDE.md` | 50+ OS-control tools, tool registry |
 | `desktop/src/` | `desktop/src/CLAUDE.md` | React UI, IPC event consumers |
 | `desktop/src-tauri/` | `desktop/src-tauri/CLAUDE.md` | Rust shell, subprocess mgmt |
 

@@ -1,3 +1,5 @@
+> **Archived** — historical document retained for provenance; not maintained. For current plans and repo structure see ROADMAP.md and the living docs at the repo root.
+
 # Kim — Agent Harness Roadmap
 
 Prioritized roadmap for the Python orchestrator, MCP server, and Codex bridge

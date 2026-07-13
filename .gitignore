@@ -88,3 +88,4 @@ graphify-out/
 .coverage
 .coverage.*
 htmlcov/
+coverage.json

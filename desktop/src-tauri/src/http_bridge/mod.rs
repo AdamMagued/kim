@@ -17,6 +17,11 @@ mod results;
 mod session_meta;
 mod tasks;
 
+// F-H-9 (issue #56-H): route × auth regression matrix. Test-only; see
+// auth_matrix_tests.rs for the full route table and exhaustiveness guard.
+#[cfg(test)]
+mod auth_matrix_tests;
+
 use std::sync::atomic::Ordering;
 
 use tauri::Manager;

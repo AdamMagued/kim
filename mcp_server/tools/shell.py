@@ -28,6 +28,7 @@ from mcp_server.os_utils import (
     minimal_subprocess_env,
     translate_command,
 )
+from mcp_server.policy_platform import _with_windows_env_aliases
 from mcp_server.tools._errors import tool_error
 
 logger = logging.getLogger(__name__)
@@ -485,13 +486,12 @@ def _check_exec_capable_binary(command_tokens: list[str]) -> str | None:
 def _filtered_env() -> dict[str, str]:
     """Return the minimal allowlist env for non-sandbox subprocess runs (S4).
 
-    Historically this was the full parent env minus _DANGEROUS_ENV_VARS; that
-    still leaked every provider API key and token in the parent process to
+    The old denylist-based copy leaked provider API keys and tokens to
     the child. It is now a positive allowlist (PATH/HOME/locale/display —
     see os_utils.minimal_subprocess_env), so injection vectors AND secrets
     are excluded by construction.
     """
-    return minimal_subprocess_env()
+    return _with_windows_env_aliases(minimal_subprocess_env())
 
 
 def _sandbox_enabled() -> bool:

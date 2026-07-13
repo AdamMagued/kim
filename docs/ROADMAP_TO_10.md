@@ -6,6 +6,9 @@ robustness 7, docs 6 (full assessment recorded in the session audit; the worst/b
 summarized inline below).
 **Companion docs:** `docs/PROPOSAL_codex_appserver_parity.md` (Phase 3 uses it as-is),
 `docs/APPENDIX_appserver_probe_findings.md`.
+**Execution state:** tracked in `docs/ROADMAP_PROGRESS.md` — as of 2026-07-06 Phases 0–2 are
+done and Phase 3 is code-complete there; check it before treating any backlog row below as
+pending (this file is the plan snapshot, not the progress ledger).
 
 An executable improvement program grounded in the actual code. Every item carries file:line
 evidence, an effort tag (S ≤0.5d, M ~1–2d, L ~3–5d agent-days), and the score delta it buys.
@@ -49,7 +52,7 @@ MCP tools (`tool_tiers.py`).
 | **A3** Unify the two spawn paths behind one `TaskRuntime` owner | `subprocess.rs:send_task` (GUI) vs `http_bridge.rs:1128` (`/v1/task`) duplicate reservation/env/HITL; `task_runtime.rs` already exists as the seam | **M** | +0.3 |
 | **A4** Split `provider.rs` (2246 lines) — separate the browser route (`stream_codex_subprocess`) from the local-ollama route (`start_responses_proxy` + embedded `responses_proxy.py`) | `cli/src/provider.rs:934-1105` and `1260-1379` are two unrelated proxies in one file | **M** | +0.3 |
 | **A5** Adjudicate dormant subsystems (product decision, REFACTOR R-7) | `relay_server/` (RELAY_ENABLED=false, deployable attack surface), voice scaffold, ~25/82 Rust commands with no UI caller, vendored `pythonExperimentTool/claw-code` | **S** (decision) / **M** (removal) | +0.2 |
-| **A6** Flip `ipc_protocol` default to typed `kim:*` (R-2, pairs with A2) | REFACTOR_ROADMAP R-2; requires live-app verification | **S** | +0.2 |
+| **A6** Flip `ipc_protocol` default to typed `kim:*` (R-2, pairs with A2) *[shipped in Phase 2 — default is already `typed` (`config.rs default_ipc_protocol()`); see ROADMAP_PROGRESS.md "A6 / R-2"; live-app verification still outstanding]* | REFACTOR_ROADMAP R-2; requires live-app verification | **S** | +0.2 |
 
 **Ceiling note:** architecture can reach 9. The last point (→10) requires the app-server
 migration (Phase 3), which structurally fixes the "spawn a fresh Codex per message that forgets

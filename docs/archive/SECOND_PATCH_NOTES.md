@@ -1,3 +1,5 @@
+> **Archived** — historical document retained for provenance; not maintained. For current plans and repo structure see ROADMAP.md and the living docs at the repo root.
+
 # Second Patch Notes — Browser Meta, Restore UX, Races
 
 ## Scope delivered in this patch

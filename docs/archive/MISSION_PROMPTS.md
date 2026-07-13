@@ -1,3 +1,5 @@
+> **Archived** — historical document retained for provenance; not maintained. For current plans and repo structure see ROADMAP.md and the living docs at the repo root.
+
 # MISSION_PROMPTS — run these in order, one per agent session
 
 Usage: tell your agent **"Open MISSION_PROMPTS.md and execute Prompt N exactly."**

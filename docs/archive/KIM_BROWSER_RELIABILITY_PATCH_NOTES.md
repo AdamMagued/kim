@@ -1,3 +1,5 @@
+> **Archived** — historical document retained for provenance; not maintained. For current plans and repo structure see ROADMAP.md and the living docs at the repo root.
+
 # Kim browser reliability patch notes
 
 Implemented from the browser LLM reliability/session-continuity plan:

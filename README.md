@@ -14,7 +14,7 @@ Kim is a local AI agent platform that connects any cloud LLM (Claude, Gemini, GP
 - **OS control:** Take screenshots, click, type, scroll, run shell commands, read/write files, manage windows
 - **Browser automation:** Fill forms, navigate pages, extract structured data from the DOM
 - **Code workspace:** Integrated code agent (Code tab) powered by Claw/Codex with browser-provider backend
-- **MCP server:** 31 OS-control tools exposed via the Model Context Protocol — usable from Claude Code or any MCP client
+- **MCP server:** 50+ OS-control tools exposed via the Model Context Protocol — usable from Claude Code or any MCP client
 - **Session history:** Every run is saved as a JSONL trace in `kim_sessions/`
 
 ---
@@ -30,9 +30,18 @@ Kim is a local AI agent platform that connects any cloud LLM (Claude, Gemini, GP
 
 ### 1. Clone and set up Python
 
+**Quick path** — the install script does all of this step for you (creates `venv/`, installs Python deps + Playwright Chromium, seeds `.env` from the template, and records the project root in `~/.kim_root` for the packaged app):
+
 ```bash
 git clone https://github.com/AdamMagued/kim.git
 cd kim/kim-pro
+./install.sh          # macOS / Linux
+# install.bat         # Windows
+```
+
+**Manual path** — the same, by hand:
+
+```bash
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -54,6 +63,11 @@ GOOGLE_API_KEY=...
 OPENAI_API_KEY=sk-...
 ```
 
+Beyond the provider API keys, Kim's behavior knobs are `KIM_*` environment
+variables (log level, tool tiers, HITL gates, browser automation, offline fake
+mode, …) — see [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) for the generated
+reference of every variable.
+
 ### 3. Run the desktop app
 
 ```bash
@@ -66,15 +80,20 @@ The Tauri window opens. Select a provider in Settings → AI, type a task, and p
 
 ### 4. Run tests
 
+All four test suites (the `cli/` crate is separate — easy to forget):
+
 ```bash
-# Python (816+ tests)
+# Python
 python -m pytest tests/ -q
 
-# Frontend (31 Vitest tests)
+# Frontend (Vitest + type check)
 cd desktop && npm run test && npx tsc --noEmit
 
-# Rust (50 tests)
+# Rust (desktop)
 cd desktop/src-tauri && cargo test
+
+# Rust (kim CLI)
+cd cli && cargo test
 ```
 
 Or with `just` (if installed: `brew install just`):
@@ -99,7 +118,7 @@ Rust backend (lib.rs)
     ↕ stdin/stdout IPC
 Python orchestrator (agent.py)
     ↕ MCP stdio
-MCP server (31 OS tools)
+MCP server (50+ OS tools)
 ```
 
 ---
@@ -107,7 +126,7 @@ MCP server (31 OS tools)
 ## How-to recipes
 
 See [HOW_TO.md](HOW_TO.md) for minimal file sets to:
-- Add an MCP tool (4 files)
+- Add an MCP tool (3 files)
 - Add a provider (3 files)
 - Add a settings pane (3 files)
 - Run a targeted test pass
@@ -135,6 +154,21 @@ Kim runs entirely locally. Nothing leaves your machine except:
 - Screenshots in `kim_sessions/` (screenshot payloads are stripped from sessions older than 2 days; whole sessions are deleted after 30 days; export or back up your data from Settings → Data)
 
 No telemetry, no accounts, no cloud storage.
+
+---
+
+## Troubleshooting
+
+**Tasks fail instantly with `ModuleNotFoundError` (e.g. `No module named 'anthropic'`) — missing or broken venv.**
+The desktop app resolves a Python interpreter in this order: bundled sidecar → `~/.kim/venv` → project `venv/`/`.venv/` → bare system `python3`. If the project venv is missing or broken, Kim silently falls back to your system Python, which does not have Kim's packages. Current builds run a dependency preflight on that fallback and show "Kim's Python dependencies are not installed…" instead of spawning; if you see either that message or a raw `ModuleNotFoundError` in the task stream, the fix is the same — create the venv:
+
+```bash
+./install.sh
+# or manually:
+python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+```
+
+**Where are the logs?** Settings → Feedback → "Reveal logs", or `logs/kim_YYYY-MM-DD.jsonl` (structured JSONL, 7-day retention).
 
 ---
 

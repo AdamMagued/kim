@@ -1,0 +1,22 @@
+{
+  "_doc": [
+    "Per-package Python coverage floors, enforced in CI by",
+    "scripts/check_coverage_ratchet.py against pytest-cov's coverage.json",
+    "(--cov=orchestrator --cov=mcp_server --cov=codex_engine --cov=kimctl).",
+    "MONOTONIC RATCHET: raise a floor when the checker suggests it; never",
+    "lower one to make a PR pass. Replaces the old flat --cov-fail-under=61",
+    "(#56 F-K-2).",
+    "Baseline measured locally on macOS 2026-07-13 (Python 3.12.12):",
+    "orchestrator 74.49%, mcp_server 70.72%, codex_engine 70.71%,",
+    "kimctl 70.75%, total 72.74%. Floors = floor(measured) - 2 because CI",
+    "runs on Linux and skips platform-specific branches (macOS/Windows-only",
+    "code paths), so CI percentages can sit slightly below the local ones."
+  ],
+  "packages": {
+    "orchestrator": 72,
+    "mcp_server": 68,
+    "codex_engine": 68,
+    "kimctl": 68
+  },
+  "total": 70
+}

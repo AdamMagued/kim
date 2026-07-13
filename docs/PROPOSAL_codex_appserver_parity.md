@@ -1,6 +1,7 @@
 # Codex App-Server Parity — Kim Code Mode = Full Codex, Routed to Browser
 
-**Status:** proposal (evidence-verified, not started)
+> **Status:** accepted — implemented code-complete as ROADMAP_TO_10 Phase 3 (2026-07-06, see docs/ROADMAP_PROGRESS.md "Phase 3 — App-server parity"); default transport flip + live GUI/CLI smoke still outstanding — 2026-07-13
+
 **Verified against:** codex-cli 0.134.0 (local binary), branch `feat/browser-stateful-threads`
 **Goal:** Kim's Code mode (CLI + Tauri code tab) behaves *exactly* like Codex — per-command
 approvals ("allow / allow always / deny"), workspace-write sandbox with escalation, live

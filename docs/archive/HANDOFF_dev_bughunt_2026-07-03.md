@@ -1,3 +1,5 @@
+> **Archived** — historical document retained for provenance; not maintained. For current plans and repo structure see ROADMAP.md and the living docs at the repo root.
+
 # Handoff — Kim bug-hunt & fixes (dev branch)
 
 _Last updated: 2026-07-03. Branch `dev`, latest commit `c0525b4` (pushed to `origin/dev`)._

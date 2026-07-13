@@ -140,6 +140,12 @@ class GithubCreateRepoTests(unittest.IsolatedAsyncioTestCase):
             state["repo_name"] = args["text"]
             return "Filled w1 with 13 chars"
 
+        async def fake_click(args):
+            # The form has no "Private" control, so any click the flow attempts
+            # is a wrong guess; report it clicked and let the confirm step fail.
+            state.setdefault("clicks", []).append(args["element_id"])
+            return f"Clicked {args['element_id']}"
+
         async def fake_page():
             return FakePage("kim-test-repo")
 
@@ -148,6 +154,7 @@ class GithubCreateRepoTests(unittest.IsolatedAsyncioTestCase):
             patch.object(github.web, "handle_web_open", side_effect=fake_open),
             patch.object(github.web, "handle_web_observe", side_effect=fake_observe),
             patch.object(github.web, "handle_web_fill", side_effect=fake_fill),
+            patch.object(github.web, "handle_web_click", side_effect=fake_click),
             patch.object(github.web, "_page", side_effect=fake_page),
         ):
             raw = await github.handle_github_create_repo({"name": "kim-test-repo"})
