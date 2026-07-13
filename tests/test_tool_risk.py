@@ -16,7 +16,11 @@ from pathlib import Path
 
 from orchestrator.tool_risk import classify_tool_risk, coerce_hitl_bool
 
-_REGISTRY_PY = Path(__file__).resolve().parent.parent / "mcp_server" / "tool_registry.py"
+_MCP_DIR = Path(__file__).resolve().parent.parent / "mcp_server"
+_REGISTRY_PY = _MCP_DIR / "tool_registry.py"
+# Schemas extracted for the file-size gate live in a sibling module; the
+# static coverage scan must see every registered tool, wherever its schema is.
+_SCHEMA_FILES = (_REGISTRY_PY, _MCP_DIR / "tool_schemas_parity.py")
 
 
 class ClassifyToolRiskTests(unittest.TestCase):
@@ -326,9 +330,9 @@ class StaticRiskCoverageTests(unittest.TestCase):
     """
 
     def _registered_tool_names(self) -> list[str]:
-        source = _REGISTRY_PY.read_text(encoding="utf-8")
+        source = "\n".join(f.read_text(encoding="utf-8") for f in _SCHEMA_FILES)
         # Matches Tool( followed by optional whitespace + newline + indentation
-        # + name="<tool_name>" — the exact pattern used in tool_registry.py.
+        # + name="<tool_name>" — the exact pattern used in the schema modules.
         return re.findall(r'Tool\(\s+name="([^"]+)"', source)
 
     def test_registry_file_exists(self):
