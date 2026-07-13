@@ -132,7 +132,7 @@ Quality campaign: [docs/OPERATION_GOOGLE_LEVEL.md](docs/OPERATION_GOOGLE_LEVEL.m
 
 Kim runs entirely locally. Nothing leaves your machine except:
 - LLM API calls (task text + screenshots sent to your chosen provider)
-- Screenshots in `kim_sessions/` (retained 7 days, strippable — see Settings → Data)
+- Screenshots in `kim_sessions/` (screenshot payloads are stripped from sessions older than 2 days; whole sessions are deleted after 30 days; export or back up your data from Settings → Data)
 
 No telemetry, no accounts, no cloud storage.
 
