@@ -67,7 +67,9 @@ class SingleReplaceTests(_TmpDirMixin, unittest.TestCase):
     def test_result_includes_context(self):
         self._write_raw("a.txt", b"line1\nline2 target\nline3\n")
         result = self._edit("a.txt", old_string="target", new_string="replaced")
-        self.assertIn("line2 target", result)
+        # Success message shows the post-edit state of the edited site.
+        self.assertIn("Context after edit:", result)
+        self.assertIn("line2 replaced", result)
 
 
 # ── Multi-occurrence handling ───────────────────────────────────────────
@@ -225,6 +227,116 @@ class LineEndingAndUnicodeTests(_TmpDirMixin, unittest.TestCase):
         self._edit("a.txt", old_string="target-line", new_string="日本語-replaced")
         out = p.read_text(encoding="utf-8")
         self.assertEqual(out, "héllo wörld 日本語 🎉\n日本語-replaced\n")
+
+
+# ── D2 — file permission bits preserved ─────────────────────────────────────
+
+
+class FileModePreservationTests(_TmpDirMixin, unittest.TestCase):
+    def test_exec_bit_preserved(self):
+        import os as _os
+        import stat as _stat
+
+        p = self._write_raw("script.sh", b"#!/bin/sh\necho target\n")
+        _os.chmod(p, 0o755)
+        result = self._edit("script.sh", old_string="target", new_string="edited")
+        self.assertNotIn("ERROR", result)
+        mode = _stat.S_IMODE(_os.stat(p).st_mode)
+        self.assertEqual(mode, 0o755, f"exec bit lost: mode is {oct(mode)}")
+
+
+# ── D1 — HITL approval preview must match what apply does ───────────────────
+
+
+class PreviewApplyParityTests(_TmpDirMixin, unittest.TestCase):
+    """build_approval_preview and handle_edit_file share compute_edit_result,
+    so the previewed diff must equal the applied change — including the
+    expected_occurrences>1 case, where a matched count replaces ALL matches."""
+
+    def test_expected_occurrences_preview_matches_apply(self):
+        from mcp_server.policy import build_approval_preview
+
+        p = self._write_raw("a.txt", b"foo\nmid\nfoo\nend\nfoo\n")
+        args = {
+            "path": str(p),
+            "old_string": "foo",
+            "new_string": "bar",
+            "expected_occurrences": 3,
+        }
+        preview = build_approval_preview("edit_file", args)
+        # Preview must show all 3 lines changing, not just the first.
+        self.assertEqual(preview.count("-foo"), 3, f"preview:\n{preview}")
+        self.assertEqual(preview.count("+bar"), 3, f"preview:\n{preview}")
+        # Apply and confirm the file matches exactly what the preview showed.
+        result = asyncio.run(handle_edit_file(args))
+        self.assertNotIn("ERROR", result)
+        self.assertEqual(p.read_text(encoding="utf-8"), "bar\nmid\nbar\nend\nbar\n")
+
+    def test_replace_all_preview_matches_apply(self):
+        from mcp_server.policy import build_approval_preview
+
+        p = self._write_raw("a.txt", b"foo\nfoo\n")
+        args = {"path": str(p), "old_string": "foo", "new_string": "bar", "replace_all": True}
+        preview = build_approval_preview("edit_file", args)
+        self.assertEqual(preview.count("-foo"), 2, f"preview:\n{preview}")
+        asyncio.run(handle_edit_file(args))
+        self.assertEqual(p.read_text(encoding="utf-8"), "bar\nbar\n")
+
+    def test_rejected_edit_previews_as_no_change(self):
+        from mcp_server.policy import build_approval_preview
+
+        p = self._write_raw("a.txt", b"foo\nfoo\n")
+        # Ambiguous multi-match without replace_all/expected_occurrences: the
+        # handler will reject, so the preview must show no change.
+        args = {"path": str(p), "old_string": "foo", "new_string": "bar"}
+        preview = build_approval_preview("edit_file", args)
+        self.assertIn("no textual change", preview)
+
+
+# ── D3 — preview must not read/render sandboxed or alias-smuggled paths ─────
+
+
+class PreviewPathValidationTests(_TmpDirMixin, unittest.TestCase):
+    SECRET = "OPENAI_API_KEY=sk-verysecret"
+
+    def test_preview_denied_for_secret_path(self):
+        from mcp_server.policy import build_approval_preview
+
+        env_file = self.tmp / ".env"
+        env_file.write_text(self.SECRET + "\n", encoding="utf-8")
+        preview = build_approval_preview("edit_file", {
+            "path": str(env_file),
+            "old_string": "sk-verysecret",
+            "new_string": "sk-other",
+        })
+        self.assertEqual(preview, "")
+
+    def test_preview_ignores_file_path_alias(self):
+        from mcp_server.policy import build_approval_preview
+
+        secret_file = self.tmp / "notes.txt"
+        secret_file.write_text(self.SECRET + "\n", encoding="utf-8")
+        # Empty "path" + real target smuggled in an alias arg the policy path
+        # table doesn't cover: the preview must never read the alias.
+        preview = build_approval_preview("edit_file", {
+            "path": "",
+            "file_path": str(secret_file),
+            "old_string": "sk-verysecret",
+            "new_string": "sk-other",
+        })
+        # The secret's surrounding file content must never appear in the
+        # preview — the alias path is simply never read.
+        self.assertNotIn("OPENAI_API_KEY", preview)
+
+    def test_policy_denies_empty_path_arg(self):
+        from mcp_server.policy import enforce
+
+        decision = enforce("edit_file", {
+            "path": "",
+            "old_string": "a",
+            "new_string": "b",
+        })
+        self.assertEqual(decision.action, "deny")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import base64
 import logging
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 
@@ -83,33 +84,90 @@ def _line_context(content: str, index: int, match_len: int) -> str:
     return "\n".join(lines[lo:hi])
 
 
+class EditError(ValueError):
+    """Raised by compute_edit_result when an edit_file call must be rejected."""
+
+
+def compute_edit_result(
+    content: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+    expected_occurrences: object = None,
+    *,
+    label: str = "file",
+) -> "tuple[str, int]":
+    """Single source of truth for edit_file's validation + transform logic.
+
+    Used by BOTH handle_edit_file (apply) and policy.build_approval_preview
+    (approval-card diff) so the previewed change can never diverge from what
+    apply actually does (D1). Pure string logic — no I/O.
+
+    Returns (new_content, applied_count). Raises EditError with the
+    user-facing message when the edit must be rejected (empty old_string,
+    old==new, bad expected_occurrences, not found, ambiguous multi-match).
+    ``label`` is only interpolated into error messages (typically the path).
+    """
+    if old_string == "":
+        raise EditError(
+            "old_string must not be empty — edit_file only modifies existing content "
+            "that already exists in the file; use write_file to create a new file."
+        )
+    if old_string == new_string:
+        raise EditError("old_string and new_string are identical — nothing to edit")
+
+    if expected_occurrences is not None:
+        try:
+            expected_occurrences = int(expected_occurrences)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise EditError("expected_occurrences must be an integer")
+        if expected_occurrences <= 0:
+            raise EditError("expected_occurrences must be a positive integer")
+
+    count = content.count(old_string)
+
+    if count == 0:
+        hint = ""
+        normalized_old = " ".join(old_string.split())
+        if normalized_old and " ".join(content.split()).find(normalized_old) != -1:
+            hint = (
+                " A whitespace-normalized match exists (differing indentation or line "
+                "breaks) — re-copy old_string verbatim from the file's current content; "
+                "this hint is informational only and is NOT applied automatically."
+            )
+        raise EditError(f"old_string not found in {label}.{hint}")
+
+    if expected_occurrences is not None and count != expected_occurrences:
+        raise EditError(
+            f"old_string occurs {count} time(s) in {label}, but expected_occurrences="
+            f"{expected_occurrences} — update expected_occurrences to match, or add more "
+            "surrounding context to old_string to change the count"
+        )
+
+    if count > 1 and not replace_all and expected_occurrences is None:
+        raise EditError(
+            f"old_string occurs {count} times in {label} — it must be unique. Add more "
+            "surrounding context to old_string to disambiguate, set replace_all=true to "
+            "replace every occurrence, or pass expected_occurrences to confirm the count "
+            "explicitly."
+        )
+
+    # NOTE: a verified expected_occurrences > 1 replaces ALL matches, exactly
+    # like replace_all — the count check above already confirmed intent.
+    if replace_all or count > 1:
+        return content.replace(old_string, new_string), count
+    return content.replace(old_string, new_string, 1), 1
+
+
 async def handle_edit_file(args: dict) -> str:
     path = validate_path(args["path"])
     old_string = args.get("old_string")
     new_string = args.get("new_string")
-    replace_all = bool(args.get("replace_all", False))
-    expected_occurrences = args.get("expected_occurrences")
 
     if old_string is None or new_string is None:
         return tool_error("edit_file requires both 'old_string' and 'new_string' arguments")
     old_string = str(old_string)
     new_string = str(new_string)
-
-    if old_string == "":
-        return tool_error(
-            "old_string must not be empty — edit_file only modifies existing content "
-            "that already exists in the file; use write_file to create a new file."
-        )
-    if old_string == new_string:
-        return tool_error("old_string and new_string are identical — nothing to edit")
-
-    if expected_occurrences is not None:
-        try:
-            expected_occurrences = int(expected_occurrences)
-        except (TypeError, ValueError):
-            return tool_error("expected_occurrences must be an integer")
-        if expected_occurrences <= 0:
-            return tool_error("expected_occurrences must be a positive integer")
 
     if not path.exists():
         return tool_error(f"File not found: {path}")
@@ -125,46 +183,26 @@ async def handle_edit_file(args: dict) -> str:
     except UnicodeDecodeError as e:
         return tool_error(f"failed to decode {path} as UTF-8 text: {e}")
 
-    count = content.count(old_string)
-
-    if count == 0:
-        hint = ""
-        normalized_old = " ".join(old_string.split())
-        if normalized_old and " ".join(content.split()).find(normalized_old) != -1:
-            hint = (
-                " A whitespace-normalized match exists (differing indentation or line "
-                "breaks) — re-copy old_string verbatim from the file's current content; "
-                "this hint is informational only and is NOT applied automatically."
-            )
-        return tool_error(f"old_string not found in {path}.{hint}")
-
-    if expected_occurrences is not None and count != expected_occurrences:
-        return tool_error(
-            f"old_string occurs {count} time(s) in {path}, but expected_occurrences="
-            f"{expected_occurrences} — update expected_occurrences to match, or add more "
-            "surrounding context to old_string to change the count"
+    try:
+        new_content, applied = compute_edit_result(
+            content,
+            old_string,
+            new_string,
+            replace_all=bool(args.get("replace_all", False)),
+            expected_occurrences=args.get("expected_occurrences"),
+            label=str(path),
         )
-
-    apply_all = replace_all or count > 1
-    if count > 1 and not replace_all and expected_occurrences is None:
-        return tool_error(
-            f"old_string occurs {count} times in {path} — it must be unique. Add more "
-            "surrounding context to old_string to disambiguate, set replace_all=true to "
-            "replace every occurrence, or pass expected_occurrences to confirm the count "
-            "explicitly."
-        )
+    except EditError as e:
+        return tool_error(str(e))
 
     first_index = content.find(old_string)
-    context = _line_context(content, first_index, len(old_string))
-
-    if apply_all:
-        new_content = content.replace(old_string, new_string)
-        applied = count
-    else:
-        new_content = content.replace(old_string, new_string, 1)
-        applied = 1
 
     backup_pre_image(path)  # K1: checkpoint pre-image before mutating
+
+    # Preserve the original file's permission bits (D2): mkstemp creates the
+    # tmp 0600 and os.replace keeps the tmp's metadata — without the chmod
+    # below, a 0755 script would lose its exec bit after an edit.
+    original_mode = stat.S_IMODE(os.stat(path).st_mode)
 
     # Atomic write: tmp file in the same directory, then os.replace.
     fd, tmp_name = tempfile.mkstemp(
@@ -173,6 +211,7 @@ async def handle_edit_file(args: dict) -> str:
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(new_content.encode("utf-8"))
+        os.chmod(tmp_name, original_mode)
         os.replace(tmp_name, path)
     except Exception:
         try:
@@ -183,9 +222,10 @@ async def handle_edit_file(args: dict) -> str:
 
     logger.info(f"edit_file: {path} ({applied} replacement(s))")
     plural = "s" if applied != 1 else ""
+    context = _line_context(new_content, first_index, len(new_string))
     return (
         f"Edited {path}: replaced {applied} occurrence{plural} of old_string.\n"
-        f"Context:\n{context}"
+        f"Context after edit:\n{context}"
     )
 
 

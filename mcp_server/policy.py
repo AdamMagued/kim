@@ -172,7 +172,12 @@ def _check_one_path(value: str) -> str | None:
     """validate_path with ~ expansion. Returns an error string or None."""
     text = str(value).strip()
     if not text:
-        return None
+        # An explicitly-passed empty path is a validation failure, not a skip:
+        # letting "" through meant a call could satisfy the declared path arg
+        # with an empty string while smuggling the real target in an alias arg
+        # the table doesn't cover (D3). None/absent args are still skipped by
+        # the caller (_validate_path_args) before reaching here.
+        return "empty path value"
     try:
         validate_path(str(Path(text).expanduser()))
     except PermissionError as e:
@@ -661,19 +666,37 @@ def build_approval_preview(name: str, args: dict) -> str:
         if name == "run_powershell":
             return str(args.get("script", "")).strip()[:400]
         if name == "edit_file":
-            path = str(args.get("path") or args.get("file_path") or "")
+            # D3: only the schema-declared (and policy-validated) "path" arg is
+            # honored — never a "file_path" alias that _PATH_ARGS doesn't cover.
+            # validate_path is re-applied here (mirroring the handler) so the
+            # preview can never render content from a sandboxed/secret file.
+            path = str(args.get("path") or "")
+            try:
+                p = validate_path(str(Path(path).expanduser())) if path.strip() else None
+            except PermissionError:
+                return ""  # denied path: render no preview at all
             old_string = str(args.get("old_string", ""))
             new_string = str(args.get("new_string", ""))
             old = ""
             try:
-                p = Path(path)
-                if p.is_file():
+                if p is not None and p.is_file():
                     old = p.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 old = ""
-            if old_string and old_string in old:
-                new = old.replace(old_string, new_string) if args.get("replace_all") else old.replace(old_string, new_string, 1)
-            else:
+            # D1: same function the handler applies — preview/apply divergence
+            # is structurally impossible. A rejected edit previews as no change.
+            from mcp_server.tools.files import EditError, compute_edit_result
+
+            try:
+                new, _count = compute_edit_result(
+                    old,
+                    old_string,
+                    new_string,
+                    replace_all=bool(args.get("replace_all", False)),
+                    expected_occurrences=args.get("expected_occurrences"),
+                    label=path or "file",
+                )
+            except EditError:
                 new = old
             import difflib
 

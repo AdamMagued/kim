@@ -118,7 +118,9 @@ _FILE_TOOLS: list[Tool] = [
             "replace every occurrence (e.g. renaming a variable). If you already know "
             "how many occurrences exist, pass expected_occurrences as a self-check: "
             "the edit only applies if the actual count matches, otherwise it errors "
-            "instead of silently editing the wrong number of places. This is much "
+            "instead of silently editing the wrong number of places. NOTE: when a "
+            "matched expected_occurrences is greater than 1, ALL matched occurrences "
+            "are replaced (same effect as replace_all). This is much "
             "cheaper than write_file for small changes because you don't have to "
             "reproduce the entire file content. Not for creating new files (use "
             "write_file for that) — old_string must already exist in the file."
@@ -130,7 +132,7 @@ _FILE_TOOLS: list[Tool] = [
                 "old_string": {"type": "string", "description": "Exact text to find in the file. Must match verbatim (whitespace included) and must not be empty."},
                 "new_string": {"type": "string", "description": "Text to replace old_string with. Must differ from old_string."},
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence of old_string instead of requiring exactly one match. Default false.", "default": False},
-                "expected_occurrences": {"type": "integer", "description": "Optional self-check: the exact number of occurrences of old_string you expect. If the actual count differs, the edit is rejected instead of applied. When set, satisfies the uniqueness requirement even if the count is greater than one."},
+                "expected_occurrences": {"type": "integer", "description": "Optional self-check: the exact number of occurrences of old_string you expect. If the actual count differs, the edit is rejected instead of applied. When set and matched, satisfies the uniqueness requirement — and if greater than 1, ALL matched occurrences are replaced (same effect as replace_all)."},
             },
             "required": ["path", "old_string", "new_string"],
         },
