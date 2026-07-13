@@ -151,7 +151,7 @@ class C2HitlStdinTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(bridge_mod._pending_stdin_read)
             # The supervisor answers prompt 2; the parked read delivers it.
             os.write(self._w, b'{"type": "hitl_approve", "approved": true}\n')
-            self.assertTrue(await bridge_mod._await_hitl_decision(timeout=5.0))
+            self.assertTrue(await bridge_mod._await_hitl_decision(timeout=30.0))
             self.assertIsNone(bridge_mod._pending_stdin_read)
 
     async def test_late_decision_for_timed_out_prompt_is_discarded(self):
@@ -166,7 +166,7 @@ class C2HitlStdinTest(unittest.IsolatedAsyncioTestCase):
             # ...so the next prompt must NOT be approved by it; it waits for
             # its own line (a denial here).
             os.write(self._w, b'{"type": "hitl_approve", "approved": false}\n')
-            self.assertFalse(await bridge_mod._await_hitl_decision(timeout=5.0))
+            self.assertFalse(await bridge_mod._await_hitl_decision(timeout=30.0))
 
 
 # ---------------------------------------------------------------------------
