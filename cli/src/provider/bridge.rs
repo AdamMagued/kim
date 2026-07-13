@@ -62,7 +62,7 @@ pub fn bridge_token_source() -> String {
 /// D2: read the local-loopback bridge token the desktop app persists to
 /// `~/.kim/bridge_token`, so a `kim` install pairs with desktop automatically.
 fn bridge_token_from_file() -> Option<String> {
-    let path = dirs::home_dir()?.join(".kim").join("bridge_token");
+    let path = crate::config::kim_home()?.join(".kim").join("bridge_token");
     std::fs::read_to_string(path)
         .ok()
         .map(|t| t.trim().to_string())
