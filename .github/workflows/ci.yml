@@ -264,12 +264,23 @@ jobs:
             pytest-cov
           python -m pip check
 
-      - name: pyright (basic type check — orchestrator + mcp_server + codex_engine)
+      - name: pyright (standard type check — app packages + tests)
         run: |
+          # Gate is errors-only; warnings are printed (count + first 20) so the
+          # backlog stays visible. pyrightconfig.json runs `standard` mode over
+          # orchestrator/mcp_server/codex_engine/kimctl/tests, with known debt
+          # downgraded to warnings via file/dir-scoped executionEnvironments
+          # (agent.py mcp-1.28 type drift, tests/ monkeypatch idioms). Tighten
+          # the gate to errors+warnings only after that backlog reaches zero.
           pyright --outputjson | python3 -c "
           import sys, json
           d = json.load(sys.stdin)
-          errs = [e for e in d.get('generalDiagnostics', []) if e['severity'] == 'error']
+          diags = d.get('generalDiagnostics', [])
+          errs = [e for e in diags if e['severity'] == 'error']
+          warns = [e for e in diags if e['severity'] == 'warning']
+          print('pyright: ' + str(len(warns)) + ' warnings (non-blocking)')
+          for w in warns[:20]:
+              print('  ' + w['file'] + ':' + str(w['range']['start']['line']+1) + ': ' + w['message'].split(chr(10))[0])
           if errs:
               for e in errs:
                   print(e['file'] + ':' + str(e['range']['start']['line']+1) + ': ' + e['message'])
