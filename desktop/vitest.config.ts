@@ -17,10 +17,11 @@ export default defineConfig({
       ],
       reporter: ['text', 'json-summary'],
       thresholds: {
-        statements: 34,
-        branches: 26,
-        functions: 27,
-        lines: 36,
+        // Negative values are monotonic max-uncovered baselines; increases require explicit review.
+        statements: -3107,
+        branches: -3262,
+        functions: -797,
+        lines: -2565,
       },
     },
     server: {
