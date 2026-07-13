@@ -4,12 +4,11 @@ Each recipe lists the exact minimal file set to touch. Read only those files.
 
 ---
 
-## Add an MCP tool (4 files)
+## Add an MCP tool (3 files)
 
 1. **`mcp_server/tools/<group>.py`** — implement `async def handle_<tool>(args) -> str`.
-2. **`mcp_server/tool_registry.py`** — add the JSON schema under `TOOL_SCHEMAS` and a dispatch entry in `TOOL_DISPATCH` pointing to your handler.
-3. **`mcp_server/tool_tiers.py`** — add a risk tier entry (`low` / `medium` / `high`).
-4. **`tests/test_mcp_tools.py`** — add a unit test for the new tool.
+2. **`mcp_server/tool_registry.py`** — add the tool schema to the `TOOLS` list, a dispatch entry in the `DISPATCH` dict pointing to your handler, and a tier entry in `TIER_DISPATCH` (`core` / `git` / `shell` / …). All three tables live in this one file; `mcp_server/tool_tiers.py` only *filters* tools by `KIM_ENABLED_TOOL_TIERS` — no per-tool entry goes there.
+3. **`tests/`** — add a unit test for the new tool (schema↔dispatch parity is enforced by `tests/test_invariants.py` and `tests/test_tool_registry_schema.py`).
 
 Invariant: schema and dispatch entries must be added in the same commit — startup validation catches mismatches.
 
@@ -31,26 +30,24 @@ Invariant: schema and dispatch entries must be added in the same commit — star
 
 ---
 
-## Add an agent event — end-to-end (3 files after V-1)
+## Add an agent event — end-to-end (3 files, 4 steps)
 
-After the IPC refactor (V-1) lands, every new event touches exactly these:
-
-1. **`events.schema.json`** (repo root) — define the new event shape.
-2. Run **`npm run gen:events`** — regenerates `desktop/src/types/events.gen.ts` (do not hand-edit).
+1. **`desktop/src/types/events.schema.json`** — define the new event shape.
+2. Run **`npm run gen:events`** (from `desktop/`) — regenerates `desktop/src/types/events.gen.ts` (do not hand-edit).
 3. **`orchestrator/ui_bridge.py`** — add an emit method calling `self._emit("kim:<event>", payload)`.
 4. **`desktop/src/components/ChatView.tsx`** (or the relevant consumer) — add a `listen("kim:<event>", ...)` handler.
 
-Until V-1 lands: also emit the legacy text line from `ui_bridge.py` and add a regex in `desktop/src/components/chat/parsers.ts`.
+Typed IPC (`ipc_protocol: typed`) is the default. If you must also support legacy mode (`ipc_protocol: legacy` in `config.yaml`), emit the legacy text line from `ui_bridge.py` and add a regex in `desktop/src/components/chat/parsers.ts`.
 
 ---
 
 ## Fix a web automation issue (3–5 files)
 
-1. **`mcp_server/tools/web.py`** — main web tool handlers (`web_fill_form`, `web_observe`, etc.).
+1. **`mcp_server/tools/web/`** — main web tool handlers, split by concern: `actions.py` (`web_fill_form`, clicks), `navigation.py`, `observation.py` (`web_observe`, `FORM_SCHEMA`), `resolution.py`, `browser.py` (Playwright/CDP session).
 2. **`mcp_server/tools/web_element_scoring.py`** — element resolver, synonym table, scoring logic.
-3. **`orchestrator/providers/browser/site_configs.py`** — per-site overrides and `FORM_SCHEMA` definitions.
-4. **`tests/evals/<fixture>.py`** — add or update a fixture-driven eval for the bug scenario.
-5. **`tests/test_web_tools.py`** — unit test for the specific fix.
+3. **`orchestrator/providers/browser/site_configs.py`** — per-site overrides (`SITE_CONFIGS`) for the browser provider.
+4. **`tests/evals/<fixture>.py`** — add or update a fixture-driven eval for the bug scenario (e.g. `tests/evals/test_web_fill_form_eval.py`).
+5. **`tests/test_web_*.py`** — unit test for the specific fix (e.g. `test_web_resolver.py`, `test_web_wait_for.py`).
 
 ---
 

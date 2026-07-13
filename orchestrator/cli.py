@@ -177,7 +177,7 @@ async def _cli_main(args: argparse.Namespace) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    # Wire structured rotating file logs (logs/kim-YYYY-MM-DD.jsonl, 7-day retention)
+    # Wire structured rotating file logs (logs/kim_YYYY-MM-DD.jsonl, 7-day retention)
     try:
         from mcp_server.logger import setup_structured_logging, apply_log_retention
         # D3: repo logs/ may be read-only (packaged/installed); fall back to a

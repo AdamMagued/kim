@@ -30,9 +30,18 @@ Kim is a local AI agent platform that connects any cloud LLM (Claude, Gemini, GP
 
 ### 1. Clone and set up Python
 
+**Quick path** — the install script does all of this step for you (creates `venv/`, installs Python deps + Playwright Chromium, seeds `.env` from the template, and records the project root in `~/.kim_root` for the packaged app):
+
 ```bash
 git clone https://github.com/AdamMagued/kim.git
 cd kim/kim-pro
+./install.sh          # macOS / Linux
+# install.bat         # Windows
+```
+
+**Manual path** — the same, by hand:
+
+```bash
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -117,7 +126,7 @@ MCP server (50+ OS tools)
 ## How-to recipes
 
 See [HOW_TO.md](HOW_TO.md) for minimal file sets to:
-- Add an MCP tool (4 files)
+- Add an MCP tool (3 files)
 - Add a provider (3 files)
 - Add a settings pane (3 files)
 - Run a targeted test pass
@@ -145,6 +154,21 @@ Kim runs entirely locally. Nothing leaves your machine except:
 - Screenshots in `kim_sessions/` (screenshot payloads are stripped from sessions older than 2 days; whole sessions are deleted after 30 days; export or back up your data from Settings → Data)
 
 No telemetry, no accounts, no cloud storage.
+
+---
+
+## Troubleshooting
+
+**Tasks fail instantly with `ModuleNotFoundError` (e.g. `No module named 'anthropic'`) — missing or broken venv.**
+The desktop app resolves a Python interpreter in this order: bundled sidecar → `~/.kim/venv` → project `venv/`/`.venv/` → bare system `python3`. If the project venv is missing or broken, Kim silently falls back to your system Python, which does not have Kim's packages. Current builds run a dependency preflight on that fallback and show "Kim's Python dependencies are not installed…" instead of spawning; if you see either that message or a raw `ModuleNotFoundError` in the task stream, the fix is the same — create the venv:
+
+```bash
+./install.sh
+# or manually:
+python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+```
+
+**Where are the logs?** Settings → Feedback → "Reveal logs", or `logs/kim_YYYY-MM-DD.jsonl` (structured JSONL, 7-day retention).
 
 ---
 

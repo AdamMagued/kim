@@ -32,7 +32,7 @@ Full spec: `ARCHITECTURE.md` § "Stdout Text Protocol".
 ## Local invariants
 - **Spawn changes go in `task_spec.rs` builders**, never inline in `send_task`
   or the `/v1/task` handler — that is what keeps the two paths from diverging.
-- **`find_python_interpreter()`** (`subprocess.rs`): resolution order is bundled-sidecar-first → `~/.kim_root` → `~/.kim` → system. Do not short-circuit this.
+- **`find_python_interpreter()`** (`subprocess.rs`): resolution order is bundled-sidecar-first → `~/.kim/venv` (or `~/.kim/.venv`) → project-local venv (`venv/`, `.venv/`) → bare system `python3`/`python`. Do not short-circuit this. When the search falls through to a bare system python, `preflight_python_deps()` probes `import mcp, anthropic` and fails the spawn with an actionable message if Kim's deps are missing. (The former `~/.kim_root`-as-directory arm was dead — install.sh writes `~/.kim_root` as a *file* — and has been removed from the code.)
 - **`tauri dev` restart required** after any `.rs` file change — Rust is not hot-reloaded.
 - **No `unwrap()` in production paths** — use `?` or `match` with proper error propagation.
 - **WebView label `"kim-browser-signin"`** is used by the OAuth flow heuristic. Do not rename.

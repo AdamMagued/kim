@@ -13,8 +13,8 @@ The local MCP server exposing 50 OS-control tools to the orchestrator over stdio
 | `config.py` | `PROJECT_ROOT`, allowed paths, config loading |
 | `logger.py` | JSON-Lines structured logger (`logs/kim_YYYY-MM-DD.jsonl`) |
 | `os_utils.py` | Cross-platform command translation and OS detection |
-| `tools/` | One file per tool group: files, shell, screen, mouse, keyboard, windows, browser, web, git, code, search |
-| `sites/` | Per-site web automation configs (`site_configs.py`, `FORM_SCHEMA`) |
+| `tools/` | One module per tool group: `files`, `shell`, `screen`, `mouse`, `keyboard`, `windows`, `git`, `github`, `code`, `search`, `memory`, `ui_observe`, plus the `web/` package (`actions`, `navigation`, `observation` — home of `FORM_SCHEMA` —, `resolution`, `browser`) and its helpers `web_element_scoring.py`, `web_observe_js.py`, `screen_annotator.py`, `_errors.py` |
+| `sites/` | Site-connector base + process-global registry (`base.py`: `SiteConnector`). Note: per-site *browser-provider* configs live in `orchestrator/providers/browser/site_configs.py`, not here |
 
 ## Local invariants
 - **Schema ↔ dispatch parity**: every schema in `tool_registry.py` must have a corresponding dispatch entry and vice versa. Mismatch = startup error. Tests in `tests/test_invariants.py` verify this.
@@ -26,7 +26,7 @@ The local MCP server exposing 50 OS-control tools to the orchestrator over stdio
 - **Cross-platform**: new shell tools must go through `os_utils.translate_command()`.
 
 ## How to add an MCP tool
-See `HOW_TO.md` → "Add an MCP tool" (4 files to touch).
+See `HOW_TO.md` → "Add an MCP tool" (3 files to touch).
 
 ## How to test this layer
 ```bash
