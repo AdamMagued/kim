@@ -123,6 +123,7 @@ def hitl_threshold() -> str | None:
 
 _PATH_ARGS: dict[str, tuple[str, ...]] = {
     "read_file": ("path",),
+    "view_image": ("path",),
     "write_file": ("path",),
     "delete_file": ("path",),
     "edit_file": ("path",),

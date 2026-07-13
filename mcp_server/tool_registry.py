@@ -25,6 +25,7 @@ from mcp_server.tools.files import (
     handle_edit_file,
     handle_list_dir,
     handle_read_file,
+    handle_view_image,
     handle_write_file,
 )
 from mcp_server.tools.git import (
@@ -149,6 +150,25 @@ _FILE_TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="view_image",
+        description=(
+            "View an image file from disk. Returns the image itself (as a "
+            "data:<mime>;base64 payload, same shape as take_screenshot) so you can "
+            "look at its actual visual content — screenshots saved earlier, design "
+            "mockups, photos, charts. Supported extensions: .png, .jpg, .jpeg, "
+            ".gif, .webp, .bmp. Files over 10 MB or 25 megapixels are rejected. "
+            "Use this instead of read_file for image files — read_file returns "
+            "unreadable binary text for images."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Image file path (absolute or relative to PROJECT_ROOT)"},
+            },
+            "required": ["path"],
+        },
+    ),
+    Tool(
         name="list_dir",
         description="List files and directories inside a directory.",
         inputSchema={
@@ -175,6 +195,7 @@ _FILE_TOOLS: list[Tool] = [
 _FILE_READ_DISPATCH = {
     "read_file": handle_read_file,
     "list_dir": handle_list_dir,
+    "view_image": handle_view_image,
 }
 
 _FILE_WRITE_DISPATCH = {

@@ -136,6 +136,7 @@ _TOOL_REASON: dict[str, str] = {
     # File operations
     "read_file": "read_only",
     "list_dir": "read_only",
+    "view_image": "read_only",
     # Screen / UI observation
     "take_screenshot": "read_only",
     "get_screen_info": "read_only",

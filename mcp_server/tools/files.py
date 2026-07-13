@@ -1,4 +1,5 @@
 import base64
+import io
 import logging
 import os
 import re
@@ -259,6 +260,69 @@ async def handle_edit_file(args: dict) -> str:
         f"Edited {path}: replaced {applied} occurrence{plural} of old_string.\n"
         f"Context after edit:\n{context}"
     )
+
+
+# view_image guards: extension allowlist, byte cap, and pixel cap. The pixel
+# cap mirrors screenshot handling's practical output scale (a full 4K screen
+# grab at scale=1.0 is ~8.3 MP; 25 MP leaves ample headroom while refusing
+# decompression bombs), and the byte cap keeps the base64 payload uploadable.
+_IMAGE_MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024   # 10 MB on disk
+_MAX_IMAGE_PIXELS = 25_000_000        # 25 megapixels
+
+
+async def handle_view_image(args: dict) -> str:
+    path = validate_path(args["path"])
+    if not path.exists():
+        return tool_error(f"File not found: {path}")
+    if not path.is_file():
+        return tool_error(f"Not a file: {path}")
+
+    ext = path.suffix.lower()
+    mime = _IMAGE_MIME_BY_EXT.get(ext)
+    if mime is None:
+        return tool_error(
+            f"unsupported image extension '{ext or '(none)'}' for {path} — "
+            f"supported: {', '.join(sorted(_IMAGE_MIME_BY_EXT))}"
+        )
+
+    size = path.stat().st_size
+    if size > _MAX_IMAGE_BYTES:
+        return tool_error(
+            f"image too large: {path} is {size} bytes "
+            f"(max {_MAX_IMAGE_BYTES} bytes)"
+        )
+
+    async with aiofiles.open(path, "rb") as f:
+        raw = await f.read()
+
+    # Verify it decodes as an image and respects the pixel cap (lazy PIL
+    # import, same pattern as the screenshot handlers in tools/screen.py).
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(raw)) as img:
+            width, height = img.size
+        if width * height > _MAX_IMAGE_PIXELS:
+            return tool_error(
+                f"image too large: {path} is {width}x{height} "
+                f"({width * height} pixels, max {_MAX_IMAGE_PIXELS})"
+            )
+    except Exception as e:
+        return tool_error(f"failed to decode {path} as an image: {e}")
+
+    b64 = base64.b64encode(raw).decode()
+    logger.info(f"view_image: {path} {width}x{height} ({len(b64)} b64 chars)")
+    # Same return shape as take_screenshot so the agent/provider image-upload
+    # path works unchanged: a whole-content data URI.
+    return f"data:{mime};base64,{b64}"
 
 
 async def handle_list_dir(args: dict) -> str:
