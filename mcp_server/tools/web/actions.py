@@ -27,7 +27,13 @@ async def handle_web_click(args: dict) -> str:
     el_id = str(args.get("element_id", "")).strip()
     if not el_id:
         return tool_error("element_id is required")
-    page = await browser._page()
+    # A missing/unlaunchable browser must fail compactly like any other click
+    # failure — callers (e.g. github.py's create-repo flow) branch on the
+    # "ERROR: " prefix and must never see a raw playwright traceback.
+    try:
+        page = await browser._page()
+    except Exception as e:
+        return tool_error(f"browser unavailable for click on {el_id}: {e}")
     # Pass `page` so a selector that no longer uniquely identifies one element
     # (cssPath()'s 6-level ancestor truncation can collide on repetitive
     # markup) is disambiguated or rejected instead of silently acting on
@@ -50,7 +56,10 @@ async def handle_web_fill(args: dict) -> str:
     text = str(args.get("text", ""))
     if not el_id:
         return tool_error("element_id is required")
-    page = await browser._page()
+    try:
+        page = await browser._page()
+    except Exception as e:
+        return tool_error(f"browser unavailable for fill on {el_id}: {e}")
     selector, err = await resolution._resolve_selector(el_id, page)
     if not selector:
         return err
