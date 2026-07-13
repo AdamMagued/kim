@@ -21,8 +21,8 @@ use commands::{
 };
 use config::KimConfig;
 use file_refs::prompt_with_file_references;
-use oneshot::{help_text, parse_cli_args, run_oneshot, CliCommand};
 pub(crate) use file_refs::split_shellish_tokens;
+use oneshot::{help_text, parse_cli_args, run_oneshot, CliCommand};
 use paint::{kim_accent_color, paint_bold, paint_dim, paint_text, print_message, print_note};
 use pickers::{choose_model_interactively, choose_session_interactively};
 use provider::{provider_info, stream_kim_request, AppEvent, ChatMessage};
@@ -1163,7 +1163,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
         // One partial chunk arrives, then the cancel fires (biased select drains
         // the ready chunk first, then takes the cancel branch).
-        tx.send(AppEvent::TextChunk("partial answer".to_string())).unwrap();
+        tx.send(AppEvent::TextChunk("partial answer".to_string()))
+            .unwrap();
 
         consume_turn_events(
             &mut app,
@@ -1445,7 +1446,14 @@ mod tests {
     #[test]
     fn code_mode_allows_only_ollama_and_browser() {
         // Allowed: the two real codex backends (+ empty → ollama).
-        for ok in ["ollama", "ollama-cloud", "", "browser", "browser:chatgpt", "BROWSER:Claude"] {
+        for ok in [
+            "ollama",
+            "ollama-cloud",
+            "",
+            "browser",
+            "browser:chatgpt",
+            "BROWSER:Claude",
+        ] {
             assert!(
                 code_mode_denied_reason(ok).is_none(),
                 "code mode must allow {ok:?}"

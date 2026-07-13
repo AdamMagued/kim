@@ -186,10 +186,7 @@ pub(crate) fn save_session_messages_in(
 /// flock-style `cron_store.py` locking) since re-creating it is free and
 /// deleting a lock file out from under another lock-holder is a classic
 /// TOCTOU bug.
-fn lock_session_file(
-    root: &Path,
-    safe_id: &str,
-) -> Result<fd_lock::RwLock<fs::File>, String> {
+fn lock_session_file(root: &Path, safe_id: &str) -> Result<fd_lock::RwLock<fs::File>, String> {
     let lock_path = root.join(format!("{safe_id}.lock"));
     let lock_file = fs::OpenOptions::new()
         .create(true)
