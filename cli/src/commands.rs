@@ -2,6 +2,11 @@ use std::fs;
 
 mod doctor;
 mod providers;
+/// `kim tui` launcher + the standalone `kimcli` binary's shared entry point.
+/// Public (unlike `doctor`/`providers`) because `src/bin/kimcli.rs` — a
+/// separate crate — calls `kim_cli::commands::tui::run_tui_standalone`
+/// directly.
+pub mod tui;
 
 use doctor::doctor;
 #[allow(unused_imports)]

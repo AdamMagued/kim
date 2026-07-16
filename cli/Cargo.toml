@@ -6,9 +6,20 @@ description = "Kim terminal CLI — install once, works anywhere"
 license = "MIT"
 publish = false
 
+[lib]
+name = "kim_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "kim"
 path = "src/main.rs"
+
+# `kim tui` launcher standalone entry point — spawns the kimcli/codex binary
+# (see src/commands/tui.rs). Shares all logic with `kim tui` via the kim_cli
+# library crate rather than duplicating it in a second binary.
+[[bin]]
+name = "kimcli"
+path = "src/bin/kimcli.rs"
 
 [dependencies]
 base64 = { workspace = true }
@@ -18,6 +29,10 @@ dirs = { workspace = true }
 # transitive dependency via rustyline, promoted to direct so we can use it.
 fd-lock = "4"
 futures-util = "0.3"
+# `kim tui`'s graceful proxy shutdown (SIGTERM, grace period, then SIGKILL) —
+# already a transitive dependency (e.g. via rustyline), promoted to direct the
+# same way fd-lock was.
+libc = "0.2"
 reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 rpassword = "7"
 rustyline = "15"

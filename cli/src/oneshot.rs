@@ -19,6 +19,14 @@ pub(crate) enum CliCommand {
     Repl {
         resume_id: Option<String>,
     },
+    /// `kim tui` launcher: spawns the standalone kimcli/codex binary (see
+    /// `commands::tui`). Flag parsing (`--provider`/`--model`/`--cwd`/
+    /// `--verbose`/`-- <passthrough>`) happens in `commands::tui` itself so the
+    /// exact same parser serves both `kim tui` and the standalone `kimcli`
+    /// binary entry point.
+    Tui {
+        args: Vec<String>,
+    },
     /// #6: a CLI flag was given but is malformed (currently only a bare
     /// trailing `--resume`). Carries the message to print to stderr before
     /// exiting non-zero — never silently falls through to a fresh session.
@@ -26,10 +34,15 @@ pub(crate) enum CliCommand {
 }
 
 pub(crate) fn parse_cli_args(args: &[String]) -> CliCommand {
-    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+    // Only scan for kim's own global flags BEFORE a literal `--` separator —
+    // anything after `--` is passthrough for a downstream program (e.g.
+    // `kim tui -- --help` must reach kimcli's own --help, not print kim's).
+    let scan_end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let head = &args[..scan_end];
+    if head.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         return CliCommand::ShowHelp;
     }
-    if args
+    if head
         .iter()
         .any(|a| matches!(a.as_str(), "--version" | "-V"))
     {
@@ -81,6 +94,12 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliCommand {
             };
             CliCommand::Oneshot { mode, prompt }
         }
+        // `kim tui [--provider <name>] [--model <name>] [--cwd <dir>] [--verbose]
+        // [-- <raw args...>]` — launches the standalone kimcli/codex TUI. All
+        // flag validation happens in `commands::tui::parse_tui_flags`.
+        Some("tui") => CliCommand::Tui {
+            args: args[1..].to_vec(),
+        },
         // `kim --resume <id>` resumes an existing session in the REPL. The id
         // is required (#6: a bare trailing `--resume` is a usage error, never a
         // silent new session).
@@ -107,7 +126,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliCommand {
         // the same way `--resume`-without-value is rejected.
         Some(other) => CliCommand::UsageError(format!(
             "kim: unknown command '{other}'.\n\
-             Usage: kim [chat|code <prompt>] | kim doctor | kim --resume <id> | kim --help"
+             Usage: kim [chat|code <prompt>] | kim doctor | kim tui | kim --resume <id> | kim --help"
         )),
     }
 }
@@ -141,7 +160,7 @@ pub(crate) async fn run_oneshot(
 }
 
 pub(crate) fn help_text() -> &'static str {
-    "Kim terminal CLI\n\nUsage:\n  kim                      Launch the interactive chat/code REPL\n  kim chat <prompt...>     Send one prompt in chat mode and exit\n  kim code <prompt...>     Send one prompt in code-agent mode and exit\n  kim doctor               Check install, providers, desktop bridge, and code mode\n  kim doctor --strict      Same, but exit non-zero on any failed check (CI)\n  kim --resume <id>        Resume a Kim session in the REPL\n  kim --resume latest      Resume the newest saved session\n  kim --help               Show this help\n  kim --version            Show the version\n\nPipe a prompt via stdin:\n  echo 'explain this' | kim chat\n  echo 'fix the build' | kim code\n\nInside Kim, type /help for commands and /login to connect a provider."
+    "Kim terminal CLI\n\nUsage:\n  kim                      Launch the interactive chat/code REPL\n  kim chat <prompt...>     Send one prompt in chat mode and exit\n  kim code <prompt...>     Send one prompt in code-agent mode and exit\n  kim tui                  Launch the full Codex-style TUI (kimcli) via Kim's providers\n  kim doctor               Check install, providers, desktop bridge, and code mode\n  kim doctor --strict      Same, but exit non-zero on any failed check (CI)\n  kim --resume <id>        Resume a Kim session in the REPL\n  kim --resume latest      Resume the newest saved session\n  kim --help               Show this help\n  kim --version            Show the version\n\nPipe a prompt via stdin:\n  echo 'explain this' | kim chat\n  echo 'fix the build' | kim code\n\n`kim tui` flags:\n  --provider <name>        Provider to route through (default: config tui_provider, or browser:claude)\n  --model <name>           Model name to pass to kimcli\n  --cwd <dir>              Working directory for the TUI (default: current dir)\n  --verbose                Forward proxy/launcher diagnostics to stderr\n  -- <args...>             Passthrough args appended verbatim to the kimcli binary\n\nInside Kim, type /help for commands and /login to connect a provider."
 }
 
 #[cfg(test)]
@@ -358,5 +377,60 @@ mod tests {
             } => assert_eq!(p, "one two three"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // ── `kim tui` parsing ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_args_tui_bare_forwards_no_args() {
+        let cmd = parse_cli_args(&args(&["tui"]));
+        match cmd {
+            CliCommand::Tui { args } => assert!(args.is_empty()),
+            other => panic!("expected Tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_args_tui_forwards_flags_and_passthrough_verbatim() {
+        let cmd = parse_cli_args(&args(&[
+            "tui",
+            "--provider",
+            "browser:claude",
+            "--verbose",
+            "--",
+            "--help",
+        ]));
+        match cmd {
+            CliCommand::Tui { args } => assert_eq!(
+                args,
+                vec!["--provider", "browser:claude", "--verbose", "--", "--help"]
+            ),
+            other => panic!("expected Tui, got {other:?}"),
+        }
+    }
+
+    // A `--` separator hides everything after it from kim's own global
+    // --help/--version scan, so `kim tui -- --help` reaches kimcli's --help
+    // instead of printing kim's own help text.
+    #[test]
+    fn parse_args_help_after_double_dash_is_not_intercepted() {
+        let cmd = parse_cli_args(&args(&["tui", "--", "--help"]));
+        assert!(
+            matches!(cmd, CliCommand::Tui { .. }),
+            "passthrough --help after -- must not trigger kim's own ShowHelp, got {cmd:?}"
+        );
+    }
+
+    // Existing behavior is unchanged when there is no `--` separator at all.
+    #[test]
+    fn parse_args_help_before_any_double_dash_still_shows_help() {
+        assert!(matches!(
+            parse_cli_args(&args(&["--help"])),
+            CliCommand::ShowHelp
+        ));
+        assert!(matches!(
+            parse_cli_args(&args(&["chat", "hello", "--help"])),
+            CliCommand::ShowHelp
+        ));
     }
 }

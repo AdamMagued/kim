@@ -2292,6 +2292,7 @@ dependencies = [
  "dirs 5.0.1",
  "fd-lock",
  "futures-util",
+ "libc",
  "reqwest 0.12.28",
  "rpassword",
  "rustyline",
