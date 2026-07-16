@@ -28,13 +28,19 @@ Kim's Codex bridge (`codex_engine/engine.py` `_CodexProxy`, `orchestrator/codex_
   This is kimcli's primary path: `BrowserProvider.complete()` speaks the
   `/v1/responses` JSON contract rather than native tool-calling.
 - **`responses-passthrough`** — for API providers (Claude, Gemini, DeepSeek,
-  Ollama-behind-proxy). codex-cli 0.144.3 removed the chat-completions wire
-  API entirely (`WireApi` in `codex-rs/model-provider-info/src/lib.rs` only
-  has the `Responses` variant now), so **codex 0.144.3 is Responses-wire-only**
-  — these providers are served natively on `/v1/responses` with no
+  and, as of the `kim tui` launcher's default, Ollama-behind-proxy).
+  codex-cli 0.144.3 removed the chat-completions wire API entirely
+  (`WireApi` in `codex-rs/model-provider-info/src/lib.rs` only has the
+  `Responses` variant now), so **codex 0.144.3 is Responses-wire-only** —
+  these providers are served natively on `/v1/responses` with no
   chat-completions fallback. See `codex_engine/responses_passthrough.py`.
-- **`ollama direct`** — Ollama can also be driven directly (no browser
-  proxy hop) when configured that way; see `orchestrator/providers/ollama.py`.
+  For Ollama specifically, the proxy wraps `orchestrator/providers/ollama.py`
+  (`OllamaProvider`), which speaks Ollama's native `/api/chat` tool-calling
+  wire format and re-emits proper Responses-API `function_call` items.
+- **`ollama direct`** — `kim tui --provider ollama` can instead be driven
+  straight at Ollama's own `/v1/responses` endpoint with no proxy hop, but
+  this is opt-in only (`KIM_TUI_OLLAMA_DIRECT=1`), not the default — see the
+  caveat below.
 
 `codex_engine/standalone_proxy.py` is the standalone kimcli entry point (used
 by `kim tui` and the standalone `kimcli` binary path): it auto-selects
@@ -133,3 +139,14 @@ Apache-2.0 §4(d).
   requests default-deny without one. Phase 2 tracks wiring these through as
   MCP elicitations (`mcpServer/elicitation/request`); see the follow-up issue
   for the design pointer.
+- **`ollama-direct` is opt-in/experimental, not the default**: `kim tui
+  --provider ollama` routes through the standalone proxy by default (same as
+  `claude`/`gemini`/`deepseek`), because live testing on Ollama 0.32.0 with
+  `qwen3-coder` showed the DIRECT `/v1/responses` route is broken for
+  agentic use — the model's tool calls come back in a shape codex 0.144.3's
+  tool router rejects (`ERROR codex_core::tools::router: error=unsupported
+  call`), looping every tool-call turn until the relay budget dies; text-only
+  replies work fine direct, tool calls don't. Set `KIM_TUI_OLLAMA_DIRECT=1`
+  to opt back into the legacy direct route (e.g. to test a future Ollama
+  release that fixes the tool-call shape); see `cli/src/commands/tui/
+  routing.rs` for the routing table.

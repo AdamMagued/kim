@@ -4,12 +4,19 @@
 //! of `codex`, or the upstream `codex` binary as a fallback) as a child
 //! process that inherits the terminal, routed at one of Kim's providers:
 //!
-//! - `ollama` → DIRECT route: kimcli talks straight to the local Ollama
-//!   `/v1/responses` endpoint (no Python involved).
-//! - everything else (`browser:*`, `claude`, `gemini`, `deepseek`, …) → PROXY
-//!   route: spawn `python -m codex_engine.standalone_proxy`, read its one-line
-//!   JSON handshake (`{"event":"ready","port":...,"token":"..."}` or
+//! - every provider, INCLUDING `ollama` by default, → PROXY route: spawn
+//!   `python -m codex_engine.standalone_proxy --provider <name>`, read its
+//!   one-line JSON handshake
+//!   (`{"event":"ready","port":...,"token":"..."}` or
 //!   `{"event":"fatal","message":"..."}`), then point kimcli at that proxy.
+//!   For `ollama` the proxy wraps `OllamaProvider`, which speaks Ollama's
+//!   native `/api/chat` tool-calling wire format and re-emits Responses-API
+//!   `function_call` items codex's tool router accepts.
+//! - `ollama` ONLY, opt-in via `KIM_TUI_OLLAMA_DIRECT=1` → DIRECT route:
+//!   kimcli talks straight to the local Ollama `/v1/responses` endpoint (no
+//!   Python involved). Kept for testing/parity only — see `routing.rs` for
+//!   why this stopped being the default (ollama 0.32.0's tool-call shape on
+//!   that endpoint is rejected by codex 0.144.3's tool router).
 //!
 //! Both routes wire up `mcp_servers.kim` so kimcli gets Kim's MCP tools
 //! (scoped to the `ui,browser` tiers) alongside the model connection.
@@ -19,7 +26,7 @@
 //! `[[bin]]` targets and `src/bin/kimcli.rs`.
 //!
 //! Split into focused submodules (file-size gate): `routing` (the
-//! ollama-direct/proxy routing table), `resolve` (kimcli/codex binary
+//! ollama-direct-opt-in/proxy routing table), `resolve` (kimcli/codex binary
 //! resolution), `argv` (the `-c` override argv builders), `proxy` (the
 //! standalone proxy's handshake/spawn/drain/teardown), `env` (the child
 //! process env allowlist). This file is the entry point + orchestration.
@@ -162,7 +169,8 @@ pub async fn run_tui_standalone(args: Vec<String>) -> i32 {
 }
 
 /// Full launch: resolve the Kim repo root + Python + kimcli binary, set up
-/// the route (spawn+handshake the proxy, or go direct at Ollama), spawn
+/// the route (spawn+handshake the proxy, or — opt-in only — go direct at
+/// Ollama), spawn
 /// kimcli as a child inheriting this terminal's stdio, wait for it while
 /// swallowing our own Ctrl-C so we don't die before it's reaped, tear the
 /// proxy down, and propagate kimcli's exit code.

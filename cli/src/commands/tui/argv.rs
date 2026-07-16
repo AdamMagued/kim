@@ -69,8 +69,12 @@ fn proxy_route_overrides(port: u16, model: &str) -> Vec<String> {
 }
 
 /// `-c` overrides that route kimcli directly at the local Ollama
-/// `/v1/responses` endpoint (`provider == "ollama"`). Ollama gained an
-/// OpenAI-Responses-compatible endpoint in codex's built-in provider
+/// `/v1/responses` endpoint (`provider == "ollama"` AND
+/// `KIM_TUI_OLLAMA_DIRECT=1` — see `routing.rs`; NOT the default route as of
+/// this override set's current form, kept opt-in for testing/parity because
+/// ollama 0.32.0's tool-call shape on this endpoint is rejected by codex
+/// 0.144.3's tool router). Ollama gained an OpenAI-Responses-compatible
+/// endpoint in codex's built-in provider
 /// (`create_oss_provider(11434, WireApi::Responses)`); an Ollama older than
 /// ~0.13.4 without `/v1/responses` will surface a generic HTTP error here
 /// rather than a Kim-specific one — a known limitation, not a bug in this

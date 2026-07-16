@@ -68,7 +68,7 @@ Mechanism vocabulary used in the table:
 | A-11 | `tests/test_view_image_tool.py` | Kim's `view_image` MCP tool — data-URI shape, size/type guards, secret-path sandbox denial. |
 | A-12 | `tests/test_gemini_oauth_provider.py`, `tests/test_gemini_user_project_mode.py` | Gemini's two auth modes (API key vs Kim OAuth bearer) at the provider-adapter layer feeding `responses-passthrough`. |
 | A-13 | `cli/src/commands/tui/argv.rs` unit tests (`cargo test -p kim-cli`) — `proxy_route_argv_matches_the_trusted_design_exactly`, `ollama_direct_argv_matches_the_trusted_design_exactly` | The exact `-c` override argv `kim tui` builds per route (proxy vs. ollama-direct) — argv shape only, does not itself spawn kimcli. |
-| A-14 | `cli/src/commands/tui/routing.rs` unit test `routing_table_ollama_is_direct_everything_else_is_proxy` | `ollama` (exact, case-insensitive) is the only provider name that takes the direct (no-proxy-hop) route. |
+| A-14 | `cli/src/commands/tui/routing.rs` unit tests (`ollama_defaults_to_proxy_without_the_opt_in_env_var`, `ollama_is_direct_when_the_opt_in_env_var_is_set_to_1`, `routing_table_non_ollama_providers_always_use_the_real_entry_point`) | `ollama` routes through the proxy by default, same as every other provider; it only takes the direct (no-proxy-hop) route when `KIM_TUI_OLLAMA_DIRECT=1` is set (opt-in, not the default — see the caveat in `docs/kimcli.md`). |
 | A-15 | `tests/test_e2e_smoke.py` | Full bridge→proxy→codex relay loop, SSE framing, bearer auth — codex side is a **scripted fake binary** (not the real kimcli/codex), so this is wire-shape proof, not real-binary proof. |
 
 ### Manual (`M-*`)
@@ -88,19 +88,19 @@ Mechanism vocabulary used in the table:
 | M-11 | Ask the model to run `git status`/`git diff`/commit inside a real repo; confirm native git integration (not a Kim MCP git tool) is what runs. |
 | M-12 | Trigger a long-running/background task; confirm any desktop notification fires on completion. |
 | M-13 | Run `/resume` (or `--resume` / the session picker) in a live TUI; confirm the prior session's messages reload and continuation works. |
-| M-14 | `api:ollama(direct)` only: with a local Ollama ≥ 0.13.4 running, launch `kim tui --provider ollama`, confirm chat works with zero Kim-proxy hop (kill the proxy process and confirm the session is unaffected, since this route never spawns one). |
+| M-14 | `api:ollama` default (proxy) route: with a local Ollama running, launch `kim tui --provider ollama`, confirm chat AND tool calls both work through the Kim proxy (`OllamaProvider` native `/api/chat` tool-calling, re-emitted as Responses-API `function_call` items). Opt-in DIRECT route only (`KIM_TUI_OLLAMA_DIRECT=1 kim tui --provider ollama`, requires a local Ollama ≥ 0.13.4 for `/v1/responses`): confirm text-only chat works with zero Kim-proxy hop (kill the proxy process and confirm the session is unaffected, since this route never spawns one) — known-broken for tool calls as of Ollama 0.32.0, do not expect agentic turns to complete on this route. |
 | M-15 | `browser:*` only: confirm the exact site (claude.ai / chatgpt.com / gemini.google.com) opens for `preferred_site` and that `browser-contract` mode's nudge/salvage narration appears in logs, not stdout. |
 
 ## The matrix
 
-| Row | browser:claude | browser:chatgpt | browser:gemini | api:claude | api:gemini(key) | api:gemini(oauth) | api:deepseek | api:ollama(direct) |
+| Row | browser:claude | browser:chatgpt | browser:gemini | api:claude | api:gemini(key) | api:gemini(oauth) | api:deepseek | api:ollama(proxy default; direct opt-in) |
 |---|---|---|---|---|---|---|---|---|
 | **Interactive TUI chat + streaming** | proxy-translated — M-1 | proxy-translated — M-1 | proxy-translated — M-1 | native — M-1 | native — M-1 | native — M-1 | native — M-1 | native — M-1 |
 | **`/model`** | native (TUI-internal) — M-2 | native — M-2 | native — M-2 | native — M-2 | native — M-2 | native — M-2 | native — M-2 | native — M-2 |
 | **`/approvals` + sandbox modes** | native protocol (A-7), TUI render M-3 | native protocol (A-7), TUI render M-3 | native protocol (A-7), TUI render M-3 | native protocol (A-7), TUI render M-3 | native protocol (A-7), TUI render M-3 | native protocol (A-7), TUI render M-3 | native protocol (A-7), TUI render M-3 | native protocol (A-7), TUI render M-3 |
 | **`/new`** | native (TUI-internal) — M-4 | native — M-4 | native — M-4 | native — M-4 | native — M-4 | native — M-4 | native — M-4 | native — M-4 |
 | **`/compact`** | native (TUI-internal) — M-5 | native — M-5 | native — M-5 | native — M-5 | native — M-5 | native — M-5 | native — M-5 | native — M-5 |
-| **`exec --json`** | proxy-translated — A-15 (fake binary only); M-1-class real-binary gap noted below | proxy-translated — A-15 (fake binary only) | proxy-translated — A-15 (fake binary only) | native, item-structure preserved — **A-3**, A-8, A-9 | native — **A-3**, A-8, A-9, A-12 | native — **A-3**, A-8, A-9, A-12 | native — **A-3**, A-8, A-9 | n/a — exec transport has no ollama-direct branch (only `kim tui`'s launcher does; via exec, "ollama" is just another responses-passthrough provider) |
+| **`exec --json`** | proxy-translated — A-15 (fake binary only); M-1-class real-binary gap noted below | proxy-translated — A-15 (fake binary only) | proxy-translated — A-15 (fake binary only) | native, item-structure preserved — **A-3**, A-8, A-9 | native — **A-3**, A-8, A-9, A-12 | native — **A-3**, A-8, A-9, A-12 | native — **A-3**, A-8, A-9 | native, item-structure preserved — **A-3**, A-8, A-9 (exec transport has no ollama-direct branch; via exec, and via `kim tui`'s default route, "ollama" is just another responses-passthrough provider — direct-at-Ollama `/v1/responses` is an opt-in `kim tui`-launcher-only path with no exec-transport equivalent) |
 | **resume / sessions** | proxy-translated — A-6 (app-server surface); TUI `/resume` M-13 | proxy-translated — A-6; M-13 | proxy-translated — **A-6**; M-13 | native — A-6-class coverage is browser-only today; M-13 | native — M-13 | native — M-13 | native — M-13 | native — M-13 |
 | **Kim MCP tools listed + callable** | native kimcli MCP client, provider-agnostic — **A-4**, A-5; invocation M-6 | native — A-4, A-5; M-6 | native — A-4, A-5; M-6 | native — A-4, A-5; M-6 | native — A-4, A-5; M-6 | native — A-4, A-5; M-6 | native — A-4, A-5; M-6 | native — A-4, A-5; M-6 |
 | **Image input / `view_image`** | proxy-translated (image parts flattened into contract text) — A-11 (`view_image` tool only); M-7 | proxy-translated — A-11; M-7 | proxy-translated — A-11; M-7 | native — A-11; M-7 | native — A-11; M-7 | native — A-11; M-7 | native — A-11; M-7 | native — A-11; M-7 |
@@ -121,12 +121,18 @@ Column-specific notes not otherwise obvious from the table:
   follow-up rather than papered over; `A-6`/`A-7` (app-server, real binary,
   `browser:gemini`) is the closest real-binary proof that the browser-
   contract loop works end-to-end against this codex build.
-- **`api:ollama(direct)`**: this route only exists in `kim tui`'s Rust
-  launcher (`argv.rs`/`routing.rs`, A-13/A-14) — the Python `exec --json`
-  legacy transport (`codex_bridge_service.py`) has no ollama-direct branch
-  at all, hence "n/a" rather than a mechanism, in that row. An Ollama
-  behind the Kim proxy (a *different*, non-direct configuration) would
-  instead be just another `responses-passthrough` provider.
+- **`api:ollama`**: `kim tui --provider ollama` routes through the Kim proxy
+  by default, exactly like `claude`/`gemini`/`deepseek` — the proxy wraps
+  `OllamaProvider` (native `/api/chat` tool-calling, re-emitted as
+  Responses-API `function_call` items), so ollama is just another
+  `responses-passthrough` provider today. The DIRECT-at-Ollama `/v1/responses`
+  route (`argv.rs`/`routing.rs`, A-13/A-14) still exists but is opt-in only
+  (`KIM_TUI_OLLAMA_DIRECT=1`), kept for testing/parity — live testing on
+  Ollama 0.32.0 with `qwen3-coder` proved that route's tool-call shape is
+  rejected by codex 0.144.3's tool router (`error=unsupported call`),
+  so it is no longer the default. The direct route only exists in `kim
+  tui`'s Rust launcher regardless — the Python `exec --json` legacy
+  transport (`codex_bridge_service.py`) has no ollama-direct branch at all.
 - **`resume/sessions`**: A-6's continuity proof was written against
   `browser:gemini` only; the underlying sidecar (`codex_engine/
   thread_state.py`) and app-server transport are provider-agnostic, so the
@@ -169,8 +175,11 @@ Column-specific notes not otherwise obvious from the table:
    `kim tui --provider gemini` (API-key mode is config-driven; OAuth mode
    requires a signed-in Kim desktop session so Tauri can inject
    `KIM_GOOGLE_ACCESS_TOKEN`), `kim tui --provider deepseek`,
-   `kim tui --provider ollama` (requires a local Ollama ≥ 0.13.4 daemon —
-   see docs/kimcli.md's Ollama caveat).
+   `kim tui --provider ollama` (default proxy route — requires a local
+   Ollama daemon with `/api/chat`; the opt-in direct route,
+   `KIM_TUI_OLLAMA_DIRECT=1 kim tui --provider ollama`, additionally
+   requires Ollama ≥ 0.13.4 for `/v1/responses` — see docs/kimcli.md's
+   ollama-direct caveat).
 3. Work through the `M-*` instructions above for every row that applies to
    that column; note the mechanism actually observed (native / proxy-
    translated / parity-tool) against what this matrix expects, and file a
