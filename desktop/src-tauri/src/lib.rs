@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager};
 
 pub mod account;
 pub mod browser_bridge;
+mod binary_resolver;
 mod codex_bridge;
 pub mod codex_projects;
 pub mod config;

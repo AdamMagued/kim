@@ -731,7 +731,7 @@ async fn preflight_python_deps(interpreter: &str) -> Result<(), String> {
 
 /// Search PATH for an executable, returning its resolved path. (#20: uses the
 /// platform-appropriate lookup command.)
-fn executable_on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn executable_on_path(name: &str) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let search_cmd = ("where", name);
     #[cfg(not(target_os = "windows"))]
@@ -758,21 +758,16 @@ fn executable_on_path(name: &str) -> Option<PathBuf> {
     }
 }
 
-/// Locate the `codex` binary for the Code tab.
+/// Locate the codex/kimcli binary for the Code tab.
 ///
 /// F-G-1: the bundled-Codex / bundled-Claw arms (`pythonExperimentTool/…`) and
 /// the `CLAW_BIN` env / `claw`-on-PATH fallbacks were removed — the vendored
 /// `pythonExperimentTool/` tree is deleted, so those arms were dead hooks that
 /// could only ever produce a misleading "Build pythonExperimentTool/…" error.
-/// Resolution is now simply: `CODEX_BIN` env → `codex` on PATH.
+/// Resolution chain now lives in `binary_resolver` (#61): `CODEX_BIN` env →
+/// `~/.kim/bin/kimcli` → `kimcli` on PATH → `codex` on PATH.
 fn find_code_backend(_kim_root: &Path) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CODEX_BIN") {
-        let path = PathBuf::from(p);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    executable_on_path("codex")
+    crate::binary_resolver::resolve_code_backend()
 }
 
 #[allow(clippy::too_many_arguments)]
