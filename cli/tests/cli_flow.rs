@@ -616,3 +616,60 @@ fn oneshot_no_response_exits_nonzero() {
         combined_output(&output)
     );
 }
+
+// ── `kim tui` launcher (black-box, no kimcli/python required) ───────────────
+
+// A malformed `kim tui` flag must be rejected before anything is spawned —
+// same "usage error" contract as the rest of the CLI's flag parsing.
+#[test]
+fn tui_unknown_flag_exits_2_before_spawning_anything() {
+    let home = temp_home_with_config(&ollama_config("http://127.0.0.1:1"));
+    let out = run_kim(&home, &["tui", "--bogus-flag"], &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unknown `kim tui` flag must exit 2; output:\n{}",
+        combined_output(&out)
+    );
+    let all = combined_output(&out);
+    assert!(
+        all.contains("--bogus-flag") && all.contains("Usage: kim tui"),
+        "the usage error must name the offending flag; output:\n{all}"
+    );
+}
+
+#[test]
+fn tui_provider_flag_missing_value_exits_2() {
+    let home = temp_home_with_config(&ollama_config("http://127.0.0.1:1"));
+    let out = run_kim(&home, &["tui", "--provider"], &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a `--provider` with no value must exit 2; output:\n{}",
+        combined_output(&out)
+    );
+    assert!(
+        combined_output(&out).contains("requires a value"),
+        "output:\n{}",
+        combined_output(&out)
+    );
+}
+
+// With no Kim repo root discoverable (isolated temp home + cwd, no
+// KIM_PROJECT_ROOT / ~/.kim_root), `kim tui` must fail fast with an
+// actionable message instead of trying to spawn a nonexistent proxy/kimcli.
+#[test]
+fn tui_without_a_kim_repo_root_fails_with_actionable_message() {
+    let home = temp_home_with_config(&ollama_config("http://127.0.0.1:1"));
+    let out = run_kim(&home, &["tui"], &[]);
+    assert!(
+        !out.status.success(),
+        "kim tui with no discoverable Kim repo root must not succeed; output:\n{}",
+        combined_output(&out)
+    );
+    let all = combined_output(&out);
+    assert!(
+        all.contains("Kim source root not found"),
+        "output must explain why kim tui couldn't start; output:\n{all}"
+    );
+}

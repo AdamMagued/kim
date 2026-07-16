@@ -65,6 +65,11 @@ pub async fn doctor_report(config: &KimConfig) -> DoctorReport {
         format!("codex: {}", command_status("codex", &["--version"]).await),
         format!("git: {}", command_status("git", &["--version"]).await),
         format!("cargo: {}", command_status("cargo", &["--version"]).await),
+        format!("kimcli binary: {}", kimcli_binary_status().await),
+        format!(
+            "kimcli proxy dry-check: {}",
+            kimcli_proxy_dry_check(&root, python_found).await
+        ),
     ];
 
     // required_ok gates the exit code unconditionally; all_ok also folds in the
@@ -238,6 +243,92 @@ async fn python_status() -> String {
             )
         }
         None => "not found (tried repo venv, python3, python)".to_string(),
+    }
+}
+
+/// `kim doctor`'s "kimcli" section (`kim tui` launcher health): binary
+/// resolution result + version string. Purely informational — never gates
+/// the exit code (a missing kimcli install doesn't block chat/code mode).
+async fn kimcli_binary_status() -> String {
+    match crate::commands::tui::resolve_kimcli_binary() {
+        Ok(crate::commands::tui::KimcliResolution::Kimcli(path)) => {
+            let version = command_status(&path.to_string_lossy(), &["--version"]).await;
+            format!("{} — {version}", path.display())
+        }
+        Ok(crate::commands::tui::KimcliResolution::CodexFallback(path)) => {
+            let version = command_status(&path.to_string_lossy(), &["--version"]).await;
+            format!(
+                "{} — {version} (upstream 'codex' binary — branding differs; \
+                 install kimcli via scripts/install_kimcli.sh)",
+                path.display()
+            )
+        }
+        Err(e) => format!("not found — {e}"),
+    }
+}
+
+/// `kim doctor`'s proxy dry-check: spawn `python -m
+/// codex_engine.standalone_proxy` with a bogus provider and expect a `fatal`
+/// handshake line within 10s (proving the proxy launches and honors the
+/// handshake contract). Gracefully skipped — not reported as a failure —
+/// when Python or the Kim repo root (specifically `codex_engine/`) aren't
+/// available, since `kim tui` itself would report those separately.
+async fn kimcli_proxy_dry_check(root: &std::path::Path, python_found: bool) -> String {
+    if !python_found {
+        return "skipped (no Python interpreter found)".to_string();
+    }
+    if !root
+        .join("codex_engine")
+        .join("standalone_proxy.py")
+        .is_file()
+    {
+        return "skipped (codex_engine/standalone_proxy.py not found — not inside the Kim repo?)"
+            .to_string();
+    }
+    let Some(python) = crate::agentic::find_python(root) else {
+        return "skipped (no Python interpreter found)".to_string();
+    };
+
+    use tokio::io::BufReader;
+    use tokio::process::Command;
+
+    let mut child = match Command::new(&python)
+        .args([
+            "-m",
+            "codex_engine.standalone_proxy",
+            "--provider",
+            "kim-doctor-bogus-provider-xyz",
+        ])
+        .current_dir(root)
+        .env("PYTHONPATH", root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("could not spawn a dry-check ({e})"),
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.start_kill();
+        return "could not capture the dry-check's stdout".to_string();
+    };
+    let mut reader = BufReader::new(stdout);
+    let result = crate::commands::tui::read_proxy_handshake_with_timeout(
+        &mut reader,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let _ = child.start_kill();
+
+    match result {
+        Ok(crate::commands::tui::ProxyHandshake::Fatal { message }) => {
+            format!("ok (correctly rejected a bogus provider: {message})")
+        }
+        Ok(crate::commands::tui::ProxyHandshake::Ready { .. }) => {
+            "⚠ unexpected: a bogus provider produced a ready handshake".to_string()
+        }
+        Err(e) => format!("⚠ unexpected: {e}"),
     }
 }
 

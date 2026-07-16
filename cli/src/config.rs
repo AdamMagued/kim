@@ -54,6 +54,12 @@ pub struct KimConfig {
     pub ollama_base_url: String,
     pub desktop_bridge_url: String,
     pub api_keys: BTreeMap<String, String>,
+    /// `kim tui` default provider (overridable per-run with `--provider`).
+    /// `None` falls back to "browser:claude".
+    pub tui_provider: Option<String>,
+    /// `kim tui` default model (overridable per-run with `--model`). `None`
+    /// falls back to `model` above.
+    pub tui_model: Option<String>,
 }
 
 impl Default for KimConfig {
@@ -65,6 +71,8 @@ impl Default for KimConfig {
             ollama_base_url: "http://127.0.0.1:11434".to_string(),
             desktop_bridge_url: "http://127.0.0.1:18991".to_string(),
             api_keys: BTreeMap::new(),
+            tui_provider: None,
+            tui_model: None,
         }
     }
 }

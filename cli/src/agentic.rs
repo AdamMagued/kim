@@ -201,7 +201,10 @@ pub fn find_python(root: &Path) -> Option<PathBuf> {
     None
 }
 
-fn which(name: &str) -> Option<PathBuf> {
+/// Resolve `name` on PATH via the platform's `which`/`where`. Shared beyond
+/// this module (e.g. `commands::tui::resolve_kimcli_binary`) so PATH lookup
+/// logic lives in exactly one place.
+pub(crate) fn which(name: &str) -> Option<PathBuf> {
     let out = std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
         .arg(name)
         .output()
