@@ -4,14 +4,15 @@
 //! command output, plan checklist, diff summary, and the interrupt-first
 //! cancel path. Split out so main.rs stays under the file-size gate.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, stdout, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
+use crate::app::{App, MessageRole, UiMessage};
 use crate::paint::{
     kim_accent_color, paint_bold, paint_dim, paint_text, print_message, print_note,
 };
 use crate::provider::{AppEvent, UserInputQuestion};
-use crate::{format_repl_elapsed, stdout, App, MessageRole, UiMessage};
+use crate::turn::format_repl_elapsed;
 
 /// Consume one turn's streamed events, render them, and persist the result.
 /// Extracted from `stream_repl_turn` so it can be driven by a stubbed event
