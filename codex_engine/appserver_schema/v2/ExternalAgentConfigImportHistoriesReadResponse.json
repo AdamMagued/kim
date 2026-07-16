@@ -1,23 +1,49 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "ExternalAgentConfigImportCompletedNotification",
+  "title": "ExternalAgentConfigImportHistoriesReadResponse",
   "type": "object",
   "required": [
-    "importId",
-    "itemTypeResults"
+    "data"
   ],
   "properties": {
-    "importId": {
-      "type": "string"
-    },
-    "itemTypeResults": {
+    "data": {
       "type": "array",
       "items": {
-        "$ref": "#/definitions/ExternalAgentConfigImportTypeResult"
+        "$ref": "#/definitions/ExternalAgentConfigImportHistory"
       }
     }
   },
   "definitions": {
+    "ExternalAgentConfigImportHistory": {
+      "type": "object",
+      "required": [
+        "completedAtMs",
+        "failures",
+        "importId",
+        "successes"
+      ],
+      "properties": {
+        "completedAtMs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "failures": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeFailure"
+          }
+        },
+        "importId": {
+          "type": "string"
+        },
+        "successes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeSuccess"
+          }
+        }
+      }
+    },
     "ExternalAgentConfigImportItemTypeFailure": {
       "type": "object",
       "required": [
@@ -81,31 +107,6 @@
             "string",
             "null"
           ]
-        }
-      }
-    },
-    "ExternalAgentConfigImportTypeResult": {
-      "type": "object",
-      "required": [
-        "failures",
-        "itemType",
-        "successes"
-      ],
-      "properties": {
-        "failures": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeFailure"
-          }
-        },
-        "itemType": {
-          "$ref": "#/definitions/ExternalAgentConfigMigrationItemType"
-        },
-        "successes": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeSuccess"
-          }
         }
       }
     },

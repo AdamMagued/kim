@@ -31,7 +31,6 @@
           "type": "string",
           "enum": [
             "untrusted",
-            "on-failure",
             "on-request",
             "never"
           ]
@@ -101,6 +100,12 @@
             "null"
           ]
         },
+        "allowRemoteControl": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "allowedApprovalPolicies": {
           "type": [
             "array",
@@ -110,22 +115,23 @@
             "$ref": "#/definitions/AskForApproval"
           }
         },
-        "featureRequirements": {
+        "models": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelsRequirements"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "allowedPermissionProfiles": {
           "type": [
             "object",
             "null"
           ],
           "additionalProperties": {
             "type": "boolean"
-          }
-        },
-        "allowedPermissions": {
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "string"
           }
         },
         "allowedSandboxModes": {
@@ -146,6 +152,15 @@
             "$ref": "#/definitions/WebSearchMode"
           }
         },
+        "allowedWindowsSandboxImplementations": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/WindowsSandboxSetupMode"
+          }
+        },
         "computerUse": {
           "anyOf": [
             {
@@ -154,6 +169,12 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "defaultPermissions": {
+          "type": [
+            "string",
+            "null"
           ]
         },
         "enforceResidency": {
@@ -165,6 +186,15 @@
               "type": "null"
             }
           ]
+        },
+        "featureRequirements": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "boolean"
+          }
         }
       }
     },
@@ -357,6 +387,21 @@
         }
       }
     },
+    "ModelsRequirements": {
+      "type": "object",
+      "properties": {
+        "newThread": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/NewThreadModelDefaults"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
     "NetworkDomainPermission": {
       "type": "string",
       "enum": [
@@ -476,8 +521,40 @@
       "type": "string",
       "enum": [
         "allow",
-        "none"
+        "deny"
       ]
+    },
+    "NewThreadModelDefaults": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelReasoningEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "serviceTier": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ReasoningEffort": {
+      "description": "A non-empty reasoning effort value advertised by the model.",
+      "type": "string",
+      "minLength": 1
     },
     "ResidencyRequirement": {
       "type": "string",
@@ -498,7 +575,15 @@
       "enum": [
         "disabled",
         "cached",
+        "indexed",
         "live"
+      ]
+    },
+    "WindowsSandboxSetupMode": {
+      "type": "string",
+      "enum": [
+        "elevated",
+        "unelevated"
       ]
     }
   }

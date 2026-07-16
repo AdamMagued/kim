@@ -1,12 +1,12 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "ExternalAgentConfigImportResponse",
+  "title": "ThreadDeleteParams",
   "type": "object",
   "required": [
-    "importId"
+    "threadId"
   ],
   "properties": {
-    "importId": {
+    "threadId": {
       "type": "string"
     }
   }
