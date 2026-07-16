@@ -30,6 +30,15 @@ Auto-compaction (claw-style two-pass):
     summarizes older messages via the browser LLM (first pass), then applies
     priority-based line selection to keep the summary under a character budget
     (second pass — adapted from claw's summary_compression.rs).
+
+Modes (``_CodexProxy(..., mode=...)``):
+    "browser-contract" (default) — today's behavior: the browser-JSON-contract
+    translation on both /v1/responses and /v1/chat/completions, unchanged.
+    "chat-passthrough" — codex_engine/standalone_proxy.py's kimcli runtime:
+    /v1/chat/completions translates via codex_engine/chat_passthrough.py and
+    calls the provider's native complete(); /v1/responses 400s (this mode is
+    "wire_api = chat" only) and auto-compaction is skipped (codex manages its
+    own context in this mode).
 """
 
 from __future__ import annotations
@@ -47,7 +56,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from orchestrator.providers.browser_provider import BrowserProvider
+    from orchestrator.providers.base import BaseProvider
 
 # K5: bracket-tag vocabulary comes from the generated event manifest so the
 # text protocol cannot drift between the three runtimes.
@@ -78,19 +87,30 @@ ALLOWED_CODEX_TOOLS = {
     "web_search",
 }
 
-# Compaction constants (adapted from claw compact.rs)
-COMPACT_KEEP_ITEMS = 20      # Keep last N items uncompressed
-COMPACT_MIN_ITEMS_TO_REMOVE = 5  # Don't compact if fewer than this many items would be removed
-
-# Per-provider context thresholds (tokens) before compaction triggers
-_COMPACT_THRESHOLDS: dict[str, int] = {
-    "claude": 180_000,
-    "chatgpt": 100_000,
-    "gemini": 800_000,
-    "grok": 100_000,
-    "deepseek": 60_000,
-}
-_DEFAULT_COMPACT_THRESHOLD = 100_000
+# Compaction constants + helpers live in codex_engine/compaction.py (Q6
+# file-size gate — this file is already over the 800-line cap and may not
+# grow). Re-exported here so `from codex_engine.engine import X` call sites
+# (codex_bridge_service.py, tests) keep working unchanged.
+from codex_engine.compaction import (  # noqa: E402
+    COMPACT_KEEP_ITEMS,
+    COMPACT_MIN_ITEMS_TO_REMOVE,
+    _compress_summary,
+    _estimate_tokens,
+    _fix_tool_boundary,
+    _get_compact_threshold,
+    _is_compaction_summary,
+    _merge_compact_summaries,
+    _summarize_messages,
+)
+from codex_engine.chat_passthrough import (  # noqa: E402
+    canonical_to_chat_response,
+    chat_request_to_canonical,
+    stream_chat_response,
+)
+from codex_engine.turn_tracking import (  # noqa: E402
+    contains_new_user_turn,
+    detect_conversation_reset,
+)
 
 # Deterministic provider-failure signatures for a send into a stored browser
 # thread that never registered or whose tab is gone (bridge.js fail-fast
@@ -139,206 +159,30 @@ env_key = "CODEX_API_KEY"
     logger.info(f"Wrote Codex config: {config_path}")
 
 
-# ── Compaction helpers ───────────────────────────────────────────────────────
-
-
-def _estimate_tokens(items: list) -> int:
-    """Rough token estimate: ~4 chars per token."""
-    total = 0
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for field in ("content", "output", "arguments", "text"):
-            val = item.get(field, "")
-            if isinstance(val, str):
-                total += len(val) // 4
-            elif isinstance(val, list):
-                for block in val:
-                    if isinstance(block, dict):
-                        total += len(block.get("text", "")) // 4
-    return total
-
-
-def _get_compact_threshold(provider_name: str) -> int:
-    name = provider_name.lower()
-    for key, threshold in _COMPACT_THRESHOLDS.items():
-        if key in name:
-            return threshold
-    return _DEFAULT_COMPACT_THRESHOLD
-
-
-def _is_compaction_summary(item: object) -> bool:
-    """Return True if this item is a Kim compaction summary block."""
-    if not isinstance(item, dict):
-        return False
-    content = item.get("content", "")
-    if isinstance(content, str):
-        return "[CONTEXT SUMMARY" in content
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and "[CONTEXT SUMMARY" in block.get("text", ""):
-                return True
-    return False
-
-
-def _fix_tool_boundary(items: list, keep_from: int) -> int:
-    """Walk keep_from forward past any leading function_call_output items
-    to avoid orphaning a tool result without its paired tool call."""
-    idx = keep_from
-    while idx < len(items):
-        item = items[idx]
-        if isinstance(item, dict) and item.get("type") == "function_call_output":
-            idx += 1
-        else:
-            break
-    return idx
-
-
-def _compress_summary(summary_text: str, max_chars: int = 1200, max_lines: int = 24, max_line_chars: int = 160) -> str:
-    """Second-pass compression (adapted from claw summary_compression.rs).
-
-    Deduplicates, truncates long lines, and selects within a char/line budget
-    using a priority ordering that keeps core fields over noise.
-    """
-    inner = re.sub(r"</?summary>", "", summary_text).strip()
-
-    seen: set[str] = set()
-    lines: list[str] = []
-    for raw_line in inner.splitlines():
-        normalized = " ".join(raw_line.split())[:max_line_chars]
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        lines.append(normalized)
-
-    def _priority(line: str) -> int:
-        lower = line.lower()
-        if any(lower.startswith(k) for k in (
-            "scope:", "current work:", "tools used:", "key files:",
-            "pending:", "recent user requests:", "key decisions:",
-        )):
-            return 0
-        if any(lower.startswith(k) for k in (
-            "timeline:", "previously compacted:", "newly compacted:",
-        )):
-            return 1
-        if line.startswith(("- ", "• ", "* ", "  -")):
-            return 2
-        return 3
-
-    lines.sort(key=_priority)
-
-    selected: list[str] = []
-    total_chars = 0
-    for line in lines:
-        if len(selected) >= max_lines:
-            break
-        if total_chars + len(line) + 1 > max_chars:
-            break
-        selected.append(line)
-        total_chars += len(line) + 1
-
-    omitted = len(lines) - len(selected)
-    body = "\n".join(selected)
-    if omitted > 0:
-        body += f"\n[{omitted} additional context lines omitted]"
-
-    return f"<summary>\n{body}\n</summary>"
-
-
-def _merge_compact_summaries(existing: str, new_summary: str) -> str:
-    """Merge existing and new compaction summaries (claw merge_compact_summaries pattern)."""
-    existing_inner = re.sub(r"</?summary>", "", existing).strip()
-    new_inner = re.sub(r"</?summary>", "", new_summary).strip()
-    return (
-        f"<summary>\nPreviously compacted context:\n{existing_inner}\n\n"
-        f"Newly compacted context:\n{new_inner}\n</summary>"
-    )
-
-
-async def _summarize_messages(items: list, provider: "BrowserProvider") -> str:
-    """Call the browser LLM to produce a <summary> XML block for the given items."""
-    parts: list[str] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        role = item.get("role", "")
-        itype = item.get("type", "")
-        content = item.get("content", "")
-
-        if itype == "function_call":
-            name = item.get("name", "unknown")
-            args = str(item.get("arguments", ""))[:400]
-            parts.append(f"[TOOL CALL: {name}]\n{args}")
-        elif itype == "function_call_output":
-            output = item.get("output", "")
-            if isinstance(output, list):
-                output = " ".join(str(o) for o in output)
-            parts.append(f"[TOOL RESULT]\n{str(output)[:400]}")
-        elif role == "user":
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") in ("input_text", "text"):
-                        parts.append(f"[USER]\n{block.get('text', '')[:800]}")
-            elif isinstance(content, str) and not _is_compaction_summary(item):
-                parts.append(f"[USER]\n{content[:800]}")
-        elif role == "assistant":
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") in ("output_text", "text"):
-                        parts.append(f"[ASSISTANT]\n{block.get('text', '')[:800]}")
-            elif isinstance(content, str):
-                parts.append(f"[ASSISTANT]\n{content[:800]}")
-
-    transcript = "\n\n".join(parts)
-
-    prompt = (
-        "Summarize the following coding agent conversation for context compaction. "
-        "Output ONLY this XML block:\n\n"
-        "<summary>\n"
-        "Scope: [N tool calls, M user turns]\n"
-        "Tools used: [comma-separated tool names]\n"
-        "Recent user requests: [brief list]\n"
-        "Key files touched: [files created/modified/read]\n"
-        "Current work: [what was in progress at the end]\n"
-        "Key decisions: [important findings or decisions]\n"
-        "Timeline: [brief chronological summary]\n"
-        "</summary>\n\n"
-        f"TRANSCRIPT (truncated to 8000 chars):\n{transcript[:8000]}"
-    )
-
-    try:
-        response = await provider.complete(
-            messages=[{"role": "user", "content": prompt}],
-            tools=[],
-            system="You are a precise context summarizer. Output only the requested <summary>...</summary> XML block. No other text.",
-            clear_chat=True,
-        )
-        raw = response.get("content", "") if isinstance(response, dict) else str(response)
-        match = re.search(r"<summary>(.*?)</summary>", raw, re.DOTALL)
-        if match:
-            return f"<summary>{match.group(1)}</summary>"
-        return f"<summary>{raw[:1000]}</summary>"
-    except Exception as exc:
-        logger.warning(f"Summarization LLM call failed: {exc}")
-        return f"<summary>Context compacted. {len(items)} messages summarized.</summary>"
-
-
 # ── Local HTTP Proxy Server ──────────────────────────────────────────────────
 
 
 class _CodexProxy:
-    """Minimal HTTP server that translates Codex Responses API calls
-    into BrowserProvider.complete() calls, with auto-compaction."""
+    """Minimal HTTP server that translates Codex Responses/chat-completions
+    calls into BaseProvider.complete() calls, with auto-compaction.
+
+    ``mode="browser-contract"`` (default) is today's browser-JSON-contract
+    translation, bit-identical to before this param existed. ``mode=
+    "chat-passthrough"`` is the standalone kimcli runtime (see module
+    docstring) — /v1/responses 400s and /v1/chat/completions speaks
+    codex_engine/chat_passthrough.py's plain OpenAI wire translation.
+    """
 
     def __init__(
         self,
-        browser_provider: "BrowserProvider",
+        provider: "BaseProvider",
         provider_name: str = "",
         thread_state: Optional[dict] = None,
         stateful: bool = False,
+        mode: str = "browser-contract",
+        max_relays: Optional[int] = None,
     ):
-        self._provider = browser_provider
+        self._provider = provider
         self._provider_name = provider_name
         # Cross-task browser-thread state (codex_engine/thread_state.py sidecar,
         # loaded/saved by codex_bridge_service). Mutated in place so the service
@@ -346,6 +190,11 @@ class _CodexProxy:
         # CONTINUATION across tasks; handoff consumption works either way.
         self._thread_state: dict = thread_state if isinstance(thread_state, dict) else {}
         self._stateful = bool(stateful)
+        self._mode = mode
+        # A runaway guard for a single turn (see begin_turn / TUI fix below);
+        # None keeps the module default so every existing caller that never
+        # passes max_relays is bit-identical to before this param existed.
+        self._max_relays = int(max_relays) if max_relays is not None else MAX_RELAYS
         self._server = None
         self._runner = None
         self._port = 0
@@ -353,6 +202,9 @@ class _CodexProxy:
         self._last_sent_count = 0  # how many input_items were forwarded to the browser last relay
         self._last_proxy_response: Optional[dict] = None  # last Responses API reply sent to Codex
         self._last_tool_commands: Optional[tuple] = None  # last relay's tool-call signature (loop guard)
+        # Fingerprint of the last-forwarded input's first item (TUI fix —
+        # detect_conversation_reset). None until the first /v1/responses call.
+        self._last_first_fingerprint: Optional[str] = None
         # Cache: hash(json(prefix_items)) → summary_item dict
         # Avoids re-summarizing the same prefix on every Codex turn.
         # Bounded (C5): one entry per distinct compacted prefix would
@@ -433,13 +285,15 @@ class _CodexProxy:
         if not self._check_auth(request):
             return web.json_response({"error": {"message": "Unauthorized"}}, status=401)
 
-        self._relay_count += 1
-        relay_num = self._relay_count
-
-        if relay_num > MAX_RELAYS:
-            logger.error(f"Relay count exceeded {MAX_RELAYS}")
+        if self._mode != "browser-contract":
+            # chat-passthrough codex config always sets wire_api="chat" — Codex
+            # should never hit the Responses endpoint in that mode.
             return web.json_response(
-                {"error": {"message": "Too many relay attempts"}}, status=429,
+                {"error": {"message": (
+                    "This proxy is running in chat-passthrough mode "
+                    "(wire_api=\"chat\") — /v1/responses is not served."
+                )}},
+                status=400,
             )
 
         try:
@@ -447,11 +301,39 @@ class _CodexProxy:
         except Exception:
             return web.json_response({"error": {"message": "Invalid JSON body"}}, status=400)
 
+        input_items = body.get("input", [])
+        _turn_items = input_items if isinstance(input_items, list) else []
+
+        # TUI fixes for the standalone proxy's long-lived process (module
+        # docstring "Modes"): the exec transport spawns one process per turn
+        # so MAX_RELAYS/the sent-cursor naturally reset between turns; a
+        # long-lived kimcli session does not, so detect the boundaries here.
+        is_reset, new_fingerprint = detect_conversation_reset(
+            _turn_items, self._last_sent_count, self._last_first_fingerprint,
+        )
+        if is_reset:
+            logger.info("Detected a fresh conversation (codex /new) — resetting proxy state")
+            self._last_sent_count = 0
+            self._last_proxy_response = None
+            self._last_tool_commands = None
+            self._relay_count = 0
+        elif contains_new_user_turn(_turn_items[self._last_sent_count:]):
+            self._relay_count = 0
+        self._last_first_fingerprint = new_fingerprint
+
+        self._relay_count += 1
+        relay_num = self._relay_count
+
+        if relay_num > self._max_relays:
+            logger.error(f"Relay count exceeded {self._max_relays}")
+            return web.json_response(
+                {"error": {"message": "Too many relay attempts"}}, status=429,
+            )
+
         stream = bool(body.get("stream", False))
         logger.info(f"[relay #{relay_num}] Codex request received")
 
         # ── Auto-compaction ──────────────────────────────────────────────────
-        input_items = body.get("input", [])
         compacted = False
         if isinstance(input_items, list) and input_items:
             threshold = _get_compact_threshold(self._provider_name)
@@ -480,7 +362,7 @@ class _CodexProxy:
                 prompt = _extract_delta_prompt(input_items) or _extract_prompt_from_responses_request(body)
                 clear_chat = False
                 if hasattr(self._provider, "mark_thread_continuation"):
-                    self._provider.mark_thread_continuation()
+                    self._provider.mark_thread_continuation()  # type: ignore[attr-defined] — browser-contract mode only
                 logger.info(
                     f"[relay #{relay_num}] First relay — continuing stored browser thread "
                     f"(delta only, {self._thread_state.get('turns', 0)} prior turns)"
@@ -491,7 +373,7 @@ class _CodexProxy:
                 clear_chat = True
                 # Ensure system prompt is re-injected when the new browser chat opens.
                 if hasattr(self._provider, '_sent_system_prompt'):
-                    self._provider._sent_system_prompt = False
+                    self._provider._sent_system_prompt = False  # type: ignore[attr-defined] — browser-contract mode only
                 logger.info(f"[relay #{relay_num}] First relay — sending full context")
             # ChatGPT weighs the END of a long prompt far more than the top.
             # Repeat the same JSON contract the Responses parser expects; do
@@ -564,7 +446,7 @@ class _CodexProxy:
                 messages=[{"role": "user", "content": prompt}],
                 tools=[],
                 system=_system_prompt_for(self._provider_name),
-                clear_chat=clear_chat,
+                clear_chat=clear_chat,  # type: ignore[call-arg] — BrowserProvider accepts clear_chat/handoff kwargs
                 **extra_kwargs,
             )
             if continuing_thread and _is_thread_send_failure(response):
@@ -576,13 +458,13 @@ class _CodexProxy:
                 clear_chat = True
                 handoff = str(self._thread_state.get("handoff") or "").strip() or None
                 if hasattr(self._provider, '_sent_system_prompt'):
-                    self._provider._sent_system_prompt = False
+                    self._provider._sent_system_prompt = False  # type: ignore[attr-defined] — browser-contract mode only
                 extra_kwargs = {"handoff": handoff} if handoff else {}
                 response = await self._provider.complete(
                     messages=[{"role": "user", "content": prompt}],
                     tools=[],
                     system=_system_prompt_for(self._provider_name),
-                    clear_chat=True,
+                    clear_chat=True,  # type: ignore[call-arg] — BrowserProvider accepts clear_chat/handoff kwargs
                     **extra_kwargs,
                 )
         except Exception as e:
@@ -674,7 +556,7 @@ class _CodexProxy:
                 messages=[{"role": "user", "content": nudge}],
                 tools=[],
                 system=_system_prompt_for(self._provider_name),
-                clear_chat=False,
+                clear_chat=False,  # type: ignore[call-arg] — BrowserProvider accepts clear_chat/handoff kwargs
             )
         except Exception as e:
             logger.warning(f"[relay #{relay_num}] Contract nudge failed ({e}) — keeping original reply")
@@ -752,7 +634,7 @@ class _CodexProxy:
         self._relay_count += 1
         relay_num = self._relay_count
 
-        if relay_num > MAX_RELAYS:
+        if relay_num > self._max_relays:
             return web.json_response({"error": {"message": "Too many relay attempts"}}, status=429)
 
         try:
@@ -761,6 +643,9 @@ class _CodexProxy:
             return web.json_response({"error": {"message": "Invalid JSON body"}}, status=400)
 
         logger.info(f"[relay #{relay_num}] Chat completions request received")
+
+        if self._mode != "browser-contract":
+            return await self._handle_chat_passthrough(body, relay_num)
 
         # ── Auto-compaction ──────────────────────────────────────────────────
         messages = body.get("messages", [])
@@ -780,7 +665,7 @@ class _CodexProxy:
                 messages=[{"role": "user", "content": prompt}],
                 tools=[],
                 system=_system_prompt_for(self._provider_name),
-                clear_chat=True,
+                clear_chat=True,  # type: ignore[call-arg] — BrowserProvider accepts clear_chat/handoff kwargs
             )
         except Exception as e:
             logger.error(f"[relay #{relay_num}] Browser LLM call failed: {e}")
@@ -790,6 +675,32 @@ class _CodexProxy:
         _surface_relay_reasoning(response, relay_num)
 
         return web.json_response(reply)
+
+    async def _handle_chat_passthrough(self, body: dict, relay_num: int):
+        """chat-passthrough mode: plain OpenAI wire translation via
+        codex_engine/chat_passthrough.py — no browser JSON contract, no
+        compaction (codex manages its own context in this mode)."""
+        from aiohttp import web
+
+        messages, tools, system_prompt = chat_request_to_canonical(body)
+        try:
+            response = await self._provider.complete(
+                messages=messages, tools=tools, system=system_prompt or "",
+            )
+        except Exception as e:
+            logger.error(f"[relay #{relay_num}] Provider call failed: {e}")
+            return web.json_response({"error": {"message": f"LLM call failed: {e}"}}, status=502)
+
+        model = str(body.get("model") or "kim-proxy-model")
+        request_id = f"chatcmpl_{uuid.uuid4().hex[:16]}"
+        if bool(body.get("stream", False)):
+            frames = "".join(stream_chat_response(response, model, request_id))
+            return web.Response(
+                body=frames.encode(),
+                content_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        return web.json_response(canonical_to_chat_response(response, model, request_id))
 
     async def _apply_compaction_chat(self, messages: list, relay_num: int) -> list:
         """Compaction for chat completions format (role/content messages)."""
