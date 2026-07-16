@@ -73,18 +73,18 @@ from orchestrator.compact_prompt import (
     render_handoff_text,
 )
 from orchestrator.providers.base import create_provider
+from orchestrator.agent_config import load_config as _shared_load_config
 
 # Control tasks that compact the code-mode browser thread instead of running
 # Codex. Mirrors _COMPACT_CONTROL_TASKS in orchestrator/agent.py so /compact
 # behaves the same in the Code tab and CLI code mode as in normal chat.
 _COMPACT_CONTROL_TASKS = {"/compact", "compact", "__kim_compact_context__"}
 
-# Repo root — used to locate the default ``config.yaml`` when ``--config`` is
-# omitted (see ``_load_config`` below). Import resolution for ``codex_engine.*``,
-# ``orchestrator.*`` and ``mcp_server.*`` comes from ``PYTHONPATH=kim_root`` set by
-# the Tauri launcher (``subprocess.rs``), so no ``sys.path`` manipulation is needed.
-_HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent
+# Default config.yaml resolution (when --config is omitted) now lives in the
+# shared orchestrator.agent_config.load_config helper (see _load_config
+# below). Import resolution for codex_engine.*, orchestrator.* and
+# mcp_server.* comes from PYTHONPATH=kim_root set by the Tauri launcher
+# (subprocess.rs), so no sys.path manipulation is needed here.
 
 logger = logging.getLogger("kim.codex_bridge_service")
 
@@ -167,18 +167,16 @@ _install_sigterm_handler()
 
 
 def _load_config(path: Optional[str]) -> dict:
-    cfg_path = Path(path) if path else _REPO / "config.yaml"
-    if not cfg_path.exists():
-        return {}
-    try:
-        import yaml  # type: ignore[import-not-found]
-    except ImportError:
-        return {}
-    try:
-        loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-        return loaded if isinstance(loaded, dict) else {}
-    except Exception:  # noqa: BLE001
-        return {}
+    """Load config.yaml the same way the rest of the orchestrator does.
+
+    Thin wrapper kept for this module's existing internal call site — the
+    actual loading (default-path resolution, malformed/non-mapping
+    degrade-to-{}) lives in the shared ``orchestrator.agent_config.load_config``
+    helper, which ``codex_engine/standalone_proxy.py`` also calls (via a
+    runtime import, to keep codex_engine free of a module-level orchestrator
+    dependency) so both Codex bridge entry points read config identically.
+    """
+    return _shared_load_config(path)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
