@@ -31,7 +31,16 @@ expands a provider's ``"batch"`` reply into genuine parallel
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+import logging
+import uuid
+from typing import TYPE_CHECKING, Any, Optional
+
+from codex_engine.turn_tracking import contains_new_user_turn
+
+if TYPE_CHECKING:
+    from codex_engine.engine import _CodexProxy
+
+logger = logging.getLogger("kim.codex_bridge")
 
 from codex_engine.chat_passthrough import _canonical_calls
 
@@ -187,3 +196,72 @@ def canonical_reply_to_responses_parts(resp: object) -> tuple[str, Optional[list
         tool_calls = [{"name": c.get("tool"), "input": c.get("args") or {}} for c in calls]
         return str(resp.get("content") or ""), tool_calls
     return str(resp.get("content", "")), None
+
+
+# ── _CodexProxy._handle_responses dispatch target ────────────────────────────
+#
+# Lives here (not as a _CodexProxy method) so engine.py — already over the
+# Q6 800-line file-size gate and not allowed to grow past its previous push —
+# only carries a 2-line dispatch (`if self._mode == "responses-passthrough":
+# return await handle_responses_passthrough(self, body, _turn_items)`).
+
+
+async def handle_responses_passthrough(proxy: "_CodexProxy", body: dict, input_items: list):
+    """responses-passthrough mode: native BaseProvider tool-calling on
+    /v1/responses (codex 0.144.3 removed wire_api="chat" entirely — see
+    engine.py's module docstring "Modes"). Keeps item STRUCTURE (this
+    module's ``responses_request_to_canonical``) — no prompt flattening, no
+    delta cursor, no compaction, no browser-JSON-contract nudge/salvage;
+    codex resends the full input every relay and manages its own context.
+
+    Relay-cap turn-reset (TUI fix 1) still applies: ``proxy._last_sent_count``
+    is reused here purely as a turn-boundary bookkeeping cursor (NOT a delta
+    cursor — the full canonical translation is sent every relay regardless
+    of its value).
+
+    Reuses engine.py's existing Responses API emitters
+    (``_make_responses_text_reply`` / ``_make_responses_tool_reply`` /
+    ``_sse_or_json``) unchanged, via a deferred import — engine.py imports
+    this function at module scope, so importing engine.py back at THIS
+    module's top level would be circular; deferring it into the function
+    body is safe because both modules are fully loaded by the time this is
+    actually called.
+    """
+    from aiohttp import web
+
+    from codex_engine.engine import (
+        _make_responses_text_reply,
+        _make_responses_tool_reply,
+        _sse_or_json,
+    )
+
+    if contains_new_user_turn(input_items[proxy._last_sent_count:]):
+        proxy._relay_count = 0
+    proxy._last_sent_count = len(input_items)
+
+    proxy._relay_count += 1
+    relay_num = proxy._relay_count
+    if relay_num > proxy._max_relays:
+        logger.error(f"Relay count exceeded {proxy._max_relays}")
+        return web.json_response(
+            {"error": {"message": "Too many relay attempts"}}, status=429,
+        )
+
+    stream = bool(body.get("stream", False))
+    messages, tools, system_prompt = responses_request_to_canonical(body)
+
+    try:
+        response = await proxy._provider.complete(
+            messages=messages, tools=tools, system=system_prompt or "",
+        )
+    except Exception as e:
+        logger.error(f"[relay #{relay_num}] Provider call failed: {e}")
+        return web.json_response({"error": {"message": f"LLM call failed: {e}"}}, status=502)
+
+    resp_id = f"resp_{uuid.uuid4().hex[:16]}"
+    text, tool_calls = canonical_reply_to_responses_parts(response)
+    responses_reply = (
+        _make_responses_tool_reply(resp_id, text, tool_calls)
+        if tool_calls else _make_responses_text_reply(resp_id, text)
+    )
+    return _sse_or_json(stream, responses_reply)

@@ -34,21 +34,10 @@ Auto-compaction (claw-style two-pass):
 Modes (``_CodexProxy(..., mode=...)``):
     "browser-contract" (default) — today's behavior: the browser-JSON-contract
     translation on both /v1/responses and /v1/chat/completions, unchanged.
-    "responses-passthrough" — codex_engine/standalone_proxy.py's kimcli
-    runtime for API providers (claude, gemini, deepseek, ollama-behind-proxy):
-    codex 0.144.3 removed the chat-completions wire API entirely (``WireApi``
-    in codex-rs/model-provider-info/src/lib.rs has only the ``Responses``
-    variant), so /v1/responses translates via
-    codex_engine/responses_passthrough.py, keeping item structure (no prompt
-    flattening), and calls the provider's native complete(); no delta cursor,
-    no browser thread state, and auto-compaction is skipped (codex resends
-    the full input every relay and manages its own context). The relay-cap
-    turn-reset (TUI fix 1) still applies.
-    "chat-passthrough" — an OpenAI-compatible /v1/chat/completions
-    translation via codex_engine/chat_passthrough.py, kept for non-codex
-    OpenAI-compat clients (codex itself never selects it — see
-    standalone_proxy.py's mode auto-resolution); /v1/responses 400s in this
-    mode and auto-compaction is skipped here too.
+    "responses-passthrough" — kimcli's mode for API providers (codex 0.144.3
+    removed the chat wire API — see responses_passthrough.py); keeps item
+    structure, no delta cursor/compaction/nudge. "chat-passthrough" — plain
+    OpenAI /v1/chat/completions (chat_passthrough.py), non-codex clients only.
 """
 
 from __future__ import annotations
@@ -117,10 +106,7 @@ from codex_engine.chat_passthrough import (  # noqa: E402
     chat_request_to_canonical,
     stream_chat_response,
 )
-from codex_engine.responses_passthrough import (  # noqa: E402
-    canonical_reply_to_responses_parts,
-    responses_request_to_canonical,
-)
+from codex_engine.responses_passthrough import handle_responses_passthrough  # noqa: E402
 from codex_engine.turn_tracking import (  # noqa: E402
     contains_new_user_turn,
     detect_conversation_reset,
@@ -181,12 +167,8 @@ class _CodexProxy:
     calls into BaseProvider.complete() calls, with auto-compaction.
 
     ``mode="browser-contract"`` (default) is today's browser-JSON-contract
-    translation, bit-identical to before this param existed. ``mode=
-    "responses-passthrough"`` is kimcli's real runtime mode for API
-    providers — /v1/responses speaks codex_engine/responses_passthrough.py's
-    structure-preserving translation. ``mode="chat-passthrough"`` speaks
-    codex_engine/chat_passthrough.py's plain OpenAI /v1/chat/completions
-    wire translation and 400s /v1/responses (see module docstring "Modes").
+    translation, bit-identical to before this param existed. See module
+    docstring "Modes" for ``"responses-passthrough"``/``"chat-passthrough"``.
     """
 
     def __init__(
@@ -319,9 +301,8 @@ class _CodexProxy:
 
         input_items = body.get("input", [])
         _turn_items = input_items if isinstance(input_items, list) else []
-
         if self._mode == "responses-passthrough":
-            return await self._handle_responses_passthrough(body, _turn_items)
+            return await handle_responses_passthrough(self, body, _turn_items)
 
         # TUI fixes for the standalone proxy's long-lived process (module
         # docstring "Modes"): the exec transport spawns one process per turn
@@ -535,52 +516,6 @@ class _CodexProxy:
         self._last_tool_commands = cmds
         self._last_proxy_response = responses_reply
 
-        return _sse_or_json(stream, responses_reply)
-
-    async def _handle_responses_passthrough(self, body: dict, input_items: list):
-        """responses-passthrough mode: native BaseProvider tool-calling on
-        /v1/responses (codex 0.144.3 removed wire_api="chat" entirely — see
-        module docstring "Modes"). Keeps item STRUCTURE via
-        responses_passthrough.py — no prompt flattening, no delta cursor, no
-        compaction, no browser-JSON-contract nudge/salvage; codex resends
-        the full input every relay and manages its own context.
-
-        Relay-cap turn-reset (TUI fix 1) still applies: ``_last_sent_count``
-        is reused here purely as a turn-boundary bookkeeping cursor (NOT a
-        delta cursor — the full canonical translation is sent every relay
-        regardless of its value).
-        """
-        from aiohttp import web
-
-        if contains_new_user_turn(input_items[self._last_sent_count:]):
-            self._relay_count = 0
-        self._last_sent_count = len(input_items)
-
-        self._relay_count += 1
-        relay_num = self._relay_count
-        if relay_num > self._max_relays:
-            logger.error(f"Relay count exceeded {self._max_relays}")
-            return web.json_response(
-                {"error": {"message": "Too many relay attempts"}}, status=429,
-            )
-
-        stream = bool(body.get("stream", False))
-        messages, tools, system_prompt = responses_request_to_canonical(body)
-
-        try:
-            response = await self._provider.complete(
-                messages=messages, tools=tools, system=system_prompt or "",
-            )
-        except Exception as e:
-            logger.error(f"[relay #{relay_num}] Provider call failed: {e}")
-            return web.json_response({"error": {"message": f"LLM call failed: {e}"}}, status=502)
-
-        resp_id = f"resp_{uuid.uuid4().hex[:16]}"
-        text, tool_calls = canonical_reply_to_responses_parts(response)
-        responses_reply = (
-            _make_responses_tool_reply(resp_id, text, tool_calls)
-            if tool_calls else _make_responses_text_reply(resp_id, text)
-        )
         return _sse_or_json(stream, responses_reply)
 
     async def _nudge_contract_retry(self, response: dict, relay_num: int) -> dict:
