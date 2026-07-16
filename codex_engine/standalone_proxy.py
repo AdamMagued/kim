@@ -9,7 +9,8 @@ spawns the kimcli binary pointed at ``http://127.0.0.1:<port>/v1`` with
 Usage:
     python -m codex_engine.standalone_proxy --provider claude
         [--config path/to/config.yaml]
-        [--mode auto|browser-contract|chat-passthrough]   (default: auto)
+        [--mode auto|browser-contract|responses-passthrough|chat-passthrough]
+            (default: auto)
         [--max-relays N]
         [--parent-pid PID]
         [--preflight]
@@ -29,14 +30,22 @@ the fatal path (which always runs before that redirect) writes to the real
 stdout.
 
 Mode ("auto", the default): ``browser:*`` (and bare ``"browser"``) providers
-resolve to "browser-contract" — the primary kimcli path, since
-BrowserProvider.complete() speaks the /v1/responses JSON contract rather
-than native tool-calling. Every other provider resolves to
-"chat-passthrough" — plain OpenAI wire translation via chat_passthrough.py,
-calling complete() with the native BaseProvider signature (no clear_chat/
-handoff kwargs). Both explicit mode values remain available as overrides
-(e.g. forcing chat-passthrough against a browser provider, or vice versa,
-for testing/parity).
+resolve to "browser-contract" — the primary kimcli path for those
+providers, since BrowserProvider.complete() speaks the /v1/responses JSON
+contract rather than native tool-calling. Every other provider (claude,
+gemini — both auth modes, deepseek, ollama-behind-proxy) resolves to
+"responses-passthrough": codex 0.144.3 removed the chat-completions wire
+API entirely (``WireApi`` in codex-rs/model-provider-info/src/lib.rs has
+only the ``Responses`` variant), so codex will never call
+/v1/chat/completions — API providers must be served natively on
+/v1/responses via codex_engine/responses_passthrough.py, which keeps item
+structure (no prompt flattening) and calls complete() with the native
+BaseProvider signature (no clear_chat/handoff kwargs). "chat-passthrough"
+(codex_engine/chat_passthrough.py's OpenAI /v1/chat/completions
+translation) is never selected by auto-resolution — codex itself has no use
+for it — but stays available as an explicit override for OpenAI-compatible
+clients other than codex that do speak wire_api="chat". All three explicit
+mode values remain available as overrides for testing/parity.
 
 Shutdown: SIGTERM/SIGINT triggers a clean aiohttp teardown and exit(0). When
 --parent-pid is given, a background watchdog polls every 5s (override via
@@ -77,9 +86,9 @@ def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     p.add_argument("--config", default=None, help="Path to config.yaml (defaults to the repo's config.yaml).")
     p.add_argument(
         "--mode", default="auto",
-        choices=["auto", "browser-contract", "chat-passthrough"],
+        choices=["auto", "browser-contract", "responses-passthrough", "chat-passthrough"],
         help="See module docstring — 'auto' resolves browser:* providers to "
-             "browser-contract and everything else to chat-passthrough.",
+             "browser-contract and everything else to responses-passthrough.",
     )
     p.add_argument("--max-relays", type=int, default=None)
     p.add_argument("--parent-pid", type=int, default=None, help="Watchdog: exit if this pid disappears.")
@@ -93,13 +102,16 @@ def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
 def _resolve_auto_mode(provider_name: str) -> str:
     """"auto" mode resolution (module docstring "Mode").
 
-    browser:* providers (and bare "browser") are the primary kimcli path —
-    BrowserProvider.complete() speaks the /v1/responses JSON contract, not
-    native BaseProvider tool-calling — so they resolve to "browser-contract".
-    Every other provider resolves to "chat-passthrough".
+    browser:* providers (and bare "browser") are the primary kimcli path for
+    those providers — BrowserProvider.complete() speaks the /v1/responses
+    JSON contract, not native BaseProvider tool-calling — so they resolve to
+    "browser-contract". Every other provider (claude, gemini, deepseek,
+    ollama-behind-proxy, ...) resolves to "responses-passthrough": codex
+    0.144.3 removed the chat-completions wire API entirely, so those
+    providers are served natively on /v1/responses instead.
     """
     name = provider_name.strip().lower()
-    return "browser-contract" if name == "browser" or name.startswith("browser:") else "chat-passthrough"
+    return "browser-contract" if name == "browser" or name.startswith("browser:") else "responses-passthrough"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -108,7 +120,17 @@ def _pid_alive(pid: int) -> bool:
     POSIX: os.kill(pid, 0) — no signal sent, just existence/permission check.
     Windows: os.kill(pid, 0) is not supported by CPython for arbitrary pids
     (raises OSError unconditionally), and psutil is NOT a project dependency
-    (see requirements.txt) — so this uses a small ctypes OpenProcess check.
+    (see requirements.txt) — so this uses ctypes OpenProcess +
+    GetExitCodeProcess. OpenProcess succeeding is NOT enough on its own: a
+    Windows process object stays queryable by pid as long as ANY handle to
+    it remains open anywhere — including the launcher's own
+    ``subprocess.Popen`` handle to a parent it already terminated and
+    waited on — so a bare "did OpenProcess succeed" check read an already-
+    dead parent as alive forever and the watchdog never fired (verified:
+    this is what made tests/test_standalone_proxy.py's watchdog test hang
+    on Windows CI). Comparing the queried exit code against STILL_ACTIVE
+    (259) reports the true run state regardless of who else still holds a
+    handle to the process object.
     If ctypes itself is unavailable, degrade gracefully: assume alive rather
     than risk spuriously killing a live proxy from a broken liveness check.
     """
@@ -118,13 +140,22 @@ def _pid_alive(pid: int) -> bool:
         try:
             import ctypes
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
             handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
                 PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
             )
             if not handle:
                 return False
-            ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
-            return True
+            try:
+                exit_code = ctypes.c_ulong()
+                queried = ctypes.windll.kernel32.GetExitCodeProcess(  # type: ignore[attr-defined]
+                    handle, ctypes.byref(exit_code),
+                )
+                if not queried:
+                    return False  # couldn't read the exit code — don't orphan the proxy on a guess
+                return exit_code.value == STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
         except Exception:
             logger.warning("Parent-pid watchdog unavailable on this Windows host; disabling it.")
             return True

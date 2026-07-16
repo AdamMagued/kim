@@ -6,7 +6,8 @@ parent-pid watchdog, and clean SIGTERM shutdown.
 
 See tests/test_codex_proxy_modes.py for the in-process _CodexProxy
 mode-generalization tests (chat-passthrough translation, the two TUI fixes)
-that this runtime builds on.
+and tests/test_responses_passthrough.py for the responses-passthrough golden
+translation tests that this runtime builds on.
 """
 
 from __future__ import annotations
@@ -96,7 +97,10 @@ def _wait_for_substring(lines: list, substring: str, timeout: float = 10.0) -> b
 class AutoModeResolutionTests(unittest.TestCase):
     """"auto" --mode resolution (module docstring "Mode"): browser:* (and
     bare "browser") providers are kimcli's primary path and must resolve to
-    browser-contract; everything else resolves to chat-passthrough."""
+    browser-contract; everything else (API providers — codex 0.144.3 removed
+    the chat-completions wire API, so they can only be served on
+    /v1/responses) resolves to responses-passthrough. chat-passthrough is
+    never an auto-resolution target — it stays explicit-only."""
 
     def test_browser_colon_provider_resolves_to_browser_contract(self):
         for name in ("browser:claude", "browser:chatgpt", "browser:gemini", "browser:grok"):
@@ -109,10 +113,10 @@ class AutoModeResolutionTests(unittest.TestCase):
     def test_case_insensitive(self):
         self.assertEqual(_resolve_auto_mode("Browser:Claude"), "browser-contract")
 
-    def test_non_browser_providers_resolve_to_chat_passthrough(self):
+    def test_non_browser_providers_resolve_to_responses_passthrough(self):
         for name in ("claude", "openai", "gemini", "deepseek", "ollama", "fake"):
             with self.subTest(name=name):
-                self.assertEqual(_resolve_auto_mode(name), "chat-passthrough")
+                self.assertEqual(_resolve_auto_mode(name), "responses-passthrough")
 
 
 class StandaloneProxyHandshakeTests(unittest.TestCase):
@@ -249,20 +253,28 @@ class StdoutRedirectAfterHandshakeTests(unittest.TestCase):
 
 class StandaloneProxyWatchdogTests(unittest.TestCase):
     def test_watchdog_exits_when_parent_pid_dies(self):
-        dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        # A short-lived dummy that exits ON ITS OWN, rather than one we
+        # terminate(): the dummy's OWN Popen object here would otherwise
+        # keep it queryable-by-pid on Windows via a lingering open handle
+        # for the rest of this test regardless of the child's actual run
+        # state (see _pid_alive's Windows docstring) — a natural exit plus
+        # a plain wait() sidesteps that entirely and does not depend on
+        # this test's own signal delivery to the dummy being reliable.
+        dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
         proc = None
         try:
             proc = _spawn(
                 ["--provider", "fake", "--parent-pid", str(dummy.pid)],
                 env_extra={"KIM_FAKE": "1", "KIM_STANDALONE_PROXY_WATCHDOG_INTERVAL_S": "0.2"},
             )
-            line = _readline_with_timeout(proc.stdout)
+            # Generous timeout: this test spawns two subprocesses, and
+            # process-spawn-heavy work is measurably slower on some CI runners.
+            line = _readline_with_timeout(proc.stdout, timeout=30.0)
             self.assertIsNotNone(line)
 
-            dummy.terminate()
-            dummy.wait(timeout=10)
+            dummy.wait(timeout=10)  # exits on its own after ~2s
 
-            proc.wait(timeout=15)  # watchdog polls every 0.2s in this test
+            proc.wait(timeout=20)  # watchdog polls every 0.2s in this test
             self.assertEqual(proc.returncode, 0)
         finally:
             if proc is not None:
