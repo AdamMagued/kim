@@ -18,10 +18,13 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from codex_engine.standalone_proxy import _resolve_auto_mode
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MODULE_CMD = [sys.executable, "-u", "-m", "codex_engine.standalone_proxy"]
@@ -65,6 +68,51 @@ def _terminate(proc: subprocess.Popen, timeout: float = 5.0) -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=timeout)
+
+
+def _collect_lines(stream) -> list:
+    """Background-thread line collector — readline() until EOF, appending to
+    a list a concurrently-reading test can poll (safe under the GIL: only
+    ever appended to here, only ever iterated/read elsewhere)."""
+    lines: list = []
+
+    def _reader() -> None:
+        for line in iter(stream.readline, ""):
+            lines.append(line)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    return lines
+
+
+def _wait_for_substring(lines: list, substring: str, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(substring in line for line in lines):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class AutoModeResolutionTests(unittest.TestCase):
+    """"auto" --mode resolution (module docstring "Mode"): browser:* (and
+    bare "browser") providers are kimcli's primary path and must resolve to
+    browser-contract; everything else resolves to chat-passthrough."""
+
+    def test_browser_colon_provider_resolves_to_browser_contract(self):
+        for name in ("browser:claude", "browser:chatgpt", "browser:gemini", "browser:grok"):
+            with self.subTest(name=name):
+                self.assertEqual(_resolve_auto_mode(name), "browser-contract")
+
+    def test_bare_browser_resolves_to_browser_contract(self):
+        self.assertEqual(_resolve_auto_mode("browser"), "browser-contract")
+
+    def test_case_insensitive(self):
+        self.assertEqual(_resolve_auto_mode("Browser:Claude"), "browser-contract")
+
+    def test_non_browser_providers_resolve_to_chat_passthrough(self):
+        for name in ("claude", "openai", "gemini", "deepseek", "ollama", "fake"):
+            with self.subTest(name=name):
+                self.assertEqual(_resolve_auto_mode(name), "chat-passthrough")
 
 
 class StandaloneProxyHandshakeTests(unittest.TestCase):
@@ -135,6 +183,66 @@ class StandaloneProxyHandshakeTests(unittest.TestCase):
             proc.send_signal(signal.SIGTERM)
             proc.wait(timeout=10)
             self.assertEqual(proc.returncode, 0)
+        finally:
+            _terminate(proc)
+
+
+class StdoutRedirectAfterHandshakeTests(unittest.TestCase):
+    """After the one ready line, stdout's fd is dup2'd onto stderr's — proves
+    the redirect against a REAL child process (an in-process test can't: it
+    would repoint the test runner's own fd 1). browser-contract mode is used
+    deliberately (--mode override, bypassing "auto") because it is the one
+    mode whose narration/compaction prints would otherwise reach stdout."""
+
+    def test_post_handshake_narration_lands_on_stderr_not_stdout(self):
+        proc = _spawn(
+            ["--provider", "fake", "--mode", "browser-contract"],
+            env_extra={"KIM_FAKE": "1"},
+        )
+        stderr_lines = _collect_lines(proc.stderr)
+        try:
+            ready_line = _readline_with_timeout(proc.stdout)
+            self.assertIsNotNone(ready_line, "no handshake line printed within timeout")
+            payload = json.loads(ready_line)
+            self.assertEqual(payload["event"], "ready")
+            port, token = payload["port"], payload["token"]
+
+            # A big enough /v1/responses input to cross the auto-compaction
+            # threshold: _CodexProxy._apply_compaction unconditionally
+            # prints two bare "[STATUS] Compacting context..."/"...compacted"
+            # lines in browser-contract mode — real production narration,
+            # not a contrived print, and independent of what the fake
+            # provider's scripted replies actually contain.
+            big_items = [{"role": "user", "content": "x" * 20000} for _ in range(25)]
+            body = json.dumps({"model": "kim-proxy-model", "input": big_items, "stream": False}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/responses",
+                data=body,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+                method="POST",
+            )
+            # The compaction narration prints unconditionally BEFORE the
+            # actual LLM call — orchestrator's FakeProvider (built for the
+            # agent loop, not this browser-contract kwarg surface) 502s on
+            # the follow-up complete(clear_chat=...) call, which is fine:
+            # this test is about the print()->stderr redirect, not a
+            # successful model round-trip.
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    resp.read()
+            except urllib.error.HTTPError:
+                pass
+
+            # The narration reached stderr...
+            self.assertTrue(
+                _wait_for_substring(stderr_lines, "Compacting context"),
+                f"expected narration on stderr; got: {stderr_lines!r}",
+            )
+            # ...and stdout's original pipe saw nothing further — dup2 closed
+            # its write end in the child, so the parent's read end hits EOF
+            # (readline() returns "") rather than ever seeing a second line.
+            extra = _readline_with_timeout(proc.stdout, timeout=5.0)
+            self.assertIn(extra, (None, ""), f"unexpected extra stdout content: {extra!r}")
         finally:
             _terminate(proc)
 

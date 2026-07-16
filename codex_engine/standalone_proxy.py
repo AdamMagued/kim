@@ -9,7 +9,7 @@ spawns the kimcli binary pointed at ``http://127.0.0.1:<port>/v1`` with
 Usage:
     python -m codex_engine.standalone_proxy --provider claude
         [--config path/to/config.yaml]
-        [--mode browser-contract|chat-passthrough]   (default: chat-passthrough)
+        [--mode auto|browser-contract|chat-passthrough]   (default: auto)
         [--max-relays N]
         [--parent-pid PID]
         [--preflight]
@@ -18,19 +18,25 @@ Stdout contract (IMPORTANT — nothing else may ever reach stdout; it is the
 one-shot handshake channel the Rust launcher parses):
     success: exactly one line  {"event": "ready", "port": <int>, "token": "<bearer>"}
     failure: exactly one line  {"event": "fatal", "message": "<...>"}, exit(1)
-Everything else (logging, --preflight status) goes to stderr, mirroring
-mcp_server/server.py's "stdout is reserved for protocol messages" convention.
+Immediately after the ready line is flushed, stdout's underlying OS file
+descriptor is dup2'd onto stderr's (see _async_main) — every later bare
+``print()`` anywhere in this process (engine.py's browser-contract
+narration/compaction/salvage lines, this module's own --preflight status,
+third-party libraries) is transparently redirected to stderr for the rest of
+the process's life, so it can never corrupt the one-shot handshake channel
+or deadlock a launcher that stops draining stdout after its first read. Only
+the fatal path (which always runs before that redirect) writes to the real
+stdout.
 
-Mode note: only ``chat-passthrough`` (the default) actually keeps this
-contract. ``_CodexProxy``'s browser-contract code path (narration, the
-compaction/salvage status lines) calls the module-level bare
-``print(..., flush=True)`` in codex_engine/engine.py, which was written for
-the desktop app's exec transport, where stdout IS the continuously-parsed IPC
-channel. chat-passthrough mode never reaches that code (compaction is
-skipped and /v1/responses 400s outright — see engine.py's module docstring
-"Modes"), so it is the only mode safe to run under this stdout contract.
-``--mode browser-contract`` is accepted for testing/parity but a real kimcli
-launch should never select it.
+Mode ("auto", the default): ``browser:*`` (and bare ``"browser"``) providers
+resolve to "browser-contract" — the primary kimcli path, since
+BrowserProvider.complete() speaks the /v1/responses JSON contract rather
+than native tool-calling. Every other provider resolves to
+"chat-passthrough" — plain OpenAI wire translation via chat_passthrough.py,
+calling complete() with the native BaseProvider signature (no clear_chat/
+handoff kwargs). Both explicit mode values remain available as overrides
+(e.g. forcing chat-passthrough against a browser provider, or vice versa,
+for testing/parity).
 
 Shutdown: SIGTERM/SIGINT triggers a clean aiohttp teardown and exit(0). When
 --parent-pid is given, a background watchdog polls every 5s (override via
@@ -70,9 +76,10 @@ def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     p.add_argument("--provider", required=True, help="Provider name, e.g. 'claude', 'browser:gemini', 'fake'.")
     p.add_argument("--config", default=None, help="Path to config.yaml (defaults to the repo's config.yaml).")
     p.add_argument(
-        "--mode", default="chat-passthrough",
-        choices=["browser-contract", "chat-passthrough"],
-        help="See module docstring — only chat-passthrough keeps the stdout handshake contract.",
+        "--mode", default="auto",
+        choices=["auto", "browser-contract", "chat-passthrough"],
+        help="See module docstring — 'auto' resolves browser:* providers to "
+             "browser-contract and everything else to chat-passthrough.",
     )
     p.add_argument("--max-relays", type=int, default=None)
     p.add_argument("--parent-pid", type=int, default=None, help="Watchdog: exit if this pid disappears.")
@@ -81,6 +88,18 @@ def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         help="Best-effort provider warm-up status printed to stderr, then continue serving.",
     )
     return p.parse_args(argv)
+
+
+def _resolve_auto_mode(provider_name: str) -> str:
+    """"auto" mode resolution (module docstring "Mode").
+
+    browser:* providers (and bare "browser") are the primary kimcli path —
+    BrowserProvider.complete() speaks the /v1/responses JSON contract, not
+    native BaseProvider tool-calling — so they resolve to "browser-contract".
+    Every other provider resolves to "chat-passthrough".
+    """
+    name = provider_name.strip().lower()
+    return "browser-contract" if name == "browser" or name.startswith("browser:") else "chat-passthrough"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -177,12 +196,14 @@ async def _async_main(args: argparse.Namespace) -> int:
     if args.preflight:
         _run_preflight(provider)
 
+    mode = _resolve_auto_mode(args.provider) if args.mode == "auto" else args.mode
+
     proxy = _CodexProxy(
         provider,
         provider_name=args.provider,
         thread_state={},
         stateful=False,
-        mode=args.mode,
+        mode=mode,
         max_relays=args.max_relays,
     )
 
@@ -193,6 +214,17 @@ async def _async_main(args: argparse.Namespace) -> int:
         return 1
 
     _print_ready(port, proxy._bearer_token)  # noqa: SLF001 — same-package access
+
+    # Contract (module docstring): stdout carries exactly the ONE handshake
+    # line just printed above, then becomes an alias of stderr for the rest
+    # of this process's life. dup2 repoints the underlying OS file descriptor
+    # (fd 1), so every later write through it — engine.py's browser-contract
+    # narration/compaction/salvage bare print()s, --preflight status, any
+    # third-party library that writes to stdout — is redirected transparently.
+    # No rebinding of the `sys.stdout` Python object is needed: it still
+    # wraps fd 1, which now points at the same file as stderr.
+    sys.stdout.flush()
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
