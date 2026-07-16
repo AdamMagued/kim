@@ -42,7 +42,6 @@ pub(crate) use codex_route::{configure_codex_direct_provider, selected_ollama_co
 pub(crate) mod spawn_supervisor;
 pub(crate) mod task_runtime;
 pub mod task_spec;
-
 // Re-export commonly used types/helpers from submodules so remaining lib.rs
 // code (session listing, run history, codex file-bridge) can use them unqualified.
 use codex_bridge::start_bridge_file_watcher;
