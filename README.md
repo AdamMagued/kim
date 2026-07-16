@@ -13,7 +13,7 @@ Kim is a local AI agent platform that connects any cloud LLM (Claude, Gemini, GP
 - **Multi-provider:** Claude, Gemini (OAuth), OpenAI, DeepSeek, Ollama local, or drive any LLM via an open browser tab (no API key needed)
 - **OS control:** Take screenshots, click, type, scroll, run shell commands, read/write files, manage windows
 - **Browser automation:** Fill forms, navigate pages, extract structured data from the DOM
-- **Code workspace:** Integrated code agent (Code tab) powered by Claw/Codex with browser-provider backend
+- **Code workspace:** Integrated code agent (Code tab) powered by Claw/Codex with browser-provider backend, running on `kimcli` — Kim's rebranded, pinned build of codex-cli 0.144.3 ([docs/kimcli.md](docs/kimcli.md))
 - **MCP server:** 50+ OS-control tools exposed via the Model Context Protocol — usable from Claude Code or any MCP client
 - **Session history:** Every run is saved as a JSONL trace in `kim_sessions/`
 
