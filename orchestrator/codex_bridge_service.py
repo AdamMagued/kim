@@ -47,8 +47,8 @@ from orchestrator.events_gen import (
     emit_agent_error,
 )
 
+from codex_engine.binary_resolver import resolve_codex_binary
 from codex_engine.engine import (
-    CODEX_BINARY,
     _CodexProxy,
     _codex_browser_system_prompt,
     _get_compact_threshold,
@@ -484,8 +484,8 @@ async def _run_compact_task(args: argparse.Namespace, config: dict) -> int:
     # App-server transport: ALSO compact codex's own transcript (two
     # independent context budgets — parity Part 2.4). Best-effort.
     if transport_name(config) == "app-server":
-        binary = os.environ.get("CODEX_BIN", "").strip() or CODEX_BINARY
-        binary_path = shutil.which(binary) if not os.path.isabs(binary) else binary
+        binary = resolve_codex_binary()
+        binary_path = binary if os.path.isabs(binary) else shutil.which(binary)
         if binary_path and os.path.exists(binary_path):
             state_after = load_thread_state(args.cwd, args.provider)
             if await compact_codex_thread(
@@ -610,9 +610,9 @@ async def _run_async(args: argparse.Namespace) -> int:
     if hasattr(provider, "_sent_system_prompt"):
         provider._sent_system_prompt = False  # type: ignore[attr-defined]
 
-    # Resolve the Codex binary (Tauri may have set CODEX_BIN).
-    binary = os.environ.get("CODEX_BIN", "").strip() or CODEX_BINARY
-    binary_path = shutil.which(binary) if not os.path.isabs(binary) else binary
+    # Resolve the Codex binary (CODEX_BIN -> ~/.kim/bin/kimcli -> PATH; see codex_engine/binary_resolver).
+    binary = resolve_codex_binary()
+    binary_path = binary if os.path.isabs(binary) else shutil.which(binary)
     if not binary_path or not os.path.exists(binary_path):
         print(f"{LOG_TAG_FAILED} Codex binary not found: {binary}.", flush=True)
         return 1
