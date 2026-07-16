@@ -5,11 +5,10 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 
+use crate::app::{App, MessageRole, UiMessage, ViewState};
+use crate::paint::{kim_accent_color, paint_bold, paint_dim, print_message, print_note};
+use crate::repl::{print_model_options, print_recent_transcript};
 use crate::sessions::load_session_messages;
-use crate::{
-    kim_accent_color, paint_bold, paint_dim, print_message, print_model_options, print_note,
-    print_recent_transcript, App, MessageRole, UiMessage, ViewState,
-};
 
 struct RawModeGuard;
 

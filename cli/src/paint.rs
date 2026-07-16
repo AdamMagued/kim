@@ -2,7 +2,7 @@ use std::io::{stdout, IsTerminal};
 
 use crossterm::style::{Color as TerminalColor, Stylize};
 
-use crate::{MessageRole, UiMessage};
+use crate::app::{MessageRole, UiMessage};
 
 fn colors_enabled() -> bool {
     stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()

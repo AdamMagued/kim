@@ -1,7 +1,6 @@
-use super::{
-    code_mode_denied_reason, provider_is_ready, stream_repl_turn, App, AppMode, MessageRole,
-};
+use crate::app::{App, AppMode, MessageRole};
 use crate::config::KimConfig;
+use crate::turn::{code_mode_denied_reason, provider_is_ready, stream_repl_turn};
 
 #[derive(Debug)]
 pub(crate) enum CliCommand {
@@ -166,7 +165,7 @@ pub(crate) fn help_text() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{parse_cli_args, CliCommand};
-    use crate::AppMode;
+    use crate::app::AppMode;
 
     // ── parse_cli_args tests ──────────────────────────────────────────────────
 

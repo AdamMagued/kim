@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use serde_json::Value;
 
-use crate::{MessageRole, UiMessage};
+use crate::app::{MessageRole, UiMessage};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
@@ -599,7 +599,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::load_session_messages;
-    use crate::MessageRole;
+    use crate::app::MessageRole;
 
     // ── epoch_secs_to_calendar / format_epoch_secs ───────────────────────────
 
@@ -686,7 +686,7 @@ mod tests {
         dir
     }
 
-    use crate::UiMessage;
+    use crate::app::UiMessage;
 
     // F-E-3: a message's own creation timestamp must survive a save→load→save
     // cycle; only a message that never carried one gets stamped `now`. The old
