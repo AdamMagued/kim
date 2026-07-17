@@ -51,6 +51,7 @@ from codex_engine.app_server import (
     check_schema_drift,
     decline_result_for,
 )
+from orchestrator.codex_appserver_items import summarize_item
 from orchestrator.events_gen import (
     LOG_TAG_FAILED,
     LOG_TAG_TASK_COMPLETE,
@@ -854,37 +855,18 @@ class AppServerTurnRunner:
         item = params.get("item")
         if not isinstance(item, dict):
             return
-        kind = str(item.get("type") or "")
-        item_id = str(item.get("id") or "")
-        title = ""
-        if kind == "commandExecution":
-            title = str(item.get("command") or "")
-        elif kind == "fileChange":
-            changes = item.get("changes")
-            if isinstance(changes, list):
-                paths = [str(c.get("path") or "") for c in changes if isinstance(c, dict)]
-                title = ", ".join(p for p in paths if p)
-                # Stash the raw change list for a fileChange approval request.
-                with contextlib.suppress(Exception):
-                    self._item_titles[f"changes:{item_id}"] = json.dumps([
-                        {"path": c.get("path"), "kind": c.get("kind")}
-                        for c in changes if isinstance(c, dict)
-                    ])
-        elif kind == "agentMessage":
-            if phase == "completed":
-                text = str(item.get("text") or "")
-                if text.strip():
-                    self._answer_parts.append(_scrub(text))
-        elif kind == "userMessage":
+        summary = summarize_item(item)
+        if summary.kind == "userMessage":
             return  # echo of our own input — not activity
-        # The item's own outcome (e.g. commandExecution's "completed" | "failed"
-        # | "declined") is distinct from `phase`, which only echoes the JSON-RPC
-        # method name (item/started vs item/completed) and says nothing about
-        # whether the command actually succeeded — a sandbox-denied command
-        # still reaches item/completed. Surface it so callers can tell "the
-        # item lifecycle happened" apart from "the command actually worked".
-        status = str(item.get("status") or "")
-        emit_item_lifecycle(item_id=item_id, kind=kind, phase=phase, title=_scrub(title), status=status)
+        if summary.changes_json is not None:
+            # Stash the raw change list for a fileChange approval request.
+            self._item_titles[f"changes:{summary.item_id}"] = summary.changes_json
+        if phase == "completed" and summary.agent_message_text:
+            self._answer_parts.append(_scrub(summary.agent_message_text))
+        emit_item_lifecycle(
+            item_id=summary.item_id, kind=summary.kind, phase=phase,
+            title=_scrub(summary.title), status=summary.status,
+        )
 
     async def _on_token_usage(self, params: dict) -> None:
         usage = params.get("tokenUsage")

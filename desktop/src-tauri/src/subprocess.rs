@@ -469,13 +469,7 @@ pub(crate) fn forward_agent_stdout_line(
                         serde_json::json!({"input": input, "output": output, "total": total}),
                     );
                 }
-                KimEvent::ItemLifecycle {
-                    item_id,
-                    kind,
-                    phase,
-                    title,
-                    status,
-                } => {
+                KimEvent::ItemLifecycle { item_id, kind, phase, title, status } => {
                     emit(
                         "kim:item-lifecycle",
                         serde_json::json!({
