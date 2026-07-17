@@ -123,15 +123,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          asset=kimcli-x86_64-unknown-linux-musl.tar.gz
+          base=kimcli-x86_64-unknown-linux-musl
+          asset="${base}.tar.gz"
+          sidecar="${base}.sha256"
           mkdir -p kimcli-dl
           gh release download kimcli-v0.144.3 \
             --repo AdamMagued/codex \
-            --pattern "${asset}*" \
+            --pattern "${asset}" \
+            --pattern "${sidecar}" \
             --dir kimcli-dl
 
           cd kimcli-dl
-          expected=$(awk '{print $1}' "${asset}.sha256")
+          expected=$(awk '{print $1}' "${sidecar}")
           actual=$(sha256sum "$asset" | awk '{print $1}')
           if [ "$actual" != "$expected" ]; then
             echo "checksum mismatch for $asset: expected $expected, got $actual" >&2
