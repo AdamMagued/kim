@@ -1,8 +1,8 @@
 //! `kim tui` launcher + the standalone `kimcli` binary's shared entry point.
 //!
 //! Launches the full Codex-style TUI (the `kimcli` binary — a rebranded fork
-//! of `codex`, or the upstream `codex` binary as a fallback) as a child
-//! process that inherits the terminal, routed at one of Kim's providers:
+//! of `codex`) as a child process that inherits the terminal, routed at one
+//! of Kim's providers:
 //!
 //! - every provider, INCLUDING `ollama` by default, → PROXY route: spawn
 //!   `python -m codex_engine.standalone_proxy --provider <name>`, read its
@@ -41,7 +41,7 @@ mod routing;
 // submodules directly (`kim doctor`'s kimcli section: binary resolution +
 // version, and a proxy dry-check reusing the same handshake reader/types).
 pub(crate) use proxy::{read_proxy_handshake_with_timeout, ProxyHandshake};
-pub(crate) use resolve::{resolve_kimcli_binary, KimcliResolution};
+pub(crate) use resolve::resolve_kimcli_binary;
 
 use std::path::PathBuf;
 
@@ -197,16 +197,7 @@ pub(crate) async fn run_tui(opts: &TuiOptions) -> i32 {
         }
     };
     let kimcli_bin = match resolve_kimcli_binary() {
-        Ok(KimcliResolution::Kimcli(path)) => path,
-        Ok(KimcliResolution::CodexFallback(path)) => {
-            eprintln!(
-                "kim tui: no kimcli binary found — falling back to the upstream 'codex' binary \
-                 ({}). Branding (and possibly some behavior) will differ; install kimcli via \
-                 scripts/install_kimcli.sh.",
-                path.display()
-            );
-            path
-        }
+        Ok(path) => path,
         Err(e) => {
             eprintln!("kim tui: {e}");
             return 1;

@@ -251,17 +251,9 @@ async fn python_status() -> String {
 /// the exit code (a missing kimcli install doesn't block chat/code mode).
 async fn kimcli_binary_status() -> String {
     match crate::commands::tui::resolve_kimcli_binary() {
-        Ok(crate::commands::tui::KimcliResolution::Kimcli(path)) => {
+        Ok(path) => {
             let version = command_status(&path.to_string_lossy(), &["--version"]).await;
             format!("{} — {version}", path.display())
-        }
-        Ok(crate::commands::tui::KimcliResolution::CodexFallback(path)) => {
-            let version = command_status(&path.to_string_lossy(), &["--version"]).await;
-            format!(
-                "{} — {version} (upstream 'codex' binary — branding differs; \
-                 install kimcli via scripts/install_kimcli.sh)",
-                path.display()
-            )
         }
         Err(e) => format!("not found — {e}"),
     }
