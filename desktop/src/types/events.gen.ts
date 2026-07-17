@@ -380,10 +380,12 @@ export interface KimItemLifecyclePayload extends KimRunEnvelope {
   item_id: string;
   /** Item kind (commandExecution | agentMessage | fileChange | reasoning | …). */
   kind: string;
-  /** 'started' or 'completed'. */
+  /** 'started' or 'completed' (JSON-RPC method name, not the item's own outcome). */
   phase: string;
   /** Human-readable label (command string, file list, …); may be empty. */
   title: string;
+  /** The item's own outcome, distinct from `phase`. For commandExecution: 'inProgress' | 'completed' | 'failed' | 'declined'. Empty for kinds that carry no such status (agentMessage, reasoning, …) or on legacy emitters. */
+  status?: string;
 }
 
 /** Codex app-server: a turn started / completed / was interrupted. */

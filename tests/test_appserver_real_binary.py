@@ -66,6 +66,7 @@ async def _run_message(
     task: str = "create smoke.txt",
     env_extra: dict | None = None,
     decisions: list | None = None,
+    sandbox_mode: str | None = None,
 ) -> SimpleNamespace:
     from orchestrator import codex_bridge_service as svc
     from orchestrator import codex_appserver_transport as transport
@@ -76,7 +77,14 @@ async def _run_message(
     (project / ".git").mkdir(exist_ok=True)
 
     config_path = tmp / "config.yaml"
-    config_path.write_text(_CONFIG)
+    # sandbox_mode is a documented app-server SandboxMode value
+    # ("read-only" | "workspace-write" | "danger-full-access"), routed through
+    # codex_appserver_transport.resolve_policies()'s codex_bridge.sandbox_mode
+    # config key — not KIM_CODEX_BYPASS_SANDBOX, which that transport ignores.
+    config_text = _CONFIG
+    if sandbox_mode:
+        config_text += f"  sandbox_mode: {sandbox_mode}\n"
+    config_path.write_text(config_text)
 
     provider = CannedProvider(replies)
     parent_env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED_VARS}
@@ -126,10 +134,92 @@ def _typed(out: str, kind: str) -> list[dict]:
     return events
 
 
+def _command_execution_items(out: str) -> list[dict]:
+    """item_lifecycle events for commandExecution items, each carrying the
+    item's own `status` (distinct from `phase`, which only echoes the
+    JSON-RPC method name — item/completed fires whether the command
+    succeeded, failed, or was sandbox-denied)."""
+    return [e for e in _typed(out, "item_lifecycle") if e.get("kind") == "commandExecution"]
+
+
+_SANDBOX_PROBE_CACHE: tuple[bool, str] | None = None
+
+
+async def _probe_workspace_write_sandbox() -> tuple[bool, str]:
+    """Honest, binary-driven sandbox capability probe.
+
+    Rather than inspecting Landlock ABI availability (magical, and one layer
+    removed from what the contract actually cares about), run one trivial
+    exec_command turn through the *exact* plumbing under test and check
+    whether the write really lands. This is the same mechanism
+    ``test_turn_executes_command_and_persists_thread_then_resumes`` depends
+    on, so asking the binary itself is the most direct signal.
+    """
+    if not CODEX:
+        return False, "codex binary not installed"
+    import tempfile
+
+    probe_reply = json.dumps({
+        "text": "probe",
+        "tool_calls": [{"name": "exec_command",
+                        "input": {"cmd": "printf 'ok' > .kim_sandbox_probe"}}],
+    })
+    done_reply = json.dumps({"text": "probe complete"})
+    try:
+        with tempfile.TemporaryDirectory() as tmpd:
+            tmp = Path(tmpd)
+            result = await _run_message(
+                tmp, [probe_reply, done_reply], task="sandbox capability probe",
+            )
+            wrote = (result.project / ".kim_sandbox_probe").exists()
+    except Exception as exc:  # noqa: BLE001 - the probe itself must never raise
+        return False, f"probe turn raised {exc!r}"
+
+    items = _command_execution_items(result.out)
+    status = items[-1].get("status") if items else "no commandExecution item observed"
+    if wrote and status == "completed":
+        return True, "workspace-write sandbox permits exec_command writes"
+    return False, (
+        "runner cannot enforce+permit workspace-write sandbox execution "
+        f"(Landlock unavailable/blocked?): wrote={wrote} item_status={status!r}"
+    )
+
+
+async def _sandbox_capability() -> tuple[bool, str]:
+    """Cached across the module — the probe spawns the real binary, so pay
+    that cost once per test session, not once per test."""
+    global _SANDBOX_PROBE_CACHE
+    if _SANDBOX_PROBE_CACHE is None:
+        _SANDBOX_PROBE_CACHE = await _probe_workspace_write_sandbox()
+    return _SANDBOX_PROBE_CACHE
+
+
 @unittest.skipUnless(CODEX, "codex binary not installed")
 class RealBinaryAppServerSmoke(unittest.IsolatedAsyncioTestCase):
     async def test_turn_executes_command_and_persists_thread_then_resumes(self):
         import tempfile
+
+        capable, detail = await _sandbox_capability()
+        sandbox_mode = None if capable else "danger-full-access"
+        if not capable:
+            # (b), not (a): the app-server protocol offers a clean per-turn
+            # override (thread/start's `sandbox` field accepts the documented
+            # SandboxMode "danger-full-access" — not the retired
+            # --dangerously-bypass-approvals-and-sandbox flag, and not
+            # KIM_CODEX_BYPASS_SANDBOX, which this transport ignores by
+            # design; see resolve_policies()). Skipping outright would hide
+            # this runner from the contract entirely; bypassing just the
+            # sandbox for the write assertion keeps the app-server/thread/
+            # exec/resume plumbing under real test, and the DEGRADED-MODE
+            # print below makes the runner's limitation loud instead of
+            # silent.
+            print(
+                f"[degraded-mode] {detail} — re-running with "
+                "sandbox_mode=danger-full-access so this test still exercises "
+                "the app-server turn/exec/thread-persist contract on a runner "
+                "that cannot enforce workspace-write.",
+                file=sys.stderr,
+            )
 
         write_reply = json.dumps({
             "text": "Creating the file.",
@@ -140,8 +230,23 @@ class RealBinaryAppServerSmoke(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmpd:
             tmp = Path(tmpd)
-            first = await _run_message(tmp, [write_reply, done_reply])
+            first = await _run_message(tmp, [write_reply, done_reply], sandbox_mode=sandbox_mode)
             self.assertEqual(first.rc, 0, first.out)
+            # Hardening: assert the commandExecution item's OWN outcome, not
+            # just that some item_lifecycle event fired. `phase` only echoes
+            # the JSON-RPC method name (item/completed fires whether the
+            # command succeeded, failed, or was sandbox-denied); `status` is
+            # the real result. This fails right here, with a clear message,
+            # instead of surfacing lines later as a bare FileNotFoundError.
+            exec_items = _command_execution_items(first.out)
+            self.assertTrue(exec_items, first.out)
+            self.assertEqual(
+                exec_items[-1].get("status"),
+                "completed",
+                "commandExecution item did not report success "
+                f"(status={exec_items[-1].get('status')!r}, sandbox_capable={capable}, "
+                f"probe_detail={detail!r}, sandbox_mode={sandbox_mode!r}): {first.out}",
+            )
             # The command REALLY ran, natively, inside the sandboxed cwd.
             self.assertEqual((first.project / "smoke.txt").read_text(), "smoke")
             # Outward contract + sidecar continuity.
@@ -156,6 +261,7 @@ class RealBinaryAppServerSmoke(unittest.IsolatedAsyncioTestCase):
             second = await _run_message(
                 tmp, [json.dumps({"text": "Still here — the file is already made."})],
                 task="did you make the file already?",
+                sandbox_mode=sandbox_mode,
             )
             self.assertEqual(second.rc, 0, second.out)
             self.assertEqual(second.state.get("codex_thread_id"), thread_id)

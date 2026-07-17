@@ -137,6 +137,8 @@ pub(crate) enum KimEvent {
         phase: String,
         #[serde(default)]
         title: String,
+        #[serde(default)]
+        status: String,
     },
     TurnLifecycle {
         phase: String,

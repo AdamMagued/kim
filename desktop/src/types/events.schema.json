@@ -277,8 +277,9 @@
       "payload": {
         "item_id": { "type": "string", "description": "Item id." },
         "kind": { "type": "string", "description": "Item kind (commandExecution | agentMessage | fileChange | reasoning | …)." },
-        "phase": { "type": "string", "description": "'started' or 'completed'." },
-        "title": { "type": "string", "default": true, "description": "Human-readable label (command string, file list, …); may be empty." }
+        "phase": { "type": "string", "description": "'started' or 'completed' (JSON-RPC method name, not the item's own outcome)." },
+        "title": { "type": "string", "default": true, "description": "Human-readable label (command string, file list, …); may be empty." },
+        "status": { "type": "string", "optional": true, "default": true, "description": "The item's own outcome, distinct from `phase`. For commandExecution: 'inProgress' | 'completed' | 'failed' | 'declined'. Empty for kinds that carry no such status (agentMessage, reasoning, …) or on legacy emitters." }
       }
     },
     {

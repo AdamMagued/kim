@@ -229,8 +229,8 @@ def emit_token_usage(input: float, output: float, total: float) -> None:
     emit_event("token_usage", input=input, output=output, total=total)
 
 
-def emit_item_lifecycle(item_id: str, kind: str, phase: str, title: str) -> None:
-    emit_event("item_lifecycle", item_id=item_id, kind=kind, phase=phase, title=title)
+def emit_item_lifecycle(item_id: str, kind: str, phase: str, title: str, status: str = '') -> None:
+    emit_event("item_lifecycle", item_id=item_id, kind=kind, phase=phase, title=title, status=status)
 
 
 def emit_turn_lifecycle(phase: str, turn_id: str) -> None:

@@ -474,6 +474,7 @@ pub(crate) fn forward_agent_stdout_line(
                     kind,
                     phase,
                     title,
+                    status,
                 } => {
                     emit(
                         "kim:item-lifecycle",
@@ -482,6 +483,7 @@ pub(crate) fn forward_agent_stdout_line(
                             "kind": kind,
                             "phase": phase,
                             "title": title,
+                            "status": status,
                         }),
                     );
                 }

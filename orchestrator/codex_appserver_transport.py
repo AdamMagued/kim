@@ -877,7 +877,14 @@ class AppServerTurnRunner:
                     self._answer_parts.append(_scrub(text))
         elif kind == "userMessage":
             return  # echo of our own input — not activity
-        emit_item_lifecycle(item_id=item_id, kind=kind, phase=phase, title=_scrub(title))
+        # The item's own outcome (e.g. commandExecution's "completed" | "failed"
+        # | "declined") is distinct from `phase`, which only echoes the JSON-RPC
+        # method name (item/started vs item/completed) and says nothing about
+        # whether the command actually succeeded — a sandbox-denied command
+        # still reaches item/completed. Surface it so callers can tell "the
+        # item lifecycle happened" apart from "the command actually worked".
+        status = str(item.get("status") or "")
+        emit_item_lifecycle(item_id=item_id, kind=kind, phase=phase, title=_scrub(title), status=status)
 
     async def _on_token_usage(self, params: dict) -> None:
         usage = params.get("tokenUsage")
