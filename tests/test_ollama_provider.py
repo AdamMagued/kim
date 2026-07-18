@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from orchestrator.providers.ollama import (
     DEFAULT_OLLAMA_CLOUD_MODEL,
@@ -592,6 +592,106 @@ class OllamaTimeoutClassificationTests(unittest.TestCase):
         classified = classify_provider_error(ctx.exception)
         self.assertEqual(classified.code, "timeout")
         self.assertTrue(classified.retryable)
+
+
+class OllamaCloudSigninRetryTests(unittest.TestCase):
+    """A cloud completion that hits the sign-in-required error triggers
+    `ollama signin`, waits for it, and retries the SAME turn once — instead
+    of the old dead-end `raise` (see OllamaProvider.complete()'s
+    `except PermissionError` branch)."""
+
+    async def _noop_daemon(self):
+        return None
+
+    async def _fake_usage(self, _final, _model):
+        return {"provider": "ollama", "source": "ollama", "mode": "cloud"}
+
+    def test_signed_in_user_never_triggers_signin_fast_path(self):
+        # The fast path: a request that just succeeds must never call
+        # trigger_signin_and_wait at all.
+        provider = OllamaProvider({"ollama": {"mode": "cloud", "cloud_model": "m:cloud"}})
+        calls = {"stream": 0}
+
+        async def _stream(_payload):
+            calls["stream"] += 1
+            return {"done_reason": "stop", "model": "m:cloud"}, "hi there", []
+
+        signin_mock = AsyncMock()
+        with patch.object(provider, "_ensure_daemon_running", self._noop_daemon), \
+             patch.object(provider, "_stream_chat", _stream), \
+             patch.object(provider, "_usage_from_final", self._fake_usage), \
+             patch("orchestrator.providers.ollama.trigger_signin_and_wait", signin_mock):
+            result = asyncio.run(provider.complete([{"role": "user", "content": "hi"}], [], "sys"))
+
+        self.assertEqual(result["content"], "hi there")
+        self.assertEqual(calls["stream"], 1)
+        signin_mock.assert_not_called()
+
+    def test_not_signed_in_triggers_signin_then_retries_and_succeeds(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud", "cloud_model": "m:cloud"}})
+        calls = {"stream": 0}
+
+        async def _stream(_payload):
+            calls["stream"] += 1
+            if calls["stream"] == 1:
+                raise PermissionError("Sign in to Ollama to use cloud models.")
+            return {"done_reason": "stop", "model": "m:cloud"}, "back online", []
+
+        signin_mock = AsyncMock()
+        with patch.object(provider, "_ensure_daemon_running", self._noop_daemon), \
+             patch.object(provider, "_stream_chat", _stream), \
+             patch.object(provider, "_usage_from_final", self._fake_usage), \
+             patch("orchestrator.providers.ollama.trigger_signin_and_wait", signin_mock):
+            result = asyncio.run(provider.complete([{"role": "user", "content": "hi"}], [], "sys"))
+
+        signin_mock.assert_awaited_once()
+        self.assertEqual(calls["stream"], 2)
+        self.assertEqual(result["content"], "back online")
+
+    def test_signin_failure_propagates_without_a_second_stream_attempt(self):
+        provider = OllamaProvider({"ollama": {"mode": "cloud", "cloud_model": "m:cloud"}})
+        calls = {"stream": 0}
+
+        async def _stream(_payload):
+            calls["stream"] += 1
+            raise PermissionError("Sign in to Ollama to use cloud models.")
+
+        async def _signin_timeout():
+            from orchestrator.providers.ollama_signin import OllamaSigninTimeout
+            raise OllamaSigninTimeout("timed out waiting for sign-in")
+
+        with patch.object(provider, "_ensure_daemon_running", self._noop_daemon), \
+             patch.object(provider, "_stream_chat", _stream), \
+             patch.object(provider, "_usage_from_final", self._fake_usage), \
+             patch("orchestrator.providers.ollama.trigger_signin_and_wait", _signin_timeout):
+            with self.assertRaises(PermissionError):
+                asyncio.run(provider.complete([{"role": "user", "content": "hi"}], [], "sys"))
+
+        # Only the original attempt — signin failed before any retry.
+        self.assertEqual(calls["stream"], 1)
+
+    def test_local_mode_permission_error_is_not_retried(self):
+        # Sign-in retry is a cloud-only concept; a local-mode PermissionError
+        # (e.g. an unrelated auth failure) must still raise immediately.
+        provider = OllamaProvider({"ollama": {"mode": "local", "local_model": "llama3.2"}})
+        provider._auto_selected_model = False
+
+        async def _stream(_payload):
+            raise PermissionError("Sign in to Ollama to use cloud models.")
+
+        async def _fake_tags():
+            return [{"name": "llama3.2"}]
+
+        signin_mock = AsyncMock()
+        with patch.object(provider, "_ensure_daemon_running", self._noop_daemon), \
+             patch.object(provider, "_fetch_tags_cached", _fake_tags), \
+             patch.object(provider, "_stream_chat", _stream), \
+             patch.object(provider, "_validate_model", AsyncMock()), \
+             patch("orchestrator.providers.ollama.trigger_signin_and_wait", signin_mock):
+            with self.assertRaises(PermissionError):
+                asyncio.run(provider.complete([{"role": "user", "content": "hi"}], [], "sys"))
+
+        signin_mock.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -23,6 +23,13 @@ from orchestrator.providers.base import (
     malformed_tool_args_text,
     ProviderEnvironmentError,
 )
+from orchestrator.providers.ollama_context import (  # noqa: F401 — re-exported, tests import from here
+    _parse_context_column,
+    _parse_num_ctx,
+    _parse_ollama_ps_context,
+    _ps_context_column_span,
+)
+from orchestrator.providers.ollama_signin import trigger_signin_and_wait
 
 logger = logging.getLogger(__name__)
 
@@ -40,91 +47,6 @@ def _env_or_cfg(config: dict, env_key: str, *path: str, default: Any = None) -> 
             return default
         cur = cur.get(key)
     return cur if cur not in (None, "") else default
-
-
-def _parse_num_ctx(text: str | None) -> int | None:
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    for line in raw.splitlines():
-        s = line.strip().replace("=", " ").replace(":", " ")
-        parts = [p for p in s.split() if p]
-        for i, part in enumerate(parts[:-1]):
-            if part == "num_ctx":
-                try:
-                    return max(0, int(parts[i + 1]))
-                except ValueError:
-                    continue
-    return None
-
-
-def _parse_context_column(raw: str) -> int | None:
-    text = raw.strip()
-    if not text:
-        return None
-    mult = 1
-    if text[-1].lower() == "k":
-        mult = 1000
-        text = text[:-1]
-    elif text[-1].lower() == "m":
-        mult = 1_000_000
-        text = text[:-1]
-    try:
-        return int(float(text) * mult)
-    except ValueError:
-        return None
-
-
-def _ps_context_column_span(header_line: str) -> tuple[int, int] | None:
-    """Char span [start, end) of the CONTEXT column in an `ollama ps` header.
-
-    The real header is ``NAME  ID  SIZE  PROCESSOR  CONTEXT  UNTIL`` — CONTEXT is
-    NOT the last column; UNTIL ("4 minutes from now") is. Taking the last
-    whitespace token therefore grabbed "now", so this path always returned None
-    (issue #30). `ollama ps` is column-aligned (Go tabwriter), so the CONTEXT
-    header and its values start at the same character offset; slice by that.
-    Returns None for older `ollama` builds whose `ps` has no CONTEXT column.
-    """
-    cols: list[tuple[int, str]] = []
-    idx = 0
-    for token in header_line.split():
-        start = header_line.find(token, idx)
-        if start < 0:
-            continue
-        idx = start + len(token)
-        cols.append((start, token))
-    for i, (start, name) in enumerate(cols):
-        if name.upper() == "CONTEXT":
-            end = cols[i + 1][0] if i + 1 < len(cols) else len(header_line) + 1_000_000
-            return start, end
-    return None
-
-
-def _parse_ollama_ps_context(output: str, model: str) -> int | None:
-    wanted = model.strip().lower()
-    span: tuple[int, int] | None = None
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        lowered = stripped.lower()
-        if lowered.startswith("name ") or lowered == "name":
-            span = _ps_context_column_span(line)
-            continue
-        if not lowered.startswith(wanted):
-            continue
-        if span is None:
-            # No CONTEXT column in this `ollama ps` (old build) — no reliable
-            # way to read it positionally; let callers fall back to /api/show.
-            return None
-        start, end = span
-        if start >= len(line):
-            continue
-        segment = line[start:end].strip()
-        value = _parse_context_column(segment)
-        if value is not None:
-            return value
-    return None
 
 
 class OllamaProvider(BaseProvider):
@@ -227,6 +149,24 @@ class OllamaProvider(BaseProvider):
 
         try:
             final_obj, content, tool_calls = await self._stream_chat(_build_payload(messages))
+        except PermissionError:
+            # Cloud request needs Ollama sign-in (_stream_chat_inner's "sign
+            # in"/"unauthorized"/"forbidden" detection). Trigger `ollama
+            # signin` (opens the user's browser) and poll it to completion —
+            # bounded, cancellable, not a dead-end raise — then retry this
+            # SAME turn once so the terminal picks the sign-in up without the
+            # user restarting. A signed-in user never reaches this branch at
+            # all (the request just succeeds), so this is the not-signed-in
+            # path only — never a tax on the fast path.
+            if self._mode != "cloud":
+                raise
+            await trigger_signin_and_wait()
+            try:
+                final_obj, content, tool_calls = await self._stream_chat(_build_payload(messages))
+            except (httpx.HTTPError, TimeoutError, ConnectionError):
+                self._daemon_alive = False
+                self._session_tags = None
+                raise
         except EnvironmentError as exc:
             if _looks_like_vision_model_error(str(exc).lower()) and self._messages_have_images(messages):
                 # Model doesn't support images — cache and retry without them.

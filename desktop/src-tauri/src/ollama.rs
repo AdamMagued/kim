@@ -304,53 +304,34 @@ async fn ollama_chat_probe(base_url: &str, model: &str) -> Result<(), String> {
     })
 }
 
-/// Classify `ollama whoami` output into a sign-in verdict (#22).
-///
-/// Ok(true)  — signed in (command succeeded and printed an account).
-/// Ok(false) — definitively not signed in.
-/// Err(_)    — indeterminate (old CLI without `whoami`, timeout, other error);
-///             callers should fall back to the previous liveness-only behavior
-///             rather than hard-blocking cloud tasks.
-fn classify_whoami_output(success: bool, stdout: &str, stderr: &str) -> Result<bool, String> {
-    if success {
-        return Ok(!stdout.trim().is_empty());
+/// Real ollama.com sign-in probe: `POST <base_url>/api/me` on the LOCAL
+/// daemon (#61 replacement for the old `ollama whoami` check — Ollama 0.32.0
+/// has no `whoami` subcommand at all: `ollama whoami` prints `Error: unknown
+/// command "whoami" for "ollama"` and exits 1, which the old check's
+/// catch-all error fallback treated as "indeterminate → report connected
+/// anyway", so this ALWAYS reported signed-in regardless of real state —
+/// verified live against 0.32.0). `/api/me` is what the desktop Ollama app
+/// itself uses to show the signed-in account: POST (not GET — confirmed via
+/// `OPTIONS`/`Allow: POST` and a live 200 with `{"id","email","name",...}`
+/// while signed in) returns the account when authenticated, 401/403 when
+/// not, and anything else (network error, or an even older daemon without
+/// this route) is indeterminate — callers fall back to the previous
+/// liveness-only "connected" behavior rather than hard-blocking cloud tasks.
+async fn ollama_cloud_signed_in(base_url: &str) -> Result<bool, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(format!("{}/api/me", base_url.trim_end_matches('/')))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    match resp.status().as_u16() {
+        200 => Ok(true),
+        401 | 403 => Ok(false),
+        other => Err(format!("unexpected /api/me status {other}")),
     }
-    let combined = format!("{} {}", stdout, stderr).to_lowercase();
-    if combined.contains("not signed in")
-        || combined.contains("sign in")
-        || combined.contains("signin")
-        || combined.contains("unauthorized")
-        || combined.contains("401")
-    {
-        return Ok(false);
-    }
-    if combined.contains("unknown command") || combined.contains("unknown flag") {
-        return Err("ollama CLI does not support `whoami`".to_string());
-    }
-    Err(if combined.trim().is_empty() {
-        "whoami failed".to_string()
-    } else {
-        combined
-    })
-}
-
-/// Real ollama.com sign-in probe: `ollama whoami` (#22).
-/// The previous check hit `/api/version`, which is a daemon-liveness endpoint
-/// that never requires an account — it reported "connected" even when the
-/// user had never run `ollama signin`.
-async fn ollama_cloud_signed_in(binary: &str) -> Result<bool, String> {
-    let out = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::process::Command::new(binary).arg("whoami").output(),
-    )
-    .await
-    .map_err(|_| "whoami timed out".to_string())?
-    .map_err(|e| e.to_string())?;
-    classify_whoami_output(
-        out.status.success(),
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-    )
 }
 
 #[tauri::command]
@@ -492,14 +473,15 @@ pub async fn ollama_get_status(
         })
         .unwrap_or(false);
 
-    // Cloud mode: check the real ollama.com sign-in state via `ollama whoami`
-    // (#22). Free and local — no generation request, no token cost. If the
-    // installed CLI predates `whoami` (or the probe errors), fall back to the
+    // Cloud mode: check the real ollama.com sign-in state via the local
+    // daemon's `/api/me` (#61). Free and local — no generation request, no
+    // token cost, no browser popup (unlike `ollama signin`, which this check
+    // deliberately never calls — see ollama_cloud_signed_in's doc comment).
+    // If the probe errors (older daemon, network hiccup), fall back to the
     // old daemon-liveness semantics instead of hard-blocking cloud tasks.
     // Explicit model validation is available via `ollama_test_model`.
     let (cloud_connected, cloud_message) = if selected_mode == "cloud" {
-        let binary = installed_path.as_deref().unwrap_or("ollama");
-        match ollama_cloud_signed_in(binary).await {
+        match ollama_cloud_signed_in(&base_url).await {
             Ok(true) => (true, Some("Connected to Ollama".to_string())),
             Ok(false) => (
                 false,
@@ -726,42 +708,57 @@ pub async fn ollama_pull_model(model: String, app_handle: tauri::AppHandle) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::classify_whoami_output;
+    use super::ollama_cloud_signed_in;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
-    #[test]
-    fn whoami_success_with_account_is_signed_in() {
-        assert_eq!(
-            classify_whoami_output(true, "alice@example.com\n", ""),
-            Ok(true)
+    /// Fake `/api/me` server: accepts exactly one connection and replies with
+    /// `status_line`/`body`, then closes. Returns the `http://127.0.0.1:<port>`
+    /// base URL `ollama_cloud_signed_in` should be pointed at.
+    fn fake_me_server(status_line: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake /api/me server");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn api_me_200_with_account_reports_signed_in() {
+        let base = fake_me_server(
+            "HTTP/1.1 200 OK",
+            r#"{"id":"x","email":"a@b.com","name":"alice","plan":"free"}"#,
         );
+        assert_eq!(ollama_cloud_signed_in(&base).await, Ok(true));
     }
 
-    #[test]
-    fn whoami_success_with_empty_output_is_not_signed_in() {
-        assert_eq!(classify_whoami_output(true, "  \n", ""), Ok(false));
+    #[tokio::test]
+    async fn api_me_401_reports_not_signed_in() {
+        let base = fake_me_server("HTTP/1.1 401 Unauthorized", "");
+        assert_eq!(ollama_cloud_signed_in(&base).await, Ok(false));
     }
 
-    #[test]
-    fn whoami_not_signed_in_error_is_definitive_false() {
-        assert_eq!(
-            classify_whoami_output(false, "", "Error: you are not signed in"),
-            Ok(false)
-        );
-        assert_eq!(
-            classify_whoami_output(false, "", "Error: unauthorized"),
-            Ok(false)
-        );
+    #[tokio::test]
+    async fn api_me_403_reports_not_signed_in() {
+        let base = fake_me_server("HTTP/1.1 403 Forbidden", "");
+        assert_eq!(ollama_cloud_signed_in(&base).await, Ok(false));
     }
 
-    #[test]
-    fn whoami_unknown_command_is_indeterminate() {
-        // Old ollama CLI without `whoami` — must NOT report signed-out,
-        // callers fall back to liveness-only semantics.
-        assert!(classify_whoami_output(false, "", "Error: unknown command \"whoami\"").is_err());
-    }
-
-    #[test]
-    fn whoami_other_failure_is_indeterminate() {
-        assert!(classify_whoami_output(false, "", "some transient failure").is_err());
+    #[tokio::test]
+    async fn api_me_unexpected_status_is_indeterminate() {
+        // e.g. a daemon old enough to not have this route at all (404) — the
+        // old whoami check's "indeterminate" outcome, same fallback contract.
+        let base = fake_me_server("HTTP/1.1 404 Not Found", "");
+        assert!(ollama_cloud_signed_in(&base).await.is_err());
     }
 }

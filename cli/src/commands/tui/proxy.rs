@@ -176,13 +176,22 @@ where
 /// --parent-pid <this process's pid>` with cwd = the Kim repo root, complete
 /// its one-line handshake, then start draining its stdout/stderr in the
 /// background so the pipes never fill.
+///
+/// `extra_env` is set on the child IN ADDITION to this launcher's own
+/// inherited environment (this `Command` has no `env_clear()`, unlike the
+/// kimcli child's — see `env::build_child_env`'s allowlist docs) — used by
+/// `ollama_cloud::resolve_ollama_cloud` to force `KIM_OLLAMA_MODE=cloud` /
+/// `KIM_OLLAMA_CLOUD_MODEL=<model>` on the proxy so `OllamaProvider` actually
+/// enters cloud mode for an Ollama cloud request.
 pub(crate) async fn spawn_standalone_proxy(
     python: &Path,
     kim_root: &Path,
     provider: &str,
     verbose: bool,
+    extra_env: &[(String, String)],
 ) -> Result<ProxyProcess, String> {
-    let mut child = Command::new(python)
+    let mut command = Command::new(python);
+    command
         .args([
             "-m",
             "codex_engine.standalone_proxy",
@@ -195,14 +204,16 @@ pub(crate) async fn spawn_standalone_proxy(
         .env("PYTHONPATH", kim_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "failed to start the codex proxy ({}): {e}",
-                python.display()
-            )
-        })?;
+        .kill_on_drop(true);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().map_err(|e| {
+        format!(
+            "failed to start the codex proxy ({}): {e}",
+            python.display()
+        )
+    })?;
 
     let stdout = child
         .stdout
