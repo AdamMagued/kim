@@ -88,7 +88,9 @@ from orchestrator.providers.browser.bridge_client import complete_via_webview_br
 from orchestrator.providers.browser.markdown_scraper import MARKDOWN_SERIALIZER_JS
 from orchestrator.providers.browser.page_driver import PageDriver
 from orchestrator.providers.browser.prompt_builder import format_prompt
+from orchestrator.providers.browser.reasoning_effort import apply_effort, resolve_effort
 from orchestrator.providers.browser.response_parser import parse_response, strip_transport_markers
+from orchestrator.providers.browser.session_paths import resolve_session_root
 from orchestrator.providers.browser.site_configs import (
     CDP_URL,
     GENERATION_WAIT_S,
@@ -261,15 +263,11 @@ class BrowserProvider(BaseProvider):
         self._gemini_authuser = self._parse_authuser_env(os.environ.get("KIM_GEMINI_AUTHUSER", ""))
         if self._gemini_authuser is None:
             self._gemini_authuser = self._load_active_gemini_authuser_from_account()
-
-        # _managed_pw / _managed_browser removed: they were set but never read
-        # and never explicitly closed, causing resource leaks (#43).
+        self._effort = resolve_effort(config)
 
         # ── Persistent session directory ────────────────────────────────
-        project_root = Path(
-            os.environ.get("PROJECT_ROOT")
-            or config.get("project_root", str(Path.cwd()))
-        ).resolve()
+        # F-B-14: anchored to the stable Kim install, not cwd/PROJECT_ROOT (session_paths.py).
+        project_root = resolve_session_root(config)
         default_data_dir = str(project_root / "sessions" / "chrome_data")
         self._user_data_dir = str(
             Path(bp_cfg.get("user_data_dir", default_data_dir)).resolve()
@@ -838,6 +836,8 @@ class BrowserProvider(BaseProvider):
             self._last_chat_page_url = page.url
 
         cfg = self._site_configs[site]
+        if not self._sent_system_prompt:
+            await apply_effort(page, site, self._effort, log=logger)
 
         image_attachments = [
             a for a in attachments
