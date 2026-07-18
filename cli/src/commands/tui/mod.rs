@@ -133,6 +133,44 @@ pub(crate) fn parse_tui_flags(args: &[String]) -> Result<TuiFlags, String> {
     Ok(out)
 }
 
+/// Resolve the effective (provider, model) pair an explicit `--provider`
+/// flag must win for BOTH: routing (unchanged) AND the display label kimcli
+/// shows as its header/footer/model-metadata lookup.
+///
+/// F-B-16: a browser provider's "model" is a fixed, cosmetic label derived
+/// from the provider itself (browser-claude/-chatgpt/-gemini) — not a real
+/// installed model. Persisted `tui_model`/`model` can be stale from a PRIOR
+/// `--provider` run (e.g. last session used browser:chatgpt) and must not
+/// leak into THIS session's header/footer/"Model metadata for … not found"
+/// warning: execution already correctly used the resolved `provider` for
+/// routing, but the display label was reading old, unrelated config. Non-
+/// browser providers keep persisted-model precedence unchanged — that
+/// string is a real user choice (an installed Ollama tag, etc.) worth
+/// remembering across runs.
+pub(crate) fn resolve_provider_and_model(
+    flags: &TuiFlags,
+    config: &crate::config::KimConfig,
+) -> (String, String) {
+    let provider = flags.provider.clone().unwrap_or_else(|| {
+        config
+            .tui_provider
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TUI_PROVIDER.to_string())
+    });
+    let model = flags.model.clone().unwrap_or_else(|| {
+        if crate::provider::is_browser_provider(&provider) {
+            if let Some(info) = crate::provider::provider_info(&provider) {
+                return info.default_model.to_string();
+            }
+        }
+        config
+            .tui_model
+            .clone()
+            .unwrap_or_else(|| config.model.clone())
+    });
+    (provider, model)
+}
+
 /// Standalone `kimcli` binary's entry point AND `kim tui`'s dispatch target
 /// (see `lib.rs`'s `CliCommand::Tui` arm) — the exact same function serves
 /// both. Parses flags, resolves defaults from `KimConfig`, and runs.
@@ -145,15 +183,7 @@ pub async fn run_tui_standalone(args: Vec<String>) -> i32 {
         }
     };
     let config = crate::config::KimConfig::load();
-    let provider = flags.provider.unwrap_or_else(|| {
-        config
-            .tui_provider
-            .clone()
-            .unwrap_or_else(|| DEFAULT_TUI_PROVIDER.to_string())
-    });
-    let model = flags
-        .model
-        .unwrap_or_else(|| config.tui_model.clone().unwrap_or(config.model));
+    let (provider, model) = resolve_provider_and_model(&flags, &config);
     let cwd = flags
         .cwd
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -358,5 +388,94 @@ mod tests {
         let err = parse_tui_flags(&strs(&["--nope"])).unwrap_err();
         assert!(err.contains("--nope"), "got: {err}");
         assert!(err.contains("Usage: kim tui"), "got: {err}");
+    }
+
+    // ── F-B-16: explicit --provider must win the DISPLAY label too ────────
+
+    fn config_with(
+        tui_provider: Option<&str>,
+        tui_model: Option<&str>,
+        model: &str,
+    ) -> crate::config::KimConfig {
+        crate::config::KimConfig {
+            tui_provider: tui_provider.map(str::to_string),
+            tui_model: tui_model.map(str::to_string),
+            model: model.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explicit_provider_flag_derives_the_matching_browser_model_label() {
+        // The exact QA repro: `kim tui --provider browser:claude` with a
+        // stale `tui_model: "browser-chatgpt"` left over from a prior
+        // `--provider browser:chatgpt` session.
+        let flags = TuiFlags {
+            provider: Some("browser:claude".to_string()),
+            ..Default::default()
+        };
+        let config = config_with(
+            Some("browser:chatgpt"),
+            Some("browser-chatgpt"),
+            "browser-chatgpt",
+        );
+        let (provider, model) = resolve_provider_and_model(&flags, &config);
+        assert_eq!(provider, "browser:claude");
+        assert_eq!(
+            model, "browser-claude",
+            "display label must match the flag, not stale config"
+        );
+    }
+
+    #[test]
+    fn explicit_model_flag_always_wins_even_for_browser_providers() {
+        let flags = TuiFlags {
+            provider: Some("browser:gemini".to_string()),
+            model: Some("custom-label".to_string()),
+            ..Default::default()
+        };
+        let config = config_with(None, None, "llama3.2");
+        let (provider, model) = resolve_provider_and_model(&flags, &config);
+        assert_eq!(provider, "browser:gemini");
+        assert_eq!(model, "custom-label");
+    }
+
+    #[test]
+    fn no_flags_falls_back_to_persisted_provider_and_its_matching_model() {
+        let flags = TuiFlags::default();
+        let config = config_with(
+            Some("browser:chatgpt"),
+            Some("stale-unrelated-label"),
+            "llama3.2",
+        );
+        let (provider, model) = resolve_provider_and_model(&flags, &config);
+        assert_eq!(provider, "browser:chatgpt");
+        // Even the PERSISTED provider's own stale tui_model gets corrected —
+        // the derivation is keyed off the resolved provider, not off which
+        // input (flag vs config) supplied it.
+        assert_eq!(model, "browser-chatgpt");
+    }
+
+    #[test]
+    fn non_browser_provider_keeps_persisted_model_precedence() {
+        // A real installed Ollama tag must NOT be clobbered by any
+        // browser-style derivation — ollama has no provider-derived model.
+        let flags = TuiFlags {
+            provider: Some("ollama".to_string()),
+            ..Default::default()
+        };
+        let config = config_with(None, Some("qwen2.5-coder:7b"), "llama3.2");
+        let (provider, model) = resolve_provider_and_model(&flags, &config);
+        assert_eq!(provider, "ollama");
+        assert_eq!(model, "qwen2.5-coder:7b");
+    }
+
+    #[test]
+    fn no_flags_and_no_config_falls_back_to_default_provider_and_model() {
+        let flags = TuiFlags::default();
+        let config = config_with(None, None, "llama3.2");
+        let (provider, model) = resolve_provider_and_model(&flags, &config);
+        assert_eq!(provider, DEFAULT_TUI_PROVIDER);
+        assert_eq!(model, "browser-claude");
     }
 }
