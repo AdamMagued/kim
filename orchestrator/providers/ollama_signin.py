@@ -91,29 +91,52 @@ async def trigger_signin_and_wait(
         raise OllamaSigninUnavailable(f"Could not launch `ollama signin`: {exc}") from exc
 
     output_task = asyncio.create_task(_drain_stdout(proc))
-    elapsed = 0.0
+
+    # Use a monotonic event-loop deadline (not an accumulated interval
+    # counter) so the timeout reflects real wall-clock elapsed time
+    # regardless of per-iteration scheduling jitter — Windows'
+    # ProactorEventLoop has ~15.6ms timer granularity, coarser than a
+    # sub-15ms poll_interval_s, so counting "elapsed += poll_interval_s"
+    # per loop tick drifts arbitrarily far from real time.
+    #
+    # Wait on a SINGLE long-lived `proc.wait()` task across every
+    # iteration (via `asyncio.wait(..., timeout=...)`, which does not
+    # cancel the task when its own timeout elapses) rather than
+    # re-awaiting a fresh `proc.wait()` each tick. This guarantees the
+    # process-exit signal is observed by one waiter that is never torn
+    # down and recreated mid-flight, so a completion that lands in the
+    # gap between two iterations can't be missed.
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    deadline = start + timeout_s
+    wait_task: "asyncio.Task[int]" = asyncio.ensure_future(proc.wait())
     try:
         while True:
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=poll_interval_s)
+            tick = min(poll_interval_s, max(deadline - loop.time(), 0.0))
+            done, _ = await asyncio.wait({wait_task}, timeout=tick)
+            if wait_task in done:
                 break
-            except asyncio.TimeoutError:
-                elapsed += poll_interval_s
-                if elapsed >= timeout_s:
-                    proc.kill()
-                    with contextlib.suppress(Exception):
-                        await proc.wait()
-                    output_task.cancel()
-                    raise OllamaSigninTimeout(
-                        f"Ollama sign-in did not complete within {int(timeout_s)}s. "
-                        "Finish signing in in your browser and try again, or run "
-                        "`ollama signin` manually in another terminal."
-                    )
-                logger.info(
-                    "OllamaProvider: still waiting for Ollama sign-in (%ds elapsed)...",
-                    int(elapsed),
+            if loop.time() >= deadline:
+                wait_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await wait_task
+                proc.kill()
+                with contextlib.suppress(Exception):
+                    await proc.wait()
+                output_task.cancel()
+                raise OllamaSigninTimeout(
+                    f"Ollama sign-in did not complete within {int(timeout_s)}s. "
+                    "Finish signing in in your browser and try again, or run "
+                    "`ollama signin` manually in another terminal."
                 )
+            logger.info(
+                "OllamaProvider: still waiting for Ollama sign-in (%ds elapsed)...",
+                int(loop.time() - start),
+            )
     except asyncio.CancelledError:
+        wait_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await wait_task
         proc.kill()
         with contextlib.suppress(Exception):
             await proc.wait()
