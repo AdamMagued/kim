@@ -19,6 +19,18 @@ const KIM_TUI_ENABLED_TOOL_TIERS: &str = "ui,browser";
 /// round-trip byte-for-byte, e.g. a `cwd` with a backslash on Windows or a
 /// literal quote) rather than a cosmetic model name that can tolerate lossy
 /// sanitization.
+///
+/// FIX 8 (#61 review): a TOML basic string forbids every raw control
+/// character except tab (U+0000–U+0008, U+000A–U+001F, and U+007F must all
+/// be escaped — TOML v1.0 spec, "Any Unicode character may be used except
+/// those that must be escaped: quotation mark, backslash, and the control
+/// characters other than tab"). The previous version only escaped
+/// `\n`/`\r`/`\t`, so e.g. a path containing an ESC (U+001B) byte — unusual
+/// but not impossible, and not under this program's control since paths
+/// come from the filesystem/user input — produced an invalid `-c` override
+/// that kimcli's TOML parser would reject. Named escapes are used where
+/// TOML defines one (`\b`, `\t`, `\n`, `\f`, `\r`, `\"`, `\\`); every other
+/// forbidden control character falls back to the generic `\u00XX` form.
 fn toml_quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -26,9 +38,14 @@ fn toml_quote(value: &str) -> String {
         match ch {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
+            '\u{08}' => out.push_str("\\b"),
             '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{0C}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7F => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
             c => out.push(c),
         }
     }
@@ -276,6 +293,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn toml_quote_escapes_control_chars_below_0x20_and_0x7f() {
+        // FIX 8 (#61 review): every raw control char except tab must be
+        // escaped in a TOML basic string, not just \n\r\t. Built via
+        // char::from_u32 at runtime (rather than literal escapes in this
+        // source file) so this file never has to embed a raw control byte.
+        let esc = char::from_u32(0x1B).unwrap();
+        let nul = char::from_u32(0x00).unwrap();
+        let bel = char::from_u32(0x07).unwrap();
+        let del = char::from_u32(0x7F).unwrap();
+        let bs = char::from_u32(0x08).unwrap();
+        let ff = char::from_u32(0x0C).unwrap();
+
+        assert_eq!(
+            toml_quote(&format!("a{esc}b")),
+            format!("\"a\\u{:04X}b\"", 0x1Bu32),
+            "ESC (U+001B)"
+        );
+        assert_eq!(
+            toml_quote(&format!("a{nul}b")),
+            format!("\"a\\u{:04X}b\"", 0x00u32),
+            "NUL (U+0000)"
+        );
+        assert_eq!(
+            toml_quote(&format!("a{bel}b")),
+            format!("\"a\\u{:04X}b\"", 0x07u32),
+            "BEL (U+0007)"
+        );
+        assert_eq!(
+            toml_quote(&format!("a{del}b")),
+            format!("\"a\\u{:04X}b\"", 0x7Fu32),
+            "DEL (U+007F)"
+        );
+        // Named escapes still take priority over the generic \u00XX form.
+        assert_eq!(
+            toml_quote(&format!("a{bs}b")),
+            "\"a\\bb\"",
+            "backspace uses \\b"
+        );
+        assert_eq!(
+            toml_quote(&format!("a{ff}b")),
+            "\"a\\fb\"",
+            "form feed uses \\f"
+        );
+        assert_eq!(toml_quote("a\tb"), "\"a\\tb\"");
+        assert_eq!(toml_quote("a\nb"), "\"a\\nb\"");
+        assert_eq!(toml_quote("a\rb"), "\"a\\rb\"");
+
+        // A control-char path must still produce a well-formed `-c`
+        // override argv element -- the raw control byte never survives
+        // into the generated TOML.
+        let target_cwd = format!("/cwd/proj{esc}ect");
+        let argv = build_kimcli_argv(
+            TuiRoute::OllamaDirect,
+            "model",
+            None,
+            "/usr/bin/python3",
+            "/root",
+            &target_cwd,
+            &[],
+        );
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains("PROJECT_ROOT=\"/cwd/proj\\u001Bect\""),
+            "got: {joined}"
+        );
+        assert!(!joined.contains(esc), "raw ESC byte must not survive");
+    }
     #[test]
     fn argv_appends_passthrough_verbatim_at_the_end() {
         let passthrough: Vec<String> = ["--some-codex-flag", "value with spaces"]

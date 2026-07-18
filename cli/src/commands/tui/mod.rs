@@ -173,6 +173,31 @@ pub(crate) fn resolve_provider_and_model(
     (provider, model)
 }
 
+/// Resolve `--cwd` into the absolute directory used both as the spawned
+/// kimcli process's own working directory AND (via `argv.rs`'s
+/// `mcp_kim_overrides`) as `mcp_servers.kim.env.PROJECT_ROOT`.
+///
+/// FIX 3 (#61 review): an explicit `--cwd` MUST be canonicalized here. The
+/// MCP server's own process cwd is pinned to `kim_root`
+/// (`mcp_servers.kim.cwd` in `argv.rs`), and `mcp_server/config.py`'s
+/// `PROJECT_ROOT` resolution deliberately resolves a *relative*
+/// `PROJECT_ROOT` against its own directory (`_PROJECT_DIR`, i.e.
+/// `kim_root`), NOT the caller's intended project directory — see that
+/// file's "Resolve project_root relative to config.yaml's directory — NOT
+/// cwd" comment. So `kim tui --cwd ./myproj` without this canonicalization
+/// would root every MCP tool at `<kim_root>/myproj` instead of the user's
+/// actual project. `std::env::current_dir()` (the no-flag default) already
+/// returns an absolute path, so this only changes behavior for an explicit
+/// relative `--cwd`. Falls back to the given (possibly relative/
+/// non-existent) path if canonicalization fails, so a typo'd or
+/// not-yet-created `--cwd` surfaces its own clear error later (e.g. kimcli
+/// failing to spawn with that cwd) rather than a silent swap here.
+fn resolve_tui_cwd(flag_cwd: Option<PathBuf>) -> PathBuf {
+    flag_cwd
+        .map(|dir| dir.canonicalize().unwrap_or(dir))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
 /// Standalone `kimcli` binary's entry point AND `kim tui`'s dispatch target
 /// (see `lib.rs`'s `CliCommand::Tui` arm) — the exact same function serves
 /// both. Parses flags, resolves defaults from `KimConfig`, and runs.
@@ -186,9 +211,7 @@ pub async fn run_tui_standalone(args: Vec<String>) -> i32 {
     };
     let config = crate::config::KimConfig::load();
     let (provider, model) = resolve_provider_and_model(&flags, &config);
-    let cwd = flags
-        .cwd
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let cwd = resolve_tui_cwd(flags.cwd);
 
     let opts = TuiOptions {
         provider,
@@ -490,5 +513,61 @@ mod tests {
         let (provider, model) = resolve_provider_and_model(&flags, &config);
         assert_eq!(provider, DEFAULT_TUI_PROVIDER);
         assert_eq!(model, "browser-claude");
+    }
+
+    // ── FIX 3 (#61 review): --cwd must be canonicalized ────────────────────
+
+    #[test]
+    fn resolve_tui_cwd_canonicalizes_and_normalizes_an_explicit_cwd() {
+        // Regression for FIX 3 (#61 review): resolve_tui_cwd must actually
+        // canonicalize (not just pass through) an explicit --cwd, since an
+        // unresolved --cwd flows straight into mcp_servers.kim.env.
+        // PROJECT_ROOT, and mcp_server/config.py resolves a *relative*
+        // PROJECT_ROOT against kim_root (its own directory), not the user's
+        // intended project — rooting every MCP tool at the wrong place.
+        // Deliberately avoids mutating the real process cwd (which would be
+        // racy under parallel test execution): build a path with a
+        // redundant `..` component instead, so canonicalize()'s
+        // normalization is directly observable without touching global
+        // state.
+        let base = tempfile::tempdir().unwrap();
+        let sub = base.path().join("myproj");
+        std::fs::create_dir_all(&sub).unwrap();
+        let unresolved = base.path().join("myproj").join("..").join("myproj");
+        assert_ne!(
+            unresolved, sub,
+            "test fixture sanity: the unresolved path must be syntactically different"
+        );
+
+        let resolved = resolve_tui_cwd(Some(unresolved));
+        assert_eq!(resolved, sub.canonicalize().unwrap());
+        assert!(
+            resolved.is_absolute(),
+            "PROJECT_ROOT must not stay relative — mcp_server/config.py \
+             resolves a relative PROJECT_ROOT against kim_root, not the \
+             user's --cwd"
+        );
+    }
+
+    #[test]
+    fn resolve_tui_cwd_leaves_an_already_absolute_cwd_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_tui_cwd(Some(dir.path().to_path_buf()));
+        assert_eq!(resolved, dir.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_tui_cwd_falls_back_to_current_dir_when_no_flag_given() {
+        let resolved = resolve_tui_cwd(None);
+        assert_eq!(resolved, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn resolve_tui_cwd_falls_back_to_the_given_path_if_canonicalize_fails() {
+        // A typo'd/not-yet-created --cwd must not panic or silently vanish
+        // here — it surfaces its own clear error later (e.g. spawn failure).
+        let bogus = PathBuf::from("/definitely/does/not/exist/kim-cwd-test");
+        let resolved = resolve_tui_cwd(Some(bogus.clone()));
+        assert_eq!(resolved, bogus);
     }
 }
