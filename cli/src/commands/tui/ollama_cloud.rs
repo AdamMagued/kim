@@ -23,6 +23,7 @@
 //!      catalog — every entry ends in `-cloud`), so a plain `ollama` request
 //!      for one of those is unambiguously a cloud request even without the
 //!      alias.
+//!
 //! `create_provider` (orchestrator/providers/base.py) only recognizes the
 //! exact name `"ollama"` — never `"ollama-cloud"` — so both paths resolve to
 //! `proxy_provider: "ollama"` for the `--provider` arg actually passed to
