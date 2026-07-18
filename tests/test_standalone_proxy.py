@@ -12,6 +12,7 @@ translation tests that this runtime builds on.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import queue
@@ -24,8 +25,14 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
-from codex_engine.standalone_proxy import _resolve_auto_mode
+from codex_engine.standalone_proxy import (
+    _pid_alive,
+    _resolve_auto_mode,
+    _watchdog,
+    _WatchdogUnavailable,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MODULE_CMD = [sys.executable, "-u", "-m", "codex_engine.standalone_proxy"]
@@ -249,6 +256,45 @@ class StdoutRedirectAfterHandshakeTests(unittest.TestCase):
             self.assertIn(extra, (None, ""), f"unexpected extra stdout content: {extra!r}")
         finally:
             _terminate(proc)
+
+
+class PidAliveWindowsFallbackTests(unittest.TestCase):
+    """_pid_alive's ctypes-unavailable fallback (in-process, no subprocess):
+    it must raise _WatchdogUnavailable rather than silently returning True
+    forever, so the watchdog loop actually stops instead of re-logging the
+    same "disabling it" warning every interval."""
+
+    def test_raises_watchdog_unavailable_when_ctypes_missing(self):
+        real_import = __import__
+
+        def _fake_import(name, *args, **kwargs):
+            if name == "ctypes":
+                raise ImportError("no ctypes on this fake host")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(sys, "platform", "win32"), \
+                patch("builtins.__import__", side_effect=_fake_import):
+            with self.assertRaises(_WatchdogUnavailable):
+                _pid_alive(12345)
+
+
+class WatchdogStopsOnUnavailableLivenessCheckTests(unittest.IsolatedAsyncioTestCase):
+    """_watchdog must stop polling (not spin forever re-logging a warning)
+    once _pid_alive reports the liveness check is unusable — the bug this
+    fixes: the fallback logged "disabling it" but the poll loop kept going."""
+
+    async def test_watchdog_returns_promptly_without_setting_stop_event(self):
+        stop_event = asyncio.Event()
+        with patch(
+            "codex_engine.standalone_proxy._pid_alive",
+            side_effect=_WatchdogUnavailable(),
+        ) as mocked:
+            await asyncio.wait_for(_watchdog(12345, stop_event), timeout=2.0)
+        # Stopped after the very first check — no re-polling loop.
+        self.assertEqual(mocked.call_count, 1)
+        # The proxy itself is NOT told to shut down: the parent might well
+        # still be alive, the check just can't tell anymore.
+        self.assertFalse(stop_event.is_set())
 
 
 class StandaloneProxyWatchdogTests(unittest.TestCase):

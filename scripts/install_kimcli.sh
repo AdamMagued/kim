@@ -57,7 +57,8 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 tmp="$(mktemp -d)"
-cleanup() { rm -rf "$tmp"; }
+tmp_dest=""
+cleanup() { rm -rf "$tmp"; [ -n "$tmp_dest" ] && rm -f "$tmp_dest"; return 0; }
 trap cleanup EXIT INT TERM
 
 url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
@@ -122,17 +123,29 @@ if [ "$target" = "x86_64-pc-windows-msvc" ]; then
   dest="$INSTALL_DIR/kimcli.exe"
 fi
 
-cp "$bin" "$dest"
+# Install atomically: copying straight over $dest with `cp` truncates the
+# existing file in place, which fails ETXTBSY on Linux if kimcli is
+# self-upgrading while its own binary is still running, and can SIGKILL a
+# signed binary in place on macOS. Instead, stage into a temp file in the
+# SAME directory as $dest (so the final `mv` is a same-filesystem rename,
+# not a cross-device copy) and apply the usual quarantine/chmod steps to
+# the staged file, then `mv` it into place — a rename swaps the directory
+# entry atomically instead of writing through the old inode.
+tmp_dest="$dest.tmp.$$"
+cp "$bin" "$tmp_dest"
 
 if [ "$os" = "darwin" ]; then
   # Unsigned binary: strip the quarantine flag so Gatekeeper doesn't block
   # the first launch. Best-effort — absence of the attribute is not an error.
-  xattr -d com.apple.quarantine "$dest" 2>/dev/null || true
+  xattr -d com.apple.quarantine "$tmp_dest" 2>/dev/null || true
 fi
 
 if [ "$target" != "x86_64-pc-windows-msvc" ]; then
-  chmod +x "$dest"
+  chmod +x "$tmp_dest"
 fi
+
+mv "$tmp_dest" "$dest"
+tmp_dest=""
 
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;

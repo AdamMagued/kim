@@ -114,6 +114,15 @@ def _resolve_auto_mode(provider_name: str) -> str:
     return "browser-contract" if name == "browser" or name.startswith("browser:") else "responses-passthrough"
 
 
+class _WatchdogUnavailable(Exception):
+    """Raised by ``_pid_alive`` when the liveness check itself is unusable
+    (ctypes missing on Windows) — the watchdog can never answer the "is the
+    parent alive" question on this host, so it must stop polling entirely
+    rather than claim "alive" forever, which would make its own "disabling
+    it" log message a lie (the poll loop kept running and re-logging the
+    same warning every interval)."""
+
+
 def _pid_alive(pid: int) -> bool:
     """Best-effort cross-platform liveness check for the watchdog.
 
@@ -131,8 +140,12 @@ def _pid_alive(pid: int) -> bool:
     on Windows CI). Comparing the queried exit code against STILL_ACTIVE
     (259) reports the true run state regardless of who else still holds a
     handle to the process object.
-    If ctypes itself is unavailable, degrade gracefully: assume alive rather
-    than risk spuriously killing a live proxy from a broken liveness check.
+    If ctypes itself is unavailable, this raises ``_WatchdogUnavailable``
+    instead of returning: the check can never succeed on this host (retrying
+    it every interval would just re-import the same missing module and
+    re-log the same warning forever), and the caller stops polling for good
+    rather than risk spuriously killing a live proxy from a broken liveness
+    check.
     """
     if pid <= 0:
         return False
@@ -158,7 +171,7 @@ def _pid_alive(pid: int) -> bool:
                 ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
         except Exception:
             logger.warning("Parent-pid watchdog unavailable on this Windows host; disabling it.")
-            return True
+            raise _WatchdogUnavailable()
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -172,7 +185,16 @@ def _pid_alive(pid: int) -> bool:
 
 async def _watchdog(parent_pid: int, stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
-        if not _pid_alive(parent_pid):
+        try:
+            alive = _pid_alive(parent_pid)
+        except _WatchdogUnavailable:
+            # The liveness check itself is unusable on this host — never
+            # able to succeed, so stop polling for good instead of re-
+            # logging the same "disabling it" warning every interval while
+            # doing nothing (see _pid_alive's docstring). The proxy keeps
+            # running; it just no longer has a working parent-death check.
+            return
+        if not alive:
             logger.warning("Parent pid %d is gone — shutting down.", parent_pid)
             stop_event.set()
             return

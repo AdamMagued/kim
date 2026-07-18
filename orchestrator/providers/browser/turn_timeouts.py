@@ -97,7 +97,22 @@ async def run_phase(
         raise PhaseTimeout(phase, timeout_s, site) from exc
 
 
+# Per-phase closing instruction for the NEED_HELP text. "submit" gets its
+# own wording: the timeout can land just after Enter was pressed, meaning
+# the message may already have posted — telling the user to blindly resend
+# risks duplicating it, so they're told to check the chat first.
+_PHASE_RESEND_HINTS = {
+    "submit": (
+        "check the browser window and see whether the message already "
+        "posted — it may have gone out right before the timeout fired — "
+        "and only resend if it did not"
+    ),
+}
+_DEFAULT_RESEND_HINT = "check the browser window, sign in or clear the block if needed, then resend"
+
+
 def phase_timeout_response(exc: PhaseTimeout) -> dict:
+    resend_hint = _PHASE_RESEND_HINTS.get(exc.phase, _DEFAULT_RESEND_HINT)
     return {
         "type": "text",
         "content": (
@@ -105,7 +120,6 @@ def phase_timeout_response(exc: PhaseTimeout) -> dict:
             f"{_PHASE_LABELS.get(exc.phase, exc.phase)} and did not finish "
             f"within {exc.timeout_s:.0f}s. This usually means the tab is on "
             "an unexpected page (signed out, a bot/CAPTCHA check, or a stale "
-            "tab) rather than the actual chat — check the browser window, "
-            "sign in or clear the block if needed, then resend."
+            f"tab) rather than the actual chat — {resend_hint}."
         ),
     }

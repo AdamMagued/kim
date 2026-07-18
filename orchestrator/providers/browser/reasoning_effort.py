@@ -168,35 +168,46 @@ async def apply_effort(page, site: str, effort: Optional[str], *, log=None) -> b
         log.warning("reasoning_effort: could not open %s's picker (%s) — no-op.", site, exc)
         return False
 
+    # From here on the picker is OPEN. Every exit path below must close it
+    # again (Escape) before returning — except the happy path, where
+    # clicking the matched item already closes the picker itself. A
+    # try/finally guarantees this even when reading/matching items raises,
+    # so a picker never gets left open over the composer for the next
+    # submit-phase click to collide with.
+    picker_closed = False
     try:
-        item_loc = page.locator(_ITEM_SELECTOR)
-        count = await item_loc.count()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("reasoning_effort: could not read %s's picker items (%s) — no-op.", site, exc)
-        return False
+        try:
+            item_loc = page.locator(_ITEM_SELECTOR)
+            count = await item_loc.count()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("reasoning_effort: could not read %s's picker items (%s) — no-op.", site, exc)
+            return False
 
-    for term in terms:
-        for i in range(count):
-            try:
-                item = item_loc.nth(i)
-                if not await item.is_visible():
+        for term in terms:
+            for i in range(count):
+                try:
+                    item = item_loc.nth(i)
+                    if not await item.is_visible():
+                        continue
+                    text = (await item.inner_text() or "").strip().lower()
+                    if term in text:
+                        await item.click()
+                        picker_closed = True
+                        log.info(
+                            "reasoning_effort: set %s effort=%s via %r", site, effort, text[:60],
+                        )
+                        return True
+                except Exception:
                     continue
-                text = (await item.inner_text() or "").strip().lower()
-                if term in text:
-                    await item.click()
-                    log.info(
-                        "reasoning_effort: set %s effort=%s via %r", site, effort, text[:60],
-                    )
-                    return True
-            except Exception:
-                continue
 
-    log.warning(
-        "reasoning_effort: opened %s's picker but found no item matching %s "
-        "for effort=%s — closing without change.", site, terms, effort,
-    )
-    try:
-        await page.keyboard.press("Escape")
-    except Exception:
-        pass
-    return False
+        log.warning(
+            "reasoning_effort: opened %s's picker but found no item matching %s "
+            "for effort=%s — closing without change.", site, terms, effort,
+        )
+        return False
+    finally:
+        if not picker_closed:
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass

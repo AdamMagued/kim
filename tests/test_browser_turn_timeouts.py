@@ -93,6 +93,20 @@ class TestPhaseTimeoutResponse(unittest.TestCase):
         self.assertIn("chatgpt", resp["content"])
         self.assertIn("90", resp["content"])
 
+    def test_submit_phase_warns_message_may_already_have_posted(self):
+        # The submit-phase timeout can land just after Enter was pressed —
+        # the message may already be sent, so the text must tell the user
+        # to check before resending rather than just "resend".
+        exc = PhaseTimeout("submit", 90.0, site="chatgpt")
+        resp = phase_timeout_response(exc)
+        self.assertIn("already posted", resp["content"])
+
+    def test_connect_phase_keeps_generic_resend_wording(self):
+        exc = PhaseTimeout("connect", 45.0, site="chatgpt")
+        resp = phase_timeout_response(exc)
+        self.assertNotIn("already posted", resp["content"])
+        self.assertIn("resend", resp["content"])
+
 
 # ---------------------------------------------------------------------------
 # End-to-end: BrowserProvider.complete() must never hang past its budgets

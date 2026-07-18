@@ -153,6 +153,31 @@ class TestApplyEffort(unittest.IsolatedAsyncioTestCase):
         applied = await apply_effort(page, "chatgpt", "high")
         self.assertFalse(applied)
 
+    async def test_closes_menu_when_reading_items_after_trigger_raises(self):
+        # Regression for the picker-left-open bug: the trigger click opens
+        # the picker successfully, but the item-count call blows up before
+        # any item is read. Escape must still be pressed so the menu isn't
+        # left open over the composer for the next submit-phase click to
+        # collide with.
+        page = _FakePage(True, [])
+
+        class _BoomLocator(_FakeLocator):
+            async def count(self):
+                raise RuntimeError("items gone")
+
+        real_locator = page.locator
+
+        def _locator(sel: str):
+            if "menuitem" in sel or "option" in sel or "switch" in sel:
+                return _BoomLocator([])
+            return real_locator(sel)
+
+        page.locator = _locator
+
+        applied = await apply_effort(page, "chatgpt", "high")
+        self.assertFalse(applied)
+        self.assertIn("Escape", page.keyboard.pressed)
+
 
 if __name__ == "__main__":
     unittest.main()
