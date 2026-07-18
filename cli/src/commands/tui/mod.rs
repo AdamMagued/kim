@@ -33,6 +33,7 @@
 
 mod argv;
 mod env;
+mod ollama_cloud;
 mod proxy;
 mod resolve;
 mod routing;
@@ -49,6 +50,7 @@ use tokio::process::Command;
 
 use argv::build_kimcli_argv;
 use env::build_child_env;
+use ollama_cloud::resolve_ollama_cloud;
 use proxy::{spawn_standalone_proxy, ProxyProcess};
 use routing::{route_for_provider, TuiRoute};
 
@@ -205,7 +207,7 @@ pub async fn run_tui_standalone(args: Vec<String>) -> i32 {
 /// swallowing our own Ctrl-C so we don't die before it's reaped, tear the
 /// proxy down, and propagate kimcli's exit code.
 pub(crate) async fn run_tui(opts: &TuiOptions) -> i32 {
-    let route = route_for_provider(&opts.provider);
+    let route = route_for_provider(&opts.provider, &opts.model);
 
     let kim_root = match crate::sessions::find_kim_repo_root() {
         Some(root) => root,
@@ -235,54 +237,65 @@ pub(crate) async fn run_tui(opts: &TuiOptions) -> i32 {
     };
 
     let mut proxy: Option<ProxyProcess> = None;
-    let (extra_env, argv): (Vec<(String, String)>, Vec<String>) =
-        match route {
-            TuiRoute::OllamaDirect => {
-                let argv = build_kimcli_argv(
-                    route,
-                    &opts.model,
-                    None,
-                    &python.to_string_lossy(),
-                    &kim_root.to_string_lossy(),
-                    &opts.cwd.to_string_lossy(),
-                    &opts.passthrough,
-                );
-                // Dummy token mirrors codex_stream.rs's convention for ollama —
-                // there is no real bearer token to check on that path.
-                let env = vec![
-                    ("CODEX_API_KEY".to_string(), "ollama".to_string()),
-                    ("OPENAI_API_KEY".to_string(), "ollama".to_string()),
-                ];
-                (env, argv)
-            }
-            TuiRoute::Proxy => {
-                let spawned =
-                    match spawn_standalone_proxy(&python, &kim_root, &opts.provider, opts.verbose)
-                        .await
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("kim tui: {e}");
-                            return 1;
-                        }
-                    };
-                let argv = build_kimcli_argv(
-                    route,
-                    &opts.model,
-                    Some(spawned.port),
-                    &python.to_string_lossy(),
-                    &kim_root.to_string_lossy(),
-                    &opts.cwd.to_string_lossy(),
-                    &opts.passthrough,
-                );
-                let env = vec![
-                    ("CODEX_API_KEY".to_string(), spawned.token.clone()),
-                    ("OPENAI_API_KEY".to_string(), spawned.token.clone()),
-                ];
-                proxy = Some(spawned);
-                (env, argv)
-            }
-        };
+    let (extra_env, argv): (Vec<(String, String)>, Vec<String>) = match route {
+        TuiRoute::OllamaDirect => {
+            let argv = build_kimcli_argv(
+                route,
+                &opts.model,
+                None,
+                &python.to_string_lossy(),
+                &kim_root.to_string_lossy(),
+                &opts.cwd.to_string_lossy(),
+                &opts.passthrough,
+            );
+            // Dummy token mirrors codex_stream.rs's convention for ollama —
+            // there is no real bearer token to check on that path.
+            let env = vec![
+                ("CODEX_API_KEY".to_string(), "ollama".to_string()),
+                ("OPENAI_API_KEY".to_string(), "ollama".to_string()),
+            ];
+            (env, argv)
+        }
+        TuiRoute::Proxy => {
+            // FINDING 1 (#61): `--model <name>-cloud` (or an explicit
+            // `--provider ollama-cloud`) must actually reach
+            // OllamaProvider as cloud mode — see ollama_cloud.rs. The
+            // resolved `proxy_provider` is what `create_provider`
+            // (orchestrator/providers/base.py) understands; the alias is
+            // a kim-tui-only surface concept.
+            let cloud = resolve_ollama_cloud(&opts.provider, &opts.model);
+            let spawned = match spawn_standalone_proxy(
+                &python,
+                &kim_root,
+                &cloud.proxy_provider,
+                opts.verbose,
+                &cloud.extra_env,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("kim tui: {e}");
+                    return 1;
+                }
+            };
+            let argv = build_kimcli_argv(
+                route,
+                &opts.model,
+                Some(spawned.port),
+                &python.to_string_lossy(),
+                &kim_root.to_string_lossy(),
+                &opts.cwd.to_string_lossy(),
+                &opts.passthrough,
+            );
+            let env = vec![
+                ("CODEX_API_KEY".to_string(), spawned.token.clone()),
+                ("OPENAI_API_KEY".to_string(), spawned.token.clone()),
+            ];
+            proxy = Some(spawned);
+            (env, argv)
+        }
+    };
 
     let mut cmd = Command::new(&kimcli_bin);
     cmd.args(&argv).current_dir(&opts.cwd).env_clear();

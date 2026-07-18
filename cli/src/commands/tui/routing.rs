@@ -37,20 +37,27 @@ pub(crate) enum TuiRoute {
 /// `tests/test_kimcli_binary.py`'s E2E coverage of that path).
 ///
 /// Set `KIM_TUI_OLLAMA_DIRECT=1` to opt back into the old DIRECT route (e.g.
-/// to test a future Ollama release that fixes the tool-call shape).
-pub(crate) fn route_for_provider(provider: &str) -> TuiRoute {
-    route_for_provider_with_env(provider, |key| std::env::var(key).ok())
+/// to test a future Ollama release that fixes the tool-call shape). That
+/// opt-in never applies to an Ollama CLOUD model (a `model` tag ending in
+/// `-cloud` — see `ollama_cloud::resolve_ollama_cloud`) regardless of the
+/// env var: the DIRECT route talks straight to the local daemon with no
+/// Python/`OllamaProvider` involved, so it has no way to run the sign-in
+/// flow a cloud model needs — always PROXY for those.
+pub(crate) fn route_for_provider(provider: &str, model: &str) -> TuiRoute {
+    route_for_provider_with_env(provider, model, |key| std::env::var(key).ok())
 }
 
 /// Env-injectable core of [`route_for_provider`] — kept separate so tests
 /// can exercise both branches of the `KIM_TUI_OLLAMA_DIRECT` opt-in without
 /// mutating real process env (see `crate::turn::provider_is_ready_with_env`
 /// for the same pattern elsewhere in this crate).
-fn route_for_provider_with_env<F>(provider: &str, env_var: F) -> TuiRoute
+fn route_for_provider_with_env<F>(provider: &str, model: &str, env_var: F) -> TuiRoute
 where
     F: Fn(&str) -> Option<String>,
 {
+    let is_cloud_tagged_model = model.trim().to_ascii_lowercase().ends_with("-cloud");
     if provider.trim().eq_ignore_ascii_case("ollama")
+        && !is_cloud_tagged_model
         && env_var(KIM_TUI_OLLAMA_DIRECT_ENV).as_deref() == Some("1")
     {
         TuiRoute::OllamaDirect
@@ -80,7 +87,7 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                route_for_provider(provider),
+                route_for_provider(provider, "some-model"),
                 TuiRoute::Proxy,
                 "{provider} should route through the proxy"
             );
@@ -93,7 +100,7 @@ mod tests {
         // see the two tests below for the exact truth table.
         for provider in ["browser:claude", "claude", "gemini", "ollama-cloud", ""] {
             assert_eq!(
-                route_for_provider_with_env(provider, |_| Some("1".to_string())),
+                route_for_provider_with_env(provider, "some-model", |_| Some("1".to_string())),
                 TuiRoute::Proxy,
                 "{provider} should route through the proxy even with the opt-in set"
             );
@@ -103,24 +110,24 @@ mod tests {
     #[test]
     fn ollama_defaults_to_proxy_without_the_opt_in_env_var() {
         assert_eq!(
-            route_for_provider_with_env("ollama", |_| None),
+            route_for_provider_with_env("ollama", "llama3.2", |_| None),
             TuiRoute::Proxy
         );
         assert_eq!(
-            route_for_provider_with_env("OLLAMA", |_| None),
+            route_for_provider_with_env("OLLAMA", "llama3.2", |_| None),
             TuiRoute::Proxy
         );
         assert_eq!(
-            route_for_provider_with_env("  ollama  ", |_| None),
+            route_for_provider_with_env("  ollama  ", "llama3.2", |_| None),
             TuiRoute::Proxy
         );
         // Any value other than exactly "1" is treated as unset.
         assert_eq!(
-            route_for_provider_with_env("ollama", |_| Some("true".to_string())),
+            route_for_provider_with_env("ollama", "llama3.2", |_| Some("true".to_string())),
             TuiRoute::Proxy
         );
         assert_eq!(
-            route_for_provider_with_env("ollama", |_| Some(String::new())),
+            route_for_provider_with_env("ollama", "llama3.2", |_| Some(String::new())),
             TuiRoute::Proxy
         );
     }
@@ -128,14 +135,33 @@ mod tests {
     #[test]
     fn ollama_is_direct_when_the_opt_in_env_var_is_set_to_1() {
         assert_eq!(
-            route_for_provider_with_env("ollama", |key| {
+            route_for_provider_with_env("ollama", "llama3.2", |key| {
                 (key == "KIM_TUI_OLLAMA_DIRECT").then(|| "1".to_string())
             }),
             TuiRoute::OllamaDirect
         );
         assert_eq!(
-            route_for_provider_with_env("  OLLAMA  ", |_| Some("1".to_string())),
+            route_for_provider_with_env("  OLLAMA  ", "llama3.2", |_| Some("1".to_string())),
             TuiRoute::OllamaDirect
+        );
+    }
+
+    #[test]
+    fn ollama_cloud_tagged_model_never_uses_direct_even_with_the_opt_in() {
+        // The DIRECT route has no Python/OllamaProvider in the loop, so it
+        // can't run the sign-in flow a cloud model needs — always Proxy for
+        // a `-cloud` tagged model regardless of KIM_TUI_OLLAMA_DIRECT.
+        assert_eq!(
+            route_for_provider_with_env("ollama", "qwen3-coder:480b-cloud", |_| Some(
+                "1".to_string()
+            )),
+            TuiRoute::Proxy
+        );
+        assert_eq!(
+            route_for_provider_with_env("ollama", "QWEN3-CODER:480B-CLOUD", |_| Some(
+                "1".to_string()
+            )),
+            TuiRoute::Proxy
         );
     }
 }
