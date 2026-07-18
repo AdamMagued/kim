@@ -7,22 +7,17 @@ single text message, waits for generation to finish, scrapes the response, and
 parses it into the canonical {"type": "tool_call"|"text", ...} format.
 
 Multimodal support:
-    Screenshots from the conversation history are decoded from base64, written
-    to a temporary ``temp_screenshot.png`` file, and uploaded via the site's
-    upload button + Playwright file chooser (or a hidden ``<input type="file">``)
-    BEFORE the text prompt is pasted.  The temp file is cleaned up in a
-    ``finally`` block after the message has been sent.
+    Screenshots are decoded from base64 and pasted via the clipboard (or a
+    hidden ``<input type="file">``) BEFORE the text prompt, per-image.
 
 Text injection:
-    Uses clipboard-paste (``navigator.clipboard.writeText`` + Cmd/Ctrl+V)
-    instead of the deprecated ``document.execCommand('insertText')``, which
-    truncates at newlines in contenteditable editors (ProseMirror, Gemini's
-    rich-textarea, etc.).
+    Clipboard-paste (``navigator.clipboard.writeText`` + Cmd/Ctrl+V), not
+    the deprecated ``document.execCommand('insertText')``, which truncates
+    at newlines in contenteditable editors (ProseMirror, Gemini's textarea).
 
 Popup handling:
-    After uploading an image, a ``_dismiss_popups`` sweep clicks through any
-    one-time consent dialogs (Gemini "I agree" / "Got it" / "Continue") so
-    they don't block the Send button.
+    ``_dismiss_popups`` clicks through one-time consent dialogs (Gemini
+    "I agree" / "Got it" / "Continue") so they don't block Send.
 
 MODES:
     1. Visible (browser_headless: false)  —  Default / first-time setup.
@@ -30,29 +25,13 @@ MODES:
        Session cookies are saved to sessions/chrome_data/ for reuse.
 
     2. Headless (browser_headless: true)  —  Background mode after first login.
-       Kim auto-launches Chromium invisibly via Playwright, reusing the
-       saved session directory.  No browser window appears on screen.
+       Kim auto-launches Chromium invisibly, reusing the saved session dir.
+       Requires a prior visible-mode login so those cookies already exist.
 
-       IMPORTANT: You must have logged in ONCE in visible mode first so
-       the session cookies exist in sessions/chrome_data/.
-
-SETUP (visible mode):
-    Launch Chrome with remote debugging and a persistent profile:
-
-    Windows:
-        chrome.exe --remote-debugging-port=9222 --user-data-dir="<project>/sessions/chrome_data"
-
-    macOS:
-        /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\
-            --remote-debugging-port=9222 --user-data-dir="<project>/sessions/chrome_data"
-
-    Linux:
-        google-chrome --remote-debugging-port=9222 --user-data-dir="<project>/sessions/chrome_data"
-
-    Then navigate to one of:
-        https://claude.ai/new
-        https://chatgpt.com
-        https://gemini.google.com
+SETUP: with browser_auto_launch (default true), Kim opens Chrome with remote
+debugging itself on first use — sign in in that window once. Manual launch
+is only needed with browser_auto_launch: false; see _launch_headed_chrome's
+ConnectionError message for the exact command for your OS.
 """
 from __future__ import annotations
 
@@ -72,13 +51,9 @@ from typing import Optional, TYPE_CHECKING, cast
 
 import httpx
 
-# Playwright is only needed for the CDP fallback path (driving an external
-# Chrome). The primary desktop path is the in-app webview bridge (httpx), which
-# needs no playwright at all. Import it lazily so that selecting a browser
-# provider does not hard-crash with ModuleNotFoundError when playwright isn't
-# installed — the CDP path imports it on demand and degrades to a graceful
-# NEED_HELP if it's missing. Type-only names stay importable for type checkers
-# (annotations are already PEP 563 strings via `from __future__`).
+# Playwright is only needed for the CDP fallback path (the in-app webview
+# bridge path needs no playwright at all); imported lazily below so selecting
+# a browser provider doesn't hard-crash when playwright isn't installed.
 if TYPE_CHECKING:
     from playwright.async_api import Browser, Page, Playwright
 
@@ -91,6 +66,12 @@ from orchestrator.providers.browser.prompt_builder import format_prompt
 from orchestrator.providers.browser.reasoning_effort import apply_effort, resolve_effort
 from orchestrator.providers.browser.response_parser import parse_response, strip_transport_markers
 from orchestrator.providers.browser.session_paths import resolve_session_root
+from orchestrator.providers.browser.turn_timeouts import (
+    PhaseTimeout,
+    phase_timeout_response,
+    phase_timeout_s,
+    run_phase,
+)
 from orchestrator.providers.browser.site_configs import (
     CDP_URL,
     GENERATION_WAIT_S,
@@ -178,12 +159,10 @@ def _normalize_for_marker(text: str) -> str:
     return re.sub(r"[\s`*_]+", "", text or "")
 
 
-# F-B-7: the injected prompt itself contains the literal completion hash inside
-# the "always append the exact string …" instruction, so the echoed USER bubble
-# (which Claude/Grok response selectors also match) contains the sentinel in the
-# MIDDLE of the marker instruction. A verbatim signature of that instruction
-# marks a scraped candidate as the prompt echo rather than the model's answer.
-# (Kept lowercase; compared against the lowercased scrape.)
+# F-B-7: the injected prompt's own "always append the exact string …"
+# instruction contains the literal hash, so an echoed USER bubble (matched by
+# Claude/Grok response selectors too) also contains the sentinel. This
+# verbatim signature marks such a scrape as the prompt echo, not the answer.
 _MARKER_INSTRUCTION_SIGNATURE = "always append the exact string"
 
 # How many normalized trailing chars beyond the sentinel still count as "at the
@@ -712,9 +691,12 @@ class BrowserProvider(BaseProvider):
         # constructor's; when present, playwright is skipped entirely.
         driver = page_driver if page_driver is not None else self._page_driver
 
+        connect_timeout = phase_timeout_s(self._config, "connect")
         try:
             if driver is not None:
-                page, site = await driver.acquire()
+                page, site = await run_phase(
+                    driver.acquire(), phase="connect", timeout_s=connect_timeout, log=logger,
+                )
                 if page is None or site is None:
                     return lost_chat_response()
                 # cast: PageLike stands in for the concrete Page (string form: Page is TYPE_CHECKING-only).
@@ -731,18 +713,22 @@ class BrowserProvider(BaseProvider):
             # below instead of a NameError.
             from playwright.async_api import async_playwright
 
-            async with async_playwright() as pw:
+            async def _acquire_cdp_page(pw) -> tuple:
                 browser = await self._connect(pw)
                 page, site = await self._find_chat_page(browser)
-                if page is None or site is None:
-                    if self._last_chat_site:
-                        logger.warning(
-                            f"Lost reference to {self._last_chat_site} tab "
-                            f"(was at {self._last_chat_page_url!r}). Retrying page scan once…"
-                        )
-                        await asyncio.sleep(1)
-                        page, site = await self._find_chat_page(browser)
+                if (page is None or site is None) and self._last_chat_site:
+                    logger.warning(
+                        f"Lost reference to {self._last_chat_site} tab "
+                        f"(was at {self._last_chat_page_url!r}). Retrying page scan once…"
+                    )
+                    await asyncio.sleep(1)
+                    page, site = await self._find_chat_page(browser)
+                return page, site
 
+            async with async_playwright() as pw:
+                page, site = await run_phase(
+                    _acquire_cdp_page(pw), phase="connect", timeout_s=connect_timeout, log=logger,
+                )
                 if page is None or site is None:
                     return lost_chat_response()
 
@@ -751,6 +737,8 @@ class BrowserProvider(BaseProvider):
                 )
                 self._commit_sent_system_prompt(result, new_sent)
                 return result
+        except PhaseTimeout as e:
+            return self._attach_usage(phase_timeout_response(e), estimated_usage)
         except _DeliveredNoResponse as e:
             # F-B-8: prompt already delivered — return a NEED_HELP that names the
             # thread state (non-retryable, in-band) instead of re-raising a
@@ -1635,23 +1623,24 @@ class BrowserProvider(BaseProvider):
         initial_count = await page.locator(response_sel).count()
         logger.debug(f"Response count before send: {initial_count}")
 
-        await page.keyboard.press("Escape")
-        await asyncio.sleep(0.2)
+        async def _submit() -> None:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.2)
 
-        input_sel = await self._find_selector(page, cfg["input_selectors"])
-        if not input_sel:
-            raise RuntimeError("Could not locate chat input box")
+            input_sel = await self._find_selector(page, cfg["input_selectors"])
+            if not input_sel:
+                raise RuntimeError("Could not locate chat input box")
 
-        await self._inject_text(page, input_sel, message)
-        await asyncio.sleep(0.3)
-        if not await self._verify_injection(page, input_sel, message):
-            raise RuntimeError("Prompt changed after injection; refusing to send a partial prompt")
+            await self._inject_text(page, input_sel, message)
+            await asyncio.sleep(0.3)
+            if not await self._verify_injection(page, input_sel, message):
+                raise RuntimeError("Prompt changed after injection; refusing to send a partial prompt")
 
-        send_sel = await self._find_selector(page, cfg.get("send_selectors", []))
-        if send_sel:
-            await page.locator(send_sel).first.click()
-            logger.debug("Submitted via send button click")
-        else:
+            send_sel = await self._find_selector(page, cfg.get("send_selectors", []))
+            if send_sel:
+                await page.locator(send_sel).first.click()
+                logger.debug("Submitted via send button click")
+                return
             for key in ["Enter", "Meta+Enter", "Control+Enter"]:
                 await page.keyboard.press(key)
                 await asyncio.sleep(0.3)
@@ -1662,6 +1651,15 @@ class BrowserProvider(BaseProvider):
                 except Exception:
                     break
             logger.debug("Submitted via keyboard Enter fallback")
+
+        # F-B-15: bounded so a composer that never renders (auth wall, wrong
+        # tab, dead page) fails fast with a phase-named NEED_HELP instead of
+        # silently burning up to 9 chained ~30s Playwright click timeouts
+        # across _inject_text's 3 retries x 3 fallback strategies.
+        await run_phase(
+            _submit(), phase="submit",
+            timeout_s=phase_timeout_s(self._config, "submit"), site=site, log=logger,
+        )
 
         logger.info(f"[STATUS] Waiting for {site} to respond…")
         logger.info("Message sent, waiting for response…")
