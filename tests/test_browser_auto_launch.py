@@ -7,6 +7,7 @@ instructions. These tests cover the pure/mocked seams — no real browser.
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,7 +16,11 @@ from orchestrator.providers.browser.provider import BrowserProvider
 
 
 def _provider(**bp_cfg):
-    return BrowserProvider({"project_root": ".", "browser_provider": bp_cfg})
+    # Isolate from any REAL ~/.../kim/account.json on the machine running the
+    # tests (FIX 6 threads self._gemini_authuser, loaded from that file, into
+    # gemini URLs).
+    with patch.dict(os.environ, {"KIM_ACCOUNT_PATH": "/nonexistent/kim-account-test-isolation.json"}):
+        return BrowserProvider({"project_root": ".", "browser_provider": bp_cfg})
 
 
 class TestAutoLaunchConfig(unittest.TestCase):

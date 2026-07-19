@@ -9,7 +9,13 @@ use tauri::{Emitter, Listener, Manager};
 
 use crate::*;
 
-pub(crate) const PERSISTENT_BRIDGE_JS: &str = include_str!("bridge.js");
+// FIX 1: bridge_effort.js (the on-page reasoning-effort picker, kept in its
+// own file to avoid growing the already-large bridge.js) is concatenated
+// AFTER bridge.js into one script string. Both run in the same eval'd
+// context, so bridge_effort.js's `window.__kimApplyEffort` is available to
+// bridge.js's send() regardless of bridge.js's own top-level IIFE closure.
+pub(crate) const PERSISTENT_BRIDGE_JS: &str =
+    concat!(include_str!("bridge.js"), include_str!("bridge_effort.js"));
 
 pub(crate) fn open_browser_signin_window_impl(
     url: &str,
@@ -769,6 +775,7 @@ pub(crate) fn run_bridge_completion_once(
     _callback_token: &str,
     completion_hash: Option<&str>,
     model_tier: Option<&str>,
+    effort: Option<&str>,
 ) -> Result<BridgeCompleteResponse, String> {
     let app_config = window.state::<config::AppConfig>();
     let timeout_secs = app_config.bridge_timeout_secs;
@@ -815,11 +822,12 @@ pub(crate) fn run_bridge_completion_once(
     let hash_json = serde_json::to_string(&completion_hash).unwrap_or_else(|_| "null".to_string());
 
     let tier_json = serde_json::to_string(&model_tier).unwrap_or_else(|_| "null".to_string());
+    let effort_json = serde_json::to_string(&effort).unwrap_or_else(|_| "null".to_string());
 
     let bridge_call = format!(
         r#"(() => {{
             if (window.__kimBridge && window.__kimBridge._v >= 2) {{
-                window.__kimBridge.send({prompt}, {req_id}, {site}, {attachments}, null, {hash}, {tier});
+                window.__kimBridge.send({prompt}, {req_id}, {site}, {attachments}, null, {hash}, {tier}, {effort});
             }} else {{
                 // Persistent bridge not installed — signal to fall back
                 document.title = '__KIMBRIDGE_NO_PERSISTENT__';
@@ -831,6 +839,7 @@ pub(crate) fn run_bridge_completion_once(
         attachments = attachments_json,
         hash = hash_json,
         tier = tier_json,
+        effort = effort_json,
     );
 
     agent_debug_log(

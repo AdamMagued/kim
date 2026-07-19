@@ -60,12 +60,19 @@ if TYPE_CHECKING:
 from orchestrator.context_meter import IMAGE_TOKEN_ESTIMATE, estimate_text_tokens
 from orchestrator.providers.base import BaseProvider
 from orchestrator.providers.browser.bridge_client import complete_via_webview_bridge
+from orchestrator.providers.browser.gemini_url import (
+    apply_gemini_authuser,
+    collect_selector_baselines,
+    scrape_slice_start,
+)
 from orchestrator.providers.browser.markdown_scraper import MARKDOWN_SERIALIZER_JS
 from orchestrator.providers.browser.page_driver import PageDriver
+from orchestrator.providers.browser.popup_matching import EXTRA_POPUP_DISMISS_LABELS, dismiss_popup_label
 from orchestrator.providers.browser.prompt_builder import format_prompt
 from orchestrator.providers.browser.reasoning_effort import apply_effort, resolve_effort
 from orchestrator.providers.browser.response_parser import parse_response, strip_transport_markers
 from orchestrator.providers.browser.session_paths import resolve_session_root
+from orchestrator.providers.browser.thinking_probe import build_thinking_probe
 from orchestrator.providers.browser.turn_timeouts import (
     PhaseTimeout,
     phase_timeout_response,
@@ -580,6 +587,10 @@ class BrowserProvider(BaseProvider):
         if self._use_webview_bridge:
             known_tools = {t["name"] for t in (tools or []) if "name" in t}
             capability_repair_attempted = False
+            # FIX 1: apply effort only on the first send of a fresh chat, like
+            # the CDP path's `if not self._sent_system_prompt: apply_effort`
+            # gate below. Retries (capability/contract repair) omit it.
+            effort_for_this_send = self._effort if not sent_sys else None
             result = await complete_via_webview_bridge(
                 bridge_url=self._bridge_url,
                 bridge_token=self._bridge_token,
@@ -592,6 +603,7 @@ class BrowserProvider(BaseProvider):
                 known_tools=known_tools,
                 clear_chat=clear_chat,
                 site_configs=getattr(self, "_site_configs", None),
+                effort=effort_for_this_send,
             )
             if self._needs_chatgpt_capability_repair(
                 result,
@@ -824,9 +836,8 @@ class BrowserProvider(BaseProvider):
             self._last_chat_page_url = page.url
 
         cfg = self._site_configs[site]
-        if not self._sent_system_prompt:
-            await apply_effort(page, site, self._effort, log=logger)
-
+        # FIX 4: apply_effort moved to AFTER _dismiss_popups() below — a
+        # first-load consent overlay could sit on top of the picker trigger.
         image_attachments = [
             a for a in attachments
             if str(a.get("mime_type", "")).startswith("image/") and a.get("data_base64")
@@ -876,6 +887,9 @@ class BrowserProvider(BaseProvider):
 
         logger.info(f"[STATUS] Preparing {site}…")
         await self._dismiss_popups(page)
+
+        if not self._sent_system_prompt:
+            await apply_effort(page, site, self._effort, log=logger)
 
         logger.info(f"[STATUS] Sending message to {site}…")
         raw_response = await self._send_and_wait(page, cfg, prompt, site, completion_hash)
@@ -995,6 +1009,12 @@ class BrowserProvider(BaseProvider):
                     return found
         return None
 
+    def _apply_gemini_authuser(self, site: str, url: str) -> str:
+        """FIX 6 (gemini_url.py): thread self._gemini_authuser into a gemini
+        URL on the CDP path (the webview-bridge path already forwards it via
+        bridge_client's payload)."""
+        return apply_gemini_authuser(site, url, self._gemini_authuser)
+
     def _fresh_chat_url(self, site: str) -> Optional[str]:
         """URL that opens a NEW conversation on ``site`` (the site root).
 
@@ -1003,7 +1023,7 @@ class BrowserProvider(BaseProvider):
         an in-progress conversation lives at a permalink that survives reloads.
         """
         pattern = str(self._site_configs.get(site, {}).get("url_pattern") or "").strip()
-        return f"https://{pattern}/" if pattern else None
+        return None if not pattern else self._apply_gemini_authuser(site, f"https://{pattern}/")
 
     def _site_launch_url(self) -> Optional[str]:
         """Full URL to open on auto-launch so the user lands on the AI chat
@@ -1015,7 +1035,7 @@ class BrowserProvider(BaseProvider):
         if not key:
             return None
         pattern = str(self._site_configs[key].get("url_pattern") or "").strip()
-        return f"https://{pattern}/" if pattern else None
+        return None if not pattern else self._apply_gemini_authuser(key, f"https://{pattern}/")
 
     async def _launch_headed_chrome(
         self, pw: Playwright, port: int
@@ -1349,23 +1369,14 @@ class BrowserProvider(BaseProvider):
             except Exception:
                 break
         logger.debug("Escape-key sweep complete (3 presses)")
-        for label in _POPUP_DISMISS_LABELS:
+        # FIX 5 (popup_matching.py): word-boundary-safe label match instead of
+        # an XPath substring `contains()`, which could not distinguish a
+        # standalone "Continue" from "Continue generating".
+        for label in list(_POPUP_DISMISS_LABELS) + EXTRA_POPUP_DISMISS_LABELS:
             try:
-                btn = page.locator(
-                    f"xpath=//button[contains(translate(., "
-                    f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-                    f"'abcdefghijklmnopqrstuvwxyz'), "
-                    f"'{label.lower()}')]"
-                )
-                if await btn.count() > 0:
-                    first = btn.first
-                    try:
-                        await first.wait_for(state="visible", timeout=1500)
-                        await first.click()
-                        logger.info(f"Dismissed popup button: {label!r}")
-                        await asyncio.sleep(0.5)
-                    except Exception:
-                        pass
+                if await dismiss_popup_label(page, label):
+                    logger.info(f"Dismissed popup button: {label!r}")
+                    await asyncio.sleep(0.5)
             except Exception as e:
                 logger.debug(f"Popup check for {label!r} failed: {e}")
                 continue
@@ -1623,6 +1634,11 @@ class BrowserProvider(BaseProvider):
         initial_count = await page.locator(response_sel).count()
         logger.debug(f"Response count before send: {initial_count}")
 
+        # FIX 2 (gemini_url.collect_selector_baselines): per-selector baseline.
+        selector_baselines = await collect_selector_baselines(
+            page, cfg["response_selectors"], response_sel, initial_count
+        )
+
         async def _submit() -> None:
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.2)
@@ -1668,14 +1684,20 @@ class BrowserProvider(BaseProvider):
             page, response_sel, initial_count
         )
         if not started:
+            # FIX 3 (thinking_probe.py): a slow-reasoning model (e.g. DeepSeek
+            # R1) may still be visibly working — extend the wait instead of
+            # failing fast.
+            if await self._model_still_thinking(page, cfg):
+                logger.info(f"[STATUS] {site} still appears to be reasoning — extending wait…")
+                started = await self._wait_for_new_response(
+                    page, response_sel, initial_count, timeout_s=GENERATION_WAIT_S
+                )
+        if not started:
             # F-B-8: the prompt was already injected + submitted above, so this
             # timeout is POST-delivery. Signal a non-retryable delivered state
             # instead of a retryable TimeoutError, so the agent does not re-send
             # the same content (with a new hash) into the same live thread.
             raise _DeliveredNoResponse(site, RESPONSE_WAIT_S)
-
-        new_count = await page.locator(response_sel).count()
-        new_element_index = max(new_count - 1, 0)
 
         logger.info(f"[STATUS] {site} is responding…")
 
@@ -1685,7 +1707,7 @@ class BrowserProvider(BaseProvider):
             cfg["response_selectors"],
             completion_hash,
             site,
-            min_index=new_element_index
+            min_index=selector_baselines,
         )
 
         # The sentinel is only emitted after the full response has rendered, so
@@ -1695,8 +1717,17 @@ class BrowserProvider(BaseProvider):
 
         logger.info(f"[STATUS] Reading {site}'s response…")
         return await self._scrape_last_response(
-            page, cfg["response_selectors"], min_index=new_element_index, as_markdown=True
+            page, cfg["response_selectors"], min_index=selector_baselines, as_markdown=True
         )
+
+    async def _model_still_thinking(self, page: Page, cfg: dict) -> bool:
+        """FIX 3 (thinking_probe.py): best-effort "still actively reasoning"
+        probe used by _send_and_wait before it gives up waiting for a
+        response to even start. Never raises — reuses _find_selector's own
+        per-selector try/except.
+        """
+        probe = build_thinking_probe(cfg.get("stop_selectors"))
+        return bool(await self._find_selector(page, probe))
 
     @staticmethod
     async def _safe_page_title(page) -> str:
@@ -1734,7 +1765,8 @@ class BrowserProvider(BaseProvider):
         return None
 
     async def _wait_for_new_response(
-        self, page: Page, response_sel: str, initial_count: int
+        self, page: Page, response_sel: str, initial_count: int,
+        timeout_s: Optional[float] = None,
     ) -> bool:
         # Snapshot the last pre-send response element: some sites (and reused
         # threads) stream the new answer INTO an existing element instead of
@@ -1749,7 +1781,9 @@ class BrowserProvider(BaseProvider):
             except Exception:
                 pass
 
-        deadline = asyncio.get_running_loop().time() + RESPONSE_WAIT_S
+        deadline = asyncio.get_running_loop().time() + (
+            RESPONSE_WAIT_S if timeout_s is None else timeout_s
+        )
         while asyncio.get_running_loop().time() < deadline:
             count = await page.locator(response_sel).count()
             if count > initial_count:
@@ -1775,7 +1809,8 @@ class BrowserProvider(BaseProvider):
 
     async def _wait_for_generation_complete(
         self, page: Page, stop_selectors: list[str], response_selectors: list[str],
-        completion_hash: Optional[str], site: str = "AI", min_index: int = 0,
+        completion_hash: Optional[str], site: str = "AI",
+        min_index: "int | dict[str, int]" = 0,
         min_generation_s: float = 5.0,
     ) -> bool:
         """Wait until the site finishes generating.
@@ -1783,6 +1818,9 @@ class BrowserProvider(BaseProvider):
         Returns True when the completion sentinel was found (definitive — the
         response is fully rendered), False when we fell back to the idle/stop
         heuristics or timed out (caller should allow extra settle time).
+
+        min_index: forwarded to _scrape_last_response as-is (FIX 2: int or a
+        per-selector {selector: baseline_count} dict).
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + GENERATION_WAIT_S
@@ -1914,13 +1952,20 @@ class BrowserProvider(BaseProvider):
         self,
         page: Page,
         response_selectors: list[str],
-        min_index: int = 0,
+        min_index: "int | dict[str, int]" = 0,
         as_markdown: bool = False,
     ) -> str:
+        # FIX 2 (gemini_url.scrape_slice_start): min_index may be a
+        # per-selector {selector: baseline_count} dict, not just a single int
+        # applied uniformly to every selector's own element array — see
+        # scrape_slice_start's docstring for why that used to be wrong.
         for sel in response_selectors:
             try:
                 elements = await page.locator(sel).all()
-                candidates = elements[min_index:] if min_index < len(elements) else []
+                baseline = min_index.get(sel, 0) if isinstance(min_index, dict) else int(min_index)
+                cur_len = len(elements)
+                idx = scrape_slice_start(cur_len, baseline)
+                candidates = elements[idx:] if idx < cur_len else []
                 for el in reversed(candidates):
                     text = None
                     if as_markdown:

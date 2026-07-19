@@ -76,6 +76,7 @@ async def complete_via_webview_bridge(
     known_tools: Optional[set[str]] = None,
     clear_chat: bool = False,
     site_configs: Optional[dict] = None,
+    effort: Optional[str] = None,
 ) -> dict:
     """Run completion through Kim desktop's in-app webview bridge."""
     if not bridge_url or not bridge_token:
@@ -84,16 +85,22 @@ async def complete_via_webview_bridge(
             "content": "NEED_HELP: In-app browser bridge is not configured.",
         }
 
-    site = preferred_site or "claude"
     known_sites = site_configs or SITE_CONFIGS
+    # The browser:claude site was removed from SITE_CONFIGS entirely (feat/
+    # kimcli-61) — "claude" is no longer a fallback candidate on the Python
+    # side. Default to the first known site (chatgpt, ordered first in
+    # SITE_CONFIGS) instead, so a missing preferred_site doesn't route
+    # through a site Kim's own config no longer recognizes.
+    _default_site = "chatgpt" if "chatgpt" in known_sites else next(iter(known_sites), "chatgpt")
+    site = preferred_site or _default_site
     if site not in known_sites:
         # L5: never silently reroute an unknown/typo'd preferred_site — the
         # user asked for one provider and would get another with no notice.
         logger.warning(
-            "Unknown preferred_site %r (known: %s) — falling back to claude.",
-            site, ", ".join(sorted(known_sites)),
+            "Unknown preferred_site %r (known: %s) — falling back to %s.",
+            site, ", ".join(sorted(known_sites)), _default_site,
         )
-        site = "claude"
+        site = _default_site
 
     bridge_attachments: list[dict] = []
     max_attachments = 8
@@ -134,6 +141,10 @@ async def complete_via_webview_bridge(
     }
     if model_tier:
         payload["model_tier"] = model_tier
+    if effort:
+        # FIX 1: forwarded to Rust's /v1/send, which threads it through to
+        # bridge.js's on-page effort picker (see bridge_effort.js).
+        payload["effort"] = effort
 
     if site == "gemini" and gemini_authuser is not None:
         payload["authuser"] = gemini_authuser

@@ -45,6 +45,88 @@ class _BridgeClient:
         )
 
 
+class _CapturingBridgeClient:
+    """Same happy-path responses as _BridgeClient, but records every POST
+    payload so tests can inspect exactly what was sent to /v1/send."""
+
+    sent_payloads: list = []
+
+    def __init__(self, *, legacy=False, **_kwargs):
+        self.legacy = legacy
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def post(self, url, **kwargs):
+        if url.endswith("/v1/send"):
+            _CapturingBridgeClient.sent_payloads.append(kwargs.get("json"))
+            return _BridgeResponse(200, {"req_id": "req-1", "sent_confirmed": True})
+        return _BridgeResponse(
+            200,
+            {"ok": True, "response": 'TASK_COMPLETE: example {"tool":"fake","args":{}}'},
+        )
+
+    async def get(self, _url, **_kwargs):
+        return _BridgeResponse(
+            200,
+            {"ok": True, "response": 'TASK_COMPLETE: example {"tool":"fake","args":{}}'},
+        )
+
+
+class TestWebviewBridgeEffortPayload(unittest.IsolatedAsyncioTestCase):
+    """FIX 1: resolve_effort()'s result must reach the Rust bridge's
+    /v1/send payload, not be computed and discarded."""
+
+    async def _send(self, **overrides):
+        from orchestrator.providers.browser.bridge_client import (
+            complete_via_webview_bridge,
+        )
+
+        _CapturingBridgeClient.sent_payloads = []
+        kwargs = dict(
+            bridge_url="http://bridge",
+            bridge_token="token",
+            preferred_site="chatgpt",
+            model_tier=None,
+            gemini_authuser=None,
+            prompt="prompt",
+            attachments=[],
+            completion_hash="",
+        )
+        kwargs.update(overrides)
+        with patch(
+            "orchestrator.providers.browser.bridge_client.httpx.AsyncClient",
+            _CapturingBridgeClient,
+        ):
+            await complete_via_webview_bridge(**kwargs)
+        return _CapturingBridgeClient.sent_payloads
+
+    async def test_effort_included_in_send_payload(self):
+        payloads = await self._send(effort="high")
+        assert len(payloads) == 1
+        assert payloads[0]["effort"] == "high"
+
+    async def test_no_effort_key_when_none(self):
+        payloads = await self._send(effort=None)
+        assert len(payloads) == 1
+        assert "effort" not in payloads[0]
+
+    async def test_default_site_is_chatgpt_not_claude_when_unset(self):
+        # bridge_client used to default a missing/unknown preferred_site to
+        # "claude" — but browser:claude was removed from Python's own
+        # SITE_CONFIGS, so that fallback pointed at a site Kim's config no
+        # longer recognizes.
+        payloads = await self._send(preferred_site=None)
+        assert payloads[0]["site"] == "chatgpt"
+
+    async def test_unknown_preferred_site_falls_back_to_chatgpt_not_claude(self):
+        payloads = await self._send(preferred_site="not-a-real-site")
+        assert payloads[0]["site"] == "chatgpt"
+
+
 class TestWebviewBridgeToolGuard(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_tool_json_remains_text(self):
         from orchestrator.providers.browser.bridge_client import (

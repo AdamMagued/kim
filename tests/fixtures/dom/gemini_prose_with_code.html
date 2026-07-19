@@ -1,0 +1,29 @@
+<!-- Synthesized Gemini response DOM: an ORDINARY prose reply that happens to
+     contain a code block, buried in the real app's Angular nesting (same
+     single-child wrapper chain as gemini_text_response.html /
+     gemini_tool_call.html: model-response > response-container > ... >
+     message-content > div.markdown). Unlike gemini_tool_call.html, this is
+     NOT a tool call — it's the FIX 7 regression case: before the markdown
+     serializer descended through the single-child wrapper chain, this
+     flattened straight to el.innerText and the ```python fence around the
+     <pre> block was silently dropped.
+     __COMPLETION_HASH__ is replaced with the live per-turn sentinel by the test. -->
+<model-response class="ng-star-inserted">
+<div class="response-container ng-star-inserted">
+<div class="response-container-content">
+<div class="presented-response-container">
+<div class="response-content">
+<message-content class="model-response-text ng-star-inserted">
+<div class="markdown markdown-main-panel" dir="ltr">
+<p data-sourcepos="1:1-1:52">TASK_COMPLETE: Here is the paddle clamp helper:</p>
+<pre data-sourcepos="3:1-6:3"><div class="code-block"><div class="code-block-decoration header-formatted gds-title-s"><span>python</span><button class="copy-button" aria-label="Copy code">content_copy</button></div><div class="formatted-code-block-internal-container"><code class="code-container formatted" role="text">def clamp(y):
+    return max(0, min(y, HEIGHT - PADDLE_H))</code></div></div></pre>
+<p data-sourcepos="8:1-8:60">Call it every frame before drawing the paddle.</p>
+<p data-sourcepos="10:1-10:30"><code>__COMPLETION_HASH__</code></p>
+</div>
+</message-content>
+</div>
+</div>
+</div>
+</div>
+</model-response>

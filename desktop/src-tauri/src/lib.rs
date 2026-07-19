@@ -102,6 +102,11 @@ struct BridgeCompleteRequest {
     /// Optional model tier (e.g. "fast", "pro", "thinking") requested by the user.
     #[serde(default)]
     model_tier: Option<String>,
+    /// FIX 1 (K-EFFORT via webview bridge): requested reasoning effort
+    /// ("low"/"medium"/"high"), forwarded to bridge.js's on-page effort
+    /// picker (see bridge_effort.js). None means "leave the site default".
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -544,7 +544,7 @@
   };
 
   // ── Main send function ───────────────────────────────────────────────
-  const send = async (prompt, reqId, site, attachments, callbackUrl, completionHash, modelTier) => {
+  const send = async (prompt, reqId, site, attachments, callbackUrl, completionHash, modelTier, effort) => {
     window.__kimModelTier = modelTier;
     const siteKey = SITE_CONFIGS[site] ? site : 'claude';
     const cfg = SITE_CONFIGS[siteKey];
@@ -745,6 +745,15 @@
         };
         await selectGeminiPro();
         }
+      }
+
+      // FIX 1 (K-EFFORT via webview bridge): best-effort on-page reasoning-
+      // effort picker for chatgpt/gemini/deepseek. Defined in bridge_effort.js
+      // (concatenated after this file into one injected script — see
+      // PERSISTENT_BRIDGE_JS). Never throws; absence of the function (a
+      // stale cached script) is a no-op.
+      if (effort && typeof window.__kimApplyEffort === 'function') {
+        try { await window.__kimApplyEffort(siteKey, effort); } catch (_) {}
       }
 
       // 1. Find input (use shadow-DOM-aware finder for Gemini)

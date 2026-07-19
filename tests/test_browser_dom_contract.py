@@ -193,7 +193,9 @@ def find_first(root: _Node, tag: str) -> Optional[_Node]:
 
 # ---------------------------------------------------------------------------
 # Python mirror of provider._MARKDOWN_SERIALIZER_JS (same algorithm over the
-# parsed DOM: top-level element children; PRE -> ```lang fence from the code's
+# parsed DOM: descend through single-child wrapper chains (FIX 7 — Gemini's
+# Angular nesting) to the level where fenced code blocks are actual direct
+# siblings of paragraph text; PRE -> ```lang fence from the code's
 # language- class or the header div's first line; else innerText).
 # ---------------------------------------------------------------------------
 
@@ -202,7 +204,19 @@ _HDR_LANG_RE = re.compile(r"^[a-z0-9+#.-]{1,15}$")
 
 
 def serialize_markdown(el: _Node) -> str:
-    kids = [c for c in el.children if isinstance(c, _Node)]
+    root = el
+    for _guard in range(20):
+        root_kids = [c for c in root.children if isinstance(c, _Node)]
+        if len(root_kids) != 1:
+            break
+        only = root_kids[0]
+        if only.tag == "pre":
+            break
+        only_kids = [c for c in only.children if isinstance(c, _Node)]
+        if not only_kids:
+            break
+        root = only
+    kids = [c for c in root.children if isinstance(c, _Node)]
     if not kids:
         return inner_text(el)
     parts = []
@@ -443,6 +457,9 @@ class _DomContractCase(unittest.IsolatedAsyncioTestCase):
         self._env.start()
         for key in _ENV_KEYS:
             os.environ.pop(key, None)
+        # FIX 6: isolate from any REAL ~/.../kim/account.json on the machine
+        # running the tests (self._gemini_authuser is loaded from it).
+        os.environ["KIM_ACCOUNT_PATH"] = "/nonexistent/kim-account-test-isolation.json"
 
     def tearDown(self):
         self._env.stop()
@@ -564,9 +581,13 @@ class TestGeminiFixtures(_DomContractCase):
         self.assertNotRegex(result["content"], _HASH_RE)
 
     async def test_tool_call_survives_as_bare_json_when_fences_flatten(self):
-        # model-response's only element child is a container div, so the
-        # serializer flattens to innerText — the tool call must still parse
-        # via the balanced-brace bare-JSON scan gated by known_tools.
+        # Regardless of whether the serializer reconstructs a ```json fence
+        # around this PRE block (FIX 7 now descends through model-response's
+        # single-child wrapper chain, so it does) or flattens to innerText,
+        # the non-greedy fenced-JSON regex can't span the tool call's nested
+        # {"args": {...}} braces and falls through to the balanced-brace
+        # bare-JSON scan — so the tool call must survive via THAT path
+        # either way, gated by known_tools.
         page = FakeChatPage("gemini", load_fixture("gemini_tool_call.html"))
         result = await self._complete(self._provider(), page_driver=FakePageDriver(page))
 
@@ -574,6 +595,40 @@ class TestGeminiFixtures(_DomContractCase):
         self.assertEqual(result["tool"], "click_ui")
         self.assertEqual(result["args"], {"element_id": 4, "double": False})
         self.assertIn("STEP 2", result.get("content", ""))
+
+    async def test_prose_reply_keeps_code_fence(self):
+        # FIX 7: gemini_prose_with_code.html is an ORDINARY prose answer (not
+        # a tool call) with a code block nested the same number of Angular
+        # wrapper layers deep as gemini_tool_call.html / gemini_text_response
+        # html. Before the markdown-serializer descent fix, this flattened to
+        # plain innerText and the ```python fence around the <pre> block was
+        # silently dropped — exactly the audit finding (fixture comment in
+        # gemini_tool_call.html) this fix addresses.
+        page = FakeChatPage("gemini", load_fixture("gemini_prose_with_code.html"))
+        result = await self._complete(self._provider(), page_driver=FakePageDriver(page))
+
+        self.assertEqual(result["type"], "text")
+        self.assertIn("```python", result["content"])
+        self.assertIn("def clamp(y):", result["content"])
+        self.assertIn("return max(0, min(y, HEIGHT - PADDLE_H))", result["content"])
+        self.assertIn("```", result["content"])
+        self.assertIn("Call it every frame before drawing the paddle.", result["content"])
+
+    def test_serializer_mirror_descends_wrapper_chain_for_prose_with_code(self):
+        # Guard the mirror itself against the fixture's nested DOM.
+        root = parse_html(load_fixture("gemini_prose_with_code.html"))
+        md = serialize_markdown(root)
+        self.assertIn("```python\ndef clamp(y):", md)
+        self.assertIn("return max(0, min(y, HEIGHT - PADDLE_H))\n```", md)
+
+    def test_serializer_mirror_unaffected_for_flat_chatgpt_root(self):
+        # Regression guard for FIX 7: ChatGPT's response root already has
+        # multiple direct children (p, pre, p) — the new descent loop must
+        # not touch it (it only descends single-child wrapper chains).
+        root = parse_html(load_fixture("chatgpt_tool_call.html"))
+        md = serialize_markdown(root)
+        self.assertIn("```json\n{\n", md)
+        self.assertTrue(md.startswith("STEP 1:"))
 
 
 class TestDriverSeam(_DomContractCase):

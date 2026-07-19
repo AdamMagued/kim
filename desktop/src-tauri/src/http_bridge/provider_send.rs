@@ -247,6 +247,7 @@ pub(super) fn complete(mut request: Request, app_handle: tauri::AppHandle, token
         token.as_str(),
         parsed.completion_hash.as_deref(),
         parsed.model_tier.as_deref(),
+        parsed.effort.as_deref(),
     );
 
     let needs_nav_retry = match &completion {
@@ -454,11 +455,12 @@ pub(super) fn send(mut request: Request, app_handle: tauri::AppHandle) {
         serde_json::to_string(&parsed.completion_hash).unwrap_or_else(|_| "null".to_string());
     let tier_json =
         serde_json::to_string(&parsed.model_tier).unwrap_or_else(|_| "null".to_string());
+    let effort_json = serde_json::to_string(&parsed.effort).unwrap_or_else(|_| "null".to_string());
 
     let bridge_call = format!(
         r#"(() => {{
             if (window.__kimBridge && window.__kimBridge._v >= 2) {{
-                window.__kimBridge.send({prompt}, {req_id}, {site}, {attachments}, null, {hash}, {tier});
+                window.__kimBridge.send({prompt}, {req_id}, {site}, {attachments}, null, {hash}, {tier}, {effort});
             }} else {{
                 document.title = '__KIMBRIDGE_NO_PERSISTENT__';
             }}
@@ -469,6 +471,7 @@ pub(super) fn send(mut request: Request, app_handle: tauri::AppHandle) {
         attachments = attachments_json,
         hash = hash_json,
         tier = tier_json,
+        effort = effort_json,
     );
 
     // An image (screenshot) is pasted into the chat with a REAL Cmd+V
