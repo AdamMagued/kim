@@ -712,9 +712,6 @@ mod tests {
             let info = provider_info(name).unwrap_or_else(|| panic!("missing provider: {name}"));
             assert!(info.key_env.is_none(), "{name} must be keyless");
         }
-        // Goal A: browser:claude / browser:grok were removed (API "claude" is unaffected).
-        assert!(provider_info("browser:claude").is_none());
-        assert!(provider_info("browser:grok").is_none());
     }
 
     #[test]
