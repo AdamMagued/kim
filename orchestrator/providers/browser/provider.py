@@ -60,7 +60,8 @@ if TYPE_CHECKING:
 from orchestrator.context_meter import IMAGE_TOKEN_ESTIMATE, estimate_text_tokens
 from orchestrator.providers.base import BaseProvider
 from orchestrator.providers.browser.bridge_client import complete_via_webview_bridge
-from orchestrator.providers.browser.gemini_url import apply_gemini_authuser, collect_selector_baselines, response_candidates
+from orchestrator.providers.browser.gemini_url import apply_gemini_authuser, response_candidates
+from orchestrator.providers.browser.gemini_url import collect_selector_baselines
 from orchestrator.providers.browser.markdown_scraper import MARKDOWN_SERIALIZER_JS
 from orchestrator.providers.browser.page_driver import PageDriver
 from orchestrator.providers.browser.popup_matching import EXTRA_POPUP_DISMISS_LABELS, dismiss_popup_label
@@ -1616,8 +1617,7 @@ class BrowserProvider(BaseProvider):
             response_sel = cfg["response_selectors"][0]
         initial_count = await page.locator(response_sel).count()
         logger.debug(f"Response count before send: {initial_count}")
-
-        selector_baselines = await collect_selector_baselines(page, cfg["response_selectors"], response_sel, initial_count)  # FIX 2
+        base_counts = await collect_selector_baselines(page, cfg["response_selectors"], response_sel, initial_count)
 
         async def _submit() -> None:
             await page.keyboard.press("Escape")
@@ -1681,7 +1681,7 @@ class BrowserProvider(BaseProvider):
             cfg["response_selectors"],
             completion_hash,
             site,
-            min_index=selector_baselines,
+            min_index=base_counts,
         )
 
         # The sentinel is only emitted after the full response has rendered, so
@@ -1691,7 +1691,7 @@ class BrowserProvider(BaseProvider):
 
         logger.info(f"[STATUS] Reading {site}'s response…")
         return await self._scrape_last_response(
-            page, cfg["response_selectors"], min_index=selector_baselines, as_markdown=True
+            page, cfg["response_selectors"], min_index=base_counts, as_markdown=True
         )
 
     async def _model_still_thinking(self, page: Page, cfg: dict) -> bool:  # FIX 3: still-reasoning probe.
