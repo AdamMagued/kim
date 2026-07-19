@@ -326,7 +326,7 @@ mod tests {
             "",
             "browser",
             "browser:chatgpt",
-            "BROWSER:Claude",
+            "BROWSER:Gemini",
         ] {
             assert!(
                 code_mode_denied_reason(ok).is_none(),

@@ -814,7 +814,7 @@ async fn session_browser_url_commit(
         .map(normalize_site)
         .filter(|s| !s.is_empty())
         .or_else(|| browser_url_site(&current_url))
-        .unwrap_or_else(|| "claude".to_string());
+        .unwrap_or_else(|| "chatgpt".to_string());
 
     if browser_url_is_bad_for_commit(&current_url, &site) {
         // Preserve good previous metadata. Generic homes, login pages, and
@@ -872,7 +872,7 @@ async fn restore_browser_for_session(
         .map(normalize_site)
         .filter(|s| !s.is_empty())
         .or(meta.browser_last_site.clone())
-        .unwrap_or_else(|| "claude".to_string());
+        .unwrap_or_else(|| "chatgpt".to_string());
 
     let mut restored = false;
     let mut reason = "fallback_home".to_string();
@@ -1328,47 +1328,22 @@ mod tests {
 
     #[test]
     fn normalize_site_default() {
-        // Empty string falls back to "claude".
-        assert_eq!(normalize_site(""), "claude");
+        // Empty string falls back to "chatgpt" (default browser site).
+        assert_eq!(normalize_site(""), "chatgpt");
         // Aliases: openai and gpt both map to chatgpt.
         assert_eq!(normalize_site("openai"), "chatgpt");
         assert_eq!(normalize_site("gpt"), "chatgpt");
         // Alias: google maps to gemini.
         assert_eq!(normalize_site("google"), "gemini");
         // Canonical names pass through unchanged.
-        assert_eq!(normalize_site("claude"), "claude");
         assert_eq!(normalize_site("chatgpt"), "chatgpt");
         assert_eq!(normalize_site("gemini"), "gemini");
         assert_eq!(normalize_site("deepseek"), "deepseek");
-        assert_eq!(normalize_site("grok"), "grok");
     }
 
     // -----------------------------------------------------------------------
     // host_matches_site regression guards
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn host_matches_site_grok_excludes_xcom() {
-        // x.com is Twitter's root domain — must NOT match grok (#9).
-        assert!(
-            !host_matches_site("x.com", "grok"),
-            "x.com must not match grok"
-        );
-        // www. prefix should be stripped, still not match.
-        assert!(
-            !host_matches_site("www.x.com", "grok"),
-            "www.x.com must not match grok"
-        );
-        // Canonical Grok hosts must match.
-        assert!(
-            host_matches_site("grok.com", "grok"),
-            "grok.com must match grok"
-        );
-        assert!(
-            host_matches_site("grok.x.com", "grok"),
-            "grok.x.com must match grok"
-        );
-    }
 
     #[test]
     fn host_matches_site_others() {
@@ -1379,11 +1354,12 @@ mod tests {
         assert!(host_matches_site("gemini.google.com", "gemini"));
         // DeepSeek canonical host.
         assert!(host_matches_site("chat.deepseek.com", "deepseek"));
-        // Claude canonical host.
-        assert!(host_matches_site("claude.ai", "claude"));
         // Aliases resolve correctly through host_matches_site (openai alias).
         assert!(host_matches_site("chatgpt.com", "openai"));
-        // www. prefix stripping works for claude.
-        assert!(host_matches_site("www.claude.ai", "claude"));
+        // www. prefix stripping works.
+        assert!(host_matches_site("www.chatgpt.com", "chatgpt"));
+        // Removed browser sites no longer match any host.
+        assert!(!host_matches_site("claude.ai", "claude"));
+        assert!(!host_matches_site("grok.com", "grok"));
     }
 }

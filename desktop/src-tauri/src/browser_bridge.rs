@@ -915,7 +915,7 @@ mod title_pull_tests {
             ok: true,
             response: Some(response.to_string()),
             error: None,
-            site: Some("claude".to_string()),
+            site: Some("chatgpt".to_string()),
             attachments_uploaded: None,
         }
     }
@@ -947,7 +947,7 @@ mod title_pull_tests {
         assert!(decode_title_pull_payload("r-1-7", "r-1-7|__KIMBRIDGE_NONE__").is_none());
         assert!(decode_title_pull_payload("r-1-7", "r-1-7|not base64!!").is_none());
         // Normal page titles (no stamp at all).
-        assert!(decode_title_pull_payload("r-1-7", "Claude").is_none());
+        assert!(decode_title_pull_payload("r-1-7", "ChatGPT").is_none());
         assert!(decode_title_pull_payload("r-1-7", "Gemini - Google").is_none());
         assert!(decode_title_pull_payload("r-1-7", "").is_none());
     }
@@ -990,7 +990,7 @@ mod gc_sweep_tests {
             ok: true,
             response: Some("hi".to_string()),
             error: None,
-            site: Some("claude".to_string()),
+            site: Some("chatgpt".to_string()),
             attachments_uploaded: None,
         }
     }

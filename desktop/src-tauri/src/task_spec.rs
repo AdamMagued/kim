@@ -175,8 +175,8 @@ pub fn run_id_for_session(session_id: &str) -> String {
 
 /// Normalize the caller's provider choice.
 ///
-/// In Code-tab (codex) mode, bare "gemini"/"claude"/"chatgpt"/… have no direct
-/// API-key path in Kim — promote them to `browser:<name>` so they route
+/// In Code-tab (codex) mode, bare "gemini"/"chatgpt"/"deepseek-browser" have no
+/// direct API-key path in Kim — promote them to `browser:<name>` so they route
 /// through the browser bridge automatically.
 pub fn promote_provider(raw: Option<String>, default: &str, is_codex: bool) -> String {
     let raw = raw
@@ -187,9 +187,7 @@ pub fn promote_provider(raw: Option<String>, default: &str, is_codex: bool) -> S
     }
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
-        "gemini" | "claude" | "chatgpt" | "grok" | "deepseek-browser"
-            if !raw.starts_with("browser:") =>
-        {
+        "gemini" | "chatgpt" | "deepseek-browser" if !raw.starts_with("browser:") => {
             format!("browser:{}", lower)
         }
         _ => raw,
@@ -395,7 +393,7 @@ mod tests {
 
     #[test]
     fn promote_provider_codex_promotes_bare_browser_names() {
-        for name in ["gemini", "claude", "chatgpt", "grok", "deepseek-browser"] {
+        for name in ["gemini", "chatgpt", "deepseek-browser"] {
             assert_eq!(
                 promote_provider(Some(name.to_string()), "ollama", true),
                 format!("browser:{name}")

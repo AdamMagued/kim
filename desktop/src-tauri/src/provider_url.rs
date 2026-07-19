@@ -6,27 +6,22 @@ use std::path::Path;
 
 pub(crate) fn normalize_site(site: &str) -> String {
     match site.trim().to_lowercase().as_str() {
-        "claude" | "claude.ai" => "claude".to_string(),
         "chatgpt" | "openai" | "gpt" => "chatgpt".to_string(),
         "gemini" | "google" => "gemini".to_string(),
         "deepseek" | "deepseek-browser" => "deepseek".to_string(),
-        "grok" => "grok".to_string(),
         other if !other.is_empty() => other.to_string(),
-        _ => "claude".to_string(),
+        _ => "chatgpt".to_string(),
     }
 }
 
 pub(crate) fn host_matches_site(host: &str, site: &str) -> bool {
     let host = host.trim().trim_start_matches("www.").to_ascii_lowercase();
     match normalize_site(site).as_str() {
-        "claude" => host == "claude.ai" || host.ends_with(".claude.ai"),
         "chatgpt" => {
             host == "chatgpt.com" || host == "chat.openai.com" || host.ends_with(".chatgpt.com")
         }
         "gemini" => host == "gemini.google.com",
         "deepseek" => host == "chat.deepseek.com" || host.ends_with(".deepseek.com"),
-        // x.com is Twitter's root domain, not Grok (#9).
-        "grok" => host == "grok.com" || host == "grok.x.com",
         _ => false,
     }
 }
@@ -34,7 +29,7 @@ pub(crate) fn host_matches_site(host: &str, site: &str) -> bool {
 pub(crate) fn browser_url_site(url: &str) -> Option<String> {
     let parsed = tauri::Url::parse(url).ok()?;
     let host = parsed.host_str()?.to_ascii_lowercase();
-    for site in ["claude", "chatgpt", "gemini", "deepseek", "grok"] {
+    for site in ["chatgpt", "gemini", "deepseek"] {
         if host_matches_site(&host, site) {
             return Some(site.to_string());
         }
@@ -74,14 +69,12 @@ pub(crate) fn browser_url_is_bad_for_commit(url: &str, site: &str) -> bool {
     let normalized = lower.trim_end_matches('/');
     let site_norm = normalize_site(site);
     match site_norm.as_str() {
-        "claude" => normalized == "https://claude.ai" || normalized == "https://claude.ai/new",
         "chatgpt" => normalized == "https://chatgpt.com" || normalized == "https://chat.openai.com",
         "gemini" => {
             normalized == "https://gemini.google.com"
                 || normalized == "https://gemini.google.com/app"
         }
         "deepseek" => normalized == "https://chat.deepseek.com",
-        "grok" => normalized == "https://grok.com" || normalized == "https://grok.x.com",
         _ => true,
     }
 }
@@ -100,10 +93,8 @@ pub(crate) fn last_llm_provider_allowed(p: &str) -> bool {
     matches!(
         p,
         "browser"
-            | "browser:claude"
             | "browser:chatgpt"
             | "browser:gemini"
-            | "browser:grok"
             | "browser:deepseek"
             | "browser:custom"
             | "claude"
@@ -116,11 +107,9 @@ pub(crate) fn last_llm_provider_allowed(p: &str) -> bool {
 
 pub(crate) fn default_site_url(site: &str) -> &'static str {
     match normalize_site(site).as_str() {
-        "chatgpt" => "https://chatgpt.com",
         "gemini" => "https://gemini.google.com/app",
         "deepseek" => "https://chat.deepseek.com",
-        "grok" => "https://grok.com",
-        _ => "https://claude.ai/new",
+        _ => "https://chatgpt.com",
     }
 }
 
@@ -208,7 +197,7 @@ pub(crate) fn browser_restore_status_for_session(
     let resolved_site = if site.is_empty() {
         meta.browser_last_site
             .clone()
-            .unwrap_or_else(|| "claude".to_string())
+            .unwrap_or_else(|| "chatgpt".to_string())
     } else {
         site
     };

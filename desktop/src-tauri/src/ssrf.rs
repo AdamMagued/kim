@@ -212,11 +212,9 @@ mod tests {
     #[test]
     fn allows_public_provider_hosts() {
         for h in [
-            "claude.ai",
             "chatgpt.com",
             "gemini.google.com",
             "accounts.google.com",
-            "grok.com",
             "chat.deepseek.com",
             "8.8.8.8",
             "1.1.1.1",

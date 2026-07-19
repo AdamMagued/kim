@@ -110,7 +110,7 @@ pub(crate) fn start_bridge_file_watcher(app_handle: tauri::AppHandle) {
                             }
                             "switch_site" => {
                                 let site =
-                                    cmd.get("site").and_then(|v| v.as_str()).unwrap_or("claude");
+                                    cmd.get("site").and_then(|v| v.as_str()).unwrap_or("chatgpt");
                                 let url = site_to_url(site);
                                 let provider = Some(format!("{} (via /model)", capitalize(site)));
                                 let _ = open_browser_signin_window_impl(&url, provider, &app);
@@ -156,11 +156,9 @@ pub(crate) fn start_bridge_file_watcher(app_handle: tauri::AppHandle) {
 
 fn site_to_url(site: &str) -> String {
     match site {
-        "chatgpt" => "https://chatgpt.com/".to_string(),
         "gemini" => "https://gemini.google.com/app".to_string(),
         "deepseek" => "https://chat.deepseek.com/".to_string(),
-        "grok" => "https://grok.com/".to_string(),
-        _ => "https://claude.ai/new".to_string(),
+        _ => "https://chatgpt.com/".to_string(),
     }
 }
 
@@ -196,11 +194,6 @@ fn url_to_site(url: &str) -> &'static str {
         "gemini"
     } else if url.contains("deepseek.com") {
         "deepseek"
-    } else if url.contains("grok.com") || url.contains("grok.x.com") || url.contains("x.com/i/grok")
-    {
-        "grok"
-    } else if url.contains("claude.ai") {
-        "claude"
     } else {
         "unknown"
     }
@@ -235,7 +228,7 @@ mod codex_bridge_tests {
     fn signed_in_heuristic_uses_parsed_url() {
         // False positives under the old substring check — now signed in.
         assert!(url_looks_signed_in(
-            "https://claude.ai/chat/talk-about-authors"
+            "https://chat.deepseek.com/a/chat/talk-about-authors"
         ));
         assert!(url_looks_signed_in(
             "https://chatgpt.com/c/login-page-design-help"
@@ -246,7 +239,7 @@ mod codex_bridge_tests {
         assert!(!url_looks_signed_in(
             "https://accounts.google.com/v3/signin/identifier"
         ));
-        assert!(!url_looks_signed_in("https://claude.ai/login"));
+        assert!(!url_looks_signed_in("https://chat.deepseek.com/login"));
         assert!(!url_looks_signed_in("https://chatgpt.com/auth/login"));
         assert!(!url_looks_signed_in(
             "https://auth.openai.com/authorize?x=1"

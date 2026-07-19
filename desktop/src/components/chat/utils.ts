@@ -975,7 +975,7 @@ export function costBasisLabel(provider: string): string | null {
  * for providers we have no pricing data for.
  */
 export function estimateCostUsd(provider: string, inputTokens: number, outputTokens: number): number | null {
-  // B5: browser providers stream as `browser:claude` / `browser:chatgpt` etc.
+  // B5: browser providers stream as `browser:chatgpt` / `browser:gemini` etc.
   // Those are free local sessions — normalize to the `browser` (zero-cost) key.
   const normalized = provider.trim().toLowerCase().startsWith('browser')
     ? 'browser'

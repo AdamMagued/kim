@@ -36,10 +36,8 @@ pub struct ProviderAuthStatus {
 pub(crate) fn provider_origin(site: &str) -> Option<&'static str> {
     match site {
         "chatgpt" | "openai" => Some("https://chatgpt.com"),
-        "claude" | "anthropic" => Some("https://claude.ai"),
         "gemini" | "google" => Some("https://gemini.google.com"),
         "deepseek" => Some("https://chat.deepseek.com"),
-        "grok" => Some("https://grok.com"),
         _ => None,
     }
 }
@@ -47,13 +45,11 @@ pub(crate) fn provider_origin(site: &str) -> Option<&'static str> {
 pub(crate) fn provider_login_url(site: &str) -> Option<String> {
     match site {
         "chatgpt" | "openai" => Some("https://chatgpt.com/auth/login".to_string()),
-        "claude" | "anthropic" => Some("https://claude.ai/login".to_string()),
         "gemini" | "google" => Some(
             "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fgemini.google.com%2Fapp"
                 .to_string(),
         ),
         "deepseek" => Some("https://chat.deepseek.com/sign_in".to_string()),
-        "grok" => Some("https://grok.com/sign-in".to_string()),
         _ => None,
     }
 }
@@ -61,7 +57,6 @@ pub(crate) fn provider_login_url(site: &str) -> Option<String> {
 pub(crate) fn build_auth_probe_js(site: &str, req_id: &str, base_url: &str, token: &str) -> String {
     let endpoint = match site {
         "chatgpt" | "openai" => "/api/auth/session",
-        "claude" | "anthropic" => "/api/organizations",
         "gemini" | "google" => "__GEMINI_DOM__",
         _ => "__UNKNOWN__",
     };
@@ -118,16 +113,6 @@ pub(crate) fn build_auth_probe_js(site: &str, req_id: &str, base_url: &str, toke
                                 email: data.user.email,
                                 name: data.user.name || null,
                                 avatar: data.user.image || data.user.picture || null,
-                            }};
-                        }}
-                    }} else if (site === 'claude' || site === 'anthropic') {{
-                        if (Array.isArray(data) && data.length > 0) {{
-                            const org = data[0] || {{}};
-                            info = {{
-                                provider: 'claude',
-                                signed_in: true,
-                                email: org.email_address || org.billing_email || null,
-                                name: org.name || null,
                             }};
                         }}
                     }}
@@ -272,15 +257,8 @@ pub(crate) async fn provider_check_auth(
 pub(crate) fn post_signin_url_patterns(site: &str) -> Vec<&'static str> {
     match site {
         "chatgpt" | "openai" => vec!["chatgpt.com/c/", "chatgpt.com/?", "chatgpt.com/g/"],
-        "claude" | "anthropic" => vec![
-            "claude.ai/chat",
-            "claude.ai/new",
-            "claude.ai/chats",
-            "claude.ai/projects",
-        ],
         "gemini" | "google" => vec!["gemini.google.com/app"],
         "deepseek" => vec!["chat.deepseek.com/a", "chat.deepseek.com/?"],
-        "grok" => vec!["grok.com/chat", "grok.com/?"],
         _ => vec![],
     }
 }
@@ -369,7 +347,6 @@ pub(crate) async fn provider_signout(
     // added, scope this to a per-account sign-out instead of the global URL.
     let logout_url = match site.as_str() {
         "chatgpt" | "openai" => format!("{}/auth/logout", origin),
-        "claude" | "anthropic" => format!("{}/login?logout=true", origin),
         "gemini" | "google" => "https://accounts.google.com/Logout".to_string(),
         _ => format!("{}/logout", origin),
     };

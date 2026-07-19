@@ -26,7 +26,7 @@ Bug this fixes (login-reuse regression):
 
     The browser-automation login session is a per-INSTALL resource, not a
     per-target-project one — a user should never have to re-sign-in to
-    claude.ai just because they cd'd into a different repo.  This module
+    chatgpt.com just because they cd'd into a different repo.  This module
     anchors it to the one stable Kim install instead: ``~/.kim_root`` (the
     marker ``install.sh`` writes, already trusted by the Rust CLI/desktop
     app's own ``paths.rs::resolve_project_root`` — see that file's docstring

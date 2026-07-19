@@ -1005,7 +1005,7 @@ class BrowserProvider(BaseProvider):
         """URL that opens a NEW conversation on ``site`` (the site root).
 
         Used by clear_chat: every supported site starts a fresh chat at its
-        root (chatgpt.com/, claude.ai/, gemini.google.com/ → /app, …), whereas
+        root (chatgpt.com/, gemini.google.com/ → /app, deepseek …), whereas
         an in-progress conversation lives at a permalink that survives reloads.
         """
         pattern = str(self._site_configs.get(site, {}).get("url_pattern") or "").strip()
