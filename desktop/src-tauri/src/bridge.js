@@ -3,14 +3,6 @@
   if (window.__kimBridge && window.__kimBridge._v >= 10) return;
 
   const SITE_CONFIGS = {
-    claude: {
-      input_selectors: ["div[contenteditable='true'].ProseMirror", "div[contenteditable='true']"],
-      send_selectors: ["button[aria-label*='Send message']", "button[aria-label*='Send']", "button[aria-label*='send']"],
-      stop_selectors: ["button[aria-label*='Stop']"],
-      response_selectors: ["[data-testid^='conversation-turn']", ".font-claude-message"],
-      upload_button_selectors: ["button[aria-label*='Attach']", "button[aria-label*='Upload']"],
-      file_input_selectors: ["input[type='file']"],
-    },
     chatgpt: {
       input_selectors: ["div#prompt-textarea", "div[contenteditable='true']"],
       send_selectors: ["button[data-testid='send-button']", "button[aria-label*='Send']"],
@@ -32,14 +24,6 @@
       send_selectors: ["button[aria-label*='Send']", "button[type='submit']"],
       stop_selectors: ["button[aria-label*='Stop']", "div[role='button'][class*='stop']"],
       response_selectors: ["div.ds-markdown"],
-      upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']"],
-      file_input_selectors: ["input[type='file']"],
-    },
-    grok: {
-      input_selectors: ["textarea", "div[contenteditable='true']"],
-      send_selectors: ["button[aria-label*='Send']", "button[type='submit']"],
-      stop_selectors: ["button[aria-label*='Stop']"],
-      response_selectors: ["article", "div.markdown", "[data-testid*='message']"],
       upload_button_selectors: ["button[aria-label*='Upload']", "button[aria-label*='Attach']"],
       file_input_selectors: ["input[type='file']"],
     },
@@ -546,7 +530,7 @@
   // ── Main send function ───────────────────────────────────────────────
   const send = async (prompt, reqId, site, attachments, callbackUrl, completionHash, modelTier, effort) => {
     window.__kimModelTier = modelTier;
-    const siteKey = SITE_CONFIGS[site] ? site : 'claude';
+    const siteKey = SITE_CONFIGS[site] ? site : 'chatgpt';
     const cfg = SITE_CONFIGS[siteKey];
     const baselineNodes = getResponseNodes(cfg, siteKey);
     const baselineNodeSet = new Set(baselineNodes);
@@ -747,14 +731,8 @@
         }
       }
 
-      // FIX 1 (K-EFFORT via webview bridge): best-effort on-page reasoning-
-      // effort picker for chatgpt/gemini/deepseek. Defined in bridge_effort.js
-      // (concatenated after this file into one injected script — see
-      // PERSISTENT_BRIDGE_JS). Never throws; absence of the function (a
-      // stale cached script) is a no-op.
-      if (effort && typeof window.__kimApplyEffort === 'function') {
-        try { await window.__kimApplyEffort(siteKey, effort); } catch (_) {}
-      }
+      // FIX 1 (K-EFFORT): best-effort on-page picker, defined in bridge_effort.js.
+      await window.__kimApplyEffortIfNeeded(siteKey, effort);
 
       // 1. Find input (use shadow-DOM-aware finder for Gemini)
       const inputEl = (siteKey === 'gemini' ? findGeminiInput() : null) || findElement(cfg.input_selectors, { visible: true });
@@ -903,10 +881,8 @@
       // into the content sub-node and strip any "<Provider> said" label.
       const ANSWER_SUBSELECTORS = {
         gemini: ['message-content', '.response-content', '.markdown-main-panel', '.markdown'],
-        claude: ['.font-claude-message', 'div.markdown', '.prose'],
         chatgpt: ['div.markdown', '.prose'],
         deepseek: ['div.ds-markdown'],
-        grok: ['.markdown', '.prose'],
       };
       const stripSaidLabel = (t) =>
         (t || '').replace(/^\s*(?:Gemini|Claude|ChatGPT|Grok|DeepSeek|Assistant)\s+said:?\s*/i, '').trim();
@@ -1055,10 +1031,8 @@
   const detectSite = () => {
     const href = window.location.href.toLowerCase();
     if (href.includes('gemini.google.com')) return 'gemini';
-    if (href.includes('claude.ai')) return 'claude';
     if (href.includes('chatgpt.com')) return 'chatgpt';
     if (href.includes('chat.deepseek.com')) return 'deepseek';
-    if (href.includes('grok.com')) return 'grok';
     return null;
   };
 
@@ -1096,7 +1070,7 @@
     SITE_CONFIGS,
     // Legacy compat
     getLatestResponseText: (site) => {
-      const siteKey = SITE_CONFIGS[site] ? site : 'claude';
+      const siteKey = SITE_CONFIGS[site] ? site : 'chatgpt';
       return getLatestResponseText(SITE_CONFIGS[siteKey], siteKey);
     },
   };

@@ -60,11 +60,7 @@ if TYPE_CHECKING:
 from orchestrator.context_meter import IMAGE_TOKEN_ESTIMATE, estimate_text_tokens
 from orchestrator.providers.base import BaseProvider
 from orchestrator.providers.browser.bridge_client import complete_via_webview_bridge
-from orchestrator.providers.browser.gemini_url import (
-    apply_gemini_authuser,
-    collect_selector_baselines,
-    scrape_slice_start,
-)
+from orchestrator.providers.browser.gemini_url import apply_gemini_authuser, collect_selector_baselines, response_candidates
 from orchestrator.providers.browser.markdown_scraper import MARKDOWN_SERIALIZER_JS
 from orchestrator.providers.browser.page_driver import PageDriver
 from orchestrator.providers.browser.popup_matching import EXTRA_POPUP_DISMISS_LABELS, dismiss_popup_label
@@ -587,10 +583,7 @@ class BrowserProvider(BaseProvider):
         if self._use_webview_bridge:
             known_tools = {t["name"] for t in (tools or []) if "name" in t}
             capability_repair_attempted = False
-            # FIX 1: apply effort only on the first send of a fresh chat, like
-            # the CDP path's `if not self._sent_system_prompt: apply_effort`
-            # gate below. Retries (capability/contract repair) omit it.
-            effort_for_this_send = self._effort if not sent_sys else None
+            effort_for_this_send = self._effort if not sent_sys else None  # FIX 1: first send only (mirrors CDP gate).
             result = await complete_via_webview_bridge(
                 bridge_url=self._bridge_url,
                 bridge_token=self._bridge_token,
@@ -836,8 +829,6 @@ class BrowserProvider(BaseProvider):
             self._last_chat_page_url = page.url
 
         cfg = self._site_configs[site]
-        # FIX 4: apply_effort moved to AFTER _dismiss_popups() below — a
-        # first-load consent overlay could sit on top of the picker trigger.
         image_attachments = [
             a for a in attachments
             if str(a.get("mime_type", "")).startswith("image/") and a.get("data_base64")
@@ -887,10 +878,8 @@ class BrowserProvider(BaseProvider):
 
         logger.info(f"[STATUS] Preparing {site}…")
         await self._dismiss_popups(page)
-
         if not self._sent_system_prompt:
             await apply_effort(page, site, self._effort, log=logger)
-
         logger.info(f"[STATUS] Sending message to {site}…")
         raw_response = await self._send_and_wait(page, cfg, prompt, site, completion_hash)
         # Pass known_tools so the parser can reject prompt-injected fake tool
@@ -1009,10 +998,7 @@ class BrowserProvider(BaseProvider):
                     return found
         return None
 
-    def _apply_gemini_authuser(self, site: str, url: str) -> str:
-        """FIX 6 (gemini_url.py): thread self._gemini_authuser into a gemini
-        URL on the CDP path (the webview-bridge path already forwards it via
-        bridge_client's payload)."""
+    def _apply_gemini_authuser(self, site: str, url: str) -> str:  # FIX 6: CDP-path gemini authuser.
         return apply_gemini_authuser(site, url, self._gemini_authuser)
 
     def _fresh_chat_url(self, site: str) -> Optional[str]:
@@ -1369,10 +1355,7 @@ class BrowserProvider(BaseProvider):
             except Exception:
                 break
         logger.debug("Escape-key sweep complete (3 presses)")
-        # FIX 5 (popup_matching.py): word-boundary-safe label match instead of
-        # an XPath substring `contains()`, which could not distinguish a
-        # standalone "Continue" from "Continue generating".
-        for label in list(_POPUP_DISMISS_LABELS) + EXTRA_POPUP_DISMISS_LABELS:
+        for label in list(_POPUP_DISMISS_LABELS) + EXTRA_POPUP_DISMISS_LABELS:  # FIX 5: word-boundary-safe match.
             try:
                 if await dismiss_popup_label(page, label):
                     logger.info(f"Dismissed popup button: {label!r}")
@@ -1634,10 +1617,7 @@ class BrowserProvider(BaseProvider):
         initial_count = await page.locator(response_sel).count()
         logger.debug(f"Response count before send: {initial_count}")
 
-        # FIX 2 (gemini_url.collect_selector_baselines): per-selector baseline.
-        selector_baselines = await collect_selector_baselines(
-            page, cfg["response_selectors"], response_sel, initial_count
-        )
+        selector_baselines = await collect_selector_baselines(page, cfg["response_selectors"], response_sel, initial_count)  # FIX 2
 
         async def _submit() -> None:
             await page.keyboard.press("Escape")
@@ -1683,15 +1663,9 @@ class BrowserProvider(BaseProvider):
         started = await self._wait_for_new_response(
             page, response_sel, initial_count
         )
-        if not started:
-            # FIX 3 (thinking_probe.py): a slow-reasoning model (e.g. DeepSeek
-            # R1) may still be visibly working — extend the wait instead of
-            # failing fast.
-            if await self._model_still_thinking(page, cfg):
-                logger.info(f"[STATUS] {site} still appears to be reasoning — extending wait…")
-                started = await self._wait_for_new_response(
-                    page, response_sel, initial_count, timeout_s=GENERATION_WAIT_S
-                )
+        if not started and await self._model_still_thinking(page, cfg):  # FIX 3: model may still be visibly reasoning.
+            logger.info(f"[STATUS] {site} still appears to be reasoning — extending wait…")
+            started = await self._wait_for_new_response(page, response_sel, initial_count, timeout_s=GENERATION_WAIT_S)
         if not started:
             # F-B-8: the prompt was already injected + submitted above, so this
             # timeout is POST-delivery. Signal a non-retryable delivered state
@@ -1720,12 +1694,7 @@ class BrowserProvider(BaseProvider):
             page, cfg["response_selectors"], min_index=selector_baselines, as_markdown=True
         )
 
-    async def _model_still_thinking(self, page: Page, cfg: dict) -> bool:
-        """FIX 3 (thinking_probe.py): best-effort "still actively reasoning"
-        probe used by _send_and_wait before it gives up waiting for a
-        response to even start. Never raises — reuses _find_selector's own
-        per-selector try/except.
-        """
+    async def _model_still_thinking(self, page: Page, cfg: dict) -> bool:  # FIX 3: still-reasoning probe.
         probe = build_thinking_probe(cfg.get("stop_selectors"))
         return bool(await self._find_selector(page, probe))
 
@@ -1765,8 +1734,7 @@ class BrowserProvider(BaseProvider):
         return None
 
     async def _wait_for_new_response(
-        self, page: Page, response_sel: str, initial_count: int,
-        timeout_s: Optional[float] = None,
+        self, page: Page, response_sel: str, initial_count: int, timeout_s: Optional[float] = None,
     ) -> bool:
         # Snapshot the last pre-send response element: some sites (and reused
         # threads) stream the new answer INTO an existing element instead of
@@ -1781,9 +1749,7 @@ class BrowserProvider(BaseProvider):
             except Exception:
                 pass
 
-        deadline = asyncio.get_running_loop().time() + (
-            RESPONSE_WAIT_S if timeout_s is None else timeout_s
-        )
+        deadline = asyncio.get_running_loop().time() + (RESPONSE_WAIT_S if timeout_s is None else timeout_s)
         while asyncio.get_running_loop().time() < deadline:
             count = await page.locator(response_sel).count()
             if count > initial_count:
@@ -1809,8 +1775,7 @@ class BrowserProvider(BaseProvider):
 
     async def _wait_for_generation_complete(
         self, page: Page, stop_selectors: list[str], response_selectors: list[str],
-        completion_hash: Optional[str], site: str = "AI",
-        min_index: "int | dict[str, int]" = 0,
+        completion_hash: Optional[str], site: str = "AI", min_index: "int | dict[str, int]" = 0,
         min_generation_s: float = 5.0,
     ) -> bool:
         """Wait until the site finishes generating.
@@ -1818,9 +1783,6 @@ class BrowserProvider(BaseProvider):
         Returns True when the completion sentinel was found (definitive — the
         response is fully rendered), False when we fell back to the idle/stop
         heuristics or timed out (caller should allow extra settle time).
-
-        min_index: forwarded to _scrape_last_response as-is (FIX 2: int or a
-        per-selector {selector: baseline_count} dict).
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + GENERATION_WAIT_S
@@ -1955,17 +1917,10 @@ class BrowserProvider(BaseProvider):
         min_index: "int | dict[str, int]" = 0,
         as_markdown: bool = False,
     ) -> str:
-        # FIX 2 (gemini_url.scrape_slice_start): min_index may be a
-        # per-selector {selector: baseline_count} dict, not just a single int
-        # applied uniformly to every selector's own element array — see
-        # scrape_slice_start's docstring for why that used to be wrong.
-        for sel in response_selectors:
+        for sel in response_selectors:  # FIX 2: min_index may be a per-selector dict now.
             try:
                 elements = await page.locator(sel).all()
-                baseline = min_index.get(sel, 0) if isinstance(min_index, dict) else int(min_index)
-                cur_len = len(elements)
-                idx = scrape_slice_start(cur_len, baseline)
-                candidates = elements[idx:] if idx < cur_len else []
+                candidates = response_candidates(elements, min_index, sel)
                 for el in reversed(candidates):
                     text = None
                     if as_markdown:

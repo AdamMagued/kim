@@ -1,6 +1,5 @@
-//! In-app webview bridge engine: the persistent bridge JS, the browser
-//! sign-in window, payload collection, and one-shot bridge completion.
-//! Extracted from lib.rs (file-split restructure) — behavior unchanged.
+//! In-app webview bridge engine: sign-in window, payload collection, and
+//! one-shot bridge completion. Extracted from lib.rs — behavior unchanged.
 
 use base64::Engine as _;
 use std::collections::HashMap;
@@ -8,14 +7,6 @@ use std::time::{Duration, Instant};
 use tauri::{Emitter, Listener, Manager};
 
 use crate::*;
-
-// FIX 1: bridge_effort.js (the on-page reasoning-effort picker, kept in its
-// own file to avoid growing the already-large bridge.js) is concatenated
-// AFTER bridge.js into one script string. Both run in the same eval'd
-// context, so bridge_effort.js's `window.__kimApplyEffort` is available to
-// bridge.js's send() regardless of bridge.js's own top-level IIFE closure.
-pub(crate) const PERSISTENT_BRIDGE_JS: &str =
-    concat!(include_str!("bridge.js"), include_str!("bridge_effort.js"));
 
 pub(crate) fn open_browser_signin_window_impl(
     url: &str,

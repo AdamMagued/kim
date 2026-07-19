@@ -135,4 +135,12 @@
       return false;
     }
   };
+
+  // Guarded entry point for bridge.js's send(): never throws, no-ops when
+  // there's no effort requested or this script failed to load (stale cache).
+  window.__kimApplyEffortIfNeeded = async (site, effort) => {
+    if (effort && typeof window.__kimApplyEffort === 'function') {
+      try { await window.__kimApplyEffort(site, effort); } catch (_) {}
+    }
+  };
 })();

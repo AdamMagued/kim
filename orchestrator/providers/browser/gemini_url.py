@@ -34,6 +34,17 @@ def scrape_slice_start(cur_len: int, baseline: int) -> int:
     return baseline if cur_len > baseline else max(cur_len - 1, 0)
 
 
+def response_candidates(elements: list, min_index: "int | dict[str, int]", sel: str) -> list:
+    """FIX 2: slice ``elements`` (a response selector's current element list)
+    down to the ones that appeared since send-time. ``min_index`` may be a
+    single int (legacy, applied uniformly) or a {selector: baseline} dict —
+    see scrape_slice_start above for why per-selector baselines matter.
+    """
+    baseline = min_index.get(sel, 0) if isinstance(min_index, dict) else int(min_index)
+    idx = scrape_slice_start(len(elements), baseline)
+    return elements[idx:] if idx < len(elements) else []
+
+
 async def collect_selector_baselines(
     page, response_selectors: list[str], response_sel: str, initial_count: int
 ) -> dict[str, int]:

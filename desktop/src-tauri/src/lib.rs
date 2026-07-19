@@ -9,6 +9,8 @@ use tauri::{Emitter, Manager};
 
 pub mod account;
 pub mod browser_bridge;
+mod browser_bridge_effort;
+pub(crate) use browser_bridge_effort::PERSISTENT_BRIDGE_JS;
 mod binary_resolver;
 mod codex_bridge;
 pub mod codex_projects;
@@ -88,23 +90,16 @@ struct BridgeCompleteRequest {
     attachments: Vec<BridgeAttachment>,
     #[serde(default)]
     completion_hash: Option<String>,
-    /// When true, navigate the provider webview to a fresh chat page before
-    /// injecting the prompt. BrowserProvider uses this for Codex bridge relays
-    /// because each relay prompt already contains the full Codex conversation;
-    /// keeping the provider page history can make the scraper read stale bubbles.
+    /// When true, navigate to a fresh chat page before injecting (Codex bridge
+    /// relays: each prompt already has the full conversation; stale history confuses the scraper).
     #[serde(default)]
     clear_chat: bool,
-    /// Optional authuser index for Google multi-account routing.
-    /// When set, the browser window navigates to gemini.google.com?authuser=N
-    /// before injecting the prompt.
+    /// Optional Google authuser index; when set, navigates to gemini.google.com?authuser=N first.
     #[serde(default)]
     authuser: Option<u32>,
-    /// Optional model tier (e.g. "fast", "pro", "thinking") requested by the user.
     #[serde(default)]
     model_tier: Option<String>,
-    /// FIX 1 (K-EFFORT via webview bridge): requested reasoning effort
-    /// ("low"/"medium"/"high"), forwarded to bridge.js's on-page effort
-    /// picker (see bridge_effort.js). None means "leave the site default".
+    /// Requested reasoning effort ("low"/"medium"/"high"); None = site default.
     #[serde(default)]
     effort: Option<String>,
 }
