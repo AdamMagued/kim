@@ -238,10 +238,8 @@ export const ALL_PROVIDERS: { value: Provider; title: string; sub: string }[] = 
 
 /** Browser providers Kim can sign into. */
 export const BROWSER_PROVIDERS: { id: string; label: string }[] = [
-  { id: 'claude',   label: 'Claude' },
   { id: 'chatgpt',  label: 'ChatGPT' },
   { id: 'gemini',   label: 'Gemini' },
-  { id: 'grok',     label: 'Grok' },
   { id: 'deepseek', label: 'DeepSeek' },
 ];
 

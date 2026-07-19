@@ -181,7 +181,7 @@ class TestProviderNames(unittest.TestCase):
     """Verify the provider factory knows all documented names."""
 
     VALID_NAMES = ["claude", "openai", "gemini", "deepseek", "browser", "ollama"]
-    EXTENDED_NAMES = ["browser:claude", "browser:chatgpt", "browser:gemini"]
+    EXTENDED_NAMES = ["browser:chatgpt", "browser:gemini", "browser:deepseek"]
 
     def test_create_provider_accepts_all_valid_names(self):
         from orchestrator.providers.base import create_provider

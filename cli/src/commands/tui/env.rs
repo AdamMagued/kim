@@ -87,6 +87,22 @@ pub(crate) fn build_child_env() -> Vec<(String, String)> {
     build_child_env_from(std::env::vars())
 }
 
+/// `KIM_BROWSER_EFFORT` override for the spawned kimcli/codex child, derived
+/// from `kim tui --effort <low|medium|high>` (see `mod.rs`'s `TuiOptions`).
+/// Empty when no `--effort` flag was given — the child then falls back to
+/// whatever `orchestrator/providers/browser/reasoning_effort.py::
+/// resolve_effort()` already resolves from env/config, unchanged. Reusing
+/// that existing env-over-config resolution path is exactly why this is a
+/// plain env var rather than a new `-c` TOML override in `argv.rs`: no
+/// Python-side change is needed for `--effort` to take effect on the
+/// CLI/CDP browser transport.
+pub(crate) fn effort_env(effort: Option<&str>) -> Vec<(String, String)> {
+    match effort {
+        Some(value) => vec![("KIM_BROWSER_EFFORT".to_string(), value.to_string())],
+        None => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +237,21 @@ mod tests {
         assert_eq!(
             map.get("PATHEXT").map(String::as_str),
             Some(".COM;.EXE;.BAT;.CMD")
+        );
+    }
+
+    // ── Goal C: --effort -> KIM_BROWSER_EFFORT ──────────────────────────────
+
+    #[test]
+    fn effort_env_is_empty_when_no_effort_given() {
+        assert_eq!(effort_env(None), Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn effort_env_sets_kim_browser_effort_when_given() {
+        assert_eq!(
+            effort_env(Some("high")),
+            vec![("KIM_BROWSER_EFFORT".to_string(), "high".to_string())]
         );
     }
 }

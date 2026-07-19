@@ -93,9 +93,10 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliCommand {
             };
             CliCommand::Oneshot { mode, prompt }
         }
-        // `kim tui [--provider <name>] [--model <name>] [--cwd <dir>] [--verbose]
-        // [-- <raw args...>]` — launches the standalone kimcli/codex TUI. All
-        // flag validation happens in `commands::tui::parse_tui_flags`.
+        // `kim tui [--provider <name>] [--model <name>] [--cwd <dir>]
+        // [--effort <low|medium|high>] [--verbose] [-- <raw args...>]` —
+        // launches the standalone kimcli/codex TUI. All flag validation
+        // happens in `commands::tui::parse_tui_flags`.
         Some("tui") => CliCommand::Tui {
             args: args[1..].to_vec(),
         },
@@ -159,7 +160,7 @@ pub(crate) async fn run_oneshot(
 }
 
 pub(crate) fn help_text() -> &'static str {
-    "Kim terminal CLI\n\nUsage:\n  kim                      Launch the interactive chat/code REPL\n  kim chat <prompt...>     Send one prompt in chat mode and exit\n  kim code <prompt...>     Send one prompt in code-agent mode and exit\n  kim tui                  Launch the full Codex-style TUI (kimcli) via Kim's providers\n  kim doctor               Check install, providers, desktop bridge, and code mode\n  kim doctor --strict      Same, but exit non-zero on any failed check (CI)\n  kim --resume <id>        Resume a Kim session in the REPL\n  kim --resume latest      Resume the newest saved session\n  kim --help               Show this help\n  kim --version            Show the version\n\nPipe a prompt via stdin:\n  echo 'explain this' | kim chat\n  echo 'fix the build' | kim code\n\n`kim tui` flags:\n  --provider <name>        Provider to route through (default: config tui_provider, or browser:claude)\n  --model <name>           Model name to pass to kimcli\n  --cwd <dir>              Working directory for the TUI (default: current dir)\n  --verbose                Forward proxy/launcher diagnostics to stderr\n  -- <args...>             Passthrough args appended verbatim to the kimcli binary\n\nInside Kim, type /help for commands and /login to connect a provider."
+    "Kim terminal CLI\n\nUsage:\n  kim                      Launch the interactive chat/code REPL\n  kim chat <prompt...>     Send one prompt in chat mode and exit\n  kim code <prompt...>     Send one prompt in code-agent mode and exit\n  kim tui                  Launch the full Codex-style TUI (kimcli) via Kim's providers\n  kim doctor               Check install, providers, desktop bridge, and code mode\n  kim doctor --strict      Same, but exit non-zero on any failed check (CI)\n  kim --resume <id>        Resume a Kim session in the REPL\n  kim --resume latest      Resume the newest saved session\n  kim --help               Show this help\n  kim --version            Show the version\n\nPipe a prompt via stdin:\n  echo 'explain this' | kim chat\n  echo 'fix the build' | kim code\n\n`kim tui` flags:\n  --provider <name>        Provider to route through (default: config tui_provider, or browser:chatgpt)\n  --model <name>           Model name to pass to kimcli\n  --cwd <dir>              Working directory for the TUI (default: current dir)\n  --effort <level>         Browser LLM reasoning effort: low, medium, or high (default: unset, KIM_BROWSER_EFFORT env or config)\n  --verbose                Forward proxy/launcher diagnostics to stderr\n  -- <args...>             Passthrough args appended verbatim to the kimcli binary\n\nInside Kim, type /help for commands and /login to connect a provider."
 }
 
 #[cfg(test)]
@@ -394,7 +395,7 @@ mod tests {
         let cmd = parse_cli_args(&args(&[
             "tui",
             "--provider",
-            "browser:claude",
+            "browser:chatgpt",
             "--verbose",
             "--",
             "--help",
@@ -402,7 +403,7 @@ mod tests {
         match cmd {
             CliCommand::Tui { args } => assert_eq!(
                 args,
-                vec!["--provider", "browser:claude", "--verbose", "--", "--help"]
+                vec!["--provider", "browser:chatgpt", "--verbose", "--", "--help"]
             ),
             other => panic!("expected Tui, got {other:?}"),
         }

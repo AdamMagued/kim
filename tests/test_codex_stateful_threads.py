@@ -100,10 +100,10 @@ class TestThreadStateSidecar(unittest.TestCase):
     def test_distinct_cwd_or_provider_do_not_collide(self):
         ts.save_thread_state("/proj/a", "browser:gemini", {"turns": 1})
         ts.save_thread_state("/proj/b", "browser:gemini", {"turns": 2})
-        ts.save_thread_state("/proj/a", "browser:claude", {"turns": 3})
+        ts.save_thread_state("/proj/a", "browser:chatgpt", {"turns": 3})
         self.assertEqual(ts.load_thread_state("/proj/a", "browser:gemini")["turns"], 1)
         self.assertEqual(ts.load_thread_state("/proj/b", "browser:gemini")["turns"], 2)
-        self.assertEqual(ts.load_thread_state("/proj/a", "browser:claude")["turns"], 3)
+        self.assertEqual(ts.load_thread_state("/proj/a", "browser:chatgpt")["turns"], 3)
 
     def test_reset_clears_accounting_and_carries_handoff(self):
         ts.save_thread_state(

@@ -22,7 +22,7 @@ browser_provider:
   # Force the browser provider to launch headless Chromium directly, bypassing
   # the CDP auto-launch/connect flow. Optional; defaults to false.
   browser_force_headless: false
-  # Reasoning effort for browser LLM turns (claude/chatgpt/gemini): low |
+  # Reasoning effort for browser LLM turns (chatgpt/gemini/deepseek): low |
   # medium | high. Best-effort — clicks the site's own model/thinking
   # picker on the first turn of a fresh chat; unset (default) leaves the
   # site at whatever mode it already has selected. KIM_BROWSER_EFFORT env

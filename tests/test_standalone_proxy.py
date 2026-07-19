@@ -110,7 +110,7 @@ class AutoModeResolutionTests(unittest.TestCase):
     never an auto-resolution target — it stays explicit-only."""
 
     def test_browser_colon_provider_resolves_to_browser_contract(self):
-        for name in ("browser:claude", "browser:chatgpt", "browser:gemini", "browser:grok"):
+        for name in ("browser:chatgpt", "browser:gemini", "browser:deepseek"):
             with self.subTest(name=name):
                 self.assertEqual(_resolve_auto_mode(name), "browser-contract")
 

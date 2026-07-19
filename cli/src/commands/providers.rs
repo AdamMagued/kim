@@ -181,7 +181,7 @@ pub(super) fn known_ollama_cloud_models() -> &'static [&'static str] {
 pub(super) async fn login(args: &str, config: &mut KimConfig) -> CommandOutcome {
     if args.is_empty() {
         return CommandOutcome::Message(
-            "Choose a provider to sign in to:\n  /login ollama           — local Ollama server (free, no key)\n  /login claude           — Anthropic API key\n  /login openai           — OpenAI API key\n  /login gemini           — Google Gemini API key\n  /login deepseek         — DeepSeek API key\n  /login browser          — Kim desktop browser bridge (no key needed)\n  /login browser:claude   — Claude in browser via Kim desktop\n  /login browser:chatgpt  — ChatGPT in browser via Kim desktop\n  /login browser:gemini   — Gemini in browser via Kim desktop".to_string()
+            "Choose a provider to sign in to:\n  /login ollama           — local Ollama server (free, no key)\n  /login claude           — Anthropic API key\n  /login openai           — OpenAI API key\n  /login gemini           — Google Gemini API key\n  /login deepseek         — DeepSeek API key\n  /login browser          — Kim desktop browser bridge (no key needed)\n  /login browser:chatgpt  — ChatGPT in browser via Kim desktop\n  /login browser:gemini   — Gemini in browser via Kim desktop\n  /login browser:deepseek — DeepSeek in browser via Kim desktop".to_string()
         );
     }
     let provider = args.to_ascii_lowercase();
@@ -593,10 +593,10 @@ mod tests {
     fn is_browser_provider_recognises_all_variants() {
         use crate::provider::is_browser_provider;
         assert!(is_browser_provider("browser"));
-        assert!(is_browser_provider("browser:claude"));
         assert!(is_browser_provider("browser:chatgpt"));
         assert!(is_browser_provider("browser:gemini"));
-        assert!(is_browser_provider("BROWSER:CLAUDE")); // case-insensitive
+        assert!(is_browser_provider("browser:deepseek"));
+        assert!(is_browser_provider("BROWSER:CHATGPT")); // case-insensitive
         assert!(!is_browser_provider("claude"));
         assert!(!is_browser_provider("openai"));
         assert!(!is_browser_provider("desktop"));
@@ -615,14 +615,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_command_accepts_browser_claude() {
+    async fn provider_command_accepts_browser_deepseek() {
         let mut config = KimConfig::default();
-        let outcome = handle_command("/provider browser:claude", &mut config).await;
+        let outcome = handle_command("/provider browser:deepseek", &mut config).await;
         assert!(matches!(
             outcome,
             CommandOutcome::Info(_) | CommandOutcome::Message(_)
         ));
-        assert_eq!(config.provider, "browser:claude");
+        assert_eq!(config.provider, "browser:deepseek");
     }
 
     #[tokio::test]
@@ -650,11 +650,11 @@ mod tests {
     #[tokio::test]
     async fn login_browser_sets_provider_without_key_prompt() {
         let mut config = KimConfig::default();
-        let outcome = handle_command("/login browser:claude", &mut config).await;
+        let outcome = handle_command("/login browser:chatgpt", &mut config).await;
         // Must NOT return NeedApiKey — browser providers are keyless.
         assert!(!matches!(outcome, CommandOutcome::NeedApiKey(_)));
         assert!(matches!(outcome, CommandOutcome::Message(_)));
-        assert_eq!(config.provider, "browser:claude");
+        assert_eq!(config.provider, "browser:chatgpt");
     }
 
     #[tokio::test]
@@ -668,7 +668,7 @@ mod tests {
     #[tokio::test]
     async fn logout_browser_provider_reports_keyless() {
         let mut config = KimConfig {
-            provider: "browser:claude".to_string(),
+            provider: "browser:chatgpt".to_string(),
             ..KimConfig::default()
         };
         let outcome = handle_command("/logout", &mut config).await;
@@ -684,9 +684,9 @@ mod tests {
         use crate::provider::provider_info;
         for name in &[
             "browser",
-            "browser:claude",
             "browser:chatgpt",
             "browser:gemini",
+            "browser:deepseek",
         ] {
             assert!(
                 provider_info(name).is_some(),

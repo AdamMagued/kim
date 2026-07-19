@@ -49,14 +49,18 @@ use std::path::PathBuf;
 use tokio::process::Command;
 
 use argv::build_kimcli_argv;
-use env::build_child_env;
+use env::{build_child_env, effort_env};
 use ollama_cloud::resolve_ollama_cloud;
 use proxy::{spawn_standalone_proxy, ProxyProcess};
 use routing::{route_for_provider, TuiRoute};
 
 /// `kim tui` falls back to this provider when neither `--provider` nor
 /// `config.tui_provider` is set.
-const DEFAULT_TUI_PROVIDER: &str = "browser:claude";
+const DEFAULT_TUI_PROVIDER: &str = "browser:chatgpt";
+
+/// Valid `--effort` values — mirrors
+/// `orchestrator/providers/browser/reasoning_effort.py::EFFORT_LEVELS`.
+const EFFORT_LEVELS: [&str; 3] = ["low", "medium", "high"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TuiOptions {
@@ -65,11 +69,13 @@ pub(crate) struct TuiOptions {
     pub(crate) cwd: PathBuf,
     pub(crate) verbose: bool,
     pub(crate) passthrough: Vec<String>,
+    pub(crate) effort: Option<String>,
 }
 
-/// Parsed `--provider`/`--model`/`--cwd`/`--verbose`/`-- <passthrough>` flags,
-/// before defaults (config / cwd) are applied. Shared verbatim by `kim tui`
-/// and the standalone `kimcli` binary (see module docs).
+/// Parsed `--provider`/`--model`/`--cwd`/`--effort`/`--verbose`/
+/// `-- <passthrough>` flags, before defaults (config / cwd) are applied.
+/// Shared verbatim by `kim tui` and the standalone `kimcli` binary (see
+/// module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TuiFlags {
     pub(crate) provider: Option<String>,
@@ -77,12 +83,16 @@ pub(crate) struct TuiFlags {
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) verbose: bool,
     pub(crate) passthrough: Vec<String>,
+    pub(crate) effort: Option<String>,
 }
 
+const TUI_USAGE: &str = "Usage: kim tui [--provider <name>] [--model <name>] [--cwd <dir>] \
+     [--effort <low|medium|high>] [--verbose] [-- <args...>]";
+
 /// Parse `kim tui`/`kimcli` flags. Recognizes `--provider <name>`,
-/// `--model <name>`, `--cwd <dir>`, `--verbose`, and a trailing
-/// `-- <raw args...>` passthrough (everything after `--` is forwarded
-/// verbatim to the kimcli binary, unparsed).
+/// `--model <name>`, `--cwd <dir>`, `--effort <low|medium|high>`,
+/// `--verbose`, and a trailing `-- <raw args...>` passthrough (everything
+/// after `--` is forwarded verbatim to the kimcli binary, unparsed).
 pub(crate) fn parse_tui_flags(args: &[String]) -> Result<TuiFlags, String> {
     let mut out = TuiFlags::default();
     let mut i = 0;
@@ -93,30 +103,38 @@ pub(crate) fn parse_tui_flags(args: &[String]) -> Result<TuiFlags, String> {
                 return Ok(out);
             }
             "--provider" => {
-                let value = args.get(i + 1).ok_or_else(|| {
-                    "kim tui: --provider requires a value. Usage: kim tui [--provider <name>] \
-                     [--model <name>] [--cwd <dir>] [--verbose] [-- <args...>]"
-                        .to_string()
-                })?;
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("kim tui: --provider requires a value. {TUI_USAGE}"))?;
                 out.provider = Some(value.clone());
                 i += 2;
             }
             "--model" => {
-                let value = args.get(i + 1).ok_or_else(|| {
-                    "kim tui: --model requires a value. Usage: kim tui [--provider <name>] \
-                     [--model <name>] [--cwd <dir>] [--verbose] [-- <args...>]"
-                        .to_string()
-                })?;
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("kim tui: --model requires a value. {TUI_USAGE}"))?;
                 out.model = Some(value.clone());
                 i += 2;
             }
             "--cwd" => {
-                let value = args.get(i + 1).ok_or_else(|| {
-                    "kim tui: --cwd requires a value. Usage: kim tui [--provider <name>] \
-                     [--model <name>] [--cwd <dir>] [--verbose] [-- <args...>]"
-                        .to_string()
-                })?;
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("kim tui: --cwd requires a value. {TUI_USAGE}"))?;
                 out.cwd = Some(PathBuf::from(value));
+                i += 2;
+            }
+            "--effort" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("kim tui: --effort requires a value. {TUI_USAGE}"))?;
+                let normalized = value.trim().to_ascii_lowercase();
+                if !EFFORT_LEVELS.contains(&normalized.as_str()) {
+                    return Err(format!(
+                        "kim tui: --effort must be one of {} (got {value:?}). {TUI_USAGE}",
+                        EFFORT_LEVELS.join(", "),
+                    ));
+                }
+                out.effort = Some(normalized);
                 i += 2;
             }
             "--verbose" => {
@@ -124,11 +142,7 @@ pub(crate) fn parse_tui_flags(args: &[String]) -> Result<TuiFlags, String> {
                 i += 1;
             }
             other => {
-                return Err(format!(
-                    "kim tui: unknown option '{other}'. \
-                     Usage: kim tui [--provider <name>] [--model <name>] [--cwd <dir>] \
-                     [--verbose] [-- <args...>]"
-                ));
+                return Err(format!("kim tui: unknown option '{other}'. {TUI_USAGE}"));
             }
         }
     }
@@ -140,7 +154,7 @@ pub(crate) fn parse_tui_flags(args: &[String]) -> Result<TuiFlags, String> {
 /// shows as its header/footer/model-metadata lookup.
 ///
 /// F-B-16: a browser provider's "model" is a fixed, cosmetic label derived
-/// from the provider itself (browser-claude/-chatgpt/-gemini) — not a real
+/// from the provider itself (browser-chatgpt/-gemini/-deepseek) — not a real
 /// installed model. Persisted `tui_model`/`model` can be stale from a PRIOR
 /// `--provider` run (e.g. last session used browser:chatgpt) and must not
 /// leak into THIS session's header/footer/"Model metadata for … not found"
@@ -219,6 +233,7 @@ pub async fn run_tui_standalone(args: Vec<String>) -> i32 {
         cwd,
         verbose: flags.verbose,
         passthrough: flags.passthrough,
+        effort: flags.effort,
     };
     run_tui(&opts).await
 }
@@ -328,6 +343,13 @@ pub(crate) async fn run_tui(opts: &TuiOptions) -> i32 {
     for (key, value) in &extra_env {
         cmd.env(key, value);
     }
+    // `--effort` (Goal C): sets KIM_BROWSER_EFFORT on the child so the
+    // browser-contract path's existing env>config resolution
+    // (reasoning_effort.py::resolve_effort) picks it up — no Python change
+    // needed. A no-flag run leaves this unset, same as before.
+    for (key, value) in effort_env(opts.effort.as_deref()) {
+        cmd.env(key, value);
+    }
     // Inherit stdio: the TUI owns the terminal (no piping/capturing).
     cmd.kill_on_drop(true);
 
@@ -413,10 +435,59 @@ mod tests {
 
     #[test]
     fn parse_tui_flags_missing_value_is_an_error() {
-        for argv in [vec!["--provider"], vec!["--model"], vec!["--cwd"]] {
+        for argv in [
+            vec!["--provider"],
+            vec!["--model"],
+            vec!["--cwd"],
+            vec!["--effort"],
+        ] {
             let err = parse_tui_flags(&strs(&argv)).unwrap_err();
             assert!(err.contains("requires a value"), "got: {err}");
         }
+    }
+
+    // ── Goal C: --effort flag ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_tui_flags_effort_absent_is_unset() {
+        let flags = parse_tui_flags(&[]).unwrap();
+        assert_eq!(flags.effort, None);
+    }
+
+    #[test]
+    fn parse_tui_flags_effort_accepts_each_valid_level() {
+        for level in ["low", "medium", "high"] {
+            let flags = parse_tui_flags(&strs(&["--effort", level])).unwrap();
+            assert_eq!(flags.effort.as_deref(), Some(level));
+        }
+    }
+
+    #[test]
+    fn parse_tui_flags_effort_is_case_insensitive() {
+        let flags = parse_tui_flags(&strs(&["--effort", "HIGH"])).unwrap();
+        assert_eq!(flags.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn parse_tui_flags_effort_rejects_invalid_value() {
+        let err = parse_tui_flags(&strs(&["--effort", "ultra"])).unwrap_err();
+        assert!(err.contains("--effort must be one of"), "got: {err}");
+        assert!(err.contains("low, medium, high"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_tui_flags_effort_combines_with_other_flags() {
+        let flags = parse_tui_flags(&strs(&[
+            "--provider",
+            "browser:chatgpt",
+            "--effort",
+            "medium",
+            "--verbose",
+        ]))
+        .unwrap();
+        assert_eq!(flags.provider.as_deref(), Some("browser:chatgpt"));
+        assert_eq!(flags.effort.as_deref(), Some("medium"));
+        assert!(flags.verbose);
     }
 
     #[test]
@@ -443,22 +514,22 @@ mod tests {
 
     #[test]
     fn explicit_provider_flag_derives_the_matching_browser_model_label() {
-        // The exact QA repro: `kim tui --provider browser:claude` with a
-        // stale `tui_model: "browser-chatgpt"` left over from a prior
-        // `--provider browser:chatgpt` session.
+        // The exact QA repro: `kim tui --provider browser:chatgpt` with a
+        // stale `tui_model: "browser-gemini"` left over from a prior
+        // `--provider browser:gemini` session.
         let flags = TuiFlags {
-            provider: Some("browser:claude".to_string()),
+            provider: Some("browser:chatgpt".to_string()),
             ..Default::default()
         };
         let config = config_with(
-            Some("browser:chatgpt"),
-            Some("browser-chatgpt"),
-            "browser-chatgpt",
+            Some("browser:gemini"),
+            Some("browser-gemini"),
+            "browser-gemini",
         );
         let (provider, model) = resolve_provider_and_model(&flags, &config);
-        assert_eq!(provider, "browser:claude");
+        assert_eq!(provider, "browser:chatgpt");
         assert_eq!(
-            model, "browser-claude",
+            model, "browser-chatgpt",
             "display label must match the flag, not stale config"
         );
     }
@@ -512,7 +583,7 @@ mod tests {
         let config = config_with(None, None, "llama3.2");
         let (provider, model) = resolve_provider_and_model(&flags, &config);
         assert_eq!(provider, DEFAULT_TUI_PROVIDER);
-        assert_eq!(model, "browser-claude");
+        assert_eq!(model, "browser-chatgpt");
     }
 
     // ── FIX 3 (#61 review): --cwd must be canonicalized ────────────────────

@@ -89,11 +89,11 @@ Mechanism vocabulary used in the table:
 | M-12 | Trigger a long-running/background task; confirm any desktop notification fires on completion. |
 | M-13 | Run `/resume` (or `--resume` / the session picker) in a live TUI; confirm the prior session's messages reload and continuation works. |
 | M-14 | `api:ollama` default (proxy) route: with a local Ollama running, launch `kim tui --provider ollama`, confirm chat AND tool calls both work through the Kim proxy (`OllamaProvider` native `/api/chat` tool-calling, re-emitted as Responses-API `function_call` items). Opt-in DIRECT route only (`KIM_TUI_OLLAMA_DIRECT=1 kim tui --provider ollama`, requires a local Ollama ≥ 0.13.4 for `/v1/responses`): confirm text-only chat works with zero Kim-proxy hop (kill the proxy process and confirm the session is unaffected, since this route never spawns one) — known-broken for tool calls as of Ollama 0.32.0, do not expect agentic turns to complete on this route. |
-| M-15 | `browser:*` only: confirm the exact site (claude.ai / chatgpt.com / gemini.google.com) opens for `preferred_site` and that `browser-contract` mode's nudge/salvage narration appears in logs, not stdout. |
+| M-15 | `browser:*` only: confirm the exact site (chatgpt.com / gemini.google.com / chat.deepseek.com) opens for `preferred_site` and that `browser-contract` mode's nudge/salvage narration appears in logs, not stdout. |
 
 ## The matrix
 
-| Row | browser:claude | browser:chatgpt | browser:gemini | api:claude | api:gemini(key) | api:gemini(oauth) | api:deepseek | api:ollama(proxy default; direct opt-in) |
+| Row | browser:chatgpt | browser:gemini | browser:deepseek | api:claude | api:gemini(key) | api:gemini(oauth) | api:deepseek | api:ollama(proxy default; direct opt-in) |
 |---|---|---|---|---|---|---|---|---|
 | **Interactive TUI chat + streaming** | proxy-translated — M-1 | proxy-translated — M-1 | proxy-translated — M-1 | native — M-1 | native — M-1 | native — M-1 | native — M-1 | native — M-1 |
 | **`/model`** | native (TUI-internal) — M-2 | native — M-2 | native — M-2 | native — M-2 | native — M-2 | native — M-2 | native — M-2 | native — M-2 |
@@ -171,7 +171,7 @@ Column-specific notes not otherwise obvious from the table:
    - point Kim at a local build: `export CODEX_BIN=/path/to/local/kimcli`
      (or `KIMCLI_BIN` for the test suite specifically).
 2. For each provider column, launch: `kim tui --provider <name>` — e.g.
-   `kim tui --provider browser:claude`, `kim tui --provider claude`,
+   `kim tui --provider browser:chatgpt`, `kim tui --provider claude`,
    `kim tui --provider gemini` (API-key mode is config-driven; OAuth mode
    requires a signed-in Kim desktop session so Tauri can inject
    `KIM_GOOGLE_ACCESS_TOKEN`), `kim tui --provider deepseek`,

@@ -514,10 +514,16 @@ class TestFreshChatUrl(unittest.TestCase):
         p = _provider(preferred_site="chatgpt")
         self.assertEqual(p._fresh_chat_url("chatgpt"), "https://chatgpt.com/")
 
-    def test_gemini_and_claude_fresh_urls(self):
+    def test_gemini_and_deepseek_fresh_urls(self):
         p = _provider()
         self.assertEqual(p._fresh_chat_url("gemini"), "https://gemini.google.com/")
-        self.assertEqual(p._fresh_chat_url("claude"), "https://claude.ai/")
+        self.assertEqual(p._fresh_chat_url("deepseek"), "https://chat.deepseek.com/")
+
+    def test_claude_and_grok_are_no_longer_known_sites(self):
+        # Goal A: browser:claude and browser:grok were removed entirely.
+        p = _provider()
+        self.assertIsNone(p._fresh_chat_url("claude"))
+        self.assertIsNone(p._fresh_chat_url("grok"))
 
     def test_unknown_site_returns_none(self):
         p = _provider()

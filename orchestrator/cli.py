@@ -132,7 +132,7 @@ def resolve_log_dir() -> Path:
 
 
 def _cli_provider_type(value: str) -> str:
-    """Allow `browser:claude` / `browser:chatgpt` (desktop) as well as plain provider names."""
+    """Allow `browser:chatgpt` / `browser:gemini` (desktop) as well as plain provider names."""
     s = (value or "").strip().lower()
     base = {"claude", "openai", "gemini", "deepseek", "browser", "ollama"}
     if s in base:

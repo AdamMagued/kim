@@ -351,8 +351,17 @@ class TestBuildHistoryRecap(unittest.TestCase):
 class TestSiteConfigs(unittest.TestCase):
     def test_all_required_sites(self):
         from orchestrator.providers.browser.site_configs import SITE_CONFIGS
-        for name in ("claude", "chatgpt", "gemini", "deepseek", "grok"):
+        for name in ("chatgpt", "gemini", "deepseek"):
             assert name in SITE_CONFIGS, f"Missing site: {name}"
+
+    def test_claude_and_grok_removed(self):
+        # Goal A: the browser:claude and browser:grok sites were removed
+        # entirely. This does NOT touch the API "claude" provider
+        # (AnthropicProvider, model.claude/api:claude) — only the browser
+        # SITE_CONFIGS entry that drove automated Chrome against claude.ai.
+        from orchestrator.providers.browser.site_configs import SITE_CONFIGS
+        assert "claude" not in SITE_CONFIGS
+        assert "grok" not in SITE_CONFIGS
 
     def test_site_has_required_keys(self):
         from orchestrator.providers.browser.site_configs import SITE_CONFIGS
@@ -372,7 +381,7 @@ class TestSiteConfigs(unittest.TestCase):
 class TestReExportShim(unittest.TestCase):
     def test_site_configs_importable_from_shim(self):
         from orchestrator.providers.browser_provider import SITE_CONFIGS
-        assert "claude" in SITE_CONFIGS
+        assert "chatgpt" in SITE_CONFIGS
 
     def test_browser_provider_lazy_import(self):
         import orchestrator.providers.browser_provider as mod

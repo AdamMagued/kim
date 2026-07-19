@@ -106,8 +106,11 @@ class TestApplyEffort(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(applied)
 
     async def test_noop_for_unknown_site(self):
+        # "claude" is the removed browser-site (browser:claude no longer
+        # exists as a SITE_CONFIGS entry / effort recipe) — a genuinely
+        # unrecognized site for this module.
         page = _FakePage(True, [])
-        applied = await apply_effort(page, "deepseek", "high")
+        applied = await apply_effort(page, "claude", "high")
         self.assertFalse(applied)
 
     async def test_clicks_matching_item_for_chatgpt_high(self):
@@ -122,6 +125,21 @@ class TestApplyEffort(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(page._trigger.clicked)
         self.assertTrue(items[2].clicked)  # "pro" is high's first search term
         self.assertFalse(items[1].clicked)
+
+    async def test_prefers_exact_thinking_over_thinking_mini_for_chatgpt_medium(self):
+        # Regression: "thinking" is a substring of both "Thinking" and
+        # "Thinking mini" — an exact (case-insensitive) label match must
+        # win over a longer substring match, even when the longer one
+        # appears first in the DOM.
+        items = [
+            _FakeElement("Thinking mini"),
+            _FakeElement("Thinking"),
+        ]
+        page = _FakePage(True, items)
+        applied = await apply_effort(page, "chatgpt", "medium")
+        self.assertTrue(applied)
+        self.assertTrue(items[1].clicked)
+        self.assertFalse(items[0].clicked)
 
     async def test_clicks_matching_item_for_gemini_medium(self):
         items = [

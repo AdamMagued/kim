@@ -46,7 +46,7 @@ export function useAuthStatus(provider: string | null | undefined) {
   const inFlightProviderRef = useRef<string | null>(null);
 
   const normalized = (provider ?? '').toLowerCase().replace(/^browser:/, '').trim();
-  const supported = ['chatgpt', 'openai', 'claude', 'anthropic', 'gemini', 'google', 'deepseek', 'grok'].includes(normalized);
+  const supported = ['chatgpt', 'openai', 'claude', 'anthropic', 'gemini', 'google', 'deepseek'].includes(normalized);
 
   const refresh = useCallback(async () => {
     if (!normalized || !supported) {

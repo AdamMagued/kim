@@ -56,7 +56,7 @@ the listed source files before relying on them.
 | `KIM_OLLAMA_KEEP_ALIVE` | `orchestrator/providers/ollama.py` | Ollama `keep_alive` value (default `5m`); env wins over config `ollama.keep_alive`. |
 | `KIM_OLLAMA_LOCAL_MODEL` | `orchestrator/providers/ollama.py` | Model name used in Ollama local mode; env wins over config `ollama.local_model`. |
 | `KIM_OLLAMA_MODE` | `orchestrator/providers/ollama.py` | Ollama mode: `local` or `cloud` (invalid values fall back to `local`); env wins over config `ollama.mode`. |
-| `KIM_PREFERRED_SITE` | `orchestrator/providers/browser/provider.py` | Overrides the browser provider's preferred web-chat site (e.g. `claude`, `chatgpt`, `gemini`); env wins over config `browser_provider.preferred_site`. |
+| `KIM_PREFERRED_SITE` | `orchestrator/providers/browser/provider.py` | Overrides the browser provider's preferred web-chat site (e.g. `chatgpt`, `gemini`, `deepseek`); env wins over config `browser_provider.preferred_site`. |
 | `KIM_PROJECT_ROOT` | `cli/src/sessions.rs`, `desktop/src-tauri/src/paths.rs` | Overrides Kim project-root resolution — wins over the compile-time baked path and `~/.kim_root`, but only accepted when it is a real Kim root (contains `orchestrator/agent.py`). |
 | `KIM_PROVIDER` | `orchestrator/codex_bridge_service.py` | TODO — undocumented |
 | `KIM_REAL_BROWSER_CDP_PORT` | `desktop/src-tauri/src/lib.rs`, `mcp_server/tools/web/browser.py`, `orchestrator/providers/browser/site_configs.py` | CDP port (default 9222) of the user's *real* Chrome/Chromium when driving it instead of the dedicated profile. |

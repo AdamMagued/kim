@@ -349,9 +349,9 @@ mod tests {
     fn browser_providers_are_ready_without_api_key() {
         for name in &[
             "browser",
-            "browser:claude",
             "browser:chatgpt",
             "browser:gemini",
+            "browser:deepseek",
         ] {
             let config = KimConfig {
                 provider: name.to_string(),

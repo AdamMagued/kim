@@ -15,37 +15,39 @@ from orchestrator.providers.browser.site_configs import detect_auth_wall
 
 class DetectAuthWallTest(unittest.TestCase):
     def test_login_urls_detected(self):
+        # claude.ai/grok URLs previously exercised here were purely generic
+        # login/Cloudflare marker checks (site-agnostic) — re-pointed to the
+        # surviving sites (chatgpt/gemini/deepseek) after Goal A removed the
+        # browser:claude and browser:grok sites entirely.
         for url in (
             "https://chatgpt.com/auth/login",
-            "https://claude.ai/login?returnTo=/new",
+            "https://chat.deepseek.com/login?returnTo=/new",
             "https://accounts.google.com/v3/signin/identifier?x=1",
             "https://auth.openai.com/authorize",
             "https://gemini.google.com/signin",
-            "https://x.com/i/grok/sign-in",
         ):
             self.assertIsNotNone(detect_auth_wall(url), url)
 
     def test_cloudflare_challenges_detected(self):
         self.assertIsNotNone(detect_auth_wall("https://challenges.cloudflare.com/turnstile"))
-        self.assertIsNotNone(detect_auth_wall("https://claude.ai/?__cf_chl_tk=abc"))
-        self.assertIsNotNone(detect_auth_wall("https://claude.ai/cdn-cgi/challenge-platform/x"))
+        self.assertIsNotNone(detect_auth_wall("https://chatgpt.com/?__cf_chl_tk=abc"))
+        self.assertIsNotNone(detect_auth_wall("https://chatgpt.com/cdn-cgi/challenge-platform/x"))
 
     def test_interstitial_titles_detected(self):
-        self.assertIsNotNone(detect_auth_wall("https://claude.ai/new", "Just a moment..."))
+        self.assertIsNotNone(detect_auth_wall("https://chatgpt.com/new", "Just a moment..."))
         self.assertIsNotNone(detect_auth_wall("https://chatgpt.com/", "Sign in to ChatGPT"))
-        self.assertIsNotNone(detect_auth_wall("https://claude.ai/", "Attention Required!"))
+        self.assertIsNotNone(detect_auth_wall("https://gemini.google.com/", "Attention Required!"))
 
     def test_healthy_chat_urls_pass(self):
         for url in (
             "https://gemini.google.com/app/12ab34",
             "https://chatgpt.com/c/abc-123",
-            "https://claude.ai/chat/uuid-1",
             "https://chat.deepseek.com/a/chat",
             "",
         ):
             self.assertIsNone(detect_auth_wall(url), url)
         # Titles of healthy chats don't trip the title markers.
-        self.assertIsNone(detect_auth_wall("https://claude.ai/chat/x", "Claude"))
+        self.assertIsNone(detect_auth_wall("https://chatgpt.com/c/x", "ChatGPT"))
 
 
 class _WallPage:

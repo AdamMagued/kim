@@ -50,7 +50,7 @@ from orchestrator.cron_store import CronStore
     ("browser", True),
     ("browser:gemini", True),
     ("browser:chatgpt", True),
-    ("browser:claude", True),
+    ("browser:deepseek", True),
     ("BROWSER:GEMINI", True),
     # Refused
     ("openai", False),

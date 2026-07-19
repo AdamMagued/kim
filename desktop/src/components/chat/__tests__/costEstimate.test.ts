@@ -28,7 +28,7 @@ describe('cost estimation (F-F-7)', () => {
   it('local providers are zero-cost and browser variants normalize to free', () => {
     expect(estimateCostUsd('ollama', 1_000_000, 1_000_000)).toBe(0);
     expect(estimateCostUsd('browser', 1_000_000, 1_000_000)).toBe(0);
-    expect(estimateCostUsd('browser:claude', 500, 500)).toBe(0);
+    expect(estimateCostUsd('browser:chatgpt', 500, 500)).toBe(0);
     expect(costBasisLabel('browser:chatgpt')).toContain('$0');
   });
 

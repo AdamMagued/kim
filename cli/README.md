@@ -108,9 +108,9 @@ kim doctor             same check from your normal shell
 /chat                  switch to chat mode
 /code                  switch to code mode
 /login ollama          local models, no API key
-/login browser:claude  Claude through Kim desktop, no API key
-/login browser:chatgpt ChatGPT through Kim desktop, no API key
-/login browser:gemini  Gemini through Kim desktop, no API key
+/login browser:chatgpt  ChatGPT through Kim desktop, no API key
+/login browser:gemini   Gemini through Kim desktop, no API key
+/login browser:deepseek DeepSeek through Kim desktop, no API key
 /provider              list providers
 /status                show current mode/provider/config
 ```

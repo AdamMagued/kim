@@ -48,6 +48,14 @@ _AUTH_WALL_URL_MARKERS = (
 
 # Page titles of well-known interstitials (checked case-insensitively when a
 # title is available; URL detection alone already covers the common cases).
+# NOTE(deepseek, UNVERIFIED): deepseek's sign-in is often an in-page modal
+# rather than a URL/title change, so this URL/title-only check can miss it
+# and a turn will hang until GENERATION_WAIT_S. "sign in" / "log in" below
+# already catch it IF the modal happens to update document.title (e.g. to
+# something starting with "Sign in to DeepSeek"), but that is unconfirmed —
+# TODO(unverified): robust deepseek modal detection needs a DOM check
+# (e.g. a login-modal selector) added in provider.py's auth-wall probe,
+# not here — this module has no page/DOM access, only url/title strings.
 _AUTH_WALL_TITLE_MARKERS = (
     "just a moment",          # Cloudflare
     "attention required",     # Cloudflare block page
@@ -98,10 +106,23 @@ def auth_wall_response(site: str, reason: str) -> dict:
     }
 
 
+# NOTE(chatgpt popup collision): bare "Continue" used to live here, but the
+# dismiss check in provider.py._dismiss_popups() is a plain XPath
+# `contains(translate(., UPPER, lower), label)` substring test against the
+# button's full text — it cannot express "Continue" but not "Continue
+# generating" (both contain "continue"). In a reused ChatGPT tab that
+# ambiguity would auto-click "Continue generating" mid-response. Since the
+# match is substring-only and this module has no way to add a word-boundary
+# or negative-match condition from the label list alone, "Continue" is
+# dropped entirely here rather than risk that collision — a real consent
+# "Continue" popup will fall through to the Escape-key sweep or one of the
+# other labels below instead of an auto-click.
+# TODO(unverified, provider.py): a proper fix would make _dismiss_popups()'s
+# matcher exact/word-boundary aware (e.g. normalize-space equality, or
+# `and not(contains(., 'generating'))`) so "Continue" can safely come back.
 _POPUP_DISMISS_LABELS = [
     "I agree",
     "Got it",
-    "Continue",
     "Accept",
     "OK",
     "Dismiss",
@@ -110,30 +131,6 @@ _POPUP_DISMISS_LABELS = [
 ]
 
 SITE_CONFIGS: dict[str, dict] = {
-    "claude": {
-        "url_pattern": "claude.ai",
-        "input_selectors": [
-            'div[contenteditable="true"].ProseMirror',
-            'div[contenteditable="true"]',
-        ],
-        "send_selectors": [
-            'button[aria-label*="Send"]',
-            'button[aria-label*="send"]',
-        ],
-        "stop_selectors": [
-            'button[aria-label*="Stop"]',
-            'button[aria-label*="stop"]',
-        ],
-        "response_selectors": [
-            '[data-testid^="conversation-turn"]',
-            '.font-claude-message',
-        ],
-        "upload_button_selectors": [
-            'button[aria-label*="Attach"]',
-            'button[aria-label*="attach"]',
-            'button[aria-label*="Upload"]',
-        ],
-    },
     "chatgpt": {
         "url_pattern": "chatgpt.com",
         "input_selectors": [
@@ -198,29 +195,6 @@ SITE_CONFIGS: dict[str, dict] = {
         ],
         "response_selectors": [
             "div.ds-markdown",
-        ],
-        "upload_button_selectors": [
-            'button[aria-label*="Upload"]',
-            'button[aria-label*="Attach"]',
-        ],
-    },
-    "grok": {
-        "url_pattern": "grok.com",
-        "input_selectors": [
-            "textarea",
-            'div[contenteditable="true"]',
-        ],
-        "send_selectors": [
-            'button[aria-label*="Send"]',
-            'button[type="submit"]',
-        ],
-        "stop_selectors": [
-            'button[aria-label*="Stop"]',
-        ],
-        "response_selectors": [
-            "article",
-            "div.markdown",
-            '[data-testid*="message"]',
         ],
         "upload_button_selectors": [
             'button[aria-label*="Upload"]',

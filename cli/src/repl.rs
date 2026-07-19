@@ -225,7 +225,7 @@ fn print_repl_header(app: &App) {
     } else {
         println!(
             "{}",
-            paint_dim("Not signed in yet. Run /login ollama, /login claude, /login browser:claude, or /provider <name>.")
+            paint_dim("Not signed in yet. Run /login ollama, /login claude, /login browser:chatgpt, or /provider <name>.")
         );
     }
     println!();

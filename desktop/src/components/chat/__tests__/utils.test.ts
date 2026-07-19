@@ -11,7 +11,7 @@ describe('estimateCostUsd', () => {
   });
 
   it('returns 0 for browser:* session providers (B5 — not claude rates)', () => {
-    expect(estimateCostUsd('browser:claude', 100_000, 50_000)).toBe(0);
+    expect(estimateCostUsd('browser:deepseek', 100_000, 50_000)).toBe(0);
     expect(estimateCostUsd('browser:chatgpt', 1_000_000, 1_000_000)).toBe(0);
     expect(estimateCostUsd('BROWSER:Gemini', 500_000, 500_000)).toBe(0);
   });
@@ -185,10 +185,10 @@ describe('estimateCostUsd — provider normalization regression', () => {
     expect(estimateCostUsd('gpt-4-turbo', 500_000, 200_000)).toBeNull();
   });
 
-  it('estimateCostUsd_null_for_unknown_provider: browser:claude normalizes to zero-cost', () => {
+  it('estimateCostUsd_null_for_unknown_provider: browser:chatgpt normalizes to zero-cost', () => {
     // browser:* providers are free local sessions and must not be billed at claude rates.
-    expect(estimateCostUsd('browser:claude', 2_000_000, 2_000_000)).toBe(0);
-    expect(estimateCostUsd('BROWSER:CLAUDE', 1_000_000, 1_000_000)).toBe(0);
+    expect(estimateCostUsd('browser:chatgpt', 2_000_000, 2_000_000)).toBe(0);
+    expect(estimateCostUsd('BROWSER:CHATGPT', 1_000_000, 1_000_000)).toBe(0);
   });
 
   it('estimateCostUsd_null_for_unknown_provider: known providers compute a positive number', () => {

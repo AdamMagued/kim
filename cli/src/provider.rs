@@ -285,12 +285,6 @@ pub const PROVIDERS: &[ProviderInfo] = &[
         default_base_url: "http://127.0.0.1:18991",
     },
     ProviderInfo {
-        name: "browser:claude",
-        default_model: "browser-claude",
-        key_env: None,
-        default_base_url: "http://127.0.0.1:18991",
-    },
-    ProviderInfo {
         name: "browser:chatgpt",
         default_model: "browser-chatgpt",
         key_env: None,
@@ -302,9 +296,15 @@ pub const PROVIDERS: &[ProviderInfo] = &[
         key_env: None,
         default_base_url: "http://127.0.0.1:18991",
     },
+    ProviderInfo {
+        name: "browser:deepseek",
+        default_model: "browser-deepseek",
+        key_env: None,
+        default_base_url: "http://127.0.0.1:18991",
+    },
 ];
 
-/// Returns true for any browser-backed provider (`browser`, `browser:claude`, etc.).
+/// Returns true for any browser-backed provider (`browser`, `browser:chatgpt`, etc.).
 /// These are keyless and require the Kim desktop app to be running as a bridge.
 pub fn is_browser_provider(name: &str) -> bool {
     let n = name.trim();
@@ -396,7 +396,7 @@ pub async fn stream_kim_request(
     }
 
     // Desktop bridge or browser provider in chat mode: forward to running Tauri app.
-    // Browser providers pass the provider name (e.g. "browser:claude") to /v1/task so
+    // Browser providers pass the provider name (e.g. "browser:chatgpt") to /v1/task so
     // the desktop app can route to the correct browser tab.
     if config.provider == "desktop" || is_browser_provider(&config.provider) {
         if is_bridge_available(&config.desktop_bridge_url).await {
@@ -705,21 +705,24 @@ mod tests {
     fn browser_providers_are_in_providers_list() {
         for name in &[
             "browser",
-            "browser:claude",
             "browser:chatgpt",
             "browser:gemini",
+            "browser:deepseek",
         ] {
             let info = provider_info(name).unwrap_or_else(|| panic!("missing provider: {name}"));
             assert!(info.key_env.is_none(), "{name} must be keyless");
         }
+        // Goal A: browser:claude / browser:grok were removed (API "claude" is unaffected).
+        assert!(provider_info("browser:claude").is_none());
+        assert!(provider_info("browser:grok").is_none());
     }
 
     #[test]
     fn is_browser_provider_all_variants() {
         assert!(is_browser_provider("browser"));
-        assert!(is_browser_provider("browser:claude"));
         assert!(is_browser_provider("browser:chatgpt"));
         assert!(is_browser_provider("browser:gemini"));
+        assert!(is_browser_provider("browser:deepseek"));
         assert!(is_browser_provider("BROWSER"));
         assert!(!is_browser_provider("claude"));
         assert!(!is_browser_provider("openai"));

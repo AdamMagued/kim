@@ -428,8 +428,8 @@ fn browser_provider_routes_task_through_bridge_with_token() {
         other => panic!("unexpected bridge request: {other:?}"),
     });
     let config = serde_json::json!({
-        "provider": "browser:claude",
-        "model": "browser-claude",
+        "provider": "browser:chatgpt",
+        "model": "browser-chatgpt",
         "theme": "dark-neovim",
         "ollama_base_url": "http://127.0.0.1:1",
         "desktop_bridge_url": server.base_url,
@@ -480,7 +480,7 @@ fn browser_provider_routes_task_through_bridge_with_token() {
         "the CLI conversation id must be forwarded so /new resets the desktop browser thread; body: {body}"
     );
     assert_eq!(
-        body["provider"], "browser:claude",
+        body["provider"], "browser:chatgpt",
         "provider name must be forwarded so desktop routes to the right browser tab"
     );
 }

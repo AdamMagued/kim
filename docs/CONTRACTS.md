@@ -432,7 +432,7 @@ codex binary ──JSON-RPC (app-server)──▶ transport.py ──emit_*─�
      ▲                                       │
      │  model call (OpenAI Responses)        │ approval/user-input answer (stdin line)
      ▼                                       ▼
- _CodexProxy ──complete()──▶ BrowserProvider ──▶ provider webview (claude.ai / chatgpt / …)
+ _CodexProxy ──complete()──▶ BrowserProvider ──▶ provider webview (chatgpt.com / gemini / …)
 ```
 
 The browser provider itself has its own contract (`[END_OF_RESPONSE_{id}]` sentinel — a

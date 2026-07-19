@@ -77,8 +77,9 @@ mod tests {
         // whatever KIM_TUI_OLLAMA_DIRECT happens to be in this test process
         // — the opt-in only affects the "ollama" branch.
         for provider in [
-            "browser:claude",
             "browser:chatgpt",
+            "browser:gemini",
+            "browser:deepseek",
             "browser",
             "claude",
             "gemini",
@@ -98,7 +99,7 @@ mod tests {
     fn routing_table_ollama_env_opt_in_is_the_only_thing_that_flips_the_route() {
         // Exhaustively cover the opt-in branch via the injected-env core —
         // see the two tests below for the exact truth table.
-        for provider in ["browser:claude", "claude", "gemini", "ollama-cloud", ""] {
+        for provider in ["browser:deepseek", "claude", "gemini", "ollama-cloud", ""] {
             assert_eq!(
                 route_for_provider_with_env(provider, "some-model", |_| Some("1".to_string())),
                 TuiRoute::Proxy,

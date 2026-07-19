@@ -191,7 +191,7 @@ class RelayCapTurnBoundaryTests(unittest.IsolatedAsyncioTestCase):
         # Regression guard: one turn, well under the default 50-relay budget,
         # behaves exactly as before (no params passed -> module defaults).
         provider = _RecordingBrowserLikeProvider([{"type": "text", "content": json.dumps({"text": "done"})}])
-        proxy = _CodexProxy(provider, provider_name="browser:claude")
+        proxy = _CodexProxy(provider, provider_name="browser:chatgpt")
         body = {"input": [{"role": "user", "content": "do the thing"}]}
         resp = await proxy._handle_responses(_request(proxy, body))
         self.assertEqual(resp.status, 200)

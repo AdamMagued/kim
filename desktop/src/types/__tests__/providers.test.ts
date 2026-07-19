@@ -77,24 +77,16 @@ describe('all_providers_grid', () => {
 // ── 3. browser_vs_api_provider_sets ──────────────────────────────────────────
 
 describe('browser_vs_api_provider_sets', () => {
-  it('BROWSER_PROVIDERS includes grok', () => {
-    const ids = BROWSER_PROVIDERS.map((p) => p.id);
-    expect(ids).toContain('grok');
-  });
-
   it('BROWSER_PROVIDERS includes chatgpt', () => {
     const ids = BROWSER_PROVIDERS.map((p) => p.id);
     expect(ids).toContain('chatgpt');
   });
 
-  it('BROWSER_PROVIDERS contains exactly claude, chatgpt, gemini, grok, deepseek', () => {
+  it('BROWSER_PROVIDERS contains exactly chatgpt, gemini, deepseek (claude + grok removed)', () => {
     const ids = BROWSER_PROVIDERS.map((p) => p.id);
-    expect(ids).toEqual(['claude', 'chatgpt', 'gemini', 'grok', 'deepseek']);
-  });
-
-  it('BROWSER_PROVIDERS grok label is Grok', () => {
-    const entry = BROWSER_PROVIDERS.find((p) => p.id === 'grok');
-    expect(entry!.label).toBe('Grok');
+    expect(ids).toEqual(['chatgpt', 'gemini', 'deepseek']);
+    expect(ids).not.toContain('claude');
+    expect(ids).not.toContain('grok');
   });
 
   it('BROWSER_PROVIDERS chatgpt label is ChatGPT', () => {

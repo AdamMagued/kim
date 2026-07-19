@@ -1,7 +1,7 @@
 """
 Per-phase timeout enforcement for a browser LLM turn (K-TIMEOUT).
 
-Bug this fixes: a browser:claude/chatgpt/gemini turn could sit on
+Bug this fixes: a browser:chatgpt/gemini/deepseek turn could sit on
 "Working…" indefinitely with the tab NEVER actually driven — no timeout, no
 error, no NEED_HELP, and no way to tell from the logs whether Kim was still
 typing the prompt, waiting on the site, or simply stuck. The likely

@@ -159,7 +159,7 @@ const PROVIDER_OPTIONS: { value: string; label: string }[] = [
   { value: 'browser', label: 'browser' },
   { value: 'browser:gemini', label: 'browser:gemini' },
   { value: 'browser:chatgpt', label: 'browser:chatgpt' },
-  { value: 'browser:claude', label: 'browser:claude' },
+  { value: 'browser:deepseek', label: 'browser:deepseek' },
 ];
 
 // ---------------------------------------------------------------------------

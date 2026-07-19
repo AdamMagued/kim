@@ -70,11 +70,11 @@ class TestRunPhase(unittest.IsolatedAsyncioTestCase):
 
         start = time.monotonic()
         with self.assertRaises(PhaseTimeout) as ctx:
-            await run_phase(_never(), phase="submit", timeout_s=0.05, site="claude")
+            await run_phase(_never(), phase="submit", timeout_s=0.05, site="chatgpt")
         elapsed = time.monotonic() - start
         self.assertLess(elapsed, 2.0)  # fails fast, not after the full sleep
         self.assertEqual(ctx.exception.phase, "submit")
-        self.assertEqual(ctx.exception.site, "claude")
+        self.assertEqual(ctx.exception.site, "chatgpt")
 
     async def test_underlying_exception_propagates_unchanged(self):
         async def _boom():
@@ -126,14 +126,14 @@ class _StuckComposerPage:
     it hangs — simulates the QA repro: tab open, but never actually driven
     (the "submit" phase)."""
 
-    site = "claude"
+    site = "chatgpt"
 
     class _Keyboard:
         async def press(self, key: str) -> None:
             return None
 
     def __init__(self) -> None:
-        self.url = "https://claude.ai/new"
+        self.url = "https://chatgpt.com/new"
         self.keyboard = self._Keyboard()
 
     def locator(self, selector: str) -> "_StuckComposerPage":
@@ -185,7 +185,7 @@ class _StuckComposerDriver:
         # _StuckComposerPage is a minimal structural fake — cast rather than
         # chase pyright's invariant-field/self-referential-Protocol checks
         # for a test double never used as a real LocatorLike elsewhere.
-        return cast(PageLike, self.page), "claude"
+        return cast(PageLike, self.page), "chatgpt"
 
 
 class TestBrowserTurnNeverHangsForever(unittest.IsolatedAsyncioTestCase):

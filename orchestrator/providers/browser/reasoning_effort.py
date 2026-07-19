@@ -2,15 +2,14 @@
 Reasoning-effort control for browser-driven LLM providers (K-EFFORT).
 
 Kim's "effort" concept (low/medium/high) is a first-class wire param for the
-OpenAI-Responses provider, but the browser-contract path (claude.ai,
-chatgpt.com, gemini.google.com) previously dropped it entirely — there is no
-`reasoning_effort` field these sites accept over HTTP; effort only exists as
-an on-page model/thinking-mode control.
+OpenAI-Responses provider, but the browser-contract path (chatgpt.com,
+gemini.google.com, chat.deepseek.com) previously dropped it entirely — there
+is no `reasoning_effort` field these sites accept over HTTP; effort only
+exists as an on-page model/thinking-mode control.
 
 URL-parameter research (live Playwright probing, see the PR this shipped
-with): none of the three sites honor a query param to select reasoning mode.
-ChatGPT strips `?model=...`, Gemini ignores it, Claude never exposes the
-composer to an unauthenticated tab at all. So the only real mechanism is
+with): none of the sites honor a query param to select reasoning mode.
+ChatGPT strips `?model=...`, Gemini ignores it. So the only real mechanism is
 clicking the on-page control — this module does that, defensively.
 
 Design:
@@ -33,10 +32,10 @@ against unauthenticated sessions (2026-07):
       / "3.1 Pro" (Thinking/Pro disabled until signed in) — matched here by
       case-insensitive substring so a future version-number bump doesn't
       break the match.
-    - claude.ai: fully login-gated during research (redirects to a logged-out
-      marketing page) — candidate selectors below are best-effort and MUST
-      be treated as unverified; apply_effort()'s no-op path is what makes
-      shipping them safe.
+    - chat.deepseek.com: UNVERIFIED (not probed live — see recipe comment
+      below). DeepSeek's "effort" isn't a tiered picker like the others, it's
+      a DeepThink (R1) on/off toggle, so this recipe maps low -> leave off,
+      medium/high -> enable DeepThink.
 """
 from __future__ import annotations
 
@@ -73,18 +72,28 @@ _RECIPES: dict[str, dict] = {
             "high": ("pro", "thinking"),
         },
     },
-    "claude": {
-        # UNVERIFIED live (claude.ai was fully login-gated during research —
-        # see module docstring). Kept deliberately generous; a no-match is a
-        # safe, logged no-op, not a crash.
+    "deepseek": {
+        # UNVERIFIED (not probed live — see module docstring). DeepSeek's
+        # effort control is a DeepThink (R1) on/off toggle in the composer,
+        # not a tiered model picker like chatgpt/gemini — apply_effort()'s
+        # generic open-trigger-then-click-matching-item flow is a loose fit
+        # here, but is reused as-is to keep this module's mechanism uniform;
+        # any mismatch degrades to a safe no-op (leaves DeepThink alone).
         "trigger_selectors": [
-            'button[data-testid="model-selector-dropdown"]',
-            'button[aria-label*="Model"]',
+            'button[aria-label*="DeepThink"]',
+            'button[aria-label*="R1"]',
+            'button:has-text("DeepThink")',
         ],
         "level_terms": {
-            "low": ("sonnet",),
-            "medium": ("extended thinking", "thinking"),
-            "high": ("opus", "extended thinking", "thinking"),
+            # low: DeepSeek's own default (plain chat / V3, DeepThink off).
+            # No item is expected to match this — that's the intended
+            # no-op, since "off" means not clicking the toggle at all.
+            "low": ("deepseek chat", "v3"),
+            # medium/high both map to enabling DeepThink (R1) — DeepSeek
+            # exposes reasoning as a single on/off toggle, not tiers, so
+            # there's no further distinction available between the two.
+            "medium": ("deepthink", "r1"),
+            "high": ("deepthink", "r1"),
         },
     },
 }
@@ -184,21 +193,45 @@ async def apply_effort(page, site: str, effort: Optional[str], *, log=None) -> b
             return False
 
         for term in terms:
+            # Prefer an EXACT (case-insensitive) label match over a
+            # substring match — e.g. chatgpt's "Thinking" and "Thinking
+            # mini" both contain the substring "thinking", and a naive
+            # first-substring-wins scan can click the wrong tier. Among
+            # substring matches (no exact match found), prefer the
+            # SHORTEST item text, since a longer/more-qualified label
+            # ("Thinking mini") is a more specific, different option than
+            # the bare term ("Thinking").
+            exact_item = None
+            exact_text = ""
+            best_item = None
+            best_text = ""
             for i in range(count):
                 try:
                     item = item_loc.nth(i)
                     if not await item.is_visible():
                         continue
                     text = (await item.inner_text() or "").strip().lower()
-                    if term in text:
-                        await item.click()
-                        picker_closed = True
-                        log.info(
-                            "reasoning_effort: set %s effort=%s via %r", site, effort, text[:60],
-                        )
-                        return True
                 except Exception:
                     continue
+                if not text:
+                    continue
+                if text == term:
+                    exact_item, exact_text = item, text
+                    break  # can't do better than an exact match
+                if term in text and (best_item is None or len(text) < len(best_text)):
+                    best_item, best_text = item, text
+
+            chosen_item, chosen_text = (exact_item, exact_text) if exact_item is not None else (best_item, best_text)
+            if chosen_item is not None:
+                try:
+                    await chosen_item.click()
+                except Exception:
+                    continue
+                picker_closed = True
+                log.info(
+                    "reasoning_effort: set %s effort=%s via %r", site, effort, chosen_text[:60],
+                )
+                return True
 
         log.warning(
             "reasoning_effort: opened %s's picker but found no item matching %s "

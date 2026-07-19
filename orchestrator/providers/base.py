@@ -286,7 +286,8 @@ def create_provider(name: str, config: dict) -> BaseProvider:
     """
     Factory — returns a provider instance for the given name.
     Names: "claude", "openai", "gemini", "deepseek", "browser", "ollama", "fake"
-    Also: "browser:claude", "browser:chatgpt", … (sets browser_provider.preferred_site).
+    Also: "browser:chatgpt", "browser:gemini", "browser:deepseek", … (sets
+    browser_provider.preferred_site).
 
     KIM_FAKE=1 env var forces the "fake" provider regardless of config/args.
 

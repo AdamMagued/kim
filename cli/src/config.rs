@@ -55,7 +55,7 @@ pub struct KimConfig {
     pub desktop_bridge_url: String,
     pub api_keys: BTreeMap<String, String>,
     /// `kim tui` default provider (overridable per-run with `--provider`).
-    /// `None` falls back to "browser:claude".
+    /// `None` falls back to "browser:chatgpt".
     pub tui_provider: Option<String>,
     /// `kim tui` default model (overridable per-run with `--model`). `None`
     /// falls back to `model` above.

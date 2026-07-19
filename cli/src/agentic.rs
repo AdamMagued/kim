@@ -574,7 +574,7 @@ mod tests {
         // local Playwright agent exactly like a normal provider (ollama), so
         // both must agree on availability in whatever environment the test runs.
         assert_eq!(
-            agentic_available("browser:claude").is_some(),
+            agentic_available("browser:chatgpt").is_some(),
             agentic_available("ollama").is_some(),
         );
     }

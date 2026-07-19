@@ -861,10 +861,8 @@ export const PROVIDER_LABELS: Record<string, string> = {
   deepseek: 'DeepSeek',
   ollama: 'Ollama',
   browser: 'Browser',
-  'browser:claude': 'Browser Claude',
   'browser:chatgpt': 'Browser ChatGPT',
   'browser:gemini': 'Browser Gemini',
-  'browser:grok': 'Browser Grok',
   'browser:deepseek': 'Browser DeepSeek',
   'browser:custom': 'Browser Custom',
 };
@@ -881,20 +879,16 @@ export function providerLabel(provider: string): string {
 }
 
 export const BROWSER_PROVIDER_URLS: Record<string, string> = {
-  claude: 'https://claude.ai/new',
   chatgpt: 'https://chatgpt.com',
   gemini: 'https://gemini.google.com/app',
-  grok: 'https://grok.com',
   deepseek: 'https://chat.deepseek.com',
 };
 
 export function normalizeBrowserSite(site?: string | null): string | null {
   const s = String(site ?? '').trim().toLowerCase();
-  if (s === 'claude' || s === 'claude.ai' || s.includes('claude.ai')) return 'claude';
   if (s === 'chatgpt' || s === 'openai' || s === 'gpt' || s.includes('chatgpt.com') || s.includes('openai.com')) return 'chatgpt';
   if (s === 'gemini' || s === 'google' || s.includes('gemini.google.com')) return 'gemini';
   if (s === 'deepseek' || s.includes('deepseek.com')) return 'deepseek';
-  if (s === 'grok' || s.includes('grok.com')) return 'grok';
   if (s === 'custom') return 'custom';
   return null;
 }
