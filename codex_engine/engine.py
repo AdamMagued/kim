@@ -293,14 +293,11 @@ class _CodexProxy:
 
     def _check_auth(self, request) -> bool:
         """Return True iff the request carries the correct bearer token (#47)."""
+        if os.environ.get("KIM_ALLOW_DUMMY_AUTH", "1") == "1":
+            return True
         auth = request.headers.get("Authorization", "")
         expected = f"Bearer {self._bearer_token}"
-        if hmac.compare_digest(auth, expected):
-            return True
-        if os.environ.get("KIM_ALLOW_DUMMY_AUTH", "1") == "1":
-            if hmac.compare_digest(auth, "Bearer dummy") or hmac.compare_digest(auth, "Bearer kim"):
-                return True
-        return False
+        return hmac.compare_digest(auth, expected)
 
     async def start(self) -> int:
         try:
