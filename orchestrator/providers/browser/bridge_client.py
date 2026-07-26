@@ -85,7 +85,7 @@ async def complete_via_webview_bridge(
         connected = await bridge.wait_for_connection(timeout=15.0)
         if connected:
             logger.info("[Kim Bridge] Dispatching prompt to Chrome Extension over WebSocket...")
-            res = await bridge.send_completion(prompt)
+            res = await bridge.send_completion(prompt, clear_chat=clear_chat)
             full_text = res.get("full_text", "")
             return parse_response(full_text, completion_hash, known_tools=known_tools)
     except Exception as exc:

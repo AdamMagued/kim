@@ -27,6 +27,9 @@ class ExtensionBridgeServer:
         self.pending_requests: Dict[str, asyncio.Future] = {}
         self.streaming_callbacks: Dict[str, Callable[[str], None]] = {}
         self._runner: Optional[web.AppRunner] = None
+        # Persist conversation state across turns for single-thread continuity
+        self._current_conversation_id: Optional[str] = None
+        self._current_message_id: Optional[str] = None
 
     async def start(self):
         if self._runner is not None:
@@ -118,11 +121,25 @@ class ExtensionBridgeServer:
         conversation_id: Optional[str] = None,
         parent_message_id: Optional[str] = None,
         timeout: float = 180.0,
+        clear_chat: bool = False,
     ) -> dict[str, Any]:
         if not self.active_ws or self.active_ws.closed:
             connected = await self.wait_for_connection(timeout=10.0)
             if not connected:
                 raise RuntimeError("Chrome Extension is not connected to Kim Bridge! Open chatgpt.com in Chrome.")
+
+        # If clear_chat is requested, reset stored conversation state
+        if clear_chat:
+            logger.info("[Kim Bridge] clear_chat=True — resetting conversation state for new thread")
+            self._current_conversation_id = None
+            self._current_message_id = None
+
+        # Auto-use stored conversation state if caller didn't provide one
+        if not conversation_id and self._current_conversation_id and not clear_chat:
+            conversation_id = self._current_conversation_id
+            logger.info(f"[Kim Bridge] Continuing conversation {conversation_id[:12]}…")
+        if not parent_message_id and self._current_message_id and not clear_chat:
+            parent_message_id = self._current_message_id
 
         req_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
@@ -147,10 +164,20 @@ class ExtensionBridgeServer:
 
         try:
             res_data = await asyncio.wait_for(fut, timeout=timeout)
+
+            # Persist conversation state for next turn
+            conv_id = res_data.get("conversationId", "")
+            msg_id = res_data.get("messageId", "")
+            if conv_id:
+                self._current_conversation_id = conv_id
+                logger.info(f"[Kim Bridge] Stored conversationId={conv_id[:12]}… for next turn")
+            if msg_id:
+                self._current_message_id = msg_id
+
             return {
                 "full_text": res_data.get("fullText", ""),
-                "conversation_id": res_data.get("conversationId", ""),
-                "message_id": res_data.get("messageId", ""),
+                "conversation_id": conv_id,
+                "message_id": msg_id,
             }
         except asyncio.CancelledError:
             logger.info(f"[Kim Bridge] Request {req_id} cancelled by client — stopping ChatGPT Web generation")
