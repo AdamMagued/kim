@@ -499,7 +499,7 @@ class _CodexProxy:
                 # Stateful mode: the session's browser thread already holds the
                 # codex system prompt from a previous task — send only the new
                 # task items (env context + user task), not the instructions.
-                prompt = _extract_delta_prompt(input_items) or _extract_prompt_from_responses_request(body)
+                prompt = _extract_delta_prompt(input_items) or _extract_prompt_from_responses_request(body, include_tools=not self._uses_terminal_protocol())
                 clear_chat = False
                 if hasattr(self._provider, "mark_thread_continuation"):
                     self._provider.mark_thread_continuation()  # type: ignore[attr-defined] — browser-contract mode only
@@ -509,7 +509,7 @@ class _CodexProxy:
                 )
             else:
                 # First relay or post-compaction: send full context and start a fresh browser chat.
-                prompt = _extract_prompt_from_responses_request(body)
+                prompt = _extract_prompt_from_responses_request(body, include_tools=not self._uses_terminal_protocol())
                 clear_chat = True
                 # Ensure system prompt is re-injected when the new browser chat opens.
                 if hasattr(self._provider, '_sent_system_prompt'):
@@ -596,7 +596,7 @@ class _CodexProxy:
                 # legacy behavior: fresh chat, full context, pending handoff.
                 logger.warning(f"[relay #{relay_num}] Stored-thread send failed — retrying on a fresh chat")
                 print(f"{LOG_TAG_STATUS} Stored thread did not respond — retrying on a fresh chat…", flush=True)
-                prompt = _extract_prompt_from_responses_request(body)
+                prompt = _extract_prompt_from_responses_request(body, include_tools=not self._uses_terminal_protocol())
                 clear_chat = True
                 handoff = str(self._thread_state.get("handoff") or "").strip() or None
                 if hasattr(self._provider, '_sent_system_prompt'):
@@ -674,6 +674,15 @@ class _CodexProxy:
         self._last_proxy_response = responses_reply
 
         return _sse_or_json(stream, responses_reply)
+
+    def _uses_terminal_protocol(self) -> bool:
+        """True when this provider gets _chatgpt_terminal_system_prompt().
+
+        Kept in lockstep with _system_prompt_for: that prompt tells the model it
+        is NOT a tool runtime, so the prompt must not also carry a tool schema.
+        """
+        name = self._provider_name
+        return bool(name) and "chatgpt" in name.lower()
 
     async def _nudge_contract_retry(self, response: dict, relay_num: int) -> dict:
         """One-shot format re-ask when a reply ignored the JSON contract.
@@ -1413,15 +1422,30 @@ def _salvage_action_reply(content: object, request_tools: object) -> Optional[li
     return None
 
 
-def _extract_prompt_from_responses_request(body: dict) -> str:
-    """Extract a human-readable prompt from a Codex Responses API request."""
+def _extract_prompt_from_responses_request(body: dict, include_tools: bool = True) -> str:
+    """Extract a human-readable prompt from a Codex Responses API request.
+
+    ``include_tools`` renders codex's declared tool list into the prompt. It is
+    switched OFF for the ChatGPT terminal protocol
+    (:func:`_chatgpt_terminal_system_prompt`), which tells the model it is
+    handing shell commands to a real person and is explicitly NOT a tool
+    runtime. Showing that model a JSON tool schema at the same time is a direct
+    contradiction, and honesty-tuned ChatGPT models resolve it by refusing:
+
+        "I can't truthfully return a tool call claiming to have created a local
+         file because I don't have access to your local terminal."
+
+    This only became reachable once the configured codex model was switched off
+    the code-mode-only gpt-5.6 family — before that codex advertised no tools
+    and the section was always empty.
+    """
     parts = []
 
     instructions = body.get("instructions")
     if instructions:
         parts.append(f"[SYSTEM PROMPT]\n{instructions}\n")
 
-    tools_section = _render_codex_tools(body.get("tools"))
+    tools_section = _render_codex_tools(body.get("tools")) if include_tools else ""
     if tools_section:
         parts.append(tools_section)
 
