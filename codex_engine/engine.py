@@ -627,20 +627,6 @@ class _CodexProxy:
             response, relay_num, request_tools=body.get("tools"),
             metrics=self._thread_state.setdefault("repairs", {}),
         )
-        # Code-mode guard: the model asked to act, but codex advertised no
-        # tools to route the action through, so every call we emit would come
-        # back as `unsupported call` / `Fatal error … incompatible payload`.
-        # Say why once, in the reply the user actually sees, instead of letting
-        # the run fail opaquely (this is what silently killed stress round 1).
-        if _reply_has_tool_calls(responses_reply) and not _has_routable_tools(body.get("tools")):
-            logger.error(
-                f"[relay #{relay_num}] Model requested tool use but this codex run "
-                f"advertised no tools (model={body.get('model')!r}) — code-mode-only "
-                f"model. Ending turn with a diagnostic."
-            )
-            responses_reply = _make_responses_text_reply(
-                f"resp_{uuid.uuid4().hex[:16]}", _CODE_MODE_DIAGNOSTIC
-            )
 
         # Loop guard: if this relay's tool calls repeat the previous relay's —
         # identical, or a subset of sub-commands that already ran (`open x`
