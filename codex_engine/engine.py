@@ -466,7 +466,7 @@ class _CodexProxy:
                 {"error": {"message": "Too many relay attempts"}}, status=429,
             )
 
-        stream = bool(body.get("stream", False))
+        # `stream` is already read above, before the title interception.
         logger.info(f"[relay #{relay_num}] Codex request received, tools={json.dumps(body.get('tools', []))}")
 
         # ── Auto-compaction ──────────────────────────────────────────────────
@@ -1839,14 +1839,6 @@ def _system_prompt_for(provider_name: str) -> str:
     return _codex_browser_system_prompt()
 
 
-_TERMINAL_NUDGE = (
-    "I couldn't run that — I can only act on ONE shell command inside a single "
-    "```bash code block, and anything else is dropped. Please resend it as one short "
-    "narration line followed by the single ```bash block (for a file, use "
-    "`printf '%s' '...' > file.ext` or a python3 -c one-liner, not a heredoc). "
-    "I'll run it and paste the real output straight back. If the task is fully done, "
-    "reply with a one-line summary then DONE on its own line."
-)
 
 
 # A standalone DONE line means the model considers the task finished — end the
