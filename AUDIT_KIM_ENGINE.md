@@ -385,6 +385,14 @@ the model's entry in its built-in catalog, and the `gpt-5.6-*` family carries
 Round 1 ran on `gpt-5.6-sol` (the default in `~/.codex/config.toml`, and the
 value `CODEX_BRIDGE_SETUP.md` itself recommended). Those models expect the
 separate code-mode host protocol, so nothing the proxy emits can ever route.
+
+> **Precision note.** Round 1's logged error was `Fatal error: tool exec
+> invoked with incompatible payload`, whereas a missing tool on `gpt-5.5`
+> produces `unsupported call: exec`. The strings differ, so round 1's failure
+> is *consistent with* code-mode rather than proven to be it — plausibly a
+> code-mode runtime tool named `exec` taking a different payload. The fixes
+> below stand on their own measurements; only the attribution of round 1 is
+> inferential.
 `features.code_mode_only`, `features.code_mode` and `tool_mode` were each
 tested as config overrides; none changes the advertised tool set. Serving
 code-mode means implementing a second wire format — out of scope here, so the
@@ -403,6 +411,43 @@ codex binary now succeeds on all three paths — `apply_patch` (file created),
 the `exec` sentinel (command ran), and the bash-fence salvage ladder.
 Regression coverage: `tests/test_codex_tool_wire_shapes.py`, 17 tests, each
 row of the table above pinned.
+
+### 9.2b FIXED — two further defects the model swap uncovered
+
+Both were latent behind the code-mode configuration and became reachable the
+moment codex advertised a real tool list. Neither was catchable by the suite;
+both were found by driving the live proxy.
+
+**`KeyError: 'name'` on every relay.** Codex sends `{"type": "web_search"}` and
+`{"type": "tool_search", …}` as bare typed entries with no `name` key.
+`prompt_builder.format_prompt` and the CDP path's `known_tools` allowlist both
+indexed `t["name"]` unguarded, surfacing to codex as
+`502 Bad Gateway: LLM call failed: 'name'`. The webview-bridge path already had
+the `if "name" in t` guard; the other two did not.
+
+**The tool schema made the model refuse.** With a non-empty tool list, the
+prompt carried a JSON tool schema *and* the ChatGPT terminal system prompt,
+which says the model is handing shell commands to a person and is explicitly
+not a tool runtime. ChatGPT resolved the contradiction by refusing:
+
+> "I can't truthfully return a tool call claiming to have created a local file
+> because I don't have access to your local terminal."
+
+`_extract_prompt_from_responses_request` now takes `include_tools`, suppressed
+for the terminal protocol via `_uses_terminal_protocol()`.
+
+**Live verification.** After all three fixes, `codex exec -c model="gpt-5.5"`
+through the real proxy wrote `hello.py` to disk with exactly the requested
+contents — the first time the browser bridge has completed a file-creating
+task end to end. Both earlier attempts refused.
+
+### 9.2c The protocol fork remains YOUR decision
+
+Reverting `_system_prompt_for` to give ChatGPT the JSON contract (one of the
+two options put to you earlier) was **tested and left uncommitted**: it still
+refused on a live run and moved the suite only 15 → 14 failures. It is not a
+fix, so it did not get folded into a commit — but the 13 protocol-change test
+failures in §5 still reflect an unresolved design choice, not a bug.
 
 ### 9.3 OPEN — the loop guard fires on two identical read-only inspections
 
