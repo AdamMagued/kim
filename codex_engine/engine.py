@@ -2121,6 +2121,10 @@ def _make_responses_tool_reply(
 
     if text:
         output_items.append({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": text}],
+        })
+        output_items.append({
             "type": "message",
             "role": "assistant",
             "content": [{"type": "output_text", "text": text}],
