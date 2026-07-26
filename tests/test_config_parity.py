@@ -43,7 +43,7 @@ _REPO = Path(__file__).resolve().parent.parent
 _CANONICAL_YAML = _REPO / "config.yaml.example"
 
 # The single source of truth every layer must agree with.
-CANONICAL_PROVIDER = "ollama"
+CANONICAL_PROVIDER = "openai_oauth"
 CANONICAL_USE_REAL_BROWSER = False
 
 

@@ -21,11 +21,14 @@ _DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
 # absent (it is gitignored — `config.yaml.example` is the tracked template), so
 # these constants are what actually governs. They exist so the orchestrator's
 # call sites no longer re-type an inline default that can drift.
-# `DEFAULT_PROVIDER` is `ollama` because that is what a fresh desktop
-# install actually runs (the frontend sends `ollama` and the Rust subprocess
-# falls back to `ollama`), it needs no API key, and it matches Settings.
-# `tests/test_config_parity.py` asserts this stays in sync across every loader.
-DEFAULT_PROVIDER = "ollama"
+# `DEFAULT_PROVIDER` is `openai_oauth`: Kim runs free out of the box on the
+# local `openai-oauth` proxy, which is backed by the user's own ChatGPT session
+# (see `orchestrator/providers/openai_oauth.py`) rather than a paid API key.
+# That makes a fresh install work with no key and no billing — the same routing
+# kimcli uses — so the frontend, the Rust subprocess fallback and Settings all
+# resolve here. `tests/test_config_parity.py` asserts this stays in sync across
+# every loader; change it in one place and that suite will tell you the rest.
+DEFAULT_PROVIDER = "openai_oauth"
 
 
 def load_config(path: Optional[str] = None) -> dict:

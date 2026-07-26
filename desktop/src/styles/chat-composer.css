@@ -1,33 +1,37 @@
 /* ── Composer ─────────────────────────────────────────────────────────────── */
 .kim-composer {
-  padding: 14px 24px 18px;
-  background: var(--bg);
+  padding: 12px 24px 18px;
+  background: color-mix(in srgb, var(--bg) 94%, transparent);
   border-top: 1px solid transparent;
   flex-shrink: 0;
   animation: kim-soft-rise 0.24s cubic-bezier(.2,.8,.2,1) both;
 }
+.kim-composer--drag,
 .kim-composer--drag-over {
-  background: var(--kim-accent-soft, rgba(100, 160, 255, 0.06));
-  border-top-color: var(--kim-accent-line, rgba(100, 160, 255, 0.3));
+  background: color-mix(in srgb, var(--kim-accent-soft) 76%, var(--bg));
+  border-top-color: var(--kim-accent-line);
 }
 .kim-composer__attachments {
-  max-width: 920px;
-  margin: 0 auto 8px;
+  max-width: 820px;
+  margin: 0 auto 9px;
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 7px;
 }
 .kim-composer__attach-chip {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 8px 4px 6px;
-  border-radius: 8px;
-  background: var(--kim-surface, rgba(255,255,255,0.06));
-  border: 1px solid var(--kim-border, rgba(255,255,255,0.12));
+  gap: 7px;
+  min-height: 34px;
+  padding: 4px 7px 4px 5px;
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  border: 1px solid var(--kim-border);
   font-size: 12px;
   color: var(--kim-text-2);
-  max-width: 240px;
+  max-width: 260px;
+  box-shadow: var(--shadow-xs);
+  animation: kim-soft-pop .18s var(--ease-out) both;
 }
 .kim-composer__attach-thumb {
   width: 22px;
@@ -50,19 +54,34 @@
   flex-shrink: 0;
 }
 .kim-composer__attach-remove {
-  background: none;
-  border: none;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-xs);
   cursor: pointer;
   color: var(--kim-text-3);
-  padding: 0 0 0 2px;
+  padding: 0;
   font-size: 14px;
   line-height: 1;
   flex-shrink: 0;
-  opacity: 0.7;
+  opacity: 0.72;
+  transition: opacity .15s ease, color .15s ease, background .15s ease;
 }
-.kim-composer__attach-remove:hover { opacity: 1; color: var(--kim-text); }
+.kim-composer__attach-remove:hover {
+  opacity: 1;
+  color: var(--kim-text);
+  background: var(--kim-surface-2);
+}
+.kim-composer__attach-remove:focus-visible {
+  outline: 2px solid var(--kim-accent);
+  outline-offset: 1px;
+}
 .kim-composer__row {
-  max-width: 920px;
+  max-width: 820px;
   margin: 0 auto;
   display: flex;
   align-items: flex-end;
@@ -99,13 +118,14 @@
   margin: 0 auto;
   display: flex;
   align-items: flex-end;
-  gap: 8px;
-  padding: 10px 10px 10px 16px;
-  border-radius: 16px;
+  gap: 9px;
+  min-height: 54px;
+  padding: 8px 9px 8px 15px;
+  border-radius: 15px;
   background: var(--bg-elevated);
-  border: 1.5px solid var(--border);
+  border: 1px solid var(--border);
   box-shadow: var(--shadow-sm);
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
 }
 
 /* Slash-command autocomplete menu (audit B1/6.1). Floats above the composer. */
@@ -119,9 +139,9 @@
   flex-direction: column;
   gap: 1px;
   padding: 5px;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: var(--bg-elevated);
-  border: 1.5px solid var(--border);
+  border: 1px solid var(--border);
   box-shadow: var(--shadow-md);
   overflow: hidden;
 }
@@ -159,11 +179,11 @@
 }
 .kim-composer__box:focus-within {
   border-color: var(--accent);
-  box-shadow: var(--shadow-md), var(--shadow-glow);
+  box-shadow: var(--shadow-md), 0 0 0 3px var(--ring);
 }
 .kim-composer__box--running {
-  border-color: rgba(143, 74, 74, 0.5);
-  background: var(--bg-card);
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+  background: color-mix(in srgb, var(--bg-elevated) 92%, var(--accent-soft));
 }
 .kim-composer__textarea {
   flex: 1;
@@ -173,9 +193,9 @@
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: 14.5px;
+  font-size: 14px;
   line-height: 1.55;
-  min-height: 28px;
+  min-height: 32px;
   max-height: 200px;
   padding: 6px 0;
   overflow-y: hidden;
@@ -186,6 +206,7 @@
 }
 .kim-composer__textarea::placeholder {
   color: var(--text-subtle);
+  opacity: .9;
 }
 .kim-composer__actions {
   display: flex;
@@ -204,3 +225,10 @@
 }
 .kim-composer__hint-sep { opacity: 0.6; }
 
+@media (max-width: 680px) {
+  .kim-composer { padding: 10px 12px 12px; }
+  .kim-composer__box { padding-left: 12px; }
+  .kim-composer__attach-size { display: none; }
+  .kim-composer__attach-chip { max-width: 190px; }
+  .kim-slash-menu__hint { display: none; }
+}

@@ -242,7 +242,7 @@ class BrowserProvider(BaseProvider):
 
         self._bridge_url = os.environ.get("KIM_WEBVIEW_BRIDGE_URL", "").strip().rstrip("/")
         self._bridge_token = os.environ.get("KIM_WEBVIEW_BRIDGE_TOKEN", "").strip()
-        self._use_webview_bridge = bool(self._bridge_url and self._bridge_token)
+        self._use_webview_bridge = True
         self._gemini_authuser = self._parse_authuser_env(os.environ.get("KIM_GEMINI_AUTHUSER", ""))
         if self._gemini_authuser is None:
             self._gemini_authuser = self._load_active_gemini_authuser_from_account()

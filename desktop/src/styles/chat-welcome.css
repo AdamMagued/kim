@@ -26,7 +26,7 @@
   font-size: 22px;
   font-weight: 700;
   color: var(--text-strong);
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
 }
 .kim-empty-welcome__subtitle {
   font-size: 14px;
@@ -92,7 +92,7 @@
   font-size: 28px;
   font-weight: 700;
   color: var(--text-strong);
-  letter-spacing: -0.03em;
+  letter-spacing: 0;
   margin-bottom: 8px;
 }
 .kim-new-chat-empty__subtitle {
@@ -140,3 +140,225 @@
   box-shadow: 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
 }
 
+/* App launch state */
+.kim-launch__content {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow-y: auto;
+  padding: 40px 28px;
+}
+.kim-launch__mark {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  margin-bottom: 18px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 700;
+  box-shadow: var(--shadow-xs);
+}
+.kim-launch__title {
+  max-width: 700px;
+  margin: 0;
+  color: var(--kim-text);
+  font-size: 30px;
+  line-height: 1.18;
+  font-weight: 620;
+  letter-spacing: 0;
+  text-align: center;
+  text-wrap: balance;
+}
+.kim-launch__subtitle {
+  max-width: 500px;
+  margin: 8px 0 26px;
+  color: var(--kim-text-2);
+  font-size: 14px;
+  line-height: 1.55;
+  text-align: center;
+}
+.kim-launch__actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 34px;
+}
+.kim-launch__actions .kr-btn {
+  min-height: 40px;
+  padding: 0 15px;
+}
+.kim-launch__primary-kbd {
+  border-color: color-mix(in srgb, var(--kim-on-accent) 28%, transparent);
+  background: color-mix(in srgb, var(--kim-on-accent) 13%, transparent);
+  color: var(--kim-on-accent);
+  box-shadow: none;
+}
+.kim-launch__recents {
+  width: min(560px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-bottom: 30px;
+}
+.kim-launch__recents-label {
+  margin-bottom: 3px;
+  padding-left: 3px;
+}
+.kim-launch__recent {
+  width: 100%;
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 13px;
+  border: 1px solid var(--kim-border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--kim-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: var(--shadow-xs);
+  transition: border-color .16s ease, background .16s ease, box-shadow .16s ease, transform .16s ease;
+}
+.kim-launch__recent:hover {
+  border-color: color-mix(in srgb, var(--kim-accent) 32%, var(--kim-border));
+  background: color-mix(in srgb, var(--bg-elevated) 92%, var(--kim-accent-soft));
+  box-shadow: var(--shadow-sm);
+  transform: translateY(-1px);
+}
+.kim-launch__recent:active { transform: translateY(0); }
+.kim-launch__recent:focus-visible {
+  outline: 2px solid var(--kim-accent);
+  outline-offset: 2px;
+}
+.kim-launch__recent-icon,
+.kim-launch__recent-arrow {
+  flex: 0 0 auto;
+  color: var(--kim-text-3);
+}
+.kim-launch__recent-copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.kim-launch__recent-title,
+.kim-launch__recent-project {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kim-launch__recent-title {
+  color: var(--kim-text);
+  font-size: 13.5px;
+  font-weight: 500;
+}
+.kim-launch__recent-project {
+  color: var(--kim-text-3);
+  font: 10.5px/1.4 var(--font-mono);
+}
+.kim-launch__recent-arrow { transition: color .16s ease, transform .16s ease; }
+.kim-launch__recent:hover .kim-launch__recent-arrow {
+  color: var(--kim-accent);
+  transform: translateX(2px);
+}
+.kim-launch__shortcuts {
+  display: flex;
+  gap: 18px;
+  color: var(--kim-text-3);
+  font: 11px/1.4 var(--font-mono);
+}
+
+/* New conversation hero */
+.kim-empty-hero {
+  width: 100%;
+  max-width: 720px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin: auto;
+  padding: 36px 20px;
+  text-align: center;
+}
+.kim-empty-hero__provider {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  margin-bottom: 18px;
+  padding: 5px 10px;
+  border: 1px solid var(--kim-border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-elevated) 88%, transparent);
+  color: var(--kim-text-2);
+  font: 10.5px/1.2 var(--font-mono);
+  box-shadow: var(--shadow-xs);
+}
+.kim-empty-hero__provider-dot { background: var(--kim-green); }
+.kim-empty-hero__title {
+  max-width: 680px;
+  margin: 0 0 10px;
+  color: var(--kim-text);
+  font-size: 34px;
+  font-weight: 620;
+  line-height: 1.15;
+  letter-spacing: 0;
+  text-wrap: balance;
+}
+.kim-empty-hero__subtitle {
+  max-width: 520px;
+  margin: 0 0 24px;
+  color: var(--kim-text-2);
+  font-size: 14px;
+  line-height: 1.55;
+  text-wrap: balance;
+}
+.kim-empty-hero__composer { width: min(680px, 100%); }
+.kim-empty-hero__starters {
+  max-width: 680px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 7px;
+  margin-top: 16px;
+}
+.kim-empty-hero__starter {
+  min-height: 32px;
+  padding: 6px 10px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--kim-text-2);
+  font-size: 12px;
+  box-shadow: none;
+}
+.kim-empty-hero__starter:hover {
+  border-color: var(--kim-border);
+  background: var(--kim-surface);
+  box-shadow: none;
+}
+.kim-empty-hero__starter-icon {
+  color: var(--kim-accent);
+  font-family: var(--font-mono);
+}
+
+@media (max-width: 680px) {
+  .kim-launch__content { justify-content: flex-start; padding: 48px 18px 24px; }
+  .kim-launch__title { font-size: 26px; }
+  .kim-launch__actions { width: 100%; flex-direction: column; }
+  .kim-launch__actions .kr-btn { width: 100%; justify-content: center; }
+  .kim-launch__shortcuts { display: none; }
+  .kim-empty-hero { padding: 28px 4px; }
+  .kim-empty-hero__title { font-size: 28px; }
+  .kim-empty-hero__starters { display: grid; width: 100%; grid-template-columns: 1fr 1fr; }
+  .kim-empty-hero__starter { justify-content: flex-start; min-width: 0; }
+}

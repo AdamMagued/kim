@@ -946,6 +946,7 @@ export const PRICE_LAST_REFRESHED = '2026-07';
 const PRICE_PER_1M: Record<string, { input: number; output: number; model: string }> = {
   claude:   { input: 3.00,  output: 15.00, model: 'claude-sonnet-4.5' },
   openai:   { input: 2.50,  output: 10.00, model: 'gpt-4o-class' },
+  openai_oauth: { input: 0, output: 0, model: 'ChatGPT subscription' },
   gemini:   { input: 1.25,  output: 5.00,  model: 'gemini-2.5-pro' },
   deepseek: { input: 0.27,  output: 1.10,  model: 'deepseek-chat (cache-miss)' },
   ollama:   { input: 0,     output: 0,     model: 'local' },

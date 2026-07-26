@@ -65,25 +65,31 @@ def _apply_attachment_signal(result: dict, data: dict, sent_attachments: list[di
 
 async def complete_via_webview_bridge(
     *,
-    bridge_url: str,
-    bridge_token: str,
-    preferred_site: Optional[str],
-    model_tier: Optional[str],
-    gemini_authuser: Optional[int],
-    prompt: str,
-    attachments: list[dict],
-    completion_hash: str,
+    bridge_url: str = "",
+    bridge_token: str = "",
+    preferred_site: Optional[str] = None,
+    model_tier: Optional[str] = None,
+    gemini_authuser: Optional[int] = None,
+    prompt: str = "",
+    attachments: list[dict] = None,
+    completion_hash: str = "",
     known_tools: Optional[set[str]] = None,
     clear_chat: bool = False,
     site_configs: Optional[dict] = None,
     effort: Optional[str] = None,
 ) -> dict:
-    """Run completion through Kim desktop's in-app webview bridge."""
-    if not bridge_url or not bridge_token:
-        return {
-            "type": "text",
-            "content": "NEED_HELP: In-app browser bridge is not configured.",
-        }
+    """Run completion through Kim desktop's in-app webview bridge or Chrome Extension bridge."""
+    try:
+        from orchestrator.providers.browser.extension_bridge import get_extension_bridge
+        bridge = await get_extension_bridge()
+        connected = await bridge.wait_for_connection(timeout=15.0)
+        if connected:
+            logger.info("[Kim Bridge] Dispatching prompt to Chrome Extension over WebSocket...")
+            res = await bridge.send_completion(prompt)
+            full_text = res.get("full_text", "")
+            return parse_response(full_text, completion_hash, known_tools=known_tools)
+    except Exception as exc:
+        logger.warning(f"[Kim Bridge] Extension bridge fallback note: {exc}")
 
     known_sites = site_configs or SITE_CONFIGS
     # The browser:claude site was removed from SITE_CONFIGS entirely (feat/

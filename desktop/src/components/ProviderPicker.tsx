@@ -178,6 +178,9 @@ export function ProviderPicker({
     if (isOllama) {
       return `Ollama · ${ollama.mode}`;
     }
+    if (resolvedProvider === 'openai_oauth') {
+      return 'OpenAI (ChatGPT)';
+    }
     const label = API_PROVIDERS.find(p => p.id === resolvedProvider)?.label
       ?? resolvedProvider;
     return label;
@@ -592,6 +595,19 @@ export function ProviderPicker({
               </div>
             );
           })}
+
+          {/* ── Local OAuth proxy ──────────────────────────────────── */}
+          <div className="kim-provider-picker__section-label">
+            OAuth proxy <span>uses your local Codex sign-in</span>
+          </div>
+          <button
+            type="button"
+            className={'kim-provider-picker__item' + (currentApiProvider === 'openai_oauth' ? ' is-active' : '')}
+            onClick={() => pick('openai_oauth')}
+          >
+            <span className="kim-provider-picker__item-name">OpenAI (ChatGPT)</span>
+            <span className="kim-provider-picker__badge">no API key</span>
+          </button>
 
           {/* ── API providers ───────────────────────────────────────── */}
           <div className="kim-provider-picker__section-label">

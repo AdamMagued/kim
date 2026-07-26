@@ -157,6 +157,7 @@ BUILDERS = {
     "claude": _claude,
     "openai": lambda kind: _openai_like(("orchestrator.providers.openai_provider", "OpenAIProvider"), kind),
     "deepseek": lambda kind: _openai_like(("orchestrator.providers.deepseek", "DeepSeekProvider"), kind),
+    "openai_oauth": lambda kind: _openai_like(("orchestrator.providers.openai_oauth", "OpenAIOAuthProvider"), kind),
     "gemini": _gemini,
     "ollama": _ollama,
 }

@@ -73,7 +73,7 @@
   font-weight: 700;
   color: var(--text-strong);
   margin-bottom: 8px;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
 }
 .kim-confirm-dialog__text {
   font-size: 13px;
@@ -120,23 +120,24 @@
 .kim-btn {
   width: 34px;
   height: 34px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: none;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   flex-shrink: 0;
-  transition: all 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
   font-family: inherit;
 }
 .kim-btn--send {
   background: var(--accent);
-  color: #fff;
+  color: var(--kim-on-accent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 18%, transparent);
 }
 .kim-btn--send:hover:not(:disabled) {
-  background: var(--accent-gradient-hover);
-  box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  background: var(--accent-hover);
+  box-shadow: var(--shadow-sm), inset 0 1px 0 color-mix(in srgb, #fff 22%, transparent);
   transform: translateY(-1px);
 }
 .kim-btn--send:active:not(:disabled) {
@@ -148,11 +149,14 @@
   cursor: not-allowed;
   box-shadow: none;
 }
+.kim-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .kim-btn--stop {
   background: var(--danger);
   color: #fff;
-  box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.2);
-  animation: kim-glow-pulse 1.6s ease-in-out infinite;
+  box-shadow: var(--shadow-xs), inset 0 1px 0 rgba(255, 255, 255, 0.18);
 }
 .kim-btn--stop:hover:not(:disabled) {
   background: var(--danger-hover);
@@ -172,7 +176,7 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   height: 30px;
   width: 30px;
   flex-shrink: 0;
@@ -203,7 +207,7 @@
   font-weight: 600;
   color: var(--text-strong);
   font-family: "JetBrains Mono", "SF Mono", monospace;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -254,4 +258,3 @@
   color: var(--accent-claw);
   background: var(--accent-claw-muted);
 }
-

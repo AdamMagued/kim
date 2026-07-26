@@ -93,7 +93,7 @@
   font-family: 'Syne', ui-sans-serif, sans-serif;
   font-size: clamp(60px, 10vw, 100px);
   font-weight: 600;
-  letter-spacing: -.03em;
+  letter-spacing: 0;
   line-height: 1;
   background: linear-gradient(170deg, #e8dfd6 15%, #d4a08a 55%, #e8dfd6 100%);
   -webkit-background-clip: text;
@@ -314,4 +314,3 @@
   from { opacity: 0; transform: translateY(12px); }
   to   { opacity: 1; transform: translateY(0); }
 }
-

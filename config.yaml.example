@@ -82,11 +82,14 @@ model:
   deepseek: deepseek-chat
   gemini: gemini-2.0-flash
   openai: gpt-4o
+  openai_oauth: gpt-5.6-terra
 openai_api_key_env: OPENAI_API_KEY
 openai_base_url: ''
+# Base URL of the local `openai-oauth` proxy (npx openai-oauth@latest). Blank = default.
+openai_oauth_base_url: ''
 preview_mode: false
 project_root: .
-provider: ollama
+provider: openai_oauth
 screenshot_scale: 0.75
 # The shell command deny-list is CODE-OWNED and is NOT configurable here.
 # It lives in mcp_server/tools/shell.py (_DENY_COMMANDS / _DENY_PATTERNS),

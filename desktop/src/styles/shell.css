@@ -50,7 +50,7 @@
   font-size: 14px;
   font-weight: 600;
   color: var(--text-strong);
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -120,7 +120,7 @@
 .kim-header__title {
   font-weight: 700;
   font-size: 15px;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   color: var(--text-strong);
 }
 .kim-header__version {
@@ -219,4 +219,3 @@
   min-height: 0;
   background: transparent;
 }
-

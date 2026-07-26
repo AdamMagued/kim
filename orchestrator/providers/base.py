@@ -327,6 +327,9 @@ def create_provider(name: str, config: dict) -> BaseProvider:
     if name == "deepseek":
         from orchestrator.providers.deepseek import DeepSeekProvider
         return DeepSeekProvider(config)
+    if name == "openai_oauth":
+        from orchestrator.providers.openai_oauth import OpenAIOAuthProvider
+        return OpenAIOAuthProvider(config)
     if name == "ollama":
         from orchestrator.providers.ollama import OllamaProvider
         return OllamaProvider(config)
@@ -337,5 +340,5 @@ def create_provider(name: str, config: dict) -> BaseProvider:
         from orchestrator.providers.fake import FakeProvider
         return FakeProvider()
     raise ValueError(
-        f"Unknown provider: {name!r}. Choose from: claude, openai, gemini, deepseek, browser, ollama, fake"
+        f"Unknown provider: {name!r}. Choose from: claude, openai, openai_oauth, gemini, deepseek, browser, ollama, fake"
     )

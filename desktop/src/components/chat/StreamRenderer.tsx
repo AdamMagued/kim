@@ -586,62 +586,19 @@ export function StreamRenderer({
             made the scroll target mount-order-dependent. */}
         <div className="kim-messages" ref={outputRef}>
           {empty && (
-            <div
-              style={{
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'center',
-                width: '100%',
-                maxWidth: 680,
-                textAlign: 'center',
-                margin: 'auto',
-                padding: '40px 20px',
-              }}
-            >
-              <div
-                style={{
-                  fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
-                  fontSize: 11,
-                  color: 'var(--kim-text-3)',
-                  marginBottom: 18,
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  padding: '6px 12px',
-                  border: '1px solid var(--kim-border)',
-                  borderRadius: 999,
-                  background: 'var(--kim-surface)',
-                }}
-              >
-                <span className="kr-pulse-dot" style={{ background: 'var(--kim-green)' }} />
+            <div className="kim-empty-hero">
+              <div className="kim-empty-hero__provider">
+                <span className="kr-pulse-dot kim-empty-hero__provider-dot" />
                 <span>{providerPillLabel}</span>
               </div>
 
-              <h1
-                style={{
-                  fontWeight: 700,
-                  fontSize: 38,
-                  color: 'var(--kim-text)',
-                  margin: '0 0 12px',
-                  letterSpacing: '-0.02em',
-                  lineHeight: 1.1,
-                }}
-              >
+              <h1 className="kim-empty-hero__title">
                 {activeTab === 'code' && activeProjectPath
                   ? `What should we work on in ${activeProjectPath.split('/').filter(Boolean).pop() ?? 'this project'}?`
                   : activeTab === 'code' ? 'What are we building?'
                   : getGreeting(account.display_name.split(' ')[0])}
               </h1>
-              <p
-                style={{
-                  color: 'var(--kim-text-3)',
-                  fontSize: 14,
-                  margin: 0,
-                  marginBottom: 28,
-                  maxWidth: 480,
-                  lineHeight: 1.5,
-                }}
-              >
+              <p className="kim-empty-hero__subtitle">
                 {activeTab === 'code'
                   ? activeProjectPath
                     ? "Describe a feature, hand me a bug, or point me at a file. I'll read first, plan, then write."
@@ -649,40 +606,25 @@ export function StreamRenderer({
                   : 'Pick up where you left off, or start fresh.'}
               </p>
 
-              <div style={{ width: 'min(680px, 95%)' }}>
+              <div className="kim-empty-hero__composer">
                 {renderComposer(true)}
               </div>
 
               {renderPermissionToggle()}
 
-              <div
-                style={{
-                  display: 'flex',
-                  flexWrap: 'wrap',
-                  gap: 8,
-                  marginTop: 18,
-                  justifyContent: 'center',
-                  maxWidth: 680,
-                }}
-              >
+              <div className="kim-empty-hero__starters">
                 {starters.map(([k, t]) => (
                   <button
                     key={t}
                     type="button"
-                    className="kr-btn"
+                    className="kr-btn kim-empty-hero__starter"
                     disabled={activeTab === 'code' && !activeProjectPath}
                     onClick={() => {
                       setTaskInput(t);
                       textareaRef.current?.focus();
                     }}
-                    style={{
-                      background: 'transparent',
-                      padding: '7px 12px',
-                      fontSize: 12.5,
-                      color: 'var(--kim-text-2)',
-                    }}
                   >
-                    <span style={{ color: 'var(--kim-accent)', fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace' }}>{k}</span>
+                    <span className="kim-empty-hero__starter-icon">{k}</span>
                     <span>{t}</span>
                   </button>
                 ))}

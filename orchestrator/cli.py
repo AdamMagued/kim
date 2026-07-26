@@ -134,14 +134,14 @@ def resolve_log_dir() -> Path:
 def _cli_provider_type(value: str) -> str:
     """Allow `browser:chatgpt` / `browser:gemini` (desktop) as well as plain provider names."""
     s = (value or "").strip().lower()
-    base = {"claude", "openai", "gemini", "deepseek", "browser", "ollama"}
+    base = {"claude", "openai", "openai_oauth", "gemini", "deepseek", "browser", "ollama"}
     if s in base:
         return s
     if s.startswith("browser:") and len(s) > len("browser:"):
         return s
     raise argparse.ArgumentTypeError(
-        f"unknown provider {value!r}; use claude, openai, gemini, deepseek, browser, "
-        "ollama, or browser:<site> (e.g. browser:chatgpt)"
+        f"unknown provider {value!r}; use claude, openai, openai_oauth, gemini, deepseek, "
+        "browser, ollama, or browser:<site> (e.g. browser:chatgpt)"
     )
 
 

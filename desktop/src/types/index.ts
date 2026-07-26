@@ -153,7 +153,14 @@ export interface CodexProject {
 // ── Settings ─────────────────────────────────────────────────────────────────
 
 export type Theme = 'dark' | 'light' | 'system';
-export type Provider = 'claude' | 'openai' | 'gemini' | 'deepseek' | 'browser' | 'ollama';
+export type Provider =
+  | 'claude'
+  | 'openai'
+  | 'openai_oauth'
+  | 'gemini'
+  | 'deepseek'
+  | 'browser'
+  | 'ollama';
 export type AccentTheme = 'indigo' | 'ocean' | 'ember' | 'teal' | 'jade' | 'mono';
 /** HITL permission gate. full_auto = no gate; ask_risky = high-risk tools only; ask_always = medium+high. */
 export type PermissionMode = 'full_auto' | 'ask_risky' | 'ask_always';
@@ -198,7 +205,7 @@ export const DEFAULT_SETTINGS: Settings = {
   kim_sessions_dir: '',
   codex_sessions_dir: '',
   project_root: '',
-  provider: 'ollama',
+  provider: 'openai_oauth',
   allow_message_queue: false,
   keep_browser_visible: false,
   context_budget_tokens: 200_000,
@@ -228,6 +235,9 @@ export const DEFAULT_SETTINGS: Settings = {
  * Single source of truth — import this instead of redeclaring locally.
  */
 export const ALL_PROVIDERS: { value: Provider; title: string; sub: string }[] = [
+  // Default first: runs free on the user's ChatGPT session via the local
+  // openai-oauth proxy (see DEFAULT_SETTINGS.provider / DEFAULT_PROVIDER).
+  { value: 'openai_oauth', title: 'OpenAI (ChatGPT)', sub: 'free · no API key' },
   { value: 'ollama',   title: 'Ollama',    sub: 'local/cloud · no API key' },
   { value: 'browser',  title: 'Browser',   sub: 'via browser · no API key' },
   { value: 'claude',   title: 'Claude',    sub: 'Anthropic' },

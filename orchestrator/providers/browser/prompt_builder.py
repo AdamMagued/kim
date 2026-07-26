@@ -360,6 +360,7 @@ def format_prompt(
                 f"{handoff_block}"
                 f"[SYSTEM]\n{system}\n"
                 f"{_os_hint}\n\n"
+                f"[AVAILABLE TOOLS]\n{tools_json}\n\n"
                 + transport_marker_instruction(completion_hash) + "\n\n"
                 f"{history_block}"
                 f"{last_text}"

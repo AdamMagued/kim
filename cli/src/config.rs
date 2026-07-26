@@ -65,7 +65,7 @@ pub struct KimConfig {
 impl Default for KimConfig {
     fn default() -> Self {
         Self {
-            provider: "ollama".to_string(),
+            provider: "openai_oauth".to_string(),
             model: "llama3.2".to_string(),
             theme: ThemeName::DarkNeovim,
             ollama_base_url: "http://127.0.0.1:11434".to_string(),

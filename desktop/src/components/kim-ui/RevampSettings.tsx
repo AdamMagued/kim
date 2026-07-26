@@ -195,19 +195,9 @@ export function RevampSettings(props: Props) {
 
   return (
     <div
+      className="kim-settings-revamp"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
-      }}
-      style={{
-        position: 'fixed',
-        inset: 0,
-        zIndex: 1000,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        background: 'var(--bg-overlay)',
-        backdropFilter: 'blur(4px)',
-        padding: 28,
       }}
       role="dialog"
       aria-modal="true"
@@ -215,81 +205,36 @@ export function RevampSettings(props: Props) {
     >
       <div
         ref={modalRef}
-        className="kr-glass"
-        style={{
-          width: 'min(1100px, 100%)',
-          height: 'min(760px, calc(100vh - 56px))',
-          border: '1px solid var(--kim-border)',
-          borderRadius: 16,
-          display: 'flex',
-          overflow: 'hidden',
-          boxShadow: '0 30px 80px rgba(0,0,0,0.5)',
-        }}
+        className="kr-glass kim-settings-revamp__dialog"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Left nav */}
-        <div
-          style={{
-            width: 240,
-            flexShrink: 0,
-            borderRight: '1px solid var(--kim-border)',
-            padding: '22px 14px',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 2,
-            background: 'var(--kim-bg-2)',
-          }}
-        >
+        <div className="kim-settings-revamp__nav">
           <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 10,
-              padding: '8px 10px 16px',
-              borderBottom: '1px solid var(--kim-border)',
-              marginBottom: 10,
-            }}
+            className="kim-settings-revamp__brand"
             id="kim-revamp-settings-title"
           >
-            <svg width="18" height="18" viewBox="0 0 16 16" fill="none" style={{ color: 'var(--kim-accent)' }}>
+            <svg className="kim-settings-revamp__brand-icon" width="18" height="18" viewBox="0 0 16 16" fill="none">
               <path d="M8 1v14M1 8h14M3 3l10 10M13 3L3 13" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
             </svg>
-            <span style={{ fontWeight: 600, fontSize: 15, letterSpacing: '-0.01em' }}>Settings</span>
+            <span className="kim-settings-revamp__brand-label">Settings</span>
           </div>
           {NAV.map((n) => (
             <button
               key={n.id}
-              className="kr-row-hover"
+              className={`kim-settings-revamp__nav-item${active === n.id ? ' kim-settings-revamp__nav-item--active' : ''}`}
               onClick={() => setActive(n.id)}
               aria-current={active === n.id ? 'page' : undefined}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 11,
-                padding: '9px 11px',
-                borderRadius: 9,
-                cursor: 'pointer',
-                background: active === n.id ? 'var(--kim-surface)' : 'transparent',
-                color: active === n.id ? 'var(--kim-text)' : 'var(--kim-text-2)',
-                borderTop: 'none',
-                borderRight: 'none',
-                borderBottom: 'none',
-                borderLeft: active === n.id ? '2px solid var(--kim-accent)' : '2px solid transparent',
-                marginLeft: -2,
-                fontSize: 13.5,
-                width: '100%',
-                textAlign: 'left',
-                fontFamily: 'inherit',
-              }}
+              title={n.label}
             >
               <NavIcon name={n.icon} />
-              <span>{n.label}</span>
+              <span className="kim-settings-revamp__nav-label">{n.label}</span>
             </button>
           ))}
         </div>
 
         {/* Body */}
-        <div style={{ flex: 1, overflow: 'auto', padding: '28px 36px' }}>
+        <div className="kim-settings-revamp__body">
           <PaneHeader title={meta.title} subtitle={meta.subtitle} onClose={onClose} />
           {active === 'appearance' && <PaneAppearance settings={settings} onChange={onChange} />}
           {active === 'ai' && <PaneAI settings={settings} onChange={onChange} />}

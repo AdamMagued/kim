@@ -22,13 +22,15 @@ describe('ollama_cloud_default_constant', () => {
 // ── 2. all_providers_grid ─────────────────────────────────────────────────────
 
 describe('all_providers_grid', () => {
-  it('contains exactly six providers', () => {
-    expect(ALL_PROVIDERS).toHaveLength(6);
+  it('contains exactly seven providers', () => {
+    expect(ALL_PROVIDERS).toHaveLength(7);
   });
 
   it('contains exactly the expected provider values', () => {
     const values = ALL_PROVIDERS.map((p) => p.value);
-    expect(values).toEqual(['ollama', 'browser', 'claude', 'openai', 'gemini', 'deepseek']);
+    // openai_oauth leads the grid: it is the default provider (free, via the
+    // local openai-oauth proxy on the user's ChatGPT session).
+    expect(values).toEqual(['openai_oauth', 'ollama', 'browser', 'claude', 'openai', 'gemini', 'deepseek']);
   });
 
   it('ollama entry has correct title and sub', () => {
@@ -57,6 +59,13 @@ describe('all_providers_grid', () => {
     expect(entry).toBeDefined();
     expect(entry!.title).toBe('OpenAI');
     expect(entry!.sub).toBe('OpenAI');
+  });
+
+  it('openai_oauth entry is labeled as the ChatGPT-backed local proxy', () => {
+    const entry = ALL_PROVIDERS.find((p) => p.value === 'openai_oauth');
+    expect(entry).toBeDefined();
+    expect(entry!.title).toBe('OpenAI (ChatGPT)');
+    expect(entry!.sub).toBe('free · no API key');
   });
 
   it('gemini entry has correct title and sub', () => {

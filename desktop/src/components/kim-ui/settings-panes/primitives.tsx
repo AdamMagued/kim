@@ -5,25 +5,13 @@ import type { ReactNode } from 'react';
 
 function PaneHeader({ title, subtitle, onClose }: { title: string; subtitle?: string; onClose?: () => void }) {
   return (
-    <div
-      style={{
-        marginBottom: 26,
-        paddingBottom: 18,
-        borderBottom: '1px solid var(--kim-border)',
-        display: 'flex',
-        alignItems: 'flex-end',
-        justifyContent: 'space-between',
-        gap: 12,
-      }}
-    >
+    <div className="kim-settings-pane__header">
       <div>
-        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 500, letterSpacing: '-0.015em', color: 'var(--kim-text)' }}>
-          {title}
-        </h2>
-        {subtitle && <p style={{ margin: '4px 0 0', color: 'var(--kim-text-3)', fontSize: 13 }}>{subtitle}</p>}
+        <h2 className="kim-settings-pane__title">{title}</h2>
+        {subtitle && <p className="kim-settings-pane__subtitle">{subtitle}</p>}
       </div>
       {onClose && (
-        <button type="button" className="kr-icon-btn" onClick={onClose} style={{ width: 28, height: 28 }} aria-label="Close">
+        <button type="button" className="kr-icon-btn kim-settings-pane__close" onClick={onClose} aria-label="Close">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
             <path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
           </svg>
@@ -34,11 +22,7 @@ function PaneHeader({ title, subtitle, onClose }: { title: string; subtitle?: st
 }
 
 function SectionLabel({ children }: { children: ReactNode }) {
-  return (
-    <div className="kr-eyebrow" style={{ marginBottom: 12 }}>
-      {children}
-    </div>
-  );
+  return <div className="kr-eyebrow kim-settings-pane__section-label">{children}</div>;
 }
 
 function Row({
@@ -54,24 +38,13 @@ function Row({
 }) {
   return (
     <div
-      className={danger ? 'kr-danger' : ''}
-      style={{
-        background: 'var(--kim-surface)',
-        border: '1px solid var(--kim-border)',
-        borderRadius: 12,
-        padding: '14px 16px',
-        display: 'flex',
-        alignItems: 'center',
-        gap: 18,
-        marginBottom: 10,
-        paddingLeft: danger ? 14 : 16,
-      }}
+      className={`kim-settings-row${danger ? ' kim-settings-row--danger' : ''}`}
     >
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 14, color: 'var(--kim-text)', marginBottom: subtitle ? 3 : 0 }}>{title}</div>
-        {subtitle && <div style={{ fontSize: 12.5, color: 'var(--kim-text-3)', lineHeight: 1.5 }}>{subtitle}</div>}
+      <div className="kim-settings-row__copy">
+        <div className="kim-settings-row__title">{title}</div>
+        {subtitle && <div className="kim-settings-row__subtitle">{subtitle}</div>}
       </div>
-      <div style={{ flexShrink: 0 }}>{children}</div>
+      <div className="kim-settings-row__control">{children}</div>
     </div>
   );
 }

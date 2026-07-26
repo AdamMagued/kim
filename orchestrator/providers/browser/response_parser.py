@@ -44,6 +44,9 @@ def strip_transport_markers(text: str, completion_hash: str) -> str:
         if parts:
             text = parts[-1]
 
+    # Strip ChatGPT Web internal widget/control blocks (e200-e203) & genui_run text
+    text = re.sub(r'[\ue200-\ue203][^\ue200-\ue203]*[\ue200-\ue203]?', '', text)
+    text = re.sub(r'genui_run result of\s*:?\s*', '', text)
     text = re.sub(marker_re, "", text, flags=re.IGNORECASE).strip()
     return text
 
@@ -146,6 +149,27 @@ def _with_surrounding_content(parsed: dict, text: str, start: int, end: int) -> 
     return parsed
 
 
+def strip_widget_jsons(text: str) -> str:
+    """Strip raw ChatGPT web GenUI/search widget JSONs & GenUI control tokens from text."""
+    text = re.sub(r'[\ue200-\ue203]', '', text)
+    text = re.sub(r'\bgenui(?:_run)?\b\s*(?:result of\s*:?)?', '', text, flags=re.IGNORECASE)
+    s = text.strip()
+    if s.startswith('{') and ('"weather_' in s or '"genui_' in s or '"widget_' in s):
+        depth = 0
+        end_idx = -1
+        for i, ch in enumerate(s):
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end_idx = i
+                    break
+        if end_idx != -1:
+            return s[end_idx + 1:].strip()
+    return text.strip()
+
+
 def parse_response(text: str, completion_hash: str, known_tools: Optional[set] = None) -> dict:
     """
     Parse the scraped DOM text into the canonical response format.
@@ -194,4 +218,9 @@ def parse_response(text: str, completion_hash: str, known_tools: Optional[set] =
         if m:
             return {"type": "text", "content": f"{prefix} {m.group(1).strip()}"}
 
-    return {"type": "text", "content": text}
+    # Clean ChatGPT Web internal search/widget JSON blocks & cite tokens
+    text = strip_widget_jsons(text)
+    text = re.sub(r'cite\s*[A-Za-z0-9_]+', '', text)
+    text = re.sub(r'turn\d+search\d+', '', text).strip()
+
+    return {"type": "text", "content": text or "Response received."}

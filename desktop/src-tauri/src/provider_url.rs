@@ -99,6 +99,7 @@ pub(crate) fn last_llm_provider_allowed(p: &str) -> bool {
             | "browser:custom"
             | "claude"
             | "openai"
+            | "openai_oauth"
             | "gemini"
             | "deepseek"
             | "ollama"

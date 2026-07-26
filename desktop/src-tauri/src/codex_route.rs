@@ -110,6 +110,32 @@ pub(crate) async fn configure_codex_direct_provider(
                 label: format!("OpenAI-compatible API ({model})"),
             })
         }
+        "openai_oauth" => {
+            // Local `openai-oauth` proxy: OpenAI-compatible, backed by the Codex
+            // OAuth session in ~/.codex/auth.json, so there is no API key. The
+            // dummy value satisfies OpenAI-compatible clients (same trick the
+            // Ollama arm above uses) and the proxy ignores it.
+            let fallback = config
+                .default_model
+                .get("openai_oauth")
+                .map(|s| s.as_str())
+                .unwrap_or("gpt-5.6-terra");
+            let model = read_first_env_file_var(
+                kim_root,
+                &["CODEX_OPENAI_OAUTH_MODEL", "OPENAI_OAUTH_MODEL"],
+            )
+            .unwrap_or_else(|| fallback.to_string());
+            let base = read_env_file_var(kim_root, "OPENAI_OAUTH_BASE_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:10531/v1".to_string());
+            Ok(ProviderRoute {
+                args: vec!["--model".into(), model.clone()],
+                envs: vec![
+                    ("OPENAI_API_KEY".into(), "openai-oauth".into()),
+                    ("OPENAI_BASE_URL".into(), base),
+                ],
+                label: format!("OpenAI via ChatGPT OAuth proxy ({model})"),
+            })
+        }
         "deepseek" => {
             let key = read_env_file_var(kim_root, "DEEPSEEK_API_KEY").ok_or_else(|| {
                 "Codex with DeepSeek needs DEEPSEEK_API_KEY in the environment or Kim's .env."

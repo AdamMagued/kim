@@ -828,7 +828,7 @@ pub(crate) async fn send_task(
     } else {
         kim_root.join("kim_sessions")
     };
-    let provider_arg = task_spec::promote_provider(provider, "ollama", is_codex);
+    let provider_arg = task_spec::promote_provider(provider, "openai_oauth", is_codex);
     let is_browser = task_spec::is_browser_provider(&provider_arg);
     let session_id = resume_session_id
         .clone()

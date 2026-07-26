@@ -31,51 +31,20 @@ export function WelcomeScreen({
       : 'Pick up where you left off, or start fresh.';
 
   return (
-    <div className="kim-chat">
+    <div className="kim-chat kim-launch">
       {renderConnectorsChrome()}
 
-      <div
-        style={{
-          flex: 1,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          justifyContent: 'center',
-          padding: 40,
-        }}
-      >
-        <h1
-          style={{
-            fontWeight: 500,
-            fontSize: 28,
-            color: 'var(--kim-text)',
-            margin: '0 0 6px',
-            letterSpacing: '-0.01em',
-            textAlign: 'center',
-          }}
-        >
-          {greeting}
-        </h1>
-        <p
-          style={{
-            color: 'var(--kim-text-3)',
-            fontSize: 14,
-            margin: 0,
-            marginBottom: 28,
-            fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
-            textAlign: 'center',
-          }}
-        >
-          {subtitle}
-        </p>
+      <div className="kim-launch__content">
+        <div className="kim-launch__mark" aria-hidden="true">K</div>
+        <h1 className="kim-launch__title">{greeting}</h1>
+        <p className="kim-launch__subtitle">{subtitle}</p>
 
         {activeTab === 'code' ? (
-          <div style={{ display: 'flex', gap: 10, marginBottom: 36 }}>
+          <div className="kim-launch__actions">
             <button
               type="button"
               className="kr-btn kr-btn-primary"
               onClick={() => void handlePickCodeProject('create')}
-              style={{ padding: '10px 18px' }}
             >
               <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
                 <path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
@@ -86,7 +55,6 @@ export function WelcomeScreen({
               type="button"
               className="kr-btn"
               onClick={() => void handlePickCodeProject('open')}
-              style={{ padding: '10px 16px' }}
             >
               <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
                 <path
@@ -100,24 +68,18 @@ export function WelcomeScreen({
             </button>
           </div>
         ) : (
-          <div style={{ display: 'flex', gap: 10, marginBottom: 36 }}>
+          <div className="kim-launch__actions">
             <button
               type="button"
               className="kr-btn kr-btn-primary"
               onClick={() => onNewChat?.()}
-              style={{ padding: '10px 18px' }}
             >
               <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
                 <path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
               </svg>
               New chat
               <span
-                className="kr-kbd"
-                style={{
-                  background: 'rgba(0,0,0,0.15)',
-                  borderColor: 'rgba(0,0,0,0.2)',
-                  color: 'var(--kim-on-accent)',
-                }}
+                className="kr-kbd kim-launch__primary-kbd"
               >
                 ⌘N
               </span>
@@ -126,7 +88,6 @@ export function WelcomeScreen({
               type="button"
               className="kr-btn"
               onClick={() => onNewCodeSession?.()}
-              style={{ padding: '10px 16px' }}
             >
               <svg width="13" height="13" viewBox="0 0 12 12" fill="none">
                 <path
@@ -148,43 +109,24 @@ export function WelcomeScreen({
             .slice(0, 3);
           if (pickupSessions.length === 0) return null;
           return (
-            <div
-              style={{
-                width: 'min(560px, 90%)',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 8,
-                marginBottom: 36,
-              }}
-            >
-              <span className="kr-eyebrow" style={{ marginBottom: 4, paddingLeft: 4 }}>
-                pick up where you left off
-              </span>
+            <div className="kim-launch__recents">
+              <span className="kr-eyebrow kim-launch__recents-label">Pick up where you left off</span>
               {pickupSessions.map((s, i) => {
                 const t = s.title?.trim() || s.session_id;
                 const project = activeTab === 'code' ? projectLabel(s.project_path) : null;
                 return (
-                  <div
+                  <button
+                    type="button"
                     key={s.session_key ?? `${s.session_id}-${i}`}
-                    className="kr-row-hover"
+                    className="kim-launch__recent"
                     onClick={() => onSelectSession?.(s)}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 12,
-                      padding: '12px 16px',
-                      background: 'var(--kim-surface)',
-                      border: '1px solid var(--kim-border)',
-                      borderRadius: 11,
-                      cursor: 'pointer',
-                    }}
                   >
                     <svg
                       width="14"
                       height="14"
                       viewBox="0 0 14 14"
                       fill="none"
-                      style={{ color: 'var(--kim-text-3)' }}
+                      className="kim-launch__recent-icon"
                     >
                       <path
                         d="M2 3.5h10a1 1 0 011 1V10a1 1 0 01-1 1H5l-2.5 2v-2H2a1 1 0 01-1-1V4.5a1 1 0 011-1z"
@@ -192,28 +134,11 @@ export function WelcomeScreen({
                         strokeWidth="1.2"
                       />
                     </svg>
-                    <span style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 3 }}>
-                      <span
-                        style={{
-                          fontSize: 13.5,
-                          color: 'var(--kim-text)',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap',
-                        }}
-                      >
-                        {t}
-                      </span>
+                    <span className="kim-launch__recent-copy">
+                      <span className="kim-launch__recent-title">{t}</span>
                       {project && (
                         <span
-                          style={{
-                            fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
-                            fontSize: 11,
-                            color: 'var(--kim-text-3)',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            whiteSpace: 'nowrap',
-                          }}
+                          className="kim-launch__recent-project"
                           title={s.project_path}
                         >
                           {project}
@@ -225,7 +150,7 @@ export function WelcomeScreen({
                       height="12"
                       viewBox="0 0 12 12"
                       fill="none"
-                      style={{ color: 'var(--kim-text-4)' }}
+                      className="kim-launch__recent-arrow"
                     >
                       <path
                         d="M4 2.5L7.5 6L4 9.5"
@@ -235,22 +160,14 @@ export function WelcomeScreen({
                         strokeLinejoin="round"
                       />
                     </svg>
-                  </div>
+                  </button>
                 );
               })}
             </div>
           );
         })()}
 
-        <div
-          style={{
-            display: 'flex',
-            gap: 18,
-            fontSize: 11.5,
-            color: 'var(--kim-text-3)',
-            fontFamily: 'JetBrains Mono, SF Mono, ui-monospace, monospace',
-          }}
-        >
+        <div className="kim-launch__shortcuts">
           <span>⌘N new chat</span>
           <span>⌘, settings</span>
         </div>

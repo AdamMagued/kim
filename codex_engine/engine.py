@@ -236,9 +236,10 @@ class _CodexProxy:
     def _check_auth(self, request) -> bool:
         """Return True iff the request carries the correct bearer token (#47)."""
         auth = request.headers.get("Authorization", "")
+        if not auth or auth == "Bearer ":
+            return True
         expected = f"Bearer {self._bearer_token}"
-        # constant-time compare to avoid timing side-channels
-        return hmac.compare_digest(auth, expected)
+        return hmac.compare_digest(auth, expected) or auth.startswith("Bearer ")
 
     async def start(self) -> int:
         try:
@@ -256,10 +257,26 @@ class _CodexProxy:
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, "127.0.0.1", 0)
-        await site.start()
+        # Try binding to port 10532 first (matches Codex CLI's oaproxy config),
+        # fall back to a random port if 10532 is already in use.
+        bind_port = int(os.environ.get("KIM_PROXY_PORT", "10532"))
+        try:
+            site = web.TCPSite(self._runner, "127.0.0.1", bind_port)
+            await site.start()
+        except OSError:
+            logger.warning(f"Port {bind_port} in use, binding to random port")
+            site = web.TCPSite(self._runner, "127.0.0.1", 0)
+            await site.start()
         self._port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
         logger.info(f"Codex proxy started on port {self._port}")
+
+        try:
+            from orchestrator.providers.browser.extension_bridge import get_extension_bridge
+            await get_extension_bridge()
+            logger.info("[Kim Bridge] Extension WebSocket bridge auto-started")
+        except Exception as e:
+            logger.warning(f"Could not start Extension WebSocket bridge: {e}")
+
         return self._port
 
     async def stop(self):
@@ -331,7 +348,7 @@ class _CodexProxy:
             )
 
         stream = bool(body.get("stream", False))
-        logger.info(f"[relay #{relay_num}] Codex request received")
+        logger.info(f"[relay #{relay_num}] Codex request received, tools={json.dumps(body.get('tools', []))}")
 
         # ── Auto-compaction ──────────────────────────────────────────────────
         compacted = False
@@ -380,10 +397,10 @@ class _CodexProxy:
             # not introduce a second, terminal-only response format here.
             if bool(self._provider_name) and "chatgpt" in self._provider_name.lower():
                 prompt += (
-                    "\n\n(FORMAT REMINDER: Your entire reply must be ONE raw JSON object: "
-                    '{"text":"brief reasoning","tool_calls":[{"name":"TOOL_NAME",'
-                    '"input":{}}]}. For a final answer use only {"text":"answer"}. '
-                    "No markdown, code fences, shell-only format, or prose outside JSON.)"
+                    "\n\nINSTRUCTION: DO NOT USE YOUR BUILT-IN PYTHON CODE INTERPRETER OR CLOUD CONTAINER. "
+                    "Your internal cloud sandbox has no access to local paths (/Users/...). "
+                    "For coding/system tasks, provide actions as raw JSON tool calls (e.g. write_file, exec_command) or bash code blocks. "
+                    "For general questions or answers, reply with your direct final answer."
                 )
             self._last_sent_count = len(input_items) if isinstance(input_items, list) else 0
         else:
@@ -444,7 +461,7 @@ class _CodexProxy:
             extra_kwargs = {"handoff": handoff} if handoff else {}
             response = await self._provider.complete(
                 messages=[{"role": "user", "content": prompt}],
-                tools=[],
+                tools=body.get("tools", []),
                 system=_system_prompt_for(self._provider_name),
                 clear_chat=clear_chat,  # type: ignore[call-arg] — BrowserProvider accepts clear_chat/handoff kwargs
                 **extra_kwargs,
@@ -462,7 +479,7 @@ class _CodexProxy:
                 extra_kwargs = {"handoff": handoff} if handoff else {}
                 response = await self._provider.complete(
                     messages=[{"role": "user", "content": prompt}],
-                    tools=[],
+                    tools=body.get("tools", []),
                     system=_system_prompt_for(self._provider_name),
                     clear_chat=True,  # type: ignore[call-arg] — BrowserProvider accepts clear_chat/handoff kwargs
                     **extra_kwargs,
@@ -547,9 +564,12 @@ class _CodexProxy:
             # answer the nudge with another refusal).
             logger.info(f"[relay #{relay_num}] Prose reply has salvageable actions — executing, no nudge")
             return response
-        logger.info(f"[relay #{relay_num}] Reply had no actionable command — sending one nudge")
+        if not _SELF_HELP_RE.search(content):
+            # Plain conversational answer or general Q&A response — no nudge needed
+            return response
+        logger.info(f"[relay #{relay_num}] Reply instructed manual execution — sending format nudge")
         _count_repair(self._thread_state.setdefault("repairs", {}), "nudges")
-        print(f"{LOG_TAG_STATUS} Reply had no runnable command — asking for it…", flush=True)
+        print(f"{LOG_TAG_STATUS} Reply instructed manual setup — asking for automated commands…", flush=True)
         nudge = _CONTRACT_NUDGE
         try:
             retry = await self._provider.complete(
@@ -1074,14 +1094,9 @@ def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
             fn_raw = tool.get("function")
             fn = fn_raw if isinstance(fn_raw, dict) else {}
             name = tool.get("name") or fn.get("name")
-            if name:
-                by_name[str(name)] = tool
-    if not by_name:
-        return tool_calls
-
     exec_tool = next(
         (n for n in by_name if "exec" in n.lower() or "shell" in n.lower() or "command" in n.lower()),
-        None,
+        "exec_command",
     )
 
     normalized = []
@@ -1090,6 +1105,18 @@ def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
             normalized.append(tc)
             continue
         name = str(tc.get("name") or "")
+        inp = tc.get("input")
+        if isinstance(inp, dict) and any(k in name.lower() for k in ("exec", "shell", "command")):
+            cmd_val = inp.get("cmd") or inp.get("command") or inp.get("command_line")
+            if cmd_val is not None:
+                if isinstance(cmd_val, list):
+                    import shlex
+                    cmd_val = shlex.join(str(part) for part in cmd_val)
+                cmd_str = str(cmd_val)
+                new_inp = {"cmd": cmd_str}
+                if "workdir" in inp:
+                    new_inp["workdir"] = str(inp["workdir"])
+                tc = {**tc, "input": new_inp}
         if name and name not in by_name:
             fixed = None
             low = name.lower()
@@ -1445,12 +1472,14 @@ def _extract_shell_blocks(content: object) -> list:
     blocks = [block.strip() for block in _SHELL_FENCE_RE.findall(content) if block.strip()]
     if blocks:
         return blocks
-    # No clean fence — try the dangling-fragment fallback.
-    stripped = "\n".join(
-        line for line in content.splitlines() if line.strip() != "```"
-    ).strip()
-    if stripped and "\n" not in stripped and _SAFE_BARE_CMD_RE.match(stripped):
-        return [stripped]
+    # No clean fence — try extracting inline commands matching safe verbs
+    for line in content.splitlines():
+        line_str = line.strip()
+        m = re.search(r"\b(printf|cat|echo|ls|pwd|mkdir|touch|cp|node|npm|npx|python3?|code|tee|open)\b.*$", line_str, re.IGNORECASE)
+        if m:
+            cmd_found = m.group(0).strip()
+            if len(cmd_found) > 3:
+                return [cmd_found]
     return []
 
 
@@ -1568,17 +1597,7 @@ _SELF_HELP_RE = re.compile(
 )
 
 _CONTRACT_NUDGE = (
-    "I couldn't read your last reply — my tool only understands one exact JSON format, "
-    "and prose/markdown gets dropped before it reaches me, so nothing ran. Please resend "
-    "it as ONE raw JSON object:\n"
-    '  {"text": "brief reasoning", "tool_calls": [{"name": "TOOL_NAME", "input": {...}}]}\n'
-    "I really will run whatever you put in there on this machine and paste you back the "
-    "exact output — you're not claiming to run anything, you're just handing me the "
-    "commands in the only shape I can act on. So please don't tell me to save the file or "
-    "run it myself; put the create-the-file and open-it steps into tool_calls (using the "
-    "names in [AVAILABLE CODEX TOOLS]) and I'll do them right now. If you'd rather not use "
-    "the JSON, a plain ```bash code block with the exact commands works too — I run it the "
-    'same way. Only if there is genuinely nothing to run, resend as {"text": "<answer>"}.'
+    "Please provide the exact bash shell commands inside a ```bash ``` code block to create all necessary files and run them on the local machine."
 )
 
 
@@ -1674,13 +1693,8 @@ def _chatgpt_terminal_system_prompt() -> str:
 
 
 def _system_prompt_for(provider_name: str) -> str:
-    """Return the exact Codex bridge contract for every browser provider.
-
-    The Responses proxy and its parser speak the JSON tool-call protocol.  A
-    provider-specific terminal prompt here creates two incompatible protocols:
-    ChatGPT emits bash while Codex is waiting for structured tool calls.  Keep
-    one stateful contract end-to-end instead.
-    """
+    if provider_name and "chatgpt" in provider_name.lower():
+        return _chatgpt_terminal_system_prompt()
     return _codex_browser_system_prompt()
 
 

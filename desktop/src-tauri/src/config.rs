@@ -25,6 +25,7 @@ fn default_model_map() -> HashMap<String, String> {
     // fallback matches the shipped file (see tests/test_config_parity.py).
     map.insert("claude".to_string(), "claude-opus-4-6".to_string());
     map.insert("openai".to_string(), "gpt-4o".to_string());
+    map.insert("openai_oauth".to_string(), "gpt-5.6-terra".to_string());
     map.insert("deepseek".to_string(), "deepseek-chat".to_string());
     map.insert("gemini".to_string(), "gemini-2.0-flash".to_string());
     map.insert("ollama".to_string(), "gpt-oss:120b-cloud".to_string());

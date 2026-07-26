@@ -65,15 +65,30 @@ def contains_new_user_turn(delta_items: list) -> bool:
     return False
 
 
+def _find_first_user_text(items: list) -> Optional[str]:
+    """Find the text of the first user message in items."""
+    for item in items:
+        if isinstance(item, dict) and item.get("role") == "user":
+            text = _item_text(item).strip()
+            if text and not is_continue_keepalive_text(text):
+                return text
+    return None
+
+
 def _first_item_fingerprint(items: list) -> Optional[str]:
-    """Stable fingerprint of items[0], used to detect a discontinuous restart."""
+    """Stable fingerprint of the conversation's first user message or items[0] content.
+
+    Using raw items[0] JSON caused false resets in Codex Desktop GUI because
+    Codex GUI dynamically updates environmental context (current_date, timestamps,
+    skill manifests) inside items[0] between turns.
+    """
     if not items:
         return None
-    try:
-        raw = json.dumps(items[0], sort_keys=True, default=str)
-    except (TypeError, ValueError):
-        raw = str(items[0])
-    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
+    first_user = _find_first_user_text(items)
+    if first_user:
+        return hashlib.sha256(first_user.encode("utf-8", "replace")).hexdigest()
+    raw_text = _item_text(items[0]) if isinstance(items[0], dict) else str(items[0])
+    return hashlib.sha256(raw_text.encode("utf-8", "replace")).hexdigest()
 
 
 def detect_conversation_reset(

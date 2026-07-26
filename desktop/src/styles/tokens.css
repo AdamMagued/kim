@@ -152,162 +152,171 @@
    KIM DESIGN SYSTEM
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* ── Theme tokens: Light (Soft Pastel Light) ─────────────────────────────── */
+/* ── Theme tokens: Light ─────────────────────────────────────────────────── */
 :root {
-  /* Neutrals — warm off-whites */
-  --bg:               #faf7f5;
+  /* Type and layout */
+  --font-sans:         "Inter var", "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  --font-mono:         "SFMono-Regular", "Cascadia Code", "Roboto Mono", Consolas, monospace;
+  --text-xs:           11px;
+  --text-sm:           12.5px;
+  --text-md:           14px;
+  --text-lg:           16px;
+  --text-xl:           20px;
+  --space-1:           4px;
+  --space-2:           8px;
+  --space-3:           12px;
+  --space-4:           16px;
+  --space-5:           20px;
+  --space-6:           24px;
+  --space-8:           32px;
+  --radius-xs:         4px;
+  --radius-sm:         6px;
+  --radius-md:         8px;
+  --radius-lg:         12px;
+  --radius-xl:         16px;
+  --ease-standard:     cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-out:          cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* Neutral surfaces keep the accent purposeful rather than decorative. */
+  --bg:               #f7f7f8;
   --bg-elevated:      #ffffff;
-  --bg-sidebar:       #f2eeeb;
-  --bg-card:          #f5f1ed;
-  --bg-card-hover:    #ede8e4;
+  --bg-sidebar:       #f0f0f1;
+  --bg-card:          #f3f3f4;
+  --bg-card-hover:    #e9e9eb;
   --bg-input:         #ffffff;
-  --bg-overlay:       rgba(45, 40, 34, 0.42);
-  --bg-glass:         rgba(255, 255, 255, 0.72);
-  --sidebar-glass-bg: rgba(250, 247, 245, 0.88);
-  --sidebar-glass-bg-strong: rgba(255, 255, 255, 0.34);
-  --sidebar-glass-border: rgba(184, 138, 116, 0.20);
-  --sidebar-glass-shadow: rgba(45, 40, 34, 0.10);
-  --connector-glass-bg: rgba(250, 247, 245, 0.86);
-  --bg-inset:         #f0ebe6;
-  --surface-raised:   #f8f5f2;
+  --bg-overlay:       rgba(9, 9, 11, 0.42);
+  --bg-glass:         rgba(255, 255, 255, 0.82);
+  --sidebar-glass-bg: rgba(247, 247, 248, 0.90);
+  --sidebar-glass-bg-strong: rgba(255, 255, 255, 0.62);
+  --sidebar-glass-border: rgba(24, 24, 27, 0.09);
+  --sidebar-glass-shadow: rgba(24, 24, 27, 0.10);
+  --connector-glass-bg: rgba(250, 250, 250, 0.92);
+  --bg-inset:         #ededee;
+  --surface-raised:   #fafafa;
 
   /* Text */
-  --text:             #2d2822;
-  --text-strong:      #1a1614;
-  --text-muted:       #6b5f54;
-  --text-subtle:      #9d8f82;
+  --text:             #27272a;
+  --text-strong:      #18181b;
+  --text-muted:       #606066;
+  --text-subtle:      #8b8b92;
 
-  /* Accents — warm brand (default indigo mapped to warm terracotta) */
-  --accent:           #b88a74;
-  --accent-hover:     #a67a64;
-  --accent-active:    #946a54;
-  --accent-muted:     #f0e5dd;
-  --accent-soft:      #e8d8cc;
-  --accent-gradient:  linear-gradient(135deg, #b88a74 0%, #c89a84 55%, #d4a08a 100%);
-  --accent-gradient-hover: linear-gradient(135deg, #a67a64 0%, #b88a74 55%, #c89a84 100%);
+  /* Default accent and semantic colors */
+  --accent:           #0f766e;
+  --accent-hover:     #0d665f;
+  --accent-active:    #0a5751;
+  --accent-muted:     #e6f4f1;
+  --accent-soft:      rgba(15, 118, 110, 0.11);
+  --accent-gradient:  linear-gradient(135deg, #0f766e 0%, #0d9488 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #0d665f 0%, #0f766e 100%);
 
   /* Secondary accents */
-  --accent-claw:      #9d7861;
-  --accent-claw-muted:#f0e5dd;
-  --success:          #6a8f66;
-  --success-muted:    #e8f2e8;
-  --warning:          #c4935a;
-  --danger:           #8f4a4a;
-  --danger-hover:     #7a3a3a;
-  --danger-muted:     #f2e8e8;
+  --accent-claw:      #2563eb;
+  --accent-claw-muted:#eaf0ff;
+  --success:          #16803c;
+  --success-muted:    #e8f6ed;
+  --warning:          #a16207;
+  --warning-muted:    #fff7df;
+  --danger:           #c24145;
+  --danger-hover:     #a9363a;
+  --danger-muted:     #fbeaec;
+  --info:             #2563eb;
+  --info-muted:       #eaf0ff;
 
   /* Borders & dividers */
-  --border:           #e5ddd6;
-  --border-strong:    #d8d0c8;
-  --ring:             rgba(184, 138, 116, 0.22);
+  --border:           #dedee1;
+  --border-strong:    #c9c9ce;
+  --ring:             rgba(15, 118, 110, 0.20);
 
   /* Chat bubbles */
-  --bubble-user-bg:   #b88a74;
-  --bubble-user-text: #ffffff;
-  --bubble-ai-bg:     #f5f1ed;
-  --bubble-ai-text:   #2d2822;
-  --bubble-ai-border: #e5ddd6;
+  --bubble-user-bg:   #e7e7e9;
+  --bubble-user-text: #27272a;
+  --bubble-ai-bg:     transparent;
+  --bubble-ai-text:   #27272a;
+  --bubble-ai-border: transparent;
 
-  /* Shadows — warm-toned */
-  --shadow-xs:  0 1px 2px rgba(45, 40, 34, 0.04);
-  --shadow-sm:  0 2px 4px rgba(45, 40, 34, 0.06), 0 1px 2px rgba(45, 40, 34, 0.04);
-  --shadow-md:  0 4px 12px rgba(45, 40, 34, 0.08), 0 2px 4px rgba(45, 40, 34, 0.04);
-  --shadow-lg:  0 12px 32px rgba(45, 40, 34, 0.10), 0 4px 8px rgba(45, 40, 34, 0.05);
-  --shadow-xl:  0 24px 60px rgba(45, 40, 34, 0.16), 0 8px 16px rgba(45, 40, 34, 0.08);
+  --shadow-xs:  0 1px 2px rgba(24, 24, 27, 0.04);
+  --shadow-sm:  0 1px 2px rgba(24, 24, 27, 0.06), 0 4px 12px rgba(24, 24, 27, 0.04);
+  --shadow-md:  0 10px 30px rgba(24, 24, 27, 0.10), 0 2px 6px rgba(24, 24, 27, 0.05);
+  --shadow-lg:  0 18px 46px rgba(24, 24, 27, 0.13), 0 4px 12px rgba(24, 24, 27, 0.05);
+  --shadow-xl:  0 30px 80px rgba(24, 24, 27, 0.20), 0 8px 24px rgba(24, 24, 27, 0.08);
   --shadow-glow: 0 0 0 3px var(--ring);
 
   /* Scrollbars */
-  --scrollbar:        #d8d0c8;
-  --scrollbar-hover:  #c0b8b0;
+  --scrollbar:        #d1d1d5;
+  --scrollbar-hover:  #b9b9bf;
 
   /* Kim-revamp tokens — light variants */
-  --kim-bg:           #faf7f5;
-  --kim-bg-2:         #f2eeeb;
-  --kim-surface:      #f5f1ed;
-  --kim-surface-2:    #ede8e4;
-  --kim-border:       #e5ddd6;
-  --kim-text:         #2d2822;
-  --kim-text-2:       #6b5f54;
-  --kim-text-3:       #9d8f82;
-  --kim-text-4:       #c0b8b0;
-  --kim-accent:       #b88a74;
-  --kim-accent-soft:  #b88a7422;
-  --kim-accent-line:  #b88a7455;
-  --kim-green:        #6a8f66;
-  --kim-red:          #8f4a4a;
-  --kim-sidebar-gradient: linear-gradient(180deg, #f2eeeb 0%, #ede8e4 100%);
+  --kim-bg:           var(--bg);
+  --kim-bg-2:         var(--bg-sidebar);
+  --kim-surface:      var(--bg-card);
+  --kim-surface-2:    var(--bg-card-hover);
+  --kim-border:       var(--border);
+  --kim-text:         var(--text);
+  --kim-text-2:       var(--text-muted);
+  --kim-text-3:       var(--text-subtle);
+  --kim-text-4:       #b3b3b8;
+  --kim-accent:       var(--accent);
+  --kim-accent-soft:  var(--accent-soft);
+  --kim-accent-line:  color-mix(in srgb, var(--accent) 36%, transparent);
+  --kim-green:        var(--success);
+  --kim-red:          var(--danger);
+  --kim-sidebar-gradient: linear-gradient(180deg, #f2f2f3 0%, #ececee 100%);
   --kim-on-accent:    #ffffff;
 
   color-scheme: light;
 }
 
-/* ── Theme tokens: Dark (Kim · UI revamp — warm dark) ──────────────────────── */
+/* ── Theme tokens: Dark ───────────────────────────────────────────────────── */
 .dark {
-  /* Design tokens (kim-revamp-* mirror the source styles.css verbatim) */
-  --kim-bg:           #0d0a08;
-  --kim-bg-2:         #131010;
-  --kim-surface:      #1a1614;
-  --kim-surface-2:    #221c19;
-  --kim-border:       #2a2320;
-  --kim-text:         #ece3dc;
-  --kim-text-2:       #a89d94;
-  --kim-text-3:       #6b625b;
-  --kim-text-4:       #4a423d;
-  --kim-accent:       #e8b89a;
-  --kim-accent-soft:  #e8b89a22;
-  --kim-accent-line:  #e8b89a55;
-  --kim-green:        #7bc097;
-  --kim-red:          #d49497;
-  --kim-sidebar-gradient: linear-gradient(180deg, #110d0b 0%, #0d0a08 100%);
-  --kim-on-accent:    #1a0e08;
-
-  /* Existing kim-app tokens — remapped to design palette */
-  --bg:               #0d0a08;
-  --bg-elevated:      #1a1614;
-  --bg-sidebar:       #110d0b;
-  --bg-card:          #1a1614;
-  --bg-card-hover:    #221c19;
-  --bg-input:         #131010;
+  --bg:               #171717;
+  --bg-elevated:      #242424;
+  --bg-sidebar:       #101010;
+  --bg-card:          #262626;
+  --bg-card-hover:    #303030;
+  --bg-input:         #202020;
   --bg-overlay:       rgba(0, 0, 0, 0.65);
-  --bg-glass:         rgba(20, 16, 14, 0.72);
-  --sidebar-glass-bg: rgba(17, 13, 11, 0.94);
-  --sidebar-glass-bg-strong: rgba(232, 184, 154, 0.10);
-  --sidebar-glass-border: rgba(232, 184, 154, 0.18);
+  --bg-glass:         rgba(28, 28, 28, 0.82);
+  --sidebar-glass-bg: rgba(16, 16, 16, 0.94);
+  --sidebar-glass-bg-strong: rgba(255, 255, 255, 0.06);
+  --sidebar-glass-border: rgba(255, 255, 255, 0.09);
   --sidebar-glass-shadow: rgba(0, 0, 0, 0.50);
-  --connector-glass-bg: rgba(17, 13, 11, 0.92);
-  --bg-inset:         #131010;
-  --surface-raised:   #221c19;
+  --connector-glass-bg: rgba(20, 20, 20, 0.94);
+  --bg-inset:         #1d1d1d;
+  --surface-raised:   #2b2b2b;
 
-  --text:             #ece3dc;
+  --text:             #ececec;
   --text-strong:      #ffffff;
-  --text-muted:       #a89d94;
-  --text-subtle:      #6b625b;
+  --text-muted:       #b0b0b5;
+  --text-subtle:      #77777e;
 
-  --accent:           #e8b89a;
-  --accent-hover:     #f0c8aa;
-  --accent-active:    #d8a888;
-  --accent-muted:     #3a2d24;
-  --accent-soft:      #e8b89a22;
-  --accent-gradient:  linear-gradient(135deg, #e8b89a 0%, #d8a888 55%, #c98968 100%);
-  --accent-gradient-hover: linear-gradient(135deg, #f0c8aa 0%, #e8b89a 55%, #d8a888 100%);
+  --accent:           #6fd6c6;
+  --accent-hover:     #8be2d5;
+  --accent-active:    #4fc2b1;
+  --accent-muted:     #173b37;
+  --accent-soft:      rgba(111, 214, 198, 0.12);
+  --accent-gradient:  linear-gradient(135deg, #5bcbbb 0%, #7ddfce 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #6fd6c6 0%, #92e8dc 100%);
 
-  --accent-claw:      #e8b89a;
-  --accent-claw-muted:#3a2d24;
-  --success:          #7bc097;
-  --success-muted:    #1d2a22;
-  --warning:          #e8b89a;
-  --danger:           #d49497;
-  --danger-hover:     #e0a4a7;
-  --danger-muted:     #3a2626;
+  --accent-claw:      #8fb3ff;
+  --accent-claw-muted:#1e2b49;
+  --success:          #77d29b;
+  --success-muted:    #183326;
+  --warning:          #e8c36b;
+  --warning-muted:    #3b3118;
+  --danger:           #f08c91;
+  --danger-hover:     #f5a2a6;
+  --danger-muted:     #402326;
+  --info:             #8fb3ff;
+  --info-muted:       #1e2b49;
 
-  --border:           #2a2320;
-  --border-strong:    #34292c;
-  --ring:             rgba(232, 184, 154, 0.30);
+  --border:           #38383b;
+  --border-strong:    #4a4a4f;
+  --ring:             rgba(111, 214, 198, 0.25);
 
-  --bubble-user-bg:   #221c19;
-  --bubble-user-text: #ece3dc;
+  --bubble-user-bg:   #303030;
+  --bubble-user-text: #f4f4f5;
   --bubble-ai-bg:     transparent;
-  --bubble-ai-text:   #ece3dc;
+  --bubble-ai-text:   #ececec;
   --bubble-ai-border: transparent;
 
   --shadow-xs:  0 1px 2px rgba(0, 0, 0, 0.24);
@@ -317,8 +326,25 @@
   --shadow-xl:  0 28px 72px rgba(0, 0, 0, 0.62), 0 8px 20px rgba(0, 0, 0, 0.38);
   --shadow-glow: 0 0 0 3px var(--ring);
 
-  --scrollbar:        #3d3630;
-  --scrollbar-hover:  #4a4238;
+  --scrollbar:        #3d3d42;
+  --scrollbar-hover:  #55555b;
+
+  --kim-bg:           var(--bg);
+  --kim-bg-2:         var(--bg-sidebar);
+  --kim-surface:      var(--bg-card);
+  --kim-surface-2:    var(--bg-card-hover);
+  --kim-border:       var(--border);
+  --kim-text:         var(--text);
+  --kim-text-2:       var(--text-muted);
+  --kim-text-3:       var(--text-subtle);
+  --kim-text-4:       #55555b;
+  --kim-accent:       var(--accent);
+  --kim-accent-soft:  var(--accent-soft);
+  --kim-accent-line:  color-mix(in srgb, var(--accent) 40%, transparent);
+  --kim-green:        var(--success);
+  --kim-red:          var(--danger);
+  --kim-sidebar-gradient: linear-gradient(180deg, #121212 0%, #0e0e0e 100%);
+  --kim-on-accent:    #10201d;
 
   color-scheme: dark;
 }
@@ -337,13 +363,11 @@ html, body, #root {
 }
 
 body {
-  font-family:
-    "Inter var", "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text",
-    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-family: var(--font-sans);
   font-size: 14px;
   line-height: 1.5;
   font-feature-settings: "cv02", "cv03", "cv04", "cv11", "ss01";
-  letter-spacing: -0.005em;
+  letter-spacing: 0;
   background-color: transparent;
   color: var(--text);
   -webkit-font-smoothing: antialiased;
@@ -354,7 +378,7 @@ body {
 /* Mono stack */
 code, pre, kbd, samp,
 .kim-font-mono {
-  font-family: "JetBrains Mono", "SF Mono", "Fira Code", Consolas, monospace;
+  font-family: var(--font-mono);
   font-variant-ligatures: common-ligatures;
 }
 
@@ -418,4 +442,3 @@ kbd {
   font-family: inherit;
   line-height: 1;
 }
-
