@@ -2206,35 +2206,18 @@ def _surface_relay_reasoning(response: dict, relay_num: int) -> None:
     content = response.get("content", "")
     if not isinstance(content, str) or not content.strip():
         return
-    # Only preview the prose BEFORE the first code fence — dumping 150 chars of
-    # a raw command/code block ("```bash printf '%s' '<!doctype…") is noise, and
-    # the salvage layer already runs the command. If the reply is only a code
-    # block, there's nothing to preview.
-    prose = content.split("```", 1)[0]
-    # A save-it-yourself dodge ("you can save as game.html and open in your
-    # browser") is NOT Kim's thinking — Kim salvages and does the work itself,
-    # and the humanized "Creating game.html…" lines narrate it truthfully.
-    if _SELF_HELP_RE.search(prose):
+    # Extract prose before code fences
+    prose = content.split("```", 1)[0].strip()
+    if not prose:
         return
-    # Drop command-introduction lines ("Run these commands in your terminal:",
-    # "Now open it:") — the humanized activity lines already narrate those.
-    kept = [
-        ln for ln in prose.splitlines()
-        if not re.match(
-            r"\s*(?:run|paste|copy|now|then|here(?:'s| is| are)?)\b.*[:：]\s*$",
-            ln, re.IGNORECASE,
-        )
-    ]
-    prose = " ".join(kept)
+    
     display = re.sub(
         r"\b(Gemini|Claude|ChatGPT|Grok|DeepSeek)\b",
         "Kim",
-        prose[:150],
+        prose[:250],
         flags=re.IGNORECASE,
     )
-    # Collapse to ONE line: the consumer parses stdout line-by-line, so a
-    # newline inside the preview would make its tail lines lose the [STATUS]
-    # prefix and be misparsed as answer text.
+    # Collapse whitespace to single line so [STATUS] line displays cleanly
     display = " ".join(display.split())
     if display and not display.startswith("{"):
         print(f"{LOG_TAG_STATUS} {display}", flush=True)
