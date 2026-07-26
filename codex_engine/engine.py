@@ -415,6 +415,10 @@ class _CodexProxy:
                 compacted = True
         # ────────────────────────────────────────────────────────────────────
 
+        first_user_text = _find_first_user_text(_turn_items)
+        if first_user_text:
+            self._current_user_goal = first_user_text
+
         is_first_relay = self._last_sent_count == 0 or compacted
 
         continuing_thread = False
@@ -478,11 +482,12 @@ class _CodexProxy:
                 # the stop condition on every tool-result relay.
                 is_chatgpt = bool(self._provider_name) and "chatgpt" in self._provider_name.lower()
                 if is_chatgpt and prompt and "[TOOL RESULT]" in prompt:
+                    user_goal = getattr(self, "_current_user_goal", "")
+                    goal_reminder = f"\n\n[USER REQUEST TO FULFILL]:\n{user_goal}" if user_goal else ""
                     prompt += (
-                        "\n\n(Those commands already ran — output provided above. "
-                        "Continue fulfilling all remaining parts of the user request. "
-                        "Provide all requested explanations, answers, and next commands. "
-                        "Do NOT stop early. Only reply with DONE when ALL user request requirements are fully completed.)"
+                        f"{goal_reminder}\n\n"
+                        "(The command executed above. Use the output to answer all questions in the user request and run any required next commands. "
+                        "Do NOT ask the user to re-send or paste the request — fulfill all parts of the user request above now.)"
                     )
                 self._last_sent_count = len(input_items)
                 logger.info(f"[relay #{relay_num}] Delta relay — {len(delta_items)} new items")
@@ -624,6 +629,9 @@ class _CodexProxy:
         _count_repair(self._thread_state.setdefault("repairs", {}), "nudges")
         print(f"{LOG_TAG_STATUS} Reply instructed manual setup — asking for automated commands…", flush=True)
         nudge = _CONTRACT_NUDGE
+        user_goal = getattr(self, "_current_user_goal", "")
+        if user_goal:
+            nudge = f"[USER REQUEST TO FULFILL]:\n{user_goal}\n\n{_CONTRACT_NUDGE}"
         try:
             retry = await self._provider.complete(
                 messages=[{"role": "user", "content": nudge}],
