@@ -159,6 +159,40 @@ env_key = "CODEX_API_KEY"
     logger.info(f"Wrote Codex config: {config_path}")
 
 
+def _is_title_generator_request(items: list) -> bool:
+    for item in items:
+        if isinstance(item, dict) and item.get("role") == "user":
+            content = item.get("content", "")
+            text = content if isinstance(content, str) else str(content)
+            if "Generate a concise UI title" in text or "provide a short title" in text or "Generate a clear, informative task title" in text:
+                return True
+    return False
+
+
+def _generate_stateless_title(items: list) -> str:
+    """Generate a clean title JSON statelessly without touching the browser chat thread."""
+    raw_prompt = ""
+    for item in items:
+        if isinstance(item, dict) and item.get("role") == "user":
+            text = item.get("content", "")
+            if "User prompt:" in text:
+                raw_prompt = text.split("User prompt:")[-1].split("INSTRUCTION:")[0].strip()
+                break
+            elif isinstance(text, str):
+                raw_prompt = text.strip()
+    
+    clean_p = re.sub(r'[>\?!\.]+$', '', raw_prompt).strip()
+    words = clean_p.split()[:5]
+    title_str = " ".join(words).capitalize() or "Coding Task"
+    if len(title_str) > 36:
+        title_str = title_str[:33] + "..."
+
+    return json.dumps({
+        "title": title_str,
+        "description": f"Execute task: {title_str}"
+    })
+
+
 # ── Local HTTP Proxy Server ──────────────────────────────────────────────────
 
 
