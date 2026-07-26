@@ -307,3 +307,104 @@ Recording these so the vectors are closed rather than silently skipped.
   real token, WS bridge listening on 10533, title interception returning a valid
   Responses payload in ~15 ms with no provider call
 - PoW encoder benchmark with an equivalence assertion
+
+---
+
+## 9. Live stress test (Codex CLI → proxy → ChatGPT Web)
+
+Ran Codex CLI 0.144.3 against the running proxy with the Chrome Extension
+connected. Two invocations: build a 5-file/8-test Python CLI, then extend it.
+
+**Result: both runs failed. Final disk state was unchanged** — only the
+pre-existing `hello.txt` from the smoke test. No `tasks/`, no `tests/`, no
+`README.md`.
+
+**What worked:** token forwarding (no 401), extension connect/ready, and
+**thread continuity** — `conversationId` stayed constant across all relays
+within each run (`6a668851-c43…` ×4, `6a6689b3-729…` ×2), and each run
+correctly triggered a fresh-conversation reset at start. §3.1/§3.2 hold up
+under real load.
+
+Three further bugs surfaced. One is now fixed; two are diagnosed and open.
+
+### 9.1 FIXED — a failed extension turn fell through to a bridge that isn't there
+
+After a 180 s browser timeout, the extension path returned "fall through", and
+the desktop webview path then POSTed to `"" + "/v1/send"`:
+
+```
+[ERROR] Request f1c0c7ce-… timed out after 180s — cancelling the browser turn
+[WARNING] Bridge /v1/send failed (Request URL is missing an 'http://' or 'https://' protocol.)
+NEED_HELP: Bridge /v1/send failed — Request URL is missing an 'http://' ...
+```
+
+A diagnosable browser timeout reached the user as a malformed-URL message.
+`_try_extension_bridge` now returns `(reply, attempted)`; when the extension was
+the transport and no webview bridge is configured, the real cause is reported.
+Covered by `ExtensionBridgeFailureReportingTests`.
+
+### 9.2 OPEN — the salvage ladder emits a tool name codex cannot route
+
+**Root cause, with evidence.** Codex 0.144.3 sends `tools=[]` on every
+`/v1/responses` call — confirmed in the log, every relay:
+
+```
+[relay #1] Codex request received, tools=[]
+```
+
+It uses built-in tools rather than declaring them per request. But the salvage
+ladder hardcodes a placeholder name and relies on `_normalize_tool_calls` to
+snap it onto a real tool from `request_tools`:
+
+```python
+[{"name": "exec", "input": {"cmd": block}} for block in blocks]
+```
+
+With `tools=[]` there is nothing to snap onto, so the placeholder ships as-is
+and codex's router rejects it — repeatedly, on the first relay of both runs:
+
+```
+ERROR codex_core::tools::router: error=Fatal error: tool exec invoked with incompatible payload
+```
+
+Extracting the tool-router symbols from the codex 0.144.3 binary gives
+`shell`, `local_shell`, `write_stdin`, `apply_patch`, `update_plan`.
+**Neither `exec` nor `exec_command` is a real codex tool** — so both the current
+code (passes `exec` through) and `a48fe67` (mapped it to the literal
+`"exec_command"`) are wrong; they just fail differently.
+
+**Not fixed, deliberately.** The fix is to resolve exec-alias placeholders to
+`shell` when the request declares no tools — but `shell`'s argument schema
+(`{"command": ["bash","-lc",...]}` vs. our `{"cmd": "..."}`) must be confirmed
+empirically, and
+`test_codex_stateful_threads.py::TestNormalizeToolCalls::test_no_request_tools_is_a_no_op`
+asserts the *opposite* contract (`exec` passes through untouched). Changing this
+touches the protocol the whole setup depends on, so it needs your decision, not
+a guess from me. **This is the single highest-value follow-up.**
+
+### 9.3 OPEN — the loop guard fires on two identical read-only inspections
+
+```
+[relay #2] Repeated tool call (('exec', '{"cmd": "find tasks tests -maxdepth 3 -type f -print | sort"}'),) — ending turn (loop guard)
+[STATUS] Command already ran — finishing up…
+```
+
+The model's first `find` was interrupted (by 9.2), so it retried the same
+listing — normal recovery, not a loop. `_is_repeat_of_previous` fired on the
+second occurrence and force-ended the turn with the "already ran; nothing left
+to do" text, which Codex then reported as a completion. **Run 2 produced a
+false success claim with zero work done**, in ~25 s.
+
+Two independent weaknesses: the guard does not distinguish a *repeat after a
+failed/interrupted call* from a genuine loop, and it does not exempt read-only
+inspection commands (`find`, `ls`, `grep`, `pwd`) that are idempotent by nature.
+Both are tuning changes to load-bearing behavior; flagged, not altered.
+
+### 9.4 Assessment
+
+The transport and state layers this audit targeted — auth, thread continuity,
+session isolation, bridge lifecycle — held up. The failures are one layer up, in
+the **tool-call protocol translation** (9.2) and its **loop-guard interaction**
+(9.3). 9.2 is almost certainly the primary cause: it broke the model's first
+tool call in both runs, and the shell-quoting flailing and loop-guard trip
+downstream are consequences of it.

@@ -455,3 +455,43 @@ class TitleInterceptionShapeTests(unittest.IsolatedAsyncioTestCase):
         # Stateless: the browser thread must not be touched at all.
         self.assertEqual(provider.calls, 0)
         self.assertEqual(proxy._last_sent_count, 0)
+
+
+class ExtensionBridgeFailureReportingTests(unittest.IsolatedAsyncioTestCase):
+    """A failed extension turn must not fall through to a bridge that isn't there.
+
+    Observed live: a 180s browser timeout fell through to the desktop webview
+    path with bridge_url="", so the user's actual error read
+    "Bridge /v1/send failed — Request URL is missing an 'http://' or 'https://'
+    protocol" — which says nothing about what went wrong.
+    """
+
+    async def test_timeout_reports_the_real_cause(self):
+        from orchestrator.providers.browser import bridge_client as bc
+
+        async def _boom(**_kw):
+            return None, True  # attempted, then failed
+
+        with mock.patch.object(bc, "_try_extension_bridge", _boom):
+            result = await bc.complete_via_webview_bridge(
+                bridge_url="", bridge_token="", preferred_site="chatgpt", prompt="hi",
+            )
+
+        self.assertEqual(result["type"], "text")
+        self.assertIn("NEED_HELP", result["content"])
+        self.assertIn("Chrome Extension bridge", result["content"])
+        self.assertNotIn("http://", result["content"].replace("https://", ""))
+
+    async def test_never_connected_still_falls_through(self):
+        """No extension at all is a different case — the desktop bridge owns it."""
+        from orchestrator.providers.browser import bridge_client as bc
+
+        async def _absent(**_kw):
+            return None, False  # never attempted
+
+        with mock.patch.object(bc, "_try_extension_bridge", _absent):
+            result = await bc.complete_via_webview_bridge(
+                bridge_url="", bridge_token="", preferred_site="chatgpt", prompt="hi",
+            )
+        # Falls through to the webview path (which then reports its own error).
+        self.assertNotIn("Chrome Extension bridge did not answer", result["content"])

@@ -90,17 +90,22 @@ async def _try_extension_bridge(
     known_tools: Optional[set[str]],
     clear_chat: bool,
     attachments: list[dict],
-) -> Optional[dict]:
+) -> tuple[Optional[dict], bool]:
     """Attempt the Chrome Extension WebSocket path.
 
-    Returns the parsed reply, or None to fall through to the desktop webview
-    bridge (extension not connected / transport error).
+    Returns ``(reply, attempted)``. ``reply`` is None when the caller should
+    fall through. ``attempted`` distinguishes "the extension was never
+    connected, so this deployment isn't using it" from "the extension WAS
+    connected and the turn failed" — only the latter should be reported as a
+    bridge failure rather than silently retried on another transport.
     """
+    attempted = False
     try:
         from orchestrator.providers.browser.extension_bridge import get_extension_bridge
         bridge = await get_extension_bridge()
         if not await bridge.wait_for_connection(timeout=15.0):
-            return None
+            return None, False
+        attempted = True
 
         if attachments:
             # The extension protocol carries text only — say so rather than
@@ -117,8 +122,8 @@ async def _try_extension_bridge(
         logger.info("[Kim Bridge] Dispatching prompt to Chrome Extension over WebSocket...")
         res = await bridge.send_completion(prompt, clear_chat=clear_chat)
     except Exception as exc:
-        logger.warning(f"[Kim Bridge] Extension bridge fallback note: {exc}")
-        return None
+        logger.warning(f"[Kim Bridge] Extension bridge send failed: {exc or exc.__class__.__name__}")
+        return None, attempted
 
     full_text = res.get("full_text", "")
     if not isinstance(full_text, str) or not full_text.strip():
@@ -132,12 +137,12 @@ async def _try_extension_bridge(
                 "NEED_HELP: The Chrome Extension bridge returned an empty response. "
                 "Check that the chatgpt.com tab is open and signed in."
             ),
-        }
+        }, attempted
 
     result = parse_response(full_text, completion_hash, known_tools=known_tools)
     if attachments:
         result["attachments_uploaded"] = 0
-    return result
+    return result, attempted
 
 
 async def complete_via_webview_bridge(
@@ -159,7 +164,7 @@ async def complete_via_webview_bridge(
     attachments = list(attachments or [])
 
     if _extension_bridge_serves(preferred_site):
-        result = await _try_extension_bridge(
+        result, attempted = await _try_extension_bridge(
             prompt=prompt,
             completion_hash=completion_hash,
             known_tools=known_tools,
@@ -168,6 +173,24 @@ async def complete_via_webview_bridge(
         )
         if result is not None:
             return result
+        if attempted and not bridge_url:
+            # The extension bridge WAS the transport for this deployment and it
+            # failed mid-turn (timeout, socket drop). Falling through to the
+            # desktop webview bridge means POSTing to ""+"/v1/send", whose only
+            # possible outcome is `Request URL is missing an 'http://' ...` —
+            # a nonsense error that buries the real cause (observed live: a
+            # 180s browser timeout surfaced to the user as a malformed-URL
+            # message). Report what actually happened instead.
+            return {
+                "type": "text",
+                "content": (
+                    "NEED_HELP: The Chrome Extension bridge did not answer this turn "
+                    "(browser timeout or disconnect) and no desktop webview bridge is "
+                    "configured to fall back to. Check the chatgpt.com tab is open, "
+                    "signed in, and not showing a rate-limit or verification prompt, "
+                    "then retry."
+                ),
+            }
 
     known_sites = site_configs or SITE_CONFIGS
     # The browser:claude site was removed from SITE_CONFIGS entirely (feat/
