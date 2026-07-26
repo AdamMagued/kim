@@ -297,9 +297,8 @@ class _CodexProxy:
         """Handle POST /v1/responses — the Codex Responses API endpoint."""
         from aiohttp import web
 
-        err_resp = self._check_auth(request)
-        if err_resp is not None:
-            return err_resp
+        if not self._check_auth(request):
+            return web.json_response({"error": {"message": "Unauthorized"}}, status=401)
 
         if request.content_type != "application/json":
             return web.json_response(
