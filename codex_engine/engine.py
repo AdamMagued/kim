@@ -297,8 +297,15 @@ class _CodexProxy:
         """Handle POST /v1/responses — the Codex Responses API endpoint."""
         from aiohttp import web
 
-        if not self._check_auth(request):
-            return web.json_response({"error": {"message": "Unauthorized"}}, status=401)
+        err_resp = self._check_auth(request)
+        if err_resp is not None:
+            return err_resp
+
+        if request.content_type != "application/json":
+            return web.json_response(
+                {"error": {"message": f"Unsupported Content-Type: {request.content_type}"}},
+                status=400,
+            )
 
         if self._mode == "chat-passthrough":
             # chat-passthrough codex config always sets wire_api="chat" — Codex
@@ -321,13 +328,25 @@ class _CodexProxy:
         if self._mode == "responses-passthrough":
             return await handle_responses_passthrough(self, body, _turn_items)
 
-        # TUI fixes for the standalone proxy's long-lived process (module
-        # docstring "Modes"): the exec transport spawns one process per turn
-        # so MAX_RELAYS/the sent-cursor naturally reset between turns; a
-        # long-lived kimcli session does not, so detect the boundaries here.
+        # Intercept background Codex GUI title generator requests statelessly
+        stream = bool(body.get("stream", False))
+        if _is_title_generator_request(_turn_items):
+            logger.info("Intercepted background Codex GUI title generator request — handling statelessly")
+            title_json = _generate_stateless_title(_turn_items)
+            return _sse_or_json(stream, {"type": "text", "content": title_json})
+
+        # Lock session ID to prevent dynamic environment shifts from causing false resets
+        session_id = body.get("session_id") or request.headers.get("x-codex-session-id")
+        
         is_reset, new_fingerprint = detect_conversation_reset(
             _turn_items, self._last_sent_count, self._last_first_fingerprint,
         )
+
+        if session_id and getattr(self, "_current_codex_session_id", None) == session_id:
+            is_reset = False
+        if session_id:
+            self._current_codex_session_id = session_id
+
         if is_reset:
             logger.info("Detected a fresh conversation (codex /new) — resetting proxy state")
             self._last_sent_count = 0
