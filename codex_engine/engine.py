@@ -110,6 +110,7 @@ from codex_engine.responses_passthrough import handle_responses_passthrough  # n
 from codex_engine.turn_tracking import (  # noqa: E402
     contains_new_user_turn,
     detect_conversation_reset,
+    _find_first_user_text,
 )
 
 # Deterministic provider-failure signatures for a send into a stored browser
