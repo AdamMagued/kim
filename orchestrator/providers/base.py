@@ -340,5 +340,6 @@ def create_provider(name: str, config: dict) -> BaseProvider:
         from orchestrator.providers.fake import FakeProvider
         return FakeProvider()
     raise ValueError(
-        f"Unknown provider: {name!r}. Choose from: claude, openai, openai_oauth, gemini, deepseek, browser, ollama, fake"
+        f"Unknown provider: {name!r}. Choose from: claude, openai, openai_oauth, "
+        "gemini, deepseek, browser, ollama, fake"
     )

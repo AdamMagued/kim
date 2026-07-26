@@ -201,12 +201,13 @@
   var deviceId = crypto.randomUUID();
   var cachedScripts = [];
   var cachedDpl = '';
+  // Captured before the interceptor below replaces window.fetch. The bridge's
+  // own calls go through this so they are never re-intercepted.
   var originalFetch = window.fetch.bind(window);
 
   // ═══════════════════════════════════════════════════════════════
   // Intercept page fetch to capture auth tokens
   // ═══════════════════════════════════════════════════════════════
-  var _origFetch = window.fetch;
   window.fetch = function() {
     var args = arguments;
     var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
@@ -237,17 +238,27 @@
         if (rt) console.log('[Bridge] Captured page requirements token:', rt.slice(0, 30) + '...');
       }
     }
-    return _origFetch.apply(window, args);
+    return originalFetch.apply(window, args);
   };
 
   // ═══════════════════════════════════════════════════════════════
   // Auth & environment helpers
   // ═══════════════════════════════════════════════════════════════
+  // Hoisted: solvePoW calls this once per hash attempt (up to 500k times for
+  // one turn), and allocating a TextEncoder per call dominated the loop.
+  var _textEncoder = new TextEncoder();
+  // fromCharCode.apply over a chunk beats appending one character at a time;
+  // 8192 stays well under the argument-count limit for a spread call.
+  var _B64_CHUNK = 8192;
+
   function utf8Base64Encode(str) {
-    var encoder = new TextEncoder();
-    var bytes = encoder.encode(str);
+    var bytes = _textEncoder.encode(str);
     var binary = '';
-    for (var k = 0; k < bytes.length; k++) binary += String.fromCharCode(bytes[k]);
+    for (var k = 0; k < bytes.length; k += _B64_CHUNK) {
+      binary += String.fromCharCode.apply(
+        null, bytes.subarray(k, k + _B64_CHUNK)
+      );
+    }
     return btoa(binary);
   }
 
@@ -360,6 +371,14 @@
         return 'gAAAAAB' + b64;
       }
     }
+    // Exhausted the search space. The token below will NOT satisfy the
+    // server's check — /backend-api/conversation answers 4xx and the turn
+    // fails. Say so loudly: this used to be returned silently, so the real
+    // cause showed up only as an unexplained HTTP error further down.
+    console.error(
+      '[Bridge] PoW FAILED: no solution in 500000 attempts for difficulty ' +
+      difficulty + '. The next request will likely be rejected by ChatGPT.'
+    );
     return 'gAAAAABwQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D' + utf8Base64Encode('"' + seed + '"');
   }
 
@@ -475,7 +494,7 @@
   // ═══════════════════════════════════════════════════════════════
   // SSE Parser — handles v1 delta encoding
   // ═══════════════════════════════════════════════════════════════
-  async function parseSSEStream(response, onDelta, onDone, onError, onReader) {
+  async function parseSSEStream(response, onDelta, onDone, onError, onReader, onIds) {
     var reader = response.body.getReader();
     if (onReader) onReader(reader);
     var decoder = new TextDecoder();
@@ -518,12 +537,24 @@
               if (parsed.v.conversation_id) conversationId = parsed.v.conversation_id;
               if (parsed.v.message && parsed.v.message.conversation_id) conversationId = parsed.v.message.conversation_id;
             }
+            // Publish ids as soon as they are known so a cancel arriving
+            // mid-stream can address the real message. Waiting for onDone
+            // meant activeStreams.messageId was still null at cancel time and
+            // the backend cancel call never fired.
+            if (onIds && (conversationId || messageId)) onIds(conversationId, messageId);
 
             if (parsed.v && typeof parsed.v === 'object' && parsed.v.message) {
               var msg = parsed.v.message;
               var role = (msg.author || {}).role || '';
               isAssistant = role !== 'user';
-              if (msg.id) messageId = msg.id;
+              // Only an ASSISTANT message id may become the next turn's
+              // parent_message_id. Recording the user echo (or a trailing
+              // system/moderation message) here pointed the following turn at
+              // the wrong node and forked the thread into a branch.
+              if (isAssistant && msg.id) {
+                messageId = msg.id;
+                if (onIds) onIds(conversationId, messageId);
+              }
               if (isAssistant) {
                 var parts = ((msg.content || {}).parts) || [];
                 if (parts.length) {
@@ -626,11 +657,19 @@
       var active = activeStreams.get(cancelReqId);
       if (active) {
         console.log('[Bridge] Processing cancel request for:', cancelReqId);
+        // Mark BEFORE cancelling the reader: reader.cancel() makes the next
+        // read() resolve {done:true}, which walks parseSSEStream out of its
+        // loop and into onDone — posting a bogus 'done' carrying whatever
+        // partial text had arrived, as though the turn had finished normally.
+        active.cancelled = true;
         if (active.reader) {
           try { active.reader.cancel(); } catch(e) {}
         }
         if (active.conversationId && active.messageId) {
           cancelChatGPTStream(active.conversationId, active.messageId);
+        } else {
+          console.warn('[Bridge] Cancelled before ChatGPT returned message ids — ' +
+            'the backend turn may keep generating.');
         }
         activeStreams.delete(cancelReqId);
       }
@@ -645,13 +684,20 @@
     var conversationId = event.data.conversationId;
     var parentMessageId = event.data.parentMessageId;
 
+    var streamState = {
+      reader: null,
+      conversationId: conversationId || null,
+      messageId: null,
+      cancelled: false,
+    };
+
     try {
       var response = await sendConversation(messages, model, requestId, conversationId, parentMessageId);
-      var streamState = { reader: null, conversationId: conversationId, messageId: null };
       activeStreams.set(requestId, streamState);
 
       await parseSSEStream(response,
         function onDelta(delta) {
+          if (streamState.cancelled) return;
           window.postMessage({
             type: 'CHATGPT_BRIDGE_RESPONSE',
             requestId: requestId,
@@ -661,6 +707,7 @@
         },
         function onDone(fullText, convId, msgId) {
           activeStreams.delete(requestId);
+          if (streamState.cancelled) return;
           window.postMessage({
             type: 'CHATGPT_BRIDGE_RESPONSE',
             requestId: requestId,
@@ -672,6 +719,7 @@
         },
         function onError(err) {
           activeStreams.delete(requestId);
+          if (streamState.cancelled) return;
           window.postMessage({
             type: 'CHATGPT_BRIDGE_RESPONSE',
             requestId: requestId,
@@ -681,15 +729,20 @@
         },
         function onReader(r) {
           streamState.reader = r;
+        },
+        function onIds(convId, msgId) {
+          if (convId) streamState.conversationId = convId;
+          if (msgId) streamState.messageId = msgId;
         }
       );
     } catch(e) {
       activeStreams.delete(requestId);
+      if (streamState.cancelled) return;
       window.postMessage({
         type: 'CHATGPT_BRIDGE_RESPONSE',
         requestId: requestId,
         event: 'error',
-        error: e.message,
+        error: e && e.message ? e.message : String(e),
       }, '*');
     }
   });

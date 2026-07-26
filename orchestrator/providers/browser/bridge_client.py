@@ -63,6 +63,83 @@ def _apply_attachment_signal(result: dict, data: dict, sent_attachments: list[di
     return result
 
 
+# The Chrome Extension bridge talks to chatgpt.com and nothing else
+# (chrome_extension/injected.js posts to /backend-api/conversation). Routing a
+# gemini/deepseek request through it because a ChatGPT tab happened to be open
+# would silently answer from the wrong provider — the user asked for one model
+# and would get another with no notice.
+_EXTENSION_BRIDGE_SITE = "chatgpt"
+
+
+def _extension_bridge_serves(preferred_site: Optional[str]) -> bool:
+    """True when `preferred_site` is one the Chrome Extension can actually serve.
+
+    An unset site means "whatever the bridge defaults to", which is chatgpt —
+    so that case routes through the extension too.
+    """
+    if not preferred_site:
+        return True
+    # Sites carry an optional model suffix ("chatgpt:gpt-5.6-sol").
+    return str(preferred_site).split(":", 1)[0].strip().lower() == _EXTENSION_BRIDGE_SITE
+
+
+async def _try_extension_bridge(
+    *,
+    prompt: str,
+    completion_hash: str,
+    known_tools: Optional[set[str]],
+    clear_chat: bool,
+    attachments: list[dict],
+) -> Optional[dict]:
+    """Attempt the Chrome Extension WebSocket path.
+
+    Returns the parsed reply, or None to fall through to the desktop webview
+    bridge (extension not connected / transport error).
+    """
+    try:
+        from orchestrator.providers.browser.extension_bridge import get_extension_bridge
+        bridge = await get_extension_bridge()
+        if not await bridge.wait_for_connection(timeout=15.0):
+            return None
+
+        if attachments:
+            # The extension protocol carries text only — say so rather than
+            # letting the model answer "describe this screenshot" without one.
+            logger.warning(
+                "Chrome Extension bridge cannot carry %d attachment(s) — sending text only.",
+                len(attachments),
+            )
+            prompt = (
+                f"{prompt}\n\n[Kim note: {len(attachments)} attachment(s) could NOT be "
+                "sent — the Chrome Extension bridge relays text only.]"
+            )
+
+        logger.info("[Kim Bridge] Dispatching prompt to Chrome Extension over WebSocket...")
+        res = await bridge.send_completion(prompt, clear_chat=clear_chat)
+    except Exception as exc:
+        logger.warning(f"[Kim Bridge] Extension bridge fallback note: {exc}")
+        return None
+
+    full_text = res.get("full_text", "")
+    if not isinstance(full_text, str) or not full_text.strip():
+        # Mirrors the webview path's empty-response guard: an empty string
+        # parses as a blank final answer, so codex ends the turn having done
+        # nothing and the user sees a silent no-op instead of a diagnosis.
+        logger.warning("[Kim Bridge] Extension returned an empty response.")
+        return {
+            "type": "text",
+            "content": (
+                "NEED_HELP: The Chrome Extension bridge returned an empty response. "
+                "Check that the chatgpt.com tab is open and signed in."
+            ),
+        }
+
+    result = parse_response(full_text, completion_hash, known_tools=known_tools)
+    if attachments:
+        result["attachments_uploaded"] = 0
+    return result
+
+
 async def complete_via_webview_bridge(
     *,
     bridge_url: str = "",
@@ -71,7 +148,7 @@ async def complete_via_webview_bridge(
     model_tier: Optional[str] = None,
     gemini_authuser: Optional[int] = None,
     prompt: str = "",
-    attachments: list[dict] = None,
+    attachments: Optional[list[dict]] = None,
     completion_hash: str = "",
     known_tools: Optional[set[str]] = None,
     clear_chat: bool = False,
@@ -79,17 +156,18 @@ async def complete_via_webview_bridge(
     effort: Optional[str] = None,
 ) -> dict:
     """Run completion through Kim desktop's in-app webview bridge or Chrome Extension bridge."""
-    try:
-        from orchestrator.providers.browser.extension_bridge import get_extension_bridge
-        bridge = await get_extension_bridge()
-        connected = await bridge.wait_for_connection(timeout=15.0)
-        if connected:
-            logger.info("[Kim Bridge] Dispatching prompt to Chrome Extension over WebSocket...")
-            res = await bridge.send_completion(prompt, clear_chat=clear_chat)
-            full_text = res.get("full_text", "")
-            return parse_response(full_text, completion_hash, known_tools=known_tools)
-    except Exception as exc:
-        logger.warning(f"[Kim Bridge] Extension bridge fallback note: {exc}")
+    attachments = list(attachments or [])
+
+    if _extension_bridge_serves(preferred_site):
+        result = await _try_extension_bridge(
+            prompt=prompt,
+            completion_hash=completion_hash,
+            known_tools=known_tools,
+            clear_chat=clear_chat,
+            attachments=attachments,
+        )
+        if result is not None:
+            return result
 
     known_sites = site_configs or SITE_CONFIGS
     # The browser:claude site was removed from SITE_CONFIGS entirely (feat/

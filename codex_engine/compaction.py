@@ -14,6 +14,7 @@ priority-based line selection to keep the summary under a character budget
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from typing import TYPE_CHECKING, Optional
@@ -152,6 +153,23 @@ def _merge_compact_summaries(existing: str, new_summary: str) -> str:
     )
 
 
+@contextlib.asynccontextmanager
+async def _preserved_browser_thread():
+    """``extension_bridge.preserved_thread_state``, degrading to a no-op.
+
+    codex_engine deliberately avoids importing orchestrator at module scope
+    (see engine.py's module docstring), and the extension bridge is optional —
+    a run without it must still compact.
+    """
+    try:
+        from orchestrator.providers.browser.extension_bridge import preserved_thread_state
+    except Exception:  # pragma: no cover - optional dependency path
+        yield
+        return
+    async with preserved_thread_state():
+        yield
+
+
 async def _summarize_messages(items: list, provider: "BrowserProvider") -> str:
     """Call the browser LLM to produce a <summary> XML block for the given items."""
     parts: list[str] = []
@@ -204,12 +222,18 @@ async def _summarize_messages(items: list, provider: "BrowserProvider") -> str:
     )
 
     try:
-        response = await provider.complete(
-            messages=[{"role": "user", "content": prompt}],
-            tools=[],
-            system="You are a precise context summarizer. Output only the requested <summary>...</summary> XML block. No other text.",
-            clear_chat=True,
-        )
+        # clear_chat=True keeps the summary out of the user's chat, but on the
+        # Chrome Extension bridge it also overwrote the live thread's
+        # conversation/parent-message pointers with the summarizer's throwaway
+        # thread — so every turn after a compaction silently continued in the
+        # wrong chat. Snapshot and restore them around the side-call.
+        async with _preserved_browser_thread():
+            response = await provider.complete(
+                messages=[{"role": "user", "content": prompt}],
+                tools=[],
+                system="You are a precise context summarizer. Output only the requested <summary>...</summary> XML block. No other text.",
+                clear_chat=True,
+            )
         raw = response.get("content", "") if isinstance(response, dict) else str(response)
         match = re.search(r"<summary>(.*?)</summary>", raw, re.DOTALL)
         if match:

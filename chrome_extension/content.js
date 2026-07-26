@@ -14,21 +14,43 @@
     (document.head || document.documentElement).appendChild(s);
   }
 
+  // While the proxy is down every outgoing frame was queued forever. A long
+  // streaming turn produces thousands of deltas, so a disconnect during one
+  // grew this array without bound — and replaying stale deltas after
+  // reconnect is useless anyway, because the proxy-side request they belonged
+  // to is already gone. Cap the queue and drop deltas first: 'done'/'error'
+  // are the frames a reconnected proxy could still act on.
+  var MAX_BUFFERED = 200;
+
+  function bufferMessage(msg, isDelta) {
+    if (messageBuffer.length >= MAX_BUFFERED) {
+      if (isDelta) return;
+      var dropIdx = messageBuffer.findIndex(function(m) { return m.isDelta; });
+      if (dropIdx === -1) dropIdx = 0;
+      messageBuffer.splice(dropIdx, 1);
+    }
+    messageBuffer.push({ msg: msg, isDelta: !!isDelta });
+  }
+
   function sendToProxy(data) {
     var msg = JSON.stringify(data);
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(msg);
+      try {
+        ws.send(msg);
+      } catch(e) {
+        bufferMessage(msg, data && data.event === 'delta');
+      }
     } else {
-      messageBuffer.push(msg);
+      bufferMessage(msg, data && data.event === 'delta');
     }
   }
 
   function flushBuffer() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     while (messageBuffer.length > 0) {
-      var msg = messageBuffer.shift();
-      try { ws.send(msg); } catch(e) {
-        messageBuffer.unshift(msg);
+      var entry = messageBuffer.shift();
+      try { ws.send(entry.msg); } catch(e) {
+        messageBuffer.unshift(entry);
         break;
       }
     }
@@ -80,7 +102,15 @@
     };
 
     ws.onerror = function() {
+      // Close explicitly before dropping the reference. Clearing `ws` alone
+      // left a live socket that later fired its own onclose and queued a
+      // SECOND reconnect, so each error halved the backoff.
+      var dead = ws;
       ws = null;
+      if (dead) {
+        dead.onclose = null;
+        try { dead.close(); } catch(e) {}
+      }
       scheduleReconnect();
     };
   }

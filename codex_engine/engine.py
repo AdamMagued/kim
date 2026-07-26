@@ -42,6 +42,7 @@ Modes (``_CodexProxy(..., mode=...)``):
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -111,6 +112,7 @@ from codex_engine.turn_tracking import (  # noqa: E402
     contains_new_user_turn,
     detect_conversation_reset,
     _find_first_user_text,
+    _item_text,
 )
 
 # Deterministic provider-failure signatures for a send into a stored browser
@@ -174,14 +176,20 @@ def _generate_stateless_title(items: list) -> str:
     """Generate a clean title JSON statelessly without touching the browser chat thread."""
     raw_prompt = ""
     for item in items:
-        if isinstance(item, dict) and item.get("role") == "user":
-            text = item.get("content", "")
-            if "User prompt:" in text:
-                raw_prompt = text.split("User prompt:")[-1].split("INSTRUCTION:")[0].strip()
-                break
-            elif isinstance(text, str):
-                raw_prompt = text.strip()
-    
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        # Codex Desktop sends user content as a block list, not a bare string
+        # — the old `"User prompt:" in text` ran against the list itself,
+        # matched nothing, and every title came out as "Coding Task".
+        text = _item_text(item) if not isinstance(item.get("content"), str) else item["content"]
+        if not isinstance(text, str):
+            continue
+        if "User prompt:" in text:
+            raw_prompt = text.split("User prompt:")[-1].split("INSTRUCTION:")[0].strip()
+            break
+        raw_prompt = text.strip()
+
+
     clean_p = re.sub(r'[>\?!\.]+$', '', raw_prompt).strip()
     words = clean_p.split()[:5]
     title_str = " ".join(words).capitalize() or "Coding Task"
@@ -248,6 +256,21 @@ class _CodexProxy:
         # every request so any other local process cannot drive the authenticated
         # browser session through this proxy.
         self._bearer_token: str = secrets.token_urlsafe(32)
+        # Codex's own session id (body.session_id / x-codex-session-id), used to
+        # tell "same conversation, environmental context rewritten" apart from
+        # "a different codex session is now driving this proxy".
+        self._current_codex_session_id: Optional[str] = None
+        # First user message of the current turn, re-injected into tool-result
+        # relays and format nudges so a long command output can't push the
+        # actual request out of the browser model's attention.
+        self._current_user_goal: str = ""
+        # One /v1/responses turn at a time. Every relay reads-then-writes
+        # _last_sent_count / _relay_count / _last_proxy_response / the browser
+        # thread itself across several awaits; two overlapping requests (codex
+        # firing a background turn while a foreground one is mid-flight)
+        # interleaved those updates and corrupted the sent-cursor, which shows
+        # up as duplicated or skipped items in the next prompt.
+        self._turn_lock: asyncio.Lock = asyncio.Lock()
 
     def begin_turn(self) -> None:
         """Reset the relay budget for a new codex turn (Rb6).
@@ -271,10 +294,16 @@ class _CodexProxy:
     def _check_auth(self, request) -> bool:
         """Return True iff the request carries the correct bearer token (#47)."""
         auth = request.headers.get("Authorization", "")
-        if not auth or auth == "Bearer ":
-            return True
         expected = f"Bearer {self._bearer_token}"
-        return hmac.compare_digest(auth, expected) or auth.startswith("Bearer ")
+        # constant-time compare to avoid timing side-channels.
+        #
+        # Do NOT relax this: accepting an empty header, or any string that
+        # merely starts with "Bearer ", makes the per-run token (#47) a no-op
+        # and lets any other local process drive the authenticated browser
+        # session through this proxy. The real token is handed to codex via
+        # CODEX_API_KEY/OPENAI_API_KEY (see _write_codex_config's env_key and
+        # the ready-line handshake in standalone_proxy) — clients must send it.
+        return hmac.compare_digest(auth, expected)
 
     async def start(self) -> int:
         try:
@@ -329,15 +358,30 @@ class _CodexProxy:
         })
 
     async def _handle_responses(self, request):
-        """Handle POST /v1/responses — the Codex Responses API endpoint."""
+        """Handle POST /v1/responses — the Codex Responses API endpoint.
+
+        Serialized on ``_turn_lock``: the relay bookkeeping below is a
+        read-modify-write across several awaits (see __init__).
+        """
+        async with self._turn_lock:
+            return await self._handle_responses_locked(request)
+
+    async def _handle_responses_locked(self, request):
         from aiohttp import web
 
         if not self._check_auth(request):
             return web.json_response({"error": {"message": "Unauthorized"}}, status=401)
 
-        if request.content_type != "application/json":
+        # Codex always sends application/json. Reject anything else, but read
+        # the attribute defensively: `request` is only duck-typed here (the
+        # app-server transport and the proxy's own tests pass lightweight
+        # request stand-ins that carry `headers`/`json()` and nothing else),
+        # and a hard `request.content_type` turned every such caller into an
+        # AttributeError-500 instead of a served request.
+        content_type = getattr(request, "content_type", "application/json")
+        if content_type != "application/json":
             return web.json_response(
-                {"error": {"message": f"Unsupported Content-Type: {request.content_type}"}},
+                {"error": {"message": f"Unsupported Content-Type: {content_type}"}},
                 status=400,
             )
 
@@ -376,9 +420,25 @@ class _CodexProxy:
             _turn_items, self._last_sent_count, self._last_first_fingerprint,
         )
 
-        if session_id and getattr(self, "_current_codex_session_id", None) == session_id:
-            is_reset = False
+        known_session_id = getattr(self, "_current_codex_session_id", None)
         if session_id:
+            if known_session_id == session_id:
+                # Same codex session: the shape-based heuristic can't be
+                # trusted here. Codex Desktop rewrites environmental context
+                # (current_date, skill manifests) inside the first item between
+                # turns, which changes the fingerprint and read as a /new.
+                is_reset = False
+            elif known_session_id is not None:
+                # A DIFFERENT codex session is now driving this proxy. Its item
+                # list is unrelated to the one the cursor/cache/loop-guard were
+                # built from, and a similar item count would have hidden that
+                # from detect_conversation_reset — carrying the old state over
+                # leaks one session's thread pointers into another's turns.
+                logger.info(
+                    "Codex session changed (%s → %s) — resetting proxy state",
+                    known_session_id, session_id,
+                )
+                is_reset = True
             self._current_codex_session_id = session_id
 
         if is_reset:
@@ -1156,6 +1216,14 @@ def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
             fn_raw = tool.get("function")
             fn = fn_raw if isinstance(fn_raw, dict) else {}
             name = tool.get("name") or fn.get("name")
+            if name:
+                by_name[str(name)] = tool
+    if not by_name:
+        # No tool list in the request — there is nothing to snap names onto,
+        # and the schema-driven coercion below has no schema to read. Pass the
+        # calls through untouched.
+        return tool_calls
+
     exec_tool = next(
         (n for n in by_name if "exec" in n.lower() or "shell" in n.lower() or "command" in n.lower()),
         "exec_command",
@@ -1172,7 +1240,6 @@ def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
             cmd_val = inp.get("cmd") or inp.get("command") or inp.get("command_line")
             if cmd_val is not None:
                 if isinstance(cmd_val, list):
-                    import shlex
                     cmd_val = shlex.join(str(part) for part in cmd_val)
                 cmd_str = str(cmd_val)
                 new_inp = {"cmd": cmd_str}
@@ -1534,14 +1601,20 @@ def _extract_shell_blocks(content: object) -> list:
     blocks = [block.strip() for block in _SHELL_FENCE_RE.findall(content) if block.strip()]
     if blocks:
         return blocks
-    # No clean fence — try extracting inline commands matching safe verbs
-    for line in content.splitlines():
-        line_str = line.strip()
-        m = re.search(r"\b(printf|cat|echo|ls|pwd|mkdir|touch|cp|node|npm|npx|python3?|code|tee|open)\b.*$", line_str, re.IGNORECASE)
-        if m:
-            cmd_found = m.group(0).strip()
-            if len(cmd_found) > 3:
-                return [cmd_found]
+    # No clean fence — try the dangling-fragment fallback.
+    #
+    # This must stay anchored (^) and single-line. A search-anywhere variant
+    # matched a safe verb inside ordinary prose, so a narration line like
+    # "you can open the file in your editor" was lifted out and executed as
+    # the shell command `open the file in your editor`. The terminal system
+    # prompt (_chatgpt_terminal_system_prompt) requires a real ```bash fence,
+    # which _SHELL_FENCE_RE above already handles — this fallback exists only
+    # for a fence fragment whose opening marker was lost in a re-scrape.
+    stripped = "\n".join(
+        line for line in content.splitlines() if line.strip() != "```"
+    ).strip()
+    if stripped and "\n" not in stripped and _SAFE_BARE_CMD_RE.match(stripped):
+        return [stripped]
     return []
 
 

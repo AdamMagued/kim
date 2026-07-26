@@ -50,30 +50,48 @@ You should see log lines indicating:
 - `Chrome Extension connected!`
 - `Chrome Extension bridge ready!`
 
+The **first line** of output is the handshake, and it contains the proxy's
+per-run bearer token:
+
+```json
+{"event": "ready", "port": 10532, "token": "<TOKEN>"}
+```
+
+Copy that `token` — Step 4 needs it. It is regenerated on every start, so
+re-copy it whenever you restart the proxy.
+
+> **Why a token?** The proxy drives your authenticated ChatGPT Web session.
+> Without the check, any other process on your machine could send prompts
+> through it. The proxy rejects requests that do not carry the exact token
+> with `401 Unauthorized` — a placeholder like `"dummy"` will not work.
+
 ---
 
 ## Step 4: Configure Codex CLI / Desktop
 
-Point Codex to the local Kim proxy:
+Point Codex to the local Kim proxy, using the `token` printed in Step 3:
 
 ### For Codex CLI / Environment Variables
-Add to your shell profile (`~/.zshrc` or `~/.bashrc`):
 ```bash
 export OPENAI_BASE_URL="http://127.0.0.1:10532/v1"
-export OPENAI_API_KEY="dummy"
+export OPENAI_API_KEY="<TOKEN from the ready line>"
 ```
+
+(Do not hard-code this in `~/.zshrc` — the token changes on every proxy start.)
 
 ### For Codex Desktop (`~/.codex/config.toml`)
 ```toml
 [model_providers.kim_proxy]
 type = "openai"
 base_url = "http://127.0.0.1:10532/v1"
-api_key = "dummy"
+env_key = "CODEX_API_KEY"
 
 [profiles.default]
 model_provider = "kim_proxy"
 model = "gpt-5.6-sol"
 ```
+
+Then launch Codex Desktop with `CODEX_API_KEY=<TOKEN>` in its environment.
 
 ---
 

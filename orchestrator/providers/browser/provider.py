@@ -242,7 +242,18 @@ class BrowserProvider(BaseProvider):
 
         self._bridge_url = os.environ.get("KIM_WEBVIEW_BRIDGE_URL", "").strip().rstrip("/")
         self._bridge_token = os.environ.get("KIM_WEBVIEW_BRIDGE_TOKEN", "").strip()
-        self._use_webview_bridge = True
+        # Route through complete_via_webview_bridge when a transport for it
+        # actually exists: Kim desktop's Tauri webview bridge (URL + token in
+        # env), or the Chrome Extension WebSocket bridge, which callers opt
+        # into with KIM_EXTENSION_BRIDGE=1 (scripts/start_codex_proxy.sh sets
+        # it). Forcing this True unconditionally sent every OTHER deployment —
+        # the CDP/playwright path, which needs no bridge at all — to
+        # http:///v1/send with an empty base URL, so every completion came
+        # back as "NEED_HELP: Bridge /v1/send failed" instead of running.
+        self._use_webview_bridge = bool(self._bridge_url and self._bridge_token) or (
+            os.environ.get("KIM_EXTENSION_BRIDGE", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
         self._gemini_authuser = self._parse_authuser_env(os.environ.get("KIM_GEMINI_AUTHUSER", ""))
         if self._gemini_authuser is None:
             self._gemini_authuser = self._load_active_gemini_authuser_from_account()
