@@ -27,27 +27,14 @@ def strip_transport_markers(text: str, completion_hash: str) -> str:
     # Remove everything after the current-turn completion hash.  The hash is
     # unique per-request so this anchors us to exactly this turn's response.
     # Anchor on the LAST occurrence (L6): a scraped DOM that echoes the user
-    # prompt contains the hash inside the "always append" instruction, and
-    # splitting on the FIRST occurrence would discard the real answer that
-    # follows it. The model appends its own marker at the end, so the last
-    # occurrence is the transport marker.
-    if completion_hash and completion_hash in text:
-        text = text.rsplit(completion_hash, 1)[0]
-
-    # Within the current-turn fragment (before the completion_hash sentinel),
-    # there may still be older END_OF_RESPONSE markers from a reused chat tab.
-    # Split on those markers and take the LAST segment — the most recent
-    # response — then clean up any straggler markers.
+    # Remove all END_OF_RESPONSE markers (with optional completion hash suffix)
+    # without truncating trailing code blocks or text.
     marker_re = r"\[END_OF_RESPONSE(?:_[A-Za-z0-9-]+)?\]"
-    if re.search(marker_re, text, flags=re.IGNORECASE):
-        parts = [part.strip() for part in re.split(marker_re, text, flags=re.IGNORECASE) if part.strip()]
-        if parts:
-            text = parts[-1]
+    text = re.sub(marker_re, "", text, flags=re.IGNORECASE).strip()
 
     # Strip ChatGPT Web internal widget/control blocks (e200-e203) & genui_run text
     text = re.sub(r'[\ue200-\ue203][^\ue200-\ue203]*[\ue200-\ue203]?', '', text)
-    text = re.sub(r'genui_run result of\s*:?\s*', '', text)
-    text = re.sub(marker_re, "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r'genui_run result of\s*:?\s*', '', text).strip()
     return text
 
 
