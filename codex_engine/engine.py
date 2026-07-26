@@ -479,9 +479,10 @@ class _CodexProxy:
                 is_chatgpt = bool(self._provider_name) and "chatgpt" in self._provider_name.lower()
                 if is_chatgpt and prompt and "[TOOL RESULT]" in prompt:
                     prompt += (
-                        "\n\n(Those commands already ran — no output means success. "
-                        "If the request is now fully complete, reply with just DONE. "
-                        "Do NOT re-send a command that already ran.)"
+                        "\n\n(Those commands already ran — output provided above. "
+                        "Continue fulfilling all remaining parts of the user request. "
+                        "Provide all requested explanations, answers, and next commands. "
+                        "Do NOT stop early. Only reply with DONE when ALL user request requirements are fully completed.)"
                     )
                 self._last_sent_count = len(input_items)
                 logger.info(f"[relay #{relay_num}] Delta relay — {len(delta_items)} new items")
