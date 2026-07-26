@@ -636,20 +636,24 @@ class _CodexProxy:
         # finishes, which is the "it never registers as done" fix.
         cmds = _tool_command_signature(responses_reply)
         if _is_repeat_of_previous(cmds, self._last_tool_commands):
-            logger.info(f"[relay #{relay_num}] Repeated tool call {cmds} — ending turn (loop guard)")
-            print(f"{LOG_TAG_STATUS} Command already ran — finishing up…", flush=True)
-            # Honest final answer: name the command that actually repeated —
-            # never claim work ("the file was created") the commands don't show.
-            subs = sorted(_signature_subcommands(cmds))
-            if subs:
-                did = " and ".join(_humanize_single(s).lower() for s in subs)
-                done_text = f"Done — {did} already ran; nothing left to do."
-            else:
-                done_text = "Done — that command already ran; nothing left to do."
-            responses_reply = _make_responses_text_reply(
-                f"resp_{uuid.uuid4().hex[:16]}", done_text
-            )
-            cmds = None
+            self._repeat_count = getattr(self, "_repeat_count", 0) + 1
+            if self._repeat_count >= 2:
+                logger.info(f"[relay #{relay_num}] Repeated tool call {cmds} twice — ending turn (loop guard)")
+                print(f"{LOG_TAG_STATUS} Command already ran — finishing up…", flush=True)
+                # Honest final answer: name the command that actually repeated —
+                # never claim work ("the file was created") the commands don't show.
+                subs = sorted(_signature_subcommands(cmds))
+                if subs:
+                    did = " and ".join(_humanize_single(s).lower() for s in subs)
+                    done_text = f"Done — {did} already ran; nothing left to do."
+                else:
+                    done_text = "Done — that command already ran; nothing left to do."
+                responses_reply = _make_responses_text_reply(
+                    f"resp_{uuid.uuid4().hex[:16]}", done_text
+                )
+                cmds = None
+        else:
+            self._repeat_count = 0
         self._last_tool_commands = cmds
         self._last_proxy_response = responses_reply
 
