@@ -332,15 +332,21 @@ def format_prompt(
 
     new_sent_system_prompt = sent_system_prompt
     if not sent_system_prompt:
+        # Not every advertised tool carries a "name": codex 0.144.3 sends
+        # {"type": "web_search"} and {"type": "tool_search", …} as bare typed
+        # entries. Fall back to the type, and skip anything with neither —
+        # a hard t["name"] here raised KeyError 'name' and took down every
+        # relay the moment codex advertised its real tool list.
         compact_tools = [
             {
-                "name": t["name"],
+                "name": t.get("name") or t.get("type"),
                 "description": t.get("description", ""),
                 "args": list(
-                    t.get("parameters", {}).get("properties", {}).keys()
+                    (t.get("parameters") or {}).get("properties", {}).keys()
                 ),
             }
             for t in tools
+            if isinstance(t, dict) and (t.get("name") or t.get("type"))
         ]
         tools_json = json.dumps(compact_tools, indent=2)
 

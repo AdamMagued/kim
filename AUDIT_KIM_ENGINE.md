@@ -343,44 +343,66 @@ A diagnosable browser timeout reached the user as a malformed-URL message.
 the transport and no webview bridge is configured, the real cause is reported.
 Covered by `ExtensionBridgeFailureReportingTests`.
 
-### 9.2 OPEN — the salvage ladder emits a tool name codex cannot route
+### 9.2 FIXED — two defects, and a corrected diagnosis
 
-**Root cause, with evidence.** Codex 0.144.3 sends `tools=[]` on every
-`/v1/responses` call — confirmed in the log, every relay:
+> **This section previously recommended resolving `exec` → `shell`. That was
+> wrong** and is retracted. It was inferred from tool-name symbols in the codex
+> binary rather than measured. `shell` is not a tool codex advertises to the
+> model at all. What follows is measured, not inferred.
 
-```
-[relay #1] Codex request received, tools=[]
-```
+**Method.** I answered codex's own `/v1/responses` request with hand-written
+tool calls in each candidate wire shape and recorded which ones its router
+accepted. No browser, no model, no ChatGPT account in the loop — just the real
+`codex` 0.144.3 binary and a 60-line responder.
 
-It uses built-in tools rather than declaring them per request. But the salvage
-ladder hardcodes a placeholder name and relies on `_normalize_tool_calls` to
-snap it onto a real tool from `request_tools`:
+| output item | name | codex 0.144.3 |
+|---|---|---|
+| `function_call` | `exec` | ❌ `unsupported call: exec` |
+| `function_call` | `exec_command` | ✅ ran the command |
+| `function_call` + JSON args | `apply_patch` | ❌ `Fatal error: tool apply_patch invoked with incompatible payload` |
+| `custom_tool_call` + raw patch | `apply_patch` | ✅ patch applied |
+| `function_call` | `update_plan` | ✅ accepted |
 
-```python
-[{"name": "exec", "input": {"cmd": block}} for block in blocks]
-```
+**Defect A — `apply_patch` was structurally unroutable.** Codex declares it as
+`{"type": "custom"}` with a lark grammar, but `_make_responses_tool_reply`
+emitted *every* call as a `function_call` carrying JSON arguments. Codex's own
+system prompt instructs the model *"Use `apply_patch` for local file edits. Do
+not create or edit files with `cat` or other shell write tricks"* — so the
+proxy's primary edit path was guaranteed to fail. The builder now reads the
+declared tool type from the request and picks the matching shape.
 
-With `tools=[]` there is nothing to snap onto, so the placeholder ships as-is
-and codex's router rejects it — repeatedly, on the first relay of both runs:
+**Defect B — the real cause of the round-1 failure.** The claim "codex sends
+`tools=[]` on every call" was true but not general: it is a property of the
+**configured model**, not of codex. Codex derives its whole tool surface from
+the model's entry in its built-in catalog, and the `gpt-5.6-*` family carries
+`"tool_mode": "code_mode_only"`:
 
-```
-ERROR codex_core::tools::router: error=Fatal error: tool exec invoked with incompatible payload
-```
+| model | tools codex advertises |
+|---|---|
+| `gpt-5.6-sol` / `-terra` / `-luna` | **0 — no `tools` key at all** |
+| `gpt-5.5`, `gpt-5.4`, `gpt-5.2` | 14, incl. `exec_command`, `apply_patch`, `update_plan` |
 
-Extracting the tool-router symbols from the codex 0.144.3 binary gives
-`shell`, `local_shell`, `write_stdin`, `apply_patch`, `update_plan`.
-**Neither `exec` nor `exec_command` is a real codex tool** — so both the current
-code (passes `exec` through) and `a48fe67` (mapped it to the literal
-`"exec_command"`) are wrong; they just fail differently.
+Round 1 ran on `gpt-5.6-sol` (the default in `~/.codex/config.toml`, and the
+value `CODEX_BRIDGE_SETUP.md` itself recommended). Those models expect the
+separate code-mode host protocol, so nothing the proxy emits can ever route.
+`features.code_mode_only`, `features.code_mode` and `tool_mode` were each
+tested as config overrides; none changes the advertised tool set. Serving
+code-mode means implementing a second wire format — out of scope here, so the
+proxy now **detects** the case and returns a `NEED_HELP` reply naming the fix,
+rather than failing opaquely.
 
-**Not fixed, deliberately.** The fix is to resolve exec-alias placeholders to
-`shell` when the request declares no tools — but `shell`'s argument schema
-(`{"command": ["bash","-lc",...]}` vs. our `{"cmd": "..."}`) must be confirmed
-empirically, and
-`test_codex_stateful_threads.py::TestNormalizeToolCalls::test_no_request_tools_is_a_no_op`
-asserts the *opposite* contract (`exec` passes through untouched). Changing this
-touches the protocol the whole setup depends on, so it needs your decision, not
-a guess from me. **This is the single highest-value follow-up.**
+**The salvage ladder's `exec` sentinel is fine and was left alone.** It is an
+internal placeholder, and `_normalize_tool_calls` resolves it onto the real
+`exec_command` whenever codex advertises tools (verified: with the real 14-tool
+list, `exec` → `exec_command`). Renaming it would have broken
+`test_no_request_tools_is_a_no_op` for no functional gain.
+
+**Verified end to end.** A probe that feeds canned browser replies through the
+production `_provider_response_to_responses_api` and serves them to the real
+codex binary now succeeds on all three paths — `apply_patch` (file created),
+the `exec` sentinel (command ran), and the bash-fence salvage ladder.
+Regression coverage: `tests/test_codex_tool_wire_shapes.py`, 17 tests, each
+row of the table above pinned.
 
 ### 9.3 OPEN — the loop guard fires on two identical read-only inspections
 

@@ -896,7 +896,10 @@ class BrowserProvider(BaseProvider):
         raw_response = await self._send_and_wait(page, cfg, prompt, site, completion_hash)
         # Pass known_tools so the parser can reject prompt-injected fake tool
         # calls whose names aren't in the schema the agent actually has (#38).
-        known = {t["name"] for t in (tools or [])} if tools else None
+        # Nameless typed entries (codex's {"type": "web_search"}) contribute no
+        # callable name — same guard as the webview-bridge path above, which a
+        # hard t["name"] here did not share (KeyError 'name' on every relay).
+        known = {t["name"] for t in tools if "name" in t} if tools else None
         return self._attach_usage(
             parse_response(raw_response, completion_hash, known_tools=known),
             estimated_usage,

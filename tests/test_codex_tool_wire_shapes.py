@@ -147,6 +147,36 @@ class RoutableToolDetectionTests(unittest.TestCase):
         self.assertFalse(_reply_has_tool_calls(None))
 
 
+class NamelessToolEntryTests(unittest.TestCase):
+    """Codex sends {"type": "web_search"} / {"type": "tool_search"} with no name.
+
+    A hard `t["name"]` on those raised `KeyError: 'name'`, which surfaced to
+    codex as `502 Bad Gateway: LLM call failed: 'name'` on every single relay.
+    It stayed invisible while the configured model was code-mode-only (zero
+    tools advertised) and appeared the instant a real tool list arrived.
+    """
+
+    def test_format_prompt_survives_nameless_tools(self):
+        from orchestrator.providers.browser.prompt_builder import format_prompt
+
+        prompt, _attachments, _hash, _sent = format_prompt(
+            [{"role": "user", "content": "hi"}],
+            CODEX_TOOLS,
+            "sys",
+            sent_system_prompt=False,
+            max_inject_chars=10000,
+            use_webview_bridge=True,
+        )
+        # Named tools are described, and the nameless one degrades to its type
+        # rather than crashing or vanishing silently.
+        self.assertIn("exec_command", prompt)
+        self.assertIn("web_search", prompt)
+
+    def test_known_tools_allowlist_skips_nameless_entries(self):
+        known = {t["name"] for t in CODEX_TOOLS if "name" in t}
+        self.assertEqual(known, {"exec_command", "apply_patch"})
+
+
 class EndToEndConversionTests(unittest.TestCase):
     def test_contract_reply_naming_apply_patch_converts_to_custom_call(self):
         content = (
