@@ -402,3 +402,56 @@ class StatelessTitleTests(unittest.TestCase):
 
         payload = _json.loads(_generate_stateless_title([]))
         self.assertEqual(payload["title"], "Coding Task")
+
+
+class TitleInterceptionShapeTests(unittest.IsolatedAsyncioTestCase):
+    """The interception must answer in the Responses API shape codex parses.
+
+    It was the one branch of _handle_responses that returned the raw provider
+    dict ({"type": "text", "content": ...}) instead of a Responses payload, so
+    codex read `output[]` and found nothing there.
+    """
+
+    class _Provider:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, *a, **kw):
+            self.calls += 1
+            return {"type": "text", "content": "{}"}
+
+    async def test_title_reply_is_a_responses_payload_and_skips_the_browser(self):
+        import json as _json
+        import types
+        from codex_engine.engine import _CodexProxy
+
+        provider = self._Provider()
+        proxy = _CodexProxy(
+            provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
+        )
+        body = {
+            "input": [{
+                "role": "user",
+                "content": "Generate a concise UI title.\nUser prompt: build a snake game\nINSTRUCTION: json",
+            }],
+            "tools": [],
+        }
+
+        async def _json_body():
+            return body
+
+        request = types.SimpleNamespace(
+            headers={"Authorization": f"Bearer {proxy._bearer_token}"},
+            content_type="application/json",
+            json=_json_body,
+        )
+        resp = await proxy._handle_responses(request)
+        payload = _json.loads(resp.body.decode())
+
+        self.assertEqual(payload["object"], "response")
+        self.assertEqual(payload["output"][0]["type"], "message")
+        title = _json.loads(payload["output"][0]["content"][0]["text"])["title"]
+        self.assertIn("snake", title.lower())
+        # Stateless: the browser thread must not be touched at all.
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(proxy._last_sent_count, 0)

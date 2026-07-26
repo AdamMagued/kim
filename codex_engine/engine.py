@@ -411,7 +411,13 @@ class _CodexProxy:
         if _is_title_generator_request(_turn_items):
             logger.info("Intercepted background Codex GUI title generator request — handling statelessly")
             title_json = _generate_stateless_title(_turn_items)
-            return _sse_or_json(stream, {"type": "text", "content": title_json})
+            # Must be a Responses API payload, not a raw provider dict: this is
+            # the one branch that returned {"type","content"} straight to
+            # codex, whose parser reads `output[]` and found nothing there.
+            return _sse_or_json(
+                stream,
+                _make_responses_text_reply(f"resp_{uuid.uuid4().hex[:16]}", title_json),
+            )
 
         # Lock session ID to prevent dynamic environment shifts from causing false resets
         session_id = body.get("session_id") or request.headers.get("x-codex-session-id")
