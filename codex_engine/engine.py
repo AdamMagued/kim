@@ -633,6 +633,21 @@ class _CodexProxy:
             response, relay_num, request_tools=body.get("tools"),
             metrics=self._thread_state.setdefault("repairs", {}),
         )
+        # Code-mode guard: the model asked to act, but codex advertised no
+        # tools to route the action through, so every call we emit would come
+        # back as `unsupported call` / `Fatal error … incompatible payload`.
+        # Say why once, in the reply the user actually sees, instead of letting
+        # the run fail opaquely (this is what silently killed stress round 1).
+        if _reply_has_tool_calls(responses_reply) and not _has_routable_tools(body.get("tools")):
+            logger.error(
+                f"[relay #{relay_num}] Model requested tool use but this codex run "
+                f"advertised no tools (model={body.get('model')!r}) — code-mode-only "
+                f"model. Ending turn with a diagnostic."
+            )
+            responses_reply = _make_responses_text_reply(
+                f"resp_{uuid.uuid4().hex[:16]}", _CODE_MODE_DIAGNOSTIC
+            )
+
         # Loop guard: if this relay's tool calls repeat the previous relay's —
         # identical, or a subset of sub-commands that already ran (`open x`
         # after `printf … && open x`) — the model is looping (an empty tool
@@ -1944,7 +1959,9 @@ def _provider_response_to_responses_api(
             tool_calls = parsed.get("tool_calls", [])
             if tool_calls:
                 tool_calls = _normalize_tool_calls(tool_calls, request_tools)
-                return _make_responses_tool_reply(resp_id, text, tool_calls)
+                return _make_responses_tool_reply(
+                    resp_id, text, tool_calls, request_tools
+                )
             # DONE with no file-write command = task finished; end the turn
             # cleanly rather than salvaging any trailing "you could also…"
             # chatter into another relay (the browser-chat hang).
@@ -1964,7 +1981,7 @@ def _provider_response_to_responses_api(
                 # _announce_commands narrate the work — passing the full reply
                 # (prose + file body) would dump it to the user as "Kim: …".
                 _count_repair(metrics, "salvages")
-                return _make_responses_tool_reply(resp_id, "", salvaged)
+                return _make_responses_tool_reply(resp_id, "", salvaged, request_tools)
             return _make_responses_text_reply(resp_id, text or content)
 
         # Prose reply — a DONE signal ends the turn; otherwise execute any
@@ -1977,7 +1994,7 @@ def _provider_response_to_responses_api(
         if salvaged is not None:
             # Empty text — the humanized activity lines narrate it (see above).
             _count_repair(metrics, "salvages")
-            return _make_responses_tool_reply(resp_id, "", salvaged)
+            return _make_responses_tool_reply(resp_id, "", salvaged, request_tools)
 
         return _make_responses_text_reply(resp_id, content)
 
@@ -2000,8 +2017,96 @@ def _make_responses_text_reply(resp_id: str, text: str) -> dict:
     }
 
 
-def _make_responses_tool_reply(resp_id: str, text: str, tool_calls: list) -> dict:
+def _has_routable_tools(request_tools: object) -> bool:
+    """True when codex advertised at least one tool it can actually route to.
+
+    Codex derives its tool surface from the configured model's catalog entry.
+    Models whose entry carries `"tool_mode": "code_mode_only"` (the whole
+    gpt-5.6-* family) send NO `tools` key at all — they expect the code-mode
+    host protocol instead of function calls. Verified against codex 0.144.3:
+    gpt-5.6-sol sends 0 tools, gpt-5.5/gpt-5.2 send 14 (exec_command,
+    apply_patch, update_plan, …). No config knob overrides it; the catalog
+    decides. Serving code-mode would mean implementing a second wire format,
+    so the proxy detects the mode and says so rather than emitting calls that
+    codex rejects with an opaque `unsupported call` / `Fatal error`.
+    """
+    if not isinstance(request_tools, list):
+        return False
+    return any(
+        isinstance(t, dict) and (t.get("name") or t.get("type") in ("custom", "function"))
+        for t in request_tools
+    )
+
+
+_CODE_MODE_DIAGNOSTIC = (
+    "NEED_HELP: This Codex run advertised no tools, so there is nothing for me "
+    "to act through — I can only reply with text.\n\n"
+    "Cause: the configured model is code-mode-only (the gpt-5.6-* family: "
+    "sol, terra, luna). Codex sends those models an empty tool set and expects "
+    "the code-mode host protocol, which this proxy does not implement.\n\n"
+    "Fix: run codex against a model that uses ordinary function tools, e.g.\n"
+    "    codex -c model=\"gpt-5.5\" …\n"
+    "or set `model = \"gpt-5.5\"` in ~/.codex/config.toml. "
+    "gpt-5.5, gpt-5.4 and gpt-5.2 all work."
+)
+
+
+def _reply_has_tool_calls(reply: object) -> bool:
+    if not isinstance(reply, dict):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("type") in ("function_call", "custom_tool_call")
+        for item in (reply.get("output") or [])
+    )
+
+
+def _custom_tool_names(request_tools: object) -> set:
+    """Names codex advertised as freeform ("custom") rather than function tools.
+
+    Codex 0.144.3 sends `apply_patch` as {"type": "custom", "format": {lark
+    grammar}}. Such a tool is NOT routable as a function_call: verified against
+    the real binary, a function_call carrying JSON arguments is rejected with
+    `Fatal error: tool apply_patch invoked with incompatible payload`, while a
+    `custom_tool_call` carrying the raw patch text applies cleanly.
+    """
+    names = set()
+    if isinstance(request_tools, list):
+        for tool in request_tools:
+            if isinstance(tool, dict) and tool.get("type") == "custom":
+                name = tool.get("name")
+                if name:
+                    names.add(str(name))
+    return names
+
+
+# Keys a model plausibly wraps freeform tool text in when it emits the call as
+# JSON. Ordered: an explicit "input"/"patch" wins over a generic body field.
+_FREEFORM_INPUT_KEYS = ("input", "patch", "text", "content", "body", "cmd")
+
+
+def _freeform_tool_input(inp: object) -> str:
+    """Flatten a tool_call `input` down to the raw string a custom tool wants."""
+    if isinstance(inp, str):
+        return inp
+    if isinstance(inp, dict):
+        for key in _FREEFORM_INPUT_KEYS:
+            val = inp.get(key)
+            if isinstance(val, str):
+                return val
+        # Single-valued wrapper under some other key — unwrap it rather than
+        # handing codex a JSON blob its grammar parser cannot read.
+        vals = [v for v in inp.values() if isinstance(v, str)]
+        if len(vals) == 1:
+            return vals[0]
+    return json.dumps(inp)
+
+
+def _make_responses_tool_reply(
+    resp_id: str, text: str, tool_calls: list, request_tools: object = None
+) -> dict:
     output_items = []
+    custom_tools = _custom_tool_names(request_tools)
 
     if text:
         output_items.append({
@@ -2012,11 +2117,21 @@ def _make_responses_tool_reply(resp_id: str, text: str, tool_calls: list) -> dic
 
     for tc in tool_calls:
         if isinstance(tc, dict):
+            name = tc.get("name", "unknown")
+            call_id = f"call_{uuid.uuid4().hex[:12]}"
+            if name in custom_tools:
+                output_items.append({
+                    "type": "custom_tool_call",
+                    "name": name,
+                    "input": _freeform_tool_input(tc.get("input", "")),
+                    "call_id": call_id,
+                })
+                continue
             output_items.append({
                 "type": "function_call",
-                "name": tc.get("name", "unknown"),
+                "name": name,
                 "arguments": json.dumps(tc.get("input", {})),
-                "call_id": f"call_{uuid.uuid4().hex[:12]}",
+                "call_id": call_id,
             })
 
     return {

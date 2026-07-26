@@ -86,12 +86,45 @@ type = "openai"
 base_url = "http://127.0.0.1:10532/v1"
 env_key = "CODEX_API_KEY"
 
-[profiles.default]
+[profiles.kim]
 model_provider = "kim_proxy"
-model = "gpt-5.6-sol"
+model = "gpt-5.5"
 ```
 
-Then launch Codex Desktop with `CODEX_API_KEY=<TOKEN>` in its environment.
+Then launch Codex Desktop with `CODEX_API_KEY=<TOKEN>` in its environment, or
+from the CLI with `codex --profile kim`.
+
+### ⚠️ The `model` setting is not cosmetic — pick a non-code-mode model
+
+Codex derives its **entire tool surface** from the configured model's entry in
+its built-in catalog. The `gpt-5.6-*` family (`sol`, `terra`, `luna`) is marked
+`"tool_mode": "code_mode_only"`, and for those models codex sends **no `tools`
+array at all** — it expects the separate code-mode host protocol, which this
+proxy does not implement. Verified against codex 0.144.3:
+
+| model | tools codex advertises |
+|-------|------------------------|
+| `gpt-5.6-sol` / `-terra` / `-luna` | **0 — no `tools` key** |
+| `gpt-5.5`, `gpt-5.4`, `gpt-5.2` | 14, incl. `exec_command`, `apply_patch`, `update_plan` |
+
+With zero tools the model can only talk — it can never run a command or edit a
+file, and codex rejects any call the proxy emits (`unsupported call: exec`).
+No config knob overrides this; `features.code_mode_only`, `features.code_mode`
+and `tool_mode` were all tested and none change the advertised tool set.
+
+Use **`gpt-5.5`** (or `gpt-5.4` / `gpt-5.2`). Per invocation:
+
+```bash
+codex -c model="gpt-5.5" "your task"
+```
+
+If you do point it at a code-mode-only model, the proxy detects it and replies
+with an explicit `NEED_HELP:` message naming the fix rather than failing
+silently.
+
+Note this is independent of `KIM_PREFERRED_SITE` in
+`scripts/start_codex_proxy.sh`: that selects which **ChatGPT web** model the
+browser extension drives, and `gpt-5.6-sol` is a fine choice there.
 
 ---
 
