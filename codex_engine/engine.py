@@ -442,12 +442,13 @@ class _CodexProxy:
             self._current_codex_session_id = session_id
 
         if is_reset:
-            logger.info("Detected a fresh conversation (codex /new) — resetting proxy state")
+            logger.info("Detected a fresh conversation (codex /new or fresh launch) — resetting proxy and thread state")
             self._last_sent_count = 0
             self._last_proxy_response = None
             self._last_tool_commands = None
             self._relay_count = 0
             self._accumulated_thinking_lines = []
+            self._thread_state.clear()  # Clear stored instructions/turn state so ChatGPT starts a fresh chat
         elif contains_new_user_turn(_turn_items[self._last_sent_count:]):
             self._relay_count = 0
         self._last_first_fingerprint = new_fingerprint
@@ -521,10 +522,10 @@ class _CodexProxy:
             # not introduce a second, terminal-only response format here.
             if bool(self._provider_name) and "chatgpt" in self._provider_name.lower():
                 prompt += (
-                    "\n\nINSTRUCTION: DO NOT USE YOUR BUILT-IN CLOUD PYTHON INTERPRETER OR CLOUD SANDBOX. "
-                    "An automated local terminal runner is connected to this chat session. "
-                    "Whatever shell command you place inside a ```bash code block is EXECUTED IMMEDIATELY on the user's local Mac workspace (/Users/adammaged/...). "
-                    "Do NOT refuse tasks or claim you cannot access local paths. To inspect files, search the codebase, edit code, or run shell commands, emit your command inside a ```bash code block now."
+                    "\n\nCRITICAL OUTPUT FORMAT RULES:\n"
+                    "1. NO PREAMBLE: Do NOT print out project guidelines, AGENTS.md content, or tech stack summaries. Jump immediately to the action.\n"
+                    "2. MANDATORY CODE FENCES: NEVER format commands using indented text or bare lines. EVERY shell command MUST be inside a ```bash code block. EVERY file edit MUST be inside an ```apply_patch code block.\n"
+                    "3. STRICT TWO-PART TURN: Reply with (1) ONE short narration line, followed by (2) EXACTLY ONE ```bash or ```apply_patch code block. Stop immediately after the block."
                 )
             self._last_sent_count = len(input_items) if isinstance(input_items, list) else 0
         else:
@@ -1448,28 +1449,60 @@ def _salvage_action_reply(content: object, request_tools: object) -> Optional[li
     return None
 
 
+def _clean_user_input_text(text: str) -> str:
+    """Filter out Codex CLI's injected AGENTS.md / reference documentation and legacy instructions."""
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    if "DIRECT RESPONSE FORMAT REQUEST" in text or "NEED_HELP:" in text or "You are operating as Kim through local tools" in text:
+        return ""
+
+    ref_markers = (
+        "Codex Agent",
+        "Project Reference",
+        "Tool & Output Format Reference",
+        "Single Command Turn-by-Turn Protocol",
+        "### Branching Model",
+        "### Key Commands",
+        "### Verification Rules",
+        "### Git Safety",
+        "### Ports & URLs",
+        "### High-Risk Areas",
+        "### Environment Variables Required for Deploy",
+        "## Shell Commands",
+        "## File Edits",
+        "## Task Completion",
+        "## File References",
+    )
+
+    if any(marker in text for marker in ref_markers):
+        user_lines = []
+        for line in text.splitlines():
+            line_s = line.strip()
+            if line_s.startswith("› ") or line_s.startswith("<environment_context>") or line_s.startswith("[USER]") or line_s.startswith("check ") or line_s.startswith("run ") or line_s.startswith("create ") or line_s.startswith("git ") or line_s.startswith("npm ") or line_s.startswith("list "):
+                user_lines.append(line_s.lstrip("› ").strip())
+        if user_lines:
+            return "\n".join(user_lines).strip()
+
+        lines = []
+        for line in text.splitlines():
+            if not any(k in line for k in ("apps/", "packages/", "docs/", "scripts/", "### Branching", "### Key Commands", "### Verification", "### Git Safety", "### Ports", "### High-Risk", "### Environment Variables", "━━━━━━━━", "────────────────", "## Shell Commands", "## File Edits", "## Task Completion", "## File References", "Correct Format", "Incorrect Formats")):
+                lines.append(line)
+        return "\n".join(lines).strip()
+
+    return text
+
+
 def _extract_prompt_from_responses_request(body: dict, include_tools: bool = True) -> str:
-    """Extract a human-readable prompt from a Codex Responses API request.
-
-    ``include_tools`` renders codex's declared tool list into the prompt. It is
-    switched OFF for the ChatGPT terminal protocol
-    (:func:`_chatgpt_terminal_system_prompt`), which tells the model it is
-    handing shell commands to a real person and is explicitly NOT a tool
-    runtime. Showing that model a JSON tool schema at the same time is a direct
-    contradiction, and honesty-tuned ChatGPT models resolve it by refusing:
-
-        "I can't truthfully return a tool call claiming to have created a local
-         file because I don't have access to your local terminal."
-
-    This only became reachable once the configured codex model was switched off
-    the code-mode-only gpt-5.6 family — before that codex advertised no tools
-    and the section was always empty.
-    """
+    """Extract a human-readable prompt from a Codex Responses API request."""
     parts = []
 
     instructions = body.get("instructions")
     if instructions:
-        parts.append(f"[SYSTEM PROMPT]\n{instructions}\n")
+        # Filter out legacy JSON tool mode instructions (DIRECT RESPONSE FORMAT REQUEST, NEED_HELP, TASK_COMPLETE)
+        # that contradict the terminal ```bash / ```apply_patch protocol.
+        if not include_tools or ("DIRECT RESPONSE FORMAT REQUEST" not in instructions and "NEED_HELP" not in instructions):
+            if "DIRECT RESPONSE FORMAT REQUEST" not in instructions and "NEED_HELP" not in instructions:
+                parts.append(f"[SYSTEM PROMPT]\n{instructions}\n")
 
     tools_section = _render_codex_tools(body.get("tools")) if include_tools else ""
     if tools_section:
@@ -1477,11 +1510,15 @@ def _extract_prompt_from_responses_request(body: dict, include_tools: bool = Tru
 
     input_items = body.get("input")
     if isinstance(input_items, str):
-        parts.append(f"[USER]\n{input_items}\n")
+        cleaned = _clean_user_input_text(input_items)
+        if cleaned:
+            parts.append(f"[USER]\n{cleaned}\n")
     elif isinstance(input_items, list):
         for item in input_items:
             if isinstance(item, str):
-                parts.append(f"[USER]\n{item}\n")
+                cleaned = _clean_user_input_text(item)
+                if cleaned:
+                    parts.append(f"[USER]\n{cleaned}\n")
             elif isinstance(item, dict):
                 role = item.get("role", "user").upper()
                 content = item.get("content", "")
@@ -1490,11 +1527,15 @@ def _extract_prompt_from_responses_request(body: dict, include_tools: bool = Tru
                         if isinstance(block, dict):
                             btype = block.get("type", "")
                             if btype in ("input_text", "text"):
-                                parts.append(f"[{role}]\n{block.get('text', '')}\n")
+                                text = _clean_user_input_text(block.get("text", ""))
+                                if text:
+                                    parts.append(f"[{role}]\n{text}\n")
                             elif btype == "output_text":
                                 parts.append(f"[ASSISTANT]\n{block.get('text', '')}\n")
                 elif isinstance(content, str):
-                    parts.append(f"[{role}]\n{content}\n")
+                    text = _clean_user_input_text(content)
+                    if text:
+                        parts.append(f"[{role}]\n{text}\n")
 
     return "\n".join(parts) if parts else str(body)
 
@@ -1648,17 +1689,10 @@ def _parse_contract(content: object) -> Optional[dict]:
     return _coerce_contract_dict(parsed)
 
 
-# Fenced shell blocks in a prose reply. Some models (ChatGPT-web) refuse the
-# JSON tool-call protocol as "injected" but freely write the exact commands
-# in ```bash fences — execute what they wrote instead of arguing.
+# Fenced shell blocks in a prose reply.
 _SHELL_FENCE_RE = re.compile(r"```(?:bash|sh|shell|zsh)[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
-# Fallback for a leftover fence fragment: a streaming/multi-relay re-scrape can
-# catch just the tail of a code block ("open pong.html\n```", opening fence
-# lost), which matches no fenced pattern → a spurious "no runnable command"
-# nudge. If, after stripping stray ``` lines, ONE line remains and it starts
-# with a safe, expected command verb, run it. Deliberately conservative — no
-# rm/mv/dd/curl/chmod/sudo — a fragment must be an obvious build/open step.
+# Conservative fallback for fence fragments only
 _SAFE_BARE_CMD_RE = re.compile(
     r"^(?:open|printf|cat|echo|ls|pwd|mkdir|touch|cp|node|npm|npx|python3?|code|tee)\b",
     re.IGNORECASE,
@@ -1669,26 +1703,16 @@ _NO_OP_SHELL_CMDS = {":", "true", "echo \"\"", "echo ''", "echo", "exit 0", "sle
 
 
 def _extract_shell_blocks(content: object) -> list:
-    """Return the contents of ```bash/sh/shell/zsh fences (not html/js/etc.)."""
+    """Return the contents of ```bash/sh/shell/zsh fences."""
     if not isinstance(content, str):
         return []
     raw_blocks = [block.strip() for block in _SHELL_FENCE_RE.findall(content) if block.strip()]
     blocks = [b for b in raw_blocks if b not in _NO_OP_SHELL_CMDS]
     if blocks:
         return blocks
-    # No clean fence — try the dangling-fragment fallback.
-    #
-    # This must stay anchored (^) and single-line. A search-anywhere variant
-    # matched a safe verb inside ordinary prose, so a narration line like
-    # "you can open the file in your editor" was lifted out and executed as
-    # the shell command `open the file in your editor`. The terminal system
-    # prompt (_chatgpt_terminal_system_prompt) requires a real ```bash fence,
-    # which _SHELL_FENCE_RE above already handles — this fallback exists only
-    # for a fence fragment whose opening marker was lost in a re-scrape.
     for line in content.splitlines():
         line_s = line.strip()
-        if line_s != "```" and _SAFE_BARE_CMD_RE.match(line_s) and len(line_s) > 8 and not line_s.endswith("?"):
-            # Reject English prose like "Open this request...", "Open your editor...", "Open the file..."
+        if line_s != "```" and _SAFE_BARE_CMD_RE.match(line_s) and len(line_s) >= 2 and not line_s.endswith("?"):
             if re.match(r"^open\s+(?:this|your|the|a|an|my|our|any|all|every)\b", line_s, re.IGNORECASE):
                 continue
             return [line_s]
@@ -1858,38 +1882,63 @@ def _chatgpt_terminal_system_prompt(mode: str = "LOCAL") -> str:
 
     if mode == "PATCH":
         base_prompt = (
-            "You are Kim, pair-programming at a Mac terminal (codex bridge PATCH mode).\n"
-            "An automated runner attached workspace.zip containing the project codebase.\n"
-            "Inside your execution environment, extract workspace.zip, perform all code modifications, run the unit test suite inside your environment to verify 100% pass, and then output your verified changes inside a single ```diff code block:\n\n"
-            "EVERY working reply has exactly TWO parts, in this order:\n"
-            "1. ONE short narration line — summary of the changes made and test suite pass verification inside your environment.\n"
-            "2. EXACTLY ONE unified git diff patch inside a ```diff code block. Nothing after the block.\n\n"
-            "Rules:\n"
-            "- Extract workspace.zip and execute all test suites INSIDE your sandbox environment first to confirm zero test failures BEFORE emitting the patch.\n"
-            "- Output your verified codebase changes inside a ```diff block so `git apply` can apply it atomically to the local workspace.\n"
-            "- When the whole task is finished and verified, reply with a summary line, then DONE on its own line.\n"
+            "You are the execution engine for Codex, running on a live Mac terminal.\n\n"
+            "# REALITY CONTRACT (CRITICAL)\n\n"
+            "You are NOT a chat advisor. You have direct, real-time control over the user's local Mac operating system and workspace through an automated execution runner connected to this session.\n\n"
+            "Every bash code block and apply_patch code block you write is parsed automatically and EXECUTED IMMEDIATELY on the user's actual terminal and disk. The exact stdout, stderr, and exit code will be returned to you in the next message.\n\n"
+            "- Your tool calls are REAL and LIVE. Never doubt your access.\n"
+            "- NEVER say \"I don't have access to your terminal\", \"I can't run local commands\", or \"I cannot edit local files\". YOU CAN AND YOU DO.\n"
+            "- NEVER tell the user to run commands, install dependencies, or open URLs manually. YOU execute the commands yourself.\n\n"
+            "# TURN PROTOCOL\n\n"
+            "Work strictly one step at a time. Every working turn MUST follow this exact 2-part structure:\n\n"
+            "1. ONE short narration line in plain text — explain the immediate action you are taking.\n"
+            "2. EXACTLY ONE bash code block (or ONE apply_patch code block).\n\n"
+            "After the code block, STOP IMMEDIATELY. Do not add explanations, second commands, or prose after the block. Wait for the runner to return the execution output.\n\n"
+            "# COMMAND FORMATTING\n\n"
+            "- ALWAYS open every shell block with ```bash on its own line and close with ```.\n"
+            "- ALWAYS open every file edit block with ```apply_patch on its own line and close with ```.\n"
+            "- NEVER output un-fenced shell commands or un-fenced file edits.\n"
+            "- Run commands directly in the foreground so stdout/stderr output is captured.\n\n"
+            "# TASK COMPLETION\n\n"
+            "Only when all actions are finished and verified by execution output, reply with a summary line, then DONE on its own line:\n\n"
+            "DONE\n"
         )
     else:
         base_prompt = (
-            "You are Kim, pair-programming at a Mac terminal (codex bridge terminal mode).\n"
-            "An automated local terminal runner is connected to this session and executes your commands immediately on the user's local Mac workspace.\n"
-            "Work with the codebase by outputting commands inside ```bash code blocks:\n\n"
-            "EVERY working reply has exactly TWO parts, in this order:\n"
-            "1. ONE short narration line — what you're about to do and why, in plain natural language.\n"
-            "2. EXACTLY ONE shell command, inside a single ```bash code block. Nothing after the block — no second command, no extra prose.\n\n"
-            "Rules:\n"
-            "- ALWAYS take the FASTEST, SHORTEST, most direct route. Prefer direct HTTP/API requests (curl, fetch, POST endpoints) over heavy browser UI automation unless visual interaction is explicitly requested.\n"
-            "- Run one-off scripts directly in the foreground so errors (stdout/stderr) are visible immediately — do NOT hide script runs behind `nohup ... &`.\n"
-            "- ALWAYS enclose your shell command in a ```bash code block. NEVER write out commands as plain text or tell the user to run commands/open URLs manually.\n"
-            "- One command per reply, then STOP and wait for output.\n"
-            "- HTTP 302 redirects on protected routes are NORMAL expected behavior for unauthenticated users. Do NOT treat 302 redirects as server errors or restart servers because of them.\n"
-            "- Run `open http://...` ONCE when the app server is ready — never repeat `open` in status checks.\n"
-            "- When the whole task is finished and verified, reply with a summary line, then DONE on its own line.\n"
+            "You are the execution engine for Codex, running on a live Mac terminal.\n\n"
+            "# REALITY CONTRACT (CRITICAL)\n\n"
+            "You are NOT a chat advisor. You have direct, real-time control over the user's local Mac operating system and workspace through an automated execution runner connected to this session.\n\n"
+            "Every bash code block and apply_patch code block you write is parsed automatically and EXECUTED IMMEDIATELY on the user's actual terminal and disk. The exact stdout, stderr, and exit code will be returned to you in the next message.\n\n"
+            "- Your tool calls are REAL and LIVE. Never doubt your access.\n"
+            "- NEVER say \"I don't have access to your terminal\", \"I can't run local commands\", or \"I cannot edit local files\". YOU CAN AND YOU DO.\n"
+            "- NEVER tell the user to run commands, install dependencies, or open URLs manually. YOU execute the commands yourself.\n\n"
+            "# TURN PROTOCOL\n\n"
+            "Work strictly one step at a time. Every working turn MUST follow this exact 2-part structure:\n\n"
+            "1. ONE short narration line in plain text — explain the immediate action you are taking.\n"
+            "2. EXACTLY ONE bash code block (or ONE apply_patch code block).\n\n"
+            "After the code block, STOP IMMEDIATELY. Do not add explanations, second commands, or prose after the block. Wait for the runner to return the execution output.\n\n"
+            "# COMMAND FORMATTING\n\n"
+            "- ALWAYS open every shell block with ```bash on its own line and close with ```.\n"
+            "- ALWAYS open every file edit block with ```apply_patch on its own line and close with ```.\n"
+            "- NEVER output un-fenced shell commands or un-fenced file edits.\n"
+            "- Run commands directly in the foreground so stdout/stderr output is captured.\n\n"
+            "# KNOWLEDGE BASE & WORKSPACE CONTEXT\n\n"
+            "- [cwd: /path] at the start of a prompt is your current working directory.\n"
+            "- Check Knowledge files (project_reference.md, tool_format_reference.md) for project layout, standard scripts, and verification rules. Apply them silently.\n\n"
+            "# TASK COMPLETION\n\n"
+            "Only when all actions are finished and verified by execution output, reply with a summary line, then DONE on its own line:\n\n"
+            "DONE\n"
         )
     return base_prompt + workspace_rules
 
 
 def _system_prompt_for(provider_name: str) -> str:
+    gizmo_id = os.getenv("KIM_GIZMO_ID") or "g-6a6799761630819197e463478a4e70e5"
+    if gizmo_id:
+        # Custom GPT Gizmo mode: the Custom GPT on chatgpt.com already contains
+        # its own pre-configured system instructions. Strip system prompt injection
+        # so ChatGPT routes the query directly to the Custom GPT without prompt pollution.
+        return ""
     if provider_name and "chatgpt" in provider_name.lower():
         return _chatgpt_terminal_system_prompt()
     return _codex_browser_system_prompt()
@@ -1983,6 +2032,16 @@ def _count_repair(metrics: object, key: str) -> None:
         metrics[key] = int(metrics.get(key) or 0) + 1
 
 
+def _strip_patch_blocks(content: str) -> str:
+    """Clean raw diff patch blocks from model output for clean CLI rendering."""
+    if not isinstance(content, str) or not content:
+        return content
+    if "*** Begin Patch" in content:
+        content = re.sub(r"\*\*\* Begin Patch.*?\*\*\* End Patch", "\n[File patch applied]\n", content, flags=re.DOTALL)
+    content = re.sub(r"```(?:apply_patch|diff|patch)\n.*?```", "\n[File patch applied]\n", content, flags=re.DOTALL)
+    return content.strip()
+
+
 def _provider_response_to_responses_api(
     response: dict, relay_num: int, request_tools: object = None, metrics: object = None
 ) -> dict:
@@ -2001,56 +2060,44 @@ def _provider_response_to_responses_api(
             if tool_calls:
                 tool_calls = _normalize_tool_calls(tool_calls, request_tools)
                 return _make_responses_tool_reply(
-                    resp_id, text, tool_calls, request_tools
+                    resp_id, _strip_patch_blocks(text), tool_calls, request_tools
                 )
-            # DONE with no file-write command = task finished; end the turn
-            # cleanly rather than salvaging any trailing "you could also…"
-            # chatter into another relay (the browser-chat hang).
             if _is_done_reply(text) or _is_done_reply(content):
-                return _make_responses_text_reply(resp_id, _strip_done_marker(text))
-            # No tool_calls: the model may still have described actions — a
-            # ```bash/json fence or a save-as directive. Try the parsed `text`
-            # first (a genuine final answer embeds fences there with real
-            # newlines), then the full `content` (json_repair may have reduced
-            # `parsed` to a bare {"cmd": …} lifted out of a ```json fence,
-            # leaving the fence only in content).
+                return _make_responses_text_reply(resp_id, _strip_patch_blocks(_strip_done_marker(text)))
             salvaged = _salvage_action_reply(text, request_tools)
             if salvaged is None:
                 salvaged = _salvage_action_reply(content, request_tools)
             if salvaged is not None:
                 prose = content.split("```", 1)[0].strip() if isinstance(content, str) else ""
+                prose = _strip_patch_blocks(prose)
                 _count_repair(metrics, "salvages")
                 return _make_responses_tool_reply(resp_id, prose, salvaged, request_tools)
-            return _make_responses_text_reply(resp_id, text or content)
+            return _make_responses_text_reply(resp_id, _strip_patch_blocks(text or content))
 
         # Hybrid Patch Engine integration: if response contains a unified git patch/diff block,
         # apply it to the local workspace cleanly.
-        if "```diff" in str(content) or "```patch" in str(content) or "diff --git" in str(content):
+        if "```apply_patch" in str(content) or "```diff" in str(content) or "```patch" in str(content) or "diff --git" in str(content) or "--- a/" in str(content) or "*** Begin Patch" in str(content):
             try:
                 import os
                 from codex_engine.patch_engine import apply_git_patch
                 patch_res = apply_git_patch(os.getcwd(), str(content))
                 if patch_res.get("success"):
                     logger.info("Hybrid Engine: Successfully applied git patch via %s", patch_res.get("method"))
-                    content = f"{content}\n\n[HYBRID ENGINE: Applied git diff patch cleanly to workspace via {patch_res.get('method')}]"
                 else:
                     logger.warning("Hybrid Engine: Could not apply git patch: %s", patch_res.get("error"))
             except Exception as e:
                 logger.error("Hybrid Engine patch exception: %s", e)
 
-        # Prose reply — a DONE signal ends the turn; otherwise execute any
-        # actions the model described: ```bash/json fences, or a "save this
-        # code as X" directive with the file body in a fence. Protocol-
-        # refusing models still hand the work over in these shapes.
         if _is_done_reply(content):
-            return _make_responses_text_reply(resp_id, _strip_done_marker(content))
+            return _make_responses_text_reply(resp_id, _strip_patch_blocks(_strip_done_marker(content)))
         salvaged = _salvage_action_reply(content, request_tools)
         if salvaged is not None:
             prose = content.split("```", 1)[0].strip() if isinstance(content, str) else ""
+            prose = _strip_patch_blocks(prose)
             _count_repair(metrics, "salvages")
             return _make_responses_tool_reply(resp_id, prose, salvaged, request_tools)
 
-        return _make_responses_text_reply(resp_id, content)
+        return _make_responses_text_reply(resp_id, _strip_patch_blocks(content))
 
     return _make_responses_text_reply(resp_id, str(content))
 
@@ -2116,7 +2163,12 @@ def _extract_brief_status_summary(text: str) -> str:
 
 
 def _make_responses_text_reply(resp_id: str, text: str) -> dict:
-    text = _normalize_response_image_links(text)
+    text = _normalize_response_image_links(text or "")
+    text = re.sub(r"Make sure to include\s+(?:filecite[^]+|turn\d+file\d+|\s*)*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"filecite[^]+", "", text)
+    text = re.sub(r"\bturn\d+file\d+\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*[*•\-]?\s*filecite\b[^\n]*", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"^\s*Make sure to include\s*$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
     output_items = []
     summary_text = _extract_brief_status_summary(text)
     if summary_text:
@@ -2127,7 +2179,7 @@ def _make_responses_text_reply(resp_id: str, text: str) -> dict:
     output_items.append({
         "type": "message",
         "role": "assistant",
-        "content": [{"type": "output_text", "text": text or ""}],
+        "content": [{"type": "output_text", "text": text}],
     })
     return {
         "id": resp_id,
@@ -2247,11 +2299,6 @@ def _make_responses_tool_reply(
         output_items.append({
             "type": "reasoning",
             "summary": _build_summary_items(text),
-        })
-        output_items.append({
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text}],
         })
 
     for tc in tool_calls:
