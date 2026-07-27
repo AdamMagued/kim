@@ -276,7 +276,7 @@ def format_prompt(
         else:
             last_text = strip_data_uris(str(content), attachments)
 
-    # Convert Codex Desktop <image path="..."> XML tags into real base64 attachments
+    # Convert Codex Desktop <image path="..."> XML tags and ## file.png headers into real base64 attachments
     def _parse_image_xml_tag(match):
         img_path = match.group(1).strip()
         if os.path.isfile(img_path):
@@ -295,6 +295,25 @@ def format_prompt(
                 pass
         return ""
 
+    def _parse_header_image_path(match):
+        img_path = match.group(2).strip()
+        if os.path.isfile(img_path) and img_path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            try:
+                import base64
+                with open(img_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("utf-8")
+                mime = "image/png"
+                if img_path.lower().endswith((".jpg", ".jpeg")):
+                    mime = "image/jpeg"
+                elif img_path.lower().endswith(".webp"):
+                    mime = "image/webp"
+                append_attachment(attachments, mime, b64, name=os.path.basename(img_path))
+                return f"## {match.group(1)}: [Image attached]"
+            except Exception:
+                pass
+        return match.group(0)
+
+    last_text = re.sub(r'##\s+([^\n]+\.(?:png|jpg|jpeg|webp|gif)):\s*(/(?:tmp|var|Users)/[^\s\n]+)', _parse_header_image_path, last_text, flags=re.IGNORECASE)
     last_text = re.sub(r'<image\s+name=[^>]*\bpath="([^"]+)"[^>]*>', _parse_image_xml_tag, last_text)
     last_text = re.sub(r'<image\s+path="([^"]+)"[^>]*>', _parse_image_xml_tag, last_text)
     last_text = re.sub(r'</image>', '', last_text)

@@ -111,16 +111,7 @@ async def _try_extension_bridge(
         attempted = True
 
         if attachments:
-            # The extension protocol carries text only — say so rather than
-            # letting the model answer "describe this screenshot" without one.
-            logger.warning(
-                "Chrome Extension bridge cannot carry %d attachment(s) — sending text only.",
-                len(attachments),
-            )
-            prompt = (
-                f"{prompt}\n\n[Kim note: {len(attachments)} attachment(s) could NOT be "
-                "sent — the Chrome Extension bridge relays text only.]"
-            )
+            logger.info(f"[Kim Bridge] Forwarding {len(attachments)} attachment(s) to Chrome Extension over WebSocket bridge.")
 
         accumulated_delta: list[str] = []
         last_printed_prose: list[str] = [""]

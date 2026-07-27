@@ -81,6 +81,7 @@
             type: 'CHATGPT_BRIDGE_REQUEST',
             requestId: msg.requestId,
             messages: msg.messages,
+            attachments: msg.attachments,
             model: msg.model,
             conversationId: msg.conversationId,
             parentMessageId: msg.parentMessageId,

@@ -413,7 +413,7 @@
     return resp.json();
   }
 
-  async function sendConversation(messages, model, requestId, conversationId, parentMessageId) {
+    async function sendConversation(messages, model, requestId, conversationId, parentMessageId, attachments) {
     await ensureAuth();
     if (!authToken) throw new Error('No auth token available. Make sure you are logged into ChatGPT.');
 
@@ -429,12 +429,23 @@
       console.log('[Bridge] PoW solved in ' + elapsed + 'ms');
     }
 
-    var chatgptMessages = messages.map(function(m) {
+    var chatgptMessages = messages.map(function(m, idx) {
+      var text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+      if (idx === messages.length - 1 && Array.isArray(attachments) && attachments.length > 0) {
+        attachments.forEach(function(att) {
+          var b64 = att.data_base64 || att.data || '';
+          var mime = att.mime_type || att.media_type || 'image/png';
+          var name = att.name || 'image.png';
+          if (b64) {
+            text += '\n\n![' + name + '](data:' + mime + ';base64,' + b64 + ')';
+          }
+        });
+      }
       return {
         id: crypto.randomUUID(),
         author: { role: m.role || 'user' },
         create_time: Date.now() / 1000,
-        content: { content_type: 'text', parts: [typeof m.content === 'string' ? m.content : JSON.stringify(m.content)] },
+        content: { content_type: 'text', parts: [text] },
         metadata: {},
       };
     });
@@ -692,7 +703,7 @@
     };
 
     try {
-      var response = await sendConversation(messages, model, requestId, conversationId, parentMessageId);
+      var response = await sendConversation(messages, model, requestId, conversationId, parentMessageId, event.data.attachments);
       activeStreams.set(requestId, streamState);
 
       await parseSSEStream(response,
