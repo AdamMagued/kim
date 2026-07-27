@@ -1843,7 +1843,19 @@ def _chatgpt_terminal_system_prompt() -> str:
     NOTE: "codex bridge terminal" is load-bearing — prompt_builder matches it
     to pick the codex layout (not the chat-mode one). Guarded by tests.
     """
-    return (
+    workspace_rules = ""
+    for path in ["AGENTS.md", ".agents/AGENTS.md"]:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                    if content:
+                        workspace_rules = f"\n\nPROJECT WORKSPACE GUIDELINES (AGENTS.md):\n{content}"
+                        break
+            except Exception:
+                pass
+
+    base_prompt = (
         "You are Kim, pair-programming at a Mac terminal (codex bridge terminal mode).\n"
         "An automated local terminal runner is connected to this session and executes your commands immediately on the user's local Mac workspace.\n"
         "Work with the codebase by outputting commands inside ```bash code blocks:\n\n"
@@ -1859,6 +1871,7 @@ def _chatgpt_terminal_system_prompt() -> str:
         "- Run `open http://...` ONCE when the app server is ready — never repeat `open` in status checks.\n"
         "- When the whole task is finished and verified, reply with a summary line, then DONE on its own line.\n"
     )
+    return base_prompt + workspace_rules
 
 
 def _system_prompt_for(provider_name: str) -> str:
