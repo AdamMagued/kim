@@ -2014,6 +2014,7 @@ def _make_responses_text_reply(resp_id: str, text: str) -> dict:
     if text:
         output_items.append({
             "type": "reasoning",
+            "reasoning_text": text,
             "summary": [{"type": "summary_text", "text": text}],
         })
         output_items.append({
@@ -2124,6 +2125,7 @@ def _make_responses_tool_reply(
     if text:
         output_items.append({
             "type": "reasoning",
+            "reasoning_text": text,
             "summary": [{"type": "summary_text", "text": text}],
         })
         output_items.append({
