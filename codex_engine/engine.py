@@ -1678,6 +1678,9 @@ def _extract_shell_blocks(content: object) -> list:
     for line in content.splitlines():
         line_s = line.strip()
         if line_s != "```" and _SAFE_BARE_CMD_RE.match(line_s) and len(line_s) > 8 and not line_s.endswith("?"):
+            # Reject English prose like "Open this request...", "Open your editor...", "Open the file..."
+            if re.match(r"^open\s+(?:this|your|the|a|an|my|our|any|all|every)\b", line_s, re.IGNORECASE):
+                continue
             return [line_s]
     return []
 
