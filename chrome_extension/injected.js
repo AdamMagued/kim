@@ -513,9 +513,12 @@
       var urlDomain = '';
       try { urlDomain = new URL(uploadUrl).hostname; } catch(e) { urlDomain = uploadUrl.substring(0, 60); }
       bridgeLog('Uploading to: ' + urlDomain + ' mime=' + mime + ' blobSize=' + blob.size);
-      var uploadHeaders = { 'Content-Type': mime };
+      var uploadHeaders = {};
       if (uploadUrl.includes('blob.core.windows.net') || uploadUrl.includes('azure')) {
         uploadHeaders['x-ms-blob-type'] = 'BlockBlob';
+        uploadHeaders['Content-Type'] = 'application/octet-stream';
+      } else {
+        uploadHeaders['Content-Type'] = mime;
       }
       try {
         var uploadResp = await window.fetch(uploadUrl, {
