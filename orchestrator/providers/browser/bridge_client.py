@@ -7,8 +7,9 @@ using the split send/result API with legacy fallback.
 
 import asyncio
 import logging
+import re
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 
@@ -91,6 +92,7 @@ async def _try_extension_bridge(
     known_tools: Optional[set[str]],
     clear_chat: bool,
     attachments: list[dict],
+    on_delta: Optional[Callable[[str], None]] = None,
 ) -> tuple[Optional[dict], bool]:
     """Attempt the Chrome Extension WebSocket path.
 
@@ -129,18 +131,32 @@ async def _try_extension_bridge(
                 return
             accumulated_delta.append(delta)
             full_so_far = "".join(accumulated_delta)
-            prose = full_so_far.split("```", 1)[0].strip()
+            
+            # Clean JSON syntax or code fences from prose
+            prose = full_so_far
+            if prose.startswith("{"):
+                m = re.search(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)', prose)
+                prose = m.group(1).replace('\\"', '"').replace('\\n', '\n') if m else ""
+            if "```" in prose:
+                prose = prose.split("```", 1)[0]
+            prose = re.sub(r"\[END_OF_RESPONSE(?:_[A-Za-z0-9-]+)?\]", "", prose, flags=re.IGNORECASE).strip()
+            
             if not prose:
                 return
             clean_prose = " ".join(prose.split())[:200]
             now = time.time()
-            # Only print if it's a complete sentence/line or at least 1.5 seconds elapsed
             is_boundary = delta.endswith(("\n", ". ", "! ", "? ", ": ")) or "\n" in delta
             time_elapsed = (now - last_print_time[0]) >= 1.5
             if clean_prose and clean_prose != last_printed_prose[0] and (is_boundary or time_elapsed):
                 last_printed_prose[0] = clean_prose
                 last_print_time[0] = now
                 print(f"[STATUS] {clean_prose}", flush=True)
+
+            if on_delta is not None:
+                try:
+                    on_delta(delta)
+                except Exception as exc:
+                    logger.warning(f"[Kim Bridge] External on_delta callback raised: {exc}")
 
         logger.info("[Kim Bridge] Dispatching prompt to Chrome Extension over WebSocket...")
         res = await bridge.send_completion(prompt, on_delta=_on_extension_delta, clear_chat=clear_chat)
@@ -182,6 +198,7 @@ async def complete_via_webview_bridge(
     clear_chat: bool = False,
     site_configs: Optional[dict] = None,
     effort: Optional[str] = None,
+    on_delta: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Run completion through Kim desktop's in-app webview bridge or Chrome Extension bridge."""
     attachments = list(attachments or [])
@@ -193,6 +210,7 @@ async def complete_via_webview_bridge(
             known_tools=known_tools,
             clear_chat=clear_chat,
             attachments=attachments,
+            on_delta=on_delta,
         )
         if result is not None:
             return result

@@ -293,7 +293,7 @@ class _CodexProxy:
 
     def _check_auth(self, request) -> bool:
         """Return True iff the request carries the correct bearer token (#47)."""
-        if os.environ.get("KIM_ALLOW_DUMMY_AUTH", "1") == "1":
+        if os.environ.get("KIM_ALLOW_DUMMY_AUTH") == "1":
             return True
         auth = request.headers.get("Authorization", "")
         expected = f"Bearer {self._bearer_token}"
@@ -410,7 +410,7 @@ class _CodexProxy:
             # codex, whose parser reads `output[]` and found nothing there.
             return _sse_or_json(
                 stream,
-                _make_responses_text_reply(f"resp_{uuid.uuid4().hex[:16]}", title_json),
+                _make_responses_title_reply(f"resp_{uuid.uuid4().hex[:16]}", title_json),
             )
 
         # Lock session ID to prevent dynamic environment shifts from causing false resets
@@ -447,6 +447,7 @@ class _CodexProxy:
             self._last_proxy_response = None
             self._last_tool_commands = None
             self._relay_count = 0
+            self._accumulated_thinking_lines = []
         elif contains_new_user_turn(_turn_items[self._last_sent_count:]):
             self._relay_count = 0
         self._last_first_fingerprint = new_fingerprint
@@ -576,6 +577,12 @@ class _CodexProxy:
                     flush=True,
                 )
 
+        if stream:
+            from codex_engine.responses_streaming import stream_responses_http
+            return await stream_responses_http(
+                self, request, body, input_items, prompt, clear_chat, is_first_relay, handoff, relay_num
+            )
+
         try:
             extra_kwargs = {"handoff": handoff} if handoff else {}
             response = await self._provider.complete(
@@ -618,30 +625,18 @@ class _CodexProxy:
             response=response,
         )
 
-        # Narrate the model's prose FIRST ("I'll drop a simple click-the-box
-        # game…"), then the humanized command lines from _announce_commands —
-        # this is the visible "thinking" for a browser model whose real chain
-        # of thought can't be scraped.
         _surface_relay_reasoning(response, relay_num)
         responses_reply = _provider_response_to_responses_api(
             response, relay_num, request_tools=body.get("tools"),
             metrics=self._thread_state.setdefault("repairs", {}),
         )
 
-        # Loop guard: if this relay's tool calls repeat the previous relay's —
-        # identical, or a subset of sub-commands that already ran (`open x`
-        # after `printf … && open x`) — the model is looping (an empty tool
-        # result gives it no signal to stop). Re-running achieves nothing, so
-        # end the turn with a plain final answer — codex sees no tool call and
-        # finishes, which is the "it never registers as done" fix.
         cmds = _tool_command_signature(responses_reply)
         if _is_repeat_of_previous(cmds, self._last_tool_commands):
             self._repeat_count = getattr(self, "_repeat_count", 0) + 1
             if self._repeat_count >= 2:
                 logger.info(f"[relay #{relay_num}] Repeated tool call {cmds} twice — ending turn (loop guard)")
                 print(f"{LOG_TAG_STATUS} Command already ran — finishing up…", flush=True)
-                # Honest final answer: name the command that actually repeated —
-                # never claim work ("the file was created") the commands don't show.
                 subs = sorted(_signature_subcommands(cmds))
                 if subs:
                     did = " and ".join(_humanize_single(s).lower() for s in subs)
@@ -1113,6 +1108,28 @@ def _make_sse_response(responses_reply: dict):
                 "output_index": idx,
                 "item": {**item, "status": "completed"},
             })
+        elif item_type == "reasoning":
+            text = str(item.get("reasoning_text") or "")
+            events.append({
+                "type": "response.output_item.added",
+                "output_index": idx,
+                "item": {**item, "reasoning_text": "", "summary": [], "status": "in_progress"},
+            })
+            events.append({
+                "type": "response.reasoning.text.delta",
+                "item_id": item_id, "output_index": idx, "content_index": 0,
+                "delta": text,
+            })
+            events.append({
+                "type": "response.reasoning.text.done",
+                "item_id": item_id, "output_index": idx, "content_index": 0,
+                "text": text,
+            })
+            events.append({
+                "type": "response.output_item.done",
+                "output_index": idx,
+                "item": {**item, "status": "completed"},
+            })
         else:
             events.append({
                 "type": "response.output_item.added", "output_index": idx, "item": item,
@@ -1256,6 +1273,16 @@ def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
                 if isinstance(cmd_val, list):
                     cmd_val = shlex.join(str(part) for part in cmd_val)
                 cmd_str = str(cmd_val)
+                # Clean subshell parenthesizing ( ... & ) or osascript traps that cause tool runner aborts
+                if cmd_str.startswith("(") and cmd_str.endswith("& )"):
+                    inner = cmd_str[1:-3].strip()
+                    cmd_str = f"nohup {inner} >/tmp/kim_bg.log 2>&1 &"
+                elif "osascript" in cmd_str and "Terminal" in cmd_str:
+                    m_cd = re.search(r"cd\s+([^\s;&\"']+)", cmd_str)
+                    m_run = re.search(r"npm\s+run\s+([^\s;&\"']+)", cmd_str)
+                    cd_part = f"cd {m_cd.group(1)} && " if m_cd else ""
+                    run_part = f"nohup npm run {m_run.group(1)} >/tmp/devup.log 2>&1 &" if m_run else "nohup npm run dev:up >/tmp/devup.log 2>&1 &"
+                    cmd_str = f"{cd_part}{run_part}"
                 new_inp = {"cmd": cmd_str}
                 if "workdir" in inp:
                     new_inp["workdir"] = str(inp["workdir"])
@@ -2017,16 +2044,30 @@ def _make_responses_text_reply(resp_id: str, text: str) -> dict:
             "reasoning_text": text,
             "summary": [{"type": "summary_text", "text": text}],
         })
-        output_items.append({
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text}],
-        })
+    output_items.append({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text or ""}],
+    })
     return {
         "id": resp_id,
         "object": "response",
         "status": "completed",
         "output": output_items,
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    }
+
+
+def _make_responses_title_reply(resp_id: str, text: str) -> dict:
+    return {
+        "id": resp_id,
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        }],
         "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     }
 

@@ -596,6 +596,7 @@ class BrowserProvider(BaseProvider):
             known_tools = {t["name"] for t in (tools or []) if "name" in t}
             capability_repair_attempted = False
             effort_for_this_send = self._effort if not sent_sys else None  # FIX 1: first send only (mirrors CDP gate).
+            on_delta_cb = kwargs.get("on_delta")
             result = await complete_via_webview_bridge(
                 bridge_url=self._bridge_url,
                 bridge_token=self._bridge_token,
@@ -609,6 +610,7 @@ class BrowserProvider(BaseProvider):
                 clear_chat=clear_chat,
                 site_configs=getattr(self, "_site_configs", None),
                 effort=effort_for_this_send,
+                on_delta=on_delta_cb,
             )
             if self._needs_chatgpt_capability_repair(
                 result,

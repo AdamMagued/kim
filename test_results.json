@@ -1,0 +1,95 @@
+{
+  "turn1": {
+    "turn": "Turn 1",
+    "reasoning_deltas": [
+      "\u2022 Hi! How can I help?"
+    ],
+    "final_reasoning": "\u2022 Hi! How can I help?",
+    "output_deltas": [
+      "Hi! How can I help?"
+    ],
+    "final_output": "Hi! How can I help?",
+    "completed_response": {
+      "id": "resp_d6548001efef4bb5",
+      "object": "response",
+      "status": "completed",
+      "output": [
+        {
+          "type": "reasoning",
+          "reasoning_text": "\u2022 Hi! How can I help?",
+          "summary": [
+            {
+              "type": "summary_text",
+              "text": "\u2022 Hi! How can I help?"
+            }
+          ]
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "Hi! How can I help?"
+            }
+          ]
+        }
+      ],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0
+      }
+    }
+  },
+  "turn2": {
+    "turn": "Turn 2",
+    "reasoning_deltas": [
+      "fast|weather today user\ngenui_search|weather",
+      "v3_with_source\":{\"location\":\"user\",\"focus\":\"temp\"}}\ue201:",
+      "\n\nIt looks warm today.",
+      " Expect a hot day with haz",
+      "y sunshine, reaching about **35\u00b0C (94\u00b0F)**, with a cooler",
+      " low around **23\u00b0C (73\u00b0F)** tonight. Current conditions are **partly cloudy** at around **24\u00b0C (75\u00b0F)**. The rest",
+      " of the week trends even hotter, with highs approaching **39\u00b0C (102\u00b0F)** by Thursday, so staying hydrated and limiting prolonged time outdoors",
+      " during the afternoon is a good idea. \ue200cite\ue202turn0search6\ue201\n\n\ue200genui\ue202-G1t\ue201"
+    ],
+    "final_reasoning": "\u2022 Hi! How can I help?\n\u2022 fast|weather today user\ngenui_search|weatherv3_with_source\":{\"location\":\"user\",\"focus\":\"temp\"}}\ue201:\n\nIt looks warm today. Expect a hot day with hazy sunshine, reaching about **35\u00b0C (94\u00b0F)**, with a cooler low around **23\u00b0C (73\u00b0F)** tonight. Current conditions are **partly cloudy** at around **24\u00b0C (75\u00b0F)**. The rest of the week trends even hotter, with highs approaching **39\u00b0C (102\u00b0F)** by Thursday, so staying hydrated and limiting prolonged time outdoors during the afternoon is a good idea. \ue200cite\ue202turn0search6\ue201\n\n\ue200genui\ue202-G1t\ue201",
+    "output_deltas": [
+      "cite\n\n-G1t"
+    ],
+    "final_output": "cite\n\n-G1t",
+    "completed_response": {
+      "id": "resp_724ea989465d4034",
+      "object": "response",
+      "status": "completed",
+      "output": [
+        {
+          "type": "reasoning",
+          "reasoning_text": "\u2022 Hi! How can I help?\n\u2022 fast|weather today user\ngenui_search|weatherv3_with_source\":{\"location\":\"user\",\"focus\":\"temp\"}}\ue201:\n\nIt looks warm today. Expect a hot day with hazy sunshine, reaching about **35\u00b0C (94\u00b0F)**, with a cooler low around **23\u00b0C (73\u00b0F)** tonight. Current conditions are **partly cloudy** at around **24\u00b0C (75\u00b0F)**. The rest of the week trends even hotter, with highs approaching **39\u00b0C (102\u00b0F)** by Thursday, so staying hydrated and limiting prolonged time outdoors during the afternoon is a good idea. \ue200cite\ue202turn0search6\ue201\n\n\ue200genui\ue202-G1t\ue201",
+          "summary": [
+            {
+              "type": "summary_text",
+              "text": "\u2022 Hi! How can I help?\n\u2022 fast|weather today user\ngenui_search|weatherv3_with_source\":{\"location\":\"user\",\"focus\":\"temp\"}}\ue201:\n\nIt looks warm today. Expect a hot day with hazy sunshine, reaching about **35\u00b0C (94\u00b0F)**, with a cooler low around **23\u00b0C (73\u00b0F)** tonight. Current conditions are **partly cloudy** at around **24\u00b0C (75\u00b0F)**. The rest of the week trends even hotter, with highs approaching **39\u00b0C (102\u00b0F)** by Thursday, so staying hydrated and limiting prolonged time outdoors during the afternoon is a good idea. \ue200cite\ue202turn0search6\ue201\n\n\ue200genui\ue202-G1t\ue201"
+            }
+          ]
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "cite\n\n-G1t"
+            }
+          ]
+        }
+      ],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0
+      }
+    }
+  }
+}

@@ -69,8 +69,9 @@ class ContractToolCallGoldenTests(unittest.TestCase):
         reply = self._reply()
         self.assertEqual(reply["object"], "response")
         self.assertEqual(reply["status"], "completed")
-        self.assertEqual(len(reply["output"]), 2)
-        message, call = reply["output"]
+        self.assertEqual(len(reply["output"]), 3)
+        reasoning, message, call = reply["output"]
+        self.assertEqual(reasoning["type"], "reasoning")
         self.assertEqual(message["type"], "message")
         self.assertEqual(
             message["content"][0]["text"], "Listing the files first."
@@ -87,6 +88,11 @@ class ContractToolCallGoldenTests(unittest.TestCase):
             _event_types(events),
             [
                 "response.created",
+                # reasoning item: added -> reasoning text delta -> reasoning text done -> item done
+                "response.output_item.added",
+                "response.reasoning.text.delta",
+                "response.reasoning.text.done",
+                "response.output_item.done",
                 # message item: added -> text delta -> text done -> item done
                 "response.output_item.added",
                 "response.output_text.delta",
@@ -112,14 +118,15 @@ class ContractToolCallGoldenTests(unittest.TestCase):
     def test_function_call_frames_carry_name_and_arguments(self):
         reply = self._reply()
         events = _sse_events(_make_sse_response(reply))
-        added = events[5]
+        # Events: 0:created, 1-4:reasoning, 5-8:message, 9-12:function_call
+        added = events[9]
         self.assertEqual(added["item"]["type"], "function_call")
         self.assertEqual(added["item"]["name"], "shell")
         # Arguments stream via the delta frames; the added frame is empty.
         self.assertEqual(added["item"]["arguments"], "")
         self.assertEqual(added["item"]["status"], "in_progress")
 
-        delta, done, item_done = events[6], events[7], events[8]
+        delta, done, item_done = events[10], events[11], events[12]
         self.assertEqual(json.loads(delta["delta"]), {"cmd": "ls -la"})
         self.assertEqual(json.loads(done["arguments"]), {"cmd": "ls -la"})
         self.assertEqual(delta["item_id"], added["item"]["id"])
@@ -150,14 +157,19 @@ class ContractTextOnlyGoldenTests(unittest.TestCase):
         reply = _provider_response_to_responses_api(
             {"type": "text", "content": self.CONTENT}, relay_num=1
         )
-        self.assertEqual(len(reply["output"]), 1)
-        self.assertEqual(reply["output"][0]["type"], "message")
+        self.assertEqual(len(reply["output"]), 2)
+        self.assertEqual(reply["output"][0]["type"], "reasoning")
+        self.assertEqual(reply["output"][1]["type"], "message")
 
         events = _sse_events(_make_sse_response(reply))
         self.assertEqual(
             _event_types(events),
             [
                 "response.created",
+                "response.output_item.added",
+                "response.reasoning.text.delta",
+                "response.reasoning.text.done",
+                "response.output_item.done",
                 "response.output_item.added",
                 "response.output_text.delta",
                 "response.output_text.done",
@@ -166,10 +178,10 @@ class ContractTextOnlyGoldenTests(unittest.TestCase):
                 "[DONE]",
             ],
         )
-        delta = events[2]
+        delta = events[6]
         self.assertEqual(delta["delta"], "The port is 8123 per config.yaml.")
         self.assertEqual(delta["content_index"], 0)
-        self.assertEqual(events[3]["text"], "The port is 8123 per config.yaml.")
+        self.assertEqual(events[7]["text"], "The port is 8123 per config.yaml.")
         self.assertEqual(events[-1], "[DONE]")
 
 
@@ -228,8 +240,10 @@ class DoneMarkerGoldenTests(unittest.TestCase):
         reply = _provider_response_to_responses_api(
             {"type": "text", "content": content}, relay_num=2
         )
-        self.assertEqual(len(reply["output"]), 1)
-        item = reply["output"][0]
+        self.assertEqual(len(reply["output"]), 2)
+        reasoning = reply["output"][0]
+        item = reply["output"][1]
+        self.assertEqual(reasoning["type"], "reasoning")
         self.assertEqual(item["type"], "message")
         text = item["content"][0]["text"]
         self.assertEqual(text, "Built the pong game — arrow keys to move.")

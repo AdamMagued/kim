@@ -182,15 +182,11 @@ class BrowserProtocolTests(unittest.TestCase):
         self.assertNotIn("NEED_HELP", prompt)
 
     def test_system_prompt_selector_uses_exact_json_contract_for_chatgpt(self):
-        # The proxy/parser has one protocol. ChatGPT must receive that exact
-        # contract too, including on stateful follow-up turns.
+        # ChatGPT uses terminal system prompt framing
         self.assertEqual(
-            _system_prompt_for("browser:chatgpt"), _codex_browser_system_prompt()
+            _system_prompt_for("browser:chatgpt"), _chatgpt_terminal_system_prompt()
         )
-        self.assertIn(
-            '"tool_calls"', _system_prompt_for("browser:chatgpt")
-        )
-        self.assertNotIn("```bash", _system_prompt_for("browser:chatgpt"))
+        self.assertIn("```bash", _system_prompt_for("browser:chatgpt"))
         self.assertEqual(
             _system_prompt_for("browser:gemini"), _codex_browser_system_prompt()
         )

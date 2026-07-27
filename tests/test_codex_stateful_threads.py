@@ -1289,7 +1289,7 @@ class TestRepeatedCommandLoopGuard(unittest.IsolatedAsyncioTestCase):
         # stop condition — empty output otherwise reads as "nothing happened".
         sent = provider.calls[1]["messages"][0]["content"]
         self.assertIn("[TOOL RESULT]", sent)
-        self.assertIn("reply with just DONE", sent)
+        self.assertIn("(The command executed above.", sent)
 
     async def test_format_reminder_appended_to_chatgpt_first_relay(self):
         from codex_engine.engine import _CodexProxy
@@ -1302,9 +1302,8 @@ class TestRepeatedCommandLoopGuard(unittest.IsolatedAsyncioTestCase):
         )
         await proxy._handle_responses(self._request(proxy, 1))
         sent = provider.calls[0]["messages"][0]["content"]
-        self.assertIn("FORMAT REMINDER", sent)
-        self.assertIn('"tool_calls"', sent)
-        self.assertTrue(sent.rstrip().endswith("prose outside JSON.)"))
+        self.assertIn("INSTRUCTION: DO NOT USE YOUR BUILT-IN PYTHON CODE INTERPRETER", sent)
+        self.assertIn("tool calls", sent)
 
     async def test_format_reminder_not_appended_for_gemini(self):
         from codex_engine.engine import _CodexProxy
@@ -1516,7 +1515,8 @@ class TestDoneReply(unittest.TestCase):
         reply = _provider_response_to_responses_api(
             {"type": "text", "content": "DONE"}, relay_num=1, request_tools=_CODEX_TOOLS
         )
-        self.assertEqual(reply["output"][0]["type"], "message")
+        self.assertEqual(reply["output"][0]["type"], "reasoning")
+        self.assertEqual(reply["output"][1]["type"], "message")
 
     def test_done_suppresses_trailing_chatter_command(self):
         from codex_engine.engine import _provider_response_to_responses_api
@@ -1550,7 +1550,8 @@ class TestDoneReply(unittest.TestCase):
             relay_num=1,
             request_tools=_CODEX_TOOLS,
         )
-        self.assertEqual(reply["output"][0]["type"], "message")
+        self.assertEqual(reply["output"][0]["type"], "reasoning")
+        self.assertEqual(reply["output"][1]["type"], "message")
 
     def test_word_done_in_prose_is_not_a_done_signal(self):
         from codex_engine.engine import _is_done_reply
@@ -1579,10 +1580,10 @@ class TestChatgptContractNudge(unittest.IsolatedAsyncioTestCase):
         proxy = _CodexProxy(
             provider, provider_name="browser:chatgpt", thread_state={}, stateful=False
         )
-        original = {"type": "text", "content": "Here's how you'd do it, in theory."}
+        original = {"type": "text", "content": "Save this file as pong.html then run open pong.html"}
         await proxy._nudge_contract_retry(original, relay_num=1)
         self.assertEqual(len(provider.calls), 1)
-        self.assertEqual(provider.calls[0]["messages"][0]["content"], _CONTRACT_NUDGE)
+        self.assertIn("bash", provider.calls[0]["messages"][0]["content"])
 
     async def test_gemini_still_gets_json_nudge(self):
         from codex_engine.engine import _CodexProxy, _CONTRACT_NUDGE
@@ -1591,7 +1592,7 @@ class TestChatgptContractNudge(unittest.IsolatedAsyncioTestCase):
         proxy = _CodexProxy(
             provider, provider_name="browser:gemini", thread_state={}, stateful=False
         )
-        original = {"type": "text", "content": "I'll explain the approach."}
+        original = {"type": "text", "content": "Save this file as pong.html then run open pong.html"}
         await proxy._nudge_contract_retry(original, relay_num=1)
         self.assertEqual(provider.calls[0]["messages"][0]["content"], _CONTRACT_NUDGE)
 
@@ -1746,18 +1747,14 @@ class TestContractNudge(unittest.IsolatedAsyncioTestCase):
             }),
         }
         proxy, provider = _proxy(responses=[retry_reply])
-        original = {"type": "text", "content": "I'll create the files and open them for you."}
+        original = {"type": "text", "content": "Save this as index.html then run open index.html"}
 
         result = await proxy._nudge_contract_retry(original, relay_num=1)
 
         self.assertIs(result, retry_reply)
         self.assertEqual(len(provider.calls), 1)
         sent = provider.calls[0]["messages"][0]["content"]
-        # Accommodation framing: the nudge asks for the format as the reader's
-        # constraint, not as an adversarial "FORMAT ERROR" correction.
-        self.assertIn("JSON", sent)
-        self.assertIn("tool_calls", sent)
-        # Same thread — the nudge must never wipe the chat.
+        self.assertIn("bash", sent)
         self.assertFalse(provider.calls[0]["kwargs"]["clear_chat"])
 
     async def test_contract_reply_is_not_nudged(self):
@@ -1773,19 +1770,17 @@ class TestContractNudge(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_retry_keeps_original_and_nudges_only_once(self):
         proxy, provider = _proxy(responses=[{"type": "text", "content": "still prose, sorry"}])
-        original = {"type": "text", "content": "Sure, I'll do that right away."}
+        original = {"type": "text", "content": "Save this as index.html then run open index.html"}
         result = await proxy._nudge_contract_retry(original, relay_num=1)
         self.assertIs(result, original)
         self.assertEqual(len(provider.calls), 1)
-        # Ignoring the explicit nudge burns the thread: refusals compound, so
-        # the next task must start a fresh chat instead of resuming this one.
         self.assertTrue(proxy._thread_state.get("burned"))
 
     async def test_successful_retry_does_not_burn_thread(self):
         proxy, provider = _proxy(
             responses=[{"type": "text", "content": json.dumps({"text": "The answer is 42."})}]
         )
-        original = {"type": "text", "content": "Sure, I'll do that right away."}
+        original = {"type": "text", "content": "Save this as index.html then run open index.html"}
         await proxy._nudge_contract_retry(original, relay_num=1)
         self.assertFalse(proxy._thread_state.get("burned"))
 

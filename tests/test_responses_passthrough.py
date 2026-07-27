@@ -244,7 +244,8 @@ class ResponsesPassthroughModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 200)
         payload = json.loads(resp.body)
         self.assertEqual(payload["object"], "response")
-        self.assertEqual(payload["output"][0]["content"][0]["text"], "hello there")
+        msg_item = next(item for item in payload["output"] if item["type"] == "message")
+        self.assertEqual(msg_item["content"][0]["text"], "hello there")
         # Native BaseProvider signature — no clear_chat/handoff kwargs.
         self.assertEqual(provider.calls[0]["system"], "be nice")
         self.assertEqual(provider.calls[0]["messages"], [{"role": "user", "content": "hi"}])
@@ -284,6 +285,8 @@ class ResponsesPassthroughModeTests(unittest.IsolatedAsyncioTestCase):
             _event_types(events),
             [
                 "response.created",
+                "response.output_item.added", "response.reasoning.text.delta",
+                "response.reasoning.text.done", "response.output_item.done",
                 "response.output_item.added", "response.output_text.delta",
                 "response.output_text.done", "response.output_item.done",
                 "response.output_item.added", "response.function_call_arguments.delta",

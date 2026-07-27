@@ -100,7 +100,7 @@ class CustomToolShapeTests(unittest.TestCase):
             "resp_1", "editing", [{"name": "apply_patch", "input": PATCH}], CODEX_TOOLS
         )
         types = [i["type"] for i in _items(reply)]
-        self.assertEqual(types, ["message", "custom_tool_call"])
+        self.assertEqual(types, ["reasoning", "message", "custom_tool_call"])
 
 
 class FreeformInputFlatteningTests(unittest.TestCase):
