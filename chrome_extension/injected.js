@@ -510,6 +510,9 @@
     var uploadUrl = initData.upload_url;
 
     if (uploadUrl) {
+      var urlDomain = '';
+      try { urlDomain = new URL(uploadUrl).hostname; } catch(e) { urlDomain = uploadUrl.substring(0, 60); }
+      bridgeLog('Uploading to: ' + urlDomain + ' mime=' + mime + ' blobSize=' + blob.size);
       var uploadHeaders = { 'Content-Type': mime };
       if (uploadUrl.includes('blob.core.windows.net') || uploadUrl.includes('azure')) {
         uploadHeaders['x-ms-blob-type'] = 'BlockBlob';
@@ -522,7 +525,8 @@
         });
         bridgeLog('uploadUrl PUT status: ' + uploadResp.status);
         if (!uploadResp.ok) {
-          console.error('[Bridge] Failed to upload file bytes:', await uploadResp.text());
+          var errBody = await uploadResp.text();
+          bridgeLog('PUT FAIL body: ' + errBody.substring(0, 300));
           return null;
         }
       } catch(e) {
