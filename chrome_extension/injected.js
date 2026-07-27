@@ -455,22 +455,38 @@
     var headers = baseHeaders();
     headers['Content-Type'] = 'application/json';
 
-    var initResp = await originalFetch('/backend-api/files', {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify({
-        file_name: name,
-        file_size: size,
-        use_case: 'multimodal'
-      })
-    });
-    console.log('[Bridge] /backend-api/files init status:', initResp.status);
-    if (!initResp.ok) {
-      var errTxt = await initResp.text();
-      console.error('[Bridge] Failed to init file upload:', errTxt);
+    var useCases = ['multimodal', 'ace_upload', 'my_files'];
+    var initResp = null;
+    var initData = null;
+    for (var u = 0; u < useCases.length; u++) {
+      try {
+        initResp = await originalFetch('/backend-api/files', {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({
+            file_name: name,
+            file_size: size,
+            use_case: useCases[u]
+          })
+        });
+        console.log('[Bridge] /backend-api/files init status (use_case=' + useCases[u] + '):', initResp.status);
+        if (initResp.ok) {
+          initData = await initResp.json();
+          break;
+        } else {
+          var errTxt = await initResp.text();
+          console.error('[Bridge] Failed to init file upload with use_case=' + useCases[u] + ':', errTxt);
+        }
+      } catch(e) {
+        console.error('[Bridge] Error calling /backend-api/files:', e);
+      }
+    }
+
+    if (!initData || !initData.file_id) {
+      console.error('[Bridge] Failed to obtain file_id from /backend-api/files');
       return null;
     }
-    var initData = await initResp.json();
+
     console.log('[Bridge] /backend-api/files init data:', initData);
     var fileId = initData.file_id;
     var uploadUrl = initData.upload_url;
@@ -480,27 +496,32 @@
       if (uploadUrl.includes('blob.core.windows.net') || uploadUrl.includes('azure')) {
         uploadHeaders['x-ms-blob-type'] = 'BlockBlob';
       }
-      var uploadResp = await window.fetch(uploadUrl, {
-        method: 'PUT',
-        headers: uploadHeaders,
-        body: blob
-      });
-      console.log('[Bridge] uploadUrl PUT status:', uploadResp.status);
-      if (!uploadResp.ok) {
-        console.error('[Bridge] Failed to upload file bytes:', await uploadResp.text());
+      try {
+        var uploadResp = await window.fetch(uploadUrl, {
+          method: 'PUT',
+          headers: uploadHeaders,
+          body: blob
+        });
+        console.log('[Bridge] uploadUrl PUT status:', uploadResp.status);
+        if (!uploadResp.ok) {
+          console.error('[Bridge] Failed to upload file bytes:', await uploadResp.text());
+          return null;
+        }
+      } catch(e) {
+        console.error('[Bridge] Error uploading file bytes to uploadUrl:', e);
         return null;
       }
     }
 
-    var completeResp = await originalFetch('/backend-api/files/' + fileId + '/uploaded', {
-      method: 'POST',
-      headers: Object.assign({}, baseHeaders(), { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ file_id: fileId })
-    });
-    console.log('[Bridge] /backend-api/files/uploaded status:', completeResp.status);
-    if (!completeResp.ok) {
-      console.error('[Bridge] Failed to mark file uploaded:', await completeResp.text());
-      return null;
+    try {
+      var completeResp = await originalFetch('/backend-api/files/' + fileId + '/uploaded', {
+        method: 'POST',
+        headers: Object.assign({}, baseHeaders(), { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ file_id: fileId })
+      });
+      console.log('[Bridge] /backend-api/files/uploaded status:', completeResp.status);
+    } catch(e) {
+      console.warn('[Bridge] Warning on file uploaded completion:', e);
     }
 
     return {
@@ -525,26 +546,51 @@
 
     var chatgptMessages = messages.map(function(m, idx) {
       var text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-      if (idx === messages.length - 1 && Array.isArray(attachments) && attachments.length > 0) {
+      if (idx === messages.length - 1 && (uploadedFiles.length > 0 || (Array.isArray(attachments) && attachments.length > 0))) {
         var parts = [];
-        attachments.forEach(function(att) {
-          var b64 = att.data_base64 || att.data || '';
-          var mime = att.mime_type || att.media_type || 'image/png';
-          if (b64) {
+        var metadataAttachments = [];
+        if (uploadedFiles.length > 0) {
+          uploadedFiles.forEach(function(f) {
             parts.push({
-              content_type: 'image_url',
-              image_url: { url: 'data:' + mime + ';base64,' + b64 }
+              asset_pointer: 'file-service://' + f.file_id,
+              content_type: 'image_asset_pointer',
+              size_bytes: f.file_size,
+              width: 1000,
+              height: 1000
             });
-          }
-        });
+            metadataAttachments.push({
+              id: f.file_id,
+              size: f.file_size,
+              name: f.file_name,
+              mime_type: f.mime_type,
+              width: 1000,
+              height: 1000
+            });
+          });
+        } else {
+          attachments.forEach(function(att) {
+            var b64 = att.data_base64 || att.data || '';
+            var mime = att.mime_type || att.media_type || 'image/png';
+            if (b64) {
+              parts.push({
+                content_type: 'image_url',
+                image_url: { url: 'data:' + mime + ';base64,' + b64 }
+              });
+            }
+          });
+        }
         parts.push(text);
-        return {
+        var msgObj = {
           id: crypto.randomUUID(),
           author: { role: m.role || 'user' },
           create_time: Date.now() / 1000,
           content: { content_type: 'multimodal_text', parts: parts },
           metadata: {},
         };
+        if (metadataAttachments.length > 0) {
+          msgObj.metadata.attachments = metadataAttachments;
+        }
+        return msgObj;
       }
       return {
         id: crypto.randomUUID(),
