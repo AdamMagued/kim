@@ -113,13 +113,16 @@ class ExtensionBridgeServer:
         await ws.prepare(request)
 
         previous = self.active_ws
+        # If a connection is already live and has an in-flight request, do not displace it
+        if previous is not None and not previous.closed and self.pending_requests:
+            logger.info("[Kim Bridge] Ignoring secondary extension connection while request is in-flight")
+            await ws.close(code=4000, message=b"Request in-flight on primary connection")
+            return ws
+
         self.active_ws = ws
         self.bridge_ready = True
         self._connected_event.set()
-        if previous is not None and previous is not ws:
-            # A second tab (or a reloaded extension) took over. Anything still
-            # in flight belonged to the socket we just displaced and will
-            # never be answered — fail it now instead of at timeout.
+        if previous is not None and previous is not ws and not previous.closed:
             self._fail_pending(
                 RuntimeError("Chrome Extension reconnected — in-flight request abandoned")
             )
