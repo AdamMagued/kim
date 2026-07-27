@@ -2063,6 +2063,15 @@ def _normalize_response_image_links(text: str) -> str:
     return text
 
 
+def _build_summary_items(text: str) -> list[dict]:
+    if not text or not text.strip():
+        return []
+    lines = [line.lstrip("•-* ").strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return [{"type": "summary_text", "text": text.strip()}]
+    return [{"type": "summary_text", "text": line} for line in lines]
+
+
 def _make_responses_text_reply(resp_id: str, text: str) -> dict:
     text = _normalize_response_image_links(text)
     output_items = []
@@ -2070,7 +2079,7 @@ def _make_responses_text_reply(resp_id: str, text: str) -> dict:
         output_items.append({
             "type": "reasoning",
             "reasoning_text": text,
-            "summary": [{"type": "summary_text", "text": text}],
+            "summary": _build_summary_items(text),
         })
     output_items.append({
         "type": "message",
@@ -2195,7 +2204,7 @@ def _make_responses_tool_reply(
         output_items.append({
             "type": "reasoning",
             "reasoning_text": text,
-            "summary": [{"type": "summary_text", "text": text}],
+            "summary": _build_summary_items(text),
         })
         output_items.append({
             "type": "message",

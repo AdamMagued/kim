@@ -211,13 +211,15 @@ async def stream_responses_http(
         if bullet_line not in proxy._accumulated_thinking_lines:
             proxy._accumulated_thinking_lines.append(bullet_line)
 
+    from codex_engine.engine import _build_summary_items
     full_reasoning = "\n".join(proxy._accumulated_thinking_lines) if proxy._accumulated_thinking_lines else (curr_reasoning or "Thinking...")
+    summary_items = _build_summary_items(full_reasoning)
 
     # Ensure responses_reply reasoning items reflect the full accumulated multi-line reasoning
     for item in responses_reply.get("output") or []:
         if isinstance(item, dict) and item.get("type") == "reasoning":
             item["reasoning_text"] = full_reasoning
-            item["summary"] = [{"type": "summary_text", "text": full_reasoning}]
+            item["summary"] = summary_items
 
     ev_reasoning_done = {
         "type": "response.reasoning.text.done",
@@ -235,7 +237,7 @@ async def stream_responses_http(
             "id": reasoning_id,
             "type": "reasoning",
             "reasoning_text": full_reasoning,
-            "summary": [{"type": "summary_text", "text": full_reasoning}],
+            "summary": summary_items,
             "status": "completed",
         },
     }
