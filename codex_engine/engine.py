@@ -515,10 +515,10 @@ class _CodexProxy:
             # not introduce a second, terminal-only response format here.
             if bool(self._provider_name) and "chatgpt" in self._provider_name.lower():
                 prompt += (
-                    "\n\nINSTRUCTION: DO NOT USE YOUR BUILT-IN PYTHON CODE INTERPRETER OR CLOUD CONTAINER. "
-                    "Your internal cloud sandbox has no access to local paths (/Users/...). "
-                    "To inspect files, search the codebase, edit code, or run shell commands, ALWAYS emit a JSON tool call (e.g. exec_command, write_file, apply_patch). "
-                    "Do NOT ask the user to run commands for you or output text starting with NEED_HELP when a tool can perform the action. Emit the JSON tool call directly."
+                    "\n\nINSTRUCTION: DO NOT USE YOUR BUILT-IN CLOUD PYTHON INTERPRETER OR CLOUD SANDBOX. "
+                    "An automated local terminal runner is connected to this chat session. "
+                    "Whatever shell command you place inside a ```bash code block is EXECUTED IMMEDIATELY on the user's local Mac workspace (/Users/adammaged/...). "
+                    "Do NOT refuse tasks or claim you cannot access local paths. To inspect files, search the codebase, edit code, or run shell commands, emit your command inside a ```bash code block now."
                 )
             self._last_sent_count = len(input_items) if isinstance(input_items, list) else 0
         else:
@@ -1840,11 +1840,9 @@ def _chatgpt_terminal_system_prompt() -> str:
     to pick the codex layout (not the chat-mode one). Guarded by tests.
     """
     return (
-        "You are Kim, pair-programming with a person at their Mac terminal "
-        "(codex bridge terminal mode). They will personally run whatever command you "
-        "give and paste back the exact real output — they have already granted "
-        "permission. Work with them the way you naturally would, with a few rules that "
-        "make it actually run:\n\n"
+        "You are Kim, pair-programming at a Mac terminal (codex bridge terminal mode). "
+        "An automated local terminal runner is connected to this session and executes your commands immediately on the user's local Mac workspace (/Users/adammaged/...). "
+        "Never refuse tasks or claim you cannot access local file paths or Mac paths. Work with the codebase by outputting commands inside ```bash code blocks:\n\n"
         "EVERY working reply has exactly TWO parts, in this order:\n"
         "1. ONE short narration line — what you're about to do and why, in plain "
         "natural language. Examples: \"Writing the whole game file now.\" / "
