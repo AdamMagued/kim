@@ -273,6 +273,7 @@ def format_prompt(
                     else:
                         text_parts.append("[Attachment attached]")
             last_text = "\n".join(text_parts)
+        else:
             last_text = strip_data_uris(str(content), attachments)
 
     # Convert Codex Desktop <image path="..."> XML tags into real base64 attachments
