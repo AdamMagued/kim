@@ -276,19 +276,34 @@ def format_prompt(
         else:
             last_text = strip_data_uris(str(content), attachments)
 
+def _compress_image_b64(img_path: str, max_dim: int = 1000, quality: int = 75) -> tuple[str, str]:
+    try:
+        from PIL import Image
+        import io, base64
+        with Image.open(img_path) as img:
+            img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality)
+            return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg"
+    except Exception:
+        import base64
+        with open(img_path, "rb") as f:
+            mime = "image/png"
+            if img_path.lower().endswith((".jpg", ".jpeg")):
+                mime = "image/jpeg"
+            elif img_path.lower().endswith(".webp"):
+                mime = "image/webp"
+            return base64.b64encode(f.read()).decode("utf-8"), mime
+
+
     # Convert Codex Desktop <image path="..."> XML tags and ## file.png headers into real base64 attachments
     def _parse_image_xml_tag(match):
         img_path = match.group(1).strip()
         if os.path.isfile(img_path):
             try:
-                import base64
-                with open(img_path, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("utf-8")
-                mime = "image/png"
-                if img_path.endswith((".jpg", ".jpeg")):
-                    mime = "image/jpeg"
-                elif img_path.endswith(".webp"):
-                    mime = "image/webp"
+                b64, mime = _compress_image_b64(img_path)
                 append_attachment(attachments, mime, b64, name=os.path.basename(img_path))
                 return f"![{os.path.basename(img_path)}](data:{mime};base64,{b64})"
             except Exception:
@@ -299,16 +314,9 @@ def format_prompt(
         img_path = match.group(2).strip()
         if os.path.isfile(img_path) and img_path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
             try:
-                import base64
-                with open(img_path, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("utf-8")
-                mime = "image/png"
-                if img_path.lower().endswith((".jpg", ".jpeg")):
-                    mime = "image/jpeg"
-                elif img_path.lower().endswith(".webp"):
-                    mime = "image/webp"
+                b64, mime = _compress_image_b64(img_path)
                 append_attachment(attachments, mime, b64, name=os.path.basename(img_path))
-                return f"## {match.group(1)}: [Image attached]"
+                return f"## {match.group(1)}: ![{os.path.basename(img_path)}](data:{mime};base64,{b64})"
             except Exception:
                 pass
         return match.group(0)
@@ -500,7 +508,8 @@ def format_prompt(
             )
         prompt += "\n\n" + direct_contract
 
-    if len(prompt) > max_inject_chars:
+    effective_max = max(max_inject_chars, len(prompt) + 1000) if attachments else max_inject_chars
+    if len(prompt) > effective_max:
         # Preserve the ENTIRE [SYSTEM] block + transport-marker instruction as
         # the head — a 200-char head silently drops the operating rules (the
         # codex terminal contract, the JSON contract), and the model then
