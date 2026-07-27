@@ -2027,6 +2027,7 @@ def _provider_response_to_responses_api(
         # apply it to the local workspace cleanly.
         if "```diff" in str(content) or "```patch" in str(content) or "diff --git" in str(content):
             try:
+                import os
                 from codex_engine.patch_engine import apply_git_patch
                 patch_res = apply_git_patch(os.getcwd(), str(content))
                 if patch_res.get("success"):
