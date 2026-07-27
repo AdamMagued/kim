@@ -314,8 +314,7 @@ def format_prompt(
         return match.group(0)
 
     last_text = re.sub(r'##\s+([^\n]+\.(?:png|jpg|jpeg|webp|gif)):\s*(/(?:tmp|var|Users)/[^\s\n]+)', _parse_header_image_path, last_text, flags=re.IGNORECASE)
-    last_text = re.sub(r'<image\s+name=[^>]*\bpath="([^"]+)"[^>]*>', _parse_image_xml_tag, last_text)
-    last_text = re.sub(r'<image\s+path="([^"]+)"[^>]*>', _parse_image_xml_tag, last_text)
+    last_text = re.sub(r'<image\b[^>]*\bpath="([^"]+)"[^>]*>', _parse_image_xml_tag, last_text)
     last_text = re.sub(r'</image>', '', last_text)
 
     last_text = last_text.strip()
