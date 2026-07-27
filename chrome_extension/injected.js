@@ -540,14 +540,19 @@
 
     var uploadedFiles = [];
     if (Array.isArray(attachments) && attachments.length > 0) {
+      console.log('[Bridge] Starting upload of', attachments.length, 'attachment(s). Keys:', Object.keys(attachments[0] || {}));
       for (var a = 0; a < attachments.length; a++) {
         try {
           var uRes = await uploadAttachment(attachments[a]);
+          console.log('[Bridge] uploadAttachment result for #' + a + ':', uRes);
           if (uRes) uploadedFiles.push(uRes);
         } catch(err) {
-          console.error('[Bridge] Error uploading attachment:', err);
+          console.error('[Bridge] Error uploading attachment #' + a + ':', err);
         }
       }
+      console.log('[Bridge] Upload complete. uploadedFiles count:', uploadedFiles.length);
+    } else {
+      console.log('[Bridge] No attachments array or empty. attachments:', typeof attachments, Array.isArray(attachments) ? attachments.length : 'N/A');
     }
 
     var chatgptMessages = messages.map(function(m, idx) {
@@ -585,8 +590,8 @@
             }
           });
         }
-        var cleanText = text.replace(/\[Image attached:[^\]]+\]/g, '').trim();
-        parts.push(cleanText || text);
+        var cleanText = text.replace(/\[Image attached:[^\]]+\]/g, '').replace(/!\[[^\]]*\]\(data:[^)]+\)/g, '').replace(/!\[[^\]]*\]\(data:[^)]*$/g, '').trim();
+        parts.push(cleanText || 'Please analyze the attached image.');
         var msgObj = {
           id: crypto.randomUUID(),
           author: { role: m.role || 'user' },

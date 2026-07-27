@@ -306,7 +306,7 @@ def format_prompt(
             try:
                 b64, mime = _compress_image_b64(img_path)
                 append_attachment(attachments, mime, b64, name=os.path.basename(img_path))
-                return f"![{os.path.basename(img_path)}](data:{mime};base64,{b64})"
+                return f"[Image attached: {os.path.basename(img_path)}]"
             except Exception:
                 pass
         return ""
@@ -317,7 +317,7 @@ def format_prompt(
             try:
                 b64, mime = _compress_image_b64(img_path)
                 append_attachment(attachments, mime, b64, name=os.path.basename(img_path))
-                return f"## {match.group(1)}: ![{os.path.basename(img_path)}](data:{mime};base64,{b64})"
+                return f"## {match.group(1)}: [Image attached: {os.path.basename(img_path)}]"
             except Exception:
                 pass
         return match.group(0)
