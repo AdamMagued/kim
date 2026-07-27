@@ -515,10 +515,22 @@
       try { urlDomain = new URL(uploadUrl).hostname; } catch(e) { urlDomain = uploadUrl.substring(0, 60); }
       bridgeLog('Uploading to: ' + urlDomain + ' mime=' + mime + ' blobSize=' + blob.size);
 
+      var svParam = '';
+      try {
+        var uObj = new URL(uploadUrl);
+        svParam = uObj.searchParams.get('sv') || '';
+      } catch(e) {}
+      bridgeLog('Extracted Azure svParam: ' + svParam);
+
       var headerOptions = [];
-      if (uploadUrl.includes('blob.core.windows.net') || uploadUrl.includes('azure')) {
+      if (uploadUrl.includes('oaiusercontent.com') || uploadUrl.includes('blob.core.windows.net') || uploadUrl.includes('azure')) {
+        if (svParam) {
+          headerOptions.push({ 'x-ms-blob-type': 'BlockBlob', 'x-ms-version': svParam, 'x-ms-blob-content-type': mime, 'Content-Type': mime });
+          headerOptions.push({ 'x-ms-blob-type': 'BlockBlob', 'x-ms-version': svParam });
+        }
+        headerOptions.push({ 'x-ms-blob-type': 'BlockBlob', 'x-ms-blob-content-type': mime, 'Content-Type': mime });
+        headerOptions.push({ 'x-ms-blob-type': 'BlockBlob', 'x-ms-version': '2020-04-08' });
         headerOptions.push({ 'x-ms-blob-type': 'BlockBlob', 'Content-Type': mime });
-        headerOptions.push({ 'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/octet-stream' });
         headerOptions.push({ 'x-ms-blob-type': 'BlockBlob' });
       } else {
         headerOptions.push({ 'Content-Type': mime });
