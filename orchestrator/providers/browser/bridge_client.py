@@ -121,6 +121,7 @@ async def _try_extension_bridge(
 
         accumulated_delta: list[str] = []
         last_printed_prose: list[str] = [""]
+        last_print_time: list[float] = [0.0]
 
         def _on_extension_delta(delta: str):
             if not delta:
@@ -128,11 +129,17 @@ async def _try_extension_bridge(
             accumulated_delta.append(delta)
             full_so_far = "".join(accumulated_delta)
             prose = full_so_far.split("```", 1)[0].strip()
-            if prose:
-                clean_prose = " ".join(prose.split())[:200]
-                if clean_prose and clean_prose != last_printed_prose[0]:
-                    last_printed_prose[0] = clean_prose
-                    print(f"[STATUS] {clean_prose}", flush=True)
+            if not prose:
+                return
+            clean_prose = " ".join(prose.split())[:200]
+            now = time.time()
+            # Only print if it's a complete sentence/line or at least 1.5 seconds elapsed
+            is_boundary = delta.endswith(("\n", ". ", "! ", "? ", ": ")) or "\n" in delta
+            time_elapsed = (now - last_print_time[0]) >= 1.5
+            if clean_prose and clean_prose != last_printed_prose[0] and (is_boundary or time_elapsed):
+                last_printed_prose[0] = clean_prose
+                last_print_time[0] = now
+                print(f"[STATUS] {clean_prose}", flush=True)
 
         logger.info("[Kim Bridge] Dispatching prompt to Chrome Extension over WebSocket...")
         res = await bridge.send_completion(prompt, on_delta=_on_extension_delta, clear_chat=clear_chat)
