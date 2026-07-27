@@ -2003,11 +2003,9 @@ def _provider_response_to_responses_api(
             if salvaged is None:
                 salvaged = _salvage_action_reply(content, request_tools)
             if salvaged is not None:
-                # Empty message text: the humanized activity lines from
-                # _announce_commands narrate the work — passing the full reply
-                # (prose + file body) would dump it to the user as "Kim: …".
+                prose = content.split("```", 1)[0].strip() if isinstance(content, str) else ""
                 _count_repair(metrics, "salvages")
-                return _make_responses_tool_reply(resp_id, "", salvaged, request_tools)
+                return _make_responses_tool_reply(resp_id, prose, salvaged, request_tools)
             return _make_responses_text_reply(resp_id, text or content)
 
         # Prose reply — a DONE signal ends the turn; otherwise execute any
@@ -2018,9 +2016,9 @@ def _provider_response_to_responses_api(
             return _make_responses_text_reply(resp_id, _strip_done_marker(content))
         salvaged = _salvage_action_reply(content, request_tools)
         if salvaged is not None:
-            # Empty text — the humanized activity lines narrate it (see above).
+            prose = content.split("```", 1)[0].strip() if isinstance(content, str) else ""
             _count_repair(metrics, "salvages")
-            return _make_responses_tool_reply(resp_id, "", salvaged, request_tools)
+            return _make_responses_tool_reply(resp_id, prose, salvaged, request_tools)
 
         return _make_responses_text_reply(resp_id, content)
 
