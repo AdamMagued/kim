@@ -570,42 +570,29 @@
 
     var chatgptMessages = messages.map(function(m, idx) {
       var text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-      if (idx === messages.length - 1 && (uploadedFiles.length > 0 || (Array.isArray(attachments) && attachments.length > 0))) {
+      var cleanText = text.replace(/\[Image attached:[^\]]+\]/g, '').replace(/!\[[^\]]*\]\(data:[^)]+\)/g, '').replace(/!\[[^\]]*\]\(data:[^)]*$/g, '').trim();
+      if (idx === messages.length - 1 && uploadedFiles.length > 0) {
         var parts = [];
         var metadataAttachments = [];
-        if (uploadedFiles.length > 0) {
-          uploadedFiles.forEach(function(f) {
-            parts.push({
-              asset_pointer: 'file-service://' + f.file_id,
-              content_type: 'image_asset_pointer',
-              size_bytes: f.file_size,
-              width: 1000,
-              height: 1000
-            });
-            metadataAttachments.push({
-              id: f.file_id,
-              size: f.file_size,
-              name: f.file_name,
-              mime_type: f.mime_type,
-              width: 1000,
-              height: 1000
-            });
+        parts.push(cleanText || 'Please analyze the attached image.');
+        uploadedFiles.forEach(function(f) {
+          parts.push({
+            asset_pointer: 'file-service://' + f.file_id,
+            content_type: 'image_asset_pointer',
+            size_bytes: f.file_size,
+            width: 1000,
+            height: 1000
           });
-        } else {
-          attachments.forEach(function(att) {
-            var b64 = att.data_base64 || att.data || '';
-            var mime = att.mime_type || att.media_type || 'image/png';
-            if (b64) {
-              parts.push({
-                content_type: 'image_url',
-                image_url: { url: 'data:' + mime + ';base64,' + b64 }
-              });
-            }
+          metadataAttachments.push({
+            id: f.file_id,
+            size: f.file_size,
+            name: f.file_name,
+            mime_type: f.mime_type,
+            width: 1000,
+            height: 1000
           });
-        }
-        var cleanText = text.replace(/\[Image attached:[^\]]+\]/g, '').replace(/!\[[^\]]*\]\(data:[^)]+\)/g, '').replace(/!\[[^\]]*\]\(data:[^)]*$/g, '').trim();
-        parts.unshift(cleanText || 'Please analyze the attached image.');
-        bridgeLog('parts count=' + parts.length + ' parts[0] type=' + typeof parts[0] + ' parts[1] type=' + (parts[1] ? typeof parts[1] : 'N/A'));
+        });
+        bridgeLog('multimodal_text parts=' + parts.length + ' first_type=' + typeof parts[0]);
         var msgObj = {
           id: crypto.randomUUID(),
           author: { role: m.role || 'user' },
@@ -622,7 +609,7 @@
         id: crypto.randomUUID(),
         author: { role: m.role || 'user' },
         create_time: Date.now() / 1000,
-        content: { content_type: 'text', parts: [text] },
+        content: { content_type: 'text', parts: [cleanText || text] },
         metadata: {},
       };
     });

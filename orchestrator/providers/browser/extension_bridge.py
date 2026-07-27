@@ -176,6 +176,10 @@ class ExtensionBridgeServer:
             return
         event = data.get("event")
 
+        if event == "log":
+            logger.info("[Kim Bridge] %s", data.get("delta", ""))
+            return
+
         if event == "delta":
             callback = self.streaming_callbacks.get(req_id)
             delta = data.get("delta", "")
