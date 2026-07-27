@@ -888,6 +888,7 @@
     if (event.data.type !== 'CHATGPT_BRIDGE_REQUEST') return;
 
     var requestId = event.data.requestId;
+    bridgeLog('Received request requestId=' + requestId + ' atts=' + (Array.isArray(event.data.attachments) ? event.data.attachments.length : 'none'));
     var messages = event.data.messages;
     var model = event.data.model;
     var conversationId = event.data.conversationId;
