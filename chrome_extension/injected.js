@@ -447,7 +447,8 @@
     }
 
   function b64ToBlob(b64, mime) {
-    var byteChars = atob(b64);
+    var cleanB64 = (b64 || '').replace(/^data:[^;]+;base64,/, '').replace(/[\s\r\n]/g, '');
+    var byteChars = atob(cleanB64);
     var byteNumbers = new Array(byteChars.length);
     for (var i = 0; i < byteChars.length; i++) {
       byteNumbers[i] = byteChars.charCodeAt(i);
@@ -505,7 +506,7 @@
       return null;
     }
 
-    bridgeLog('/backend-api/files OK: file_id=' + (initData.file_id || 'NONE') + ' upload_url=' + (initData.upload_url ? 'YES' : 'NONE'));
+    bridgeLog('/backend-api/files OK: initData=' + JSON.stringify(initData));
     var fileId = initData.file_id;
     var uploadUrl = initData.upload_url;
 
@@ -513,27 +514,40 @@
       var urlDomain = '';
       try { urlDomain = new URL(uploadUrl).hostname; } catch(e) { urlDomain = uploadUrl.substring(0, 60); }
       bridgeLog('Uploading to: ' + urlDomain + ' mime=' + mime + ' blobSize=' + blob.size);
-      var uploadHeaders = {};
+
+      var headerOptions = [];
       if (uploadUrl.includes('blob.core.windows.net') || uploadUrl.includes('azure')) {
-        uploadHeaders['x-ms-blob-type'] = 'BlockBlob';
-        uploadHeaders['Content-Type'] = 'application/octet-stream';
+        headerOptions.push({ 'x-ms-blob-type': 'BlockBlob', 'Content-Type': mime });
+        headerOptions.push({ 'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/octet-stream' });
+        headerOptions.push({ 'x-ms-blob-type': 'BlockBlob' });
       } else {
-        uploadHeaders['Content-Type'] = mime;
+        headerOptions.push({ 'Content-Type': mime });
+        headerOptions.push({ 'Content-Type': 'application/octet-stream' });
+        headerOptions.push({});
       }
-      try {
-        var uploadResp = await window.fetch(uploadUrl, {
-          method: 'PUT',
-          headers: uploadHeaders,
-          body: blob
-        });
-        bridgeLog('uploadUrl PUT status: ' + uploadResp.status);
-        if (!uploadResp.ok) {
-          var errBody = await uploadResp.text();
-          bridgeLog('PUT FAIL body: ' + errBody.substring(0, 300));
-          return null;
+
+      var uploadSuccess = false;
+      for (var hIdx = 0; hIdx < headerOptions.length; hIdx++) {
+        try {
+          var uploadResp = await window.fetch(uploadUrl, {
+            method: 'PUT',
+            headers: headerOptions[hIdx],
+            body: blob
+          });
+          bridgeLog('uploadUrl PUT opt#' + hIdx + ' status: ' + uploadResp.status);
+          if (uploadResp.ok) {
+            uploadSuccess = true;
+            break;
+          } else {
+            var errBody = await uploadResp.text();
+            bridgeLog('PUT opt#' + hIdx + ' FAIL body: ' + errBody.substring(0, 200));
+          }
+        } catch(e) {
+          bridgeLog('PUT opt#' + hIdx + ' EXCEPTION: ' + e.message);
         }
-      } catch(e) {
-        console.error('[Bridge] Error uploading file bytes to uploadUrl:', e);
+      }
+      if (!uploadSuccess) {
+        bridgeLog('ALL PUT strategies failed for file_id=' + fileId);
         return null;
       }
     }
