@@ -476,14 +476,16 @@
     var uploadUrl = initData.upload_url;
 
     if (uploadUrl) {
-      var uploadResp = await originalFetch(uploadUrl, {
+      var uploadHeaders = { 'Content-Type': mime };
+      if (uploadUrl.includes('blob.core.windows.net') || uploadUrl.includes('azure')) {
+        uploadHeaders['x-ms-blob-type'] = 'BlockBlob';
+      }
+      var uploadResp = await window.fetch(uploadUrl, {
         method: 'PUT',
-        headers: {
-          'x-ms-blob-type': 'BlockBlob',
-          'Content-Type': mime
-        },
+        headers: uploadHeaders,
         body: blob
       });
+      console.log('[Bridge] uploadUrl PUT status:', uploadResp.status);
       if (!uploadResp.ok) {
         console.error('[Bridge] Failed to upload file bytes:', await uploadResp.text());
         return null;
@@ -493,8 +495,9 @@
     var completeResp = await originalFetch('/backend-api/files/' + fileId + '/uploaded', {
       method: 'POST',
       headers: Object.assign({}, baseHeaders(), { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({})
+      body: JSON.stringify({ file_id: fileId })
     });
+    console.log('[Bridge] /backend-api/files/uploaded status:', completeResp.status);
     if (!completeResp.ok) {
       console.error('[Bridge] Failed to mark file uploaded:', await completeResp.text());
       return null;
