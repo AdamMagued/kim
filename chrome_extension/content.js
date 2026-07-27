@@ -69,6 +69,7 @@
     ws.onopen = function() {
       console.log('[Bridge Content] Connected to proxy');
       clearTimeout(reconnectTimer);
+      injectScript();
       ws.send(JSON.stringify({ type: 'extension_connected', ready: bridgeReady }));
       flushBuffer();
     };
