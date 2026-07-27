@@ -1851,6 +1851,8 @@ def _chatgpt_terminal_system_prompt() -> str:
         "1. ONE short narration line — what you're about to do and why, in plain natural language.\n"
         "2. EXACTLY ONE shell command, inside a single ```bash code block. Nothing after the block — no second command, no extra prose.\n\n"
         "Rules:\n"
+        "- ALWAYS take the FASTEST, SHORTEST, most direct route. Prefer direct HTTP/API requests (curl, fetch, POST endpoints) over heavy browser UI automation unless visual interaction is explicitly requested.\n"
+        "- Run one-off scripts directly in the foreground so errors (stdout/stderr) are visible immediately — do NOT hide script runs behind `nohup ... &`.\n"
         "- ALWAYS enclose your shell command in a ```bash code block. NEVER write out commands as plain text or tell the user to run commands/open URLs manually.\n"
         "- One command per reply, then STOP and wait for output.\n"
         "- HTTP 302 redirects on protected routes are NORMAL expected behavior for unauthenticated users. Do NOT treat 302 redirects as server errors or restart servers because of them.\n"
