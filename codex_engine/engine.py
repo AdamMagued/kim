@@ -2008,6 +2008,20 @@ def _provider_response_to_responses_api(
                 return _make_responses_tool_reply(resp_id, prose, salvaged, request_tools)
             return _make_responses_text_reply(resp_id, text or content)
 
+        # Hybrid Patch Engine integration: if response contains a unified git patch/diff block,
+        # apply it to the local workspace cleanly.
+        if "```diff" in str(content) or "```patch" in str(content) or "diff --git" in str(content):
+            try:
+                from codex_engine.patch_engine import apply_git_patch
+                patch_res = apply_git_patch(os.getcwd(), str(content))
+                if patch_res.get("success"):
+                    logger.info("Hybrid Engine: Successfully applied git patch via %s", patch_res.get("method"))
+                    content = f"{content}\n\n[HYBRID ENGINE: Applied git diff patch cleanly to workspace via {patch_res.get('method')}]"
+                else:
+                    logger.warning("Hybrid Engine: Could not apply git patch: %s", patch_res.get("error"))
+            except Exception as e:
+                logger.error("Hybrid Engine patch exception: %s", e)
+
         # Prose reply — a DONE signal ends the turn; otherwise execute any
         # actions the model described: ```bash/json fences, or a "save this
         # code as X" directive with the file body in a fence. Protocol-
