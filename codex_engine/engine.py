@@ -2201,7 +2201,6 @@ def _make_responses_tool_reply(
     if text:
         output_items.append({
             "type": "reasoning",
-            "reasoning_text": text,
             "summary": _build_summary_items(text),
         })
         output_items.append({
