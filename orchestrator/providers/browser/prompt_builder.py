@@ -409,7 +409,15 @@ def format_prompt(
         else:
             _os_hint = f"You are running on Windows. Home is {_home}. Use 'start' to launch apps and Windows paths."
 
-        if is_codex_bridge:
+        gizmo_id = os.getenv("KIM_GIZMO_ID") or None
+
+        if gizmo_id:
+            prompt = (
+                f"{history_block}"
+                f"{last_text}\n\n"
+                + transport_marker_instruction(completion_hash)
+            )
+        elif is_codex_bridge:
             prompt = (
                 # Handoff goes FIRST so a fresh chat anchors on the prior
                 # conversation rather than the large [SYSTEM] block below it.
