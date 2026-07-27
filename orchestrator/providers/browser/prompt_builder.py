@@ -273,8 +273,30 @@ def format_prompt(
                     else:
                         text_parts.append("[Attachment attached]")
             last_text = "\n".join(text_parts)
-        else:
             last_text = strip_data_uris(str(content), attachments)
+
+    # Convert Codex Desktop <image path="..."> XML tags into real base64 attachments
+    def _parse_image_xml_tag(match):
+        img_path = match.group(1).strip()
+        if os.path.isfile(img_path):
+            try:
+                import base64
+                with open(img_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("utf-8")
+                mime = "image/png"
+                if img_path.endswith((".jpg", ".jpeg")):
+                    mime = "image/jpeg"
+                elif img_path.endswith(".webp"):
+                    mime = "image/webp"
+                append_attachment(attachments, mime, b64, name=os.path.basename(img_path))
+                return f"[Image attached: {os.path.basename(img_path)}]"
+            except Exception:
+                pass
+        return ""
+
+    last_text = re.sub(r'<image\s+name=[^>]*\bpath="([^"]+)"[^>]*>', _parse_image_xml_tag, last_text)
+    last_text = re.sub(r'<image\s+path="([^"]+)"[^>]*>', _parse_image_xml_tag, last_text)
+    last_text = re.sub(r'</image>', '', last_text)
 
     last_text = last_text.strip()
 
