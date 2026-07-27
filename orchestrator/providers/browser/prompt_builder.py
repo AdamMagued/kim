@@ -67,6 +67,28 @@ def ext_for_mime(mime_type: str) -> str:
     return "bin"
 
 
+def _compress_image_b64(img_path: str, max_dim: int = 1000, quality: int = 75) -> tuple[str, str]:
+    try:
+        from PIL import Image
+        import io, base64
+        with Image.open(img_path) as img:
+            img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality)
+            return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg"
+    except Exception:
+        import base64
+        with open(img_path, "rb") as f:
+            mime = "image/png"
+            if img_path.lower().endswith((".jpg", ".jpeg")):
+                mime = "image/jpeg"
+            elif img_path.lower().endswith(".webp"):
+                mime = "image/webp"
+            return base64.b64encode(f.read()).decode("utf-8"), mime
+
+
 def append_attachment(
     attachments_out: list[dict],
     mime_type: str,
@@ -275,27 +297,6 @@ def format_prompt(
             last_text = "\n".join(text_parts)
         else:
             last_text = strip_data_uris(str(content), attachments)
-
-def _compress_image_b64(img_path: str, max_dim: int = 1000, quality: int = 75) -> tuple[str, str]:
-    try:
-        from PIL import Image
-        import io, base64
-        with Image.open(img_path) as img:
-            img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=quality)
-            return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg"
-    except Exception:
-        import base64
-        with open(img_path, "rb") as f:
-            mime = "image/png"
-            if img_path.lower().endswith((".jpg", ".jpeg")):
-                mime = "image/jpeg"
-            elif img_path.lower().endswith(".webp"):
-                mime = "image/webp"
-            return base64.b64encode(f.read()).decode("utf-8"), mime
 
 
     # Convert Codex Desktop <image path="..."> XML tags and ## file.png headers into real base64 attachments

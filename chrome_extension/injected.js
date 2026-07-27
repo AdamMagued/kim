@@ -292,9 +292,14 @@
   }
 
   async function ensureAuth() {
+    if (!authToken && window.__NEXT_DATA__ && window.__NEXT_DATA__.props && window.__NEXT_DATA__.props.pageProps) {
+      var pp = window.__NEXT_DATA__.props.pageProps;
+      if (pp.accessToken) authToken = pp.accessToken;
+      else if (pp.session && pp.session.accessToken) authToken = pp.session.accessToken;
+    }
     if (authToken) return;
     try {
-      var resp = await originalFetch('/api/auth/session');
+      var resp = await originalFetch('/api/auth/session', { credentials: 'same-origin' });
       if (resp.ok) {
         var data = await resp.json();
         if (data.accessToken) {
@@ -440,6 +445,7 @@
   }
 
   async function uploadAttachment(att) {
+    await ensureAuth();
     var b64 = att.data_base64 || att.data || '';
     var mime = att.mime_type || att.media_type || 'image/png';
     var name = att.name || 'image.png';

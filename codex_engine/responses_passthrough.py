@@ -255,7 +255,7 @@ async def handle_responses_passthrough(proxy: "_CodexProxy", body: dict, input_i
             messages=messages, tools=tools, system=system_prompt or "",
         )
     except Exception as e:
-        logger.error(f"[relay #{relay_num}] Provider call failed: {e}")
+        logger.error(f"[relay #{relay_num}] Provider call failed: {e}", exc_info=True)
         return web.json_response({"error": {"message": f"LLM call failed: {e}"}}, status=502)
 
     resp_id = f"resp_{uuid.uuid4().hex[:16]}"

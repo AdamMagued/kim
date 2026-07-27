@@ -251,9 +251,9 @@ class BrowserProvider(BaseProvider):
         # http:///v1/send with an empty base URL, so every completion came
         # back as "NEED_HELP: Bridge /v1/send failed" instead of running.
         self._use_webview_bridge = bool(self._bridge_url and self._bridge_token) or (
-            os.environ.get("KIM_EXTENSION_BRIDGE", "").strip().lower()
+            os.environ.get("KIM_EXTENSION_BRIDGE", "1").strip().lower()
             in ("1", "true", "yes", "on")
-        )
+        ) or bool(bp_cfg.get("in_app_bridge", True))
         self._gemini_authuser = self._parse_authuser_env(os.environ.get("KIM_GEMINI_AUTHUSER", ""))
         if self._gemini_authuser is None:
             self._gemini_authuser = self._load_active_gemini_authuser_from_account()
@@ -597,7 +597,7 @@ class BrowserProvider(BaseProvider):
             capability_repair_attempted = False
             effort_for_this_send = self._effort if not sent_sys else None  # FIX 1: first send only (mirrors CDP gate).
             on_delta_cb = kwargs.get("on_delta")
-            result, _ = await complete_via_webview_bridge(
+            result = await complete_via_webview_bridge(
                 bridge_url=self._bridge_url,
                 bridge_token=self._bridge_token,
                 preferred_site=self._preferred_site,
@@ -634,7 +634,7 @@ class BrowserProvider(BaseProvider):
                     "ChatGPT falsely denied Kim tool access — retrying once (first=%s)",
                     first_tool,
                 )
-                result, _ = await complete_via_webview_bridge(
+                result = await complete_via_webview_bridge(
                     bridge_url=self._bridge_url,
                     bridge_token=self._bridge_token,
                     preferred_site=self._preferred_site,

@@ -107,7 +107,10 @@ async def _try_extension_bridge(
         from orchestrator.providers.browser.extension_bridge import get_extension_bridge
         bridge = await get_extension_bridge()
         if not await bridge.wait_for_connection(timeout=15.0):
-            return {}, False
+            return {
+                "type": "text",
+                "content": "NEED_HELP: Chrome Extension bridge is not connected. Open chatgpt.com in Chrome."
+            }, True
         attempted = True
 
         if attachments:
