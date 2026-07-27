@@ -467,7 +467,7 @@ def format_prompt(
                 '1. A JSON tool call on a single line: '
                 '{"tool": "<name>", "args": {<args>}}\n'
                 "2. TASK_COMPLETE: <one-line summary>\n"
-                "3. NEED_HELP: <reason you cannot proceed>\n"
+                "IMPORTANT: To inspect files, search the codebase, edit code, or run shell commands, ALWAYS emit a JSON tool call (e.g. exec_command, write_file). NEVER output NEED_HELP to ask the user to run shell commands for you. Emit the tool call directly.\n"
                 "Do NOT include markdown formatting around the JSON.\n"
                 "CRITICAL: If your JSON arguments contain double quotes (e.g., "
                 "HTML attributes or code), you MUST escape them (\\\") so the "

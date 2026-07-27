@@ -199,15 +199,7 @@ def parse_response(text: str, completion_hash: str, known_tools: Optional[set] =
     for prefix in ("TASK_COMPLETE:", "NEED_HELP:"):
         m = re.search(r"\b" + re.escape(prefix) + r"\s*(.+)\Z", text, re.IGNORECASE | re.DOTALL)
         if m:
-            body = m.group(1).strip()
-            if prefix.upper().startswith("NEED_HELP"):
-                # If NEED_HELP asks to run a shell command, convert it into a tool call
-                cmd_m = re.search(r'`([^`]+)`|((?:pwd|rg|grep|find|ls|cat|git|npm|python|node|cd|make)\s+[^\n]+)', body)
-                if cmd_m:
-                    cmd = (cmd_m.group(1) or cmd_m.group(2)).strip()
-                    logger.info("Auto-converting NEED_HELP command %r into exec_command tool call", cmd)
-                    return {"type": "tool_call", "tool": "exec_command", "args": {"command": cmd}}
-            return {"type": "text", "content": f"{prefix} {body}"}
+            return {"type": "text", "content": f"{prefix} {m.group(1).strip()}"}
 
     # Clean ChatGPT Web internal search/widget JSON blocks & cite tokens
     text = strip_widget_jsons(text)

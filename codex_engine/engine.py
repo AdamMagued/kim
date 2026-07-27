@@ -517,8 +517,8 @@ class _CodexProxy:
                 prompt += (
                     "\n\nINSTRUCTION: DO NOT USE YOUR BUILT-IN PYTHON CODE INTERPRETER OR CLOUD CONTAINER. "
                     "Your internal cloud sandbox has no access to local paths (/Users/...). "
-                    "For coding/system tasks, provide actions as raw JSON tool calls (e.g. write_file, exec_command) or bash code blocks. "
-                    "For general questions or answers, reply with your direct final answer."
+                    "To inspect files, search the codebase, edit code, or run shell commands, ALWAYS emit a JSON tool call (e.g. exec_command, write_file, apply_patch). "
+                    "Do NOT ask the user to run commands for you or output text starting with NEED_HELP when a tool can perform the action. Emit the JSON tool call directly."
                 )
             self._last_sent_count = len(input_items) if isinstance(input_items, list) else 0
         else:
