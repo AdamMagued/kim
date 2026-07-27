@@ -9,7 +9,7 @@
 
   function injectScript() {
     var s = document.createElement('script');
-    s.src = chrome.runtime.getURL('injected.js');
+    s.src = chrome.runtime.getURL('injected.js') + '?v=' + Date.now();
     s.onload = function() { s.remove(); };
     (document.head || document.documentElement).appendChild(s);
   }
