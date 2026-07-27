@@ -2010,17 +2010,22 @@ def _provider_response_to_responses_api(
 
 
 def _make_responses_text_reply(resp_id: str, text: str) -> dict:
+    output_items = []
+    if text:
+        output_items.append({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": text}],
+        })
+        output_items.append({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        })
     return {
         "id": resp_id,
         "object": "response",
         "status": "completed",
-        "output": [
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text}],
-            }
-        ],
+        "output": output_items,
         "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     }
 
