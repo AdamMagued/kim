@@ -407,6 +407,18 @@
     return h;
   }
 
+  function bridgeLog(msg) {
+    console.log('[Bridge]', msg);
+    try {
+      window.postMessage({
+        type: 'CHATGPT_BRIDGE_RESPONSE',
+        requestId: '__log__',
+        event: 'log',
+        delta: '[EXT] ' + msg,
+      }, '*');
+    } catch(e) {}
+  }
+
   async function getChatRequirements() {
     var pToken = generateRequirementsToken();
     var resp = await originalFetch('/backend-api/sentinel/chat-requirements', {
@@ -450,13 +462,13 @@
     var mime = att.mime_type || att.media_type || 'image/png';
     var name = att.name || 'image.png';
     if (!b64) {
-      console.log('[Bridge] uploadAttachment: no base64 data found');
+      bridgeLog('uploadAttachment: no base64 data found, keys: ' + Object.keys(att).join(','));
       return null;
     }
 
     var blob = b64ToBlob(b64, mime);
     var size = blob.size;
-    console.log('[Bridge] uploadAttachment: Blob created, size:', size, 'mime:', mime);
+    bridgeLog('uploadAttachment: Blob created, size=' + size + ' mime=' + mime);
 
     var headers = baseHeaders();
     headers['Content-Type'] = 'application/json';
@@ -475,13 +487,13 @@
             use_case: useCases[u]
           })
         });
-        console.log('[Bridge] /backend-api/files init status (use_case=' + useCases[u] + '):', initResp.status);
+        bridgeLog('/backend-api/files init status (use_case=' + useCases[u] + '): ' + initResp.status);
         if (initResp.ok) {
           initData = await initResp.json();
           break;
         } else {
           var errTxt = await initResp.text();
-          console.error('[Bridge] Failed to init file upload with use_case=' + useCases[u] + ':', errTxt);
+          bridgeLog('FAIL init file upload use_case=' + useCases[u] + ': ' + errTxt.substring(0, 200));
         }
       } catch(e) {
         console.error('[Bridge] Error calling /backend-api/files:', e);
@@ -489,11 +501,11 @@
     }
 
     if (!initData || !initData.file_id) {
-      console.error('[Bridge] Failed to obtain file_id from /backend-api/files');
+      bridgeLog('FAIL: no file_id from /backend-api/files after all use_cases');
       return null;
     }
 
-    console.log('[Bridge] /backend-api/files init data:', initData);
+    bridgeLog('/backend-api/files OK: file_id=' + (initData.file_id || 'NONE') + ' upload_url=' + (initData.upload_url ? 'YES' : 'NONE'));
     var fileId = initData.file_id;
     var uploadUrl = initData.upload_url;
 
@@ -508,7 +520,7 @@
           headers: uploadHeaders,
           body: blob
         });
-        console.log('[Bridge] uploadUrl PUT status:', uploadResp.status);
+        bridgeLog('uploadUrl PUT status: ' + uploadResp.status);
         if (!uploadResp.ok) {
           console.error('[Bridge] Failed to upload file bytes:', await uploadResp.text());
           return null;
@@ -525,7 +537,7 @@
         headers: Object.assign({}, baseHeaders(), { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ file_id: fileId })
       });
-      console.log('[Bridge] /backend-api/files/uploaded status:', completeResp.status);
+      bridgeLog('/backend-api/files/uploaded status: ' + completeResp.status);
     } catch(e) {
       console.warn('[Bridge] Warning on file uploaded completion:', e);
     }
@@ -540,19 +552,20 @@
 
     var uploadedFiles = [];
     if (Array.isArray(attachments) && attachments.length > 0) {
-      console.log('[Bridge] Starting upload of', attachments.length, 'attachment(s). Keys:', Object.keys(attachments[0] || {}));
+      bridgeLog('Starting upload of ' + attachments.length + ' attachment(s). Keys: ' + Object.keys(attachments[0] || {}).join(','));
+      bridgeLog('authToken present: ' + !!authToken + ', b64 length: ' + (attachments[0].data_base64 || attachments[0].data || '').length);
       for (var a = 0; a < attachments.length; a++) {
         try {
           var uRes = await uploadAttachment(attachments[a]);
-          console.log('[Bridge] uploadAttachment result for #' + a + ':', uRes);
+          bridgeLog('uploadAttachment result #' + a + ': ' + JSON.stringify(uRes));
           if (uRes) uploadedFiles.push(uRes);
         } catch(err) {
-          console.error('[Bridge] Error uploading attachment #' + a + ':', err);
+          bridgeLog('ERROR uploading #' + a + ': ' + err.message);
         }
       }
-      console.log('[Bridge] Upload complete. uploadedFiles count:', uploadedFiles.length);
+      bridgeLog('Upload done. uploadedFiles: ' + uploadedFiles.length);
     } else {
-      console.log('[Bridge] No attachments array or empty. attachments:', typeof attachments, Array.isArray(attachments) ? attachments.length : 'N/A');
+      bridgeLog('No attachments or empty. type=' + typeof attachments + ' isArray=' + Array.isArray(attachments));
     }
 
     var chatgptMessages = messages.map(function(m, idx) {
