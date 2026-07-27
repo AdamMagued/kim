@@ -579,7 +579,8 @@
             }
           });
         }
-        parts.push(text);
+        var cleanText = text.replace(/\[Image attached:[^\]]+\]/g, '').trim();
+        parts.push(cleanText || text);
         var msgObj = {
           id: crypto.randomUUID(),
           author: { role: m.role || 'user' },
@@ -633,6 +634,19 @@
         screen_width: window.screen.width,
       },
     };
+
+    if (uploadedFiles.length > 0) {
+      body.attachments = uploadedFiles.map(function(f) {
+        return {
+          id: f.file_id,
+          name: f.file_name,
+          size: f.file_size,
+          mime_type: f.mime_type,
+          width: 1000,
+          height: 1000
+        };
+      });
+    }
 
     if (conversationId) {
       body.conversation_id = conversationId;

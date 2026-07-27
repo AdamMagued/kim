@@ -290,7 +290,7 @@ def format_prompt(
                 elif img_path.endswith(".webp"):
                     mime = "image/webp"
                 append_attachment(attachments, mime, b64, name=os.path.basename(img_path))
-                return f"[Image attached: {os.path.basename(img_path)}]"
+                return f"![{os.path.basename(img_path)}](data:{mime};base64,{b64})"
             except Exception:
                 pass
         return ""
