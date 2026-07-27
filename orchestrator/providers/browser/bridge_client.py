@@ -119,8 +119,23 @@ async def _try_extension_bridge(
                 "sent — the Chrome Extension bridge relays text only.]"
             )
 
+        accumulated_delta: list[str] = []
+        last_printed_prose: list[str] = [""]
+
+        def _on_extension_delta(delta: str):
+            if not delta:
+                return
+            accumulated_delta.append(delta)
+            full_so_far = "".join(accumulated_delta)
+            prose = full_so_far.split("```", 1)[0].strip()
+            if prose:
+                clean_prose = " ".join(prose.split())[:200]
+                if clean_prose and clean_prose != last_printed_prose[0]:
+                    last_printed_prose[0] = clean_prose
+                    print(f"[STATUS] {clean_prose}", flush=True)
+
         logger.info("[Kim Bridge] Dispatching prompt to Chrome Extension over WebSocket...")
-        res = await bridge.send_completion(prompt, clear_chat=clear_chat)
+        res = await bridge.send_completion(prompt, on_delta=_on_extension_delta, clear_chat=clear_chat)
     except Exception as exc:
         logger.warning(f"[Kim Bridge] Extension bridge send failed: {exc or exc.__class__.__name__}")
         return None, attempted
