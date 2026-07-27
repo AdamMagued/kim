@@ -1,5 +1,7 @@
 (function() {
   'use strict';
+  if (window.__CHATGPT_BRIDGE_LOADED__) return;
+  window.__CHATGPT_BRIDGE_LOADED__ = true;
 
   // ═══════════════════════════════════════════════════════════════
   // SHA3-512 (js-sha3 by Chen Yi-Cyuan, MIT license, inlined)
