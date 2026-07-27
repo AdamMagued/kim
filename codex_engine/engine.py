@@ -2026,7 +2026,44 @@ def _provider_response_to_responses_api(
     return _make_responses_text_reply(resp_id, str(content))
 
 
+def _normalize_response_image_links(text: str) -> str:
+    """Download remote/private image URLs into local files and format as markdown images."""
+    if not isinstance(text, str) or not text:
+        return text
+
+    img_dir = "/tmp/kim_images"
+    os.makedirs(img_dir, exist_ok=True)
+
+    # 1. Download private OpenAI file URLs or HTTP image links to local disk
+    def _download_img(match):
+        url = match.group(0)
+        try:
+            import urllib.request
+            fname = f"img_{uuid.uuid4().hex[:8]}.png"
+            local_path = os.path.join(img_dir, fname)
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp, open(local_path, "wb") as f:
+                f.write(resp.read())
+            return f"![image](file://{local_path})"
+        except Exception:
+            return url
+
+    text = re.sub(r'https?://files\.oaiusercontent\.com/[^\s"\'\)]+', _download_img, text)
+
+    # 2. Format standalone local image paths into markdown image tags if not already tagged
+    def _format_local_img(match):
+        prefix = match.group(1) or ""
+        path = match.group(2)
+        if prefix.startswith("![") or prefix.startswith("](") or prefix.startswith("src="):
+            return match.group(0)
+        return f"{prefix}![image](file://{path})"
+
+    text = re.sub(r'([^!\(\"]|^)(/(?:tmp|var|Users)/[^\s"\'\)]+\.(?:png|jpg|jpeg|webp|gif))', _format_local_img, text)
+    return text
+
+
 def _make_responses_text_reply(resp_id: str, text: str) -> dict:
+    text = _normalize_response_image_links(text)
     output_items = []
     if text:
         output_items.append({
