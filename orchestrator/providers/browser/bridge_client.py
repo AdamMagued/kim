@@ -7,6 +7,7 @@ using the split send/result API with legacy fallback.
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 import httpx
