@@ -8,17 +8,10 @@
   var messageBuffer = [];
 
   function injectScript() {
-    fetch(chrome.runtime.getURL('injected.js') + '?v=' + Date.now(), { cache: 'no-store' })
-      .then(function(r) { return r.text(); })
-      .then(function(code) {
-        var s = document.createElement('script');
-        s.textContent = code;
-        (document.head || document.documentElement).appendChild(s);
-        s.remove();
-      })
-      .catch(function(e) {
-        console.error('[Bridge Content] Error injecting script:', e);
-      });
+    var s = document.createElement('script');
+    s.src = chrome.runtime.getURL('injected.js');
+    s.onload = function() { s.remove(); };
+    (document.head || document.documentElement).appendChild(s);
   }
 
   // While the proxy is down every outgoing frame was queued forever. A long
