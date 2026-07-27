@@ -107,7 +107,7 @@ async def _try_extension_bridge(
         from orchestrator.providers.browser.extension_bridge import get_extension_bridge
         bridge = await get_extension_bridge()
         if not await bridge.wait_for_connection(timeout=15.0):
-            return None, False
+            return {}, False
         attempted = True
 
         if attachments:

@@ -597,7 +597,7 @@ class BrowserProvider(BaseProvider):
             capability_repair_attempted = False
             effort_for_this_send = self._effort if not sent_sys else None  # FIX 1: first send only (mirrors CDP gate).
             on_delta_cb = kwargs.get("on_delta")
-            result = await complete_via_webview_bridge(
+            result, _ = await complete_via_webview_bridge(
                 bridge_url=self._bridge_url,
                 bridge_token=self._bridge_token,
                 preferred_site=self._preferred_site,
@@ -634,7 +634,7 @@ class BrowserProvider(BaseProvider):
                     "ChatGPT falsely denied Kim tool access — retrying once (first=%s)",
                     first_tool,
                 )
-                result = await complete_via_webview_bridge(
+                result, _ = await complete_via_webview_bridge(
                     bridge_url=self._bridge_url,
                     bridge_token=self._bridge_token,
                     preferred_site=self._preferred_site,
