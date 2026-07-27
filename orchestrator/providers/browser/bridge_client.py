@@ -159,7 +159,7 @@ async def _try_extension_bridge(
                     logger.warning(f"[Kim Bridge] External on_delta callback raised: {exc}")
 
         logger.info("[Kim Bridge] Dispatching prompt to Chrome Extension over WebSocket...")
-        res = await bridge.send_completion(prompt, on_delta=_on_extension_delta, clear_chat=clear_chat)
+        res = await bridge.send_completion(prompt, on_delta=_on_extension_delta, clear_chat=clear_chat, attachments=attachments)
     except Exception as exc:
         logger.warning(f"[Kim Bridge] Extension bridge send failed: {exc or exc.__class__.__name__}")
         return None, attempted

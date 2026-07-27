@@ -235,6 +235,7 @@ class ExtensionBridgeServer:
         parent_message_id: Optional[str] = None,
         timeout: float = 180.0,
         clear_chat: bool = False,
+        attachments: Optional[list[dict]] = None,
     ) -> dict[str, Any]:
         async with self._send_lock:
             return await self._send_completion_locked(
@@ -244,6 +245,7 @@ class ExtensionBridgeServer:
                 parent_message_id=parent_message_id,
                 timeout=timeout,
                 clear_chat=clear_chat,
+                attachments=attachments,
             )
 
     async def _send_completion_locked(
@@ -255,6 +257,7 @@ class ExtensionBridgeServer:
         parent_message_id: Optional[str],
         timeout: float,
         clear_chat: bool,
+        attachments: Optional[list[dict]] = None,
     ) -> dict[str, Any]:
         if not self.active_ws or self.active_ws.closed:
             connected = await self.wait_for_connection(timeout=10.0)
@@ -288,6 +291,8 @@ class ExtensionBridgeServer:
             "messages": [{"role": "user", "content": prompt}],
             "model": "auto",
         }
+        if attachments:
+            payload["attachments"] = attachments
         if conversation_id:
             payload["conversationId"] = conversation_id
         if parent_message_id:
