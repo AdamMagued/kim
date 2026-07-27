@@ -1659,11 +1659,15 @@ _SAFE_BARE_CMD_RE = re.compile(
 )
 
 
+_NO_OP_SHELL_CMDS = {":", "true", "echo \"\"", "echo ''", "echo", "exit 0", "sleep 0"}
+
+
 def _extract_shell_blocks(content: object) -> list:
     """Return the contents of ```bash/sh/shell/zsh fences (not html/js/etc.)."""
     if not isinstance(content, str):
         return []
-    blocks = [block.strip() for block in _SHELL_FENCE_RE.findall(content) if block.strip()]
+    raw_blocks = [block.strip() for block in _SHELL_FENCE_RE.findall(content) if block.strip()]
+    blocks = [b for b in raw_blocks if b not in _NO_OP_SHELL_CMDS]
     if blocks:
         return blocks
     # No clean fence — try the dangling-fragment fallback.
@@ -2070,14 +2074,28 @@ def _build_summary_items(text: str) -> list[dict]:
     return [{"type": "summary_text", "text": line} for line in lines]
 
 
+def _extract_brief_status_summary(text: str) -> str:
+    if not text or not text.strip():
+        return ""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return ""
+    first_line = lines[0]
+    if any(kw in first_line.lower() for kw in ("confirm", "plan", "approved", "agree", "will not launch", "waiting")):
+        return "Plan confirmed — waiting for approval"
+    if len(first_line) > 80:
+        return first_line[:77] + "..."
+    return first_line
+
+
 def _make_responses_text_reply(resp_id: str, text: str) -> dict:
     text = _normalize_response_image_links(text)
     output_items = []
-    if text:
+    summary_text = _extract_brief_status_summary(text)
+    if summary_text:
         output_items.append({
             "type": "reasoning",
-            "reasoning_text": text,
-            "summary": _build_summary_items(text),
+            "summary": [{"type": "summary_text", "text": summary_text}],
         })
     output_items.append({
         "type": "message",

@@ -215,10 +215,18 @@ async def stream_responses_http(
     full_reasoning = "\n".join(proxy._accumulated_thinking_lines) if proxy._accumulated_thinking_lines else (curr_reasoning or "Thinking...")
     summary_items = _build_summary_items(full_reasoning)
 
-    # Ensure responses_reply reasoning items reflect the full accumulated multi-line reasoning
+    has_message_item = any(
+        isinstance(it, dict) and it.get("type") == "message"
+        for it in (responses_reply.get("output") or [])
+    )
+
+    # Ensure responses_reply reasoning items reflect accumulated thinking without duplicating message text
     for item in responses_reply.get("output") or []:
         if isinstance(item, dict) and item.get("type") == "reasoning":
-            item["reasoning_text"] = full_reasoning
+            if not has_message_item:
+                item["reasoning_text"] = full_reasoning
+            else:
+                item.pop("reasoning_text", None)
             item["summary"] = summary_items
 
     ev_reasoning_done = {
@@ -226,20 +234,23 @@ async def stream_responses_http(
         "item_id": reasoning_id,
         "output_index": 0,
         "content_index": 0,
-        "text": full_reasoning,
+        "text": full_reasoning if not has_message_item else "",
     }
     await stream_res.write(f"data: {json.dumps(ev_reasoning_done)}\n\n".encode("utf-8"))
+
+    item_dict = {
+        "id": reasoning_id,
+        "type": "reasoning",
+        "summary": summary_items,
+        "status": "completed",
+    }
+    if not has_message_item:
+        item_dict["reasoning_text"] = full_reasoning
 
     reasoning_item_completed = {
         "type": "response.output_item.done",
         "output_index": 0,
-        "item": {
-            "id": reasoning_id,
-            "type": "reasoning",
-            "reasoning_text": full_reasoning,
-            "summary": summary_items,
-            "status": "completed",
-        },
+        "item": item_dict,
     }
     await stream_res.write(f"data: {json.dumps(reasoning_item_completed)}\n\n".encode("utf-8"))
 
