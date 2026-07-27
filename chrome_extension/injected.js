@@ -432,7 +432,7 @@
     return resp.json();
   }
 
-    async function sendConversation(messages, model, requestId, conversationId, parentMessageId, attachments) {
+    async function sendConversation(messages, model, requestId, conversationId, parentMessageId, attachments, gizmoId) {
     await ensureAuth();
     if (!authToken) throw new Error('No auth token available. Make sure you are logged into ChatGPT.');
 
@@ -666,7 +666,9 @@
       model: targetModel,
       timezone_offset_min: new Date().getTimezoneOffset(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      conversation_mode: { kind: 'primary_assistant' },
+      conversation_mode: gizmoId
+        ? { kind: 'gizmo_interaction', gizmo_id: gizmoId }
+        : { kind: 'primary_assistant' },
       history_and_training_disabled: false,
       supports_buffering: true,
       supported_encodings: ['v1'],
@@ -681,6 +683,11 @@
         screen_width: window.screen.width,
       },
     };
+
+    if (gizmoId) {
+      body.gizmo_id = gizmoId;
+      bridgeLog('Custom GPT Gizmo mode active: gizmo_id=' + gizmoId);
+    }
 
     if (uploadedFiles.length > 0) {
       body.attachments = uploadedFiles.map(function(f) {
