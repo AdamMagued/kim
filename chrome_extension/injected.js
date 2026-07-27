@@ -429,8 +429,121 @@
       console.log('[Bridge] PoW solved in ' + elapsed + 'ms');
     }
 
+  function b64ToBlob(b64, mime) {
+    var byteChars = atob(b64);
+    var byteNumbers = new Array(byteChars.length);
+    for (var i = 0; i < byteChars.length; i++) {
+      byteNumbers[i] = byteChars.charCodeAt(i);
+    }
+    var byteArray = new Uint8Array(byteNumbers);
+    return new Blob([byteArray], { type: mime });
+  }
+
+  async function uploadAttachment(att) {
+    var b64 = att.data_base64 || att.data || '';
+    var mime = att.mime_type || att.media_type || 'image/png';
+    var name = att.name || 'image.png';
+    if (!b64) return null;
+
+    var blob = b64ToBlob(b64, mime);
+    var size = blob.size;
+
+    var headers = baseHeaders();
+    headers['Content-Type'] = 'application/json';
+
+    var initResp = await originalFetch('/backend-api/files', {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({
+        file_name: name,
+        file_size: size,
+        use_case: 'multimodal'
+      })
+    });
+    if (!initResp.ok) {
+      console.error('[Bridge] Failed to init file upload:', await initResp.text());
+      return null;
+    }
+    var initData = await initResp.json();
+    var fileId = initData.file_id;
+    var uploadUrl = initData.upload_url;
+
+    if (uploadUrl) {
+      var uploadResp = await originalFetch(uploadUrl, {
+        method: 'PUT',
+        headers: {
+          'x-ms-blob-type': 'BlockBlob',
+          'Content-Type': mime
+        },
+        body: blob
+      });
+      if (!uploadResp.ok) {
+        console.error('[Bridge] Failed to upload file bytes:', await uploadResp.text());
+        return null;
+      }
+    }
+
+    var completeResp = await originalFetch('/backend-api/files/' + fileId + '/uploaded', {
+      method: 'POST',
+      headers: Object.assign({}, baseHeaders(), { 'Content-Type': 'application/json' }),
+      body: JSON.stringify({})
+    });
+    if (!completeResp.ok) {
+      console.error('[Bridge] Failed to mark file uploaded:', await completeResp.text());
+      return null;
+    }
+
+    return {
+      file_id: fileId,
+      file_name: name,
+      file_size: size,
+      mime_type: mime
+    };
+  }
+
+    var uploadedFiles = [];
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      for (var a = 0; a < attachments.length; a++) {
+        try {
+          var uRes = await uploadAttachment(attachments[a]);
+          if (uRes) uploadedFiles.push(uRes);
+        } catch(err) {
+          console.error('[Bridge] Error uploading attachment:', err);
+        }
+      }
+    }
+
     var chatgptMessages = messages.map(function(m, idx) {
       var text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+      if (idx === messages.length - 1 && uploadedFiles.length > 0) {
+        var parts = [];
+        var metadataAttachments = [];
+        uploadedFiles.forEach(function(f) {
+          parts.push({
+            asset_pointer: 'file-service://' + f.file_id,
+            content_type: 'image_asset_pointer',
+            size_bytes: f.file_size,
+            width: 1000,
+            height: 1000
+          });
+          metadataAttachments.push({
+            id: f.file_id,
+            size: f.file_size,
+            name: f.file_name,
+            mime_type: f.mime_type,
+            width: 1000,
+            height: 1000
+          });
+        });
+        parts.push(text);
+        return {
+          id: crypto.randomUUID(),
+          author: { role: m.role || 'user' },
+          create_time: Date.now() / 1000,
+          content: { content_type: 'multimodal_text', parts: parts },
+          metadata: { attachments: metadataAttachments }
+        };
+      }
       if (idx === messages.length - 1 && Array.isArray(attachments) && attachments.length > 0) {
         attachments.forEach(function(att) {
           var b64 = att.data_base64 || att.data || '';
