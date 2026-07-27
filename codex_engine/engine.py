@@ -2062,6 +2062,7 @@ def _normalize_response_image_links(text: str) -> str:
         return f"{prefix}![image](file://{path})"
 
     text = re.sub(r'([^!\(\"]|^)(/(?:tmp|var|Users)/[^\s"\'\)]+\.(?:png|jpg|jpeg|webp|gif))', _format_local_img, text)
+    text = re.sub(r"```(?:bash|sh|shell|zsh)?\s*\n\s*(?::|true|echo \"\"|echo '\'''\''|echo|exit 0|sleep 0)\s*\n\s*```", "", text, flags=re.IGNORECASE).strip()
     return text
 
 
