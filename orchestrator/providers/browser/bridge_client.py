@@ -153,7 +153,10 @@ async def _try_extension_bridge(
         res = await bridge.send_completion(prompt, on_delta=_on_extension_delta, clear_chat=clear_chat, attachments=attachments)
     except Exception as exc:
         logger.warning(f"[Kim Bridge] Extension bridge send failed: {exc or exc.__class__.__name__}")
-        return None, attempted
+        return {
+            "type": "text",
+            "content": f"NEED_HELP: Extension bridge error ({exc}). Check chatgpt.com in Chrome."
+        }, attempted
 
     full_text = res.get("full_text", "")
     if not isinstance(full_text, str) or not full_text.strip():
