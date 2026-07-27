@@ -58,6 +58,32 @@ cp config.yaml.example config.yaml
 Or set environment variables in `.env`:
 
 ```
+
+---
+
+## Quickstart: Codex CLI / Desktop Proxy (3 Easy Steps)
+
+Run Codex CLI or Codex Desktop GUI routed through Kim Engine with live Chrome Extension streaming:
+
+### 1. Install Dependencies
+```bash
+git clone https://github.com/AdamMagued/kim.git
+cd kim/kim-pro
+python3 -m venv venv && venv/bin/pip install -r requirements.txt
+```
+
+### 2. Start the Proxy Server
+```bash
+./scripts/start_codex_proxy.sh
+```
+*(Runs the proxy on `http://127.0.0.1:10532/v1` connected to the Chrome Extension on `ws://127.0.0.1:10533`)*
+
+### 3. Run Codex CLI
+In your project directory:
+```bash
+OPENAI_BASE_URL="http://127.0.0.1:10532/v1" codex --model gpt-5.6-sol
+```
+*(Or point Codex Desktop GUI's base URL to `http://127.0.0.1:10532/v1`)*
 ANTHROPIC_API_KEY=sk-ant-...
 GOOGLE_API_KEY=...
 OPENAI_API_KEY=sk-...
