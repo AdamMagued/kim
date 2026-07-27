@@ -1250,10 +1250,10 @@ def _normalize_tool_calls(tool_calls: list, request_tools: object) -> list:
             if name:
                 by_name[str(name)] = tool
     if not by_name:
-        # No tool list in the request — there is nothing to snap names onto,
-        # and the schema-driven coercion below has no schema to read. Pass the
-        # calls through untouched.
-        return tool_calls
+        by_name = {
+            "exec_command": {"name": "exec_command", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}},
+            "apply_patch": {"name": "apply_patch", "parameters": {"type": "object", "properties": {"patch": {"type": "string"}}, "required": ["patch"]}},
+        }
 
     exec_tool = next(
         (n for n in by_name if "exec" in n.lower() or "shell" in n.lower() or "command" in n.lower()),
