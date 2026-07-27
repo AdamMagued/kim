@@ -61,38 +61,62 @@ Or set environment variables in `.env`:
 
 ---
 
-## Quickstart: Codex CLI / Desktop Proxy (3 Easy Steps)
+## Quickstart: Codex CLI / Desktop Proxy Setup (For Any Machine)
 
-Run Codex CLI or Codex Desktop GUI routed through Kim Engine with live Chrome Extension streaming:
+Drive **Codex Desktop GUI** or **Codex CLI** through Kim Engine Proxy with real-time reasoning deltas, live Chrome extension streaming, and automatic workspace `AGENTS.md` auto-injection:
 
-### 1. Install Dependencies
+### 1. Clone Repo & Run Install
 ```bash
 git clone https://github.com/AdamMagued/kim.git
 cd kim/kim-pro
-python3 -m venv venv && venv/bin/pip install -r requirements.txt
+./install.sh
 ```
+*(Creates `venv/`, installs Python requirements, sets up Playwright & Chromium)*
 
-### 2. Start the Proxy Server
+---
+
+### 2. Start the Kim Proxy Server
 ```bash
 ./scripts/start_codex_proxy.sh
 ```
-*(Runs the proxy on `http://127.0.0.1:10532/v1` connected to the Chrome Extension on `ws://127.0.0.1:10533`)*
+When started, the terminal prints a ready message with your active proxy token:
+```text
+╔══════════════════════════════════════════════════════════╗
+║          Kim Engine → Codex CLI Proxy Launcher          ║
+╚══════════════════════════════════════════════════════════╝
+{"event": "ready", "port": 10532, "token": "YOUR_BEARER_TOKEN"}
+```
+- **Proxy OpenAI Base URL**: `http://127.0.0.1:10532/v1`
+- **Extension WebSocket Bridge**: `ws://127.0.0.1:10533`
 
-### 3. Run Codex CLI
-In your project directory:
+---
+
+### 3. Configure Codex Desktop GUI
+1. Open **Codex Desktop App**.
+2. Go to **Settings** → **Advanced** → **Custom Provider / Base URL**.
+3. Set **OpenAI Base URL**: `http://127.0.0.1:10532/v1`
+4. Set **API Key / Authorization Token**: Paste `YOUR_BEARER_TOKEN` (from step 2).
+5. Select or type Model: `gpt-5.6-sol` (or `gpt-4o`, `gemini`, `deepseek`).
+
+---
+
+### 4. Configure Codex CLI
+Add the environment variables to your `~/.zshrc` or `~/.bashrc`:
 ```bash
-OPENAI_BASE_URL="http://127.0.0.1:10532/v1" codex --model gpt-5.6-sol
+export OPENAI_BASE_URL="http://127.0.0.1:10532/v1"
+export OPENAI_API_KEY="YOUR_BEARER_TOKEN"
 ```
-*(Or point Codex Desktop GUI's base URL to `http://127.0.0.1:10532/v1`)*
-ANTHROPIC_API_KEY=sk-ant-...
-GOOGLE_API_KEY=...
-OPENAI_API_KEY=sk-...
+Run `codex` in any workspace directory:
+```bash
+codex --model gpt-5.6-sol
 ```
 
-Beyond the provider API keys, Kim's behavior knobs are `KIM_*` environment
-variables (log level, tool tiers, HITL gates, browser automation, offline fake
-mode, …) — see [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) for the generated
-reference of every variable.
+---
+
+### 5. Workspace `AGENTS.md` Auto-Injection
+In any project workspace directory, add an `AGENTS.md` file containing your local ports, dev commands, and REST endpoints. **Kim Proxy automatically reads and auto-injects your workspace `AGENTS.md` into Codex's prompt on Turn 1** — no manual prompt copy-pasting required!
+
+---
 
 ### 3. Run the desktop app
 
