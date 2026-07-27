@@ -99,8 +99,14 @@
       }
     };
 
-    ws.onclose = function() {
+    ws.onclose = function(evt) {
       ws = null;
+      if (evt && evt.code === 4000) {
+        console.log('[Bridge Content] Connection closed by proxy (code 4000) — backing off reconnect.');
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connectWS, 15000);
+        return;
+      }
       scheduleReconnect();
     };
 
