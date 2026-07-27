@@ -488,8 +488,16 @@ def format_prompt(
     # Bound unconditionally so the trimming fallback below (which re-appends
     # it under the same ChatGPT-only condition) is provably initialized.
     direct_contract = ""
+    is_terminal = bool(system and "codex bridge terminal" in str(system).lower())
     if (preferred_site or "").lower() == "chatgpt":
-        if is_codex_bridge:
+        if is_terminal:
+            direct_contract = (
+                "DIRECT RESPONSE FORMAT REQUEST FOR THIS MESSAGE:\n"
+                "Write 1 short narration line, followed by EXACTLY ONE shell command inside a ```bash code block. "
+                "NEVER write commands as plain text or tell the user to run commands manually — putting the command in a ```bash code block executes it on their Mac terminal automatically. "
+                f"After the ```bash block, append {completion_hash} as the final text."
+            )
+        elif is_codex_bridge:
             direct_contract = (
                 "DIRECT RESPONSE FORMAT REQUEST FOR THIS MESSAGE:\n"
                 "Return exactly one raw JSON object matching the Codex contract above. "

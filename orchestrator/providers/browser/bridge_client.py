@@ -117,8 +117,7 @@ async def _try_extension_bridge(
             logger.info(f"[Kim Bridge] Forwarding {len(attachments)} attachment(s) to Chrome Extension over WebSocket bridge.")
 
         accumulated_delta: list[str] = []
-        last_printed_prose: list[str] = [""]
-        last_print_time: list[float] = [0.0]
+        printed_lines: set[str] = set()
 
         def _on_extension_delta(delta: str):
             if not delta:
@@ -137,14 +136,12 @@ async def _try_extension_bridge(
             
             if not prose:
                 return
-            clean_prose = " ".join(prose.split())[:200]
-            now = time.time()
-            is_boundary = delta.endswith(("\n", ". ", "! ", "? ", ": ")) or "\n" in delta
-            time_elapsed = (now - last_print_time[0]) >= 1.5
-            if clean_prose and clean_prose != last_printed_prose[0] and (is_boundary or time_elapsed):
-                last_printed_prose[0] = clean_prose
-                last_print_time[0] = now
-                print(f"[STATUS] {clean_prose}", flush=True)
+            lines = [l.strip() for l in prose.splitlines() if l.strip()]
+            for line in lines:
+                clean_line = re.sub(r"\b(Gemini|Claude|ChatGPT|Grok|DeepSeek)\b", "Kim", line, flags=re.IGNORECASE).strip()
+                if clean_line and len(clean_line) >= 3 and clean_line not in printed_lines:
+                    printed_lines.add(clean_line)
+                    print(f"[STATUS] {clean_line[:150]}", flush=True)
 
             if on_delta is not None:
                 try:
