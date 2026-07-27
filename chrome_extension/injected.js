@@ -604,7 +604,8 @@
           });
         }
         var cleanText = text.replace(/\[Image attached:[^\]]+\]/g, '').replace(/!\[[^\]]*\]\(data:[^)]+\)/g, '').replace(/!\[[^\]]*\]\(data:[^)]*$/g, '').trim();
-        parts.push(cleanText || 'Please analyze the attached image.');
+        parts.unshift(cleanText || 'Please analyze the attached image.');
+        bridgeLog('parts count=' + parts.length + ' parts[0] type=' + typeof parts[0] + ' parts[1] type=' + (parts[1] ? typeof parts[1] : 'N/A'));
         var msgObj = {
           id: crypto.randomUUID(),
           author: { role: m.role || 'user' },
