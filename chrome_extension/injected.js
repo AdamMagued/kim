@@ -525,25 +525,17 @@
 
     var chatgptMessages = messages.map(function(m, idx) {
       var text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-      if (idx === messages.length - 1 && uploadedFiles.length > 0) {
+      if (idx === messages.length - 1 && Array.isArray(attachments) && attachments.length > 0) {
         var parts = [];
-        var metadataAttachments = [];
-        uploadedFiles.forEach(function(f) {
-          parts.push({
-            asset_pointer: 'file-service://' + f.file_id,
-            content_type: 'image_asset_pointer',
-            size_bytes: f.file_size,
-            width: 1000,
-            height: 1000
-          });
-          metadataAttachments.push({
-            id: f.file_id,
-            size: f.file_size,
-            name: f.file_name,
-            mime_type: f.mime_type,
-            width: 1000,
-            height: 1000
-          });
+        attachments.forEach(function(att) {
+          var b64 = att.data_base64 || att.data || '';
+          var mime = att.mime_type || att.media_type || 'image/png';
+          if (b64) {
+            parts.push({
+              content_type: 'image_url',
+              image_url: { url: 'data:' + mime + ';base64,' + b64 }
+            });
+          }
         });
         parts.push(text);
         return {
@@ -551,18 +543,8 @@
           author: { role: m.role || 'user' },
           create_time: Date.now() / 1000,
           content: { content_type: 'multimodal_text', parts: parts },
-          metadata: { attachments: metadataAttachments }
+          metadata: {},
         };
-      }
-      if (idx === messages.length - 1 && Array.isArray(attachments) && attachments.length > 0) {
-        attachments.forEach(function(att) {
-          var b64 = att.data_base64 || att.data || '';
-          var mime = att.mime_type || att.media_type || 'image/png';
-          var name = att.name || 'image.png';
-          if (b64) {
-            text += '\n\n![' + name + '](data:' + mime + ';base64,' + b64 + ')';
-          }
-        });
       }
       return {
         id: crypto.randomUUID(),
