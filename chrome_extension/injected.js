@@ -443,10 +443,14 @@
     var b64 = att.data_base64 || att.data || '';
     var mime = att.mime_type || att.media_type || 'image/png';
     var name = att.name || 'image.png';
-    if (!b64) return null;
+    if (!b64) {
+      console.log('[Bridge] uploadAttachment: no base64 data found');
+      return null;
+    }
 
     var blob = b64ToBlob(b64, mime);
     var size = blob.size;
+    console.log('[Bridge] uploadAttachment: Blob created, size:', size, 'mime:', mime);
 
     var headers = baseHeaders();
     headers['Content-Type'] = 'application/json';
@@ -460,11 +464,14 @@
         use_case: 'multimodal'
       })
     });
+    console.log('[Bridge] /backend-api/files init status:', initResp.status);
     if (!initResp.ok) {
-      console.error('[Bridge] Failed to init file upload:', await initResp.text());
+      var errTxt = await initResp.text();
+      console.error('[Bridge] Failed to init file upload:', errTxt);
       return null;
     }
     var initData = await initResp.json();
+    console.log('[Bridge] /backend-api/files init data:', initData);
     var fileId = initData.file_id;
     var uploadUrl = initData.upload_url;
 
