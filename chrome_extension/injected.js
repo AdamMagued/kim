@@ -916,7 +916,7 @@
     };
 
     try {
-      var response = await sendConversation(messages, model, requestId, conversationId, parentMessageId, event.data.attachments);
+      var response = await sendConversation(messages, model, requestId, conversationId, parentMessageId, event.data.attachments, event.data.gizmoId);
       activeStreams.set(requestId, streamState);
 
       await parseSSEStream(response,

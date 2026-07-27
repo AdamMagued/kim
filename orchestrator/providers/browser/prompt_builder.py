@@ -489,7 +489,9 @@ def format_prompt(
     # it under the same ChatGPT-only condition) is provably initialized.
     direct_contract = ""
     is_terminal = bool(system and "codex bridge terminal" in str(system).lower())
-    if (preferred_site or "").lower() == "chatgpt":
+    gizmo_id = os.getenv("KIM_GIZMO_ID") or None
+
+    if (preferred_site or "").lower() == "chatgpt" and not gizmo_id:
         if is_terminal:
             direct_contract = (
                 "DIRECT RESPONSE FORMAT REQUEST FOR THIS MESSAGE:\n"

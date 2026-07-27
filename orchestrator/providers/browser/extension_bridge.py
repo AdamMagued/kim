@@ -289,12 +289,17 @@ class ExtensionBridgeServer:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
 
+        gizmo_id = os.getenv("KIM_GIZMO_ID") or None
+
         payload = {
             "type": "request",
             "requestId": req_id,
             "messages": [{"role": "user", "content": prompt}],
             "model": "auto",
         }
+        if gizmo_id:
+            payload["gizmoId"] = gizmo_id
+            logger.info("[Kim Bridge] Custom GPT Gizmo mode: forwarding gizmoId=%s", gizmo_id)
         if attachments:
             payload["attachments"] = attachments
         if conversation_id:

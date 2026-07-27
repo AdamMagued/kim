@@ -84,6 +84,7 @@
             messages: msg.messages,
             attachments: msg.attachments,
             model: msg.model,
+            gizmoId: msg.gizmoId,
             conversationId: msg.conversationId,
             parentMessageId: msg.parentMessageId,
           }, '*');

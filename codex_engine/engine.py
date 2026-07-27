@@ -480,6 +480,12 @@ class _CodexProxy:
         first_user_text = _find_first_user_text(_turn_items)
         if first_user_text:
             self._current_user_goal = first_user_text
+            try:
+                from codex_engine.router import classify_task_mode
+                task_mode = classify_task_mode(first_user_text)
+                logger.info("Hybrid Router: Task classified as %s mode", task_mode)
+            except Exception as e:
+                logger.warning("Failed to classify task mode: %s", e)
 
         is_first_relay = self._last_sent_count == 0 or compacted
 

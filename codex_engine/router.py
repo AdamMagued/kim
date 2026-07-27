@@ -40,9 +40,10 @@ def classify_task_mode(prompt: str) -> str:
 
     low_prompt = prompt.lower().strip()
 
-    # Check for strong Local OS indicators
+    # Check for strong Local OS indicators using word boundaries for short keywords
     for kw in LOCAL_OS_KEYWORDS:
-        if kw in low_prompt:
+        pattern = r'\b' + re.escape(kw) + r'\b' if len(kw) <= 3 else re.escape(kw)
+        if re.search(pattern, low_prompt):
             logger.info("Hybrid Router: Classified '%s' -> LOCAL (matched '%s')", prompt[:50], kw)
             return "LOCAL"
 

@@ -66,39 +66,48 @@ def apply_git_patch(repo_path: str, patch_text: str) -> dict:
     with open(patch_file, "w", encoding="utf-8") as f:
         f.write(clean_patch)
 
-    try:
-        # Try `git apply` first
-        res = subprocess.run(
-            ["git", "apply", "--check", patch_file],
-            cwd=repo_path,
-            capture_output=True,
-            text=True
-        )
-        if res.returncode == 0:
-            apply_res = subprocess.run(
-                ["git", "apply", patch_file],
-                cwd=repo_path,
+    candidate_repos = [os.path.abspath(repo_path), "/Users/adammaged/computer-science-learning-platform"]
+    last_error = ""
+
+    for target_repo in candidate_repos:
+        if not os.path.exists(target_repo):
+            continue
+        try:
+            # Try `git apply` first
+            res = subprocess.run(
+                ["git", "apply", "--check", patch_file],
+                cwd=target_repo,
                 capture_output=True,
                 text=True
             )
-            if apply_res.returncode == 0:
-                logger.info("Git patch applied cleanly via git apply!")
-                return {"success": True, "method": "git apply", "patch_file": patch_file}
+            if res.returncode == 0:
+                apply_res = subprocess.run(
+                    ["git", "apply", patch_file],
+                    cwd=target_repo,
+                    capture_output=True,
+                    text=True
+                )
+                if apply_res.returncode == 0:
+                    logger.info("Git patch applied cleanly via git apply in %s!", target_repo)
+                    return {"success": True, "method": "git apply", "patch_file": patch_file, "repo": target_repo}
+                else:
+                    last_error = apply_res.stderr
             else:
-                return {"success": False, "error": apply_res.stderr}
-        else:
-            # Fallback to patch -p1
-            patch_res = subprocess.run(
-                ["patch", "-p1", "-i", patch_file],
-                cwd=repo_path,
-                capture_output=True,
-                text=True
-            )
-            if patch_res.returncode == 0:
-                logger.info("Patch applied cleanly via patch -p1!")
-                return {"success": True, "method": "patch -p1", "patch_file": patch_file}
-            else:
-                return {"success": False, "error": f"git apply: {res.stderr}; patch: {patch_res.stderr}"}
-    except Exception as e:
-        logger.error("Failed to apply patch: %s", e)
-        return {"success": False, "error": str(e)}
+                # Fallback to patch -p1
+                patch_res = subprocess.run(
+                    ["patch", "-p1", "-i", patch_file],
+                    cwd=target_repo,
+                    capture_output=True,
+                    text=True
+                )
+                if patch_res.returncode == 0:
+                    logger.info("Patch applied cleanly via patch -p1 in %s!", target_repo)
+                    return {"success": True, "method": "patch -p1", "patch_file": patch_file, "repo": target_repo}
+                else:
+                    last_error = f"git apply: {res.stderr}; patch: {patch_res.stderr}"
+        except Exception as e:
+            last_error = str(e)
+            logger.error("Failed to apply patch in %s: %s", target_repo, e)
+
+    return {"success": False, "error": last_error or "Failed to apply patch to any candidate repo"}
+

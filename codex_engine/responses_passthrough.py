@@ -237,6 +237,13 @@ async def handle_responses_passthrough(proxy: "_CodexProxy", body: dict, input_i
 
     if contains_new_user_turn(input_items[proxy._last_sent_count:]):
         proxy._relay_count = 0
+        try:
+            from codex_engine.router import classify_task_mode
+            prompt_str = str(body.get("input", ""))
+            task_mode = classify_task_mode(prompt_str)
+            logger.info("Hybrid Router: Task classified as %s mode", task_mode)
+        except Exception:
+            pass
     proxy._last_sent_count = len(input_items)
 
     proxy._relay_count += 1

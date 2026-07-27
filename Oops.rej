@@ -1,0 +1,9 @@
+@@ -1,7 +1,7 @@
+ export function healthCheck() {
+   return {
+-    status: 'ok' as const,
++    status: 'ok_zip_verified' as const,
+     timestamp: new Date().toISOString(),
+   };
+ }
+ export function formatTimestamp(ts: string | number | Date): string {
