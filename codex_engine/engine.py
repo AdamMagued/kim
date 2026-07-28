@@ -2037,8 +2037,10 @@ def _strip_patch_blocks(content: str) -> str:
     if not isinstance(content, str) or not content:
         return content
     if "*** Begin Patch" in content:
-        content = re.sub(r"\*\*\* Begin Patch.*?\*\*\* End Patch", "\n[File patch applied]\n", content, flags=re.DOTALL)
-    content = re.sub(r"```(?:apply_patch|diff|patch)\n.*?```", "\n[File patch applied]\n", content, flags=re.DOTALL)
+        content = re.sub(r"\*\*\* Begin Patch.*?\*\*\* End Patch", "", content, flags=re.DOTALL)
+    content = re.sub(r"```(?:apply_patch|diff|patch)\n.*?```", "", content, flags=re.DOTALL)
+    content = re.sub(r"\*\*\* Begin Patch.*$", "", content, flags=re.DOTALL)
+    content = re.sub(r"```(?:apply_patch|diff|patch).*$", "", content, flags=re.DOTALL)
     return content.strip()
 
 
@@ -2083,6 +2085,11 @@ def _provider_response_to_responses_api(
                 patch_res = apply_git_patch(os.getcwd(), str(content))
                 if patch_res.get("success"):
                     logger.info("Hybrid Engine: Successfully applied git patch via %s", patch_res.get("method"))
+                    prose = content.split("```", 1)[0].split("*** Begin Patch", 1)[0].strip() if isinstance(content, str) else ""
+                    prose = _strip_patch_blocks(prose) or "Applying file edits to workspace..."
+                    patch_tool_call = [{"name": "exec", "input": {"cmd": f"git diff --stat"}}]
+                    _count_repair(metrics, "patch_tool_calls")
+                    return _make_responses_tool_reply(resp_id, prose, patch_tool_call, request_tools)
                 else:
                     logger.warning("Hybrid Engine: Could not apply git patch: %s", patch_res.get("error"))
             except Exception as e:

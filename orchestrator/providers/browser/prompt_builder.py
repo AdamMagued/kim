@@ -187,6 +187,11 @@ def build_history_recap(
             continue
         if content.startswith("[Tool result:"):
             continue
+        # Skip title generator requests & JSON title responses
+        if any(marker in content for marker in ("Generate a concise UI title", "provide a short title", "Generate a clear, informative task title", "You are a helpful assistant.")):
+            continue
+        if content.startswith('{"title":') or content.startswith('{"title" :'):
+            continue
 
         if role == "user":
             if content.startswith("Task: "):
@@ -217,6 +222,43 @@ def build_history_recap(
     if len(recap) > max_recap:
         recap = "…\n" + recap[-max_recap:]
     return recap
+
+
+def _clean_prompt_for_gizmo(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+
+    # Preserve tool execution results and status outputs for multi-turn continuations
+    if text.startswith("[Tool result:") or text.startswith("Command output:") or text.startswith("[STATUS]") or text.startswith("[HYBRID ENGINE"):
+        return text.strip()
+
+    # Extract cwd from <environment_context> if present
+    cwd_match = re.search(r"<cwd>([^<]+)</cwd>", text)
+    cwd_prefix = f"[cwd: {cwd_match.group(1).strip()}]\n\n" if cwd_match else ""
+
+    # Isolate user text: if [USER] exists, take content after [USER]
+    clean_text = text
+    if "[USER]\n" in clean_text or "[USER]\r\n" in clean_text:
+        parts = re.split(r"\[USER\]\r?\n", clean_text)
+        clean_text = parts[-1]
+
+    # Cut off trailing INSTRUCTION: or IMPORTANT: blocks
+    if "INSTRUCTION:" in clean_text:
+        clean_text = clean_text.split("INSTRUCTION:")[0]
+    if "IMPORTANT:" in clean_text:
+        clean_text = clean_text.split("IMPORTANT:")[0]
+
+    # Clean residual XML/Developer markers if any remain
+    clean_text = re.sub(r"\[DEVELOPER\][\s\S]*?(?:</USER_SETTINGS_CHANGE>|</INSTRUCTIONS>)\s*", "", clean_text)
+    clean_text = re.sub(r"# AGENTS\.md instructions for [^\n]*\n?", "", clean_text)
+    clean_text = re.sub(r"<INSTRUCTIONS>[\s\S]*?</INSTRUCTIONS>\s*", "", clean_text)
+    clean_text = re.sub(r"<environment_context>[\s\S]*?</environment_context>\s*", "", clean_text)
+
+    pure_prompt = clean_text.strip()
+    if not pure_prompt:
+        pure_prompt = re.sub(r"<[^>]+>", "", text).strip()
+
+    return f"{cwd_prefix}{pure_prompt}" if pure_prompt else text.strip()
 
 
 def transport_marker_instruction(completion_hash: str) -> str:
@@ -380,6 +422,7 @@ def format_prompt(
             "[END HANDOFF]\n\n"
         )
 
+    gizmo_id = os.getenv("KIM_GIZMO_ID") or None
     new_sent_system_prompt = sent_system_prompt
     if not sent_system_prompt:
         # Not every advertised tool carries a "name": codex 0.144.3 sends
@@ -412,11 +455,8 @@ def format_prompt(
         gizmo_id = os.getenv("KIM_GIZMO_ID") or None
 
         if gizmo_id:
-            prompt = (
-                f"{history_block}"
-                f"{last_text}\n\n"
-                + transport_marker_instruction(completion_hash)
-            )
+            cleaned_text = _clean_prompt_for_gizmo(last_text)
+            prompt = cleaned_text
         elif is_codex_bridge:
             prompt = (
                 # Handoff goes FIRST so a fresh chat anchors on the prior
@@ -486,7 +526,10 @@ def format_prompt(
             )
         new_sent_system_prompt = True
     else:
-        prompt = last_text + "\n\n" + transport_marker_instruction(completion_hash)
+        if gizmo_id:
+            prompt = _clean_prompt_for_gizmo(last_text)
+        else:
+            prompt = last_text + "\n\n" + transport_marker_instruction(completion_hash)
 
     # ChatGPT Web often labels bracketed [SYSTEM] sections as quoted content
     # because browser providers cannot set a real API system role. Restate the

@@ -654,10 +654,7 @@
     if (sentinelToken) headers['Openai-Sentinel-Chat-Requirements-Token'] = sentinelToken;
     if (proofToken) headers['Openai-Sentinel-Proof-Token'] = proofToken;
 
-    var targetModel = model || 'auto';
-    if (targetModel.includes('5.6') || targetModel.includes('sol')) {
-      targetModel = 'gpt-5.6-sol';
-    }
+    var targetModel = 'gpt-5-6-thinking';
 
     var body = {
       action: 'next',
@@ -748,7 +745,7 @@
           var line = lines[li].trim();
           if (!line || line.startsWith('event:')) continue;
           if (!line.startsWith('data: ')) continue;
-          var data = line.slice(6).trim();
+            var data = line.slice(6).trim();
           if (data === '[DONE]') continue;
 
           try {
@@ -767,20 +764,12 @@
               if (parsed.v.conversation_id) conversationId = parsed.v.conversation_id;
               if (parsed.v.message && parsed.v.message.conversation_id) conversationId = parsed.v.message.conversation_id;
             }
-            // Publish ids as soon as they are known so a cancel arriving
-            // mid-stream can address the real message. Waiting for onDone
-            // meant activeStreams.messageId was still null at cancel time and
-            // the backend cancel call never fired.
             if (onIds && (conversationId || messageId)) onIds(conversationId, messageId);
 
             if (parsed.v && typeof parsed.v === 'object' && parsed.v.message) {
               var msg = parsed.v.message;
               var role = (msg.author || {}).role || '';
-              isAssistant = role !== 'user';
-              // Only an ASSISTANT message id may become the next turn's
-              // parent_message_id. Recording the user echo (or a trailing
-              // system/moderation message) here pointed the following turn at
-              // the wrong node and forked the thread into a branch.
+              isAssistant = role !== 'user' && role !== 'system';
               if (isAssistant && msg.id) {
                 messageId = msg.id;
                 if (onIds) onIds(conversationId, messageId);
@@ -788,8 +777,12 @@
               if (isAssistant) {
                 var parts = ((msg.content || {}).parts) || [];
                 if (parts.length) {
-                  var p0 = parts[0];
-                  var newText = typeof p0 === 'string' ? p0 : (p0 && typeof p0 === 'object' ? (p0.text || p0.val || '') : '');
+                  var extractedParts = parts.map(function(p) {
+                    if (typeof p === 'string') return p;
+                    if (p && typeof p === 'object') return p.text || p.val || p.content || (p.text_content ? p.text_content : '');
+                    return '';
+                  });
+                  var newText = extractedParts.join('\n');
                   if (typeof newText === 'string' && newText.length > fullText.length) {
                     var delta = newText.slice(fullText.length);
                     fullText = newText;
@@ -802,7 +795,7 @@
             if (parsed.o === 'append') {
               var path = parsed.p || lastPath;
               if (path) lastPath = path;
-              if (path && (path.indexOf('/content/parts/') !== -1 || path === '/message/content/parts/0') && isAssistant) {
+              if (path && (path.indexOf('/content/parts/') !== -1 || path.indexOf('/message/content/') !== -1) && isAssistant) {
                 var val = String(parsed.v || '');
                 fullText += val;
                 onDelta(val);

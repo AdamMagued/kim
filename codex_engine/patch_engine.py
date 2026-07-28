@@ -63,7 +63,7 @@ def sanitize_patch(patch_text: str) -> str:
                 old_start, new_start, rest = m.group(1), m.group(2), m.group(3)
                 clean_lines.append(f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{rest}")
             else:
-                clean_lines.append(hdr)
+                clean_lines.append(f"@@ -1,{old_count} +1,{new_count} @@")
         clean_lines.extend(hunk)
 
     for line in lines:
@@ -140,7 +140,7 @@ def apply_git_patch(repo_path: str, patch_text: str) -> dict:
     clean_patch = sanitize_patch(clean_patch)
 
     patch_file = os.path.join(tempfile.gettempdir(), f"patch_{int(time.time())}.patch")
-    with open(patch_file, "w", encoding="utf-8") as f:
+    with open(patch_file, "w", encoding="utf-8", errors="replace") as f:
         f.write(clean_patch)
 
     candidate_repos = [os.path.abspath(repo_path), "/Users/adammaged/computer-science-learning-platform"]
@@ -154,8 +154,7 @@ def apply_git_patch(repo_path: str, patch_text: str) -> dict:
             res = subprocess.run(
                 ["git", "apply", "--recount", "--ignore-space-change", "--whitespace=nowarn", patch_file],
                 cwd=target_repo,
-                capture_output=True,
-                text=True
+                capture_output=True
             )
             if res.returncode == 0:
                 logger.info("Git patch applied cleanly via git apply --recount in %s!", target_repo)
@@ -165,8 +164,7 @@ def apply_git_patch(repo_path: str, patch_text: str) -> dict:
             res3 = subprocess.run(
                 ["git", "apply", "-3", "--whitespace=nowarn", patch_file],
                 cwd=target_repo,
-                capture_output=True,
-                text=True
+                capture_output=True
             )
             if res3.returncode == 0:
                 logger.info("Git patch applied cleanly via git apply -3 in %s!", target_repo)
@@ -176,14 +174,15 @@ def apply_git_patch(repo_path: str, patch_text: str) -> dict:
             patch_res = subprocess.run(
                 ["patch", "-p1", "--fuzz=3", "--ignore-whitespace", "-i", patch_file],
                 cwd=target_repo,
-                capture_output=True,
-                text=True
+                capture_output=True
             )
             if patch_res.returncode == 0:
                 logger.info("Patch applied cleanly via patch -p1 --fuzz=3 in %s!", target_repo)
                 return {"success": True, "method": "patch -p1 --fuzz=3", "patch_file": patch_file, "repo": target_repo}
             else:
-                last_error = f"git apply: {res.stderr}; patch: {patch_res.stderr}"
+                err1 = res.stderr.decode("utf-8", errors="replace") if res.stderr else ""
+                err2 = patch_res.stderr.decode("utf-8", errors="replace") if patch_res.stderr else ""
+                last_error = f"git apply: {err1}; patch: {err2}"
         except Exception as e:
             last_error = str(e)
             logger.error("Failed to apply patch in %s: %s", target_repo, e)

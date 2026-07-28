@@ -293,7 +293,7 @@ class ExtensionBridgeServer:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
 
-        gizmo_id = os.getenv("KIM_GIZMO_ID") or None
+        gizmo_id = os.getenv("KIM_GIZMO_ID") or "g-6a6799761630819197e463478a4e70e5"
 
         payload = {
             "type": "request",

@@ -109,6 +109,20 @@ context line 2"""
             assert "new file 2 content" in c2
             assert not os.path.exists(os.path.join(tmpdir, "file3.txt"))
 
+    def test_apply_git_patch_bare_hunk_header(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.system(f"git -C '{tmpdir}' init -q && touch '{tmpdir}/test.txt' && git -C '{tmpdir}' add . && git -C '{tmpdir}' commit -m 'init' -q")
+            patch_text = """*** Begin Patch
+*** Update File: test.txt
+@@
++bare header addition
+*** End Patch"""
+            res = apply_git_patch(tmpdir, patch_text)
+            assert res.get("success") is True, f"Failed to apply patch with bare @@ header: {res}"
+            with open(os.path.join(tmpdir, "test.txt"), "r") as f:
+                content = f.read()
+            assert "bare header addition" in content
+
     def test_apply_git_patch_diff_fence(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             os.system(f"git -C '{tmpdir}' init -q && echo 'foo' > '{tmpdir}/foo.txt' && git -C '{tmpdir}' add . && git -C '{tmpdir}' commit -m 'init' -q")

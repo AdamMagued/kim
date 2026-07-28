@@ -26,7 +26,7 @@ echo "║  Connecting to Chrome Extension on ws://127.0.0.1:10533   ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
 
-export KIM_PREFERRED_SITE="chatgpt:gpt-5.6-sol"
+export KIM_PREFERRED_SITE="chatgpt:gpt-5-6-thinking"
 export KIM_EFFORT="high"
 # Opt this deployment into the Chrome Extension WebSocket bridge. Without it
 # BrowserProvider uses its normal CDP/playwright path (see _use_webview_bridge).
@@ -34,4 +34,4 @@ export KIM_EXTENSION_BRIDGE="1"
 export KIM_ALLOW_DUMMY_AUTH="1"
 
 cd "$KIM_DIR"
-exec "$PYTHON" -m codex_engine.standalone_proxy --provider browser:chatgpt:gpt-5.6-sol
+exec "$PYTHON" -m codex_engine.standalone_proxy --provider browser:chatgpt:gpt-5-6-thinking
